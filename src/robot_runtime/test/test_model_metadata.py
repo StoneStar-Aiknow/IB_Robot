@@ -84,9 +84,12 @@ def test_gazebo_platform_keeps_the_urdf_authority():
     assert model["joint_limits"]["6"]["max"] == pytest.approx(1.0)
 
 
-def test_unknown_sim_platform_is_rejected():
+def test_malformed_sim_platform_is_rejected():
+    # D2: declaration is syntax — a valid identifier is accepted (the model
+    # metadata records any declared platform); a malformed name fails
     with pytest.raises(ValueError, match="sim_platform"):
-        build_model_metadata(_profile(), use_sim=True, sim_platform="teleop", robot_description=URDF)
+        build_model_metadata(_profile(), use_sim=True, sim_platform="teleop!", robot_description=URDF)
+    build_model_metadata(_profile(), use_sim=True, sim_platform="teleop", robot_description=URDF)
 
 
 def test_physical_gripper_missing_from_urdf_is_rejected(tmp_path):

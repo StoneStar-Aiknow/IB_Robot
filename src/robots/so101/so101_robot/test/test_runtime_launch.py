@@ -18,6 +18,7 @@ from pathlib import Path
 
 import launch
 import yaml
+from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
 _PACKAGE = Path(__file__).resolve().parents[1]
@@ -39,8 +40,7 @@ def _render(extra):
         "simulated": "",
         "use_sim": "",
         "sim_platform": "",
-        "gazebo_world": "",
-        "mujoco_scene": "",
+        "sim_world": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.0",
@@ -91,7 +91,7 @@ def test_gazebo_platform_threads_world_spawn_pose_and_sim_time():
         {
             "use_sim": "true",
             "sim_platform": "gazebo",
-            "gazebo_world": "demo",
+            "sim_world": "demo",
             "spawn_x": "0.5",
             "spawn_y": "-0.25",
             "spawn_z": "0.1",
@@ -110,8 +110,6 @@ def test_gazebo_platform_threads_world_spawn_pose_and_sim_time():
     assert _text(motion_args["motion_hardware_feedback_topic"]) == ""
 
     # the create node waits behind the clock handler and carries the full pose
-    from launch.actions import RegisterEventHandler
-
     deferred = []
     for action in actions:
         if isinstance(action, RegisterEventHandler):
@@ -131,9 +129,13 @@ def test_unknown_platform_fails_fast_before_any_action():
 
     from robot_runtime.launch_support import RuntimeProfileError
 
-    # a platform outside the runtime vocabulary fails on the spot
-    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'webots'"):
+    # a well-formed platform the profile does not declare fails naming the
+    # profile's declared set (sim-platform-registry D2)
+    with pytest.raises(RuntimeProfileError, match="'webots' is not supported by this runtime profile"):
         _render({"use_sim": "true", "sim_platform": "webots"})
+    # a malformed name still fails as an unknown platform, before the profile check
+    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'web-ots'"):
+        _render({"use_sim": "true", "sim_platform": "Web-Ots"})
 
 
 def test_gazebo_platform_applies_a_peripheral_toggle_exactly_once(tmp_path):
@@ -324,7 +326,7 @@ def _inject_simulator_versions(monkeypatch):
     )
 
 
-def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
+def test_sim_world_argument_reaches_the_mujoco_composition(monkeypatch):
     import sim_models.scene_compiler as scene_compiler
 
     _inject_simulator_versions(monkeypatch)
@@ -336,7 +338,7 @@ def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
         return Path("/tmp/ibrobot_fake_composed.mjb")
 
     monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
-    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "mujoco_scene": "pick_banana"})
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "sim_world": "pick_banana"})
     assert captured["scene"] == "pick_banana"
     assert captured["sdf_meshes"] == ["wrist_roll_follower", "moving_jaw"]
     mujoco_nodes = [
@@ -429,7 +431,7 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
 
 
 def test_provider_alone_empty_scene_composes_ground_and_light(tmp_path):
-    """5b.2: provider-alone with an empty mujoco_scene carries the lit ground."""
+    """5b.2: provider-alone with an empty sim_world carries the lit ground."""
     import mujoco
 
     from robot_runtime.launch_support import render_mujoco_description

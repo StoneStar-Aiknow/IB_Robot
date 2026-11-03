@@ -15,14 +15,17 @@ per-simulation-platform controller set that REPLACES ``controllers`` when the
 runtime selects that platform. This is the explicit "the simulator needs a
 different controller combination" declaration (e.g. MuJoCo never releases a
 velocity actuator's last target, so the base controller stays active in
-``idle`` there and the base node is the gate). Keys are limited to physics
-platforms — a hardware/SDK execution has no platform and no override.
+``idle`` there and the base node is the gate). Keys are platform identifiers
+(sim-platform-registry D2: any registered platform may override, not a fixed
+list) — a hardware/SDK execution has no platform and no override.
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+
+from robot_runtime.sim_platforms import PERIPHERAL_SIMULATION_RESERVED_KEYS, is_valid_sim_platform_name
 
 
 @dataclass(frozen=True)
@@ -61,13 +64,11 @@ def resolve_mode_controllers(
     """
     if not by_platform:
         return controllers
-    from robot_runtime.profile import PHYSICS_SIM_PLATFORMS
-
     for platform, override in by_platform.items():
-        if platform not in PHYSICS_SIM_PLATFORMS:
+        if platform in PERIPHERAL_SIMULATION_RESERVED_KEYS or not is_valid_sim_platform_name(platform):
             raise ValueError(
-                f"mode {mode_name!r} controllers_by_platform key {platform!r} is not a physics platform "
-                f"(supported: {list(PHYSICS_SIM_PLATFORMS)}); hardware and SDK executions take 'controllers'"
+                f"mode {mode_name!r} controllers_by_platform key {platform!r} is not a simulation platform "
+                "identifier (expected ^[a-z][a-z0-9_]*$); hardware and SDK executions take 'controllers'"
             )
         if not isinstance(override, list | tuple):
             raise ValueError(

@@ -24,6 +24,7 @@ from robot_runtime.interface_description import (
     write_description,
 )
 from robot_runtime.interface_monitor import InterfaceMonitor
+from robot_runtime.sim_platforms import SimPlatformError
 from robot_runtime.synthetic_perception import SyntheticStreams
 from robot_runtime.wait_for_runtime import validate_endpoint_graph, validate_runtime_snapshot
 
@@ -168,8 +169,13 @@ def test_physical_execution_with_platform_rejected(profile):
         build_description(profile, use_sim=False, sim_platform="sdk")
 
 
-def test_unknown_sim_platform_rejected(profile):
-    with pytest.raises(InterfaceDescriptionError, match="unknown sim_platform 'teleport'"):
+def test_malformed_sim_platform_rejected(profile):
+    # D2: declaration is syntax — the platform must be an identifier; an
+    # unregistered identifier the registry never heard of fails at the
+    # effective-selection checkpoint naming the platform and the package
+    with pytest.raises(InterfaceDescriptionError, match="expected an identifier matching"):
+        build_description(profile, use_sim=True, sim_platform="teleport-fast!")
+    with pytest.raises(SimPlatformError, match="simulation platform 'teleport' is not installed"):
         build_description(profile, use_sim=True, sim_platform="teleport")
 
 
@@ -245,9 +251,15 @@ def test_description_sim_platform_rejects_unknown_value(profile):
     doc = build_description(profile, use_sim=True, sim_platform="sdk")
     doc["sim_platform"] = "teleport"
     doc["digest"] = description_digest(doc)
+    # D2: the schema accepts any identifier — a valid unknown platform name
+    # round-trips (reading an exported description never needs the plugin)
+    validate_description(doc)
+    assert description_sim_platform(doc) == "teleport"
+    doc["sim_platform"] = "teleport-fast!"
+    doc["digest"] = description_digest(doc)
     with pytest.raises(ValueError, match="sim_platform"):
-        validate_description(doc)  # the schema enum rejects the unknown value
-    with pytest.raises(InterfaceDescriptionError, match="unknown value 'teleport'"):
+        validate_description(doc)  # the schema pattern rejects the malformed value
+    with pytest.raises(InterfaceDescriptionError, match="unknown value 'teleport-fast!'"):
         description_sim_platform(doc)
 
 

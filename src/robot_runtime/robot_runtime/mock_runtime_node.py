@@ -64,7 +64,7 @@ from robot_runtime.contract import (
     STOP_SERVICE,
     STOP_TORQUE_OFF,
 )
-from robot_runtime.interface_description import build_description, platform_peripherals
+from robot_runtime.interface_description import build_description, effective_sensor_traits, platform_peripherals
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.peripherals import (
@@ -182,8 +182,11 @@ class MockRuntime(Node):
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
         # D3: the same platform-filtered inventory the real facade projects
         peripherals = platform_peripherals(peripherals, sim_platform or None)
+        # D4: the same effective sensor traits the real facade projects, so
+        # the mock's capability surface and its description cannot disagree.
+        sensor_traits = effective_sensor_traits(self._profile, peripherals_path, use_sim, sim_platform or None)
         capabilities = dict(self._profile["capabilities"])
-        capabilities.update(perception_capabilities(peripherals, sim_platform=sim_platform or None))
+        capabilities.update(perception_capabilities(peripherals, traits=sensor_traits))
         capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         description = build_description(self._profile, peripherals, use_sim=use_sim, sim_platform=sim_platform or None)

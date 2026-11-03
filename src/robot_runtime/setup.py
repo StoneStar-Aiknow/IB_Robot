@@ -37,5 +37,12 @@ setup(
             "odometry_twist_relay = robot_runtime.odometry_twist_relay:main",
             "runtime_interfaces = robot_runtime.interface_description:main",
         ],
+        # The physics platforms this package provides (openspec
+        # sim-platform-registry D1/D6); a platform is discovered through its
+        # ibrobot.sim_platforms entry point.
+        "ibrobot.sim_platforms": [
+            "gazebo = robot_runtime.sim_specs:GAZEBO_SPEC",
+            "mujoco = robot_runtime.sim_specs:MUJOCO_SPEC",
+        ],
     },
 )

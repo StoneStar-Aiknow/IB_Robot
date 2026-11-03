@@ -60,7 +60,14 @@ from robot_runtime.peripherals import (
     scan_converter_nodes,
     synthetic_perception_nodes,
 )
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
+from robot_runtime.sim_platforms import (
+    SDK_PLATFORM,
+    SimPlatformError,
+    get_sim_platform,
+    is_physics_selection,
+    is_valid_sim_platform_name,
+    resolve_sim_embodiment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,7 +335,9 @@ def resolve_sim_selection(
     platform fails naming both. ``simulated:=`` stays a deprecated alias of
     ``use_sim:=`` (a warning names ``use_sim``); disagreeing with ``use_sim:=``
     fails naming both. A platform the profile does not declare fails naming
-    the platform, the declared set and the profile.
+    the platform, the declared set and the profile. A physics platform that
+    is not registered (sim-platform-registry D2: the effective selection is
+    the checkpoint) fails naming the platform and the package to install.
     """
     use_sim_explicit: bool | None = None
     simulated_override = (simulated_arg or "").strip().lower()
@@ -350,8 +359,10 @@ def resolve_sim_selection(
         use_sim_explicit = use_sim_value
 
     sim_platform = (sim_platform_arg or "").strip().lower()
-    if sim_platform and sim_platform not in SIM_PLATFORMS:
-        raise RuntimeProfileError(f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}")
+    if sim_platform and not is_valid_sim_platform_name(sim_platform):
+        raise RuntimeProfileError(
+            f"unknown sim_platform {sim_platform!r}: expected an identifier matching ^[a-z][a-z0-9_]*$"
+        )
 
     # A platform alone implies simulation; otherwise the profile's selection
     # applies unless an argument overrode it.
@@ -367,13 +378,21 @@ def resolve_sim_selection(
             )
         return False, None
 
-    platform = sim_platform or str(profile.get("sim_platform") or "sdk")
-    supported = [str(entry) for entry in (profile.get("sim_platforms") or ["sdk"])]
+    platform = sim_platform or str(profile.get("sim_platform") or SDK_PLATFORM)
+    supported = [str(entry) for entry in (profile.get("sim_platforms") or [SDK_PLATFORM])]
     if platform not in supported:
         raise RuntimeProfileError(
             f"sim_platform {platform!r} is not supported by this runtime profile (supported: {supported}, "
             f"default: {profile.get('sim_platform', 'sdk')!r}{f'; profile: {source}' if source else ''})"
         )
+    if platform != SDK_PLATFORM:
+        # D2: registration is required for the effective selection — this is
+        # the runtime-entry checkpoint; an unregistered selection fails as a
+        # profile error naming the platform and the package to install.
+        try:
+            get_sim_platform(platform)
+        except SimPlatformError as exc:
+            raise RuntimeProfileError(str(exc)) from exc
     return True, platform
 
 
@@ -673,27 +692,15 @@ def gazebo_embodiment_actions(
                     ),
                 )
             ),
-            Node(
-                package="robot_runtime",
-                executable="runtime_facade",
-                name="runtime_facade",
-                output="screen",
-                parameters=[
-                    {
-                        "profile": str(profile_path),
-                        "peripherals": peripherals_file,
-                        "use_sim": True,
-                        "sim_platform": "gazebo",
-                        "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
-                        "use_sim_time": True,
-                        **(
-                            {"interface_description_json": json.dumps(interface_description)}
-                            if interface_description is not None
-                            else {}
-                        ),
-                        **({"instance_id": instance_id} if instance_id else {}),
-                    }
-                ],
+            runtime_facade_node(
+                profile,
+                profile_path,
+                peripherals_file,
+                use_sim=True,
+                sim_platform="gazebo",
+                instance_id=instance_id,
+                interface_description=interface_description,
+                use_sim_time=True,
             ),
             *simulated_joint_current_actions(profile),
         ]
@@ -937,27 +944,15 @@ def mujoco_embodiment_actions(
             timeout_s=60.0,
             use_sim_time=True,
         ),
-        Node(
-            package="robot_runtime",
-            executable="runtime_facade",
-            name="runtime_facade",
-            output="screen",
-            parameters=[
-                {
-                    "profile": str(profile_path),
-                    "peripherals": peripherals_file,
-                    "use_sim": True,
-                    "sim_platform": "mujoco",
-                    "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
-                    "use_sim_time": True,
-                    **(
-                        {"interface_description_json": json.dumps(interface_description)}
-                        if interface_description is not None
-                        else {}
-                    ),
-                    **({"instance_id": instance_id} if instance_id else {}),
-                }
-            ],
+        runtime_facade_node(
+            profile,
+            profile_path,
+            peripherals_file,
+            use_sim=True,
+            sim_platform="mujoco",
+            instance_id=instance_id,
+            interface_description=interface_description,
+            use_sim_time=True,
         ),
         *simulated_joint_current_actions(profile, sim_platform="mujoco"),
         *mujoco_camera_relays(peripherals),
@@ -993,6 +988,197 @@ def _merged_controllers_config(shipped: Path | str, generated: dict) -> Path:
     return out
 
 
+# ---------------------------------------------------------------------------
+# SimEmbodiment wrappers (sim-platform-registry D3): the platforms' default
+# embodiments, referenced by their specs as ``module:attr`` strings and
+# resolved lazily through the registry, so no platform name appears in the
+# dispatch code.
+# ---------------------------------------------------------------------------
+
+
+class _GazeboEmbodiment:
+    """The Gazebo platform's default :class:`SimEmbodiment` (D3)."""
+
+    def render_description(
+        self,
+        profile: dict[str, Any],
+        profile_path: Path,
+        *,
+        peripherals: list | None = None,
+        spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+        world: str = "",
+    ) -> str:
+        return render_gazebo_description(profile, profile_path, peripherals=peripherals, spawn_pose=spawn_pose)
+
+    def actions(
+        self,
+        profile: dict[str, Any],
+        profile_path: Path,
+        peripherals_file: str = "",
+        instance_id: str = "",
+        *,
+        robot_description: str | None = None,
+        interface_description: dict | None = None,
+        world: str = "",
+        spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+    ) -> list:
+        return gazebo_embodiment_actions(
+            profile,
+            profile_path,
+            peripherals_file,
+            instance_id,
+            robot_description=robot_description,
+            interface_description=interface_description,
+            gazebo_world=world,
+            spawn_pose=spawn_pose,
+        )
+
+
+class _MujocoEmbodiment:
+    """The MuJoCo platform's default :class:`SimEmbodiment` (D3)."""
+
+    def render_description(
+        self,
+        profile: dict[str, Any],
+        profile_path: Path,
+        *,
+        peripherals: list | None = None,
+        spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+        world: str = "",
+    ) -> str:
+        scene = None if world is None else ((world or "").strip() or "empty")
+        return render_mujoco_description(profile, profile_path, peripherals, spawn_pose=spawn_pose, scene=scene)
+
+    def actions(
+        self,
+        profile: dict[str, Any],
+        profile_path: Path,
+        peripherals_file: str = "",
+        instance_id: str = "",
+        *,
+        robot_description: str | None = None,
+        interface_description: dict | None = None,
+        world: str = "",
+        spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+    ) -> list:
+        return mujoco_embodiment_actions(
+            profile,
+            profile_path,
+            peripherals_file,
+            instance_id,
+            robot_description=robot_description,
+            interface_description=interface_description,
+            mujoco_scene=world,
+            spawn_pose=spawn_pose,
+        )
+
+
+GAZEBO_EMBODIMENT = _GazeboEmbodiment()
+MUJOCO_EMBODIMENT = _MujocoEmbodiment()
+
+
+def render_sim_description(
+    profile: dict[str, Any],
+    profile_path: Path,
+    sim_platform: str | None,
+    *,
+    peripherals: list | None = None,
+    simulated: bool = True,
+    spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+    world: str = "",
+) -> str:
+    """Render the profile's robot description for the selection (D3).
+
+    Hardware and the SDK platform keep :func:`render_robot_description`
+    (unchanged); every other simulated selection is physics by D1 and renders
+    through the effective embodiment — the profile's
+    ``simulation.<platform>.embodiment`` override when declared, else the
+    platform's default (resolved lazily through the registry, so no platform
+    name appears here).
+    """
+    if not is_physics_selection(simulated, sim_platform):
+        return render_robot_description(profile, profile_path, simulated)
+    platform = get_sim_platform(str(sim_platform))
+    embodiment = resolve_sim_embodiment(profile, profile_path, platform)
+    return embodiment.render_description(
+        profile, profile_path, peripherals=peripherals, spawn_pose=spawn_pose, world=world
+    )
+
+
+def sim_embodiment_actions(
+    profile: dict[str, Any],
+    profile_path: Path,
+    sim_platform: str | None,
+    peripherals_file: str = "",
+    instance_id: str = "",
+    *,
+    robot_description: str | None = None,
+    interface_description: dict | None = None,
+    world: str = "",
+    spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+) -> list | None:
+    """The effective embodiment's launch actions for a physics platform (D3).
+
+    Returns the embodiment's actions, or ``None`` for hardware and sdk — they
+    have no embodiment and the caller keeps the stock stack for them.
+    """
+    if not is_physics_selection(True, sim_platform):
+        return None
+    platform = get_sim_platform(str(sim_platform))
+    embodiment = resolve_sim_embodiment(profile, profile_path, platform)
+    return embodiment.actions(
+        profile,
+        profile_path,
+        peripherals_file,
+        instance_id,
+        robot_description=robot_description,
+        interface_description=interface_description,
+        world=world,
+        spawn_pose=spawn_pose,
+    )
+
+
+def runtime_facade_node(
+    profile: dict[str, Any],
+    profile_path: Path,
+    peripherals_file: str = "",
+    *,
+    use_sim: bool,
+    sim_platform: str = "",
+    instance_id: str = "",
+    interface_description: dict | None = None,
+    use_sim_time: bool = False,
+) -> Node:
+    """The runtime facade node, the one builder both stack paths share (D3).
+
+    The hardware/sdk stack and every physics embodiment construct the facade
+    identically apart from the platform identity and the sim-time flag, which
+    this helper carries as parameters.
+    """
+    return Node(
+        package="robot_runtime",
+        executable="runtime_facade",
+        name="runtime_facade",
+        output="screen",
+        parameters=[
+            {
+                "profile": str(profile_path),
+                "peripherals": peripherals_file,
+                "use_sim": use_sim,
+                "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
+                **({"sim_platform": sim_platform} if sim_platform else {}),
+                **({"use_sim_time": True} if use_sim_time else {}),
+                **(
+                    {"interface_description_json": json.dumps(interface_description)}
+                    if interface_description is not None
+                    else {}
+                ),
+                **({"instance_id": instance_id} if instance_id else {}),
+            }
+        ],
+    )
+
+
 def runtime_stack_actions(
     profile: dict[str, Any],
     profile_path: Path,
@@ -1003,8 +1189,7 @@ def runtime_stack_actions(
     robot_description: str | None = None,
     interface_description: dict | None = None,
     sim_platform: str = "",
-    gazebo_world: str = "",
-    mujoco_scene: str = "",
+    sim_world: str = "",
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> list:
     """robot_state_publisher + ros2_control_node + controller spawners + runtime facade.
@@ -1013,36 +1198,24 @@ def runtime_stack_actions(
     the robot's defaults) additionally composes the sensor driver nodes, or
     synthetic perception publishers in simulated execution (D12), and feeds
     the facade so RuntimeStatus declares the perception surface.
-    ``sim_platform`` (runtime-simulation-platform D1/D7) is forwarded to the
-    facade so its public description carries the selected platform; the
-    ``gazebo`` platform dispatches to the embodiment variant (D5): no
-    ``ros2_control_node``, entity creation in the named world (empty ⇒
-    standalone minimal world), spawners against the in-simulator controller
-    manager and the facade on sim time; the ``mujoco`` platform dispatches to
-    its embodiment variant (D2): one ``mujoco_ros2_control`` process that is
-    both the simulator and the controller manager, with the composed
-    robot+scene model; hardware and sdk are unchanged.
+    ``sim_platform`` is forwarded to the facade so its public description
+    carries the selected platform. A physics platform dispatches to its
+    embodiment (D3): the effective embodiment — the profile's
+    ``simulation.<platform>.embodiment`` override when declared, else the
+    registered platform's default — renders and composes the stack; hardware
+    and sdk are unchanged. ``sim_world`` is the platform-neutral world
+    hand-off (the world name on Gazebo, the scene name on MuJoCo).
     """
-    if simulated and sim_platform == "gazebo":
-        return gazebo_embodiment_actions(
+    if is_physics_selection(simulated, sim_platform):
+        return sim_embodiment_actions(
             profile,
             profile_path,
+            str(sim_platform),
             peripherals_file,
             instance_id,
             robot_description=robot_description,
             interface_description=interface_description,
-            gazebo_world=gazebo_world,
-            spawn_pose=spawn_pose,
-        )
-    if simulated and sim_platform == "mujoco":
-        return mujoco_embodiment_actions(
-            profile,
-            profile_path,
-            peripherals_file,
-            instance_id,
-            robot_description=robot_description,
-            interface_description=interface_description,
-            mujoco_scene=mujoco_scene,
+            world=sim_world,
             spawn_pose=spawn_pose,
         )
     if robot_description is None:
@@ -1070,26 +1243,14 @@ def runtime_stack_actions(
             output="screen",
         ),
         *spawner_nodes(broadcasters, active, inactive, controller_manager=str(profile["controller_manager"])),
-        Node(
-            package="robot_runtime",
-            executable="runtime_facade",
-            name="runtime_facade",
-            output="screen",
-            parameters=[
-                {
-                    "profile": str(profile_path),
-                    "peripherals": peripherals_file,
-                    "use_sim": simulated,
-                    "initial_mode": str((profile.get("modes") or {}).get("initial", IDLE_MODE)),
-                    **({"sim_platform": sim_platform} if sim_platform else {}),
-                    **(
-                        {"interface_description_json": json.dumps(interface_description)}
-                        if interface_description is not None
-                        else {}
-                    ),
-                    **({"instance_id": instance_id} if instance_id else {}),
-                }
-            ],
+        runtime_facade_node(
+            profile,
+            profile_path,
+            peripherals_file,
+            use_sim=simulated,
+            sim_platform=sim_platform,
+            instance_id=instance_id,
+            interface_description=interface_description,
         ),
     ]
 
@@ -1111,7 +1272,7 @@ def peripheral_stack_actions(
     """
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
-    if simulated and sim_platform in PHYSICS_SIM_PLATFORMS:
+    if is_physics_selection(simulated, sim_platform):
         # D3: excluded peripherals are not launched on the platform (the
         # audio owners and the scan converter resolve the filtered inventory)
         peripherals = platform_peripherals(peripherals, sim_platform)
@@ -1158,7 +1319,7 @@ def motion_launch_arguments(
     ]
     arm_joints = [str(j) for j in profile.get("arm_joints", profile["joints"])]
     return {
-        "use_sim_time": "true" if simulated and sim_platform in PHYSICS_SIM_PLATFORMS else "false",
+        "use_sim_time": "true" if is_physics_selection(simulated, sim_platform) else "false",
         "display": xacro_value(display),
         "joint_names": " ".join(arm_joints),
         "joint_state_topic": str(motion.get("joint_state_topic", profile["joint_state_topic"])),

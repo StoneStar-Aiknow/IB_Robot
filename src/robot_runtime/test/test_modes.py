@@ -126,20 +126,40 @@ def test_an_empty_platform_override_stays_empty():
     )
 
 
-def test_unknown_platform_key_is_rejected_even_when_not_selected():
+def test_malformed_platform_key_is_rejected_even_when_not_selected():
     profile = _platform_profile()
-    profile["modes"]["idle"]["controllers_by_platform"] = {"teleport": ["x"]}
-    with pytest.raises(ValueError, match="controllers_by_platform key 'teleport' is not a physics platform"):
+    # D2: any identifier is a valid platform key (registration is checked
+    # only for an effective selection); a malformed key is rejected up front
+    profile["modes"]["idle"]["controllers_by_platform"] = {"teleport-fast!": ["x"]}
+    with pytest.raises(ValueError, match="controllers_by_platform key 'teleport-fast!' is not a simulation platform"):
         ModeModelConfig.from_profile(profile)
-    with pytest.raises(ValueError, match="controllers_by_platform key 'teleport' is not a physics platform"):
+    with pytest.raises(ValueError, match="controllers_by_platform key 'teleport-fast!' is not a simulation platform"):
+        ModeModelConfig.from_profile(profile, "mujoco")
+    # a well-formed unregistered platform key loads (declaration is syntax)
+    profile["modes"]["idle"]["controllers_by_platform"] = {"teleport": ["x"]}
+    ModeModelConfig.from_profile(profile)
+    ModeModelConfig.from_profile(profile, "mujoco")
+
+
+def test_reserved_non_platform_key_is_rejected():
+    profile = _platform_profile()
+    # D2: 'embedded_sensor' is a reserved non-platform key of a peripheral
+    # 'simulation' block, never a platform section
+    profile["modes"]["idle"]["controllers_by_platform"] = {"embedded_sensor": ["x"]}
+    with pytest.raises(ValueError, match="not a simulation platform"):
         ModeModelConfig.from_profile(profile, "mujoco")
 
 
 def test_sdk_cannot_be_a_platform_override_key():
     profile = _platform_profile()
     profile["modes"]["idle"]["controllers_by_platform"] = {"sdk": ["x"]}
-    with pytest.raises(ValueError, match="not a physics platform"):
-        ModeModelConfig.from_profile(profile, "sdk")
+    # 'sdk' is a valid identifier, so it loads as a platform key (D2); the SDK
+    # execution never selects a platform table, so 'sdk' overrides nothing
+    ModeModelConfig.from_profile(profile)
+    from robot_runtime.modes import mode_controller_table
+
+    idle_controllers = mode_controller_table(profile, None)["idle"]
+    assert "x" not in idle_controllers
 
 
 def test_non_list_platform_override_is_rejected():

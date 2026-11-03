@@ -373,7 +373,7 @@ def _deferred_actions(actions):
 def test_gazebo_platform_action_set_has_no_ros2_control_node(tmp_path):
     profile = _profile(tmp_path)
     actions = runtime_stack_actions(
-        profile, tmp_path / "robot.xacro", simulated=True, sim_platform="gazebo", gazebo_world=""
+        profile, tmp_path / "robot.xacro", simulated=True, sim_platform="gazebo", sim_world=""
     )
     nodes = [a for a in actions if isinstance(a, Node)]
     executables = {node._Node__node_executable for node in nodes}
@@ -928,18 +928,15 @@ def test_lidar_and_imu_bridge_entries_target_the_advertised_endpoints():
     assert lidar_bridge_entries(other) == [] and imu_bridge_entries(other) == []
 
 
-def test_lidar_injection_follows_LIDAR_SIM_PLATFORMS_for_every_physics_platform():
-    """D14.2 guard: for every physics platform the lidar injection is non-empty
-    exactly when the platform simulates lidar (the capability the gate reads
-    and the render path consult cannot drift apart)."""
-    from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS
-
-    for platform in PHYSICS_SIM_PLATFORMS:
-        urdf = lidar_imu_sensor_urdf([MID360], platform=platform)
-        assert bool(urdf) == (platform in LIDAR_SIM_PLATFORMS), (
-            f"{platform}: lidar injection is {'non-empty' if urdf else 'empty'} but the platform is "
-            f"{'in' if platform in LIDAR_SIM_PLATFORMS else 'not in'} LIDAR_SIM_PLATFORMS"
-        )
+def test_lidar_injection_only_for_the_gazebo_platform():
+    """sim-platform-registry D4 guard: only the Gazebo platform's sensor
+    generation injects lidar/IMU sensors (the driver set lives in the
+    platform's sensor traits — ``robot_runtime.sim_specs``); any other
+    platform name renders nothing, so it also reports no lidar-simulation
+    capability."""
+    assert lidar_imu_sensor_urdf([MID360], platform="gazebo") != ""
+    assert lidar_imu_sensor_urdf([MID360], platform="mujoco") == ""
+    assert lidar_imu_sensor_urdf([MID360], platform="testsim") == ""
 
 
 def test_sensor_pose_prefers_the_simulation_transform():

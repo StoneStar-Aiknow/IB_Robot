@@ -40,8 +40,7 @@ def _render(profile, extra):
         "simulated": "",
         "use_sim": "",
         "sim_platform": "",
-        "gazebo_world": "",
-        "mujoco_scene": "",
+        "sim_world": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.05",
@@ -312,7 +311,7 @@ def test_launch_declares_the_gazebo_arguments():
     description = _launch_module().generate_launch_description()
     arguments = [action for action in description.entities if isinstance(action, DeclareLaunchArgument)]
     names = {_text(action._DeclareLaunchArgument__name) for action in arguments}
-    assert {"gazebo_world", "spawn_x", "spawn_y", "spawn_z", "spawn_yaw"} <= names
+    assert {"sim_world", "spawn_x", "spawn_y", "spawn_z", "spawn_yaw"} <= names
     defaults = {
         _text(action._DeclareLaunchArgument__name): _text(action._DeclareLaunchArgument__default_value)
         for action in arguments
@@ -328,7 +327,7 @@ def test_gazebo_launch_threads_world_pose_and_sim_time():
         {
             "use_sim": "true",
             "sim_platform": "gazebo",
-            "gazebo_world": "demo",
+            "sim_world": "demo",
             "spawn_x": "0.5",
             "spawn_y": "-0.25",
             "spawn_z": "0.05",
@@ -486,7 +485,7 @@ def test_rotated_mount_drives_sensor_pose_public_tf_and_extrinsics(tmp_path):
     # body, and the FAST-LIO bridge receives the mount's inverse extrinsic
     actions = _render(
         LIDAR_PROFILE,
-        {"use_sim": "true", "sim_platform": "gazebo", "peripherals": str(fragment), "gazebo_world": "demo"},
+        {"use_sim": "true", "sim_platform": "gazebo", "peripherals": str(fragment), "sim_world": "demo"},
     )
     nodes = [a for a in actions if isinstance(a, Node)]
     tf = [node for node in nodes if node._Node__node_executable == "static_transform_publisher"]

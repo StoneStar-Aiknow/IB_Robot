@@ -222,7 +222,8 @@ per platform (`robot_navigation`'s `test/config/lekiwi_lio_sim.yaml` pins
 check of the same navigation stage: it sends `NavigateToPose` goals (to a
 point and back to the spawn) and a cancel-based stop, asserting the D3 stop
 thresholds and single-publisher `map -> odom` ownership (AMCL) on simulator
-ground truth. It is parametrized over `PHYSICS_SIM_PLATFORMS` — goals,
+ground truth. It is parametrized over the first-party physics platforms
+(`gazebo`, `mujoco`) — goals,
 thresholds and assertions are identical on Gazebo and MuJoCo — and over the
 staging base (`lekiwi_lidar`, `lekiwi_nav_grasp`): the mobile manipulator
 runs the same goals through its own overlay
@@ -268,7 +269,7 @@ the URDF-derived pose (D2/D8):
 ```bash
 # provider alone, headless (no display): sensors, admission, wheels
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch lekiwi_robot runtime.launch.py \
-  profile:=lekiwi_lidar sim_platform:=mujoco [mujoco_scene:=nav_room \
+  profile:=lekiwi_lidar sim_platform:=mujoco [sim_world:=nav_room \
   spawn_x:=-1.5 spawn_y:=-1.5 spawn_z:=0.05]
 
 # navigation (FAST-LIO + Nav2/AMCL) through the robot_config entry,
@@ -277,7 +278,7 @@ ros2 launch robot_config robot.launch.py config_path:=<staged>/lekiwi_lio_sim.ya
   use_sim:=true sim_platform:=mujoco nav_stage:=navigation
 ```
 
-An empty `mujoco_scene` composes the shared `empty` scene. Use a fresh
+An empty `sim_world` composes the shared `empty` scene. Use a fresh
 `ROS_DOMAIN_ID` and kill stray `ros2_control_node` processes afterwards; the
 composed model lands under `/tmp/ibrobot_sim_models/<ROS_DOMAIN_ID>/` (an
 extension-declaring model is delivered as XML — the C++ node compiles it
@@ -353,7 +354,7 @@ printf 'fast_lio:\n  enabled: true\n' > /tmp/lekiwi_fastlio.yaml
 
 # terminal 1 — the runtime with the viewer (no IBROBOT_MUJOCO_HEADLESS)
 ros2 launch lekiwi_robot runtime.launch.py profile:=lekiwi_lidar \
-  sim_platform:=mujoco mujoco_scene:=nav_room spawn_x:=-1.5 spawn_y:=-1.5 \
+  sim_platform:=mujoco sim_world:=nav_room spawn_x:=-1.5 spawn_y:=-1.5 \
   peripherals:=/tmp/lekiwi_fastlio.yaml
 
 # terminal 2 — RViz with the FAST-LIO topics (/cloud_registered with a decay
@@ -387,7 +388,7 @@ parameter variant — the shipped base-only config keeps 0.22).
 ```bash
 # provider alone (sensors, admission, wheels, arm, MoveIt stack), either platform
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch lekiwi_robot runtime.launch.py \
-  profile:=lekiwi_nav_grasp sim_platform:=mujoco [mujoco_scene:=nav_room]
+  profile:=lekiwi_nav_grasp sim_platform:=mujoco [sim_world:=nav_room]
 IBROBOT_GAZEBO_HEADLESS=1 IGN_PARTITION=<fresh> GZ_PARTITION=<fresh> \
   ros2 launch lekiwi_robot runtime.launch.py \
   profile:=lekiwi_nav_grasp sim_platform:=gazebo

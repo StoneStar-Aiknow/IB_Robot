@@ -8,7 +8,7 @@ shipped ``lekiwi_lidar`` profile with ``sim_platform:=mujoco``:
 - D2/D2a/D9: the MuJoCo render — the composed MJCF (free joint, lidar
   extension/sensor, IMU sensors, wheel contact parameters) and the URDF's
   hardware parameters and wheel-name transmissions;
-- D7: the launch plumbing — ``mujoco_scene``, the spawn pose, simulation time;
+- D7: the launch plumbing — ``sim_world``, the spawn pose, simulation time;
 - D3.1/D3.2: the mode resolution keeps the base controller active in idle on
   MuJoCo only, and the base node receives the published cmd_vel envelope;
 - D5.3: the embodiment's merged plugin parameters (base velocity without
@@ -72,8 +72,7 @@ def _render(profile, extra):
         "simulated": "",
         "use_sim": "",
         "sim_platform": "",
-        "gazebo_world": "",
-        "mujoco_scene": "",
+        "sim_world": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.05",
@@ -129,7 +128,7 @@ def _mujoco_actions(**extra):
         {
             "use_sim": "true",
             "sim_platform": "mujoco",
-            "mujoco_scene": "nav_room",
+            "sim_world": "nav_room",
             "spawn_x": "-1.5",
             "spawn_y": "-1.5",
             "spawn_z": "0.05",
@@ -516,13 +515,13 @@ def test_launch_declares_the_mujoco_arguments():
     description = _launch_module().generate_launch_description()
     arguments = [action for action in description.entities if isinstance(action, DeclareLaunchArgument)]
     names = {_text(action._DeclareLaunchArgument__name) for action in arguments}
-    assert "mujoco_scene" in names
+    assert "sim_world" in names
     defaults = {
         _text(action._DeclareLaunchArgument__name): _text(action._DeclareLaunchArgument__default_value)
         for action in arguments
         if action._DeclareLaunchArgument__default_value
     }
-    assert defaults["mujoco_scene"] == ""
+    assert defaults["sim_world"] == ""
 
 
 def test_filters_and_static_tf_bring_the_streams_to_the_advertised_endpoints():
@@ -612,7 +611,7 @@ def test_provider_alone_run_reaches_active_and_streams_the_sensor_surface(tmp_pa
             "runtime.launch.py",
             f"profile:={profile_name}",
             "sim_platform:=mujoco",
-            f"mujoco_scene:={scene}",
+            f"sim_world:={scene}",
             f"spawn_x:={spawn[0]}",
             f"spawn_y:={spawn[1]}",
             "spawn_z:=0.05",

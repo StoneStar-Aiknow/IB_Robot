@@ -67,7 +67,11 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import resolve_profile_argument, resolve_sim_selection
+from robot_runtime.launch_support import (
+    resolve_profile_argument,
+    resolve_sim_selection,
+    sim_embodiment_actions,
+)
 from robot_runtime.peripherals import (
     fast_lio_nodes,
     load_peripherals_file,
@@ -76,6 +80,7 @@ from robot_runtime.peripherals import (
     synthetic_perception_nodes,
 )
 from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import is_physics_selection
 
 #: The vendored description ships exactly one URDF (29 DoF + Dex3 hands).
 URDF_NAME = "g1_29dof_with_hand_rev_1_0.urdf"
@@ -313,6 +318,28 @@ def _launch_setup(context, *_args, **_kwargs):
             *fast_lio_nodes(fast_lio_config, bridge_package="unitree_g1_robot", use_sim=False),
         ]
 
+    if is_physics_selection(use_sim, _sim_platform):
+        # sim-platform-registry D3: a physics platform dispatches to the
+        # effective embodiment (the profile's simulation.<platform>.embodiment
+        # override when declared, else the platform's registered default) —
+        # the vendor mock and the synthetic data plane are the sdk stand-ins
+        # and have no place on a physics platform. No G1 physics route is
+        # shipped; a test platform proves the branch.
+        sim_world = LaunchConfiguration("sim_world").perform(context).strip()
+        spawn_pose = tuple(
+            float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw")
+        )
+        return sim_embodiment_actions(
+            profile,
+            profile_path,
+            str(_sim_platform),
+            peripherals_file,
+            instance_id,
+            interface_description=description,
+            world=sim_world,
+            spawn_pose=spawn_pose,
+        )
+
     # Simulated transport: the in-repo vendor mock stands in for the robot's
     # own stack on the vendor DDS tier — the runtime's D10 startup wait
     # tolerates the discovery race, so the nodes need no stagger — and the
@@ -358,6 +385,18 @@ def generate_launch_description() -> LaunchDescription:
                 "simulated",
                 default_value="",
                 description="Deprecated alias of use_sim (a warning names use_sim)",
+            ),
+            DeclareLaunchArgument(
+                "sim_world",
+                default_value="",
+                description="Platform-neutral world hand-off: the Gazebo world name or the MuJoCo scene name "
+                "(empty: the runtime starts its own minimal world/scene)",
+            ),
+            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_z", default_value="0.0", description="Robot spawn pose z (Gazebo platform)"),
+            DeclareLaunchArgument(
+                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo platform)"
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument(

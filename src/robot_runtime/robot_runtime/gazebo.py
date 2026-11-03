@@ -48,7 +48,8 @@ from xml.sax.saxutils import escape
 
 import yaml
 
-from robot_runtime.profile import LIDAR_SIM_PLATFORMS, resolve_sensor_pose  # noqa: F401  (re-export)
+import robot_runtime.sensor_frames as sensor_frames
+from robot_runtime.profile import resolve_sensor_pose
 
 
 def _override_base() -> Path:
@@ -187,35 +188,18 @@ def _rotate_yaw_inverse(pose: dict, spawn_pose: tuple[float, float, float, float
 
 
 def advertised_camera_frame(periph: dict) -> str:
-    """The frame id the runtime description advertises for this camera's images."""
-    image_frame, _info_frame = advertised_camera_frames(periph)
-    if image_frame is not None:
-        return image_frame
-    name = periph.get("name", "camera")
-    if str(periph.get("driver", "opencv")) == "realsense":
-        return str(periph.get("optical_frame_id") or f"camera_{name}_optical_frame")
-    return str(periph.get("frame_id") or f"camera_{name}_frame")
+    """The frame id the runtime description advertises for this camera's images.
 
-
-def advertised_camera_frames(periph: dict) -> tuple[str | None, str | None]:
-    """(image frame, info frame) the description advertises — the single source.
-
-    Convention: opencv/default → ``frame_id``; realsense → ``optical_frame_id``
-    (the image frame is absent for ``direct_topic_remap`` — the native driver
-    topic carries its own frames); camera_ros → no frames (the driver
-    publishes its own). Used by the interface description and, via
-    :func:`advertised_camera_frame`, by the gz ``frame_id`` and the MuJoCo
-    sensor ``frame_name``.
+    Moved to :mod:`robot_runtime.sensor_frames` (sim-platform-registry D4);
+    kept here as the platform-facing alias the gz sensor generation and
+    ``robot_runtime.mujoco`` read.
     """
-    name = periph.get("name", "camera")
-    driver = str(periph.get("driver", "opencv"))
-    if driver == "camera_ros":
-        return None, None
-    if driver == "realsense":
-        optical = str(periph.get("optical_frame_id") or f"camera_{name}_optical_frame")
-        return (None if periph.get("direct_topic_remap") else optical), optical
-    frame = str(periph.get("frame_id") or f"camera_{name}_frame")
-    return frame, frame
+    return sensor_frames.advertised_camera_frame(periph)
+
+
+# The advertised-frame convention itself (image + info frames) is core
+# contract code (D4): robot_runtime.sensor_frames is the single source.
+advertised_camera_frames = sensor_frames.advertised_camera_frames
 
 
 #: Lidar drivers the Gazebo platform stands in for; other drivers get no
@@ -365,12 +349,12 @@ def lidar_imu_sensor_urdf(peripherals: list, *, platform: str = "gazebo") -> str
 
     Only peripherals the simulator stands in for are generated, next to the
     camera function; disabled entries are absent (callers pass the effective
-    inventory, D5 inventory-first). A platform outside
-    :data:`LIDAR_SIM_PLATFORMS` generates nothing: the rendering path
-    consults the same constant (D14.2), so a platform that renders no lidar
-    also reports no lidar-simulation capability.
+    inventory, D5 inventory-first). Only the Gazebo platform generates
+    (sim-platform-registry D4: the driver set moved to the platform's sensor
+    traits — ``robot_runtime.sim_specs``), so any other platform renders no
+    lidar and reports no lidar-simulation capability.
     """
-    if platform not in LIDAR_SIM_PLATFORMS:
+    if platform != "gazebo":
         return ""
     parts: list[str] = []
     for periph in peripherals:

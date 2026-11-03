@@ -26,9 +26,14 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import resolve_profile_argument, resolve_sim_selection
+from robot_runtime.launch_support import (
+    resolve_profile_argument,
+    resolve_sim_selection,
+    sim_embodiment_actions,
+)
 from robot_runtime.peripherals import synthetic_perception_nodes
 from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import is_physics_selection
 
 #: Geometry used only when the runtime itself generates images (simulated
 #: execution). The physical profiles declare no geometry on purpose: the vendor
@@ -102,6 +107,30 @@ def _launch_setup(context, *_args, **_kwargs):
         # endpoint in the profile is all a deployment has to do.
         return [data_plane, TimerAction(period=NODE_STAGGER_S, actions=[runtime_node()])]
 
+    if is_physics_selection(use_sim, sim_platform):
+        # sim-platform-registry D3: a physics platform dispatches to the
+        # effective embodiment (the profile's simulation.<platform>.embodiment
+        # override when declared, else the platform's registered default) —
+        # the vendor mock and the synthetic data plane are the sdk stand-ins
+        # and have no place on a physics platform. No X2 physics route is
+        # shipped; a test platform proves the branch.
+        sim_world = LaunchConfiguration("sim_world").perform(context).strip()
+        spawn_pose = tuple(
+            float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw")
+        )
+        return sim_embodiment_actions(
+            profile,
+            profile_path,
+            str(sim_platform),
+            peripherals_file,
+            instance_id,
+            interface_description=build_description(
+                profile, use_sim=use_sim, sim_platform=sim_platform, profile_path=profile_path
+            ),
+            world=sim_world,
+            spawn_pose=spawn_pose,
+        )
+
     # When simulated the platform's sensor streams have no publisher, so the
     # contract layer's synthetic publishers stand in for them on exactly the
     # declared endpoints.
@@ -155,6 +184,18 @@ def generate_launch_description() -> LaunchDescription:
                 "simulated",
                 default_value="",
                 description="Deprecated alias of use_sim (a warning names use_sim)",
+            ),
+            DeclareLaunchArgument(
+                "sim_world",
+                default_value="",
+                description="Platform-neutral world hand-off: the Gazebo world name or the MuJoCo scene name "
+                "(empty: the runtime starts its own minimal world/scene)",
+            ),
+            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_z", default_value="0.0", description="Robot spawn pose z (Gazebo platform)"),
+            DeclareLaunchArgument(
+                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo platform)"
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),

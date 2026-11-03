@@ -142,8 +142,9 @@ def generate_runtime_provider_actions(
     Generic launch passes its selection through unchanged
     (runtime-simulation-platform D1/D3): ``use_sim:=`` always, plus
     ``sim_platform:=`` when simulated — never the legacy ``simulated`` alias.
-    The Gazebo platform additionally hands the provider the resolved world
-    name and the full spawn pose from ``simulation_startup``.
+    A physics platform additionally hands the provider the resolved world
+    hand-off (``sim_world``: the gz world instance name on Gazebo, the scene
+    name on MuJoCo) and the full spawn pose from ``simulation_startup``.
     """
     provider = runtime_provider(robot_config)
     if not provider:
@@ -178,16 +179,20 @@ def generate_runtime_provider_actions(
     if use_sim:
         include_arguments["sim_platform"] = str(sim_platform).lower()
     platform = str(sim_platform).lower() if use_sim else ""
-    if platform == "gazebo":
-        # D3: the world owner hands the provider the resolved world name and
-        # spawn pose (x, y, z, yaw) — nothing is recomputed here. An empty
-        # world name means the provider starts its own minimal empty world.
+    if use_sim and platform != "sdk":
+        # sim-platform-registry D5/D3: the world owner hands the provider the
+        # resolved world hand-off (the gz world instance name on Gazebo, the
+        # scene name on MuJoCo) and the full spawn pose (x, y, z, yaw) as the
+        # platform-neutral ``sim_world`` — nothing is recomputed here, and no
+        # per-platform argument name crosses the boundary. An empty world
+        # means the provider starts its own minimal empty world (Gazebo) or
+        # composes the shared ``empty`` scene (MuJoCo).
         startup = simulation_startup
-        world_name = str(getattr(startup, "world_name", "") or "")
+        world = str(getattr(startup, "world_name", "") or getattr(startup, "scene_name", "") or "")
         spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
         include_arguments.update(
             {
-                "gazebo_world": world_name,
+                "sim_world": world,
                 "spawn_x": str(spawn_pose[0]),
                 "spawn_y": str(spawn_pose[1]),
                 "spawn_z": str(spawn_pose[2]),
@@ -196,30 +201,7 @@ def generate_runtime_provider_actions(
         )
         logger.info(
             f"runtime.provider={provider}: including {launch_path} "
-            f"(profile={profile}, use_sim=true, sim_platform=gazebo, world={world_name!r}, spawn={spawn_pose}, "
-            f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
-        )
-    elif platform == "mujoco":
-        # so101-mujoco-runtime-platform D3: the world owner hands the provider
-        # the resolved scene NAME and spawn pose — no file path crosses the
-        # boundary and nothing is recomputed. An empty scene name composes the
-        # shared sim_models ``empty`` scene (ground + light): the provider
-        # renders the robot into a scene either way, never alone.
-        startup = simulation_startup
-        scene_name = str(getattr(startup, "scene_name", "") or "")
-        spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
-        include_arguments.update(
-            {
-                "mujoco_scene": scene_name,
-                "spawn_x": str(spawn_pose[0]),
-                "spawn_y": str(spawn_pose[1]),
-                "spawn_z": str(spawn_pose[2]),
-                "spawn_yaw": str(spawn_pose[3]),
-            }
-        )
-        logger.info(
-            f"runtime.provider={provider}: including {launch_path} "
-            f"(profile={profile}, use_sim=true, sim_platform=mujoco, scene={scene_name!r}, spawn={spawn_pose}, "
+            f"(profile={profile}, use_sim=true, sim_platform={platform}, world={world!r}, spawn={spawn_pose}, "
             f"initial_mode={initial_mode or 'profile default'}, peripherals={peripherals_file or 'profile defaults'})"
         )
     else:
@@ -347,8 +329,9 @@ def generate_bound_runtime_actions(
 
     ``simulation_startup`` carries the world hand-off for a physics transport
     (runtime-simulation-transport D3): the world generic launch started ahead
-    of this call is passed to the provider as ``gazebo_world`` plus the full
-    spawn pose instead of being recomputed or re-launched.
+    of this call is passed to the provider as the platform-neutral
+    ``sim_world`` plus the full spawn pose instead of being recomputed or
+    re-launched.
 
     ``start_provider=False`` binds to the runtime another host already runs
     (as the X2's grasp pipeline on the Orin does to the robot-side stack).

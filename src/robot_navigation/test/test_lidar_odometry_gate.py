@@ -18,11 +18,12 @@ thresholds over the SAME route, staged from
 of the reset (stowed) pose for the whole metrics window with fresh
 /joint_states (a stale or out-of-envelope sample fails the gate).
 
-A platform runs the gate only when its capabilities are all present
-(D14.2): ground truth, the profile's ``sim_platforms``, lidar simulation
-(``LIDAR_SIM_PLATFORMS``) and a scene template. The gate is parametrized
-over ``PHYSICS_SIM_PLATFORMS``; both ``gazebo`` and ``mujoco`` satisfy all
-four (lekiwi-mujoco-runtime-platform D10). A second, independent check
+The gate is parametrized over the fixed first-party physics matrix
+(``gazebo``, ``mujoco``; openspec sim-platform-registry D2) and runs a
+platform only when its capabilities are all present (D14.2): ground truth,
+the profile's ``sim_platforms``, a registered platform whose traits
+simulate a lidar and a scene template — so an uninstalled plugin is a
+capability skip, not a crash. A second, independent check
 covers the simulator ENVIRONMENT (``ign`` or ``gz`` for Gazebo, either
 stack; the MuJoCo ament
 resources and a matching Python ``mujoco`` for MuJoCo): missing
@@ -84,7 +85,8 @@ from std_msgs.msg import Bool
 from tf2_msgs.msg import TFMessage
 
 from ibrobot_msgs.msg import RuntimeStatus
-from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict
 from robot_runtime.testing.sim_environment import REQUIRED_SIM_PLATFORMS_ENV, environment_missing, skip_or_fail
 from robot_runtime.testing.sim_ground_truth import (
@@ -271,8 +273,11 @@ def missing_gate_capabilities(sim_platform: str, profile: str = "lekiwi_lidar") 
     supported = [str(entry) for entry in load_profile(_gate_profile_path(profile)).get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
-    if sim_platform not in LIDAR_SIM_PLATFORMS:
-        missing.append(f"simulated lidar: {sim_platform!r} is not in LIDAR_SIM_PLATFORMS {list(LIDAR_SIM_PLATFORMS)}")
+    try:
+        if get_sim_platform(sim_platform).sensor_traits.lidar_sim_drivers is None:
+            missing.append(f"simulated lidar: {sim_platform!r} simulates no lidar driver")
+    except Exception as error:  # noqa: BLE001  (SimPlatformError: the platform is not installed)
+        missing.append(f"simulated lidar: {error}")
     try:
         get_scene_file(GATE_SCENE, sim_platform)
     except (ValueError, FileNotFoundError) as error:
@@ -300,7 +305,7 @@ def test_a_synthetic_platform_reports_all_four_capabilities():
     assert len(missing) == 4, f"expected all four capabilities missing, got {missing}"
     assert missing[0].startswith("ground truth") and "synthetic" in missing[0]
     assert missing[1].startswith("runtime profile") and "sim_platforms" in missing[1]
-    assert missing[2].startswith("simulated lidar") and "LIDAR_SIM_PLATFORMS" in missing[2]
+    assert missing[2].startswith("simulated lidar") and "synthetic" in missing[2]
     assert missing[3].startswith("scene template")
 
 
@@ -1861,7 +1866,7 @@ def _summary(report: dict) -> str:
 
 
 @pytest.mark.parametrize("profile", GATE_PROFILES)
-@pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
+@pytest.mark.parametrize("sim_platform", ("gazebo", "mujoco"))
 def test_lidar_odometry_gate(sim_platform, profile):
     # the decision sequence, with the profile value validated FIRST
     # (review round 1): capabilities, environment, effective profile —

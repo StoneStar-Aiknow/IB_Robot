@@ -61,7 +61,8 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode, StopRuntime
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict, rest_verdict
 from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
 from robot_runtime.testing.sim_ground_truth import (
@@ -74,6 +75,10 @@ PACKAGE = "lekiwi_robot"
 MODEL_NAME = "lekiwi_robot"
 WORLD_NAME = "empty"
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_nav_grasp.yaml"
+#: The fixed first-party physics matrix the gate is parametrized over
+#: (openspec sim-platform-registry D2); the capability probe reports an
+#: unregistered platform so the shared require-or-skip rule decides.
+PHYSICS_PLATFORMS = ("gazebo", "mujoco")
 ARM_JOINTS = ["1", "2", "3", "4", "5", "6"]
 #: The stowed pose = ``hardware.reset_positions`` (joints 1-5; D4).
 STOWED_TARGET = [0.0, -1.5854, 1.5708, 0.7854, 0.0]
@@ -120,6 +125,10 @@ def _platform_capabilities_missing(sim_platform: str) -> list[str]:
         open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
     except UnsupportedGroundTruth as error:
         missing.append(f"ground truth: {error}")
+    try:
+        get_sim_platform(sim_platform)
+    except Exception as error:  # noqa: BLE001  (SimPlatformError: the platform is not installed)
+        missing.append(f"sim platform: {error}")
     supported = [str(entry) for entry in load_profile(PROFILE).get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
@@ -265,7 +274,7 @@ def _launch(sim_platform: str, environment: dict, log_path: Path):
         f"sim_platform:={sim_platform}",
     ]
     if sim_platform == "mujoco":
-        arguments.append(f"mujoco_scene:={WORLD_NAME}")
+        arguments.append(f"sim_world:={WORLD_NAME}")
     return subprocess.Popen(
         arguments, stdout=log_path.open("w"), stderr=subprocess.STDOUT, env=environment, start_new_session=True
     )
@@ -321,7 +330,7 @@ def _wait_sim_seconds(node, ground_truth, seconds: float, drive: float | None = 
     raise AssertionError(f"simulation time did not advance {seconds} s")
 
 
-@pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
+@pytest.mark.parametrize("sim_platform", PHYSICS_PLATFORMS)
 def test_nav_grasp_stop_cross_assertions(tmp_path, sim_platform):
     missing = _platform_capabilities_missing(sim_platform)
     if missing:

@@ -356,7 +356,7 @@ def test_rtp_distributed_launches_the_provider_on_gazebo_pick_banana(monkeypatch
     assert provider_args["use_sim"] == "true"
     assert provider_args["sim_platform"] == "gazebo"
     assert "simulated" not in provider_args
-    assert provider_args["gazebo_world"] == "demo"
+    assert provider_args["sim_world"] == "demo"
     assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == ("0.0", "0.3", "-0.03")
     # the deployment peripheral toggle reaches the provider fragment
     import yaml as _yaml
@@ -407,7 +407,7 @@ def test_gazebo_emits_platform_world_and_full_spawn_pose_only():
     assert arguments["use_sim"] == "true"
     assert arguments["sim_platform"] == "gazebo"
     assert "simulated" not in arguments, "the legacy alias must never be passed"
-    assert arguments["gazebo_world"] == "demo"
+    assert arguments["sim_world"] == "demo"
     assert (arguments["spawn_x"], arguments["spawn_y"], arguments["spawn_z"]) == ("0.5", "0.3", "-0.03")
     assert arguments["spawn_yaw"] == "1.25"
 
@@ -418,7 +418,7 @@ def test_gazebo_without_a_started_world_spawns_into_an_empty_world():
     )
     assert arguments["use_sim"] == "true"
     assert arguments["sim_platform"] == "gazebo"
-    assert arguments["gazebo_world"] == ""
+    assert arguments["sim_world"] == ""
     assert arguments["spawn_yaw"] == "0.0"
 
 
@@ -492,15 +492,14 @@ def test_mujoco_hand_off_passes_scene_and_spawn_by_name_only():
     assert arguments["use_sim"] == "true"
     assert arguments["sim_platform"] == "mujoco"
     assert "simulated" not in arguments, "the legacy alias must never be passed"
-    assert arguments["mujoco_scene"] == "pick_banana"
+    assert arguments["sim_world"] == "pick_banana"
     assert (arguments["spawn_x"], arguments["spawn_y"], arguments["spawn_z"]) == ("0.5", "0.3", "-0.03")
     assert arguments["spawn_yaw"] == "1.25"
-    assert "gazebo_world" not in arguments
 
 
 def test_mujoco_without_a_started_world_hands_an_empty_scene():
     arguments = _mujoco_include_arguments(_provider_config(platform="mujoco"), simulation_startup=None)
-    assert arguments["mujoco_scene"] == ""
+    assert arguments["sim_world"] == ""
     assert arguments["spawn_yaw"] == "0.0"
 
 
@@ -580,7 +579,7 @@ def test_mujoco_binding_branch_hands_off_the_resolved_world(
     assert provider_args["use_sim"] == "true"
     assert provider_args["sim_platform"] == "mujoco"
     assert "simulated" not in provider_args
-    assert provider_args["mujoco_scene"] == expected_scene
+    assert provider_args["sim_world"] == expected_scene
     assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == expected_spawn
     # no generic simulator server and no generic controller-manager node
     from launch_ros.actions import Node

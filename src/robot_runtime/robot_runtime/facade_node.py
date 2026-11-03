@@ -52,6 +52,7 @@ from robot_runtime.contract import (
 from robot_runtime.interface_description import (
     build_description,
     description_sim_platform,
+    effective_sensor_traits,
     platform_peripherals,
     validate_description,
 )
@@ -63,7 +64,8 @@ from robot_runtime.peripherals import (
     merge_peripherals,
     perception_capabilities,
 )
-from robot_runtime.profile import SIM_PLATFORMS, load_profile, stop_bounds
+from robot_runtime.profile import load_profile, stop_bounds
+from robot_runtime.sim_platforms import get_sim_platform, is_valid_sim_platform_name
 from robot_runtime.state import RuntimeState
 
 _SERVICE_TIMEOUT_S = 5.0
@@ -77,7 +79,10 @@ def resolve_facade_selection(
 
     The launch resolves ``use_sim``/``sim_platform`` and passes both here; an
     empty ``sim_platform`` means the profile's default applies. Physical
-    execution cannot carry a platform; a platform the profile does not declare
+    execution cannot carry a platform; the platform must be an identifier and
+    must be registered (sim-platform-registry D2: the facade start is a
+    selection checkpoint — a platform whose plugin is not installed fails
+    naming it and the package), and a platform the profile does not declare
     fails naming the platform, the set and the profile.
     """
     use_sim = bool(use_sim_param)
@@ -87,8 +92,14 @@ def resolve_facade_selection(
             raise ValueError(f"runtime_facade: physical execution cannot select sim_platform:={explicit!r}")
         return False, None
     platform = explicit or str(profile.get("sim_platform") or "sdk")
-    if platform not in SIM_PLATFORMS:
-        raise ValueError(f"runtime_facade: unknown sim_platform {platform!r}: expected one of {list(SIM_PLATFORMS)}")
+    if not is_valid_sim_platform_name(platform):
+        raise ValueError(
+            f"runtime_facade: unknown sim_platform {platform!r}: expected an identifier matching ^[a-z][a-z0-9_]*$"
+        )
+    if platform != "sdk":
+        # D2: registration is required for the effective selection; the error
+        # names the platform and the package to install.
+        get_sim_platform(platform)
     supported = [str(entry) for entry in (profile.get("sim_platforms") or ["sdk"])]
     if platform not in supported:
         raise ValueError(
@@ -144,12 +155,14 @@ class RuntimeFacade(Node):
         # interface description and the interface monitor all project this
         # one filtered inventory.
         peripherals = platform_peripherals(peripherals, self._sim_platform)
-        # D5.4: the RuntimeStatus capability surface derives from the same
-        # platform-filtered projection as the interface description, so a
-        # sensor the platform does not stand in for is neither advertised nor
-        # claimed (capabilities computed AFTER the platform resolution).
+        # D5.4/sim-platform-registry D4: the RuntimeStatus capability surface
+        # derives from the same effective sensor traits as the interface
+        # description, so a sensor the platform does not stand in for is
+        # neither advertised nor claimed (capabilities computed AFTER the
+        # platform resolution).
+        sensor_traits = effective_sensor_traits(self._profile, path, self._use_sim, self._sim_platform)
         capabilities = dict(self._profile["capabilities"])
-        capabilities.update(perception_capabilities(peripherals, sim_platform=self._sim_platform))
+        capabilities.update(perception_capabilities(peripherals, traits=sensor_traits))
         capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         description = (

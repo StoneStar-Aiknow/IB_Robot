@@ -713,7 +713,7 @@ NAV_TEST_PROFILE=minimal colcon test --packages-select robot_config --base-paths
 
 ### 4. robot_config full 仿真测试
 
-Ubuntu 且已安装仿真器时运行 full profile。该测试由 `robot_config` 维护，按 `PHYSICS_SIM_PLATFORMS` 参数化。每个平台启动一次 `lekiwi_lidar` 的导航 stage。stage 包含 ros2_control、控制器、FAST-LIO、AMCL、Nav2 和 `robot_navigation` 节点。两个平台的阈值与断言一致（openspec `lekiwi-mujoco-runtime-platform` D15）。
+Ubuntu 且已安装仿真器时运行 full profile。该测试由 `robot_config` 维护，按固定的一线物理仿真平台矩阵（`gazebo`、`mujoco`）参数化，未安装的平台插件按能力探测 skip（验收运行用 `IBROBOT_REQUIRE_SIM_PLATFORMS` 转 fail）。每个平台启动一次 `lekiwi_lidar` 的导航 stage。stage 包含 ros2_control、控制器、FAST-LIO、AMCL、Nav2 和 `robot_navigation` 节点。两个平台的阈值与断言一致（openspec `lekiwi-mujoco-runtime-platform` D15）。
 
 ```bash
 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation

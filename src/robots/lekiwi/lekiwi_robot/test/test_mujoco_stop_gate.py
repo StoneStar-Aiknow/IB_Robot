@@ -151,7 +151,7 @@ def _launch(environment: dict, log_path: Path, profile_path: Path):
         "runtime.launch.py",
         f"profile:={profile_path}",
         "sim_platform:=mujoco",
-        f"mujoco_scene:={SCENE}",
+        f"sim_world:={SCENE}",
     ]
     return subprocess.Popen(
         arguments,

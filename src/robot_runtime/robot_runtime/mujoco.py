@@ -400,7 +400,7 @@ def camera_plugin_parameters(profile: dict, peripherals: list) -> dict:
     cameras = _enabled_cameras(peripherals)
     if not cameras:
         return {}
-    from robot_runtime.gazebo import advertised_camera_frame
+    from robot_runtime.sensor_frames import advertised_camera_frame
 
     instance: dict[str, Any] = {
         "type": CAMERA_PLUGIN_TYPE,

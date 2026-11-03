@@ -366,8 +366,12 @@ def test_facade_selection_resolution_follows_parameters():
     assert resolve_facade_selection(profile, True, "") == (True, "sdk")
     # an explicit platform wins over the profile default
     assert resolve_facade_selection(profile, True, "gazebo") == (True, "gazebo")
-    with pytest.raises(ValueError, match="unknown sim_platform"):
+    # D2: the effective selection must be registered — 'teleport' is a valid
+    # identifier the registry never heard of, so it fails naming the platform
+    with pytest.raises(ValueError, match="is not installed"):
         resolve_facade_selection(profile, True, "teleport")
+    with pytest.raises(ValueError, match="expected an identifier matching"):
+        resolve_facade_selection(profile, True, "teleport-fast!")
     # physical execution cannot carry a platform
     with pytest.raises(ValueError, match="physical execution cannot select"):
         resolve_facade_selection(profile, False, "sdk")
