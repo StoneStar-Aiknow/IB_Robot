@@ -17,6 +17,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StopRuntime
 from robot_runtime import contract as C
 
@@ -37,6 +38,12 @@ class FakeControllerManager(Node):
         self.switch_entered = threading.Event()
         self.switch_release = threading.Event()
         self.switch_release.set()
+        # Readiness-blocking hook: the facade's readiness check calls
+        # list_controllers; holding it models a slow controller manager
+        # under load (the Gazebo blocked-close starvation, e2e/gazebo-154437).
+        self.list_entered = threading.Event()
+        self.list_release = threading.Event()
+        self.list_release.set()
         self.ignore_deactivation = False
         self.create_service(SwitchController, "controller_manager/switch_controller", self._switch, callback_group=cb)
         self.create_service(ListControllers, "controller_manager/list_controllers", self._list, callback_group=cb)
@@ -63,6 +70,10 @@ class FakeControllerManager(Node):
         return response
 
     def _list(self, _request, response):
+        self.list_entered.set()
+        if not self.list_release.wait(5.0):
+            response.ok = False
+            return response
         for name in ("arm_position_controller", "arm_trajectory_controller", *self._extra_controllers):
             state = ControllerState()
             state.name = name
@@ -356,6 +367,37 @@ def test_stop_fences_in_flight_mode_switch(stack, policy):
     assert not cm.active
     assert any("stop engaged during the controller switch" in fault for fault in status.faults)
     assert caller.set_mode("idle").success
+
+
+def test_heartbeat_keeps_its_period_while_a_readiness_check_blocks(stack):
+    """The runtime-status heartbeat owns its callback group: a readiness
+    check blocked on a slow controller manager (the Gazebo blocked-close
+    starvation, e2e/gazebo-154437) must not delay the heartbeat past the
+    Gateway's freshness budget (skill_executor_node admission, 3.0 s wall)."""
+    cm, _caller = stack
+    receipts: list[float] = []
+    monitor = Node("facade_heartbeat_monitor")
+    monitor.create_subscription(RuntimeStatus, C.STATUS_TOPIC, lambda _msg: receipts.append(time.monotonic()), 10)
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(monitor)
+    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread.start()
+    try:
+        time.sleep(2.5)
+        assert len(receipts) >= 2, receipts
+
+        before = len(receipts)
+        cm.list_release.clear()
+        assert cm.list_entered.wait(timeout=2.0), "the readiness check never called list_controllers"
+        time.sleep(4.0)
+        cm.list_release.set()
+
+        assert len(receipts) - before >= 3, receipts[before:]
+        gaps = [later - earlier for earlier, later in zip(receipts, receipts[1:], strict=False)]
+        assert max(gaps) < 3.0, gaps
+    finally:
+        executor.shutdown(timeout_sec=1.0)
+        monitor.destroy_node()
 
 
 def test_facade_selection_resolution_follows_parameters(monkeypatch):

@@ -535,6 +535,10 @@ robot:
       joint_current_topic: ""
       wrist_depth_topic: /camera/wrist/aligned_depth_to_color/image_raw
       gripper_closed_position: 0.0
+      # Joint-6 fully-open reference (Gazebo acceptance fix 3, 2026-11-02): a
+      # jaw at/near this position after a close goal never moved — never
+      # contact evidence (e2e/gazebo-155516: value 1.0001 verified 0.70).
+      gripper_open_position: 1.0
       # PC-compatible joint-6 position; 0.08 corresponds to the validated raw-tick contact boundary.
       gripper_contact_min_opening: 0.08
       gripper_no_contact_max_opening: 0.03

@@ -1071,6 +1071,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
         include_visual_games=True,
         include_perception=True,
         use_sim=False,
+        use_sim_time=False,
     ):
         generated.append(
             {
@@ -1081,6 +1082,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
                 "include_visual_games": include_visual_games,
                 "include_perception": include_perception,
                 "use_sim": use_sim,
+                "use_sim_time": use_sim_time,
             }
         )
         return []
@@ -1124,6 +1126,7 @@ def test_moveit_visual_closure_starts_perception_before_controller_readiness(mon
         include_visual_games=True,
         include_perception=True,
         use_sim=False,
+        use_sim_time=False,
     ):
         generated.append(
             {

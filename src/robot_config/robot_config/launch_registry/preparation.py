@@ -211,8 +211,16 @@ def _load_config(arguments: Mapping[str, str], loaded_config: Mapping[str, Any] 
     return config
 
 
-def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict[str, Any]) -> dict[str, Any]:
-    """Design phase 0: runtime target, provider, sim platform, backend caps."""
+def resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict[str, Any]) -> dict[str, Any]:
+    """Design phase 0: runtime target, provider, sim platform, backend caps.
+
+    Public so launch entries that must agree with the base launch —
+    embodied_pipeline's R3 clock decision above all — resolve ``use_sim``,
+    ``sim_platform`` and ``node_use_sim_time`` through the SAME rules (empty
+    ``use_sim`` infers the target; a ``sim_platform`` override alone selects
+    simulation; the providerless default platform is ``gazebo``), never a
+    private re-parse of the raw ``use_sim`` argument.
+    """
     use_sim_str = arguments["use_sim"]
     requested_use_sim = None if use_sim_str == "" else parse_bool(use_sim_str, default=False)
     sim_platform_override = arguments["sim_platform"].strip()
@@ -620,7 +628,7 @@ def prepare_launch(
     hooks_by_phase = dict(registry.hooks_by_phase())
 
     _run_phase_hooks("load_target", hooks_by_phase["load_target"], robot_config, arguments)
-    target_state = _resolve_target_and_backend(arguments, robot_config)
+    target_state = resolve_target_and_backend(arguments, robot_config)
     hook_target_state = HookTargetState(use_sim=target_state["use_sim"], control_mode="")
 
     _run_phase_hooks("control_mode", hooks_by_phase["control_mode"], robot_config, arguments, hook_target_state)

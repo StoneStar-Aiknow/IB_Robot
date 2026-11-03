@@ -98,8 +98,9 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 | `config_path` | 空 | 可选的 YAML 绝对路径覆盖 |
 | `control_mode` | 空 | 默认继承所选 robot config/stage 的 `default_control_mode` |
 | `nav_stage` | 空 | 配置声明的工作阶段；导航配置支持 `mapping`/`navigation`，移动抓取统一配置还支持 `grasp` |
-| `use_sim` | `false` | 是否启动仿真路径 |
-| `sim_platform` | 空 | 覆盖 robot YAML `simulation.platform` 的 CLI 透传参数 |
+| `use_sim` | 空 | 留空时推断：配置声明了仿真即仿真，否则硬件；显式 `true`/`false` 覆盖推断；`sim_platform:=X` 单独给出即选择在 X 上仿真 |
+| `sim_platform` | 空 | 覆盖 robot YAML `simulation.platform` 的 CLI 透传参数；单独给出隐含仿真路径 |
+| `runtime_target` | 空 | 声明运行时时钟目标（review r1 item 2；留空由解析结果决定，benchmark 配置为 wall time） |
 | `entry_mode` | 空 | 覆盖 `embodied.entry_mode`（hermes/agent）；agent 模式需 `embodied.agent` 块校验通过 |
 | `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |

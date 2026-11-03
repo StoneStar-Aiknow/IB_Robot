@@ -65,7 +65,7 @@ def _bound_description(robot_config: dict[str, Any]) -> dict[str, Any]:
     return runtime.get("interface_description", {}) if runtime.get("provider") else {}
 
 
-def grasp_pipeline_node(robot_config: dict[str, Any]) -> Node:
+def grasp_pipeline_node(robot_config: dict[str, Any], use_sim_time: bool = False) -> Node:
     """The grasp pipeline's pick executor, bound to the robot's live interface description."""
     grasp_execution = delegated_grasp_execution(robot_config)
     return Node(
@@ -78,6 +78,8 @@ def grasp_pipeline_node(robot_config: dict[str, Any]) -> Node:
                 "action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
                 "grasp_execution_json": json.dumps(grasp_execution),
                 "interface_description_json": json.dumps(_bound_description(robot_config)),
+                # R3: the pipeline reads its ROS clock for budgets and stamps
+                "use_sim_time": use_sim_time,
             }
         ],
     )
@@ -110,8 +112,17 @@ def generate_embodied_nodes(
     include_visual_games: bool = True,
     include_perception: bool = True,
     use_sim: bool = False,
+    use_sim_time: bool = False,
 ) -> list[Node]:
-    """Generate embodied minimum-closure nodes from robot_config YAML."""
+    """Generate embodied minimum-closure nodes from robot_config YAML.
+
+    ``use_sim_time`` is the task_executor clock decision (R3), passed to
+    every stamped consumer: the Gateway and the safety guard (through
+    ``common_params``), the pick/place executors, the grasp planner and
+    verifier, the grasp pipeline, the perception service, the imitation
+    executor and the sound-orientation node — the nodes that compare
+    message stamps against their own ROS clock.
+    """
     embodied_config = robot_config.get("embodied", {})
     if not embodied_config.get("enabled", False):
         logger.info("Embodied minimal closure disabled, skipping")
@@ -250,6 +261,10 @@ def generate_embodied_nodes(
     visual_game_event_topic = embodied_config.get("visual_game_event_topic", "/embodied/visual_game_events")
     common_params = {
         "debug_tracing": embodied_config.get("debug_tracing", True),
+        # R3: the Gateway and the safety guard read stamped data (runtime
+        # status, joint states) against their own ROS clock — on a physics
+        # simulation that clock must be the simulator's
+        "use_sim_time": use_sim_time,
         "named_poses_json": json.dumps(named_poses),
         "named_targets_json": json.dumps(named_targets),
         "workspace_json": json.dumps(safety.get("workspace", {})),
@@ -432,6 +447,9 @@ def generate_embodied_nodes(
                     "max_history_turns": perception_conversation.get("max_history_turns", 4),
                     "max_concurrent_requests": perception.get("max_concurrent_requests", 1),
                     "min_object_confidence": perception.get("min_object_confidence", 0.0),
+                    # R3: the perception service stamps its observations and
+                    # checks image freshness on its ROS clock
+                    "use_sim_time": use_sim_time,
                 }
             ],
         )
@@ -652,6 +670,8 @@ def generate_embodied_nodes(
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "reset_positions_json": json.dumps(home_positions),
                         "joint_limits_json": json.dumps(joint_limits),
+                        # R3: the imitation executor consumes stamped images
+                        "use_sim_time": use_sim_time,
                     }
                 ],
             )
@@ -674,6 +694,8 @@ def generate_embodied_nodes(
                 "skill_action_name": common_params["skill_action_name"],
                 "debug_tracing": common_params["debug_tracing"],
                 "default_active": bool(sound_orientation.get("default_active", False)),
+                # R3: the sound-orientation node reads audio-direction stamps
+                "use_sim_time": use_sim_time,
             }
         )
         nodes.append(
@@ -694,7 +716,7 @@ def generate_embodied_nodes(
         # A robot that names grasp backends runs the robot-agnostic grasp pipeline;
         # the primitive executor and its GraspGen planner and gripper verifier are
         # for robots without one.
-        nodes.append(grasp_pipeline_node(robot_config))
+        nodes.append(grasp_pipeline_node(robot_config, use_sim_time))
     elif grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})
         planner_params, planner_env = _node_runtime_settings(grasp_execution.get("planner_node", {}))
@@ -731,6 +753,9 @@ def generate_embodied_nodes(
                                     )
                                 ),
                                 **planner_params,
+                                # R3: the planner pairs stamped colour/depth/info —
+                                # the launch clock decision wins over any YAML key
+                                "use_sim_time": use_sim_time,
                             }
                         ],
                     ),
@@ -750,6 +775,8 @@ def generate_embodied_nodes(
                                     camera.get("depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw"),
                                 ),
                                 **verifier_params,
+                                # R3: the verifier reads joint/depth stamps
+                                "use_sim_time": use_sim_time,
                             }
                         ],
                     ),
@@ -776,6 +803,9 @@ def generate_embodied_nodes(
                         "gripper_open_position": execution.get("gripper_open_position", 1.0),
                         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                        # R3: the pick executor reads dispatch budgets and
+                        # state stamps on its ROS clock
+                        "use_sim_time": use_sim_time,
                     }
                 ],
             )
@@ -802,6 +832,9 @@ def generate_embodied_nodes(
                         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
                         "gripper_position_tolerance": moveit_executor.get("gripper_position_tolerance", 0.05),
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                        # R3: the place executor reads its ROS clock like the
+                        # pick executor (release/verification timing)
+                        "use_sim_time": use_sim_time,
                     }
                 ],
             )

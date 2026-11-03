@@ -110,8 +110,10 @@ class GraspVerifierNode(Node):
         self.declare_parameter("max_sample_age_s", 2.0)
         self.declare_parameter("default_post_grasp_wait_s", 0.0)
         self.declare_parameter("gripper_closed_position", 0.0)
+        self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_contact_min_opening", 0.08)
         self.declare_parameter("gripper_no_contact_max_opening", 0.03)
+        self.declare_parameter("gripper_fully_open_tolerance", 0.05)
         self.declare_parameter("current_contact_threshold_a", 0.08)
         self.declare_parameter("depth_scale", 1000.0)
         self.declare_parameter("wrist_min_valid_depth_fraction", 0.25)
@@ -258,8 +260,10 @@ class GraspVerifierNode(Node):
             GraspVerificationInput(
                 gripper_position=self._extract_named_value(joint_state, gripper_joint, "position"),
                 gripper_closed_position=float(self.get_parameter("gripper_closed_position").value),
+                gripper_open_position=float(self.get_parameter("gripper_open_position").value),
                 gripper_contact_min_opening=float(self.get_parameter("gripper_contact_min_opening").value),
                 gripper_no_contact_max_opening=float(self.get_parameter("gripper_no_contact_max_opening").value),
+                gripper_fully_open_tolerance=float(self.get_parameter("gripper_fully_open_tolerance").value),
                 gripper_joint=gripper_joint,
                 gripper_current_abs_a=self._extract_abs_current(current, gripper_joint),
                 current_contact_threshold_a=float(self.get_parameter("current_contact_threshold_a").value),

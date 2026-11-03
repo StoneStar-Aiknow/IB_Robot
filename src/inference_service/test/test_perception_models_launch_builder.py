@@ -120,3 +120,28 @@ def test_launch_builder_emits_named_selection_and_keeps_optional_service_indepen
     assert json.loads(parameters["runtime_options_json"])["device_id"] == 0
     assert parameters["require_semantic_identity"] is False
     assert "backend" not in parameters
+
+
+def test_model_service_nodes_carry_the_clock_decision(tmp_path: Path) -> None:
+    """R3 (lekiwi-nav-grasp-mobile-manipulation revision 2): every model
+    service shares the launch's generic clock decision — simulation time on
+    physics platforms, wall time for hardware and mock (no /clock)."""
+    from inference_service.launch_builders.perception_models import build_perception_models
+    from robot_config.launch_registry.registry import LaunchBuildContext
+
+    config = _config(_bundle(tmp_path / "depth", "metric_depth"))
+
+    # hardware/mock: the context decision is False and the node keeps wall time
+    nodes = generate_perception_model_nodes(config, use_sim_time=False)
+    assert _node_parameters(nodes[0])["use_sim_time"] is False
+
+    # physics platform: the launch context decision propagates into the node
+    context = LaunchBuildContext(robot_config=config, use_sim=True, sim_platform="gazebo", node_use_sim_time=True)
+    result = build_perception_models(context)
+    assert len(result.actions) == 1
+    assert _node_parameters(result.actions[0])["use_sim_time"] is True
+
+    # a wall-time context (hardware, or mock without a /clock) stays False
+    wall_context = LaunchBuildContext(robot_config=config, use_sim=True, sim_platform="mock", node_use_sim_time=False)
+    wall_result = build_perception_models(wall_context)
+    assert _node_parameters(wall_result.actions[0])["use_sim_time"] is False

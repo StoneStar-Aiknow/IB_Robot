@@ -4,6 +4,14 @@ This is a hardware bring-up client, not a second grasp implementation.  It
 reads the live Gateway registry and sends one explicitly supervised goal to
 the production executor.  Hermes continues to use the delegated SkillCommand
 path and never sets ``supervised_direct``.
+
+Dispatch budgets are stamped from the NODE'S ROS CLOCK (R3 of
+lekiwi-nav-grasp revision 2): the pick executor and the Gateway read
+``task_budget.started_at``/``deadline`` against their own ROS clock
+(``pick_executor_node._handle_goal``, ``skill_executor_node._remaining_task_budget_sec``),
+which is SIMULATION time under ``use_sim_time`` — a wall-time stamp there
+is an expired (or never-expiring) budget. Wall time remains only for the
+process-level waits (readiness retries, the result watchdog).
 """
 
 from __future__ import annotations
@@ -17,7 +25,9 @@ import uuid
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.action.client import ClientGoalHandle
+from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 from unique_identifier_msgs.msg import UUID
 
 from ibrobot_msgs.action import PickObject
@@ -53,11 +63,74 @@ def resolve_supervised_task_id(requested_task_id: str, *, exact: bool = False, u
     return f"{prefix or 'supervised-pick'}-{suffix}"
 
 
+def fill_dispatch_budget(binding, now: Time, task_budget_sec: float) -> None:
+    """Stamp ``task_budget.started_at``/``deadline`` from the ROS clock (R3).
+
+    ``now`` is the caller's node clock reading (simulation time when the
+    client runs ``use_sim_time``); the executor compares these stamps
+    against its own ROS clock, so they must come from the same clock
+    domain — never ``time.time()``.
+    """
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at = now.to_msg()
+    binding.task_budget.deadline = (now + Duration(seconds=float(task_budget_sec))).to_msg()
+
+
+def fill_executor_identity(message, identity: dict) -> None:
+    message.schema_version = 1
+    for field_name, value in identity.items():
+        setattr(message, field_name, value)
+
+
+def build_pick_goal(
+    *,
+    task_id: str,
+    registry: dict,
+    identity: dict,
+    timeout_sec: float,
+    task_budget_sec: float,
+    prompt: str,
+    release_after_success: bool,
+    now: Time,
+) -> PickObject.Goal:
+    """One supervised-direct PickObject goal against the loaded registry.
+
+    The single construction the CLI ``execute()`` and the in-process E2E
+    caller share (R3/R9: the test reuses this logic, never a copy of the
+    dispatch-binding code). ``now`` is the node's ROS clock reading the
+    budget is stamped from.
+    """
+    goal = PickObject.Goal()
+    goal.dispatch_binding.schema_version = 1
+    goal.dispatch_binding.task_id = task_id
+    goal.dispatch_binding.root_task_id = task_id
+    goal.dispatch_binding.expected_registry_epoch = registry["epoch"]
+    goal.dispatch_binding.expected_registry_generation = registry["generation"]
+    goal.dispatch_binding.expected_registry_digest = registry["digest"]
+    fill_dispatch_budget(goal.dispatch_binding, now, task_budget_sec)
+    fill_executor_identity(goal.expected_executor, identity)
+    goal.target_query = prompt
+    goal.timeout_sec = timeout_sec
+    goal.supervised_direct = True
+    goal.mode = PickObject.Goal.MODE_EXECUTE
+    goal.release_after_success = bool(release_after_success)
+    return goal
+
+
 class PickActionClient(Node):
     """Send one supervised goal after loading the live registry identity."""
 
-    def __init__(self, args: argparse.Namespace) -> None:
-        super().__init__("pick_action_client")
+    def __init__(self, args: argparse.Namespace, *, use_sim_time: bool | None = None) -> None:
+        """``use_sim_time`` is the programmatic in-process entry (R3): True
+        switches this node's clock to simulation time. ``None`` (the CLI
+        default) leaves the decision to the ROS arguments parsed alongside
+        argparse in :func:`main` (``--ros-args -p use_sim_time:=true``)."""
+        overrides = None
+        if use_sim_time is not None:
+            from rclpy.parameter import Parameter  # noqa: PLC0415
+
+            overrides = [Parameter("use_sim_time", value=bool(use_sim_time))]
+        super().__init__("pick_action_client", parameter_overrides=overrides)
         self._args = args
         self._pick_client = ActionClient(self, PickObject, args.action_name)
         self._status_client = self.create_client(GetSkillGatewayStatus, args.status_service)
@@ -185,11 +258,24 @@ class PickActionClient(Node):
             float(status.rpc_timeout_sec),
         )
 
-    @staticmethod
-    def _fill_identity(message, identity: dict) -> None:
-        message.schema_version = 1
-        for field_name, value in identity.items():
-            setattr(message, field_name, value)
+    def _spin_until(self, future, timeout_sec: float) -> None:
+        """One bounded WALL-clock wait (a process-level watchdog; R3 — never
+        the ROS clock, which a paused simulator freezes)."""
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
+
+    def _await_result(self, goal_handle, timeout_sec: float):
+        """The goal result on the wall-clock watchdog; cancels the goal and
+        raises when it expires (the supervised client never outlives its
+        own watchdog silently)."""
+        result_future = goal_handle.get_result_async()
+        self._spin_until(result_future, max(1.0, timeout_sec + 10.0))
+        if not result_future.done():
+            goal_handle.cancel_goal_async()
+            raise RuntimeError(f"PickObject result timed out after {timeout_sec:.1f}s")
+        wrapped_result = result_future.result()
+        if wrapped_result is None:
+            raise RuntimeError("PickObject action returned no result")
+        return wrapped_result.result
 
     def execute(self) -> object:
         args = self._args
@@ -199,26 +285,19 @@ class PickActionClient(Node):
         if not self._pick_client.wait_for_server(timeout_sec=args.ready_timeout_s):
             raise RuntimeError(f"PickObject action server is unavailable: {args.action_name}")
 
-        goal = PickObject.Goal()
-        goal.dispatch_binding.schema_version = 1
-        goal.dispatch_binding.task_id = task_id
-        goal.dispatch_binding.root_task_id = task_id
-        goal.dispatch_binding.expected_registry_epoch = registry["epoch"]
-        goal.dispatch_binding.expected_registry_generation = registry["generation"]
-        goal.dispatch_binding.expected_registry_digest = registry["digest"]
-        now = time.time()
-        goal.dispatch_binding.task_budget.schema_version = 1
-        goal.dispatch_binding.task_budget.started_at.sec = int(now)
-        goal.dispatch_binding.task_budget.started_at.nanosec = int((now - int(now)) * 1_000_000_000)
-        deadline = now + task_budget_sec
-        goal.dispatch_binding.task_budget.deadline.sec = int(deadline)
-        goal.dispatch_binding.task_budget.deadline.nanosec = int((deadline - int(deadline)) * 1_000_000_000)
-        self._fill_identity(goal.expected_executor, identity)
-        goal.target_query = args.prompt
-        goal.timeout_sec = timeout_sec
-        goal.supervised_direct = True
-        goal.mode = PickObject.Goal.MODE_EXECUTE
-        goal.release_after_success = bool(args.release_after_success)
+        # R3: the budget is stamped from THIS node's ROS clock — the
+        # executor and the Gateway read it on theirs (sim time when this
+        # node runs use_sim_time; wall time on hardware stays wall time)
+        goal = build_pick_goal(
+            task_id=task_id,
+            registry=registry,
+            identity=identity,
+            timeout_sec=timeout_sec,
+            task_budget_sec=task_budget_sec,
+            prompt=args.prompt,
+            release_after_success=args.release_after_success,
+            now=self.get_clock().now(),
+        )
         print(
             f"PICK_ACTION_SEND action={args.action_name} task_id={task_id} target={args.prompt!r} "
             f"timeout_s={timeout_sec:.1f} supervised_direct=true",
@@ -235,7 +314,7 @@ class PickActionClient(Node):
 
         goal_uuid = UUID(uuid=list(uuid.uuid4().bytes))
         send_future = self._pick_client.send_goal_async(goal, feedback_callback=feedback_callback, goal_uuid=goal_uuid)
-        rclpy.spin_until_future_complete(self, send_future, timeout_sec=max(0.1, args.goal_response_timeout_s))
+        self._spin_until(send_future, max(0.1, args.goal_response_timeout_s))
         if not send_future.done():
             send_future.cancel()
             recovered_response = PickObject.Impl.SendGoalService.Response()
@@ -246,15 +325,7 @@ class PickActionClient(Node):
             goal_handle = send_future.result()
             if goal_handle is None or not goal_handle.accepted:
                 raise RuntimeError(f"PickObject goal was rejected by {args.action_name}")
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future, timeout_sec=max(1.0, timeout_sec + 10.0))
-        if not result_future.done():
-            goal_handle.cancel_goal_async()
-            raise RuntimeError(f"PickObject result timed out after {timeout_sec:.1f}s")
-        wrapped_result = result_future.result()
-        if wrapped_result is None:
-            raise RuntimeError("PickObject action returned no result")
-        result = wrapped_result.result
+        result = self._await_result(goal_handle, timeout_sec)
         print(
             f"PICK_ACTION_RESULT success={bool(result.success)} error_code={result.error_code or '-'} "
             f"candidate={int(result.candidate_index)} attempts={int(result.attempts)} "
@@ -289,8 +360,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(args=None) -> None:
-    parsed = build_parser().parse_args(args)
-    rclpy.init(args=None)
+    # ROS args are parsed ALONGSIDE argparse (R3): the CLI accepts
+    # ``--ros-args -p use_sim_time:=true`` to run the client on the
+    # simulator's clock; everything argparse does not know goes to rclpy.
+    parsed, ros_args = build_parser().parse_known_args(args)
+    rclpy.init(args=ros_args)
     node = PickActionClient(parsed)
     try:
         result = node.execute()

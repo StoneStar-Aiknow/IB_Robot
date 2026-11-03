@@ -227,9 +227,17 @@ class RuntimeFacade(Node):
         if needs_navigation_ack:
             self.create_subscription(Bool, NAVIGATION_ACK_TOPIC, self._on_navigation_ack, 10, callback_group=cb)
 
-        timer_cb = MutuallyExclusiveCallbackGroup()
-        self.create_timer(1.0, self._publish_status, callback_group=timer_cb)
-        self.create_timer(1.0, self._check_readiness, callback_group=timer_cb)
+        # The runtime-status heartbeat owns its callback group: a slow
+        # readiness check (controller-manager service calls under load —
+        # measured on Gazebo, e2e/gazebo-154437: the blocked close starved
+        # the readiness path and the heartbeat missed the Gateway's
+        # freshness budget, refusing the next primitive) must not delay the
+        # heartbeat. The node spins on a MultiThreadedExecutor, so the two
+        # groups run concurrently.
+        heartbeat_cb = MutuallyExclusiveCallbackGroup()
+        readiness_cb = MutuallyExclusiveCallbackGroup()
+        self.create_timer(1.0, self._publish_status, callback_group=heartbeat_cb)
+        self.create_timer(1.0, self._check_readiness, callback_group=readiness_cb)
         self.get_logger().info(f"runtime facade for {self._state.name} {self._state.version}: profile {path}")
 
     # --- helpers ---------------------------------------------------------------------

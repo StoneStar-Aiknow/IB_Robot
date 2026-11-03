@@ -110,6 +110,32 @@ def _load_config(robot_config_name: str, config_path_override: str, nav_stage: s
     return config
 
 
+def _resolve_embodied_clock(context, config: dict) -> dict:
+    """R3: the launch entry's target/platform resolution — the SAME rules the
+    base launch applies (``robot_config.launch_registry.preparation.
+    resolve_target_and_backend``), never a private re-parse of the raw
+    ``use_sim`` argument.
+
+    The entry combinations the base launch accepts must give the embodied
+    nodes the clock the base launch's task_executor uses: ``use_sim`` EMPTY
+    infers the target from the configuration (a config-declared simulation
+    runs simulated; anything else is hardware), a ``sim_platform`` override
+    ALONE selects simulation on that platform, and a providerless
+    configuration without ``simulation.platform`` defaults to ``gazebo``.
+    """
+    from robot_config.launch_registry.preparation import resolve_target_and_backend
+
+    return resolve_target_and_backend(
+        {
+            "use_sim": context.launch_configurations.get("use_sim", ""),
+            "sim_platform": context.launch_configurations.get("sim_platform", ""),
+            "runtime_target": context.launch_configurations.get("runtime_target", ""),
+            "auto_start_controllers": context.launch_configurations.get("auto_start_controllers", "true"),
+        },
+        config,
+    )
+
+
 def launch_setup(context, *_args, **_kwargs):
     check_launch_dds(context)
     robot_config_name = context.launch_configurations.get("robot_config", "so101_single_arm")
@@ -160,8 +186,9 @@ def launch_setup(context, *_args, **_kwargs):
     base_launch_arguments = {
         "robot_config": robot_config_name,
         "config_path": config_path_override,
-        "use_sim": context.launch_configurations.get("use_sim", "false"),
+        "use_sim": context.launch_configurations.get("use_sim", ""),
         "sim_platform": context.launch_configurations.get("sim_platform", ""),
+        "runtime_target": context.launch_configurations.get("runtime_target", ""),
         "use_mock": context.launch_configurations.get("use_mock", "false"),
         "auto_start_controllers": context.launch_configurations.get("auto_start_controllers", "true"),
         "control_mode": active_control_mode,
@@ -171,6 +198,15 @@ def launch_setup(context, *_args, **_kwargs):
         "with_embodied": "false",
         "with_perception": "false",
     }
+    # R3: the SAME target/platform resolution AND clock decision the base
+    # launch applies to task_executor (resolve_target_and_backend — empty
+    # use_sim infers the target, a sim_platform override alone selects
+    # simulation, the providerless default platform is gazebo) — every
+    # embodied node that exchanges stamped data runs on the simulator's
+    # clock on physics platforms; hardware and mock keep wall time.
+    target_state = _resolve_embodied_clock(context, config)
+    embodied_use_sim = bool(target_state["use_sim"])
+    embodied_use_sim_time = bool(target_state["node_use_sim_time"])
 
     if config.get("runtime", {}).get("provider") or required_interface_ids(config):
         # Base launch owns normalization, provider startup and the live snapshot.
@@ -204,7 +240,8 @@ def launch_setup(context, *_args, **_kwargs):
                                 effective,
                                 effective.get("default_control_mode", "moveit_planning"),
                                 motion_authorized=motion_authorized,
-                                use_sim=parse_bool(base_launch_arguments["use_sim"], default=False),
+                                use_sim=embodied_use_sim,
+                                use_sim_time=embodied_use_sim_time,
                                 # Runtime readiness replaces the legacy controller barrier.
                                 auto_start=False,
                             ),
@@ -223,13 +260,17 @@ def launch_setup(context, *_args, **_kwargs):
             config,
             active_control_mode,
             motion_authorized=motion_authorized,
-            use_sim=parse_bool(base_launch_arguments["use_sim"], default=False),
+            use_sim=embodied_use_sim,
+            use_sim_time=embodied_use_sim_time,
             auto_start=parse_bool(base_launch_arguments["auto_start_controllers"], default=True),
         ),
     ]
 
 
 def _parallel_ik_worker_action(config: dict, use_sim_time: str):
+    """The IK/FK worker pool include; ``use_sim_time`` is the task_executor
+    clock decision (R3), not the raw use_sim flag — mock provides no
+    /clock, so its workers keep wall time."""
     if config.get("runtime", {}).get("provider"):
         return None
     grasp = config.get("grasp_execution", {})
@@ -266,7 +307,10 @@ def _parallel_ik_worker_action(config: dict, use_sim_time: str):
     )
 
 
-def _construct_embodied_actions(config, active_control_mode, *, motion_authorized, use_sim, auto_start):
+def _construct_embodied_actions(config, active_control_mode, *, motion_authorized, use_sim, auto_start, use_sim_time):
+    """The embodied node actions; ``use_sim_time`` is the task_executor
+    clock decision (R3) computed once by the caller from the same inputs
+    (use_sim + sim_platform backend caps) the base launch uses."""
     actions = []
     embodied_config = config["embodied"]
     if embodied_config["enabled"]:
@@ -282,10 +326,11 @@ def _construct_embodied_actions(config, active_control_mode, *, motion_authorize
             include_motion=False,
             include_perception=visual_games_enabled,
             use_sim=use_sim,
+            use_sim_time=use_sim_time,
         )
         actions.extend(visual_actions)
         runtime_actions = []
-        worker = _parallel_ik_worker_action(config, str(use_sim).lower())
+        worker = _parallel_ik_worker_action(config, str(use_sim_time).lower())
         if worker is not None:
             runtime_actions.append(worker)
         runtime_actions.extend(
@@ -296,6 +341,7 @@ def _construct_embodied_actions(config, active_control_mode, *, motion_authorize
                 include_visual_games=False,
                 include_perception=not visual_games_enabled,
                 use_sim=use_sim,
+                use_sim_time=use_sim_time,
             )
         )
         resident_bridge = generate_resident_cli_bridge_action(config)
@@ -353,8 +399,13 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("robot_config", default_value="so101_single_arm"),
             DeclareLaunchArgument("config_path", default_value=""),
-            DeclareLaunchArgument("use_sim", default_value="false"),
+            # Empty infers the runtime target exactly like the base launch
+            # (R3, review r1 item 2): a config-declared simulation runs
+            # simulated; use_sim:=false is hardware; sim_platform:=X alone
+            # selects simulation on X.
+            DeclareLaunchArgument("use_sim", default_value=""),
             DeclareLaunchArgument("sim_platform", default_value=""),
+            DeclareLaunchArgument("runtime_target", default_value=""),
             DeclareLaunchArgument("use_mock", default_value="false"),
             DeclareLaunchArgument("auto_start_controllers", default_value="true"),
             DeclareLaunchArgument("control_mode", default_value=""),
