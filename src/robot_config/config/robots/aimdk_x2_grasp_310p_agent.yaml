@@ -1,0 +1,38 @@
+# Text Agent for the existing X2/310P grasp deployment. The workstation's
+# Trae OpenAI-compatible relay is reachable from the 310P on the management LAN.
+# Physical execution still requires the operator's authorize_motion launch flag.
+robot:
+  base_config: aimdk_x2_grasp_310p.yaml
+  name: aimdk_x2_grasp
+
+  voice_asr:
+    enabled: false
+  voice_tts:
+    enabled: false
+
+  embodied:
+    entry_mode: agent
+    execution_store_path: /root/zf/agent_grasp_state/executions.sqlite3
+    agent:
+      enabled: true
+      incubation: true
+      execution_enabled: true
+      channel_id: x2_grasp_cli
+      principal_id: local_operator
+      test_allowlist:
+        - pick_object
+      ledger_path: /root/zf/agent_grasp_state/requests.sqlite3
+      conversation_path: /root/zf/agent_grasp_state/conversation.sqlite3
+      deployment_lock_path: /root/zf/agent_grasp_state/agent.lock
+      planner:
+        mode: vlm
+        provider: openai_compatible
+        base_url: http://10.42.0.250:18081/v1
+        api_key_env: ""
+        model: DeepSeek-V4.1-Flash-1017
+        api_protocol: chat_completions
+        timeout_sec: 120.0
+        temperature: 0.3
+        catalog_view: planner
+      voice_bridge:
+        enabled: false

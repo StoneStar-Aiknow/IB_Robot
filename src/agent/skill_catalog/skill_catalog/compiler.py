@@ -277,7 +277,9 @@ class SkillCatalogCompiler:
             requirements[skill_name] = skill_requirements
             capability_view[skill_name] = {
                 "name": skill_name,
-                "summary": capability["summary"],
+                "summary": description["summary"]
+                if implementation_name in description_variants
+                else capability["summary"],
                 "domain": capability["domain"],
                 "semantic_level": manifest["semantic_level"],
                 "planner_visible": planner_visible,

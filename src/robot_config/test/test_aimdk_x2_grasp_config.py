@@ -89,6 +89,25 @@ def test_it_selects_the_omnihand_runtime_profile(merged, profile):
     assert merged["type"] == profile["runtime"]["type"] == "x2_ultra_omnihand"
 
 
+def test_agent_deployment_keeps_the_grasp_executor_and_robot_identity():
+    base = _host("aimdk_x2_grasp_310p")
+    config = load_robot_config_dict(str(ROBOTS / "aimdk_x2_grasp_310p_agent.yaml"), defer_interface_binding=True)
+    validate_robot_config_dict(config, deferred_interfaces=True)
+    assert config["name"] == base["name"]
+    assert config["runtime"] == base["runtime"]
+    assert config["grasp_execution"] == base["grasp_execution"]
+    assert config["perception_services"] == base["perception_services"]
+    assert config["embodied"]["skill_catalog_profile"] == base["embodied"]["skill_catalog_profile"]
+    assert config["embodied"]["entry_mode"] == "agent"
+    agent = config["embodied"]["agent"]
+    assert agent["enabled"] and agent["incubation"] and agent["execution_enabled"]
+    assert agent["test_allowlist"] == ["pick_object"]
+    assert agent["planner"]["mode"] == "vlm" and agent["planner"]["api_protocol"] == "chat_completions"
+    assert agent["voice_bridge"]["enabled"] is False
+    for key in ("ledger_path", "conversation_path", "deployment_lock_path"):
+        assert Path(agent[key]).is_absolute() and not agent[key].startswith("/tmp/")
+
+
 def test_arm_limits_match_the_mirror_until_the_configurations_merge(merged):
     # Two copies of the motion-control limits exist until the grasp and mirror
     # configurations become one; a change to either must reach the other.

@@ -26,6 +26,7 @@ perception half of GraspRequestProcessor.process.
 
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -47,10 +48,34 @@ from .types import CameraIntrinsics, RGBDFrame
 
 NO_EXECUTABLE_CANDIDATE = "NO_EXECUTABLE_CANDIDATE"
 
+# Exact aliases at the detector boundary, shared by CLI and Agent requests.
+# Never drop an unknown modifier: "left apple" and "apple" can name different targets.
+_CHINESE_TARGETS = {
+    "苹果": "an apple",
+    "红苹果": "a red apple",
+    "红色苹果": "a red apple",
+    "青苹果": "a green apple",
+    "绿色苹果": "a green apple",
+    "瓶子": "a bottle",
+    "水瓶": "a bottle",
+    "杯子": "a cup",
+    "水杯": "a cup",
+}
+
 
 def detection_prompt(target_query: str) -> str:
-    """GroundingDINO expects '<phrase> .'; IB_Robot passes the bare target phrase."""
+    """Resolve known Chinese nouns, then format the English GroundingDINO phrase."""
     query = " ".join(str(target_query).split())
+    alias = query.rstrip(".。 ")
+    if alias in _CHINESE_TARGETS:
+        query = _CHINESE_TARGETS[alias]
+    elif re.search(r"[\u3400-\u9fff]", query):
+        raise GraspFailure(
+            "INVALID_TARGET",
+            "Unsupported Chinese target phrase; supply a short English object phrase preserving all attributes",
+        )
+    if not query or not query.strip(".。 "):
+        raise GraspFailure("INVALID_TARGET", "An object name is required")
     return query if query.endswith(".") else f"{query} ."
 
 

@@ -174,6 +174,24 @@ def test_the_prompt_is_the_phrase_grounding_dino_expects():
     assert detection_prompt("bottle .") == "bottle ."
 
 
+@pytest.mark.parametrize(
+    ("query", "prompt"),
+    [(" 苹果。 ", "an apple ."), ("红色苹果", "a red apple ."), ("瓶子", "a bottle ."), ("杯子", "a cup .")],
+)
+def test_chinese_target_nouns_become_english_detector_prompts(query, prompt):
+    assert detection_prompt(query) == prompt
+
+
+@pytest.mark.parametrize("query", ["", " 。 ", "左边的苹果", "苹果和杯子", "抓取苹果"])
+def test_ambiguous_or_untranslated_targets_fail_before_any_perception_call(query):
+    models = FakeModels([])
+    proposer = X2Proposer(models, NoSpheres())
+    with pytest.raises(GraspFailure) as raised:
+        proposer.propose(observation(), query, deadline=time.monotonic() + 30.0, cancelled=lambda: False)
+    assert raised.value.code == "INVALID_TARGET"
+    assert not raised.value.retryable and not models.calls
+
+
 @pytest.mark.parametrize("overlap", [True, False])
 def test_a_scene_finished_by_the_grasp_head_keeps_the_support_fallback(overlap):
     from aimdk_grasp.scene_estimation import NoSupportError

@@ -12,6 +12,11 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 - `config/skills/<name>/SKILL.md`: human/Agent documentation only; never executable configuration.
 - `config/profiles/<profile>.yaml`: enabled package, selected implementation, and planner visibility.
 
+When a manifest selects a `description_variants` entry for its implementation,
+that entry's summary is also the public capability summary sent to the Planner.
+For example, the X2 `pick_object` describes its own grasp-and-return sequence;
+it does not inherit another robot's container-transport summary.
+
 The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
 `lekiwi_handeye_realsense_grasp_lidar`,

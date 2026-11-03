@@ -13,6 +13,17 @@ The migration is incremental; this README records what has landed.
 To deploy the X2 `pick_object` skill and call it, see
 [the X2 grasp skill guide](../../../../docs/aimdk_x2_grasp_skill.md).
 
+The text-Agent profile `aimdk_x2_grasp_310p_agent` adds `ibrobot_agent` and its
+OpenAI-compatible Trae planner to the existing 310P pipeline. It exposes only
+`pick_object` and keeps the same grasp, automatic put-back and retreat sequence.
+See [the Agent apple guide](../../../../docs/aimdk_x2_agent_apple.md) for this deployment's entry points.
+At the detector boundary, exact Chinese target nouns are translated to English:
+`苹果` becomes `an apple`, `瓶子`/`水瓶` becomes `a bottle`, and `杯子`/`水杯`
+becomes `a cup`. Red and green apple aliases preserve the color. Unknown Chinese
+phrases fail with `INVALID_TARGET` before model calls or arm motion; the adapter
+never discards an unrecognized attribute. English phrases keep their existing
+behavior. This normalization also applies to direct CLI requests.
+
 ## Robot feedback
 
 `aimdk_grasp.feedback` assembles the joint pose at an image time from the three
