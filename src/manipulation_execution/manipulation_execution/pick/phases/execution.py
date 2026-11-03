@@ -138,11 +138,20 @@ class ExecutionPhase:
         if response.status == VerifyGrasp.Response.STATUS_SUCCESS and response.success:
             state.verification_status = PickObject.Result.VERIFICATION_SUCCESS
             return
+
+        # review r2 finding 8: the verifier's EVIDENCE rides along in the
+        # failure messages — the retry-budget message and the PickObject
+        # result carry it, so a downstream classifier can require specific
+        # evidence (the jaw-at-open wedge) instead of guessing from a
+        # generic "uncertain".
+        evidence_suffix = ""
+        if response.evidence:
+            evidence_suffix = " [" + "; ".join(str(entry) for entry in response.evidence) + "]"
         if response.status == VerifyGrasp.Response.STATUS_UNCERTAIN:
             state.verification_status = PickObject.Result.VERIFICATION_UNCERTAIN
-            raise PickFlowError("GRASP_UNCERTAIN", response.message)
+            raise PickFlowError("GRASP_UNCERTAIN", f"{response.message}{evidence_suffix}")
         state.verification_status = PickObject.Result.VERIFICATION_FAILED
-        raise PickFlowError("GRASP_VERIFICATION_FAILED", response.message)
+        raise PickFlowError("GRASP_VERIFICATION_FAILED", f"{response.message}{evidence_suffix}")
 
     def _recover_after_close_failure(
         self,

@@ -56,6 +56,10 @@ class _FakeModeClient:
 
 
 def _node(*, enabled=True, status=None, required=("joint.trajectory", "gripper.1d")):
+    class _FakeLogger:
+        def warning(self, _message):
+            pass
+
     node = SimpleNamespace(
         _runtime_enabled=enabled,
         _runtime_name="test_runtime",
@@ -71,6 +75,7 @@ def _node(*, enabled=True, status=None, required=("joint.trajectory", "gripper.1
             snapshot=SimpleNamespace(capability_view={"pick_object": {"required_capabilities": list(required)}})
         ),
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=100_000_000_000)),
+        get_logger=lambda: _FakeLogger(),
         _wait_for_future=lambda *_args, **_kwargs: True,
     )
     for name in (

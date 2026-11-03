@@ -500,6 +500,132 @@ def test_ik_orientation_rejection_returns_to_observe_and_replans():
     assert result.pipeline_timings_json
 
 
+def test_arm_planning_failure_retries_next_candidate_without_recovery_motion():
+    """A motion primitive that failed at planning (arm did not move) is a
+    per-candidate failure: the next candidate is tried through the existing
+    retry path; the outer flow performs the observe recovery move."""
+    harness = _flow_harness(config={"max_execution_attempts": 3})
+    plans = [_prepared_candidate(index=5), _prepared_candidate(index=9)]
+    plan_calls = 0
+    executed_candidates: list[int] = []
+    observe_calls = 0
+    harness._preflight = lambda *_args: None
+
+    def observe(*_args):
+        nonlocal observe_calls
+        observe_calls += 1
+
+    def plan(*_args):
+        nonlocal plan_calls
+        selected = plans[plan_calls]
+        plan_calls += 1
+        return [selected], f"scene-{plan_calls}"
+
+    def execute(_goal, _deadline, _state, _task_id, _target_query, selected, _scene, **_kwargs):
+        executed_candidates.append(selected.ranked.index)
+        if len(executed_candidates) == 1:
+            # The Gateway's distinct code for a motion whose MoveIt planning
+            # failed before any arm motion; _run_primitive raises it with
+            # retryable=False for move_to_configuration.
+            raise PickFlowError("PRIMITIVE_ARM_PLANNING_FAILED", "Joint planning failed", retryable=False)
+        return None
+
+    harness._move_to_observe = observe
+    harness._plan_and_prepare_candidates = plan
+    harness._execute_candidate = execute
+
+    result = PickExecutorNode._execute_pick(
+        cast(Any, harness),
+        _GoalHandle(mode=PickObject.Goal.MODE_EXECUTE),
+    )
+
+    assert result.success is True
+    assert result.attempts == 2
+    assert plan_calls == 2
+    assert executed_candidates == [5, 9]
+    assert observe_calls == 2
+
+
+def test_arm_execution_failure_after_motion_started_still_aborts():
+    """A primitive failure without the planning outcome (motion started) is
+    not per-candidate: the pick aborts without another attempt."""
+    harness = _flow_harness(config={"max_execution_attempts": 3})
+    plan_calls = 0
+    executed_candidates: list[int] = []
+    observe_calls = 0
+    harness._preflight = lambda *_args: None
+
+    def observe(*_args):
+        nonlocal observe_calls
+        observe_calls += 1
+
+    def plan(*_args):
+        nonlocal plan_calls
+        plan_calls += 1
+        return [_prepared_candidate(index=5)], f"scene-{plan_calls}"
+
+    def execute(_goal, _deadline, _state, _task_id, _target_query, selected, _scene, **_kwargs):
+        executed_candidates.append(selected.ranked.index)
+        raise PickFlowError("PRIMITIVE_ARM_FAILED", "arm trajectory execution failed: -1", retryable=False)
+
+    harness._move_to_observe = observe
+    harness._plan_and_prepare_candidates = plan
+    harness._execute_candidate = execute
+    goal_handle = _GoalHandle(mode=PickObject.Goal.MODE_EXECUTE)
+
+    result = PickExecutorNode._execute_pick(cast(Any, harness), goal_handle)
+
+    assert result.success is False
+    assert result.error_code == "PRIMITIVE_ARM_FAILED"
+    assert result.attempts == 1
+    assert plan_calls == 1
+    assert executed_candidates == [5]
+    assert observe_calls == 1
+    assert goal_handle.terminal_state == "aborted"
+
+
+def test_synchronous_motion_execution_failure_still_aborts():
+    """Review r2 finding 1, the flow side: the fast-completion execution
+    failures — a dispatched goal terminal before the motion server's first
+    state query (CONTROL_FAILED, PREEMPTED, a rejected goal) — surface as
+    PRIMITIVE_ARM_FAILED and the pick aborts after ONE attempt: the
+    per-candidate retry is reserved for the never-dispatched planning
+    outcome."""
+    harness = _flow_harness(config={"max_execution_attempts": 3})
+    plan_calls = 0
+    observe_calls = 0
+    harness._preflight = lambda *_args: None
+
+    def observe(*_args):
+        nonlocal observe_calls
+        observe_calls += 1
+
+    def plan(*_args):
+        nonlocal plan_calls
+        plan_calls += 1
+        return [_prepared_candidate(index=5)], f"scene-{plan_calls}"
+
+    def execute(_goal, _deadline, _state, _task_id, _target_query, selected, _scene, **_kwargs):
+        raise PickFlowError(
+            "PRIMITIVE_ARM_FAILED", "Motion execution failed (MoveIt reported unsuccessful)", retryable=False
+        )
+
+    harness._move_to_observe = observe
+    harness._plan_and_prepare_candidates = plan
+    harness._execute_candidate = execute
+
+    result = PickExecutorNode._execute_pick(
+        cast(Any, harness),
+        _GoalHandle(mode=PickObject.Goal.MODE_EXECUTE),
+    )
+
+    assert result.success is False
+    assert result.error_code == "PRIMITIVE_ARM_FAILED"
+    assert result.attempts == 1
+    assert plan_calls == 1
+    assert observe_calls == 1  # only the executor's initial observe move — no recovery, no re-plan
+
+
 def test_final_ik_orientation_rejection_still_returns_to_observe():
     harness = _flow_harness(config={"max_execution_attempts": 2})
     candidate = _prepared_candidate(index=5)
@@ -552,6 +678,7 @@ def test_final_ik_orientation_rejection_still_returns_to_observe():
         "FK_FIXED_FINGER_BASE_SIDE_UNAVAILABLE",
         "TARGET_TABLETOP_COLLISION",
         "TF_UNAVAILABLE",
+        "PRIMITIVE_ARM_PLANNING_FAILED",
     ],
 )
 def test_execution_recovery_error_codes_are_retryable(error_code: str):

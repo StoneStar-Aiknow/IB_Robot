@@ -123,6 +123,12 @@ from skill_library.runtime_coordinator import SkillRegistryOwner
 EE_POSITION_TOLERANCE_M = 0.02
 SKILL_CANCEL_TIMEOUT = "SKILL_CANCEL_TIMEOUT"
 PRIMITIVE_CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
+# A motion primitive whose MoveIt planning failed before any arm motion: the
+# motion service reports outcome PLANNING_FAILED (robot_runtime.contract) and
+# guarantees the arm did not move, so callers may safely retry with another
+# target (e.g. the pick executor's next grasp candidate). A failure after
+# motion started stays PRIMITIVE_ARM_FAILED.
+PRIMITIVE_ARM_PLANNING_FAILED = "PRIMITIVE_ARM_PLANNING_FAILED"
 # The X2 mirror session's switch. Its skills take no arguments: the catalog
 # implementation binds the command, sent as the session's SetBool.
 MIRROR_SESSION_EXECUTOR = "mirror_session"
@@ -3454,6 +3460,15 @@ class SkillExecutorNode(Node):
         stamp_ns = status.stamp.sec * 1_000_000_000 + status.stamp.nanosec
         source_age = (self.get_clock().now().nanoseconds - stamp_ns) / 1_000_000_000
         if not 0 <= receipt_age <= max_age or not 0 <= source_age <= max_age:
+            # review r2 finding 9's instrumentation: name the measured ages at
+            # the refusal — the receipt age (this node's last processed
+            # heartbeat) and the source age (the facade's stamp on this
+            # node's clock) against the budget, so a stale-runtime refusal
+            # is diagnosable from the log instead of guessed.
+            self.get_logger().warning(
+                "[gateway-admission] runtime status refused: "
+                f"receipt_age={receipt_age:.2f}s source_age={source_age:.2f}s budget={max_age:.1f}s"
+            )
             return None, "runtime status is stale or its clock is unsynchronized"
         if status.stop_latched:
             return None, "runtime stop is latched; explicit idle rearm is required"
@@ -4526,7 +4541,7 @@ class SkillExecutorNode(Node):
 
         if goal.primitive_name == "move_to_configuration":
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
-            ok, err_msg = self._exec_move_configuration(
+            ok, error_code, err_msg = self._exec_move_configuration(
                 goal_handle,
                 list(goal.joint_names),
                 list(goal.joint_positions),
@@ -4534,7 +4549,7 @@ class SkillExecutorNode(Node):
                 move_timeout,
             )
             if not ok:
-                return self._finish_primitive_failure(result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, "")
+                return self._finish_primitive_failure(result, goal_handle, error_code, err_msg, "")
         elif goal.primitive_name == "move_to_joint_positions":
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
             ok, err_msg = self._exec_arm_joint_trajectory(
@@ -4943,9 +4958,15 @@ class SkillExecutorNode(Node):
         joint_positions: list[float],
         velocity_scaling: float,
         timeout_sec: float,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
+        """Plan and execute a joint configuration; report a distinct code for
+        planning-only failures (arm did not move) so callers can retry."""
         if not self._move_configuration_client.wait_for_service(timeout_sec=self._rpc_timeout):
-            return False, f"move configuration service unavailable: {self._move_configuration_service}"
+            return (
+                False,
+                "PRIMITIVE_ARM_FAILED",
+                f"move configuration service unavailable: {self._move_configuration_service}",
+            )
 
         request = MoveToConfiguration.Request()
         request.target_joint_state = JointState()
@@ -4957,18 +4978,20 @@ class SkillExecutorNode(Node):
         while rclpy.ok() and not future.done():
             if goal_handle.is_cancel_requested:
                 future.cancel()
-                return False, "cancelled during MoveIt configuration motion"
+                return False, "PRIMITIVE_ARM_FAILED", "cancelled during MoveIt configuration motion"
             if time.monotonic() >= deadline:
                 future.cancel()
-                return False, "timeout waiting for MoveIt configuration motion"
+                return False, "PRIMITIVE_ARM_FAILED", "timeout waiting for MoveIt configuration motion"
             time.sleep(_WAIT_POLL_SEC)
 
         response = future.result()
         if response is None:
-            return False, "move configuration service returned no response"
+            return False, "PRIMITIVE_ARM_FAILED", "move configuration service returned no response"
         if not response.success:
-            return False, response.message
-        return True, ""
+            if str(response.outcome) == RUNTIME.OUTCOME_PLANNING_FAILED:
+                return False, PRIMITIVE_ARM_PLANNING_FAILED, response.message
+            return False, "PRIMITIVE_ARM_FAILED", response.message
+        return True, "", ""
 
     def _exec_arm_joint_trajectory(
         self,

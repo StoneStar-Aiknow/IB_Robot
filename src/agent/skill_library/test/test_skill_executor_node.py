@@ -1867,6 +1867,105 @@ def test_exec_arm_via_task_dispatch_cancels_when_result_future_creation_fails():
     assert child_goal_handle.cancel_count == 1
 
 
+class _NonCancelPrimitiveGoalHandle(_PrimitiveGoalHandle):
+    @property
+    def is_cancel_requested(self) -> bool:
+        return False
+
+
+def _move_configuration_node(response) -> SkillExecutorNode:
+    node = object.__new__(SkillExecutorNode)
+    node._rpc_timeout = 0.01
+    node._debug = False
+    node._move_configuration_service = "/motion/move_to_configuration"
+    node._move_configuration_client = SimpleNamespace(
+        wait_for_service=lambda **_kwargs: True,
+        call_async=lambda _request: _Future(done=True, result=response),
+    )
+    return node
+
+
+def test_exec_move_configuration_maps_planning_outcome_to_distinct_code():
+    node = _move_configuration_node(
+        SimpleNamespace(success=False, message="Joint planning failed", outcome="PLANNING_FAILED")
+    )
+
+    ok, error_code, message = node._exec_move_configuration(
+        _NonCancelPrimitiveGoalHandle(), ["joint_1"], [0.1], 0.0, 1.0
+    )
+
+    assert (ok, error_code, message) == (False, "PRIMITIVE_ARM_PLANNING_FAILED", "Joint planning failed")
+
+
+def test_exec_move_configuration_keeps_arm_failed_code_for_execution_outcome():
+    node = _move_configuration_node(
+        SimpleNamespace(
+            success=False,
+            message="Motion completed but joint feedback did not converge to the target",
+            outcome="EXECUTION_FAILED",
+        )
+    )
+
+    ok, error_code, _message = node._exec_move_configuration(
+        _NonCancelPrimitiveGoalHandle(), ["joint_1"], [0.1], 0.0, 1.0
+    )
+
+    assert (ok, error_code) == (False, "PRIMITIVE_ARM_FAILED")
+
+
+def test_exec_move_configuration_synchronous_execution_failure_is_not_retryable():
+    """Review r2 finding 1, the Gateway side: a dispatched goal that
+    terminalizes before the motion server's first state query (a fast
+    CONTROL_FAILED/PREEMPTED, or a rejected goal) still reports
+    EXECUTION_FAILED — mapped to the NON-retryable arm failure, exactly
+    like any other execution outcome; only the never-dispatched planning
+    outcome becomes the retryable code."""
+    node = _move_configuration_node(
+        SimpleNamespace(
+            success=False,
+            message="Motion execution failed (MoveIt reported unsuccessful)",
+            outcome="EXECUTION_FAILED",
+        )
+    )
+
+    ok, error_code, message = node._exec_move_configuration(
+        _NonCancelPrimitiveGoalHandle(), ["joint_1"], [0.1], 0.0, 1.0
+    )
+
+    assert (ok, error_code, message) == (
+        False,
+        "PRIMITIVE_ARM_FAILED",
+        "Motion execution failed (MoveIt reported unsuccessful)",
+    )
+
+
+def test_exec_move_configuration_succeeds_without_error_code():
+    node = _move_configuration_node(SimpleNamespace(success=True, message="", outcome="SUCCEEDED"))
+
+    ok, error_code, message = node._exec_move_configuration(
+        _NonCancelPrimitiveGoalHandle(), ["joint_1"], [0.1], 0.0, 1.0
+    )
+
+    assert (ok, error_code, message) == (True, "", "")
+
+
+def test_execute_primitive_reports_distinct_code_when_planning_fails():
+    node = _move_configuration_node(
+        SimpleNamespace(success=False, message="Joint planning failed", outcome="PLANNING_FAILED")
+    )
+    node._validate_primitive = lambda *_args, **_kwargs: (True, "")
+    goal_handle = _NonCancelPrimitiveGoalHandle()
+    goal_handle.request.primitive_name = "move_to_configuration"
+
+    result = node._execute_primitive(goal_handle)
+
+    assert result.success is False
+    assert result.error_code == "PRIMITIVE_ARM_PLANNING_FAILED"
+    assert result.message == "Joint planning failed"
+    assert goal_handle.abort_count == 1
+    assert goal_handle.canceled_count == 0
+
+
 def test_execute_primitive_aborts_when_downstream_cancel_cleanup_times_out():
     node = object.__new__(SkillExecutorNode)
     node._validate_primitive = lambda *_args, **_kwargs: (True, "")

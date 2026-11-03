@@ -146,6 +146,10 @@ def generate_launch_description():
             "namespace_prefix": LaunchConfiguration("ik_worker_namespace_prefix"),
             "use_sim_time": use_sim_time,
             "joint_state_topic": joint_state_topic,
+            # the workers plan in the SAME frame as the primary move_group:
+            # pass the effective runtime URDF down (empty on standalone SO-101
+            # keeps the workers' default render)
+            "robot_description": LaunchConfiguration("robot_description"),
         }.items(),
         condition=IfCondition(PythonExpression(["int('", LaunchConfiguration("ik_worker_count"), "') > 0"])),
     )

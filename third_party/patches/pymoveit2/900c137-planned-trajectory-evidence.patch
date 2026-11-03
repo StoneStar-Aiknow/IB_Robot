@@ -1,0 +1,78 @@
+diff --git a/pymoveit2/moveit2.py b/pymoveit2/moveit2.py
+index 7c8a3f7..a96b6ad 100644
+--- a/pymoveit2/moveit2.py
++++ b/pymoveit2/moveit2.py
+@@ -153,6 +153,8 @@ class MoveIt2:
+         self.motion_suceeded = False
+         self.__execution_goal_handle = None
+         self.__last_error_code = None
++        self.__last_motion_planned = None
++        self.__goal_sequence = 0
+         self.__execution_mutex = threading.Lock()
+ 
+         # Create subscriber for current joint states
+@@ -331,6 +333,38 @@ class MoveIt2:
+     def get_last_execution_error_code(self) -> Optional[MoveItErrorCodes]:
+         return self.__last_error_code
+ 
++    def get_last_motion_planned(self) -> Optional[bool]:
++        """Whether the last move_action goal produced a planned trajectory.
++
++        True or False once that goal reached a terminal state (False = the
++        action aborted before any plan existed, so no trajectory was ever
++        handed to a controller); None while no result has arrived for the
++        current goal (also when the goal was rejected outright).
++        """
++        return self.__last_motion_planned
++
++    def get_last_goal_sequence(self) -> int:
++        """Monotonic count of goals actually sent to an action server.
++
++        Incremented only after the send's readiness check passes, next to
++        the evidence reset, so comparing the value across a send call is
++        POSITIVE evidence of whether a goal was dispatched: the send paths
++        can return without dispatching (the action server unavailable, or
++        ``ignore_new_calls_while_executing`` skipped the call) and the
++        state/evidence alone cannot distinguish that from a goal that
++        terminalized before the first state query.
++        """
++        return self.__goal_sequence
++
++    @staticmethod
++    def result_planned_a_trajectory(result) -> bool:
++        """Whether a MoveGroup action result carries a non-empty plan."""
++        trajectory = result.planned_trajectory
++        return bool(
++            getattr(getattr(trajectory, "joint_trajectory", None), "points", None)
++            or getattr(getattr(trajectory, "multi_dof_joint_trajectory", None), "points", None)
++        )
++
+     ####
+ 
+     def move_to_pose(
+@@ -2115,6 +2149,8 @@ class MoveIt2:
+                 return
+ 
+             self.__last_error_code = None
++            self.__last_motion_planned = None
++            self.__goal_sequence += 1
+             self.__is_motion_requested = True
+             self.__send_goal_future_move_action = (
+                 self.__move_action_client.send_goal_async(
+@@ -2157,6 +2193,7 @@ class MoveIt2:
+                 self.motion_suceeded = True
+ 
+             self.__last_error_code = res.result().result.error_code
++            self.__last_motion_planned = MoveIt2.result_planned_a_trajectory(res.result().result)
+ 
+             self.__execution_goal_handle = None
+             self.__is_executing = False
+@@ -2173,6 +2210,8 @@ class MoveIt2:
+                 return
+ 
+             self.__last_error_code = None
++            self.__last_motion_planned = None
++            self.__goal_sequence += 1
+             self.__is_motion_requested = True
+             self.__send_goal_future_execute_trajectory = (
+                 self._execute_trajectory_action_client.send_goal_async(

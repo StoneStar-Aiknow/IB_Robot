@@ -38,6 +38,11 @@ EXECUTION_RETRYABLE_CODES = frozenset(
         "TF_UNAVAILABLE",
         "RPC_TIMEOUT",
         "RPC_FAILED",
+        # The Gateway's distinct code for a motion primitive whose MoveIt
+        # planning failed before any arm motion (the arm did not move): the
+        # candidate is failed and the next one is tried through this retry
+        # path. A failure after motion started stays PRIMITIVE_ARM_FAILED.
+        "PRIMITIVE_ARM_PLANNING_FAILED",
     }
 )
 

@@ -107,6 +107,8 @@ ensure_ros_third_party_patch_stacks() {
     local fast_calib_patch_dir="${WORKSPACE}/third_party/patches/fast_calib/7747dfc"
     local livox_sdk_patch_dir="${WORKSPACE}/third_party/patches/livox_sdk2"
     local livox_driver_patch_dir="${WORKSPACE}/third_party/patches/livox_ros_driver2"
+    local pymoveit2_src="${WORKSPACE}/src/pymoveit2"
+    local pymoveit2_patch_dir="${WORKSPACE}/third_party/patches/pymoveit2"
 
     _require_ros_submodule_commit \
         "${usb_cam_src}" "cb2ae6bc0a312de629f84fef933fb3e07dac1ef8" "usb_cam" || return 1
@@ -124,6 +126,8 @@ ensure_ros_third_party_patch_stacks() {
         "${fast_calib_src}" "7747dfc6109c04b4bf81d2e3661e41626c8392e1" "FAST-Calib" || return 1
     _require_ros_submodule_commit \
         "${ikd_tree_src}" "e2e3f4e9d3b95a9e66b1ba83dc98d4a05ed8a3c4" "ikd-Tree" || return 1
+    _require_ros_submodule_commit \
+        "${pymoveit2_src}" "900c137499ec70d5a5cb216e24d88e91c7a508fc" "pymoveit2" || return 1
 
     _apply_ros_patch_once \
         "${livox_sdk_src}" \
@@ -140,6 +144,14 @@ ensure_ros_third_party_patch_stacks() {
         "${fast_lio_src}" "${fast_lio_patch_dir}/a4743b-build.patch" || return 1
     _apply_ros_patch_once \
         "${fast_lio_src}" "${fast_lio_patch_dir}/a4743b-runtime.patch" || return 1
+    # pymoveit2 (code review r1 item 1, revision 2): the planned-trajectory
+    # evidence patch the motion server's PLANNING_FAILED classification reads
+    # (get_last_motion_planned). Delivered as a managed patch against the
+    # pinned 900c137 base exactly like the fast_lio stack — never as a
+    # submodule commit; the gitlink stays unchanged.
+    _apply_ros_patch_once \
+        "${pymoveit2_src}" \
+        "${pymoveit2_patch_dir}/900c137-planned-trajectory-evidence.patch" || return 1
     _ensure_fast_calib_patch_stack "${fast_calib_src}" "${fast_calib_patch_dir}" || return 1
     log_done "ROS third-party sources are ready"
 }

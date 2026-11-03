@@ -34,6 +34,14 @@ def _launch_setup(context):
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() in ("1", "true", "yes")
     log_level = LaunchConfiguration("log_level").perform(context)
     joint_state_topic = LaunchConfiguration("joint_state_topic").perform(context)
+    # The effective runtime URDF (revision-2 E2E bring-up fix): the includer
+    # passes the same robot_description the primary move_group received, so
+    # the workers plan in the SAME frame as the primary (the default-args
+    # render's root differs on runtimes that rename the arm root, e.g.
+    # lekiwi's arm_root — the workers then TF-fail on every request). Empty
+    # keeps the standalone default render (SO-101 behaviour unchanged).
+    robot_description = context.launch_configurations.get("robot_description") or ""
+    robot_description_override = robot_description.strip()
 
     robot_description_dir = get_package_share_directory("so101_description")
     so101_urdf_path = os.path.join(robot_description_dir, "urdf", "lerobot", "so101", "so101.urdf.xacro")
@@ -55,6 +63,8 @@ def _launch_setup(context):
         "publish_robot_description_semantic": False,
         "disable_capabilities": _DISABLED_CAPABILITIES,
     }
+    if robot_description_override:
+        common_parameters["robot_description"] = robot_description_override
     return [
         Node(
             package="moveit_ros_move_group",
@@ -89,6 +99,11 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("joint_state_topic", default_value="/joint_states"),
+            DeclareLaunchArgument(
+                "robot_description",
+                default_value="",
+                description="Effective runtime URDF; empty renders the standalone default",
+            ),
             DeclareLaunchArgument("log_level", default_value="warn"),
             OpaqueFunction(function=_launch_setup),
         ]

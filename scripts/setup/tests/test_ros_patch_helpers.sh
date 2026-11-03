@@ -52,7 +52,7 @@ echo 'PASS: wrong base and missing source rejected'
 
 # Exercise the actual dispatcher with harmless stand-ins for unrelated packages.
 WORKSPACE="${TMP}/workspace"
-mkdir -p "${WORKSPACE}/third_party/patches/usb_cam/0.8.1"
+mkdir -p "${WORKSPACE}/third_party/patches/usb_cam/0.8.1" "${WORKSPACE}/third_party/patches/pymoveit2"
 _require_ros_submodule_commit() { printf 'base %s %s\n' "$1" "$2" >> "${TMP}/calls"; }
 _apply_ros_patch_once() { printf 'patch %s %s\n' "$1" "$2" >> "${TMP}/calls"; }
 _migrate_fast_lio_build_patch() { :; }
@@ -62,3 +62,10 @@ ensure_ros_third_party_patch_stacks
 grep -Fx "base ${WORKSPACE}/src/usb_cam cb2ae6bc0a312de629f84fef933fb3e07dac1ef8" "${TMP}/calls"
 grep -Fx "patch ${WORKSPACE}/src/usb_cam ${WORKSPACE}/third_party/patches/usb_cam/0.8.1/0001-upstream-pr378-raw-mjpeg-routing.patch" "${TMP}/calls"
 echo 'PASS: ROS dispatcher wires the single usb_cam patch directly'
+
+# The pymoveit2 managed patch (review r1 item 1): the dispatcher must pin the
+# 900c137 base and apply the planned-trajectory-evidence patch from
+# third_party/patches/pymoveit2 — the same require+apply pair fast_lio uses.
+grep -Fx "base ${WORKSPACE}/src/pymoveit2 900c137499ec70d5a5cb216e24d88e91c7a508fc" "${TMP}/calls"
+grep -Fx "patch ${WORKSPACE}/src/pymoveit2 ${WORKSPACE}/third_party/patches/pymoveit2/900c137-planned-trajectory-evidence.patch" "${TMP}/calls"
+echo 'PASS: ROS dispatcher wires the pymoveit2 planned-trajectory-evidence patch'
