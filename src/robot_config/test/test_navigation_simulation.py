@@ -62,6 +62,11 @@ from std_msgs.msg import Bool, String
 from tf2_msgs.msg import TFMessage
 
 from ibrobot_msgs.msg import RuntimeStatus
+from robot_config.testing.navigation_staging import (
+    NAVIGATION_STAGING,
+    load_staged_navigation_config,
+    stage_navigation_config,
+)
 from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict
 from robot_runtime_sim.testing.sim_environment import (
@@ -77,11 +82,6 @@ from robot_runtime_sim.testing.sim_ground_truth import (
     terminate_marked_processes,
 )
 from sim_models.scene_compiler import get_scene_file
-from test.navigation_sim_support import (
-    NAVIGATION_STAGING,
-    load_staged_navigation_config,
-    stage_navigation_config,
-)
 
 POSITION_TOLERANCE = 0.25
 SIM_STARTUP_TIMEOUT = 240.0
@@ -108,6 +108,16 @@ PHYSICS_PLATFORMS = ("gazebo", "mujoco")
 WORLD_NAME = "demo"  # the scene template's world name
 MODEL_NAME = "lekiwi_robot"  # the runtime's model name in the simulator
 SCENE_NAME = "nav_room"
+#: The per-staging scene and map (lekiwi-nav-grasp D6): both navigation
+# stagings run nav_room and its map; the pick E2E stages its own overlay.
+STAGING_SCENE = {
+    "lekiwi_lidar": "nav_room",
+    "lekiwi_nav_grasp": "nav_room",
+}
+STAGING_MAP = {
+    "lekiwi_lidar": "sim_map.yaml",
+    "lekiwi_nav_grasp": "sim_map.yaml",
+}
 
 SPAWN_X = -1.5
 SPAWN_Y = -1.5
@@ -260,14 +270,16 @@ def test_staged_navigation_overlay_resolves_the_production_stage(tmp_path, sim_p
         stage_navigation_config(tmp_path, sim_platform=sim_platform, base_config=base_config)
     )
 
-    # the provider path with the production navigation stage selected
+    # the provider path with the production navigation stage selected; the
+    # profile is the staging pair's BASE configuration (the grasp overlay
+    # stages the same lekiwi_nav_grasp base as the navigation overlay)
     assert config["runtime"]["provider"] == "lekiwi_robot"
-    assert config["runtime"]["profile"] == base_config
+    assert config["runtime"]["profile"] == NAVIGATION_STAGING[base_config][0].removesuffix(".yaml")
     assert config["nav_stage"] == "navigation"
 
     # the platform under test and the scene with its spawn (inside the stage)
     assert config["simulation"]["platform"] == sim_platform
-    assert config["simulation"]["scene"] == SCENE_NAME
+    assert config["simulation"]["scene"] == STAGING_SCENE[base_config]
     assert config["simulation"]["robot_spawn"] == {"x": SPAWN_X, "y": SPAWN_Y, "z": 0.05, "yaw": 0.0}
 
     # the navigation stage stays production: FAST-LIO, admission, collision
@@ -278,11 +290,11 @@ def test_staged_navigation_overlay_resolves_the_production_stage(tmp_path, sim_p
     assert navigation["nav2_bringup"]["use_amcl"] is True
     assert navigation["nav2_bringup"]["auto_global_localization"] is False
     assert navigation["nav2_bringup"]["dyn_avoid_enabled"] is True
-    assert navigation["nav2_bringup"]["map_file"].endswith("maps/sim_map.yaml")
+    assert navigation["nav2_bringup"]["map_file"].endswith(f"maps/{STAGING_MAP[base_config]}")
     # the Nav2 parameter variant follows the base configuration: the base-only
     # footprint (robot_radius 0.22) or the mobile manipulator's measured
     # footprint (robot_radius 0.28, the stowed arm's planar extent; D7)
-    expected_params = "nav2_params_navgrasp_sim.yaml" if base_config == "lekiwi_nav_grasp" else "nav2_params_sim.yaml"
+    expected_params = "nav2_params_navgrasp_sim.yaml" if base_config != "lekiwi_lidar" else "nav2_params_sim.yaml"
     assert navigation["nav2_bringup"]["params_file"].endswith(expected_params)
     # no static map -> odom is composed anywhere in the config
     for static_tf in navigation.get("static_tfs", []):
@@ -310,19 +322,19 @@ def test_shipped_navigation_overlay_pins_gazebo():
     """D15: the shipped overlays stay Gazebo-pinned — only the staged copy
     carries the platform under test (the D14 gate staging pattern); the
     mobile manipulator's overlay follows the same rule (D7)."""
-    from test.navigation_sim_support import _package_dir, overlay_name
+    from robot_config.testing.navigation_staging import overlay_name, robot_config_share_root
 
     for base_config in sorted(NAVIGATION_STAGING):
         shipped = yaml.safe_load(
-            (_package_dir() / "test" / "config" / overlay_name(base_config)).read_text(encoding="utf-8")
+            (robot_config_share_root() / "test" / "config" / overlay_name(base_config)).read_text(encoding="utf-8")
         )
         assert shipped["robot"]["nav_stages"]["navigation"]["simulation"]["platform"] == "gazebo", base_config
 
 
-def test_staging_fails_loudly_without_a_simulation_section(tmp_path, monkeypatch):
+def test_staging_fails_loudly_without_a_simulation_section(tmp_path):
     """An overlay without ``navigation.simulation`` must fail staging, not
     silently stage a platform nobody set (the loud-staging rule, D15)."""
-    import test.navigation_sim_support as support
+    from robot_config.testing.navigation_staging import stage_navigation_config
 
     package = tmp_path / "pkg"
     (package / "config" / "robots").mkdir(parents=True)
@@ -331,9 +343,8 @@ def test_staging_fails_loudly_without_a_simulation_section(tmp_path, monkeypatch
     (package / "test" / "config" / "lekiwi_navi_sim.yaml").write_text(
         "robot:\n  base_config: lekiwi_lidar\n  nav_stages:\n    navigation: {}\n", encoding="utf-8"
     )
-    monkeypatch.setattr(support, "_package_dir", lambda: package)
     with pytest.raises(ValueError, match="navigation.simulation"):
-        support.stage_navigation_config(tmp_path / "out", sim_platform="mujoco")
+        stage_navigation_config(tmp_path / "out", sim_platform="mujoco", package_root=package)
 
 
 # ---------------------------------------------------------------------------

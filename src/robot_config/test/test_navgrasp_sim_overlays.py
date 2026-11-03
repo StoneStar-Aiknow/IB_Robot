@@ -19,13 +19,13 @@ import yaml
 
 from robot_config.launch_builders.runtime import _write_peripherals_fragment
 from robot_config.loader import load_robot_config_dict
+from robot_config.testing.navigation_staging import robot_config_share_root, stage_navigation_config
 from robot_runtime.interface_description import (
     build_description,
     merge_peripherals,
     platform_peripherals,
 )
 from robot_runtime.profile import load_profile
-from test.navigation_sim_support import _package_dir, stage_navigation_config
 
 PHYSICS_PLATFORMS = ("gazebo", "mujoco")
 
@@ -82,7 +82,7 @@ def test_nav_grasp_navi_overlay_binds_on_both_physics_platforms(tmp_path, sim_pl
 def test_nav_grasp_lio_overlay_binds_on_both_physics_platforms(tmp_path, sim_platform):
     """robot_navigation's gate copy stages the same chain (sibling assets)."""
     package = Path(__file__).resolve().parents[2] / "robot_navigation"
-    robot_config_package = _package_dir()
+    robot_config_package = robot_config_share_root()
     destination = tmp_path / "staged"
     destination.mkdir(parents=True)
     # the loader resolves sibling bases only: stage the shipped base next to

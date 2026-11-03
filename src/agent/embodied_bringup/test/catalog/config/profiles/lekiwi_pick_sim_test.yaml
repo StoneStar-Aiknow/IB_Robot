@@ -1,0 +1,32 @@
+# R-S1/R2 development staging catalog PROFILE for the hybrid pick-sim E2E
+# (design R1 + refinement after spec review r2-2). This file is the only
+# committed piece of the staging catalog: the skill packages it enables are
+# COPIED from the shipped skill_catalog share at staging time
+# (robot_config.testing.navigation_staging), so no second copy of production
+# skill packages lives in the test tree.
+#
+# robot_name must equal the STAGED robot.name
+# (lekiwi_nav_grasp.yaml robot.name: lekiwi_handeye_realsense_grasp_lidar) —
+# validator.py rejects a profile whose robot_name differs from the robot
+# context. The enabled set is the pick_object CATALOG closure: the validator
+# enforces do_not_use.instead_use references (pick_object →
+# place_in_container → open_gripper_skill → close_gripper_skill), and all
+# four share the delegated grasp_pipeline implementation. No other skill is
+# enabled. Compile and digest validation stay on (the development source
+# re-validates the release digest before and after a compile).
+schema_version: 1
+name: lekiwi_pick_sim_test
+robot_name: lekiwi_handeye_realsense_grasp_lidar
+enabled_skills:
+- name: pick_object
+  implementation: lekiwi_handeye_realsense_grasp
+  planner_visible: true
+- name: place_in_container
+  implementation: lekiwi_handeye_realsense_grasp
+  planner_visible: true
+- name: open_gripper_skill
+  implementation: lekiwi_handeye_realsense_grasp
+  planner_visible: true
+- name: close_gripper_skill
+  implementation: lekiwi_handeye_realsense_grasp
+  planner_visible: true

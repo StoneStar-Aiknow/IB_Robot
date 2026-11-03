@@ -1,0 +1,166 @@
+# Hybrid-stage simulation overlay for the production pick pipeline in
+# simulation (lekiwi-nav-grasp-mobile-manipulation revision 2, R1/R2; the
+# staged copy runs the E2E test_mobile_pick_simulation.py on MuJoCo and
+# Gazebo). base_config selects the shipped production lekiwi_nav_grasp.yaml;
+# every override sits INSIDE nav_stages.hybrid, so the stage merge (stage
+# values apply last; dicts deep-merge, lists replace) applies them to the
+# production hybrid stage — the stage that already runs navigation and the
+# embodied stack together (default_control_mode: base_navigation,
+# skill_required_control_mode: moveit_planning). Exactly one stage runs
+# (nav_stage:=hybrid on the launch).
+#
+# The development staging catalog (R1 refinement after spec review r2-2):
+# a DevelopmentStagingSkillSource staging root holding config/profiles (a
+# test profile whose robot_name matches the staged robot.name) and
+# config/skills (copies of the used skill packages, unchanged). The stager
+# (test.pick_sim_staging.stage_pick_sim_config — the pick staging that
+# moved into this package's test dir, review r1 item 12;
+# robot_config.testing.navigation_staging keeps the generic staging only)
+# rewrites skill_catalog_source_root to the STAGED catalog copy; compile and
+# digest validation stay on. No loader change.
+#
+# The four R-S1 integration fixes this overlay carries (measured on
+# 2026-10-31, runs/rev2-step1 + R-S4 layer isolation):
+# 1. runtime.require_model: true — the shipped lekiwi hybrid config declares
+#    no logical interface consumers, so the launch would take the eager path:
+#    the embodied consumer pass never runs (extra_consumers is only consumed
+#    on the live-binding branch) and task_executor re-binds OFFLINE from the
+#    staged YAML and crashes with description_required. Legal here: no
+#    ros2_control section, no control_modes.*.controllers (both live in the
+#    runtime profile); so101_single_arm precedent.
+# 2. task_dispatch interface bindings — provider task_executor resolves its
+#    motion surfaces ONLY from public logical interfaces; an empty gripper
+#    default dies with interface_required.
+# 3. the development staging catalog — the validator enforces the
+#    do_not_use.instead_use closure (pick_object → place_in_container →
+#    open_gripper_skill → close_gripper_skill), so the test profile enables
+#    exactly those four skills.
+# 4. embodied.execution_store_path inside the embodied block — the machine-
+#    global default ~/.ros/ibrobot/executions.sqlite3 is a single-flock-writer
+#    store another live embodied stack may hold; the E2E stages its own.
+robot:
+  base_config: lekiwi_nav_grasp
+
+  nav_stages:
+    hybrid:
+      # ── live interface binding (R-S1 fix 1) ──────────────────────────────
+      runtime:
+        require_model: true
+
+      # ── task_dispatch interface bindings (R-S1 fix 2) ────────────────────
+      task_dispatch:
+        move_to_pose_interface: motion.move_to_pose
+        gripper_trajectory_interface: joint.trajectory_gripper
+        joint_state_interface: joint.state
+
+      # ── simulation (R1) ──────────────────────────────────────────────────
+      # scene nav_grasp_room (D1) and its layout spawn; `platform` is
+      # rewritten by the stager to the platform under test (the shipped value
+      # pins gazebo, the D14 gate-staging pattern).
+      simulation:
+        platform: gazebo
+        scene: nav_grasp_room
+        robot_spawn:
+          x: -1.5
+          y: -1.5
+          z: 0.05
+          yaw: 0.0
+
+      # ── peripherals (R1): the front camera and audio are not simulated ───
+      peripheral_names: [wrist, mid360]
+
+      # the front camera is absent, so its calibration artifact must not be
+      # projected into the wrist-only config (the shipped wrist-only grasp
+      # stage's rule)
+      sensor_calibration:
+        artifacts:
+          base_to_front_camera: ""
+
+      # ── semantic mapping off (R1) ────────────────────────────────────────
+      semantic_mapping:
+        enabled: false
+
+      # ── perception reduced to the CUDA grasp detection (R1/R2) ───────────
+      # Values copied from the shipped CUDA fixture
+      # lekiwi_handeye_realsense_grasp_pc.yaml — the loader cannot inherit
+      # across robot configs; "<pc>:<line>" cites the source line.
+      perception_services:
+        services:
+          - id: grasp_grounding
+            enabled: true
+            required: true
+            # pc:86 (replaces the 310P grounding_dino_swint_seq8_1280x720)
+            bundle_path: models/grounded_sam2_swint_ogc
+            # pc:87
+            deployment: torch_cuda
+            # pc:88 — GroundingDetectPlugin (grounded_sam2, inline masks),
+            # not the 310P GroundingDINORawDetectPlugin
+            adapter_class: perception_service.model_service_plugins:GroundingDetectPlugin
+            # pc:89
+            service_type: ibrobot_msgs/srv/GroundingDetect
+            # pc:90
+            endpoint: /perception/grasp/grounding_detect
+            # pc:91
+            node_name: grasp_grounding_detect
+
+      # ── grasp execution on CUDA (R2) ─────────────────────────────────────
+      grasp_execution:
+        # pc:99
+        model_deployment: torch_cuda
+        # pc:105 — grounded_sam2 returns inline masks, so the prompt
+        # segmentation service is dropped
+        segment_service: ""
+        planner_node:
+          # pc:245
+          inference_backend: local_cuda
+          # pc:246
+          device: cuda
+          # pc:247
+          local_manifest_path: "$(env WORKSPACE)/models/graspgen"
+          # pc:248
+          local_deployment_name: torch_cuda
+        camera:
+          # R2 Gazebo note: Gazebo publishes no aligned-depth CameraInfo —
+          # colour and depth share intrinsics there (measured in revision 1;
+          # robot_runtime gazebo.py bridges only /camera/<name>/camera_info).
+          # The colour CameraInfo topic works on BOTH platforms: MuJoCo
+          # publishes it natively (mujoco.py camera plugin info_topic) and
+          # relays it to the aligned-depth name as well.
+          camera_info_topic: /camera/wrist/camera_info
+
+      # ── embodied stack (R1) ──────────────────────────────────────────────
+      embodied:
+        # R1 catalog decision: the development staging catalog (the stager
+        # rewrites this root to the staged copy)
+        skill_catalog_profile: lekiwi_pick_sim_test
+        skill_catalog_source_root: ""
+        idle_behaviors:
+          # sound following off (R1): the production hybrid stage ships it
+          # enabled-but-inactive; the sim stage has no microphone.
+          sound_orientation:
+            enabled: false
+        # imitate human motion off (R1): its HRI model services are gone.
+        imitate_human_motion:
+          enabled: false
+        # R-S1 fix 4: the execution store is per-run staged state (the
+        # machine-global default is a single-flock-writer store a parallel
+        # embodied stack may hold); the stager points this at the run dir.
+        execution_store_path: ""
+
+      # ── HRI / audio off (R1) ─────────────────────────────────────────────
+      speech_direction:
+        enabled: false
+      voice_tts:
+        enabled: false
+      voice_asr:
+        enabled: false
+
+      # ── navigation (R1): the sim scene's map and Nav2 parameters ────────
+      navigation:
+        nav2_bringup:
+          map_file: $(find robot_navigation)/config/maps/nav_grasp_room.yaml
+          params_file: $(find robot_navigation)/config/nav2_params_navgrasp_sim.yaml
+          # deterministic localisation as in the navigation sim overlay
+          auto_global_localization: false
+        rviz:
+          enabled: false

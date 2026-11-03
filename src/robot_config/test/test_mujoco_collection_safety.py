@@ -40,11 +40,11 @@ from robot_runtime.testing.collection_safety import import_module_with_blocked_i
 #: The MuJoCo-only imports the e2e module must keep inside gated code paths.
 _BLOCKED_MODULES = ("mujoco", "mujoco_ros2_control_msgs", "mujoco_ros2_control")
 
-#: The e2e module imports its helpers as the source-path ``test`` package
-#: (``from test.navigation_sim_support import ...`` — setup.py deliberately
-#: does not install that package), so the subprocess runs from the package
-#: root and imports the module THROUGH the package, exactly like the live
-#: pytest collection does.
+#: The e2e module imports its helpers through the installed
+#: ``robot_config.testing`` staging module (moved there in revision 2, R8)
+#: and the workspace-root conftest's ROS isolation, so the subprocess runs
+#: from the package root and imports the module THROUGH the source-path
+#: ``test`` package, exactly like the live pytest collection does.
 _E2E_MODULES = ("test.test_navigation_simulation",)
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
