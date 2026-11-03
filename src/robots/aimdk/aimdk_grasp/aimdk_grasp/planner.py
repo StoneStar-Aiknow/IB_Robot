@@ -334,6 +334,22 @@ def _skip_static_scene_spheres(scene_collision, static):
         setattr(scene_collision, name, lambda state, *a, _query=query, **k: _query(masked(state), *a, **k))
 
 
+def scene_capacity(scene, validation_scene):
+    """Reserve environment, target and standing-leg slots before CUDA graph capture.
+
+    Warmup has no target mask, so its mesh count is smaller than a pick's.
+    A lazy fine scene stays deferred; its standard third mesh is the leg.
+    Preserve larger caller-supplied scenes too.
+    """
+    scenes = [scene]
+    if not isinstance(validation_scene, LazyScene):
+        scenes.append(validation_scene)
+    return {
+        "mesh": max(3, *(len(value.get("mesh", {})) for value in scenes)),
+        "cuboid": max(1, *(len(value.get("cuboid", {})) for value in scenes)),
+    }
+
+
 class LeftArmPlanner:
     """Plans and checks only the motion of one arm (``side``, the left by default); hardware transport is separate.
 
@@ -532,6 +548,7 @@ class LeftArmPlanner:
         self._checker_lock = RLock()
         self._checker_batch_size = None
         self._pending_validation_scene = validation_scene if isinstance(validation_scene, LazyScene) else None
+        self._scene_capacity = scene_capacity(scene, validation_scene)
         config = robot_config(feedback, side=side, reference_hand_collisions=reference_hand_collisions)
         kin = config["robot_cfg"]["kinematics"]
         self.collision_sphere_links = [
@@ -557,6 +574,7 @@ class LeftArmPlanner:
         motion_config = MotionPlannerCfg.create(
             robot=motion_robot,
             scene_model=copy.deepcopy(scene),
+            collision_cache=dict(self._scene_capacity),
             self_collision_check=True,
             optimizer_collision_activation_distance=activation_distance,
             max_goalset=max_goalset,
@@ -603,6 +621,8 @@ class LeftArmPlanner:
                         scene if self._pending_validation_scene is not None else validation_scene
                     ),
                     collision_activation_distance=0.0,
+                    n_meshes=self._scene_capacity["mesh"],
+                    n_cuboids=self._scene_capacity["cuboid"],
                 )
             )
             use_gpu_validation_meshes(self.checker.scene_model)
@@ -657,7 +677,11 @@ class LeftArmPlanner:
             max_goalset=1,
         )
         checker = create_collision_checker(
-            SceneCollisionCfg(device_cfg=DeviceCfg(), scene_model=SceneCfg.create(copy.deepcopy(scene)))
+            SceneCollisionCfg(
+                device_cfg=DeviceCfg(),
+                scene_model=SceneCfg.create(copy.deepcopy(scene)),
+                cache=dict(self._scene_capacity),
+            )
         )
         ik_config.exit_early_batch_success_threshold = self._screen_exit_early_fraction
         solver = IKSolver(ik_config, checker)
@@ -725,7 +749,8 @@ class LeftArmPlanner:
         """Replace coarse/fine meshes without rebuilding solvers or CUDA graphs.
 
         Serialized calls only. Receipt time comes from the new depth estimate,
-        never from completion time. Capacity is fixed by the initial scene.
+        never from completion time. Capacity is reserved before warmup, including
+        the target mesh absent from the startup scene.
         """
         import torch
         from curobo._src.geom.types import SceneCfg

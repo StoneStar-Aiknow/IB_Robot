@@ -7,7 +7,7 @@ import pytest
 from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.hand import HandMapping, hand_links
 from aimdk_grasp.joints import HEAD, LEFT_ARM, RIGHT_ARM
-from aimdk_grasp.planner import grasp_to_palm_transform, palm_goal_from_camera_grasp, robot_config
+from aimdk_grasp.planner import grasp_to_palm_transform, palm_goal_from_camera_grasp, robot_config, scene_capacity
 from aimdk_grasp.robot_model import planning_model
 from aimdk_grasp.trajectory import TimedTrajectory
 from test_hand import PRESETS
@@ -146,3 +146,20 @@ def test_a_right_arm_plan_keeps_the_right_joints_and_the_locked_left_arm():
         TimedTrajectory.from_curobo(result(names, q), 0.02, locked_positions=locked)  # planned as the left arm
     with pytest.raises(ValueError, match="seven joints of one arm"):
         TimedTrajectory(np.array([0.0, 0.1]), np.zeros((2, 7)), LEFT_ARM[:6] + RIGHT_ARM[:1])
+
+
+@pytest.mark.parametrize("meshes", [0, 1, 5])
+def test_warmup_reserves_the_target_and_fine_leg_without_materializing_depth(meshes):
+    from aimdk_grasp.scene_estimation import LazyScene
+
+    def unexpected_materialization():
+        pytest.fail("Sizing the collision cache must not build the fine mesh")
+
+    scene = {"mesh": dict.fromkeys(range(meshes)), "cuboid": {"table": {}, "leg": {}}}
+    lazy = LazyScene(unexpected_materialization)
+    capacity = scene_capacity(scene, lazy)
+    assert capacity["mesh"] >= max(3, meshes)
+    assert capacity["cuboid"] >= len(scene["cuboid"])
+    fine = {"mesh": dict.fromkeys(range(6)), "cuboid": dict.fromkeys(range(4))}
+    capacity = scene_capacity(scene, fine)
+    assert capacity["mesh"] >= 6 and capacity["cuboid"] >= 4

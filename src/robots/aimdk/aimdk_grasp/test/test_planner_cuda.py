@@ -16,7 +16,7 @@ import pytest
 from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.joints import HEAD, LEFT_ARM, RIGHT_ARM
 from aimdk_grasp.leg_obstacle import leg_obstacle
-from aimdk_grasp.scene_estimation import LEG_OBSTACLE, SceneEstimate, SupportPlane
+from aimdk_grasp.scene_estimation import LEG_OBSTACLE, LazyScene, SceneEstimate, SupportPlane
 from test_planner_contracts import GRIPPER
 
 torch = pytest.importorskip("torch")
@@ -107,3 +107,21 @@ def test_the_standing_leg_and_a_hand_behind_the_torso_are_invalid(planner):
     x, y, z = (float(value) for value in said.split("at torso (")[1].split(")")[0].split(", "))
     assert abs(x) < 0.4 and z < 0.0
     assert planner.violations(start[None]) == "no violation"
+
+
+def test_first_target_after_warmup_reuses_all_three_collision_models(planner):
+    value, feedback, now = planner
+    models = value._scene_models()
+    table = {"dims": [0.6, 1.0, 0.04], "pose": [0.55, 0.15, -0.62, 1.0, 0.0, 0.0, 0.0]}
+    far = box(np.array([1.5, -1.0, 0.0]), 0.05)
+    target = box(np.array([1.6, -1.0, 0.0]), 0.05)
+    scene = {"cuboid": {"table": table}, "mesh": {"environment": far, "target": target}}
+    fine = {"cuboid": {"table": table}, "mesh": {**scene["mesh"], LEG_OBSTACLE: leg_obstacle()}}
+    support = SupportPlane(np.array([0.55, 0.15, -0.60]), np.array([0.0, 0.0, 1.0]), np.empty((0, 3)))
+    estimate = SceneEstimate(scene, now, 2, "torso_link", False, support, {}, LazyScene(lambda: fine))
+    value.update_scene(feedback, estimate)
+    value.load_validation_scene()
+    assert all(current is original for current, original in zip(value._scene_models(), models, strict=True))
+    assert value._warmed and not value._closed
+    assert all(model.data.meshes.max_n >= 3 for model in models)
+    assert value.constraint_diagnostics(feedback.vector(LEFT_ARM)[None])["valid"].all()
