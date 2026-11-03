@@ -187,6 +187,7 @@ def _add_skill_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--motion-distance", type=float)
     parser.add_argument("--arm-side")
     parser.add_argument("--imitation-duration-sec", type=float)
+    parser.add_argument("--approach")
     parser.add_argument("--direction")
     parser.add_argument("--distance", type=float)
     parser.add_argument("--degree", type=float)
@@ -339,6 +340,7 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
         "motion_distance": getattr(args, "motion_distance", None),
         "arm_side": getattr(args, "arm_side", None),
         "imitation_duration_sec": getattr(args, "imitation_duration_sec", None),
+        "approach": getattr(args, "approach", None),
         "direction": getattr(args, "direction", None),
         "distance": getattr(args, "distance", None),
         "degree": getattr(args, "degree", None),
@@ -476,6 +478,7 @@ def _prepare_request(
         motion_distance=0.0 if args.motion_distance is None else args.motion_distance,
         arm_side=getattr(args, "arm_side", None),
         imitation_duration_sec=getattr(args, "imitation_duration_sec", None),
+        approach=getattr(args, "approach", None),
         direction=args.direction,
         distance=(
             float(getattr(args, "stand_off_distance_m", None))

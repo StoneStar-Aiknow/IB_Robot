@@ -340,6 +340,9 @@ class SafetyGuardNode(Node):
                 yaw=request.yaw if request.has_yaw else None,
                 schema_version=request_schema_version,
                 primitive_descriptors=snapshot.primitive_descriptors,
+                arm_groups=robot_context.get("arm_groups", {}),
+                gripper_approach=robot_context.get("gripper_approach", {}),
+                approach=getattr(request, "approach", ""),
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
@@ -450,6 +453,10 @@ class SafetyGuardNode(Node):
                 request.navigation_value,
                 schema_version=request_schema_version,
                 primitive_descriptors=snapshot.primitive_descriptors,
+                target_group=request.target_group,
+                arm_groups=robot_context.get("arm_groups", {}),
+                motion_limits=robot_context.get("motion_limits", {}),
+                gripper_approach=robot_context.get("gripper_approach", {}),
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")

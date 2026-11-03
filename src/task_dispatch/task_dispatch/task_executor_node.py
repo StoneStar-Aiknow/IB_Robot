@@ -44,7 +44,7 @@ from ibrobot_msgs.msg import TaskStep
 from ibrobot_msgs.srv import MoveToPose
 from robot_config.contract_utils import qos_profile_from_dict
 from robot_config.interface_binding import InterfaceBindingError, resolve_robot_interfaces
-from robot_config.loader import load_robot_section
+from robot_config.loader import load_robot_section, robot_requires_arm_surface
 from robot_runtime import contract as RUNTIME
 
 
@@ -53,11 +53,13 @@ def _load_robot_yaml(config_path: str) -> dict:
     resolved_path, robot_config = load_robot_section(config_path)
     runtime = robot_config.get("runtime") or {}
     if runtime.get("provider"):
+        # A runtime that owns its own motion (embodied.arm_surface: false) publishes no
+        # public model; its gripper joints come from task_dispatch.groups instead.
         robot_config = resolve_robot_interfaces(
             {
                 **robot_config,
                 "_config_path": str(resolved_path),
-                "runtime": {**runtime, "require_model": True},
+                "runtime": {**runtime, "require_model": robot_requires_arm_surface(robot_config)},
             }
         )
     return robot_config
@@ -141,13 +143,12 @@ class TaskExecutorNode(Node):
             callback_group=self._cb_group,
         )
 
-        # ---- Action Client: Gripper trajectory controller ----
-        self._gripper_action_client = ActionClient(
-            self,
-            FollowJointTrajectory,
-            self._gripper_action_name,
-            callback_group=self._cb_group,
-        )
+        # ---- Action Clients: Gripper trajectory controller, one per motion group ----
+        self._gripper_clients = {
+            group: ActionClient(self, FollowJointTrajectory, action_name, callback_group=self._cb_group)
+            for group, (_joint, action_name, _limits) in self._gripper_bindings.items()
+        }
+        self._gripper_action_client = self._gripper_clients[self._default_group]
 
         # ---- Subscriber: Joint states (for gripper feedback) ----
         self._latest_joint_state = None
@@ -185,6 +186,17 @@ class TaskExecutorNode(Node):
     # ------------------------------------------------------------------ #
 
     def _configure_interfaces(self) -> None:
+        self._group_bindings = None
+        self._configure_single_group()
+        # Contract v2: TaskStep.target_group names the motion group; "" = the default group.
+        if self._group_bindings:
+            self._default_group = self._group_default
+            self._gripper_bindings = dict(self._group_bindings)
+        else:
+            self._default_group = ""
+            self._gripper_bindings = {"": (self._gripper_joint, self._gripper_action_name, self._gripper_limits)}
+
+    def _configure_single_group(self) -> None:
         runtime = self._robot_cfg.get("runtime") or {}
         self._gripper_limits = None
         if not runtime.get("provider"):
@@ -195,6 +207,10 @@ class TaskExecutorNode(Node):
             return
 
         model = self._robot_cfg.get("robot_model")
+        bindings = self._robot_cfg.get("task_dispatch") or {}
+        if not model and isinstance(bindings, dict) and bindings.get("groups"):
+            self._configure_groups(runtime, bindings)
+            return
         if not model:
             raise InterfaceBindingError("model_required", "robot_model", "task execution requires public joint groups")
         gripper_joints = model["joint_groups"]["gripper"]
@@ -239,6 +255,73 @@ class TaskExecutorNode(Node):
             )
         self._joint_state_topic = state["endpoint"]
         self._joint_state_qos = qos_profile_from_dict(state["qos"])
+
+    def _resolve_interface(self, runtime: dict, path: str, interface_id, kind: str, message_type: str) -> dict:
+        if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+            raise InterfaceBindingError("interface_required", path, "select a public logical interface ID")
+        interface = runtime["interface_description"]["interfaces"].get(interface_id)
+        if interface is None:
+            raise InterfaceBindingError("unknown_interface", path, interface_id)
+        expected_direction = "publish" if kind == "topic" else "serve"
+        if (interface["kind"], interface["direction"], interface["message_type"]) != (
+            kind,
+            expected_direction,
+            message_type,
+        ):
+            raise InterfaceBindingError(
+                "interface_mismatch", path, f"requires {kind} {message_type} {expected_direction}"
+            )
+        return interface
+
+    def _configure_groups(self, runtime: dict, bindings: dict) -> None:
+        """Multi-arm runtime without a public model: one gripper binding per motion group.
+
+        ``task_dispatch.groups.<group>`` = ``{gripper_joint, gripper_trajectory_interface}``;
+        ``task_dispatch.default_group`` serves steps whose target_group is empty.
+        """
+        groups = bindings["groups"]
+        if not isinstance(groups, dict):
+            raise InterfaceBindingError("invalid_binding", "task_dispatch.groups", "must be a mapping")
+        move = self._resolve_interface(
+            runtime,
+            "task_dispatch.move_to_pose_interface",
+            bindings.get("move_to_pose_interface", "motion.move_to_pose"),
+            "service",
+            "ibrobot_msgs/srv/MoveToPose",
+        )
+        state = self._resolve_interface(
+            runtime,
+            "task_dispatch.joint_state_interface",
+            bindings.get("joint_state_interface", "joint.state"),
+            "topic",
+            "sensor_msgs/msg/JointState",
+        )
+        resolved = {}
+        for group, spec in groups.items():
+            path = f"task_dispatch.groups.{group}"
+            if not isinstance(spec, dict) or not isinstance(spec.get("gripper_joint"), str):
+                raise InterfaceBindingError(
+                    "invalid_binding", path, "needs gripper_joint and gripper_trajectory_interface"
+                )
+            action = self._resolve_interface(
+                runtime,
+                f"{path}.gripper_trajectory_interface",
+                spec.get("gripper_trajectory_interface"),
+                "action",
+                "control_msgs/action/FollowJointTrajectory",
+            )
+            if spec["gripper_joint"] not in state.get("joint_names", []):
+                raise InterfaceBindingError("joint_mismatch", path, "gripper feedback absent")
+            resolved[str(group)] = (spec["gripper_joint"], action["endpoint"], {"min": 0.0, "max": 1.0})
+        default_group = str(bindings.get("default_group", ""))
+        if default_group not in resolved:
+            raise InterfaceBindingError("invalid_binding", "task_dispatch.default_group", "must name one of the groups")
+        self._move_service_name = move["endpoint"]
+        self._joint_state_topic = state["endpoint"]
+        self._joint_state_qos = qos_profile_from_dict(state["qos"])
+        self._gripper_joint, self._gripper_action_name, self._gripper_limits = resolved[default_group]
+        self._group_bindings = resolved
+        self._group_default = default_group
 
     def _resolve_gripper_joint(self) -> str:
         """Get gripper joint name from robot_config."""
@@ -382,6 +465,7 @@ class TaskExecutorNode(Node):
         req = MoveToPose.Request()
         req.target_pose = step.target_pose
         req.velocity_scaling = step.velocity_scaling
+        req.target_group = getattr(step, "target_group", "")
 
         future = self._move_client.call_async(req)
 
@@ -407,34 +491,37 @@ class TaskExecutorNode(Node):
     def _exec_gripper(self, step: TaskStep) -> tuple:
         """Execute a GRIPPER step via FollowJointTrajectory action."""
         target_position = step.gripper_position
-        limits = getattr(self, "_gripper_limits", None)
+        binding = self._gripper_binding(getattr(step, "target_group", ""))
+        if binding is None:
+            return False, f"unknown target_group {step.target_group!r} for this robot's grippers"
+        gripper_joint, limits, gripper_client = binding
         if limits is not None and (
             not math.isfinite(target_position) or not limits["min"] <= target_position <= limits["max"]
         ):
             return False, "Gripper target is outside public joint limits"
 
-        if self._is_redundant_gripper_open(target_position):
+        if self._is_redundant_gripper_open(target_position, joint=gripper_joint):
             self.get_logger().info(f"    Gripper already open at {target_position:.2f}; skipping trajectory")
             return True, "already at open target"
 
-        if not self._gripper_action_client.server_is_ready():
+        if not gripper_client.server_is_ready():
             self.get_logger().info("Waiting for gripper trajectory action server...")
-            if not self._gripper_action_client.wait_for_server(timeout_sec=5.0):
+            if not gripper_client.wait_for_server(timeout_sec=5.0):
                 return False, "Gripper trajectory action server not available"
 
         goal_msg = FollowJointTrajectory.Goal()
         goal_msg.trajectory = JointTrajectory()
-        goal_msg.trajectory.joint_names = [self._gripper_joint]
+        goal_msg.trajectory.joint_names = [gripper_joint]
         point = JointTrajectoryPoint()
         point.positions = [target_position]
         duration = gripper_trajectory_duration(
-            target_position, self._fresh_gripper_position(), getattr(self, "_gripper_stroke", 0.0)
+            target_position, self._fresh_gripper_position(joint=gripper_joint), getattr(self, "_gripper_stroke", 0.0)
         )
         seconds, nanoseconds = divmod(int(round(duration * 1e9)), 1_000_000_000)
         point.time_from_start = Duration(sec=seconds, nanosec=nanoseconds)
         goal_msg.trajectory.points = [point]
 
-        future = self._gripper_action_client.send_goal_async(goal_msg, feedback_callback=self._gripper_feedback_cb)
+        future = gripper_client.send_goal_async(goal_msg, feedback_callback=self._gripper_feedback_cb)
 
         while not future.done():
             if self._cancel_requested:
@@ -459,6 +546,20 @@ class TaskExecutorNode(Node):
             return False, f"Gripper failed: error_code={result.result.error_code}"
 
         return True, "ok"
+
+    def _gripper_binding(self, target_group: str):
+        """``(joint, limits, action client)`` of a step's group; ``None`` for a group this robot lacks."""
+        bindings = getattr(self, "_gripper_bindings", None)
+        if bindings is None:  # single-gripper executor assembled without _configure_interfaces
+            if target_group:
+                return None
+            return self._gripper_joint, getattr(self, "_gripper_limits", None), self._gripper_action_client
+        group = target_group or self._default_group
+        if group not in bindings:
+            return None
+        joint, _action_name, limits = bindings[group]
+        client = self._gripper_action_client if group == self._default_group else self._gripper_clients[group]
+        return joint, limits, client
 
     def _gripper_feedback_cb(self, feedback_msg):
         pass
@@ -486,23 +587,24 @@ class TaskExecutorNode(Node):
             self._latest_joint_state = msg
             self._latest_joint_state_received_at = time.monotonic()
 
-    def _fresh_gripper_position(self, *, now: float | None = None) -> float | None:
+    def _fresh_gripper_position(self, *, now: float | None = None, joint: str | None = None) -> float | None:
         """Return the gripper position from fresh joint feedback, or ``None``."""
+        gripper_joint = joint or self._gripper_joint
         checked_at = time.monotonic() if now is None else float(now)
         with self._joint_state_lock:
             joint_state = self._latest_joint_state
             received_at = self._latest_joint_state_received_at
         if joint_state is None or received_at is None or checked_at - received_at > self._joint_state_max_age_s:
             return None
-        if self._gripper_joint not in joint_state.name:
+        if gripper_joint not in joint_state.name:
             return None
-        index = joint_state.name.index(self._gripper_joint)
+        index = joint_state.name.index(gripper_joint)
         if index >= len(joint_state.position):
             return None
         current_position = float(joint_state.position[index])
         return current_position if math.isfinite(current_position) else None
 
-    def _is_redundant_gripper_open(self, target: float, *, now: float | None = None) -> bool:
+    def _is_redundant_gripper_open(self, target: float, *, now: float | None = None, joint: str | None = None) -> bool:
         """Return true only when fresh feedback confirms an open-target no-op."""
         if not self._skip_redundant_gripper_open or not math.isfinite(float(target)):
             return False
@@ -510,7 +612,7 @@ class TaskExecutorNode(Node):
         if abs(float(target) - self._gripper_open_position) > tolerance:
             return False
 
-        current_position = self._fresh_gripper_position(now=now)
+        current_position = self._fresh_gripper_position(now=now, joint=joint)
         return current_position is not None and abs(current_position - float(target)) <= tolerance
 
     def _wait_for_gripper(self, target: float, timeout_s: float = 3.0, tolerance: float = 0.05):

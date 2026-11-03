@@ -136,6 +136,9 @@ def validate_skill_request(
     yaw: float | None = None,
     schema_version: int | None = None,
     primitive_descriptors: Mapping[str, Any] | None = None,
+    arm_groups: Mapping[str, str] | None = None,
+    gripper_approach: Mapping[str, Any] | None = None,
+    approach: str = "",
 ) -> tuple[bool, str]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
@@ -182,6 +185,8 @@ def validate_skill_request(
             return False, f"imitation_duration_sec is not accepted by {skill_name}"
         if container_name and "container_name" not in required_args:
             return False, f"container_name is not accepted by {skill_name}"
+        if approach:
+            return False, f"approach is not accepted by {skill_name}"
         if place_name:
             return False, f"place_name is not accepted by {skill_name}"
         if executor_name == "sound_following":
@@ -228,12 +233,24 @@ def validate_skill_request(
             return False, f"motion parameters are not accepted by {skill_name}"
         return True, ""
 
-    if arm_side or imitation_duration_sec:
+    if imitation_duration_sec or (arm_side and not arm_groups):
         return False, f"HRI parameters are not accepted by {skill_name}"
+    if arm_side:
+        # Multi-arm robot (contract v2): arm_side selects the arm the primitives act on.
+        normalized_arm_side = str(arm_side).strip().lower()
+        if normalized_arm_side != "auto" and normalized_arm_side not in arm_groups:
+            return False, f"arm_side must be one of {sorted(arm_groups)} or auto"
 
     primitive_sequence = template.get("primitive_sequence", [])
     if not isinstance(primitive_sequence, list) or not primitive_sequence:
         return False, f"skill template '{skill_name}' has no primitive_sequence"
+    if approach and not any(
+        isinstance(step, dict)
+        and step.get("primitive_name") == "set_gripper_approach"
+        and step.get("approach_from_request")
+        for step in primitive_sequence
+    ):
+        return False, f"approach is not accepted by {skill_name}"
 
     valid_directions = {"forward", "backward", "left", "right", "up", "down"}
     for step in primitive_sequence:
@@ -315,6 +332,14 @@ def validate_skill_request(
                 if not _is_finite_number(value):
                     return False, f"{field_name} must be a finite number"
 
+        if primitive_name == "set_gripper_approach":
+            resolved_approach = approach if step.get("approach_from_request") else step.get("approach", "")
+            if resolved_approach not in _approach_presets(gripper_approach):
+                return False, (
+                    f"unknown gripper approach {resolved_approach!r}; this robot declares "
+                    f"{sorted(_approach_presets(gripper_approach))}"
+                )
+
         if primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:
             # Rotation angle is carried on motion_distance for these primitives.
             # Reject NaN/inf/negative so an LLM or rule parser cannot dispatch a
@@ -379,6 +404,30 @@ def validate_skill_request(
     return True, ""
 
 
+def _approach_presets(gripper_approach: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    presets = (gripper_approach or {}).get("presets", {})
+    return presets if isinstance(presets, Mapping) else {}
+
+
+# A set_gripper_approach target must carry the declared orientation (|<q, preset>| near 1).
+APPROACH_ORIENTATION_TOLERANCE_DOT = 0.9999
+
+
+ARM_MOTION_PRIMITIVES = frozenset(
+    {
+        "set_gripper_approach",
+        "move_to_named_pose",
+        "move_to_pose",
+        "move_relative_ee",
+        "rotate_gripper_cw",
+        "rotate_gripper_ccw",
+        "move_to_configuration",
+        "move_to_joint_positions",
+        "move_through_joint_positions",
+    }
+)
+
+
 def validate_primitive_request(
     primitive_name: str,
     pose_name: str,
@@ -416,6 +465,10 @@ def validate_primitive_request(
     navigation_value: float = 0.0,
     schema_version: int | None = None,
     primitive_descriptors: Mapping[str, Any] | None = None,
+    target_group: str = "",
+    arm_groups: Mapping[str, str] | None = None,
+    motion_limits: Mapping[str, Any] | None = None,
+    gripper_approach: Mapping[str, Any] | None = None,
 ) -> tuple[bool, str]:
     if primitive_descriptors is None:
         try:
@@ -437,6 +490,18 @@ def validate_primitive_request(
 
     if velocity_scaling < 0.0 or velocity_scaling > 1.0:
         return False, "velocity_scaling must be in [0.0, 1.0]"
+    if target_group and target_group not in set((arm_groups or {}).values()):
+        return False, f"unknown target_group {target_group!r} for this robot"
+    max_velocity_scaling = (motion_limits or {}).get("max_velocity_scaling")
+    # 0.0 means "runtime default speed", which the robot's cap does not bound.
+    if (
+        max_velocity_scaling is not None
+        and primitive_name in ARM_MOTION_PRIMITIVES
+        and not 0.0 < velocity_scaling <= float(max_velocity_scaling)
+    ):
+        return False, (
+            f"velocity_scaling {velocity_scaling:g} outside this robot's limit (0, {float(max_velocity_scaling):g}]"
+        )
 
     if primitive_name in {"nav_straight", "nav_turn"}:
         expected_commands = (
@@ -495,6 +560,26 @@ def validate_primitive_request(
         if not allowed:
             return allowed, reason
         return _validate_quaternion(target_qx, target_qy, target_qz, target_qw)
+
+    if primitive_name == "set_gripper_approach":
+        preset = _approach_presets(gripper_approach).get(pose_name)
+        orientation = preset.get("orientation") if isinstance(preset, Mapping) else None
+        if not isinstance(orientation, Mapping):
+            return False, f"unknown gripper approach: {pose_name}"
+        allowed, reason = validate_xyz_within_workspace(target_x, target_y, target_z, workspace)
+        if not allowed:
+            return allowed, reason
+        allowed, reason = _validate_quaternion(target_qx, target_qy, target_qz, target_qw)
+        if not allowed:
+            return allowed, reason
+        declared = [float(orientation.get(axis, 0.0)) for axis in ("x", "y", "z", "w")]
+        target = (target_qx, target_qy, target_qz, target_qw)
+        norm = math.sqrt(sum(value * value for value in target)) * math.sqrt(sum(value * value for value in declared))
+        if norm <= 0.0 or abs(sum(a * b for a, b in zip(target, declared, strict=True))) / norm < (
+            APPROACH_ORIENTATION_TOLERANCE_DOT
+        ):
+            return False, f"target orientation is not the declared {pose_name!r} approach"
+        return True, ""
 
     if primitive_name in {"move_to_configuration", "move_to_joint_positions"}:
         resolved_joint_names = list(joint_names or [])

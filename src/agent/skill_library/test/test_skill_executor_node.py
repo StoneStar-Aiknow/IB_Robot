@@ -2081,6 +2081,7 @@ def test_execute_skill_copies_resolved_navigation_goal_and_public_parameters(mon
     assert captured["resolver_kwargs"] == {
         "current_joint_positions": {},
         "arm_joint_names": [],
+        "approach": "",
         "direction": "",
         "distance": 0.0,
         "degree": 0.0,

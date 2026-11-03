@@ -5,6 +5,10 @@
 
 geometry_msgs/Pose target_pose
 float64 velocity_scaling          # 0.0 = use default, otherwise 0.0-1.0
+# Motion group (arm) to move, as declared by the runtime's motion.move_to_pose
+# capability ("groups"). Empty = the runtime's default group, which is the only
+# group of a single-arm runtime; callers that predate this field keep working.
+string target_group
 ---
 bool success
 string message

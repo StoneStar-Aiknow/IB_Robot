@@ -10,7 +10,7 @@ from typing import Any
 from embodied_common.capability_view import project_capability_timeout_policy
 from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
 from embodied_common.mirror_session_contract import SESSION_SERVICE as MIRROR_SESSION_SERVICE
-from embodied_common.primitive_contracts import primitive_contract_for_version
+from embodied_common.primitive_contracts import primitive_contract_for_version, primitive_extensions_for_context
 from embodied_common.visual_game_contracts import build_visual_game_capability_view
 
 # Neutral online projection and helper functions are owned by robot_client and
@@ -371,8 +371,14 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         execution_endpoints=robot_execution_endpoints(robot_config),
         supported_control_modes=robot_supported_control_modes(robot_config),
+        # Optional contract-v2 surface, kept identical to the Gateway's context.
+        arm_groups=execution.get("arm_groups", {}),
+        motion_limits=embodied.get("safety", {}).get("motion_limits", {}),
+        gripper_approach=execution.get("gripper_approach", {}),
     )
-    primitive_contract = primitive_contract_for_version(robot_context.context_schema_version)
+    primitive_contract = primitive_contract_for_version(
+        robot_context.context_schema_version, primitive_extensions_for_context(robot_context)
+    )
     return compile_skill_catalog(
         source,
         profile_name=embodied["skill_catalog_profile"],

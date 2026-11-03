@@ -23,6 +23,8 @@ float32 primitive_duration_sec
 float32[] joint_waypoints
 uint32 joint_waypoint_count
 float32 waypoint_duration_sec
+# Motion group (arm) of the primitive; empty = the robot's default group.
+string target_group
 ---
 bool allowed
 string reason

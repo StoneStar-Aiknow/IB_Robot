@@ -117,6 +117,9 @@ _CAPABILITY_PARAMS: dict[str, dict[str, type]] = {
     "nav.goal": {"endpoints": list},
     "base.cmd_vel": {"max_vx": float, "max_vy": float, "max_wz": float, "staleness_s": float},
     "motion.ik": {"endpoints": list},
+    # Motion groups (arms) MoveToPose.target_group may name; an empty target_group
+    # means default_group. A runtime that declares neither has one implicit group.
+    "motion.move_to_pose": {"groups": list, "default_group": str},
     "runtime.stop": {"cancel_bound_s": float, "idle_bound_s": float, "torque_off_bound_s": float},
     "body.whole_stream": {"rate_hz": float, "groups": list, "impedance": bool},
 }

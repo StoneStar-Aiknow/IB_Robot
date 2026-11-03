@@ -350,6 +350,11 @@ def generate_embodied_nodes(
         "execute_plan_action": embodied_config.get("execute_plan_action", "/embodied/execute_agent_plan"),
         "start_visual_game_service": start_visual_game_service,
         "get_visual_game_result_service": get_visual_game_result_service,
+        # Contract v2 multi-arm surface; all empty for single-arm robots.
+        "arm_groups_json": json.dumps(execution.get("arm_groups", {})),
+        "motion_limits_json": json.dumps(safety.get("motion_limits", {})),
+        "gripper_approach_json": json.dumps(execution.get("gripper_approach", {})),
+        "default_velocity_scaling": float(execution.get("velocity_scaling", 0.0)),
     }
     if runtime_motion:
         common_params.update(
@@ -366,6 +371,17 @@ def generate_embodied_nodes(
                 }
             ),
         )
+    arm_groups = execution.get("arm_groups", {})
+    if runtime_motion and isinstance(arm_groups, dict) and arm_groups:
+        # Per-arm ee pose from the runtime's public motion.ee_pose.<group> interfaces.
+        common_params["ee_pose_topics_json"] = json.dumps(
+            {
+                str(group): public_endpoint(f"motion.ee_pose.{group}", "topic", "geometry_msgs/msg/PoseStamped")
+                for group in arm_groups.values()
+            }
+        )
+        if not arm_surface:
+            common_params["ee_pose_topic"] = public_endpoint("motion.ee_pose", "topic", "geometry_msgs/msg/PoseStamped")
     named_motion_config = embodied_config.get("runtime_named_motion", {})
     if runtime_motion and isinstance(named_motion_config, dict) and named_motion_config.get("enabled") is True:
         # Runtime-owned named motions; the endpoint comes only from the bound public description.

@@ -116,6 +116,7 @@ def resolve_skill_primitives(
     x: float | None = None,
     y: float | None = None,
     yaw: float | None = None,
+    approach: str = "",
 ) -> list[PrimitiveSpec]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
@@ -255,6 +256,14 @@ def resolve_skill_primitives(
                     gripper_position=closed_position,
                 )
             )
+            continue
+
+        if primitive_name == "set_gripper_approach":
+            # The approach name travels to the primitive as its pose_name.
+            resolved_approach = approach if step.get("approach_from_request") else step.get("approach", "")
+            if not isinstance(resolved_approach, str) or not resolved_approach.strip():
+                raise ValueError("set_gripper_approach requires an approach name")
+            primitives.append(PrimitiveSpec(primitive_name=primitive_name, pose_name=resolved_approach.strip()))
             continue
 
         if primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:

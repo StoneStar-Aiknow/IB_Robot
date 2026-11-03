@@ -129,3 +129,22 @@ def test_workflow_step_rejects_unknown_fields():
 def test_raw_workflow_validation_is_shared_before_normalization():
     with pytest.raises(TypeError, match="skill_name must be a string"):
         validate_workflow_steps([{"schema_version": 1, "skill_name": 1}])
+
+
+def test_approach_is_carried_only_when_present():
+    plain, posed = normalize_workflow_steps(
+        [
+            {
+                "schema_version": 1,
+                "skill_name": "move_relative_ee",
+                "motion_direction": "down",
+                "motion_distance": 0.05,
+            },
+            {"schema_version": 1, "skill_name": "set_gripper_approach", "arm_side": "right", "approach": " Top_Down "},
+        ]
+    )
+    assert "approach" not in plain.to_dict()
+    assert posed.approach == "top_down"
+    assert posed.to_dict()["approach"] == "top_down"
+    with pytest.raises(TypeError, match="approach must be a string"):
+        validate_workflow_steps([{"schema_version": 1, "skill_name": "set_gripper_approach", "approach": 1}])

@@ -91,6 +91,11 @@ def _robot_context_to_preimage(robot_context: Any) -> dict[str, Any]:
         preimage["supported_control_modes"] = list(
             _as_tuple(_attr(robot_context, "supported_control_modes", default=()))
         )
+    # Optional contract-v2 fields: only present when the robot declares them.
+    for optional in ("arm_groups", "motion_limits", "gripper_approach"):
+        value = _as_mapping(_attr(robot_context, optional, default={}))
+        if value:
+            preimage[optional] = value
     return preimage
 
 

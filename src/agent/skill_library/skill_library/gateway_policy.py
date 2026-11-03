@@ -49,6 +49,7 @@ _REQUEST_PARAMETER_FIELDS = (
     "motion_distance",
     "arm_side",
     "imitation_duration_sec",
+    "approach",
     "direction",
     "distance",
     "degree",
@@ -101,6 +102,7 @@ class GatewayRequest:
     motion_distance: Any = None
     arm_side: Any = None
     imitation_duration_sec: Any = None
+    approach: Any = None
     direction: Any = None
     distance: Any = None
     degree: Any = None
@@ -533,6 +535,7 @@ def build_request_identity(request: GatewayRequest, *, default_timeout_sec: floa
         has_x=request.has_x,
         has_y=request.has_y,
         has_yaw=request.has_yaw,
+        approach=request.approach,
         timeout_sec=request.timeout_sec,
         schema_version=request.schema_version,
         default_timeout_sec=default_timeout_sec,

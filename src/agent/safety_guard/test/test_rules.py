@@ -3,6 +3,7 @@ import os
 import pytest
 import rclpy
 
+from embodied_common.primitive_contracts import GRIPPER_APPROACH_EXTENSION, primitive_contract_for_version
 from ibrobot_msgs.srv import ValidateSkill
 from safety_guard.rules import validate_primitive_request, validate_skill_request
 from safety_guard.safety_guard_node import SafetyGuardNode
@@ -620,3 +621,163 @@ def test_validate_release_skill_requires_place_name():
     )
     assert allowed
     assert reason == ""
+
+
+# --- contract v2: multi-arm robots (arm_groups) and per-robot motion limits ------------------
+
+ARM_GROUPS = {"left": "left_arm", "right": "right_arm"}
+DUAL_WORKSPACE = {"x": [-0.7, 0.7], "y": [-0.45, 0.3], "z": [0.77, 1.25]}
+
+
+def _relative_skill(arm_side, arm_groups=None):
+    return validate_skill_request(
+        "move_relative_ee", "", "", "down", 0.03, {}, {}, SKILL_TEMPLATES, arm_side=arm_side, arm_groups=arm_groups
+    )
+
+
+def test_single_arm_robot_still_rejects_arm_side():
+    allowed, reason = _relative_skill("left")
+    assert not allowed and "HRI parameters are not accepted" in reason
+
+
+@pytest.mark.parametrize("arm_side", ["left", "right", "auto"])
+def test_multi_arm_robot_accepts_its_arm_sides(arm_side):
+    assert _relative_skill(arm_side, ARM_GROUPS) == (True, "")
+
+
+def test_multi_arm_robot_rejects_an_arm_it_does_not_have():
+    allowed, reason = _relative_skill("middle", ARM_GROUPS)
+    assert not allowed and "arm_side must be one of ['left', 'right']" in reason
+
+
+def _relative_primitive(**kwargs):
+    return validate_primitive_request(
+        "move_relative_ee", "", 0.0, 0.0, -0.03, -0.3, -0.3, 0.85, 0.0, {}, DUAL_WORKSPACE, **kwargs
+    )
+
+
+def test_primitive_target_group_must_be_one_of_the_robots_groups():
+    assert _relative_primitive(target_group="left_arm", arm_groups=ARM_GROUPS) == (True, "")
+    allowed, reason = _relative_primitive(target_group="left_arm")
+    assert not allowed and "unknown target_group" in reason
+
+
+def test_motion_limit_caps_velocity_scaling():
+    limits = {"max_velocity_scaling": 0.6}
+    assert _relative_primitive(velocity_scaling=0.5, motion_limits=limits) == (True, "")
+    for scaling in (0.0, 0.7):
+        allowed, reason = _relative_primitive(velocity_scaling=scaling, motion_limits=limits)
+        assert not allowed and "outside this robot's limit (0, 0.6]" in reason
+
+
+def test_motion_limit_does_not_apply_to_grippers():
+    allowed, _ = validate_primitive_request(
+        "close_gripper",
+        "",
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        {},
+        DUAL_WORKSPACE,
+        motion_limits={"max_velocity_scaling": 0.6},
+    )
+    assert allowed
+
+
+# --- gripper approach presets (set_gripper_approach) --------------------------------------------
+
+GRIPPER_APPROACH = {
+    "axis": "x",
+    "presets": {
+        "horizontal": {"orientation": {"x": 0.0, "y": 0.0, "z": 0.7071068, "w": 0.7071068}},
+        "top_down": {"orientation": {"x": -0.5, "y": 0.5, "z": 0.5, "w": 0.5}},
+    },
+}
+APPROACH_TEMPLATES = {
+    **SKILL_TEMPLATES,
+    "set_gripper_approach": {
+        "initial_gripper_state": "none",
+        "primitive_sequence": [{"primitive_name": "set_gripper_approach", "approach_from_request": True}],
+    },
+}
+APPROACH_DESCRIPTORS = primitive_contract_for_version(1, (GRIPPER_APPROACH_EXTENSION,)).descriptors
+
+
+def _approach_skill(approach, skill_name="set_gripper_approach", **kwargs):
+    return validate_skill_request(
+        skill_name,
+        "",
+        "",
+        kwargs.pop("motion_direction", ""),
+        kwargs.pop("motion_distance", 0.0),
+        {},
+        {},
+        APPROACH_TEMPLATES,
+        primitive_descriptors=APPROACH_DESCRIPTORS,
+        gripper_approach=GRIPPER_APPROACH,
+        approach=approach,
+        **kwargs,
+    )
+
+
+def test_approach_skill_accepts_only_declared_presets():
+    assert _approach_skill("top_down", arm_side="right", arm_groups=ARM_GROUPS) == (True, "")
+    allowed, reason = _approach_skill("upside_down")
+    assert not allowed and "unknown gripper approach 'upside_down'" in reason
+    allowed, reason = _approach_skill("")
+    assert not allowed and "unknown gripper approach" in reason
+
+
+def test_approach_is_refused_by_skills_that_do_not_take_it():
+    allowed, reason = _approach_skill(
+        "top_down", skill_name="move_relative_ee", motion_direction="down", motion_distance=0.03
+    )
+    assert not allowed and "approach is not accepted by move_relative_ee" in reason
+
+
+def test_approach_skill_needs_a_robot_with_the_primitive():
+    allowed, reason = validate_skill_request(
+        "set_gripper_approach", "", "", "", 0.0, {}, {}, APPROACH_TEMPLATES, approach="top_down"
+    )
+    assert not allowed and "unsupported primitive: set_gripper_approach" in reason
+
+
+def _approach_primitive(pose_name, quaternion, xyz=(0.3, -0.1, 0.85), **kwargs):
+    qx, qy, qz, qw = quaternion
+    return validate_primitive_request(
+        "set_gripper_approach",
+        pose_name,
+        0.0,
+        0.0,
+        0.0,
+        *xyz,
+        0.0,
+        {},
+        DUAL_WORKSPACE,
+        target_qx=qx,
+        target_qy=qy,
+        target_qz=qz,
+        target_qw=qw,
+        velocity_scaling=0.5,
+        primitive_descriptors=APPROACH_DESCRIPTORS,
+        target_group="right_arm",
+        arm_groups=ARM_GROUPS,
+        motion_limits={"max_velocity_scaling": 0.6},
+        gripper_approach=GRIPPER_APPROACH,
+        **kwargs,
+    )
+
+
+def test_approach_primitive_requires_the_declared_orientation_inside_the_workspace():
+    assert _approach_primitive("top_down", (-0.5, 0.5, 0.5, 0.5)) == (True, "")
+    assert _approach_primitive("top_down", (0.5, -0.5, -0.5, -0.5)) == (True, "")  # same rotation, -q
+    allowed, reason = _approach_primitive("top_down", (0.0, 0.0, 0.7071068, 0.7071068))
+    assert not allowed and "is not the declared 'top_down' approach" in reason
+    allowed, reason = _approach_primitive("sideways", (-0.5, 0.5, 0.5, 0.5))
+    assert not allowed and "unknown gripper approach" in reason
+    allowed, reason = _approach_primitive("top_down", (-0.5, 0.5, 0.5, 0.5), xyz=(0.3, -0.1, 0.70))
+    assert not allowed and "outside workspace" in reason

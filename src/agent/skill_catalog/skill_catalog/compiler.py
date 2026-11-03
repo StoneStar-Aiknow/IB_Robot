@@ -8,6 +8,7 @@ from typing import Any
 
 from embodied_common.primitive_contracts import (
     primitive_contract_for_version,
+    primitive_extensions_for_context,
 )
 from skill_catalog.digest import compute_skill_package_digest
 from skill_catalog.models import (
@@ -24,7 +25,13 @@ from skill_catalog.source import (
     build_package_file_manifest,
     load_yaml_mapping,
 )
-from skill_catalog.validator import validate_implementation, validate_manifest, validate_profile, validate_robot_context
+from skill_catalog.validator import (
+    selected_capability,
+    validate_implementation,
+    validate_manifest,
+    validate_profile,
+    validate_robot_context,
+)
 
 
 class SkillCatalogCompiler:
@@ -228,7 +235,7 @@ class SkillCatalogCompiler:
             ):
                 continue
 
-            capability = manifest["capability"]
+            capability = selected_capability(manifest, implementation_name)
             description = selected_description
             # A unified mobile-manipulator profile may expose skills from more
             # than one mutually-exclusive motion domain.  The capability's
@@ -337,7 +344,9 @@ class SkillCatalogCompiler:
     def _validate_compile_context(context: SkillCompileContext) -> list[SkillDiagnostic]:
         diagnostics = validate_robot_context(context.robot)
         try:
-            selected_contract = primitive_contract_for_version(context.robot.context_schema_version)
+            selected_contract = primitive_contract_for_version(
+                context.robot.context_schema_version, primitive_extensions_for_context(context.robot)
+            )
         except ValueError as exc:
             diagnostics.append(SkillDiagnostic.error("SKILL_SCHEMA_INVALID", str(exc)))
             selected_contract = None

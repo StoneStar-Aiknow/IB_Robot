@@ -1,0 +1,84 @@
+schema_version: 1
+name: set_gripper_approach
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Turn the gripper to a named approach orientation; the grasp point does not move.
+  category: rotation
+  when_to_use:
+  - point the gripper down before grasping a small, flat or wide object from above
+  - return the gripper to its starting orientation
+  do_not_use:
+  - condition: move the gripper somewhere else
+    instead_use: move_relative_ee
+  aliases_zh:
+  - 夹爪朝下
+  - 切换抓取姿态
+  aliases_en:
+  - point the gripper down
+  - change grasp approach
+  motion_scope:
+  - wrist
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 1.5
+  requires_motion_params: true
+capability:
+  schema_version: 1
+  summary: Turn the gripper to one of the robot's named approach orientations, keeping the grasp point.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      approach:
+        type: string
+        enum:
+        - horizontal
+        - top_down
+        - top_down_rotated
+        - tilted_45
+    required:
+    - approach
+  recovery_policy: ask_user
+capability_variants:
+  robodojo_arx_x5_v1:
+    parameters:
+      type: object
+      additionalProperties: false
+      properties:
+        arm_side:
+          type: string
+          enum:
+          - left
+          - right
+          - auto
+        approach:
+          type: string
+          enum:
+          - horizontal
+          - top_down
+          - top_down_rotated
+          - tilted_45
+      required:
+      - approach
+implementations:
+  robodojo_arx_x5_v1: implementations/robodojo_arx_x5_v1.yaml
+description_variants:
+  robodojo_arx_x5_v1:
+    summary: 'Turn one arm''s gripper to a named approach, grasp point fixed: horizontal (start, pointing forward), top_down (pointing down, fingers close along x), top_down_rotated (pointing down, fingers close along y), tilted_45 (half way).'
+    category: rotation
+    when_to_use:
+    - top_down for small, flat or wide objects grasped from above; only reachable within about y <= -0.05
+    - tilted_45 for objects farther forward (reachable to about y = +0.15)
+    - change approach well above the object (about 0.10 m up), then descend
+    do_not_use:
+    - condition: move the gripper somewhere else
+      instead_use: move_relative_ee
+    motion_scope:
+    - wrist
+    - arm
+    intensity: moderate

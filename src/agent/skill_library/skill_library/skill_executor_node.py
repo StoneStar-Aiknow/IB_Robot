@@ -44,7 +44,11 @@ from embodied_common.dispatch_binding import (
     fill_delegated_executor_identity,
     load_delegated_model_identity,
 )
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
+from embodied_common.primitive_contracts import (
+    PRIMITIVE_CONTRACT_V1,
+    primitive_contract_for_version,
+    primitive_extensions_for_context,
+)
 from embodied_common.program_contracts import canonicalize_program
 from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
@@ -161,6 +165,7 @@ def _workflow_step_message(values: dict):
     step.motion_distance = float(values.get("motion_distance", 0.0))
     step.arm_side = str(values.get("arm_side", ""))
     step.imitation_duration_sec = float(values.get("imitation_duration_sec", 0.0))
+    step.approach = str(values.get("approach", ""))
     step.timeout_sec = float(values.get("timeout_sec", 0.0))
     step.direction = str(values.get("direction", ""))
     step.distance = float(values.get("distance", 0.0))
@@ -595,6 +600,16 @@ class SkillExecutorNode(Node):
             RUNTIME.MOVE_TO_JOINT_SERVICE,
         )
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
+        # Contract v2 multi-arm surface: skill arm_side -> runtime motion group, and the
+        # ee pose topic of each group. Empty = one implicit arm (the single ee_pose_topic).
+        self.declare_parameter("arm_groups_json", "{}")
+        self.declare_parameter("ee_pose_topics_json", "{}")
+        self.declare_parameter("motion_limits_json", "{}")
+        # Gripper orientation surface: {"axis": rotate_gripper_* axis in the tool frame
+        # (default "z"), "presets": {name: {"orientation": {x, y, z, w}}}} for set_gripper_approach.
+        self.declare_parameter("gripper_approach_json", "{}")
+        # Speed of Gateway-built arm primitives; 0.0 = the runtime default.
+        self.declare_parameter("default_velocity_scaling", 0.0)
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("cmd_pose_topic", "/cmd_pose")
         self.declare_parameter("debug_tracing", False)
@@ -731,6 +746,25 @@ class SkillExecutorNode(Node):
             self.get_parameter("move_configuration_service").get_parameter_value().string_value
         )
         self._ee_pose_topic = self.get_parameter("ee_pose_topic").get_parameter_value().string_value
+        self._arm_groups = {
+            str(side): str(group)
+            for side, group in load_json_mapping(
+                self.get_parameter("arm_groups_json").get_parameter_value().string_value
+            ).items()
+        }
+        self._ee_pose_topics = {
+            str(group): str(topic)
+            for group, topic in load_json_mapping(
+                self.get_parameter("ee_pose_topics_json").get_parameter_value().string_value
+            ).items()
+        }
+        self._motion_limits = load_json_mapping(
+            self.get_parameter("motion_limits_json").get_parameter_value().string_value
+        )
+        self._gripper_approach = load_json_mapping(
+            self.get_parameter("gripper_approach_json").get_parameter_value().string_value
+        )
+        self._default_velocity_scaling = float(self.get_parameter("default_velocity_scaling").value)
         self._joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
         self._cmd_pose_topic = self.get_parameter("cmd_pose_topic").get_parameter_value().string_value
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
@@ -830,7 +864,10 @@ class SkillExecutorNode(Node):
         self._context_schema_version = self.get_parameter("context_schema_version").get_parameter_value().integer_value
         if self._context_schema_version not in {1, 2, 3}:
             raise ValueError("context_schema_version must be 1, 2, or 3")
-        self._primitive_contract = primitive_contract_for_version(self._context_schema_version)
+        self._primitive_contract = primitive_contract_for_version(
+            self._context_schema_version,
+            primitive_extensions_for_context({"gripper_approach": self._gripper_approach}),
+        )
         self._primitive_descriptors = self._primitive_contract.descriptors
         self._primitive_contract_digest = self._primitive_contract.digest
         if self._context_schema_version >= 2:
@@ -932,6 +969,7 @@ class SkillExecutorNode(Node):
         self._active_runtime_bundle = None
         self._latest_ee_pose = None
         self._latest_ee_pose_monotonic = None
+        self._latest_group_ee_pose: dict[str, tuple[PoseStamped, float]] = {}
         self._latest_joint_state = None
         self._skill_goal_lock = threading.Lock()
         self._skill_goal_active = False
@@ -969,6 +1007,14 @@ class SkillExecutorNode(Node):
             10,
             callback_group=callback_group,
         )
+        for group, topic in self._ee_pose_topics.items():
+            self.create_subscription(
+                PoseStamped,
+                topic,
+                lambda msg, g=group: self._handle_group_ee_pose(g, msg),
+                10,
+                callback_group=callback_group,
+            )
         self.create_subscription(
             JointState,
             self._joint_state_topic,
@@ -1414,6 +1460,7 @@ class SkillExecutorNode(Node):
                 skill_goal.motion_distance = step.motion_distance
                 skill_goal.arm_side = step.arm_side
                 skill_goal.imitation_duration_sec = step.imitation_duration_sec
+                skill_goal.approach = step.approach
                 # Preserve the canonical request timeout for workflow identity;
                 # GatewayPolicy applies the catalog cap and the child executor
                 # clamps the accepted timeout to the shared root deadline.
@@ -1777,6 +1824,9 @@ class SkillExecutorNode(Node):
             gripper_closed_position=self._gripper_closed,
             execution_endpoints=execution_endpoints,
             supported_control_modes=getattr(self, "_supported_control_modes", ()),
+            arm_groups=getattr(self, "_arm_groups", {}),
+            motion_limits=getattr(self, "_motion_limits", {}),
+            gripper_approach=getattr(self, "_gripper_approach", {}),
         )
         source_root = Path(self._skill_catalog_source_root)
         if self._skill_catalog_source_mode == "installed":
@@ -2653,6 +2703,21 @@ class SkillExecutorNode(Node):
             self._latest_ee_pose = msg
             self._latest_ee_pose_monotonic = time.monotonic()
 
+    def _handle_group_ee_pose(self, group: str, msg: PoseStamped) -> None:
+        with self._state_guard():
+            self._latest_group_ee_pose[group] = (msg, time.monotonic())
+
+    def _target_group_for_arm_side(self, arm_side: str) -> tuple[str, str]:
+        """Map a skill's arm_side to the runtime motion group; ``("", "")`` = default group."""
+        side = str(arm_side or "").strip().lower()
+        if not side or side == "auto":
+            return "", ""
+        arm_groups = getattr(self, "_arm_groups", {})
+        group = arm_groups.get(side)
+        if group is None:
+            return "", f"arm_side {side!r} is not an arm of this robot (arms: {sorted(arm_groups)})"
+        return group, ""
+
     def _handle_joint_state(self, msg: JointState) -> None:
         self._latest_joint_state = msg
 
@@ -2721,8 +2786,13 @@ class SkillExecutorNode(Node):
     def _ee_pose_receipt_is_fresh(self, received_monotonic: float) -> bool:
         return time.monotonic() - received_monotonic <= self._robot_state_freshness_sec
 
-    def _fresh_ee_pose_snapshot(self) -> _EePoseSnapshot | None:
+    def _fresh_ee_pose_snapshot(self, target_group: str = "") -> _EePoseSnapshot | None:
         with self._state_guard():
+            if target_group and target_group in getattr(self, "_ee_pose_topics", {}):
+                latest = self._latest_group_ee_pose.get(target_group)
+                if latest is None or not self._ee_pose_receipt_is_fresh(latest[1]):
+                    return None
+                return _EePoseSnapshot(pose=copy.deepcopy(latest[0]), received_monotonic=latest[1])
             if not self._ee_pose_is_fresh_unlocked():
                 return None
             return _EePoseSnapshot(
@@ -3013,6 +3083,7 @@ class SkillExecutorNode(Node):
                         motion_distance=step.motion_distance,
                         arm_side=step.arm_side,
                         imitation_duration_sec=step.imitation_duration_sec,
+                        approach=step.approach,
                         direction=step.direction,
                         distance=step.distance,
                         degree=step.degree,
@@ -3831,6 +3902,7 @@ class SkillExecutorNode(Node):
         motion_distance: float = 0.0,
         arm_side: str = "",
         imitation_duration_sec: float = 0.0,
+        approach: str = "",
         direction: str = "",
         distance: float = 0.0,
         degree: float = 0.0,
@@ -3855,6 +3927,7 @@ class SkillExecutorNode(Node):
         request.motion_distance = float(motion_distance)
         request.arm_side = arm_side
         request.imitation_duration_sec = float(imitation_duration_sec)
+        request.approach = str(approach or "")
         request.direction = direction
         request.distance = float(distance)
         request.degree = float(degree)
@@ -3904,6 +3977,7 @@ class SkillExecutorNode(Node):
         navigation_target_pose: PoseStamped | None = None,
         navigation_value: float = 0.0,
         dispatch_binding=None,
+        target_group: str = "",
     ) -> tuple[bool, str]:
         if not self._validate_primitive_client.wait_for_service(timeout_sec=self._rpc_timeout):
             return False, "validate_primitive service unavailable"
@@ -3939,6 +4013,8 @@ class SkillExecutorNode(Node):
             request.target_qw = 0.0
         request.velocity_scaling = float(velocity_scaling)
         request.gripper_position = float(gripper_position)
+        if hasattr(request, "target_group"):
+            request.target_group = str(target_group or "")
         request.joint_names = list(joint_names or [])
         request.joint_positions = [float(position) for position in (joint_positions or [])]
         request.joint_waypoints = [float(position) for position in (joint_waypoints or [])]
@@ -3991,6 +4067,22 @@ class SkillExecutorNode(Node):
         pose.orientation.w = float(orientation.get("w", 1.0))
         return pose
 
+    def _pose_from_gripper_approach(self, ee_pose: PoseStamped, approach: str) -> Pose | None:
+        """The current TCP position with the named approach orientation; ``None`` if undeclared."""
+        preset = (self._gripper_approach.get("presets") or {}).get(approach)
+        orientation = preset.get("orientation") if isinstance(preset, dict) else None
+        if not isinstance(orientation, dict):
+            return None
+        pose = Pose()
+        pose.position.x = float(ee_pose.pose.position.x)
+        pose.position.y = float(ee_pose.pose.position.y)
+        pose.position.z = float(ee_pose.pose.position.z)
+        pose.orientation.x = float(orientation.get("x", 0.0))
+        pose.orientation.y = float(orientation.get("y", 0.0))
+        pose.orientation.z = float(orientation.get("z", 0.0))
+        pose.orientation.w = float(orientation.get("w", 1.0))
+        return pose
+
     @staticmethod
     def _pose_from_relative_offset(ee_pose: PoseStamped, dx: float, dy: float, dz: float) -> Pose:
         pose = Pose()
@@ -4005,13 +4097,17 @@ class SkillExecutorNode(Node):
         return pose
 
     @staticmethod
-    def _pose_from_gripper_rotation(ee_pose: PoseStamped, primitive_name: str, angle_deg: float) -> Pose:
+    def _pose_from_gripper_rotation(
+        ee_pose: PoseStamped, primitive_name: str, angle_deg: float, axis: str = "z"
+    ) -> Pose:
+        """Turn the gripper about ``axis`` of its own frame (the robot's approach axis)."""
         angle_rad = math.radians(abs(angle_deg))
         half = angle_rad / 2.0
         sign = -1.0 if primitive_name == "rotate_gripper_cw" else 1.0
         cur = ee_pose.pose.orientation
         qc = (cur.x, cur.y, cur.z, cur.w)
-        qd = (0.0, 0.0, sign * math.sin(half), math.cos(half))
+        unit = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}[axis]
+        qd = (*(sign * math.sin(half) * component for component in unit), math.cos(half))
 
         # Right-multiply: q_target = q_current * q_delta (local-frame rotation)
         qx = qc[3] * qd[0] + qc[0] * qd[3] + qc[1] * qd[2] - qc[2] * qd[1]
@@ -4494,8 +4590,13 @@ class SkillExecutorNode(Node):
 
         target_pose = None
         ee_pose_snapshot = None
-        if goal.primitive_name in {"move_relative_ee", "rotate_gripper_cw", "rotate_gripper_ccw"}:
-            ee_pose_snapshot = self._fresh_ee_pose_snapshot()
+        if goal.primitive_name in {
+            "move_relative_ee",
+            "rotate_gripper_cw",
+            "rotate_gripper_ccw",
+            "set_gripper_approach",
+        }:
+            ee_pose_snapshot = self._fresh_ee_pose_snapshot(getattr(goal, "target_group", ""))
             if ee_pose_snapshot is None:
                 return self._finish_primitive_failure(
                     result,
@@ -4518,7 +4619,18 @@ class SkillExecutorNode(Node):
                 ee_pose_snapshot.pose,
                 goal.primitive_name,
                 goal.relative_dz,
+                axis=str(self._gripper_approach.get("axis", "z")),
             )
+        elif goal.primitive_name == "set_gripper_approach":
+            target_pose = self._pose_from_gripper_approach(ee_pose_snapshot.pose, goal.pose_name)
+            if target_pose is None:
+                return self._finish_primitive_failure(
+                    result,
+                    goal_handle,
+                    "UNKNOWN_POSE",
+                    f"unknown gripper approach: {goal.pose_name!r}",
+                    goal.pose_name,
+                )
 
         allowed, reason = self._validate_primitive(
             goal.primitive_name,
@@ -4539,6 +4651,7 @@ class SkillExecutorNode(Node):
             navigation_target_pose=goal.navigation_target_pose,
             navigation_value=goal.navigation_value,
             dispatch_binding=goal.dispatch_binding,
+            target_group=getattr(goal, "target_group", ""),
         )
         if not allowed:
             result.success = False
@@ -4636,6 +4749,7 @@ class SkillExecutorNode(Node):
                     ee_pose_receipt_monotonic=(
                         ee_pose_snapshot.received_monotonic if ee_pose_snapshot is not None else None
                     ),
+                    target_group=getattr(goal, "target_group", ""),
                 )
             except _EePoseSnapshotExpired:
                 return self._finish_primitive_failure(
@@ -4649,7 +4763,7 @@ class SkillExecutorNode(Node):
                 return self._finish_primitive_failure(
                     result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, goal.pose_name
                 )
-        elif goal.primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:
+        elif goal.primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw", "set_gripper_approach"}:
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
             try:
                 ok, err_msg = self._exec_rotate_gripper_via_task_dispatch(
@@ -4659,6 +4773,8 @@ class SkillExecutorNode(Node):
                     _binding_task_id(goal),
                     move_timeout,
                     ee_pose_snapshot.received_monotonic,
+                    velocity_scaling=float(goal.velocity_scaling),
+                    target_group=getattr(goal, "target_group", ""),
                 )
             except _EePoseSnapshotExpired:
                 return self._finish_primitive_failure(
@@ -4686,7 +4802,11 @@ class SkillExecutorNode(Node):
         else:
             # Delegate gripper control to task_dispatch via ExecuteTaskPlan action
             ok, err_msg = self._exec_gripper_via_task_dispatch(
-                goal_handle, goal.primitive_name, goal.gripper_position, _binding_task_id(goal)
+                goal_handle,
+                goal.primitive_name,
+                goal.gripper_position,
+                _binding_task_id(goal),
+                target_group=getattr(goal, "target_group", ""),
             )
             if not ok:
                 return self._finish_primitive_failure(
@@ -4864,8 +4984,11 @@ class SkillExecutorNode(Node):
         task_id: str,
         timeout_sec: float,
         ee_pose_receipt_monotonic: float,
+        *,
+        velocity_scaling: float = 0.0,
+        target_group: str = "",
     ) -> tuple[bool, str]:
-        """Dispatch a wrist rotation target derived from a fresh EE pose snapshot."""
+        """Dispatch a wrist orientation target derived from a fresh EE pose snapshot."""
 
         if self._debug:
             self.get_logger().info(
@@ -4882,6 +5005,8 @@ class SkillExecutorNode(Node):
             task_id,
             timeout_sec,
             ee_pose_receipt_monotonic=ee_pose_receipt_monotonic,
+            velocity_scaling=velocity_scaling,
+            target_group=target_group,
         )
 
     def _exec_arm_via_task_dispatch(
@@ -4894,6 +5019,7 @@ class SkillExecutorNode(Node):
         *,
         ee_pose_receipt_monotonic: float | None = None,
         velocity_scaling: float = 0.0,
+        target_group: str = "",
     ) -> tuple[bool, str]:
         """Send a MOVE_TO_POSE TaskStep to task_dispatch ExecuteTaskPlan action server."""
         late_cleanup_confirmation = self._late_cleanup_confirmation(goal_handle)
@@ -4910,6 +5036,7 @@ class SkillExecutorNode(Node):
         step.label = primitive_name
         step.target_pose = target_pose
         step.velocity_scaling = float(velocity_scaling)
+        step.target_group = str(target_group or "")
 
         goal_msg = ExecuteTaskPlan.Goal()
         goal_msg.steps = [step]
@@ -5182,7 +5309,7 @@ class SkillExecutorNode(Node):
         return True, ""
 
     def _exec_gripper_via_task_dispatch(
-        self, goal_handle, primitive_name: str, gripper_position: float, task_id: str
+        self, goal_handle, primitive_name: str, gripper_position: float, task_id: str, *, target_group: str = ""
     ) -> tuple[bool, str]:
         """Send a GRIPPER TaskStep to task_dispatch ExecuteTaskPlan action server."""
         late_cleanup_confirmation = self._late_cleanup_confirmation(goal_handle)
@@ -5201,6 +5328,7 @@ class SkillExecutorNode(Node):
         step.type = TaskStep.GRIPPER
         step.label = primitive_name
         step.gripper_position = float(gripper_position)
+        step.target_group = str(target_group or "")
 
         goal_msg = ExecuteTaskPlan.Goal()
         goal_msg.steps = [step]
@@ -5956,6 +6084,7 @@ class SkillExecutorNode(Node):
             motion_distance=goal.motion_distance,
             arm_side=getattr(goal, "arm_side", ""),
             imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
+            approach=getattr(goal, "approach", ""),
             direction=goal.direction,
             distance=goal.distance,
             degree=goal.degree,
@@ -6057,6 +6186,7 @@ class SkillExecutorNode(Node):
                 motion_distance=goal.motion_distance,
                 arm_side=getattr(goal, "arm_side", ""),
                 imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
+                approach=getattr(goal, "approach", ""),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -6213,6 +6343,7 @@ class SkillExecutorNode(Node):
                     motion_distance=goal.motion_distance,
                     arm_side=getattr(goal, "arm_side", ""),
                     imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
+                    approach=getattr(goal, "approach", ""),
                     timeout_sec=goal.timeout_sec,
                     direction=goal.direction,
                     distance=goal.distance,
@@ -6283,6 +6414,7 @@ class SkillExecutorNode(Node):
                     motion_distance=goal.motion_distance,
                     arm_side=getattr(goal, "arm_side", ""),
                     imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
+                    approach=getattr(goal, "approach", ""),
                     direction=goal.direction,
                     distance=goal.distance,
                     degree=goal.degree,
@@ -6336,6 +6468,7 @@ class SkillExecutorNode(Node):
                 motion_distance=goal.motion_distance,
                 arm_side=getattr(goal, "arm_side", ""),
                 imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
+                approach=getattr(goal, "approach", ""),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -6436,6 +6569,7 @@ class SkillExecutorNode(Node):
                 motion_distance=goal.motion_distance,
                 arm_side=getattr(goal, "arm_side", ""),
                 imitation_duration_sec=getattr(goal, "imitation_duration_sec", 0.0),
+                approach=getattr(goal, "approach", ""),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -6531,6 +6665,7 @@ class SkillExecutorNode(Node):
                 self._relative_motion_direction_mapping,
                 current_joint_positions=self._current_joint_positions(),
                 arm_joint_names=self._arm_joint_names,
+                approach=getattr(goal, "approach", ""),
                 direction=goal.direction,
                 distance=goal.distance,
                 degree=goal.degree,
@@ -6565,6 +6700,10 @@ class SkillExecutorNode(Node):
             result.executed_primitives = []
             goal_handle.abort()
             return result
+
+        target_group, arm_error = self._target_group_for_arm_side(getattr(goal, "arm_side", ""))
+        if arm_error:
+            return self._abort_skill(result, goal_handle, [], "SKILL_LIMIT_VIOLATION", arm_error)
 
         executed_primitives: list[str] = []
         total_steps = len(primitives)
@@ -6609,7 +6748,8 @@ class SkillExecutorNode(Node):
                 )
             primitive_goal.schema_version = descriptor.schema_version
             primitive_goal.pose_name = pose_name
-            primitive_goal.velocity_scaling = 0.0
+            primitive_goal.velocity_scaling = getattr(self, "_default_velocity_scaling", 0.0)
+            primitive_goal.target_group = target_group
             primitive_goal.relative_dx = float(primitive.relative_dx)
             primitive_goal.relative_dy = float(primitive.relative_dy)
             primitive_goal.relative_dz = float(primitive.relative_dz)

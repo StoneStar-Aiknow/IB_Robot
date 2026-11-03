@@ -1,0 +1,22 @@
+schema_version: 1
+name: robodojo_x5
+robot_name: robodojo_x5
+enabled_skills:
+- name: close_gripper_skill
+  implementation: robodojo_arx_x5_v1
+  planner_visible: true
+- name: move_relative_ee
+  implementation: robodojo_arx_x5_v1
+  planner_visible: true
+- name: open_gripper_skill
+  implementation: robodojo_arx_x5_v1
+  planner_visible: true
+- name: rotate_gripper_ccw
+  implementation: robodojo_arx_x5_v1
+  planner_visible: true
+- name: rotate_gripper_cw
+  implementation: robodojo_arx_x5_v1
+  planner_visible: true
+- name: set_gripper_approach
+  implementation: robodojo_arx_x5_v1
+  planner_visible: true

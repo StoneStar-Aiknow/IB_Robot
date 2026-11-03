@@ -19,6 +19,10 @@ string label
 geometry_msgs/Pose target_pose
 float64 velocity_scaling        # 0.0 = use default, otherwise 0.0-1.0
 
+# Motion group (arm) for MOVE_TO_POSE and GRIPPER steps. Empty = the robot's
+# default group, the only group of a single-arm robot.
+string target_group
+
 # --- GRIPPER fields ---
 float64 gripper_position        # Normalized: 0.0 (closed) to 1.0 (open)
 

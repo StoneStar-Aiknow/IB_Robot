@@ -445,6 +445,7 @@ class RosBridge:
         request.motion_distance = float(payload["motion_distance"] or 0.0)
         request.arm_side = str(payload.get("arm_side", ""))
         request.imitation_duration_sec = float(payload.get("imitation_duration_sec", 0.0) or 0.0)
+        request.approach = str(payload.get("approach", ""))
         self._copy_navigation_fields(request, payload)
         response = self._call_service(
             self._validate_client,
@@ -557,6 +558,8 @@ class RosBridge:
             "imitation_duration_sec": float(step.imitation_duration_sec),
             "timeout_sec": float(step.timeout_sec),
         }
+        if str(getattr(step, "approach", "")):
+            result["approach"] = str(step.approach)
         if int(step.schema_version) == 2:
             result.update(
                 {
@@ -673,6 +676,7 @@ class RosBridge:
         message.motion_distance = float(step.get("motion_distance", 0.0))
         message.arm_side = str(step.get("arm_side", ""))
         message.imitation_duration_sec = float(step.get("imitation_duration_sec", 0.0) or 0.0)
+        message.approach = str(step.get("approach", ""))
         self._copy_navigation_fields(message, step)
         message.timeout_sec = float(step.get("timeout_sec", 0.0))
         return message
@@ -1083,6 +1087,7 @@ class RosBridge:
         goal.motion_distance = float(payload["motion_distance"] or 0.0)
         goal.arm_side = str(payload.get("arm_side", ""))
         goal.imitation_duration_sec = float(payload.get("imitation_duration_sec", 0.0) or 0.0)
+        goal.approach = str(payload.get("approach", ""))
         self._copy_navigation_fields(goal, payload)
         goal.timeout_sec = float(payload["timeout_sec"])
 

@@ -130,3 +130,72 @@ def test_loader_requires_public_model_and_preserves_resolved_config_path(monkeyp
     assert supplied["_config_path"] == "/resolved/robot.yaml"
     assert supplied["runtime"]["require_model"] is True
     assert config == original
+
+
+# --- contract v2: multi-arm runtime without a public model (task_dispatch.groups) -------------
+
+
+@pytest.fixture
+def dual_config(config):
+    interfaces = config["runtime"]["interface_description"]["interfaces"]
+    interfaces["joint.state"]["joint_names"] = ["l1", "r1", "left_gripper", "right_gripper"]
+    for side in ("left", "right"):
+        interfaces[f"joint.trajectory_{side}_gripper"] = {
+            "kind": "action",
+            "direction": "serve",
+            "message_type": "control_msgs/action/FollowJointTrajectory",
+            "endpoint": f"/{side}_gripper_trajectory_controller/follow_joint_trajectory",
+        }
+    config.pop("robot_model")
+    config["task_dispatch"] = {
+        "default_group": "left_arm",
+        "groups": {
+            side + "_arm": {
+                "gripper_joint": f"{side}_gripper",
+                "gripper_trajectory_interface": f"joint.trajectory_{side}_gripper",
+            }
+            for side in ("left", "right")
+        },
+    }
+    return config
+
+
+def test_groups_bind_one_gripper_per_arm_without_a_public_model(dual_config):
+    node = node_for(dual_config)
+    node._configure_interfaces()
+    assert node._move_service_name == "/unit/move"
+    assert node._default_group == "left_arm" and node._gripper_joint == "left_gripper"
+    assert {g: b[:2] for g, b in node._gripper_bindings.items()} == {
+        "left_arm": ("left_gripper", "/left_gripper_trajectory_controller/follow_joint_trajectory"),
+        "right_arm": ("right_gripper", "/right_gripper_trajectory_controller/follow_joint_trajectory"),
+    }
+
+
+def test_gripper_step_goes_to_its_groups_action_and_unknown_groups_are_refused(dual_config):
+    node = node_for(dual_config)
+    node._configure_interfaces()
+    node._gripper_action_client = Mock()
+    node._gripper_clients = {"left_arm": node._gripper_action_client, "right_arm": Mock()}
+    assert node._gripper_binding("right_arm") == (
+        "right_gripper",
+        {"min": 0.0, "max": 1.0},
+        node._gripper_clients["right_arm"],
+    )
+    assert node._gripper_binding("")[0] == "left_gripper"
+    success, message = node._exec_gripper(SimpleNamespace(gripper_position=0.0, target_group="middle_arm"))
+    assert not success and "unknown target_group" in message
+
+
+def test_single_gripper_robot_refuses_a_named_group(config):
+    node = node_for(config)
+    node._configure_interfaces()
+    node._gripper_action_client = Mock()
+    success, message = node._exec_gripper(SimpleNamespace(gripper_position=0.5, target_group="right_arm"))
+    assert not success and "unknown target_group" in message
+    assert node._gripper_action_client.mock_calls == []
+
+
+def test_groups_need_a_default_group(dual_config):
+    dual_config["task_dispatch"]["default_group"] = "torso"
+    with pytest.raises(InterfaceBindingError):
+        node_for(dual_config)._configure_interfaces()
