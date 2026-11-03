@@ -54,6 +54,10 @@ GRASP_SETTLE_S = 0.3
 LIFT_HOLD_S = 3.0
 
 
+class _SearchExhausted(Exception):
+    """The planning call tried its candidates and none planned (it raised RuntimeError)."""
+
+
 @dataclass(frozen=True)
 class GraspRequestConfig:
     planning_profile: str = "latency"
@@ -204,7 +208,14 @@ class X2GraspPlanner:
             raise
         except ReobserveRequired as exc:
             raise GraspFailure(REOBSERVE_REQUIRED, str(exc), retryable=True) from exc
-        except (RuntimeError, ValueError, TimeoutError, PlannerFault) as exc:
+        except (_SearchExhausted, TimeoutError) as exc:
+            # The search found nothing in this candidate set, or ran out of time:
+            # a new observation samples new candidates (live 2026-11-03: 7 of 48
+            # picks, all before the arm moved, none retried). Candidates out of
+            # reach, a refused plan and a planner fault are not retried.
+            cause = exc.__cause__ if isinstance(exc, _SearchExhausted) else exc
+            raise GraspFailure(NO_EXECUTABLE_CANDIDATE, f"{type(cause).__name__}: {cause}", retryable=True) from exc
+        except (RuntimeError, ValueError, PlannerFault) as exc:
             raise GraspFailure(NO_EXECUTABLE_CANDIDATE, f"{type(exc).__name__}: {exc}") from exc
         finally:
             ready = report["request_timings_s"].get("complete_plan_ready")
@@ -250,21 +261,26 @@ class X2GraspPlanner:
             if not len(kept):
                 raise RuntimeError("No grasp candidate within left-palm reach")
         check_deadline()
-        plan, planning = measure(
-            "planning_call",
-            lambda: self.service.plan(
-                start,
-                estimate,
-                grasps[kept],
-                confidence[kept],
-                transform.base_from_camera,
-                screen_check=self.config.screen_check,
-                deadline=planning_deadline,
-                target_points_camera=proposals.target_points,
-                checkpoint=check_deadline,
-                snapshot_now=admitted.admitted_at,
-            ),
-        )
+        try:
+            plan, planning = measure(
+                "planning_call",
+                lambda: self.service.plan(
+                    start,
+                    estimate,
+                    grasps[kept],
+                    confidence[kept],
+                    transform.base_from_camera,
+                    screen_check=self.config.screen_check,
+                    deadline=planning_deadline,
+                    target_points_camera=proposals.target_points,
+                    checkpoint=check_deadline,
+                    snapshot_now=admitted.admitted_at,
+                ),
+            )
+        except GraspFailure:
+            raise  # a cancel or the goal deadline at a checkpoint (GraspFailure is a RuntimeError)
+        except RuntimeError as exc:
+            raise _SearchExhausted() from exc
         report.update(planning)
         report["generated_candidate_index"] = int(kept[report["candidate_index"]])
         error = float(

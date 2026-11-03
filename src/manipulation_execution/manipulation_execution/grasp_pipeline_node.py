@@ -33,6 +33,7 @@ from embodied_common.dispatch_binding import (
 )
 from ibrobot_msgs.action import PickObject
 from manipulation_execution.grasp_pipeline.backends import backend_spec, load_backends
+from manipulation_execution.grasp_pipeline.outcome_message import outcome_message
 from manipulation_execution.grasp_pipeline.pipeline import GraspPipeline, PickMode, PickOutcome, PipelineConfig
 from manipulation_execution.pick_goal import pick_goal_rejection, remaining_budget_s
 
@@ -82,14 +83,16 @@ def pick_result(outcome: PickOutcome, identity: dict[str, str]) -> PickObject.Re
     result = PickObject.Result()
     result.success = bool(outcome.success)
     result.error_code = outcome.error_code
-    result.message = outcome.message
+    # The Agent-facing account: outcome, robot/object state, retries and why, what to do next.
+    result.message = outcome_message(outcome)
     result.attempts = int(outcome.attempts)
     result.verification_status = verification_status(outcome)
     result.verification_confidence = float(outcome.held_confidence)
     result.completed_phases = list(outcome.completed_phases)
     result.candidate_index = int(outcome.candidate_index)
     result.released_after_success = bool(outcome.released_after_success)
-    result.pipeline_timings_json = json.dumps(outcome.report, sort_keys=True, default=_json_value)
+    report = {**outcome.report, "retries": outcome.retries}
+    result.pipeline_timings_json = json.dumps(report, sort_keys=True, default=_json_value)
     fill_delegated_executor_identity(result.actual_executor, identity)
     return result
 

@@ -257,6 +257,37 @@ sees and measures now, and raises `ReobserveRequired` when it no longer holds:
 Depth counts only where both frames measured it: a transparent target's valid
 pixels come and go between still frames.
 
+## Retries and what the Agent is told
+
+`aimdk_x2_grasp.yaml` sets the pipeline's retries (`grasp_pipeline.pipeline`):
+
+| Retry | When | Limit |
+|---|---|---|
+| look again | before the arm moves: `OBSERVATION_UNAVAILABLE` (camera, joint feedback or runtime status missing, stale or out of sync past `CAPTURE_WAIT_S` 0.6 s), `NO_EXECUTABLE_CANDIDATE` from a search that planned nothing or ran out of time, `REOBSERVE_REQUIRED` (the recheck after planning: feedback stale, robot or target moved, image not newer) | `max_attempts: 3` observations, shared |
+| plan again | the target watch halted the approach; the arm retraced to home | `max_moved_replans: 1` |
+| grasp again | the hand closed on nothing or lost the object; the arm is home, the hand open | `max_regrasps: 1` |
+
+A plan is not started with less than `execute_reserve_s` (50 s) of the goal
+left: the goal's timeout would cancel it mid-motion. Not retried: a target not
+seen (`TARGET_NOT_VISIBLE`), candidates out of reach, a refused plan, a planner
+fault, and anything after which the arm stopped in place.
+
+The `PickObject` result keeps `error_code` and puts an account for the Agent in
+`message` (`grasp_pipeline.outcome_message`): the outcome, where the arm and the
+object are, each retry with its reason, what to do next and the last detail.
+`pipeline_timings_json` carries the retries as `retries`.
+
+| `error_code` | Arm and object | Next step for the Agent |
+|---|---|---|
+| `TARGET_NOT_VISIBLE` | not moved | check the name or ask for the object to be put in view |
+| `NO_EXECUTABLE_CANDIDATE` | not moved | ask for the object to be moved closer or turned |
+| `OBSERVATION_UNAVAILABLE`, `REOBSERVE_REQUIRED` | not moved | wait, keep things still, try again |
+| `TARGET_MOVED` | home, hand open | keep the object still, try again |
+| `GRASP_VERIFICATION_FAILED` | home, hand open; the object may have moved or fallen | look again before retrying |
+| `SKILL_TIMEOUT`, `TASK_TIMEOUT`, `CANCELED` | not moved, or home | try again / nothing |
+| `RPC_FAILED`, `RPC_TIMEOUT`, `NOT_READY`, `SERVICE_UNAVAILABLE` | not moved | try later; the operator checks the services |
+| `MOTION_FAILED`, `WATCH_FAILED`, `EFFECTOR_FAILED`, `INTERNAL_ERROR` | stopped where it was (may hold the object), or not moved | do not retry; the operator checks the robot |
+
 ## Host deployments
 
 `aimdk_x2_grasp.yaml` is the X2 grasp without its models; each robot-side host

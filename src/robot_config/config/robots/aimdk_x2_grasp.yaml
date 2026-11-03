@@ -143,3 +143,16 @@ robot:
     pipeline:
       # The X2 puts a picked object back where it was, retracing the plan.
       release_after_success: true
+      # Observations a goal may plan from. Live 2026-11-03 (48 picks, 310P):
+      # 12 failed before the arm moved, 7 with no executable candidate for
+      # that view and 5 with feedback missing at capture; each costs 3-15 s of
+      # the 120 s goal and a new view samples new candidates.
+      max_attempts: 3
+      # A grasp that held nothing or let the object slip (4 of 48, all
+      # oranges), with the arm back at home and the hand open, is tried once
+      # more from a new observation.
+      max_regrasps: 1
+      # A pick ran 33-50 s from goal to put-back (same 48): a plan is not
+      # started with less goal time left, so a retry late in the goal cannot
+      # be cancelled by the goal's timeout mid-motion.
+      execute_reserve_s: 50.0

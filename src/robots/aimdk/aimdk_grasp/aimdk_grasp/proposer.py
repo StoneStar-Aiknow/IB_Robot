@@ -47,6 +47,7 @@ from .scene_estimation import NoSupportError, SceneEstimate, SceneEstimationConf
 from .types import CameraIntrinsics, RGBDFrame
 
 NO_EXECUTABLE_CANDIDATE = "NO_EXECUTABLE_CANDIDATE"
+TARGET_NOT_VISIBLE = "TARGET_NOT_VISIBLE"
 
 # Exact aliases at the detector boundary, shared by CLI and Agent requests.
 # Never drop an unknown modifier: "left apple" and "apple" can name different targets.
@@ -352,7 +353,8 @@ class X2Proposer:
                 "detect", lambda: self._detect(frame, stamp_ns, prompt, 1 + settings.support_fallbacks, turn, cancelled)
             )
             if not detections:
-                raise RuntimeError("No target detected")
+                # Not a planning failure: the caller must know the target was not seen.
+                raise GraspFailure(TARGET_NOT_VISIBLE, f"No target detected for {prompt!r}")
             rejected = []
             for detection in detections:
                 if any(box_iou(detection.box_xyxy, other["box_xyxy"]) > 0.5 for other in rejected):

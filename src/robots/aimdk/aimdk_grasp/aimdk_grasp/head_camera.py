@@ -59,8 +59,12 @@ SYNC_SLOP_S = 0.05
 # feedback and TF, waiting up to this long for one. The 500 Hz feedback can
 # lose samples when its thread stalls, and TF can trail the newest image
 # (live 2026-10-09: feedback gaps > 100 ms, TF 34-70 ms behind); sets are
-# ~33 ms apart, and the planner still gates scene age.
-CAPTURE_WAIT_S = 0.2
+# ~33 ms apart, and the planner still gates scene age. Live 2026-11-03 (48
+# picks, 310P robot side): feedback reaching the Orin stopped for ~400 ms at
+# times (nearest sample 356-372 ms before the image) and the vendor HAL for
+# 120-190 ms; 0.2 s failed 5 picks before any motion. Feedback that arrives
+# unhealthy or out of sync is waited out the same way.
+CAPTURE_WAIT_S = 0.6
 #: How long a capture waits for a feedback sample inside the freshness limit
 #: before it reports the stale one (five 50 Hz runtime views), and how often it looks.
 FEEDBACK_WAIT_S = 0.1
@@ -331,7 +335,7 @@ class HeadCamera:
             try:
                 require_fresh(state, self.clock(), self.revalidation)
             except ReobserveRequired as exc:
-                raise GraspFailure(OBSERVATION_UNAVAILABLE, str(exc)) from None
+                raise GraspFailure(OBSERVATION_UNAVAILABLE, str(exc), retryable=True) from None
         admitted = AdmittedState(state, self.clock(), started)
         registered = state.observation
         stamp = registered.transform.stamp_ns
@@ -352,7 +356,12 @@ class HeadCamera:
         )
 
     def capture_state(self, *, deadline: float = float("inf"), cancelled: Flag = lambda: False) -> LiveState:
-        """The newest set registered now, with the current feedback; not checked for freshness."""
+        """The newest set registered now, with the current feedback; not checked for freshness.
+
+        Waits up to CAPTURE_WAIT_S for a set with image-time feedback and TF and
+        for feedback that is healthy and in sync, then fails retryable: a later
+        capture may succeed.
+        """
         from tf2_ros import TransformException
 
         started = time.monotonic()
@@ -384,31 +393,47 @@ class HeadCamera:
                 if time.monotonic() >= wait_until:
                     reason = errors[0] if errors else "no synchronized RGB-D set received yet"
                     raise GraspFailure(
-                        OBSERVATION_UNAVAILABLE, f"No recent RGB-D set has image-time feedback and TF: {reason}"
+                        OBSERVATION_UNAVAILABLE,
+                        f"No recent RGB-D set has image-time feedback and TF: {reason}",
+                        retryable=True,
                     )
                 time.sleep(0.02)
                 continue
             profile["match_s"] += time.monotonic() - began
+            found = time.monotonic()
+            rgb_info, depth_info = kept[2:]
+            try:
+                with gpu_section(self._gpu, deadline=deadline, cancelled=cancelled, code=OBSERVATION_UNAVAILABLE):
+                    locked = time.monotonic()
+                    frame, calibration_id = register_set(
+                        rgb,
+                        depth,
+                        rgb_info,
+                        depth_info,
+                        rgb_from_depth,
+                        depth_scale=self._depth_scale,
+                        device=self._device,
+                    )
+                registered = RegisteredObservation(
+                    frame,
+                    ImageTransform(stamp, frame.frame_id, BASE_FRAME, torso, self._verified),
+                    min(stamp, stamp_ns(depth.header)) * 1e-9,
+                    feedback,
+                    calibration_id,
+                ).snapshot()
+                registered_at = time.monotonic()
+                current = self._current_feedback(deadline, cancelled)
+            except ValueError as exc:
+                # Unhealthy or unsynchronized feedback (live 2026-11-03: 3 of 48
+                # picks) clears with the next samples; a newer set is taken.
+                profile.setdefault("invalid", []).append(str(exc))
+                if time.monotonic() >= wait_until:
+                    raise GraspFailure(
+                        OBSERVATION_UNAVAILABLE, f"Invalid RGB-D set or feedback: {exc}", retryable=True
+                    ) from None
+                time.sleep(0.02)
+                continue
             break
-        found = time.monotonic()
-        rgb_info, depth_info = kept[2:]
-        try:
-            with gpu_section(self._gpu, deadline=deadline, cancelled=cancelled, code=OBSERVATION_UNAVAILABLE):
-                locked = time.monotonic()
-                frame, calibration_id = register_set(
-                    rgb, depth, rgb_info, depth_info, rgb_from_depth, depth_scale=self._depth_scale, device=self._device
-                )
-            registered = RegisteredObservation(
-                frame,
-                ImageTransform(stamp, frame.frame_id, BASE_FRAME, torso, self._verified),
-                min(stamp, stamp_ns(depth.header)) * 1e-9,
-                feedback,
-                calibration_id,
-            ).snapshot()
-            registered_at = time.monotonic()
-            current = self._current_feedback(deadline, cancelled)
-        except ValueError as exc:
-            raise GraspFailure(OBSERVATION_UNAVAILABLE, f"Invalid RGB-D set or feedback: {exc}") from None
         done = time.monotonic()
         self.calls.append(
             dict(

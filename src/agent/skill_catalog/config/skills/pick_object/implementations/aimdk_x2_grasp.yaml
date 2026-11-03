@@ -4,6 +4,7 @@ robot: aimdk_x2_grasp
 executor: grasp_pipeline
 required_args:
 - target_name
-# Two planning attempts of at most 10 s each, a moved-target retreat and
-# replan, a close of at most 15 s and the put-back stay well inside this.
+# Three observations with planning of at most 10 s each, a moved-target
+# retreat and replan, one regrasp, a close of at most 15 s and the put-back
+# stay inside this (a pick takes ~40 s, a failure before motion 3-15 s).
 timeout_sec: 120.0

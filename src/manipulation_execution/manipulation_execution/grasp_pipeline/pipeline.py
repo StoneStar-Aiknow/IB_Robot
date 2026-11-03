@@ -1,11 +1,14 @@
 """One ``PickObject`` goal for any robot: observe, propose, plan, run.
 
 The pipeline owns the order of work, the goal's budget and the retries; a
-robot's backends own everything that depends on its body. A planning failure
-that another view may fix observes again while attempts remain. A plan the
+robot's backends own everything that depends on its body. An observation or
+planning failure that another view may fix (``GraspFailure.retryable``)
+observes again while ``max_attempts`` remain; the arm has not moved. A plan the
 target watch abandoned is retraced to home and planned again from a fresh
-observation, at most ``max_moved_replans`` times; those replans do not use up
-planning attempts.
+observation, at most ``max_moved_replans`` times. A grasp that held nothing or
+lost its grip, with the arm back at home, is tried again from a fresh
+observation at most ``max_regrasps`` times. Replans and regrasps do not use up
+attempts. Every retry is recorded in ``PickOutcome.retries`` with its reason.
 
 The ROS node that serves the action maps goals onto ``run`` and outcomes onto
 the result; nothing here imports ROS.
@@ -34,6 +37,11 @@ class PipelineConfig:
     max_attempts: int = 2
     #: Plans abandoned because the target moved that may be planned again.
     max_moved_replans: int = 1
+    #: Grasps that held nothing or lost the object, with the arm back at home, that may be tried again.
+    max_regrasps: int = 0
+    #: Goal time an execution needs: with less left, a plan is not started (the goal's
+    #: own timeout would cancel it mid-motion and leave the arm stopped in place).
+    execute_reserve_s: float = 0.0
     #: How far from home a retreat may end before one corrective move.
     home_tolerance_rad: float = 0.02
     #: Put the object back after every successful pick, whether or not the goal asks to.
@@ -42,10 +50,13 @@ class PipelineConfig:
     def __post_init__(self):
         if not isinstance(self.release_after_success, bool):
             raise ValueError("release_after_success must be a boolean")
-        for name in ("max_attempts", "max_moved_replans"):
+        for name in ("max_attempts", "max_moved_replans", "max_regrasps"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < (1 if name == "max_attempts" else 0):
                 raise ValueError(f"{name} must be a non-negative integer (max_attempts at least 1)")
+        reserve = self.execute_reserve_s
+        if isinstance(reserve, bool) or not isinstance(reserve, int | float) or not 0 <= reserve < float("inf"):
+            raise ValueError("execute_reserve_s must be a finite non-negative number of seconds")
 
 
 @dataclass
@@ -63,6 +74,9 @@ class PickOutcome:
     at_rest: bool = True
     #: The requested post-pick release and return completed.
     released_after_success: bool = False
+    #: One entry per retry, in order: {"attempt", "retry", "code", "message"}; ``retry`` is
+    #: "reobserve" (nothing moved), "replan" (target moved, arm retreated) or "regrasp".
+    retries: list[dict] = field(default_factory=list)
     report: dict = field(default_factory=dict)
 
 
@@ -121,19 +135,19 @@ class GraspPipeline:
 
     def _run(self, query, mode, deadline, cancelled, stop, phase, release_after_success, outcome) -> PickOutcome:
         backends = self._backends
-        planning_failures, replans = 0, 0
+        planning_failures, replans, regrasps = 0, 0, 0
         try:
             while True:
                 outcome.attempts += 1
                 budget = {"deadline": deadline, "cancelled": stop}
                 steps: dict[str, float] = {}
-                observation = self._step("observe", phase, steps, backends.observation.capture, **budget)
-                outcome.report["observe"] = dict(observation.report)
-                self._check_budget(cancelled, deadline)
-                if mode is PickMode.OBSERVE_ONLY:
-                    outcome.success = True
-                    return outcome
                 try:
+                    observation = self._step("observe", phase, steps, backends.observation.capture, **budget)
+                    outcome.report["observe"] = dict(observation.report)
+                    self._check_budget(cancelled, deadline)
+                    if mode is PickMode.OBSERVE_ONLY:
+                        outcome.success = True
+                        return outcome
                     proposals = self._step(
                         "perceive", phase, steps, backends.proposer.propose, observation, query, **budget
                     )
@@ -147,6 +161,7 @@ class GraspPipeline:
                         outcome.report.setdefault("planning_failures", []).append(
                             {"code": failure.code, "message": str(failure)}
                         )
+                        self._retry(outcome, "reobserve", failure.code, str(failure))
                         continue
                     raise
                 outcome.candidate_index = plan.candidate_index
@@ -156,6 +171,13 @@ class GraspPipeline:
                 if mode is PickMode.PLAN_ONLY:
                     outcome.success = True
                     return outcome
+                left = deadline - self._clock()
+                if left < self._config.execute_reserve_s:
+                    raise GraspFailure(
+                        "SKILL_TIMEOUT",
+                        f"{left:.1f} s left of the goal, an execution needs {self._config.execute_reserve_s:g} s;"
+                        " the arm was not moved",
+                    )
                 # Once the arm moves, only the goal's own cancel stops it in place:
                 # the deadline gates observing, planning and starting to execute,
                 # but stopping on it mid-sequence would leave an object lifted in
@@ -171,6 +193,17 @@ class GraspPipeline:
                 ):
                     replans += 1
                     outcome.report.setdefault("retreats", []).append(result.retreated)
+                    self._retry(outcome, "replan", result.error_code, result.message)
+                    continue
+                if (
+                    result.error_code == "GRASP_VERIFICATION_FAILED"
+                    and result.at_rest
+                    and regrasps < self._config.max_regrasps
+                    and not stop()
+                ):
+                    # The sequence took the plan back: the arm is home and the hand open.
+                    regrasps += 1
+                    self._retry(outcome, "regrasp", result.error_code, result.message)
                     continue
                 if result.retreated is not None:
                     outcome.report.setdefault("retreats", []).append(result.retreated)
@@ -216,6 +249,10 @@ class GraspPipeline:
         outcome.released_after_success = result.released_after_success
         outcome.report.setdefault("executions", []).append({"phases": result.phases, "retreated": result.retreated})
         return result
+
+    @staticmethod
+    def _retry(outcome: PickOutcome, retry: str, code: str, message: str) -> None:
+        outcome.retries.append({"attempt": outcome.attempts, "retry": retry, "code": code, "message": message})
 
     def _step(self, name: str, phase: PhaseCallback, timings: dict, call, *args, **kwargs):
         phase(name, "start", {})

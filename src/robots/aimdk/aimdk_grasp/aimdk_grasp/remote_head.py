@@ -185,7 +185,11 @@ class RemoteHeadCamera:
         response = self.head.call(self.head.capture_client, request, deadline + 1.0, cancelled)
         answered = time.monotonic()
         if not response.success:
-            raise GraspFailure(response.error_code or RPC_FAILED, response.message)
+            # The capture reply has no retryable flag (aimdk_grasp_msgs): an
+            # observation the head could not take is retried from a new one, as
+            # the head's own camera marks it; nothing has moved yet.
+            code = response.error_code or RPC_FAILED
+            raise GraspFailure(code, response.message, retryable=code == "OBSERVATION_UNAVAILABLE")
         report = wire.from_json(response.report_json)
         # The head's own breakdown, plus what the call around it cost here: the
         # rest of rpc_s past the head's capture_s is encoding, transfer and the reply.

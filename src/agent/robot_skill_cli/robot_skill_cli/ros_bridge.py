@@ -485,12 +485,25 @@ class RosBridge:
         request.schema_version = 1
         request.registry_epoch = registry_epoch
         request.generation = int(generation)
-        response = self._call_service(
-            self._snapshot_client,
-            request,
-            service_name=self._snapshot_service,
-            timeout_sec=timeout_sec,
-        )
+        try:
+            response = self._call_service(
+                self._snapshot_client,
+                request,
+                service_name=self._snapshot_service,
+                timeout_sec=timeout_sec,
+            )
+        except BridgeError as exc:
+            if exc.code != "RESULT_TIMEOUT":
+                raise
+            # A read-only query before any goal is sent, so asking once more is
+            # safe. Live 2026-11-03 (X2 Gateway on a loaded 310P): one of 49 pick
+            # commands got no snapshot reply right after its status call was answered.
+            response = self._call_service(
+                self._snapshot_client,
+                request,
+                service_name=self._snapshot_service,
+                timeout_sec=timeout_sec,
+            )
         return {
             "success": bool(response.success),
             "registry_epoch": str(response.registry_epoch),

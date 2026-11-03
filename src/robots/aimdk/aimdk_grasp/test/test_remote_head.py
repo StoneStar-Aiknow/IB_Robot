@@ -69,6 +69,8 @@ class FakeHead(Node):
         names, group = head_endpoints(NAMESPACE), ReentrantCallbackGroup()
         self.ready, self.plan_seconds, self.requests, self.arm_seconds = True, 0.0, [], 0.0
         self.arm_refusal, self.sessions = "", []
+        #: The capture's failure as (error_code, message), or None to answer.
+        self.capture_failure = None
         self.phase_refusal = ""
         self.cancelled = threading.Event()
         self.scene_entered = threading.Event()
@@ -116,6 +118,9 @@ class FakeHead(Node):
         self.requests.append(("capture", request.timeout_s))
         if not self.ready:
             response.error_code, response.message = NOT_READY, "warming up"
+            return response
+        if self.capture_failure is not None:
+            response.error_code, response.message = self.capture_failure
             return response
         rgb = np.zeros((4, 6, 3), np.uint8)
         rgb[..., 0] = 200
@@ -229,7 +234,20 @@ def test_a_capture_decodes_into_an_observation_the_head_keeps(ros):
     head.ready = False
     with pytest.raises(GraspFailure) as raised:
         capture(client)
-    assert raised.value.code == NOT_READY
+    assert raised.value.code == NOT_READY and not raised.value.retryable
+
+
+def test_an_observation_the_head_could_not_take_is_retryable_and_nothing_else_is(ros):
+    """The capture reply carries no retryable flag; the code alone says another capture may succeed."""
+    head, client = ros
+    head.capture_failure = ("OBSERVATION_UNAVAILABLE", "No recent RGB-D set has image-time feedback and TF")
+    with pytest.raises(GraspFailure, match="image-time feedback") as raised:
+        capture(client)
+    assert raised.value.code == "OBSERVATION_UNAVAILABLE" and raised.value.retryable
+    head.capture_failure = ("INTERNAL_ERROR", "boom")
+    with pytest.raises(GraspFailure) as raised:
+        capture(client)
+    assert raised.value.code == "INTERNAL_ERROR" and not raised.value.retryable
 
 
 def test_a_scene_without_support_raises_what_the_proposer_falls_back_on(ros):

@@ -58,6 +58,8 @@ class FakeHead(Node):
     def __init__(self, interfaces, open_hand):
         super().__init__("fake_head")
         self.open_hand, self.tf_on = open_hand, True
+        # Joint views stop while False (a feedback gap); the runtime's lifecycle as published.
+        self.views_on, self.lifecycle = True, "ACTIVE"
 
         def publisher(kind, name):
             interface = interfaces[name]
@@ -87,8 +89,8 @@ class FakeHead(Node):
     def _tick(self):
         now = self.get_clock().now()
         stamp = now.nanoseconds
-        self.status.publish(RuntimeStatus(lifecycle="ACTIVE", stamp=now.to_msg()))
-        for pub, names in self.views.values():
+        self.status.publish(RuntimeStatus(lifecycle=self.lifecycle, stamp=now.to_msg()))
+        for pub, names in self.views.values() if self.views_on else ():
             values = {joint: 0.0 for joint in BODY_JOINTS}
             values[HEAD[0]] = encoded(stamp)
             values.update(zip(LEFT_HAND, self.open_hand, strict=True))
@@ -265,6 +267,50 @@ def test_without_tf_a_capture_reports_the_missing_transform(head):
     with pytest.raises(GraspFailure, match="image-time feedback and TF") as raised:
         camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
     assert raised.value.code == "OBSERVATION_UNAVAILABLE" and time.monotonic() - started < 1.0
+    assert raised.value.retryable  # nothing has moved: the pipeline observes again
+
+
+def after(seconds, action):
+    timer = threading.Timer(seconds, action)
+    timer.start()
+    return timer
+
+
+def test_a_feedback_gap_shorter_than_the_wait_is_waited_out(head):
+    """Live 2026-11-03: feedback reaching the head stopped for ~400 ms; 0.2 s of waiting failed the pick."""
+    fake, camera = head
+    capture(camera)
+    fake.views_on = False
+    time.sleep(0.1)  # the newest images now have no feedback near them
+    resumed = after(0.3, lambda: setattr(fake, "views_on", True))
+    try:
+        observation = camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    finally:
+        resumed.cancel()
+    assert observation.report["wait_s"] >= 0.2 and observation.report["rounds"] > 1
+
+
+def test_feedback_that_turns_unhealthy_briefly_is_waited_out_then_refused(head):
+    """An unhealthy runtime verdict or unsynchronized views waited CAPTURE_WAIT_S like a missing sample."""
+    from aimdk_grasp.head_camera import CAPTURE_WAIT_S
+
+    fake, camera = head
+    capture(camera)
+    fake.lifecycle = "FAULT"
+    time.sleep(0.1)
+    recovered = after(0.3, lambda: setattr(fake, "lifecycle", "ACTIVE"))
+    try:
+        observation = camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    finally:
+        recovered.cancel()
+    assert any("Healthy image-time feedback" in reason for reason in observation.report["invalid"])
+    fake.lifecycle = "FAULT"
+    time.sleep(0.1)
+    started = time.monotonic()
+    with pytest.raises(GraspFailure, match="Healthy image-time feedback") as raised:
+        camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    assert raised.value.code == "OBSERVATION_UNAVAILABLE" and raised.value.retryable
+    assert CAPTURE_WAIT_S <= time.monotonic() - started < CAPTURE_WAIT_S + 0.5
 
 
 def test_a_stale_capture_is_taken_again_once_then_refused(head):

@@ -57,11 +57,13 @@ def observation(stamp=1):
 
 
 class Source:
-    def __init__(self):
-        self.captures = 0
+    def __init__(self, failures=()):
+        self.captures, self.failures = 0, list(failures)
 
     def capture(self, *, deadline, cancelled):
         self.captures += 1
+        if self.failures:
+            raise self.failures.pop(0)
         return observation(self.captures)
 
 
@@ -538,6 +540,94 @@ def test_planning_observes_again_only_for_retryable_failures():
     backends, executor, *_ = streaming()
     backends.planner.failures = [GraspFailure("PLANNER_FAULT", "CUDA error")]
     assert run(backends).error_code == "PLANNER_FAULT" and backends.observation.captures == 1
+
+
+def test_an_observation_that_another_capture_may_fix_is_taken_again():
+    """Live 2026-11-03: 5 of 48 picks ended on feedback missing at the capture, before the arm moved."""
+    backends, executor, *_ = streaming()
+    backends.observation.failures = [GraspFailure("OBSERVATION_UNAVAILABLE", "feedback 372 ms old", retryable=True)]
+    outcome = run(backends)
+    assert outcome.success and outcome.attempts == 2 and backends.observation.captures == 2
+    assert outcome.retries == [
+        {"attempt": 1, "retry": "reobserve", "code": "OBSERVATION_UNAVAILABLE", "message": "feedback 372 ms old"}
+    ]
+    backends, executor, *_ = streaming()
+    backends.observation.failures = [GraspFailure("OBSERVATION_UNAVAILABLE", "x", retryable=True)] * 2
+    outcome = run(backends)
+    assert outcome.error_code == "OBSERVATION_UNAVAILABLE" and not executor.log and len(outcome.retries) == 1
+    backends, executor, *_ = streaming()
+    backends.observation.failures = [GraspFailure("RPC_FAILED", "the grasp head is gone")]
+    outcome = run(backends)
+    assert outcome.error_code == "RPC_FAILED" and backends.observation.captures == 1 and not outcome.retries
+
+
+def test_observation_and_planning_failures_share_the_attempts():
+    backends, executor, *_ = streaming()
+    backends.observation.failures = [GraspFailure("OBSERVATION_UNAVAILABLE", "gap", retryable=True)]
+    backends.planner.failures = [GraspFailure("NO_EXECUTABLE_CANDIDATE", "none planned", retryable=True)]
+    outcome = run(backends, config=PipelineConfig(max_attempts=3))
+    assert outcome.success and outcome.attempts == 3
+    assert [(r["retry"], r["code"]) for r in outcome.retries] == [
+        ("reobserve", "OBSERVATION_UNAVAILABLE"),
+        ("reobserve", "NO_EXECUTABLE_CANDIDATE"),
+    ]
+    backends, executor, *_ = streaming()
+    backends.observation.failures = [GraspFailure("OBSERVATION_UNAVAILABLE", "gap", retryable=True)]
+    backends.planner.failures = [GraspFailure("NO_EXECUTABLE_CANDIDATE", "none planned", retryable=True)]
+    outcome = run(backends)  # two attempts: the second failure ends the goal
+    assert outcome.error_code == "NO_EXECUTABLE_CANDIDATE" and not executor.log
+
+
+def test_a_moved_target_replan_is_recorded_as_a_retry():
+    backends, executor, _, planner, watch = streaming(fire_at=4)
+    outcome = run(backends)
+    assert outcome.success
+    assert [(r["retry"], r["code"]) for r in outcome.retries] == [("replan", "TARGET_MOVED")]
+
+
+@pytest.mark.parametrize("slip", [True, False])
+def test_a_grasp_that_lost_or_missed_the_object_is_tried_again_from_home(slip):
+    """Live 2026-11-03: 4 of 48 picks let an orange slip after the lift; the arm was home, the hand open."""
+    backends, executor, effector, planner, _ = streaming()
+    if slip:
+        slips = iter(["the contact fingers no longer press the object", ""])
+        effector.on_act = lambda action: (
+            setattr(effector, "grip", next(slips)) if action is EffectorAction.CLOSE else None
+        )
+    else:
+        effector.held = [False, True]
+    outcome = run(backends, config=PipelineConfig(max_regrasps=1), release_after_success=True)
+    assert outcome.success and planner.calls == 2 and backends.observation.captures == 2
+    assert [(r["retry"], r["code"]) for r in outcome.retries] == [("regrasp", "GRASP_VERIFICATION_FAILED")]
+    np.testing.assert_allclose(executor.position, HOME)
+
+
+def test_without_regrasps_left_a_lost_grasp_ends_the_goal():
+    backends, executor, effector, planner, _ = streaming()
+    effector.held = [False]
+    outcome = run(backends, config=PipelineConfig(max_regrasps=1))
+    assert outcome.error_code == "GRASP_VERIFICATION_FAILED" and planner.calls == 2 and len(outcome.retries) == 1
+    backends, executor, effector, planner, _ = streaming()
+    effector.held = [False]
+    outcome = run(backends)  # none by default
+    assert outcome.error_code == "GRASP_VERIFICATION_FAILED" and planner.calls == 1 and not outcome.retries
+
+
+def test_a_plan_is_not_started_without_the_time_an_execution_needs():
+    """A retry late in the goal must not be cut by the goal's timeout with the arm mid-motion."""
+    backends, executor, *_ = streaming()
+    outcome = run(backends, config=PipelineConfig(execute_reserve_s=150.0))  # deadline 100 s, clock 0
+    assert outcome.error_code == "SKILL_TIMEOUT" and "not moved" in outcome.message and not executor.log
+    backends, executor, *_ = streaming()
+    assert run(backends, config=PipelineConfig(execute_reserve_s=50.0)).success
+
+
+@pytest.mark.parametrize(
+    "options", [{"max_regrasps": -1}, {"max_regrasps": True}, {"execute_reserve_s": -1.0}, {"execute_reserve_s": "5"}]
+)
+def test_retry_options_are_checked(options):
+    with pytest.raises(ValueError):
+        PipelineConfig(**options)
 
 
 def test_a_passed_deadline_reports_a_timeout():

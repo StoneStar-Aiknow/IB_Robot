@@ -716,3 +716,32 @@ def test_wait_future_falls_back_for_a_future_without_done_callbacks():
     bare = _Bare()
     assert RosBridge._wait_future(bare, 5.0) is True
     assert bare.checks > 2
+
+
+def test_a_lost_snapshot_reply_is_asked_for_once_more():
+    """The snapshot is read before any goal is sent: one more request is safe, a second timeout is reported."""
+    from ibrobot_msgs.srv import GetSkillSnapshot
+
+    bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+    bridge._GetSkillSnapshot = GetSkillSnapshot
+    answers = [BridgeError("RESULT_TIMEOUT", "lost", exit_code=1), GetSkillSnapshot.Response(success=True)]
+    calls = []
+
+    def call(client, request, *, service_name, timeout_sec):
+        calls.append(request.generation)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    bridge._call_service = call
+    assert bridge.get_skill_snapshot(registry_epoch="e", generation=3, timeout_sec=1.0)["success"] is True
+    assert calls == [3, 3]
+    answers[:] = [BridgeError("RESULT_TIMEOUT", "lost", exit_code=1)] * 2
+    with pytest.raises(BridgeError) as raised:
+        bridge.get_skill_snapshot(registry_epoch="e", generation=3, timeout_sec=1.0)
+    assert raised.value.code == "RESULT_TIMEOUT" and len(calls) == 4
+    answers[:] = [BridgeError("SERVER_UNAVAILABLE", "gone", exit_code=1)]
+    with pytest.raises(BridgeError) as raised:
+        bridge.get_skill_snapshot(registry_epoch="e", generation=3, timeout_sec=1.0)
+    assert raised.value.code == "SERVER_UNAVAILABLE" and len(calls) == 5

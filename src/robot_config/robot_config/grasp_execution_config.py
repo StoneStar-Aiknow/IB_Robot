@@ -83,6 +83,8 @@ _SCHEMA: dict[str, Any] = {
     "pipeline": {
         "max_attempts": _integer(1),
         "max_moved_replans": _integer(0),
+        "max_regrasps": _integer(0),
+        "execute_reserve_s": _NON_NEGATIVE,
         "home_tolerance_rad": _POSITIVE,
         # Put the object back after every successful pick, even when the goal does not ask.
         "release_after_success": _bool(),
