@@ -1,9 +1,9 @@
 ---
-name: ibrobot-docker-verify-oee
+name: ibrobot-verify-oee
 description: "在 openEuler Embedded (aarch64) 环境中实际执行 setup.sh + build.sh：本机有 ascend-vm 时用 ascend-vm 虚拟机，否则用 Docker 容器。Use when the user explicitly asks for openEuler/OEE Docker verification, or after an author-side PR gate asks WIP vs review and the user confirms review-ready. Skip author-side [WIP] PRs; do not run automatically during PR review."
 ---
 
-# IB-Robot openEuler Embedded Docker Verification Skill
+# IB-Robot openEuler Embedded Verification Skill
 
 在 openEuler Embedded aarch64 环境中完整验证 `setup.sh` 和 `build.sh`。
 
@@ -35,7 +35,7 @@ description: "在 openEuler Embedded (aarch64) 环境中实际执行 setup.sh + 
 - 作者侧创建/更新 PR 流程触发依赖/setup 门禁，且用户确认 PR 已准备交给 reviewer 正式检视，需要真实结果写入描述。
 - 当前任务是验证本地对 `scripts/setup/platforms/openeuler-embedded-24.03.sh`、`scripts/setup.sh`、`scripts/setup/lerobot_patches.sh` 或 dnf/rosdep 相关逻辑的修改。
 - 不要仅因为 PR review 触发本 skill。
-- 作者侧门禁调用本 skill 前必须通过交互式 ask-user 工具（opencode 中的 `question` 工具）询问 WIP/正式检视阶段，不得只在文本中询问或替用户默认选择；`[WIP]` PR 暂缓两个 Docker skill，直到用户将其转为正式检视。用户单独明确要求实际 Docker 验证时仍正常执行。
+- 作者侧门禁调用本 skill 前必须通过交互式 ask-user 工具（opencode 中的 `question` 工具）询问 WIP/正式检视阶段，不得只在文本中询问或替用户默认选择；`[WIP]` PR 暂缓两个平台的验证 skill，直到用户将其转为正式检视。用户单独明确要求实际 Docker 验证时仍正常执行。
 
 ## Review Boundary
 
@@ -46,7 +46,7 @@ description: "在 openEuler Embedded (aarch64) 环境中实际执行 setup.sh + 
 
 ## PR 验证的 Tree 绑定
 
-作者侧 PR 门禁触发两个 Docker skill 时，两平台必须验证同一个已提交代码树：
+作者侧 PR 门禁触发两个平台的验证 skill 时，两平台必须验证同一个已提交代码树：
 
 1. 启动第一个平台前解析目标 commit，并记录完整 40 位
    `VERIFIED_TREE="$(git rev-parse "${VERIFIED_COMMIT}^{tree}")"`；用户当前 worktree 无需干净。

@@ -84,7 +84,7 @@ Signed-off-by: Name <email>  # 必须，使用 git commit -s
 准备交给 reviewer 正式检视。WIP 标题统一为 `[WIP] <title>` 并暂缓双平台 Docker；移除 `[WIP]`
 转为正式检视时，必须补齐当前 Git tree 的两平台验证。WIP 不豁免 DCO、AI 披露、其他测试或 CI。
 openEuler 一侧本机有 ascend-vm 时在 ascend-vm 虚拟机中验证，否则用 Docker，规则见
-`ibrobot-docker-verify-oee`。
+`ibrobot-verify-oee`。
 
 ### 测试规范（ROS 2 / ament）
 
@@ -266,7 +266,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [ibrobot-git-flow](.agents/skills/ibrobot-git-flow) | git commit、git push、DCO sign-off |
 | [ibrobot-lerobot-patch](.agents/skills/ibrobot-lerobot-patch) | 导出 lerobot patch、patch 栈管理 |
 | [ibrobot-docker-verify](.agents/skills/ibrobot-docker-verify) | Ubuntu Docker 验证 setup+build；作者侧 `[WIP]` PR 暂缓 |
-| [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 验证（本机有 ascend-vm 时用 ascend-vm，否则用 Docker）；作者侧 `[WIP]` PR 暂缓 |
+| [ibrobot-verify-oee](.agents/skills/ibrobot-verify-oee) | openEuler aarch64 验证（本机有 ascend-vm 时用 ascend-vm，否则用 Docker）；作者侧 `[WIP]` PR 暂缓 |
 | [sync-github](.agents/skills/sync-github) | 同步 AtomGit master 到 GitHub |
 | [skill-creator](.agents/skills/skill-creator) | 新建/重构 Agent skill、编写 SKILL.md、按 agentskills.io 规范校验 |
 

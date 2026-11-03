@@ -53,7 +53,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-git-flow** | 规范提交代码（openEuler DCO/Commit 规范、PR commit ≤ 5、review 修复用 fixup+autosquash），push 后自动同步 PR 描述 |
 | **ibrobot-lerobot-patch** | 将 `libs/lerobot` 的本地改动导出为受管 patch，并同步 `series.txt` / `manifest.yaml` / 测试夹具 |
 | **ibrobot-docker-verify** | 在干净 Ubuntu 22.04 Docker 中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓 |
-| **ibrobot-docker-verify-oee** | 在 openEuler Embedded 环境（ascend-vm 或 Docker）中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓 |
+| **ibrobot-verify-oee** | 在 openEuler Embedded 环境（ascend-vm 或 Docker）中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓 |
 | **sync-github** | 将 AtomGit master 分支同步推送到 GitHub |
 | **skill-creator** | 按 agentskills.io 规范新建/重构 Agent skill，编写 SKILL.md，校验 frontmatter 与渐进式披露 |
 
@@ -125,7 +125,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 把 libs/lerobot 的改动做成 patch  → ibrobot-lerobot-patch
 导出 lerobot patch 并更新 series  → ibrobot-lerobot-patch
 Docker 验证一下 setup 和 build   → ibrobot-docker-verify
-验证 openEuler 构建              → ibrobot-docker-verify-oee
+验证 openEuler 构建              → ibrobot-verify-oee
 同步到 GitHub                   → sync-github
 新建或重构一个 skill            → skill-creator
 生成 DeepWiki 配置               → deepwiki-config
