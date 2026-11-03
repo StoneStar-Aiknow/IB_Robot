@@ -35,19 +35,28 @@ files 的完整 patch 在 `patch.diff`；`pr diff --json` 是统计摘要。按�
    分支的检查结果。查看 `git remote -v`，不要将 fork 的 master 当作上游基线。
 2. 依据整个 PR 的改动写 Markdown，说明问题、结果、关键取舍和真实验证。
    按变更同步用户文档，不能把 `git diff` 当测试结果，也不能虚报测试通过。
-3. 当前 Agent 执行实际工具的 `--version` 确认版本；`--agent-tool` 必须写**产品全称 + 版本**，
+3. 正文中 issue 编号的写法只有一条规则。只有确实由本 PR 交付、期望合并时被关闭的
+   issue 才写裸 `#N`。其余一切提及（如「xxx 功能由 issue N 跟踪」「背景见 issue N」）
+   一律写 `issue "N"`，禁止裸 `#N`。原因：平台把正文里的裸 `#N` 自动绑定为关联 issue。
+   PR 合并或关闭时，连带关闭这些被绑定的 issue。裸 `#N` 绑定的是**目标仓库**的同编号
+   issue，跨 fork PR 也一样。实测：fork 内 PR 正文写 `#2`，绑定了 openEuler/IB_Robot
+   的 issue 2，不是 fork 的 issue 2。反引号内的 `` `#N` ``、`issue "N"`、`!N`（PR 引用）
+   这三种写法都不会触发绑定。
+4. 写正文时推断「预期关闭集合」：正文中全部裸 `#N` 对应的 issue 编号集合。
+   逐个确认这些 issue 确实由本 PR 交付。编号写错会漏绑目标 issue，还会多绑不相干 issue。
+5. 当前 Agent 执行实际工具的 `--version` 确认版本；`--agent-tool` 必须写**产品全称 + 版本**，
    产品名取工具官方名称，不是 CLI 命令名（如 `DeepSeek Harness 0.1.7-rc.2`，不是 `dsh 0.1.7-rc.2`；
    `--version` 只输出版本号时尤其注意）。只写 CLI 名或缩写会被社区门禁判为
    `ai-compliance-failed`（先例：#441 / #458）。收集 **PR 全部提交** 的 AI 模型集合，
    去掉 provider 前缀。记录 Prompt 摘要及第三方材料/许可证。披露块由工具生成，勿手写重复块。
-4. 用户已明确要求提交/更新时沿用授权，不重复确认。人工实质审查责任仍由贡献者承担。披露默认标记待审查；只有开发者明确确认已完成
+6. 用户已明确要求提交/更新时沿用授权，不重复确认。人工实质审查责任仍由贡献者承担。披露默认标记待审查；只有开发者明确确认已完成
    逐项审查，才传 `--human-review-status completed`，不能以发布授权代替完成确认。PR 以正式检视发布（首次以非 `[WIP]`、非 draft
    创建，或 WIP 转正式）时，Agent 必须先通过 ask-user 工具询问开发者是否已完成逐项人工审查，确认才传 completed，否则保持
    pending；WIP/draft 阶段不询问。命中双平台 Docker 门禁的正式发布把该问题合并进已有的阶段询问，一次交互完成。更新已有 PR
    时先抓取当前正文传 `--previous-body-file`：上次披露为 completed 且没有新增 AI-assisted 提交则继续传 completed，有新 AI
    提交或状态不明则重新询问。completed 披露不允许静默降级：草稿中粘贴的旧披露块或 `--previous-body-file` 里的 completed
    遇到更低的 `--human-review-status` 会被工具拒绝；确需降级必须先重新询问开发者并显式传 `--review-status-reset`。
-5. 命中双平台 Docker 条件时，尚未选择阶段才询问 WIP 或正式检视；已有选择继续生效。
+7. 命中双平台 Docker 条件时，尚未选择阶段才询问 WIP 或正式检视；已有选择继续生效。
    WIP 暂缓 Docker，保持 `[WIP]` 标题和 draft；正式检视补齐当前代码的两平台证据。
 
 在仓库根目录、同次加载 `.shrc_local` 后运行。下列尖括号值必须替换为实际信息：
@@ -63,7 +72,7 @@ source .shrc_local && python3 .agents/skills/atomgit-pr/scripts/pr_body_gate.py 
 工具从本地 Git 读取 commit/diff，而非未提交工作区。正式阶段检查本地源 head 与
 `origin/<branch>` tracking ref 一致，并从真实 Git 对象推导 tree；运行前先 fetch。
 更新已有 PR 时先抓取当前正文传 `--previous-body-file tmp/current-pr-body.md`，按相同输入规则复用
-既有证据，不手改指纹；该文件同时驱动人工审查状态防降级校验（见第 4 条）。缺失/截断 patch 不支持证据复用。
+既有证据，不手改指纹；该文件同时驱动人工审查状态防降级校验（见第 6 条）。缺失/截断 patch 不支持证据复用。
 
 项目描述规则：
 
@@ -129,3 +138,27 @@ GC_HOST=atomgit.com gitcode pr close 520 -R openEuler/IB_Robot \
 close/edit/comment 同样以回读为准（close 回读 state、comment 回读评论、edit 回读标题/正文），
 退出码只作参考——实测 close 退出码 5 却已关闭并发出评论。回读失败如实报告
 “写入结果未知”或“已写入但核验失败”，不能自动重发。
+
+## 关联 issue 回读校验
+
+每次发布（首次创建或更新正文）后，必须回读平台实际绑定的 issue 列表。校验为**严格相等**：
+绑定集合 == 预期关闭集合。多绑一个、少绑一个都要修正。
+
+不做「确认不关闭就放松检查」的例外。理由：绑定即随合并关闭，PR 描述层面表达不出
+「只关联、不关闭」。合并由维护者执行，作者放松检查的意图对合并者不可见。
+
+```bash
+GC_HOST=atomgit.com gitcode pr issues 123 -R openEuler/IB_Robot --json
+```
+
+绑定解析有延迟：create/edit 后立即查询可能返回空列表，等约 15 s 再查一次，仍为空才判定
+未绑定。不要把回读时差当成绑定失败。
+
+校验不通过时的处置：
+
+- **多绑了不该绑的 issue**：改正文，去掉对应的裸 `#N`，改写为 `issue "N"`。再回读确认
+  绑定解除（实测：改正文去掉 `#N` 后，绑定自动解除，无需 DELETE API）。只靠平台界面手动
+  解除关联、不改正文是不够的：正文里的裸 `#N` 还在，下次编辑正文仍会重新绑定。
+- **少绑了预期关闭的 issue**：检查正文是否漏写裸 `#N`，或编号写错（写错编号既漏绑目标，
+  又多绑不相干 issue）。
+- 修正后重新回读，直到绑定集合与预期关闭集合严格相等。
