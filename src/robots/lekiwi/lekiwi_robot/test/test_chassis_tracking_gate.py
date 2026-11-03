@@ -54,8 +54,8 @@ from ibrobot_msgs.srv import SetRuntimeMode
 from robot_runtime.profile import load_profile
 from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict
-from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     open_ground_truth,
     terminate_marked_processes,
@@ -91,7 +91,7 @@ _ARM_MAX_SAMPLE_GAP_SEC = 0.5
 
 
 def _environment_missing(sim_platform: str) -> str | None:
-    """The shared environment probe (robot_runtime.testing.sim_environment).
+    """The shared environment probe (robot_runtime_sim.testing.sim_environment).
 
     Kept as a local name for the call sites; the Gazebo probe accepts EITHER
     stack (``ign gazebo`` / ``gz sim``) and the MuJoCo probe names every
@@ -107,7 +107,7 @@ def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
 
 def _platform_capabilities_missing(sim_platform: str, profile: str) -> list[str]:
     """The gate's code capabilities: ground truth, the registered platform and the profile platform."""
-    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+    from robot_runtime_sim.testing.sim_ground_truth import UnsupportedGroundTruth
 
     missing = []
     try:

@@ -304,7 +304,7 @@
           </xacro:if>
           <!-- Floating-base odometry (D9): the free-joint state the system
                interface reports on its simulator-namespaced topic; the
-               constants match robot_runtime.mujoco
+               constants match robot_runtime_sim.mujoco
                (ODOM_FREE_JOINT_NAME / FLOATING_BASE_STATE_TOPIC) and the
                freejoint in mujoco/lekiwi_base.xml.template. Never advertised
                or consumed by a runtime node. -->

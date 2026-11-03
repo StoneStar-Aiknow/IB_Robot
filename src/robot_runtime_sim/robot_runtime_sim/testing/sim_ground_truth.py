@@ -548,7 +548,7 @@ class MujocoGroundTruthStream(GroundTruthStream):
         import rclpy  # noqa: PLC0415  (test-support module: no ROS import at module load)
         from nav_msgs.msg import Odometry  # noqa: PLC0415
 
-        from robot_runtime.mujoco import FLOATING_BASE_STATE_TOPIC
+        from robot_runtime_sim.mujoco import FLOATING_BASE_STATE_TOPIC
 
         # The rmw layer reads ROS_DOMAIN_ID at context creation: give the
         # private context the LAUNCH's domain (the env dict the caller

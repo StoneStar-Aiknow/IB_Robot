@@ -5,8 +5,8 @@ types only — building an interface description imports a spec module, so it
 must never import ``launch``, a simulator package or ``sim_models``). The
 embodiment and trait callables stay ``module:attr`` strings resolved lazily
 by the dispatch entries in ``launch_support``; the callables themselves live
-next to the platform code they read (``robot_runtime.gazebo`` /
-``robot_runtime.mujoco``).
+next to the platform code they read (``robot_runtime_sim.gazebo`` /
+``robot_runtime_sim.mujoco``).
 """
 
 from __future__ import annotations
@@ -47,17 +47,17 @@ MUJOCO_SENSOR_TRAITS = SimSensorTraits(
     forced_encodings={"color": "rgb8", "depth": "32FC1"},
     shared_depth_camera_info=False,
     camera_qos_reliable=True,
-    camera_rate="robot_runtime.sim_specs:mujoco_camera_rate",
+    camera_rate="robot_runtime_sim.platforms:mujoco_camera_rate",
     lidar_sim_drivers=_MUJOCO_LIDAR_SIM_DRIVERS,
-    lidar_points_rate="robot_runtime.sim_specs:mujoco_lidar_points_rate",
+    lidar_points_rate="robot_runtime_sim.platforms:mujoco_lidar_points_rate",
     integrated_imu_drivers=_INTEGRATED_IMU_DRIVERS,
-    imu_rate="robot_runtime.sim_specs:mujoco_imu_rate",
+    imu_rate="robot_runtime_sim.platforms:mujoco_imu_rate",
 )
 
 GAZEBO_SPEC = SimPlatform(
     name="gazebo",
-    package="robot_runtime",
-    embodiment="robot_runtime.launch_support:GAZEBO_EMBODIMENT",
+    package="robot_runtime_sim",
+    embodiment="robot_runtime_sim.gazebo_embodiment:GAZEBO_EMBODIMENT",
     world=None,
     scene_task=None,
     sensor_traits=GAZEBO_SENSOR_TRAITS,
@@ -65,8 +65,8 @@ GAZEBO_SPEC = SimPlatform(
 
 MUJOCO_SPEC = SimPlatform(
     name="mujoco",
-    package="robot_runtime",
-    embodiment="robot_runtime.launch_support:MUJOCO_EMBODIMENT",
+    package="robot_runtime_sim",
+    embodiment="robot_runtime_sim.mujoco_embodiment:MUJOCO_EMBODIMENT",
     world=None,
     scene_task=None,
     sensor_traits=MUJOCO_SENSOR_TRAITS,
@@ -81,7 +81,7 @@ def mujoco_camera_rate(profile: dict) -> float | None:
 
     Delegates to the MuJoCo platform module, which owns the rate algorithm.
     """
-    from robot_runtime.mujoco import mujoco_camera_publish_rate
+    from robot_runtime_sim.mujoco import mujoco_camera_publish_rate
 
     return mujoco_camera_publish_rate(profile)
 

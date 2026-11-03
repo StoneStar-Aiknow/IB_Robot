@@ -8,7 +8,7 @@ fresh on the new clock ends.
 
 from nav_msgs.msg import Odometry
 
-from robot_runtime.odometry_twist_relay import OdometryTwistRelayLogic
+from robot_runtime_sim.odometry_twist_relay import OdometryTwistRelayLogic
 
 
 def _odom(stamp: float, child: str = "base_link", vx: float = 0.15, vy: float = 0.0, wz: float = 0.0) -> Odometry:
@@ -163,7 +163,7 @@ def test_the_ros_wrapper_zero_streams_after_a_clock_jump_without_odometry():
     from rclpy.node import Node
     from rosgraph_msgs.msg import Clock
 
-    from robot_runtime.odometry_twist_relay import OdometryTwistRelay
+    from robot_runtime_sim.odometry_twist_relay import OdometryTwistRelay
 
     arguments = [
         "--ros-args",

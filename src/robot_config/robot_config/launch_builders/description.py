@@ -62,7 +62,7 @@ def _build_cameras_urdf_from_yaml(
     """从 YAML peripherals 动态生成相机 link/joint/gazebo XML。
 
     Thin re-import wrapper (openspec ``so101-gazebo-runtime-transport`` D6.1):
-    the robot-agnostic builder lives in ``robot_runtime.gazebo`` and is shared
+    the robot-agnostic builder lives in ``robot_runtime_sim.gazebo`` and is shared
     with the runtime providers; generic provider-less Gazebo callers keep the
     same behaviour through this call site (preset defaults via
     ``use_default_transform``, spawn-offset compensation for world-parented
@@ -99,7 +99,7 @@ def _build_cameras_urdf_from_yaml(
             (x, y, z) —— 用于修正 ``parent_frame="world"`` 的相机位姿。
     """
     from robot_config.launch_builders.sim_backend.camera_presets import get_preset
-    from robot_runtime.gazebo import camera_sensor_urdf
+    from robot_runtime_sim.gazebo import camera_sensor_urdf
 
     return camera_sensor_urdf(
         peripherals,

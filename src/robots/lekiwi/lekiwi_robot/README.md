@@ -211,7 +211,7 @@ and — independently — when the platform's simulator is unavailable
 matching Python `mujoco` for MuJoCo). Acceptance runs set
 `IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco` to turn any such skip into a
 failure. The environment probe and the require-or-skip rule are shared
-through `robot_runtime.testing.sim_environment` (one copy for this gate, the
+through `robot_runtime_sim.testing.sim_environment` (one copy for this gate, the
 chassis gate below and robot_config's navigation e2e). The overlay is staged
 per platform (`robot_navigation`'s `test/config/lekiwi_lio_sim.yaml` pins
 `platform: gazebo`; the gate rewrites the staged copy).
@@ -234,7 +234,7 @@ with the stowed-arm envelope asserted throughout every navigation phase.
 The staged overlay copy (not the shipped one) carries the platform under
 test. The same capability/environment/require rule as the gate applies
 (`IBROBOT_REQUIRE_SIM_PLATFORMS` turns a skip of a listed platform into a
-failure); the shared rule lives in `robot_runtime.testing.sim_environment`
+failure); the shared rule lives in `robot_runtime_sim.testing.sim_environment`
 (robot_config must not import lekiwi_robot's test assets).
 
 ```bash

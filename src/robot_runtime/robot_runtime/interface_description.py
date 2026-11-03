@@ -723,7 +723,7 @@ def peripheral_interfaces(
                 cloud_type = "sensor_msgs/msg/PointCloud2" if simulated_lidar else types[transfer]
                 # The advertised rate is the rate the platform runs: the
                 # composed MJCF honours simulation.mujoco.update_rate over
-                # publish_freq (robot_runtime.mujoco), so the description
+                # publish_freq (robot_runtime_sim.mujoco), so the description
                 # must resolve the same precedence — never claim a rate the
                 # simulation does not produce (review round 1).
                 points_rate_hz = periph.get("publish_freq", 10.0)

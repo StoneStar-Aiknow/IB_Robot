@@ -93,7 +93,7 @@ libmujoco, therefore:
   package that is too old or broken names the apt command, because rosdep
   never upgrades an installed package.
 - The runtime adds a strict check
-  (`robot_runtime.mujoco.check_simulator_versions`): on an inconsistent or
+  (`robot_runtime_sim.mujoco.check_simulator_versions`): on an inconsistent or
   too-old simulator, `sim_platform:=mujoco` fails before model composition
   with an installation diagnostic.
 - openEuler ships no MuJoCo rpm: beyond the existing

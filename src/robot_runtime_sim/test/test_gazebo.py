@@ -23,7 +23,18 @@ import yaml
 from launch_ros.actions import Node
 from sensor_msgs.msg import Imu, PointCloud2, PointField
 
-from robot_runtime.gazebo import (
+from robot_runtime.interface_description import (
+    InterfaceDescriptionError,
+    build_description,
+    merge_peripherals,
+)
+from robot_runtime.launch_support import (
+    motion_launch_arguments,
+    peripheral_stack_actions,
+    runtime_stack_actions,
+)
+from robot_runtime.peripherals import peripheral_tf_nodes_for_absent_frames
+from robot_runtime_sim.gazebo import (
     advertised_camera_frame,
     camera_bridge_entries,
     camera_sensor_urdf,
@@ -35,20 +46,11 @@ from robot_runtime.gazebo import (
     resolve_camera_pose,
     resolve_sensor_pose,
 )
-from robot_runtime.interface_description import (
-    InterfaceDescriptionError,
-    build_description,
-    merge_peripherals,
-)
-from robot_runtime.launch_support import (
+from robot_runtime_sim.gazebo_embodiment import (
     gazebo_embodiment_actions,
-    motion_launch_arguments,
-    peripheral_stack_actions,
     render_gazebo_description,
-    runtime_stack_actions,
-    simulated_joint_current_actions,
 )
-from robot_runtime.peripherals import peripheral_tf_nodes_for_absent_frames
+from robot_runtime_sim.sim_nodes import simulated_joint_current_actions
 
 # ---------------------------------------------------------------------------
 # Shared fixtures: a minimal robot-agnostic profile the launch helpers accept
@@ -745,7 +747,7 @@ def test_toggle_only_entry_for_undeclared_peripheral_is_rejected():
 def test_joint_current_conversion():
     from sensor_msgs.msg import JointState
 
-    from robot_runtime.joint_current_publisher import joint_currents_from_efforts
+    from robot_runtime_sim.joint_current_publisher import joint_currents_from_efforts
 
     message = JointState()
     message.name = ["2", "1", "6"]
@@ -798,7 +800,7 @@ def test_joint_current_scale_is_looked_up_per_platform(tmp_path):
 
 def test_advertised_camera_frames_is_the_single_source_of_the_convention():
     """5b.3/D: one helper defines the opencv/realsense/camera_ros frame rules."""
-    from robot_runtime.gazebo import advertised_camera_frame, advertised_camera_frames
+    from robot_runtime_sim.gazebo import advertised_camera_frame, advertised_camera_frames
 
     opencv = {"name": "top", "driver": "opencv", "frame_id": "camera_top_frame", "optical_frame_id": "unused"}
     assert advertised_camera_frames(opencv) == ("camera_top_frame", "camera_top_frame")
@@ -931,7 +933,7 @@ def test_lidar_and_imu_bridge_entries_target_the_advertised_endpoints():
 def test_lidar_injection_only_for_the_gazebo_platform():
     """sim-platform-registry D4 guard: only the Gazebo platform's sensor
     generation injects lidar/IMU sensors (the driver set lives in the
-    platform's sensor traits — ``robot_runtime.sim_specs``); any other
+    platform's sensor traits — ``robot_runtime_sim.platforms``); any other
     platform name renders nothing, so it also reports no lidar-simulation
     capability."""
     assert lidar_imu_sensor_urdf([MID360], platform="gazebo") != ""
@@ -1145,7 +1147,7 @@ def test_finite_cloud_filter_drops_nonfinite_points_only():
     """D5: no-hit beams arrive as ±inf; the advertised cloud stays finite."""
     import struct
 
-    from robot_runtime.finite_cloud_filter import filter_finite_points
+    from robot_runtime_sim.finite_cloud_filter import filter_finite_points
 
     def cloud(rows):
         message = PointCloud2()
@@ -1178,7 +1180,7 @@ def test_finite_cloud_filter_drops_nonfinite_points_only():
 
 
 def test_lidar_finite_filter_nodes_cover_the_3d_lidar_only():
-    from robot_runtime.gazebo import lidar_finite_filter_nodes
+    from robot_runtime_sim.gazebo import lidar_finite_filter_nodes
 
     nodes = lidar_finite_filter_nodes([TOP, MID360, LDLIDAR])
     assert [node._Node__node_name for node in nodes] == ["mid360_finite_cloud_filter"]
@@ -1186,7 +1188,7 @@ def test_lidar_finite_filter_nodes_cover_the_3d_lidar_only():
 
 def test_imu_settle_filter_holds_back_pre_settle_samples():
     """D5: the simulator's pre-settle IMU samples never reach the endpoint."""
-    from robot_runtime.imu_settle_filter import GRAVITY_MAX, GRAVITY_MIN, SettleGate, is_settle_sample
+    from robot_runtime_sim.imu_settle_filter import GRAVITY_MAX, GRAVITY_MIN, SettleGate, is_settle_sample
 
     def imu(acc, gyro=0.0):
         message = Imu()
@@ -1235,7 +1237,7 @@ def test_imu_settle_filter_holds_back_pre_settle_samples():
 
 
 def test_imu_settle_filter_nodes_cover_simulated_imus():
-    from robot_runtime.gazebo import imu_settle_filter_nodes
+    from robot_runtime_sim.gazebo import imu_settle_filter_nodes
 
     nodes = imu_settle_filter_nodes([TOP, MID360, LDLIDAR])
     assert [node._Node__node_name for node in nodes] == ["mid360_imu_settle_filter"]

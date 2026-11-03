@@ -45,12 +45,12 @@ def _build_camera_bridge_entries(periph: dict, model_name: str, world_name: str)
     """Return bridge config dicts for one camera peripheral.
 
     Thin re-import wrapper (openspec ``so101-gazebo-runtime-transport`` D6.1):
-    the robot-agnostic builder lives in ``robot_runtime.gazebo``; this call
+    the robot-agnostic builder lives in ``robot_runtime_sim.gazebo``; this call
     site keeps the generic provider-less behaviour (color, color info and the
     legacy aligned-depth entry; the runtime providers pass ``full_streams`` to
     bridge every advertised stream).
     """
-    from robot_runtime.gazebo import camera_bridge_entries
+    from robot_runtime_sim.gazebo import camera_bridge_entries
 
     return camera_bridge_entries(periph)
 

@@ -11,8 +11,8 @@ import subprocess
 
 import pytest
 
-from robot_runtime.testing import sim_environment
-from robot_runtime.testing.sim_environment import (
+from robot_runtime_sim.testing import sim_environment
+from robot_runtime_sim.testing.sim_environment import (
     REQUIRED_SIM_PLATFORMS_ENV,
     environment_missing,
     gazebo_available,

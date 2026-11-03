@@ -5,6 +5,31 @@ import logging
 import pytest
 
 from robot_runtime.launch_support import RuntimeProfileError, resolve_sim_selection
+from robot_runtime.sim_platforms import SimPlatform, SimSensorTraits
+
+
+@pytest.fixture(autouse=True)
+def _fake_first_party_platforms(monkeypatch):
+    """Register fake gazebo/mujoco platforms for every test in this module.
+
+    resolve_sim_selection checks registration for an effective physics
+    selection (sim-platform-registry D2); the fake platforms keep these
+    contract tests independent of any real simulator plugin (D6).
+    """
+    import robot_runtime.sim_platforms as sim_platforms
+
+    platforms = {}
+    for name in ("gazebo", "mujoco"):
+        platform = SimPlatform(
+            name=name,
+            package="test",
+            embodiment="robot_runtime.sim_platforms:SDK_PLATFORM",  # never resolved here
+            world=None,
+            scene_task=None,
+            sensor_traits=SimSensorTraits(),
+        )
+        platforms[name] = platform
+    monkeypatch.setattr(sim_platforms, "discover_sim_platforms", lambda *, entry_points=None: platforms)
 
 
 def _profile(**extra):

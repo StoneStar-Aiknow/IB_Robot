@@ -64,12 +64,12 @@ from tf2_msgs.msg import TFMessage
 from ibrobot_msgs.msg import RuntimeStatus
 from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict
-from robot_runtime.testing.sim_environment import (
+from robot_runtime_sim.testing.sim_environment import (
     REQUIRED_SIM_PLATFORMS_ENV,
     environment_missing,
     skip_or_fail,
 )
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     UnsupportedGroundTruth,
     leftover_domain_processes,

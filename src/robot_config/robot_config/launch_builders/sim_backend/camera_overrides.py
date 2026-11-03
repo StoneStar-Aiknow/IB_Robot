@@ -2,14 +2,14 @@
 
 Thin re-import layer (openspec ``so101-gazebo-runtime-transport`` D6.1/D6.3):
 the override reader and the override-aware pose resolution live in
-``robot_runtime.gazebo`` so runtime providers and generic launch share one
+``robot_runtime_sim.gazebo`` so runtime providers and generic launch share one
 implementation; the generic preset fallbacks stay here.
 """
 
 from __future__ import annotations
 
 from robot_config.launch_builders.sim_backend.camera_presets import get_preset
-from robot_runtime.gazebo import load_camera_override
+from robot_runtime_sim.gazebo import load_camera_override
 
 
 def load_gazebo_override(camera_name: str) -> dict | None:

@@ -1,6 +1,6 @@
 """Advertised camera frame conventions shared by every platform (D4/5b.3).
 
-Moved out of ``robot_runtime.gazebo`` (openspec sim-platform-registry D4):
+Moved out of the platform module (now ``robot_runtime_sim.gazebo``) (openspec sim-platform-registry D4):
 the advertised-frame convention is a pure contract helper, not
 simulator-specific, and the interface description (core) needs it without
 importing a platform module. The Gazebo/MuJoCo sensor generation keeps

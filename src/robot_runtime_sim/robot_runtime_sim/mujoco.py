@@ -1,6 +1,6 @@
 """Robot-agnostic MuJoCo helpers shared by the runtime provider (D2/D4/D5/D6).
 
-Mirrors ``robot_runtime.gazebo`` (openspec change ``so101-gazebo-runtime-
+Mirrors ``robot_runtime_sim.gazebo`` (openspec change ``so101-gazebo-runtime-
 transport`` D6.1): the camera pose resolution, MJCF camera generation, URDF
 camera TF, the simulator CameraPlugin parameters and the depth fan-out relays
 are robot-agnostic algorithms living in the contract layer. Robot-specific
@@ -40,8 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from robot_runtime.gazebo import _rotate_yaw_inverse, load_camera_override, resolve_camera_pose
 from robot_runtime.interface_description import platform_peripherals
+from robot_runtime_sim.gazebo import _rotate_yaw_inverse, load_camera_override, resolve_camera_pose
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ def resolve_mujoco_camera_pose(periph: dict) -> tuple[dict, Any]:
 
     Precedence: user-saved override (stored in the Gazebo convention, converted
     here) > the peripheral's ``simulation.mujoco.transform`` (+ ``fovy``) > the
-    plain ``transform`` field. The shared resolver in ``robot_runtime.gazebo``
+    plain ``transform`` field. The shared resolver in ``robot_runtime_sim.gazebo``
     handles the last two; the override conversion is MuJoCo-specific and lives
     here.
     """
@@ -612,8 +612,8 @@ def lidar_imu_mjcf(peripherals: list) -> tuple[list[tuple[str, str]], list[str],
     simulated lidar gets no site, sensor or extension — the SO-101 render
     stays byte-identical).
     """
-    from robot_runtime.gazebo import _LIDAR_DEFAULTS, LIDAR_INTEGRATED_IMU_DRIVERS, _sensor_param
     from robot_runtime.profile import resolve_sensor_pose
+    from robot_runtime_sim.gazebo import _LIDAR_DEFAULTS, LIDAR_INTEGRATED_IMU_DRIVERS, _sensor_param
 
     sites: list[tuple[str, str]] = []
     sensors: list[str] = []
@@ -677,7 +677,7 @@ def imu_sensor_urdf(peripherals: list) -> str:
     stream the settle filter consumes. Rendered into the URDF's
     ``<ros2_control>`` block by ``render_mujoco_description``.
     """
-    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+    from robot_runtime_sim.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
 
     parts: list[str] = []
     for periph in _simulated_lidars(peripherals):
@@ -706,7 +706,7 @@ def imu_sensor_urdf(peripherals: list) -> str:
 def mujoco_lidar_filter_nodes(peripherals: list) -> list:
     """The finite-point filter nodes for the MuJoCo lidars (D5.3).
 
-    One ``robot_runtime/finite_cloud_filter`` per simulated lidar: the
+    One ``robot_runtime_sim/finite_cloud_filter`` per simulated lidar: the
     plugin's raw cloud (``/<name>_lidar/raw``, bare ``x y z`` float32 with
     NaN misses) in, the advertised point cloud endpoint out, with the zero
     ``intensity`` field appended for FAST-LIO's generic handler.
@@ -718,7 +718,7 @@ def mujoco_lidar_filter_nodes(peripherals: list) -> list:
         name = periph["name"]
         nodes.append(
             Node(
-                package="robot_runtime",
+                package="robot_runtime_sim",
                 executable="finite_cloud_filter",
                 name=f"{name}_finite_cloud_filter",
                 output="screen",
@@ -737,14 +737,14 @@ def mujoco_lidar_filter_nodes(peripherals: list) -> list:
 def mujoco_imu_filter_nodes(peripherals: list) -> list:
     """The pre-settle IMU filter nodes for the MuJoCo integrated IMUs (D5.3).
 
-    One ``robot_runtime/imu_settle_filter`` per simulated integrated IMU: the
+    One ``robot_runtime_sim/imu_settle_filter`` per simulated integrated IMU: the
     broadcaster's raw stream (``/<name>_imu/raw`` — the ``~/imu`` publisher
     remapped process-wide) in, the advertised IMU endpoint out, holding the
     pre-settle samples back until gravity has been stable.
     """
     from launch_ros.actions import Node
 
-    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+    from robot_runtime_sim.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
 
     nodes = []
     for periph in _simulated_lidars(peripherals):
@@ -753,7 +753,7 @@ def mujoco_imu_filter_nodes(peripherals: list) -> list:
         name = periph["name"]
         nodes.append(
             Node(
-                package="robot_runtime",
+                package="robot_runtime_sim",
                 executable="imu_settle_filter",
                 name=f"{name}_imu_settle_filter",
                 output="screen",
@@ -786,7 +786,7 @@ def odometry_twist_relay_node(floating_base: dict | None) -> list:
         return []
     return [
         Node(
-            package="robot_runtime",
+            package="robot_runtime_sim",
             executable="odometry_twist_relay",
             name="odometry_twist_relay",
             output="screen",
@@ -810,7 +810,7 @@ def imu_broadcaster_entries(peripherals: list) -> dict:
     writes them next to the shipped controllers configuration (the shipped
     file is never edited).
     """
-    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+    from robot_runtime_sim.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
 
     entries: dict[str, Any] = {}
     for periph in _simulated_lidars(peripherals):
@@ -833,7 +833,7 @@ def imu_broadcaster_remappings(peripherals: list) -> list[tuple[str, str]]:
     ``/<name>_imu/raw`` — the internal topic the settle filter consumes
     (verified against mujoco_ros2_control 0.1.2).
     """
-    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+    from robot_runtime_sim.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
 
     remaps: list[tuple[str, str]] = []
     for periph in _simulated_lidars(peripherals):

@@ -21,7 +21,7 @@ _ROOT = Path(__file__).resolve().parents[3]
 # fallback world is the sim_models empty scene, already covered by the scene
 # glob (task 4.1's nav_room joins the scene glob when it lands).
 _WORLDS = [
-    (_ROOT / "src/robot_runtime/worlds/empty.sdf", "provider standalone world"),
+    (_ROOT / "src/robot_runtime_sim/worlds/empty.sdf", "provider standalone world"),
     *(
         (path, f"shipped scene template {path.parent.name}")
         for path in sorted((_ROOT / "src/sim_models/scenes").glob("*/*.world.template"))

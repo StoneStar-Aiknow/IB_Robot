@@ -92,6 +92,9 @@
        robot_runtime.testing; the gate probes RuntimeStatus from
        ibrobot_msgs. -->
   <test_depend>robot_runtime</test_depend>
+  <!-- the lidar-odometry gate imports the simulator test support
+       (robot_runtime_sim.testing, sim-platform-registry D6) -->
+  <test_depend>robot_runtime_sim</test_depend>
   <test_depend>ibrobot_msgs</test_depend>
 
   <export>

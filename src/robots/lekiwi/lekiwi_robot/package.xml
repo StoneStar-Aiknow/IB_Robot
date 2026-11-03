@@ -66,6 +66,10 @@
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>robot_runtime</test_depend>
+  <!-- the platform tests and the gates import the Gazebo/MuJoCo embodiment
+       code and the simulator test support (robot_runtime_sim,
+       sim-platform-registry D6) -->
+  <test_depend>robot_runtime_sim</test_depend>
   <!-- The gates probe RuntimeStatus directly (ibrobot_msgs). It is a
        contract package inside the independence gate's fixed member set
        (CONTRACT_PACKAGES in scripts/verify_runtime_independence.sh), so

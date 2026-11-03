@@ -108,9 +108,9 @@ def _urdf_joint_transforms(tf_xml: str, camera: str, urdf: str = "", joint_value
 
 
 def _production_models(tmp_path):
-    from robot_runtime.launch_support import render_mujoco_description
-    from robot_runtime.mujoco import camera_tf_urdf, render_robot_mjcf
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.mujoco import camera_tf_urdf, render_robot_mjcf
+    from robot_runtime_sim.mujoco_embodiment import render_mujoco_description
 
     profile = load_profile(_PROFILE)
     peripherals = profile.get("peripherals") or []

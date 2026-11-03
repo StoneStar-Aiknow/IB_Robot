@@ -430,17 +430,3 @@ def test_a_fake_platform_description_round_trips_and_validates_on_an_empty_regis
     doc["digest"] = description_digest(doc)
     validate_description(doc)
     assert doc == description
-
-
-# ---------------------------------------------------------------------------
-# D1: the first-party driver sets cannot drift between the spec copies
-# ---------------------------------------------------------------------------
-
-
-def test_the_spec_driver_sets_match_the_platform_modules():
-    from robot_runtime import gazebo, mujoco, sim_specs
-
-    assert sim_specs.GAZEBO_SPEC.sensor_traits.lidar_sim_drivers == gazebo.LIDAR_SIM_DRIVERS
-    assert sim_specs.GAZEBO_SPEC.sensor_traits.integrated_imu_drivers == gazebo.LIDAR_INTEGRATED_IMU_DRIVERS
-    assert sim_specs.MUJOCO_SPEC.sensor_traits.lidar_sim_drivers == mujoco.MUJOCO_LIDAR_SIM_DRIVERS
-    assert sim_specs.MUJOCO_SPEC.sensor_traits.integrated_imu_drivers == gazebo.LIDAR_INTEGRATED_IMU_DRIVERS

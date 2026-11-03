@@ -318,7 +318,7 @@ class GazeboAdapter(SimBackendAdapter):
         gz_args = f"{_headless_prefix()}-r {world_path}"
 
         clock_ready_waiter = Node(
-            package="robot_config",
+            package="robot_runtime_sim",
             executable="wait_for_clock",
             name="wait_for_gazebo_clock",
             arguments=[

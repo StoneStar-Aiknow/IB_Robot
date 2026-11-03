@@ -12,7 +12,7 @@ import struct
 import pytest
 from sensor_msgs.msg import PointCloud2, PointField
 
-from robot_runtime.finite_cloud_filter import UnsupportedCloudLayout, filter_finite_points
+from robot_runtime_sim.finite_cloud_filter import UnsupportedCloudLayout, filter_finite_points
 
 
 def _cloud(rows, *, fields=("x", "y", "z", "intensity"), width=None, height=1, point_step=None, dense=False):
@@ -185,7 +185,7 @@ def test_short_data_buffers_are_rejected():
 def test_the_node_drops_an_unsupported_layout_with_a_warning():
     import rclpy
 
-    from robot_runtime.finite_cloud_filter import FiniteCloudFilter
+    from robot_runtime_sim.finite_cloud_filter import FiniteCloudFilter
 
     class _Recorder:
         def __init__(self):
@@ -243,7 +243,7 @@ def test_the_real_node_survives_a_bad_cloud_and_keeps_publishing_good_ones():
     import rclpy
     from rclpy.executors import SingleThreadedExecutor
 
-    from robot_runtime.finite_cloud_filter import FiniteCloudFilter
+    from robot_runtime_sim.finite_cloud_filter import FiniteCloudFilter
 
     rclpy.init(
         args=[

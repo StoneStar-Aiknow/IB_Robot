@@ -19,7 +19,7 @@ missing MuJoCo environment skips the test with a reason naming what is
 missing — unless ``IBROBOT_REQUIRE_SIM_PLATFORMS`` lists ``mujoco``, in which
 case the skip becomes a failure, so an acceptance run can never silently lose
 the platform. The probe and the require-or-skip rule are the shared
-``robot_runtime.testing.sim_environment`` implementations (one copy for the
+``robot_runtime_sim.testing.sim_environment`` implementations (one copy for the
 chassis gate, the lidar-odometry gate and robot_config's navigation e2e);
 this module keeps only the mujoco-only convenience wrapper. Imports of
 MuJoCo-only packages (the Python ``mujoco`` module, ``mujoco_ros2_control``,
@@ -31,7 +31,7 @@ the simulator (openEuler), hiding every other test in the package
 
 from __future__ import annotations
 
-from robot_runtime.testing.sim_environment import mujoco_environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_environment import mujoco_environment_missing, skip_or_fail
 
 
 def require_mujoco() -> None:

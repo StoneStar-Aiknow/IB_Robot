@@ -20,13 +20,8 @@ import pytest
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import (
-    MUJOCO_SIMULATION_NODE,
-    mujoco_embodiment_actions,
-    render_mujoco_description,
-    runtime_stack_actions,
-)
-from robot_runtime.mujoco import (
+from robot_runtime.launch_support import runtime_stack_actions
+from robot_runtime_sim.mujoco import (
     CAMERA_PLUGIN_INSTANCE,
     CAMERA_PLUGIN_TYPE,
     FREE_JOINT_STATE_PLUGIN_INSTANCE,
@@ -44,6 +39,11 @@ from robot_runtime.mujoco import (
     render_robot_mjcf,
     resolve_mujoco_camera_pose,
     simulator_versions,
+)
+from robot_runtime_sim.mujoco_embodiment import (
+    MUJOCO_SIMULATION_NODE,
+    mujoco_embodiment_actions,
+    render_mujoco_description,
 )
 
 mujoco = pytest.importorskip("mujoco")
@@ -653,7 +653,7 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     injected and the composition faked, so no installed simulator needed)."""
     import yaml
 
-    import robot_runtime.mujoco as mujoco_helpers
+    import robot_runtime_sim.mujoco as mujoco_helpers
     import sim_models.scene_compiler as scene_compiler
 
     # structure only: the injected simulator version follows this module's
@@ -697,7 +697,7 @@ def test_mujoco_embodiment_adds_the_free_joint_state_plugin_for_dynamic_scenes(t
     FreeJointStatePublisherPlugin in the same params file as the cameras."""
     import yaml
 
-    import robot_runtime.mujoco as mujoco_helpers
+    import robot_runtime_sim.mujoco as mujoco_helpers
     import sim_models.scene_compiler as scene_compiler
 
     monkeypatch.setattr(
@@ -909,7 +909,7 @@ def _mid360(**simulation):
 
 
 def test_lidar_imu_mjcf_injects_site_plugin_sensor_and_imu_triple():
-    from robot_runtime.mujoco import lidar_imu_mjcf
+    from robot_runtime_sim.mujoco import lidar_imu_mjcf
 
     # the D1 LeKiwi grid (the profile declares what the Gazebo section declares)
     periph = _mid360(horizontal_samples=360, vertical_samples=32, vertical_min_deg=-7.0, vertical_max_deg=52.0)
@@ -942,7 +942,7 @@ def test_lidar_imu_mjcf_injects_site_plugin_sensor_and_imu_triple():
 
 
 def test_lidar_imu_mjcf_prefers_the_simulation_mujoco_transform():
-    from robot_runtime.mujoco import lidar_imu_mjcf
+    from robot_runtime_sim.mujoco import lidar_imu_mjcf
 
     periph = _mid360(vertical_samples=32)
     periph["simulation"]["mujoco"]["transform"] = {"parent_frame": "chassis", "x": 1.0, "y": 2.0, "z": 3.0, "yaw": 0.0}
@@ -953,7 +953,7 @@ def test_lidar_imu_mjcf_prefers_the_simulation_mujoco_transform():
 
 
 def test_lidar_imu_mjcf_planar_lidar_renders_one_elevation_sample():
-    from robot_runtime.mujoco import lidar_imu_mjcf
+    from robot_runtime_sim.mujoco import lidar_imu_mjcf
 
     periph = {**_mid360(), "driver": "livox_mid360"}
     periph["simulation"]["mujoco"]["vertical_samples"] = 1
@@ -989,7 +989,7 @@ def test_render_robot_mjcf_injects_lidar_into_the_template(tmp_path):
 
 
 def test_lidar_plugin_parameters_target_the_advertised_frame_and_raw_topic():
-    from robot_runtime.mujoco import LIDAR_PLUGIN_INSTANCE, LIDAR_PLUGIN_TYPE, lidar_plugin_parameters
+    from robot_runtime_sim.mujoco import LIDAR_PLUGIN_INSTANCE, LIDAR_PLUGIN_TYPE, lidar_plugin_parameters
 
     tree = lidar_plugin_parameters([_mid360()])
     instance = tree["mujoco_plugins"][LIDAR_PLUGIN_INSTANCE]
@@ -1003,7 +1003,7 @@ def test_lidar_plugin_parameters_target_the_advertised_frame_and_raw_topic():
 
 
 def test_base_velocity_plugin_parameters_carry_no_second_clamp():
-    from robot_runtime.mujoco import (
+    from robot_runtime_sim.mujoco import (
         BASE_VELOCITY_PLUGIN_INSTANCE,
         BASE_VELOCITY_PLUGIN_TYPE,
         FLOATING_BASE_CMD_TOPIC,
@@ -1026,7 +1026,7 @@ def test_base_velocity_plugin_parameters_carry_no_second_clamp():
 
 
 def test_floating_base_constants_are_simulator_namespaced():
-    from robot_runtime.mujoco import FLOATING_BASE_CMD_TOPIC, FLOATING_BASE_STATE_TOPIC, ODOM_FREE_JOINT_NAME
+    from robot_runtime_sim.mujoco import FLOATING_BASE_CMD_TOPIC, FLOATING_BASE_STATE_TOPIC, ODOM_FREE_JOINT_NAME
 
     assert ODOM_FREE_JOINT_NAME == "floating_base_joint"
     assert FLOATING_BASE_STATE_TOPIC == "/simulator/floating_base_state"
@@ -1034,7 +1034,7 @@ def test_floating_base_constants_are_simulator_namespaced():
 
 
 def test_imu_sensor_urdf_maps_the_mjcf_triple_with_the_default_suffixes():
-    from robot_runtime.mujoco import imu_sensor_urdf
+    from robot_runtime_sim.mujoco import imu_sensor_urdf
 
     xml = imu_sensor_urdf([_mid360()])
     sensor = ET.fromstring(f"<ros2_control>{xml}</ros2_control>").find("sensor")
@@ -1127,7 +1127,7 @@ def test_mujoco_embodiment_composes_the_floating_base_and_lidar(tmp_path, monkey
     the relay, the remaps and the platform spawner set of the LeKiwi shape."""
     import yaml
 
-    import robot_runtime.mujoco as mujoco_helpers
+    import robot_runtime_sim.mujoco as mujoco_helpers
     import sim_models.scene_compiler as scene_compiler
 
     monkeypatch.setattr(
@@ -1201,18 +1201,18 @@ def test_mujoco_embodiment_composes_the_floating_base_and_lidar(tmp_path, monkey
 
         return {_text(key): _text(value) for key, value in parameters_entry.items()}
 
-    cloud_filter = executables[("robot_runtime", "finite_cloud_filter", "mid360_finite_cloud_filter")]
+    cloud_filter = executables[("robot_runtime_sim", "finite_cloud_filter", "mid360_finite_cloud_filter")]
     assert _plain(cloud_filter._Node__parameters[0]) == {
         "input_topic": "/mid360_lidar/raw",
         "output_topic": "/livox/lidar",
         "add_intensity": True,
     }
-    imu_filter = executables[("robot_runtime", "imu_settle_filter", "mid360_imu_settle_filter")]
+    imu_filter = executables[("robot_runtime_sim", "imu_settle_filter", "mid360_imu_settle_filter")]
     assert _plain(imu_filter._Node__parameters[0]) == {
         "input_topic": "/mid360_imu/raw",
         "output_topic": "/livox/imu",
     }
-    relay = executables[("robot_runtime", "odometry_twist_relay", "odometry_twist_relay")]
+    relay = executables[("robot_runtime_sim", "odometry_twist_relay", "odometry_twist_relay")]
     assert _plain(relay._Node__parameters[0]) == {
         "twist_source_topic": "/odom",
         "cmd_vel_topic": "/simulator/floating_base/cmd_vel",
@@ -1230,7 +1230,7 @@ def test_mujoco_embodiment_composes_the_floating_base_and_lidar(tmp_path, monkey
 
 
 def test_render_mujoco_description_injects_the_imu_sensor_into_ros2_control(tmp_path, monkeypatch):
-    import robot_runtime.mujoco as mujoco_helpers
+    import robot_runtime_sim.mujoco as mujoco_helpers
     import sim_models.scene_compiler as scene_compiler
 
     monkeypatch.setattr(
@@ -1692,7 +1692,7 @@ def test_render_mujoco_description_sets_initial_values_from_reset_positions(tmp_
     """D4: the MuJoCo URDF carries the same initial_value (mujoco_ros2_control's
     set_initial_pose reads it for qpos AND the actuators' ctrl)."""
     profile = {**_profile(tmp_path, peripherals=[]), "hardware": {"reset_positions": {"1": 1.25}}}
-    monkeypatch.setattr("robot_runtime.mujoco.check_simulator_versions", lambda: None)
+    monkeypatch.setattr("robot_runtime_sim.mujoco.check_simulator_versions", lambda: None)
     composed = tmp_path / "composed.mjb"
     composed.write_bytes(b"")
     monkeypatch.setattr("sim_models.scene_compiler.compose_mujoco_model", lambda *_a, **_k: composed)

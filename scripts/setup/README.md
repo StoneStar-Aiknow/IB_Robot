@@ -91,7 +91,7 @@ libmujoco 完全一致，因此：
   `SETUP_ROS_SETUP_PATH`）；其余 profile 与 benchmark venv 只输出提示行。
   包缺失时提示用 sudo 重新运行 `./scripts/setup.sh`，由其中的 rosdep 安装；
   包已安装但版本过旧或已损坏时提示 apt 命令，因为 rosdep 不会升级已安装的包。
-- 运行时还有一道严格检查（`robot_runtime.mujoco.check_simulator_versions`）：
+- 运行时还有一道严格检查（`robot_runtime_sim.mujoco.check_simulator_versions`）：
   版本不一致或仿真器过旧时，`sim_platform:=mujoco` 在模型组装前直接失败并
   给出安装诊断。
 - openEuler 无 MuJoCo rpm：rosdep skip 键在 `mujoco_ros2_control` /

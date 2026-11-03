@@ -19,7 +19,7 @@ import time
 
 import pytest
 
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_ground_truth import (
     MAX_GAP_SEC,
     RUN_MARKER_ENV,
     GroundTruthSample,
@@ -280,7 +280,7 @@ def test_mujoco_stream_reads_a_fake_floating_base_publisher():
     import rclpy
     from nav_msgs.msg import Odometry
 
-    from robot_runtime.testing.sim_ground_truth import MujocoGroundTruthStream
+    from robot_runtime_sim.testing.sim_ground_truth import MujocoGroundTruthStream
 
     domain = 215
     previous = os.environ.get("ROS_DOMAIN_ID")
@@ -353,7 +353,7 @@ def test_mujoco_stream_starts_a_new_epoch_on_a_backwards_stamp():
     """Review round 1: a reset_world jumps the stamps back; the bisected
     window/interpolate assume a strictly ordered span, so the pre-reset
     history is dropped and cross-epoch interpolation is refused."""
-    from robot_runtime.testing.sim_ground_truth import MujocoGroundTruthStream
+    from robot_runtime_sim.testing.sim_ground_truth import MujocoGroundTruthStream
 
     stream = MujocoGroundTruthStream(world="demo", model="lekiwi_robot", env={"ROS_DOMAIN_ID": "0"})
     stream._on_odom(_floating_base_message(10.0, 1.0, 0.0))
@@ -377,7 +377,7 @@ def test_mujoco_stream_starts_a_new_epoch_on_a_backwards_stamp():
 
 
 def test_mujoco_stream_caps_its_history_like_the_gazebo_reader():
-    from robot_runtime.testing import sim_ground_truth
+    from robot_runtime_sim.testing import sim_ground_truth
 
     stream = sim_ground_truth.MujocoGroundTruthStream(world="demo", model="lekiwi_robot", env={})
     limit = sim_ground_truth._SAMPLE_LIMIT
@@ -458,7 +458,7 @@ def test_the_scan_excludes_the_scanning_process_own_ancestor_chain():
 
     domain = f"97_{os.getpid()}"  # never a real ROS domain: diagnostics only
     script = (
-        "from robot_runtime.testing.sim_ground_truth import leftover_domain_processes\n"
+        "from robot_runtime_sim.testing.sim_ground_truth import leftover_domain_processes\n"
         f"found = leftover_domain_processes({domain!r})\n"
         "print('LEFTOVERS:' + repr(found))\n"
     )
@@ -606,7 +606,7 @@ def test_importing_the_module_pulls_in_no_ros_or_simulator_module():
     """D14.1: importing starts nothing and imports no rclpy/simulator module."""
     code = (
         "import sys\n"
-        "import robot_runtime.testing.sim_ground_truth\n"
+        "import robot_runtime_sim.testing.sim_ground_truth\n"
         "forbidden = ['rclpy']\n"
         "roots = ('gz', 'ign', 'ros_gz', 'ros_gz_sim', 'ros_gz_bridge', 'launch')\n"
         "leaked = [name for name in sys.modules if name in forbidden or name.split('.')[0] in roots]\n"

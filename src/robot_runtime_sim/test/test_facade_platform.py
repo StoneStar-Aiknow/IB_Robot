@@ -9,6 +9,10 @@ The profile under test is the LeKiwi-shaped declaration: on MuJoCo the base
 controller is never released (a MuJoCo velocity actuator keeps its last
 target after its controller is deactivated), so ``idle`` carries it through
 ``controllers_by_platform`` and the base node is the gate on that platform.
+
+Moved to robot_runtime_sim (sim-platform-registry D6): the facade resolves
+the platform's sensor traits through the registry and the capabilities cases
+build real mujoco/gazebo descriptions, so the plugin must be installed.
 """
 
 from __future__ import annotations

@@ -1,0 +1,71 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>robot_runtime_sim</name>
+  <version>0.1.0</version>
+  <description>
+    Simulation platform providers for the robot runtime: the Gazebo and
+    MuJoCo platform specs (ibrobot.sim_platforms entry points), their
+    default embodiments (description rendering + launch composition), the
+    simulation-only helper nodes, and the simulator-environment test
+    support. The runtime contract layer (robot_runtime) stays
+    simulator-free and discovers these platforms through the registry.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- The runtime contract layer: profile loading, the platform registry,
+       the interface description and the shared launch helpers the
+       embodiments compose from. -->
+  <depend>robot_runtime</depend>
+  <!-- The MuJoCo embodiment composes the robot+scene model through
+       sim_models and renders the Gazebo world files of its scenes.
+       0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1): the CameraPlugin
+       parameter path needs >= 0.1.0; rosdep does not enforce versions, the
+       runtime check (robot_runtime_sim.mujoco.check_simulator_versions) is
+       the real guard. -->
+  <exec_depend>sim_models</exec_depend>
+  <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
+  <!-- lekiwi-mujoco-runtime-platform D5/D11: the MuJoCo lidar composition.
+       mujoco_3d_lidar registers the mujoco.plugin.lidar engine extension the
+       composed model declares (the C++ simulator loads it from the ament
+       mujoco_plugins index); imu_sensor_broadcaster publishes the generated
+       integrated-IMU controller's stream. 0.1.2 floor: the release paired
+       with mujoco_ros2_control 0.1.2 (verify_env.sh checks the same floor). -->
+  <exec_depend version_gte="0.1.2">mujoco_3d_lidar</exec_depend>
+  <exec_depend>imu_sensor_broadcaster</exec_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>ibrobot_msgs</depend>
+  <depend>python3-numpy</depend>
+  <depend>python3-yaml</depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>xacro</exec_depend>
+
+  <!-- Executables the moved builders launch. -->
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+  <exec_depend>ros_gz_bridge</exec_depend>
+  <exec_depend>gz_ros2_control</exec_depend>
+
+  <!-- The moved tests import sim_models directly and glob its scene
+       templates; the so101/lekiwi profiles they exercise are read from the
+       source tree by path, so no robot package is a test dependency (that
+       would cycle: those packages test_depend on this one). -->
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>sim_models</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

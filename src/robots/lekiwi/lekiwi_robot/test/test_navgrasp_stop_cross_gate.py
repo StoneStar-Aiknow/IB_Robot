@@ -64,8 +64,8 @@ from ibrobot_msgs.srv import SetRuntimeMode, StopRuntime
 from robot_runtime.profile import load_profile
 from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict, rest_verdict
-from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     open_ground_truth,
     terminate_marked_processes,
@@ -118,7 +118,7 @@ def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
 
 
 def _platform_capabilities_missing(sim_platform: str) -> list[str]:
-    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+    from robot_runtime_sim.testing.sim_ground_truth import UnsupportedGroundTruth
 
     missing = []
     try:

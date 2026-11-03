@@ -88,8 +88,8 @@ from ibrobot_msgs.msg import RuntimeStatus
 from robot_runtime.profile import load_profile
 from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict
-from robot_runtime.testing.sim_environment import REQUIRED_SIM_PLATFORMS_ENV, environment_missing, skip_or_fail
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_environment import REQUIRED_SIM_PLATFORMS_ENV, environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     UnsupportedGroundTruth,
     leftover_domain_processes,
@@ -313,7 +313,7 @@ def test_a_synthetic_platform_reports_all_four_capabilities():
 # Simulator availability and the required-platform gate (D10,
 # lekiwi-mujoco-runtime-platform: two separate checks — code capability and
 # environment availability). The environment probe and the require-or-skip
-# rule live in robot_runtime.testing.sim_environment (one copy shared with
+# rule live in robot_runtime_sim.testing.sim_environment (one copy shared with
 # the chassis gate and robot_config's navigation e2e); only this gate's
 # profile policy (_is_openeuler/_select_test_profile) stays local. Note the
 # shared Gazebo probe accepts EITHER stack: ``ign gazebo`` (Fortress) or

@@ -358,8 +358,23 @@ def test_stop_fences_in_flight_mode_switch(stack, policy):
     assert caller.set_mode("idle").success
 
 
-def test_facade_selection_resolution_follows_parameters():
+def test_facade_selection_resolution_follows_parameters(monkeypatch):
+    import robot_runtime.sim_platforms as sim_platforms
     from robot_runtime.facade_node import resolve_facade_selection
+    from robot_runtime.sim_platforms import SimPlatform, SimSensorTraits
+
+    # a fake registered platform: the success branches below must not depend
+    # on any real simulator plugin being installed (sim-platform-registry D6)
+    fake = SimPlatform(
+        name="gazebo",
+        package="test",
+        embodiment="robot_runtime.sim_platforms:SDK_PLATFORM",  # never resolved here
+        world=None,
+        scene_task=None,
+        sensor_traits=SimSensorTraits(),
+    )
+    platforms = {fake.name: fake}
+    monkeypatch.setattr(sim_platforms, "discover_sim_platforms", lambda *, entry_points=None: platforms)
 
     profile = {"runtime": {"name": "t", "version": "0"}, "use_sim": False, "sim_platforms": ["sdk", "gazebo"]}
     assert resolve_facade_selection(profile, False, "") == (False, None)
@@ -378,20 +393,3 @@ def test_facade_selection_resolution_follows_parameters():
     # a platform the profile does not declare fails naming the set
     with pytest.raises(ValueError, match="not supported by this runtime profile"):
         resolve_facade_selection({"runtime": {"name": "t"}, "use_sim": True, "sim_platforms": ["sdk"]}, True, "gazebo")
-
-
-def test_facade_identity_check_covers_sim_platform():
-    from robot_runtime.facade_node import check_description_identity
-    from robot_runtime.interface_description import build_description, description_digest
-
-    description = build_description(PROFILE, use_sim=True, sim_platform="sdk")
-    check_description_identity(PROFILE, description, True, "sdk")
-    gazebo = build_description(PROFILE, use_sim=True, sim_platform="gazebo")
-    check_description_identity(PROFILE, gazebo, True, "gazebo")
-    with pytest.raises(ValueError, match="does not match"):
-        check_description_identity(PROFILE, gazebo, True, "sdk")
-    # pre-platform snapshots default from execution and still match the sdk facade
-    legacy = build_description(PROFILE, use_sim=True, sim_platform="sdk")
-    del legacy["sim_platform"]
-    legacy["digest"] = description_digest(legacy)
-    check_description_identity(PROFILE, legacy, True, "sdk")

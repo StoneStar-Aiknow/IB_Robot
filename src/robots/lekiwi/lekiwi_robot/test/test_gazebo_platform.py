@@ -139,8 +139,8 @@ def test_nav_grasp_gazebo_render_carries_the_arm_and_the_initial_values():
     render contains the whole robot — 9 ros2_control joints with the expected
     interfaces and D4 initial values, the arm chain through arm_root (D8: no
     link named world), the wrist camera, no front camera."""
-    from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     profile = load_profile(GRASP_PROFILE)
     urdf = render_gazebo_description(profile, GRASP_PROFILE, spawn_pose=(0.0, 0.0, 0.05, 0.0))
@@ -251,9 +251,9 @@ def test_physical_and_sdk_renders_carry_no_simulation_content():
 
 
 def test_gazebo_render_carries_the_plugin_and_the_wheel_treatment():
-    from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.peripherals import merge_peripherals
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     profile = load_profile(LIDAR_PROFILE)
     urdf = render_gazebo_description(
@@ -428,9 +428,9 @@ def test_rotated_mount_drives_sensor_pose_public_tf_and_extrinsics(tmp_path):
     """A non-default rotated mount (as the application fragment forwards it):
     the simulator sensor sits at the mount, livox_frame has exactly one
     parent (body), and FAST-LIO's extrinsic is the mount's inverse."""
-    from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     translation = [-0.12, 0.05, 0.28]
     rpy = [0.2, -0.15, 1.9]  # non-default rotation

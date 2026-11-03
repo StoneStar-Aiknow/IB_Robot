@@ -47,7 +47,7 @@ from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import ComputeFk, MoveToConfiguration, SetRuntimeMode
 from robot_runtime.profile import load_profile
 from robot_runtime.sim_platforms import get_sim_platform
-from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
 
 PACKAGE = "lekiwi_robot"
 MODEL_NAME = "lekiwi_robot"
@@ -97,11 +97,11 @@ def _smoke_skip_or_fail(sim_platform: str, reason: str) -> None:
 
 
 def _platform_capabilities_missing(sim_platform: str) -> list[str]:
-    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+    from robot_runtime_sim.testing.sim_ground_truth import UnsupportedGroundTruth
 
     missing = []
     try:
-        from robot_runtime.testing.sim_ground_truth import open_ground_truth
+        from robot_runtime_sim.testing.sim_ground_truth import open_ground_truth
 
         open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
     except UnsupportedGroundTruth as error:
@@ -266,7 +266,7 @@ def test_navgrasp_motion_smoke_and_wrist_camera(tmp_path, sim_platform):
             sim_platform,
             f"nav_grasp motion smoke: platform {sim_platform!r} cannot run: {environment_missing_reason}",
         )
-    from robot_runtime.testing.sim_ground_truth import RUN_MARKER_ENV, terminate_marked_processes
+    from robot_runtime_sim.testing.sim_ground_truth import RUN_MARKER_ENV, terminate_marked_processes
 
     partition = f"navgrasp_smoke_{uuid.uuid4().hex[:8]}"
     environment = dict(os.environ)

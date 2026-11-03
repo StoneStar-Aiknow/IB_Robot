@@ -62,7 +62,7 @@ def mujoco_environment_missing() -> str | None:
     try:
         import mujoco as python_mujoco  # noqa: PLC0415
 
-        from robot_runtime.mujoco import simulator_versions
+        from robot_runtime_sim.mujoco import simulator_versions
 
         versions = simulator_versions()
         if versions.mujoco is None:

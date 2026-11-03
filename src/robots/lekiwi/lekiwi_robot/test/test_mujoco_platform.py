@@ -351,9 +351,9 @@ def test_mujoco_render_carries_the_platform_structure():
 
 def test_mujoco_urdf_carries_the_transmissions_and_odometry_params():
     """D2a/D9: the wheel-name mappings and the floating-base odometry
-    constants, matching robot_runtime.mujoco (the ground-truth subscriber and
+    constants, matching robot_runtime_sim.mujoco (the ground-truth subscriber and
     the relay resolve the same names)."""
-    from robot_runtime.mujoco import FLOATING_BASE_STATE_TOPIC, ODOM_FREE_JOINT_NAME
+    from robot_runtime_sim.mujoco import FLOATING_BASE_STATE_TOPIC, ODOM_FREE_JOINT_NAME
 
     require_mujoco()
     actions = _mujoco_actions()
@@ -381,8 +381,9 @@ def test_mujoco_urdf_carries_the_transmissions_and_odometry_params():
 def test_hardware_and_sdk_renders_carry_no_mujoco_content():
     """D2a pin: only the MuJoCo branch emits the transmissions; the physical,
     SDK and Gazebo renders keep their exact pre-change output."""
-    from robot_runtime.launch_support import render_gazebo_description, render_robot_description
+    from robot_runtime.launch_support import render_robot_description
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     profile = load_profile(LIDAR_PROFILE)
     for simulated in (False, True):
@@ -400,7 +401,7 @@ def test_hardware_and_sdk_renders_carry_no_mujoco_content():
 
 
 def test_plugin_parameters_carry_base_velocity_and_lidar():
-    from robot_runtime.mujoco import (
+    from robot_runtime_sim.mujoco import (
         BASE_VELOCITY_PLUGIN_INSTANCE,
         FLOATING_BASE_CMD_TOPIC,
         LIDAR_PLUGIN_INSTANCE,

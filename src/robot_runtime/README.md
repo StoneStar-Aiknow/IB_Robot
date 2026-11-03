@@ -52,22 +52,16 @@ must pass.
 - **Launch support** (`launch_support.py`): profile path resolution
   (`$(find)` / `$(env)`), xacro rendering, controller_manager parameter
   files, spawners derived from the mode table, and the shared stack
-  composition used by `<robot>_robot` launch entries.
-- **MuJoCo embodiment** (`mujoco.py`, in `launch_support.py`): the provider's
-  single `mujoco_ros2_control` process — robot+scene model composition,
-  simulator version checks, the CameraPlugin parameter tree, and, for
-  scenes with dynamic objects (issue #195), a
-  `FreeJointStatePublisherPlugin` instance publishing every dynamic body's
-  live pose on `/sim/<scene>/free_joint_states` for the scene task's
-  object observation.
-- **Simulated sensors** (`gazebo.py`): on the Gazebo platform the runtime
-  stands in for the declared camera, lidar and IMU peripherals — it renders
-  the sensors into the model at the peripheral's mount, bridges the gz
-  streams onto the advertised ROS endpoints, and serves those endpoints
-  through small normalizers: the finite-point cloud filter (Gazebo reports
-  no-hit beams as ±inf) and the IMU settle filter (the pre-settle zero
-  window and landing impulse never reach the endpoint). The derived scan
-  converter composes on simulation time when its source runs there.
+  composition used by `<robot>_robot` launch entries. The simulation
+  platforms dispatch through the open registry
+  (`sim_platforms.py`, openspec sim-platform-registry): `render_sim_description`,
+  `sim_embodiment_actions` and `runtime_stack_actions(sim_world=...)` resolve
+  the effective embodiment from the profile override or the registered
+  platform's `module:attr` reference — no platform name appears in the
+  dispatch and this package imports no simulator package (the Gazebo and
+  MuJoCo embodiments, platform specs and sim-only nodes live in
+  `robot_runtime_sim`; the boundary is enforced by
+  `test/test_sim_boundary.py`).
 - **Conformance suite** (`test/test_conformance.py`): the executable contract.
 
 ## Prohibited

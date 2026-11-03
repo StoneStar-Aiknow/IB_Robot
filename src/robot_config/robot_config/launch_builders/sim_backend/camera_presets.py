@@ -10,7 +10,7 @@ per-camera as ``simulation.gazebo.transform`` (+ ``fovy``) in the SO-101
 runtime profile. The MuJoCo column was removed the same way
 (so101-mujoco-runtime-platform D5): the SO-101 MuJoCo defaults live in the
 runtime profile as ``simulation.mujoco.transform`` (+ ``fovy``), and the
-gazebo→mujoco orientation conversion moved to ``robot_runtime.mujoco``
+gazebo→mujoco orientation conversion moved to ``robot_runtime_sim.mujoco``
 (``gazebo_rpy_to_mujoco_rpy``), next to the shared Gazebo camera code.
 
 ``get_preset`` stays as the generic default-pose loader hook: provider-less
@@ -31,6 +31,6 @@ def get_preset(platform: str, camera_name: str) -> dict | None:
         None — both preset columns were removed (Gazebo: runtime-owned since
         ``so101-gazebo-runtime-transport`` D6.2; MuJoCo: runtime-owned since
         ``so101-mujoco-runtime-platform`` D5). The function remains as the
-        default-pose loader hook ``robot_runtime.gazebo`` callers inject.
+        default-pose loader hook ``robot_runtime_sim.gazebo`` callers inject.
     """
     return None

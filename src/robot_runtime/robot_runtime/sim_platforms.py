@@ -73,8 +73,8 @@ class SimPlatformError(ValueError):
 #: install hint in "not installed" errors (D2). Unknown names get a generic
 #: hint.
 _FIRST_PARTY_PACKAGES = {
-    "gazebo": "robot_runtime",
-    "mujoco": "robot_runtime",
+    "gazebo": "robot_runtime_sim",
+    "mujoco": "robot_runtime_sim",
 }
 
 

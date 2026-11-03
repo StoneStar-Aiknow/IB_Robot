@@ -192,7 +192,7 @@ def advertised_camera_frame(periph: dict) -> str:
 
     Moved to :mod:`robot_runtime.sensor_frames` (sim-platform-registry D4);
     kept here as the platform-facing alias the gz sensor generation and
-    ``robot_runtime.mujoco`` read.
+    ``robot_runtime_sim.mujoco`` read.
     """
     return sensor_frames.advertised_camera_frame(periph)
 
@@ -351,7 +351,7 @@ def lidar_imu_sensor_urdf(peripherals: list, *, platform: str = "gazebo") -> str
     camera function; disabled entries are absent (callers pass the effective
     inventory, D5 inventory-first). Only the Gazebo platform generates
     (sim-platform-registry D4: the driver set moved to the platform's sensor
-    traits — ``robot_runtime.sim_specs``), so any other platform renders no
+    traits — ``robot_runtime_sim.platforms``), so any other platform renders no
     lidar and reports no lidar-simulation capability.
     """
     if platform != "gazebo":
@@ -417,7 +417,7 @@ def lidar_bridge_entries(periph: dict) -> list[dict]:
 def lidar_finite_filter_nodes(peripherals: list) -> list:
     """The finite-point filter nodes for a peripheral list (D5).
 
-    One ``robot_runtime/finite_cloud_filter`` per 3D lidar the simulator
+    One ``robot_runtime_sim/finite_cloud_filter`` per 3D lidar the simulator
     stands in for: internal ``/<name>_lidar/raw`` in, the advertised point
     cloud endpoint out, on simulation time.
     """
@@ -430,7 +430,7 @@ def lidar_finite_filter_nodes(peripherals: list) -> list:
         name = periph["name"]
         nodes.append(
             Node(
-                package="robot_runtime",
+                package="robot_runtime_sim",
                 executable="finite_cloud_filter",
                 name=f"{name}_finite_cloud_filter",
                 output="screen",
@@ -473,7 +473,7 @@ def imu_bridge_entries(periph: dict) -> list[dict]:
 def imu_settle_filter_nodes(peripherals: list) -> list:
     """The pre-settle IMU filter nodes for a peripheral list (D5).
 
-    One ``robot_runtime/imu_settle_filter`` per simulated IMU: internal
+    One ``robot_runtime_sim/imu_settle_filter`` per simulated IMU: internal
     ``/<name>_imu/raw`` in, the advertised IMU endpoint out. The filter holds
     the stream back until gravity has been stable for a full run, then
     relays every sample verbatim.
@@ -496,7 +496,7 @@ def imu_settle_filter_nodes(peripherals: list) -> list:
         )
         nodes.append(
             Node(
-                package="robot_runtime",
+                package="robot_runtime_sim",
                 executable="imu_settle_filter",
                 name=f"{name}_imu_settle_filter",
                 output="screen",
