@@ -15,8 +15,10 @@ description: "在 openEuler Embedded (aarch64) 环境中实际执行 setup.sh + 
 |----------|------------|------|
 | 安装了 ascend-vm，并且虚拟机正在运行（`ascend-vm status` 显示 `RUNNING`） | ascend-vm 虚拟机 | [references/ascend-vm.md](references/ascend-vm.md) |
 | 没有 ascend-vm | Docker 容器 | 本文件和 [references/procedure.md](references/procedure.md) |
+| 安装了 ascend-vm，但虚拟机没有运行，或者密钥登录失败 | 不验证 | 停止，请用户启动虚拟机或添加公钥 |
 
 - 两种环境只选一种。有 ascend-vm 时优先用 ascend-vm，因为它有完整的系统和真实 NPU，更接近真机。
+- 本机安装了 ascend-vm 时，不要因为虚拟机暂时不可用就改用 Docker。
 - 两种环境的通过结果都可以作为 PR 的 openEuler 验证证据。验证报告写明使用的环境。
 - Tree 绑定、Core Principle 和 Error Classification 对两种环境都适用。
 
