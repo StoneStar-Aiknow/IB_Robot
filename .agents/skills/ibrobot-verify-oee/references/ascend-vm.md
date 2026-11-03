@@ -110,7 +110,9 @@ ssh ascend-vm 'uname -m; grep -E "^(NAME|BUILD_ID)=" /etc/os-release; nproc; df 
 
 ## Phase 4 — 运行 setup.sh 和 build.sh
 
-在虚拟机中后台运行，退出码写入状态文件。SSH 断开不影响运行：
+警告：setup 和 build 之间必须执行 lz4 门禁。setup 的 dnf 事务安装 `lz4-devel` 后，`/usr/lib64/liblz4.so` 指向不存在的 `liblz4.so.1.9.4`。不修复时，build 在 `livox_ros_driver2` 链接阶段报 `No rule to make target '/usr/lib64/liblz4.so'`。2026-11-03 的 ascend-vm 实测中，这个错误让 build 在 42 分钟后失败。
+
+下面的命令在 setup 和 build 之间执行 lz4 门禁。命令在虚拟机中后台运行，退出码写入状态文件，SSH 断开不影响运行：
 
 ```bash
 ssh ascend-vm "cd ${DEST} && (nohup bash -c '
@@ -119,6 +121,10 @@ ssh ascend-vm "cd ${DEST} && (nohup bash -c '
     bash scripts/setup.sh --yes --no-sudo --accel cann > setup.log 2>&1
   echo \$? > setup.status; date +%s > setup.end
   if [ \$(cat setup.status) = 0 ]; then
+    if rpm -V lz4 lz4-devel 2>&1 | grep -q \"missing.*/usr/lib64/liblz4\" || [ ! -e /usr/lib64/liblz4.so.1.9.4 ]; then
+      dnf reinstall -y --nogpgcheck lz4 lz4-devel > lz4-gate.log 2>&1
+    fi
+    test -e \$(readlink -f /usr/lib64/liblz4.so) && echo ok > lz4-gate.status || echo broken > lz4-gate.status
     date +%s > build.start
     bash scripts/build.sh > build.log 2>&1
     echo \$? > build.status; date +%s > build.end
@@ -128,6 +134,7 @@ ssh ascend-vm "cd ${DEST} && (nohup bash -c '
 - `--accel cann` 和 Docker 流程一致。虚拟机中有 `/dev/davinci*`，所以自动探测的结果也是 `cann`。
 - `PIP_DEFAULT_TIMEOUT` 和 `PIP_RETRIES` 用于应对 pip 镜像的临时故障。
 - 虚拟机的登录环境会加载 CANN 的 `PYTHONPATH`，`setup.sh` 会输出 `PYTHONPATH is set` 警告。这个警告不影响结果。
+- lz4 门禁的结果写入 `lz4-gate.status`。如果内容是 `broken`，build 会在 `livox_ros_driver2` 失败，按 procedure.md Phase 5.5 处理后重跑 build。
 
 查看进度：
 
@@ -137,13 +144,23 @@ ssh ascend-vm "cd ${DEST}; cat setup.status build.status 2>/dev/null; tail -3 se
 
 `setup.status` 和 `build.status` 都是 `0`，并且日志中有 `Setup complete` 和 `Build complete`，验证才算通过。
 
+参考耗时（2026-11-03，ascend-vm 3.1，4 个虚拟核，ROS 第一次安装）：
+
+| 阶段 | 耗时 |
+|------|------|
+| setup | 2551 s |
+| build（从头开始） | 约 2500 s 后在 `livox_ros_driver2` 失败（lz4 未修复） |
+| build（修复 lz4 后在同一目录重跑） | 921 s |
+
+如果 build 失败后修复了环境，可以在同一目录只重跑 `build.sh`。colcon 复用已经完成的包。
+
 ## Phase 5 — 收集结果并清理
 
 1. 按 SKILL.md 的 Error Classification 收集并分类 `setup.log` 和 `build.log` 中的 ERROR 行。
 2. 记录以下信息：
    - 虚拟机 `BUILD_ID` 和 ascend-vm 版本（`ascend-vm version`）
    - setup 和 build 的耗时
-   - Phase 2 中执行的修复
+   - Phase 2 和 lz4 门禁中执行的修复
 3. 删除虚拟机中的代码目录：
 
    ```bash
