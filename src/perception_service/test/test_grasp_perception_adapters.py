@@ -15,6 +15,7 @@ from inference_service.unified_runtime import (
     OutcomeEvidence,
     RuntimeLatency,
 )
+from perception_service.adapter_support import imagenet_image_tensor
 from perception_service.model_service_plugins import SegmentDetectionsPlugin
 from perception_service.semantic_model_adapters import GroundingDINORawAdapter, SAM2PromptAdapter
 
@@ -76,16 +77,28 @@ def _write_sam2_prompt_bundle(root):
     )
 
 
-def _sam2_prompt_deployment(*, batch: int, canvas: int, mask_batch: int | None = None):
+def _sam2_prompt_deployment(
+    *,
+    batch: int,
+    canvas: int,
+    mask_batch: int | None = None,
+    canvas_width: int | None = None,
+    raw_image: bool = False,
+):
     from inference_manifest import TensorBinding
 
     mask = batch if mask_batch is None else mask_batch
+    canvas_w = canvas if canvas_width is None else canvas_width
     return _compiled(
         {
             "encoder": (
                 [
                     TensorBinding(
-                        semantic="image", index=0, dtype="float32", shape=(1, 3, canvas, canvas), layout="NCHW"
+                        semantic="image", index=0, dtype="uint8", shape=(1, canvas, canvas_w, 3), layout="NHWC"
+                    )
+                    if raw_image
+                    else TensorBinding(
+                        semantic="image", index=0, dtype="float32", shape=(1, 3, canvas, canvas_w), layout="NCHW"
                     )
                 ],
                 [
@@ -325,7 +338,7 @@ def test_sam2_prompt_adapter_derives_batch_and_canvas_from_the_compiled_deployme
     _write_sam2_prompt_bundle(tmp_path)
     adapter = SAM2PromptAdapter.from_bundle(tmp_path, deployment=_sam2_prompt_deployment(batch=1, canvas=512))
 
-    assert (adapter.batch_size, adapter.image_size) == (1, 512)
+    assert (adapter.batch_size, adapter.canvas_height, adapter.canvas_width) == (1, 512, 512)
 
     inputs = adapter.preprocess((np.zeros((256, 512, 3), dtype=np.uint8), [[0, 0, 10, 10]]))
 
@@ -504,3 +517,115 @@ def test_sam2_prompt_postprocess_crops_top_left_padding_before_resize():
 
     assert masks[0].shape == (512, 1024)
     assert not masks[0].any()
+
+
+def _reference_imagenet_tensor(image_hwc, layout):
+    """The contract written out longhand, as the adapters used to compute it."""
+    normalized = image_hwc.astype(np.float32) / np.float32(255.0)
+    normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
+        [0.229, 0.224, 0.225], dtype=np.float32
+    )
+    ordered = normalized.transpose(2, 0, 1) if layout == "NCHW" else normalized
+    return np.ascontiguousarray(ordered[None], dtype=np.float32)
+
+
+@pytest.mark.parametrize("layout", ["NCHW", "NHWC"])
+def test_imagenet_image_tensor_matches_the_longhand_contract(layout):
+    """The fused form trades four full-frame temporaries for rounding-level drift."""
+    rng = np.random.default_rng(0)
+    image = rng.integers(0, 256, size=(37, 53, 3), dtype=np.uint8)
+
+    tensor = imagenet_image_tensor(image, layout)
+    reference = _reference_imagenet_tensor(image, layout)
+
+    assert tensor.shape == reference.shape
+    assert tensor.dtype == np.float32
+    assert tensor.flags["C_CONTIGUOUS"]
+    np.testing.assert_allclose(tensor, reference, rtol=1e-6, atol=1e-6)
+
+
+def test_sam2_prompt_adapter_fills_a_canvas_matching_the_camera_aspect_ratio(tmp_path):
+    """A canvas compiled at the frame's own aspect ratio carries no padding at all."""
+    _write_sam2_prompt_bundle(tmp_path)
+    adapter = SAM2PromptAdapter.from_bundle(
+        tmp_path, deployment=_sam2_prompt_deployment(batch=1, canvas=288, canvas_width=512)
+    )
+
+    assert (adapter.canvas_height, adapter.canvas_width) == (288, 512)
+
+    frame = np.full((360, 640, 3), 200, dtype=np.uint8)
+    inputs = adapter.preprocess((frame, [[0, 0, 320, 180]]))
+
+    # 640x360 scales by 0.8 onto a 512x288 canvas, so every row carries image data.
+    assert inputs["image"].shape == (1, 3, 288, 512)
+    assert (inputs["image"] > -2.0).all()
+    np.testing.assert_allclose(inputs["point_coords"][0], [[0.0, 0.0], [256.0, 144.0]])
+
+    # The mask covers the whole canvas, so nothing is cropped on the way back out.
+    logits = np.full((1, 1, 72, 128), -1.0, dtype=np.float32)
+    logits[:, :, :36, :] = 1.0
+    masks = adapter.postprocess(_result({"mask_logits": logits}), image_shape=(360, 640), count=1)
+    assert masks[0].shape == (360, 640)
+    assert masks[0][:170].all()
+    assert not masks[0][190:].any()
+
+
+def test_grounding_dino_raw_adapter_hands_aipp_the_untouched_frame(tmp_path):
+    """A uint8 input means the compiled graph normalizes in hardware; the host must not."""
+    from inference_manifest import TensorBinding
+
+    _write_grounding_bundle(tmp_path)
+    deployment = _compiled(
+        {
+            "vision": (
+                [TensorBinding(semantic="image", index=0, dtype="uint8", shape=(1, 720, 1280, 3), layout="NHWC")],
+                [TensorBinding(semantic="pred_boxes", index=0, dtype="float32", shape=(1, 900, 4))],
+            )
+        },
+        ("vision",),
+    )
+
+    adapter = GroundingDINORawAdapter.from_bundle(tmp_path, deployment=deployment)
+    assert adapter.image_is_raw
+
+    frame = np.random.default_rng(0).integers(0, 256, size=(720, 1280, 3), dtype=np.uint8)
+    inputs = adapter.preprocess((frame, "banana", 0.3, 0.25))
+
+    assert inputs["image"].shape == (1, 720, 1280, 3)
+    assert inputs["image"].dtype == np.uint8
+    np.testing.assert_array_equal(inputs["image"][0], frame)
+
+
+def test_sam2_prompt_adapter_hands_aipp_the_letterboxed_canvas_unnormalized(tmp_path):
+    """The canvas still gets built on the host; only the normalization moves to AIPP."""
+    _write_sam2_prompt_bundle(tmp_path)
+    deployment = _sam2_prompt_deployment(batch=1, canvas=288, canvas_width=512, raw_image=True)
+
+    adapter = SAM2PromptAdapter.from_bundle(tmp_path, deployment=deployment)
+    assert adapter.image_is_raw
+
+    frame = np.full((360, 640, 3), 200, dtype=np.uint8)
+    inputs = adapter.preprocess((frame, [[0, 0, 320, 180]]))
+
+    assert inputs["image"].shape == (1, 288, 512, 3)
+    assert inputs["image"].dtype == np.uint8
+    assert (inputs["image"] == 200).all()
+
+
+def test_grounding_dino_raw_adapter_rejects_raw_pixels_declared_nchw(tmp_path):
+    """NHWC and NCHW uint8 hold the same bytes, so only this check catches a transpose."""
+    from inference_manifest import TensorBinding
+
+    _write_grounding_bundle(tmp_path)
+    deployment = _compiled(
+        {
+            "vision": (
+                [TensorBinding(semantic="image", index=0, dtype="uint8", shape=(1, 3, 720, 1280), layout="NCHW")],
+                [TensorBinding(semantic="pred_boxes", index=0, dtype="float32", shape=(1, 900, 4))],
+            )
+        },
+        ("vision",),
+    )
+
+    with pytest.raises(ValueError, match="interleaved NHWC"):
+        GroundingDINORawAdapter.from_bundle(tmp_path, deployment=deployment)
