@@ -1,11 +1,16 @@
-"""The nav_room scene (lekiwi-gazebo-runtime-platform D8, D14.5, D14.7).
+"""The room scenes (lekiwi-gazebo-runtime-platform D8, D14.5, D14.7; #205
+grasp stage D1).
 
-The room-level navigation scene: the compiler resolves its world template
-and a real Gazebo server loads the resolved world headlessly. The scene's
-static collision geometry is data (``layout.yaml`` ``static_geometry``,
-D14.7): every simulator template of the scene must carry exactly that
-geometry, and the gate route (D14.5) must keep its swept footprint and the
-collision monitor's look-ahead clear of it.
+The room-level navigation scene ``nav_room`` and its mobile-manipulation
+sibling ``nav_grasp_room`` share the navigation geometry: the compiler
+resolves each world template and a real Gazebo server loads the resolved
+world headlessly. The scenes' static collision geometry is data
+(``layout.yaml`` ``static_geometry``, D14.7): every simulator template of a
+scene must carry exactly that geometry, and the gate route (D14.5) must
+keep its swept footprint and the collision monitor's look-ahead clear of
+it. ``nav_grasp_room`` adds a dynamic grasp cube — the extras direction of
+the consistency check learns that a dynamic object is not static geometry
+(#205 grasp stage D1).
 """
 
 from __future__ import annotations
@@ -22,6 +27,11 @@ import yaml
 
 from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
 
+#: The room scenes that share the navigation geometry and the machinery
+#: below (D1: the consistency, load and route-clearance surfaces are
+#: parametrized over both).
+ROOM_SCENES = ("nav_room", "nav_grasp_room")
+
 _SCENE_DIR = Path(__file__).resolve().parents[1] / "scenes" / "nav_room"
 
 # The Nav2 footprint disc radius (robot_radius, robot_navigation
@@ -35,10 +45,12 @@ TIME_BEFORE_COLLISION = 1.5
 SIDE_MARGIN = 0.05
 AHEAD_MARGIN = 0.05
 
-#: The D14.5 gate route, read from the SAME layout data the gate executes
-#: (one definition, no drift): west half of the room, 7.0 m of translation,
-#: two in-place turns, two lateral segments, closed. Translation speeds are
-#: signed (segment 6 drives body -y); the clearance rule uses the magnitude.
+#: The D14.5 gate route of nav_room, read from the SAME layout data the
+#: gate executes (one definition, no drift): west half of the room, 7.0 m of
+#: translation, two in-place turns, two lateral segments, closed.
+#: Translation speeds are signed (segment 6 drives body -y); the clearance
+#: rule uses the magnitude. The parametrized clearance test reads each
+#: scene's own route the same way.
 ROUTE = tuple(get_scene_layout("nav_room")["gate_route"])
 
 
@@ -49,18 +61,20 @@ def _gazebo_available() -> bool:
         return False
 
 
-def test_nav_room_layout_declares_the_spawn():
-    layout = get_scene_layout("nav_room")
-    assert layout["scene_name"] == "nav_room"
-    # D8: the spawn pose of the navigation scene (z lifts the wheels)
+@pytest.mark.parametrize("scene", ROOM_SCENES)
+def test_the_room_layout_declares_the_spawn(scene):
+    layout = get_scene_layout(scene)
+    assert layout["scene_name"] == scene
+    # D8: the spawn pose of the navigation scenes (z lifts the wheels)
     assert layout["robot_spawn"] == {"x": -1.5, "y": -1.5, "z": 0.05, "yaw": 0.0}
 
 
-def test_nav_room_world_resolves_with_the_room_geometry():
-    world = get_gazebo_world_path("nav_room")
+@pytest.mark.parametrize("scene", ROOM_SCENES)
+def test_the_room_world_resolves_with_the_room_geometry(scene):
+    world = get_gazebo_world_path(scene)
     assert world.is_file()
     content = world.read_text(encoding="utf-8")
-    # same geometry as nav_test.world, so sim_map.yaml stays valid
+    # same geometry as nav_test.world, so the navigation maps stay valid
     for model in ("wall_north", "wall_south", "wall_east", "wall_west", "obstacle_box", "obstacle_cylinder"):
         assert f'name="{model}"' in content, model
     assert '<world name="demo">' in content
@@ -70,13 +84,14 @@ def test_nav_room_world_resolves_with_the_room_geometry():
 
 
 @pytest.mark.skipif(not _gazebo_available(), reason="Gazebo (ign gazebo) is not available")
-def test_nav_room_world_loads_in_gazebo():
-    world = get_gazebo_world_path("nav_room")
+@pytest.mark.parametrize("scene", ROOM_SCENES)
+def test_the_room_world_loads_in_gazebo(scene):
+    world = get_gazebo_world_path(scene)
     environment = dict(os.environ)
     # both partition variables: Fortress (ign, gz-transport11) reads only
     # IGN_PARTITION, newer gz reads GZ_PARTITION — set both so this load
     # run stays on its own gz bus on either stack
-    environment["GZ_PARTITION"] = f"nav_room_load_{uuid.uuid4().hex[:8]}"
+    environment["GZ_PARTITION"] = f"{scene}_load_{uuid.uuid4().hex[:8]}"
     environment["IGN_PARTITION"] = environment["GZ_PARTITION"]
     result = subprocess.run(
         ["ign", "gazebo", "-s", "-r", "--iterations", "10", str(world)],
@@ -88,8 +103,9 @@ def test_nav_room_world_loads_in_gazebo():
     assert result.returncode == 0, f"gazebo failed to load {world}:\n{result.stdout}\n{result.stderr}"
 
 
-def test_nav_room_layout_is_loadable_yaml_roundtrip():
-    layout = get_scene_layout("nav_room")
+@pytest.mark.parametrize("scene", ROOM_SCENES)
+def test_the_room_layout_is_loadable_yaml_roundtrip(scene):
+    layout = get_scene_layout(scene)
     assert yaml.safe_load(yaml.safe_dump(layout)) == layout
 
 
@@ -158,6 +174,8 @@ def _template_geometry_mjcf(template: Path) -> dict[str, dict] | None:
         name = body.get("name")
         if name is None:
             continue
+        if body.find("joint") is not None or body.find("freejoint") is not None:
+            continue  # a body with a joint is DYNAMIC (#205 D1: the grasp cube), not static geometry
         geom = body.find("geom")
         if geom is None or geom.get("type") not in ("box", "cylinder"):
             continue  # primitives outside the convention
@@ -217,12 +235,14 @@ def _assert_template_matches_static_geometry(template: Path, static_geometry: li
         )
 
 
-def test_every_scene_template_carries_the_layout_static_geometry():
-    layout = get_scene_layout("nav_room")
+@pytest.mark.parametrize("scene", ROOM_SCENES)
+def test_every_scene_template_carries_the_layout_static_geometry(scene):
+    layout = get_scene_layout(scene)
     static_geometry = layout["static_geometry"]
-    assert static_geometry, "nav_room must declare its static collision geometry (D14.7)"
-    templates = sorted(_SCENE_DIR.glob("nav_room.*.template"))
-    assert templates, f"no nav_room scene templates under {_SCENE_DIR}"
+    assert static_geometry, f"{scene} must declare its static collision geometry (D14.7)"
+    scene_dir = Path(__file__).resolve().parents[1] / "scenes" / scene
+    templates = sorted(scene_dir.glob(f"{scene}.*.template"))
+    assert templates, f"no {scene} scene templates under {scene_dir}"
     for template in templates:
         _assert_template_matches_static_geometry(template, static_geometry)
 
@@ -390,9 +410,11 @@ def _route_clearance_violations(route, obstacles):
     return violations
 
 
-def test_the_gate_route_clears_the_scene_geometry():
-    obstacles = [_Obstacle(element) for element in get_scene_layout("nav_room")["static_geometry"]]
-    violations = _route_clearance_violations(ROUTE, obstacles)
+@pytest.mark.parametrize("scene", ROOM_SCENES)
+def test_the_gate_route_clears_the_scene_geometry(scene):
+    route = tuple(get_scene_layout(scene)["gate_route"])
+    obstacles = [_Obstacle(element) for element in get_scene_layout(scene)["static_geometry"]]
+    violations = _route_clearance_violations(route, obstacles)
     assert not violations, "the D14.5 route must stay clear of the scene geometry: " + "; ".join(
         f"segment {segment} violates the {rule} rule against {element} by {margin:.3f} m"
         for segment, element, margin, rule in violations

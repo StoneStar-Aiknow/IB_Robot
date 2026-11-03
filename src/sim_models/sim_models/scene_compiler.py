@@ -89,6 +89,18 @@ Public API
 
   get_scene_task(scene_name) -> dict | None
       The scene's ``task:`` declaration (executable + platforms), or None.
+
+  mobile_manipulation_spec(layout) -> dict
+      The validated ``mobile_manipulation`` section of a scene layout (#205
+      grasp stage D1): the grasp object (a ``type: dynamic`` entry), the
+      table (a ``static_geometry`` entry), the Nav2 staging pose and the
+      success thresholds. ValueError names the offending key.
+
+  rasterize_static_geometry(layout, *, resolution, origin, size) -> ndarray
+      The occupancy grid of a layout's ``static_geometry`` (#205 grasp
+      stage D2): yawed boxes by their exact cell overlap (the yawed box by
+      its axis-aligned bounding box), cylinders by the closest point of each
+      cell rectangle to the axis. Rows are in PGM order (row 0 = max y).
 """
 
 import logging
@@ -628,3 +640,243 @@ def get_scene_task(scene_name: str) -> dict | None:
     """
     task = get_scene_layout(scene_name).get("task")
     return task if isinstance(task, dict) else None
+
+
+def mobile_manipulation_spec(layout: dict) -> dict:
+    """The validated ``mobile_manipulation`` section of a scene layout (D1).
+
+    The single definition of the grasp task data, read by the scene tests
+    and (Phase 2) the application support through this validator only::
+
+        mobile_manipulation:
+          object: grasp_object             # a `type: dynamic` object
+          table: table                     # a static_geometry entry
+          object_prompt: magenta cube      # the grounded_sam2 prompt (R5)
+          staging_pose: {x: .., y: .., yaw: ..}
+          success: {lift_m: 0.05, hold_s: 3.0, max_object_rotation_in_gripper_deg: 10}
+
+    Args:
+        layout: The parsed layout.yaml of the scene.
+
+    Returns:
+        The section as a plain dict (``object``, ``table``, ``staging_pose``
+        with float x/y/yaw, ``success`` with float lift_m/hold_s/
+        max_object_rotation_in_gripper_deg).
+
+    Raises:
+        ValueError: Naming the offending key — the section or a sub-key is
+            missing or of the wrong type; the object is not a dynamic object
+            of the layout; the table is not a static_geometry entry; a value
+            is not finite; or the staging pose lies inside a static element.
+    """
+    section = layout.get("mobile_manipulation")
+    if not isinstance(section, dict):
+        raise ValueError("mobile_manipulation: the section is missing or not a mapping")
+
+    object_name = section.get("object")
+    if not isinstance(object_name, str) or not object_name:
+        raise ValueError("mobile_manipulation.object: missing or not a name")
+    dynamic = [name for name, _position, _rotation in _layout_dynamic_objects(layout)]
+    if object_name not in dynamic:
+        raise ValueError(
+            f"mobile_manipulation.object: {object_name!r} is not a `type: dynamic` object "
+            f"of this layout (dynamic objects: {dynamic or 'none'})"
+        )
+
+    prompt = section.get("object_prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("mobile_manipulation.object_prompt: missing or not a non-empty string")
+    object_prompt = prompt.strip()
+
+    table_name = section.get("table")
+    if not isinstance(table_name, str) or not table_name:
+        raise ValueError("mobile_manipulation.table: missing or not a name")
+    static_names = [str(element.get("name", "")) for element in layout.get("static_geometry", []) or []]
+    if table_name not in static_names:
+        raise ValueError(
+            f"mobile_manipulation.table: {table_name!r} is not a static_geometry entry "
+            f"of this layout (entries: {static_names or 'none'})"
+        )
+
+    pose = section.get("staging_pose")
+    if not isinstance(pose, dict):
+        raise ValueError("mobile_manipulation.staging_pose: missing or not a mapping")
+    staging = {
+        key: _finite_number(pose.get(key), f"mobile_manipulation.staging_pose.{key}") for key in ("x", "y", "yaw")
+    }
+
+    success_in = section.get("success")
+    if not isinstance(success_in, dict):
+        raise ValueError("mobile_manipulation.success: missing or not a mapping")
+    success = {}
+    for key in ("lift_m", "hold_s", "max_object_rotation_in_gripper_deg"):
+        value = _finite_number(success_in.get(key), f"mobile_manipulation.success.{key}")
+        if value <= 0.0:
+            raise ValueError(f"mobile_manipulation.success.{key}: must be positive, got {value}")
+        success[key] = value
+
+    # the staging pose must not sit inside (or on) a static element: Nav2
+    # would goal-check inside an obstacle
+    for element in layout.get("static_geometry", []) or []:
+        name = str(element.get("name", ""))
+        ex, ey = float(element["pose"][0]), float(element["pose"][1])
+        if element.get("primitive") == "box":
+            half_x, half_y = float(element["size"][0]) / 2.0, float(element["size"][1]) / 2.0
+            inside = abs(staging["x"] - ex) <= half_x and abs(staging["y"] - ey) <= half_y
+        else:
+            inside = math.hypot(staging["x"] - ex, staging["y"] - ey) <= float(element["size"][0])
+        if inside:
+            raise ValueError(
+                f"mobile_manipulation.staging_pose: ({staging['x']}, {staging['y']}) lies inside "
+                f"the static element {name!r}"
+            )
+
+    return {
+        "object": object_name,
+        "object_prompt": object_prompt,
+        "table": table_name,
+        "staging_pose": staging,
+        "success": success,
+    }
+
+
+def rasterize_static_geometry(
+    layout: dict,
+    *,
+    resolution: float,
+    origin: tuple[float, float],
+    size: tuple[int, int],
+) -> "np.ndarray":
+    """The occupancy grid of a layout's ``static_geometry`` (D2).
+
+    Cell rules (spike 1.2's chosen rules, pinned by the fidelity test
+    against the shipped ``sim_map.pgm``):
+
+    * **Box, yaw 0** — a cell is occupied when the box's exact interval
+      ``[min, max]`` on an axis overlaps the cell's interval on that axis
+      (computed in exact rational arithmetic, so cells never flip on
+      floating-point representation error).
+    * **Box, yaw != 0** — the same interval rule applied to the yawed box's
+      axis-aligned bounding box (the map is planar; the yawed footprint's
+      conservative envelope).
+    * **Cylinder** — a cell is occupied when the closest point of the
+      cell's rectangle to the cylinder axis lies within the radius.
+
+    Args:
+        layout:     The parsed layout.yaml (only ``static_geometry`` is read).
+        resolution: The grid resolution in metres per cell (positive).
+        origin:     The world coordinate of the grid's lower-left corner
+                    ``(x, y)``.
+        size:       The grid dimensions ``(width, height)`` in cells.
+
+    Returns:
+        A boolean :class:`numpy.ndarray` of shape ``(height, width)`` in
+        PGM row order — row 0 is the MAXIMUM y, as ``map_server`` reads PGM
+        rasters — so the array serialises directly into the map file.
+    """
+    if resolution <= 0.0:
+        raise ValueError(f"resolution must be positive, got {resolution}")
+    width, height = size
+    _positive_int(width, "size (width)")
+    _positive_int(height, "size (height)")
+
+    from fractions import Fraction
+
+    res = Fraction(resolution).limit_denominator(10**9)
+    origin_x = Fraction(origin[0]).limit_denominator(10**9)
+    origin_y = Fraction(origin[1]).limit_denominator(10**9)
+    # world-order grid (row 0 = min y); flipped to PGM order on return
+    grid = np.zeros((int(height), int(width)), dtype=bool)
+
+    def interval_cells(lo: Fraction, hi: Fraction) -> tuple[int, int]:
+        """The half-open cell-index range [lo_cell, hi_cell) overlapped by
+        the exact world interval [lo, hi]."""
+        first = math.floor((lo - origin_axis) / res)
+        last = math.ceil((hi - origin_axis) / res)
+        return int(first), int(last)
+
+    for element in layout.get("static_geometry", []) or []:
+        pose = element.get("pose") or []
+        if len(pose) < 6:
+            raise ValueError(f"static_geometry entry {element.get('name')!r}: pose needs 6 values")
+        px, py, _pz, _r, _p, yaw = (float(value) for value in pose)
+        primitive = str(element.get("primitive", ""))
+        if primitive == "box":
+            sizes = element.get("size") or []
+            if len(sizes) < 2:
+                raise ValueError(f"static_geometry entry {element.get('name')!r}: box size needs >= 2 values")
+            half_x, half_y = float(sizes[0]) / 2.0, float(sizes[1]) / 2.0
+            if yaw == 0.0:
+                x_lo, x_hi = px - half_x, px + half_x
+                y_lo, y_hi = py - half_y, py + half_y
+            else:
+                cos_a, sin_a = abs(math.cos(yaw)), abs(math.sin(yaw))
+                extent_x = cos_a * half_x + sin_a * half_y
+                extent_y = sin_a * half_x + cos_a * half_y
+                x_lo, x_hi = px - extent_x, px + extent_x
+                y_lo, y_hi = py - extent_y, py + extent_y
+            origin_axis = origin_x
+            j0, j1 = interval_cells(Fraction(x_lo).limit_denominator(10**9), Fraction(x_hi).limit_denominator(10**9))
+            origin_axis = origin_y
+            i0, i1 = interval_cells(Fraction(y_lo).limit_denominator(10**9), Fraction(y_hi).limit_denominator(10**9))
+            i0, i1 = max(i0, 0), min(i1, int(height))
+            j0, j1 = max(j0, 0), min(j1, int(width))
+            if i0 < i1 and j0 < j1:
+                grid[i0:i1, j0:j1] = True
+        elif primitive == "cylinder":
+            sizes = element.get("size") or []
+            if len(sizes) < 1:
+                raise ValueError(f"static_geometry entry {element.get('name')!r}: cylinder size needs the radius")
+            radius = float(sizes[0])
+            radius_sq = radius * radius
+            for i in range(int(height)):
+                cell_y_lo = origin[1] + i * resolution
+                ny = min(max(py, cell_y_lo), cell_y_lo + resolution) - py
+                for j in range(int(width)):
+                    cell_x_lo = origin[0] + j * resolution
+                    nx = min(max(px, cell_x_lo), cell_x_lo + resolution) - px
+                    if nx * nx + ny * ny <= radius_sq + 1e-12:
+                        grid[i, j] = True
+        else:
+            raise ValueError(f"static_geometry entry {element.get('name')!r}: unknown primitive {primitive!r}")
+    return grid[::-1, :]
+
+
+def write_layout_map(
+    layout: dict,
+    *,
+    out_prefix: str | Path,
+    resolution: float,
+    origin: tuple[float, float],
+    size: tuple[int, int],
+) -> tuple[Path, Path]:
+    """Write a layout's occupancy grid as the trinary map pair (D2).
+
+    The PGM is binary (``P5``) with 0 = occupied and 254 = free, rows
+    top-down (row 0 = max y); the YAML mirrors ``sim_map.yaml``'s fields
+    (``mode: trinary``, ``negate: 0``, ``occupied_thresh: 0.65``,
+    ``free_thresh: 0.25``) so ``map_server`` reads it identically.
+
+    Returns:
+        ``(pgm_path, yaml_path)`` — ``{out_prefix}.pgm`` and
+        ``{out_prefix}.yaml``.
+    """
+    grid = rasterize_static_geometry(layout, resolution=resolution, origin=origin, size=size)
+    width, height = size
+    prefix = Path(out_prefix)
+    pgm_path = prefix.with_suffix(".pgm")
+    pgm_path.parent.mkdir(parents=True, exist_ok=True)
+    raster = np.where(grid, 0, 254).astype(np.uint8)
+    pgm_path.write_bytes(f"P5\n{width} {height}\n255\n".encode("ascii") + raster.tobytes())
+    yaml_path = prefix.with_suffix(".yaml")
+    yaml_path.write_text(
+        f"image: {pgm_path.name}\n"
+        "mode: trinary\n"
+        f"resolution: {resolution}\n"
+        f"origin: [{origin[0]}, {origin[1]}, 0]\n"
+        "negate: 0\n"
+        "occupied_thresh: 0.65\n"
+        "free_thresh: 0.25\n",
+        encoding="ascii",
+    )
+    return pgm_path, yaml_path

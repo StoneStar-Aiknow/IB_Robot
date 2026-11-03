@@ -1,0 +1,92 @@
+<mujoco model="nav_grasp_room">
+  <!-- nav_grasp_room MuJoCo scene — generated from nav_grasp_room.xml.template
+       (#205 grasp stage D1).
+
+       nav_room's static geometry (identical entries — MJCF boxes carry
+       HALF-extents, cylinders size="radius half-length") plus the
+       mobile-manipulation furniture of layout.yaml: a static table body
+       and one dynamic grasp cube. {{ROBOT_XML_PATH}} — absolute path to
+       the robot MJCF; the composition API
+       (scene_compiler.compose_mujoco_model) fills it. -->
+  <include file="{{ROBOT_XML_PATH}}"/>
+
+  <!-- The scene's default free-camera view (MuJoCo's viewer initialises its
+       free camera from the model statistic: lookat = center, distance =
+       1.5 * extent, azimuth 90 deg, elevation -45 deg). Centred between
+       the staging stop (x ~ 0.78, the layout's staging_pose 0.785/0.40) and
+       the grasp cube at the table's west edge (x = 1.025) with extent 0.75
+       (distance 1.125 m), so the viewer opens on the robot at the table,
+       close on the pick, instead of the whole 4 m room. View-only: the
+       statistic's center/extent take no part in the physics. -->
+  <statistic center="0.92 0.40 0.30" extent="0.75"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.4 0.4 0.4" specular="0.0 0.0 0.0"/>
+    <rgba haze="0.15 0.25 0.35 1.0"/>
+  </visual>
+
+  <asset>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge"
+             rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3" markrgb="0.8 0.8 0.8"
+             width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true"
+              texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0.0 0.0 3.5" dir="0.0 0.0 -1.0" directional="true"/>
+    <!-- Visible floor at z = 0: support AND observation surface (as
+         nav_room). The priority-1 friction keeps the contact parameters
+         from fighting the scene-independent support planes of other
+         scenes; robots whose wheels carry their own priority outrank it. -->
+    <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane"
+          material="groundplane" priority="1" friction="0.8 0.1 0.01"/>
+
+    <!-- Enclosed room: identical entries to nav_room. MJCF box size is the
+         HALF-extent (layout sizes are full extents). -->
+    <body name="wall_north" pos="0 2 0.5">
+      <geom name="wall_north" type="box" size="2.1 0.05 0.5" rgba="0.6 0.6 0.6 1"/>
+    </body>
+    <body name="wall_south" pos="0 -2 0.5">
+      <geom name="wall_south" type="box" size="2.1 0.05 0.5" rgba="0.6 0.6 0.6 1"/>
+    </body>
+    <body name="wall_east" pos="2 0 0.5">
+      <geom name="wall_east" type="box" size="0.05 2.1 0.5" rgba="0.6 0.6 0.6 1"/>
+    </body>
+    <body name="wall_west" pos="-2 0 0.5">
+      <geom name="wall_west" type="box" size="0.05 2.1 0.5" rgba="0.6 0.6 0.6 1"/>
+    </body>
+
+    <!-- Interior obstacles (identical entries to nav_room). -->
+    <body name="obstacle_box" pos="0 0 0.25">
+      <geom name="obstacle_box" type="box" size="0.2 0.2 0.25" rgba="0.9 0.3 0.3 1"/>
+    </body>
+    <!-- Cylinder: MJCF size is "radius half-length" (layout: [0.2, 0.6]). -->
+    <body name="obstacle_cylinder" pos="1.0 -0.5 0.3">
+      <geom name="obstacle_cylinder" type="cylinder" size="0.2 0.3" rgba="0.3 0.3 0.9 1"/>
+    </body>
+
+    <!-- Mobile-manipulation table (D1, lowered 2026-11-02, maintainer
+         decision: top 0.015 m above the floor — the validated grasp
+         surface z_base = -0.061): static body, box geom, priority 1
+         friction 0.8 (the empty/pick_banana support-surface rule), light
+         grey (unsaturated — outside the object's hue band). MJCF size is
+         the HALF-extent (layout: [0.40, 0.50, 0.015]). -->
+    <body name="table" pos="1.2 0.4 0.0075">
+      <geom name="table" type="box" size="0.20 0.25 0.0075" rgba="0.8 0.8 0.8 1"
+            priority="1" friction="0.8 0.1 0.01"/>
+    </body>
+
+    <!-- Grasp cube (D1): freejoint body, box geom (half-extent 0.015),
+         condim 4, explicit mass and inertia from layout.yaml (cube
+         a = 0.03, m = 0.05: I = m a^2/6 = 7.5e-6), friction from the
+         layout (sliding 1.0), saturated magenta (hue 300 deg, the mask
+         band 270-330 deg). Spawns 1 cm above the table top (0.015 m) and settles. -->
+    <body name="grasp_object" pos="1.025 0.4 0.04" euler="0 0 0.0">
+      <freejoint name="grasp_object_free"/>
+      <geom name="grasp_object" type="box" size="0.015 0.015 0.015"
+            rgba="0.85 0.1 0.85 1" condim="4" friction="1.0 0.005 0.0001"
+            mass="0.05"/>
+    </body>
+  </worldbody>
+</mujoco>
