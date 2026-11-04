@@ -341,6 +341,13 @@ SigLIP 特征向量属于关联内部状态，不通过公共消息发布。
 
 机器人当前状态汇报，包含末端位姿、关节状态和控制模式信息。
 
+### `SessionLease.msg` / `ArmCommandReference.msg`
+
+受管单臂遥操作的会话消息，只服务 SO-101 类设备遥操作。
+
+- `SessionLease.msg` 是会话保活，只有 `header`。runtime 丢弃时间戳不大于会话开始时间的 lease。
+- `ArmCommandReference.msg` 是 runtime 按控制周期发布的指令侧参考、位置和姿态误差、`tracking`（指令是否跟上参考）和原因。会话状态从 `RuntimeStatus.msg` 读取。
+
 ### 分布式观测视频控制面
 
 `VideoStreamDescriptor.msg` 通过可靠、transient-local DDS 控制面声明一条 RTP/H.264 观测流，包含
@@ -989,6 +996,10 @@ catalog。`schema_version` v1 固定为 `1`。查询语义：
 | `registry_digest` / `capability_digest` / `source_release_digest` / `provenance_digest` | 关联 digest |
 | `changed_skills` | 变更技能列表 |
 | `diagnostics` | `SkillDiagnostic[]` 结构化诊断 |
+
+### `StartArmSession.srv`
+
+启动受管单臂遥操作会话。响应返回本次会话的 clutch 起点 `reference`。起点是 runtime 的指令侧参考，不是实测位姿。`reference_reset` 表示本次是否用实测位姿重建了参考。
 
 ### `MoveToPose.srv`
 
