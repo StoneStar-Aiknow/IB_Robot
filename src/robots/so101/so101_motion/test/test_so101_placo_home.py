@@ -242,6 +242,8 @@ def _managed_node():
     node.managed_teleop = True
     node._managed_owner = True
     node._managed_mode = None
+    node._frozen_reference = None
+    node.reference_reset_threshold_m = 0.02
     node.input_mode = "auto"
     node.input_timeout = 0.2
     node.runtime_status_stale_s = 0.2
@@ -486,6 +488,113 @@ def test_managed_clutch_pose_position_only_ignores_orientation_delta():
     assert len(calls) == 1 and calls[0][0] == "position"
     np.testing.assert_allclose(calls[0][1], [0.23, -0.01, 0.17], atol=1e-12)
     np.testing.assert_allclose(node._r_ref, _rot_z(np.pi / 2))
+
+
+def _frozen_session(p_measured=(0.20, 0.0, 0.14)):
+    """An active pose session holding reference (0.20, 0, 0.15); the measured pose is a parameter."""
+    node = _managed_node()
+    node._p_ref = np.array([0.20, 0.0, 0.15])
+    node._r_ref = _rot_z(np.pi / 2)
+    node._managed_mode = "pose"
+    node.diffik = types.SimpleNamespace(
+        ee_position=lambda q: np.array(p_measured),
+        ee_rotation=lambda q: np.eye(3),
+    )
+    return node
+
+
+def _clear_latch_and_start(node):
+    node._stop_pending = False
+    node._stop_latched = False
+    node._runtime_status = types.SimpleNamespace(active_mode="idle", lifecycle="ACTIVE", stop_latched=False)
+    node._managed_owner = False
+    return _start(node)
+
+
+def test_managed_start_after_hold_takes_frozen_reference_as_clutch_origin():
+    node = _frozen_session()  # 10 mm of sag is inside the 20 mm threshold.
+    node._managed_stop("teleop stop requested")
+    assert node._p_ref is None  # The public HOLD state tracks nothing.
+    assert _clear_latch_and_start(node).success
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.15])
+    np.testing.assert_allclose(node._p_ref, [0.20, 0.0, 0.15])
+    np.testing.assert_allclose(node._ee0_R, _rot_z(np.pi / 2))
+    np.testing.assert_allclose(node._last_cmd, node._measured_q)  # Seed stays measured: QP limits close the gap.
+
+
+def test_managed_repeated_stop_keeps_the_frozen_reference():
+    node = _frozen_session()
+    node._managed_stop("teleop stop requested")
+    node._managed_stop("teleop stop requested")
+    assert _clear_latch_and_start(node).success
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.15])
+
+
+def test_managed_start_resets_a_reference_the_arm_has_left():
+    node = _frozen_session(p_measured=(0.20, 0.0, 0.10))  # 50 mm: pushed, not sag.
+    node._managed_stop("teleop stop requested")
+    assert _clear_latch_and_start(node).success
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.10])
+    np.testing.assert_allclose(node._ee0_R, np.eye(3))
+
+
+def _assert_start_uses_measured_pose(node):
+    assert _clear_latch_and_start(node).success
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.14])
+
+
+def test_managed_estop_voids_the_frozen_reference():
+    node = _frozen_session()
+    node._on_estop(types.SimpleNamespace(data=True))
+    node._on_estop(types.SimpleNamespace(data=False))
+    _assert_start_uses_measured_pose(node)
+
+
+def test_managed_estop_voids_a_reference_frozen_by_an_earlier_stop():
+    node = _frozen_session()
+    node._managed_stop("teleop stop requested")
+    node._managed_owner = False
+    node._on_estop(types.SimpleNamespace(data=True))
+    node._on_estop(types.SimpleNamespace(data=False))
+    _assert_start_uses_measured_pose(node)
+
+
+def test_managed_feedback_expiry_voids_the_reference_but_input_expiry_freezes_it():
+    node = _frozen_session()
+    node._now = lambda: 123.21
+    node._latest_js_received_at = 122.0
+    node._on_control_tick()
+    assert node._frozen_reference is None
+    node = _frozen_session()
+    node._now = lambda: 123.21
+    node._latest_js_received_at = 123.21
+    node._on_control_tick()
+    assert node.requests[0].policy == "HOLD"
+    np.testing.assert_allclose(node._frozen_reference[0], [0.20, 0.0, 0.15])
+
+
+def test_managed_joint_session_does_not_freeze_its_stale_cartesian_reference():
+    node = _frozen_session()
+    node._managed_mode = "joint"
+    node._managed_stop("teleop stop requested")
+    _assert_start_uses_measured_pose(node)
+
+
+def test_managed_home_voids_the_reference():
+    node = _frozen_session()
+    request = _activate_home(node)
+    node._managed_stop("teleop stop requested")
+    assert request.done.is_set()
+    _assert_start_uses_measured_pose(node)
+
+
+def test_managed_refused_start_for_stale_feedback_voids_the_frozen_reference():
+    node = _frozen_session()
+    node._managed_stop("teleop stop requested")
+    node._latest_js_received_at = 122.0
+    assert not _clear_latch_and_start(node).success
+    node._latest_js_received_at = 123.0
+    _assert_start_uses_measured_pose(node)
 
 
 def test_managed_home_requires_owner_and_fresh_lease():

@@ -280,6 +280,9 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("gripper_limits_lower", descriptor=_dyn)
         self.declare_parameter("gripper_limits_upper", descriptor=_dyn)
         self.declare_parameter("future_tolerance_s", 0.05)
+        # Managed start keeps the frozen command-side reference while it is within
+        # this distance (m) of the measured end-effector position.
+        self.declare_parameter("reference_reset_threshold_m", 0.09)
         self.declare_parameter("runtime_stream_mode", "stream")
         self.declare_parameter("runtime_idle_mode", "idle")
 
@@ -378,6 +381,7 @@ class SO101PlacoServoNode(Node):
         self.gripper_joint_names = list(self.get_parameter("gripper_joint_names").value)
         self.gripper_out_topic = str(self.get_parameter("gripper_command_out_topic").value).strip()
         self.future_tolerance_s = float(self.get_parameter("future_tolerance_s").value)
+        self.reference_reset_threshold_m = float(self.get_parameter("reference_reset_threshold_m").value)
         self.gripper_lo = np.asarray(_opt_param("gripper_limits_lower") or [], dtype=np.float64)
         self.gripper_hi = np.asarray(_opt_param("gripper_limits_upper") or [], dtype=np.float64)
         self.runtime_stream_mode = str(self.get_parameter("runtime_stream_mode").value).strip()
@@ -411,6 +415,8 @@ class SO101PlacoServoNode(Node):
                 raise RuntimeError("incoming_command_timeout must be positive")
             if not np.isfinite(self.runtime_status_stale_s) or self.runtime_status_stale_s <= 0:
                 raise RuntimeError("runtime_status_stale_s must be positive")
+            if not np.isfinite(self.reference_reset_threshold_m) or self.reference_reset_threshold_m <= 0:
+                raise RuntimeError("reference_reset_threshold_m must be positive")
             if not np.isfinite(self.future_tolerance_s) or self.future_tolerance_s < 0:
                 raise RuntimeError("future_tolerance_s must be nonnegative")
             if self.command_lease_timeout_s == 0:
@@ -491,6 +497,7 @@ class SO101PlacoServoNode(Node):
         self._pending_home_request: _HomeActionRequest | None = None
         self._active_home_request: _HomeActionRequest | None = None
         self._managed_owner = False
+        self._frozen_reference: tuple[np.ndarray, np.ndarray | None] | None = None
         self._stop_latched = False
         self._runtime_status = None
         self._managed_mode = None
@@ -720,7 +727,25 @@ class SO101PlacoServoNode(Node):
             and now - value <= self.input_timeout
         )
 
-    def _managed_stop(self, reason: str) -> None:
+    def _freeze_reference(self) -> None:
+        """Keep the reference across HOLD so the next start does not take sag into its origin.
+
+        A joint-stream session moves the arm without updating the Cartesian
+        reference, so its reference no longer describes the arm. HOME needs no
+        check here: starting it clears the reference.
+        """
+        if self._managed_mode == "joint":
+            self._frozen_reference = None
+        elif self._p_ref is not None:
+            self._frozen_reference = (
+                self._p_ref.copy(),
+                None if self._r_ref is None else self._r_ref.copy(),
+            )
+
+    def _managed_stop(self, reason: str, *, void_reference: bool = False) -> None:
+        self._freeze_reference()
+        if void_reference:
+            self._frozen_reference = None
         if not self._stop_pending:
             now = self._now()
             self.get_logger().warning(
@@ -825,7 +850,8 @@ class SO101PlacoServoNode(Node):
             self._estop_active = True
             self._cancel_start_request("emergency stop")
             if self.managed_teleop:
-                self._managed_stop("emergency stop")
+                self._managed_stop("emergency stop", void_reference=True)
+            self._frozen_reference = None
             self._preempt_home("EMERGENCY_STOP", "ArmReturnHome aborted by emergency stop")
             self._disable_motion_state()
             self.get_logger().error("emergency stop active; Placo motion disabled")
@@ -1125,7 +1151,7 @@ class SO101PlacoServoNode(Node):
             request.feedback_wait_started_at is not None
             and now - request.feedback_wait_started_at > self.home_joint_state_stale_s
         ):
-            self._managed_stop("fresh joint feedback unavailable after stream admission")
+            self._managed_stop("fresh joint feedback unavailable after stream admission", void_reference=True)
             return
         if self.managed_teleop and now - self._latest_js_received_at > self.home_joint_state_stale_s:
             # A switch response can arrive before the next feedback callback.
@@ -1171,6 +1197,7 @@ class SO101PlacoServoNode(Node):
             ):
                 resp.success = False
                 resp.message = "enable refused: fresh complete finite joint state required"
+                self._frozen_reference = None
                 return resp
         if self._estop_active:
             resp.success = False
@@ -1209,9 +1236,32 @@ class SO101PlacoServoNode(Node):
             return None
         return self._enable_motion(resp)
 
+    def _adopt_frozen_reference(self, p_measured: np.ndarray) -> None:
+        """Use the frozen reference as this session's reference unless the arm has left it.
+
+        Gravity sag stays inside the threshold, so it never enters the clutch
+        origin; a larger gap means the arm was moved, and the measured pose
+        already in ``_p_ref``/``_r_ref`` is kept. The IK seed stays the measured
+        joints either way, so the QP closes the gap under its step and velocity
+        limits rather than jumping to an old command.
+        """
+        frozen, self._frozen_reference = self._frozen_reference, None
+        if frozen is None:
+            return
+        error = float(np.linalg.norm(frozen[0] - p_measured))
+        if error > self.reference_reset_threshold_m:
+            self.get_logger().warning(
+                f"frozen reference is {error:.4f} m from the measured pose "
+                f"(threshold {self.reference_reset_threshold_m:.4f} m); reset to measured"
+            )
+            return
+        self._p_ref = frozen[0]
+        if frozen[1] is not None:
+            self._r_ref = frozen[1]
+
     def _enable_motion(self, resp: Trigger.Response) -> Trigger.Response:
         if self.managed_teleop and self._now() - self._latest_js_received_at > self.home_joint_state_stale_s:
-            self._managed_stop("joint feedback expired during stream admission")
+            self._managed_stop("joint feedback expired during stream admission", void_reference=True)
             resp.success = False
             resp.message = "enable refused: fresh reference expired during mode transition"
             return resp
@@ -1220,15 +1270,18 @@ class SO101PlacoServoNode(Node):
         q = self._measured_arm_joints()
         if q is None or not np.all(np.isfinite(q)):
             if self.managed_teleop:
-                self._managed_stop("joint feedback unavailable after stream admission")
+                self._managed_stop("joint feedback unavailable after stream admission", void_reference=True)
             resp.success = False
             resp.message = "enable refused: fresh finite joint reference required"
             return resp
         self._p_ref = self.diffik.ee_position(q)
         self._r_ref = self.diffik.ee_rotation(q)
+        if self.managed_teleop:
+            self._adopt_frozen_reference(self._p_ref.copy())
         # Clutch baseline for pose mode: incoming relative displacements are
-        # added to this measured EE position latched at enable, and relative
-        # rotations are composed onto this measured EE attitude.
+        # added to this EE position latched at enable, and relative rotations
+        # are composed onto this EE attitude. Unmanaged sessions latch the
+        # measured pose; managed sessions latch the command-side reference.
         self._ee0_p = self._p_ref.copy()
         self._ee0_R = self._r_ref.copy()
         self._last_cmd = q.copy()
@@ -1335,9 +1388,9 @@ class SO101PlacoServoNode(Node):
                         now - stamp > self.input_timeout
                         for stamp in (self._latest_linear_stamp, self._latest_angular_stamp)
                     )
-            expired = expired or now - self._latest_js_received_at > self.home_joint_state_stale_s
-            if expired or now - self._status_received_at > self.runtime_status_stale_s:
-                self._managed_stop("teleop command or runtime status expired")
+            feedback_expired = now - self._latest_js_received_at > self.home_joint_state_stale_s
+            if expired or feedback_expired or now - self._status_received_at > self.runtime_status_stale_s:
+                self._managed_stop("teleop command or runtime status expired", void_reference=feedback_expired)
                 return
         if self._estop_active:
             self._disable_motion_state()

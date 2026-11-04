@@ -39,6 +39,15 @@ ik_link_name: gripper            # target frame in the URDF (== moveit.ee_link).
                                  # no special case). arm_joint_names is injected
                                  # by teleop.py.
 
+# reference_reset_threshold_m: a managed start keeps the frozen command-side
+# reference while it is within this distance of the measured EE position, so
+# gravity sag does not enter the clutch origin. Must exceed the normal sag:
+# measured 2026-11-04 at up to 40.6 mm (arm fully extended, gripper frame), so
+# 0.09 is about 2.2x that. Re-measure after changing servo gains, servos, or
+# ik_link_name (tcp has a longer lever arm). A push smaller than this during
+# HOLD is not detected; the next start pulls the arm back under the QP limits.
+reference_reset_threshold_m: 0.09
+
 # --- differential-IK mode -------------------------------------------------
 # position_only=false adds a low-weight soft OrientationTask so angular joystick
 # input can steer the EE attitude without dominating the under-actuated arm.

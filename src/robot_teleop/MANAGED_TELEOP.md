@@ -23,6 +23,15 @@ The `/motion/arm/joints` intent receives stamped SI targets; no migrated input
 publishes directly to physical position controllers. Cartesian pose intent is
 clutch-relative displacement and a base-frame rotation delta, not absolute pose.
 
+The servo keeps its command-side reference across HOLD. The next start uses it
+as the clutch origin while it is within `reference_reset_threshold_m` of the
+measured end-effector position, so gravity sag does not enter the origin. A
+larger gap resets the reference to the measured pose. The SO-101 threshold is
+0.09 m, about twice the largest measured sag (40.6 mm at full extension), so an
+arm pushed by less than that during HOLD is pulled back to the old reference on
+the next start, under the QP step and velocity limits. Emergency stop, lost joint
+feedback and a joint-stream session discard the reference.
+
 ## Admission and Recovery
 
 Startup is idle and does not follow or HOME. For leader following, explicitly
