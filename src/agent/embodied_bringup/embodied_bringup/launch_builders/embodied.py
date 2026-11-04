@@ -49,6 +49,29 @@ def _node_runtime_settings(params: dict[str, Any]) -> tuple[dict[str, Any], dict
     return node_params, environment
 
 
+def apply_planner_base_url(robot_config: dict[str, Any], planner_base_url: str) -> None:
+    """Point the agent planner at the host given on the launch command line.
+
+    The planner endpoint is the part of a deployment that moves with the network
+    the compute pack is plugged into, so it is stated at launch instead of being
+    edited into the profile: an empty value keeps whatever the profile declares,
+    and a deployment without an agent planner is left alone.
+    """
+    url = str(planner_base_url or "").strip()
+    if not url:
+        return
+    embodied = robot_config.get("embodied")
+    if not isinstance(embodied, dict):
+        return
+    agent = embodied.get("agent")
+    if not isinstance(agent, dict):
+        return
+    planner = agent.get("planner")
+    if not isinstance(planner, dict):
+        return
+    planner["base_url"] = url
+
+
 def generate_embodied_nodes(
     robot_config: dict[str, Any],
     active_control_mode: str,

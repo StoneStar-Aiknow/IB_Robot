@@ -23,6 +23,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import (
+    apply_planner_base_url,
     generate_embodied_nodes,
     generate_resident_cli_bridge_action,
 )
@@ -124,6 +125,9 @@ def launch_setup(context, *_args, **_kwargs):
     config = _load_config(robot_config_name, config_path_override, nav_stage)
     if control_mode_override:
         config["default_control_mode"] = control_mode_override
+    # The planner host follows the network this compute pack is plugged into, so a
+    # launch argument states it there; the profile keeps the declared default.
+    apply_planner_base_url(config, context.launch_configurations.get("planner_base_url", ""))
 
     embodied_config = config.setdefault("embodied", {})
     embodied_config["enabled"] = (
@@ -365,6 +369,9 @@ def generate_launch_description():
             DeclareLaunchArgument("with_perception", default_value=""),
             DeclareLaunchArgument("entry_mode", default_value=""),
             DeclareLaunchArgument("authorize_motion", default_value="false"),
+            # Overrides the agent planner endpoint declared by the profile; empty
+            # keeps the profile value. The planner host moves with the network.
+            DeclareLaunchArgument("planner_base_url", default_value=""),
             OpaqueFunction(function=launch_setup),
         ]
     )
