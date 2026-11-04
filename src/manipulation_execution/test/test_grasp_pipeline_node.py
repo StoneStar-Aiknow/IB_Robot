@@ -22,6 +22,7 @@ from manipulation_execution.grasp_pipeline.contracts import EffectorAction, Gras
 from manipulation_execution.grasp_pipeline.pipeline import PickOutcome
 from manipulation_execution.grasp_pipeline_node import (
     GraspPipelineNode,
+    PreMotionTimer,
     pipeline_config,
     terminal_record,
     verification_status,
@@ -327,3 +328,49 @@ def test_terminal_record_keeps_each_attempts_watch_summary_and_grip():
 def test_terminal_record_without_watch_or_execution_is_empty_lists():
     record = terminal_record(PickOutcome(error_code="NO_EXECUTABLE_CANDIDATE"))
     assert record["watch"] == [] and record["grip"] == [] and record["arm_side"] == ""
+
+
+def test_pre_motion_timer_stops_at_the_first_arm_motion():
+    now = [10.0]
+    timer = PreMotionTimer(clock=lambda: now[0])
+    for name, event, at in (
+        ("observe", "start", 10.0),
+        ("observe", "end", 10.4),
+        ("plan", "start", 11.0),
+        ("plan", "end", 12.0),
+        ("observe", "start", 12.1),  # a re-observation after a failed plan counts toward the wait
+        ("approach", "start", 13.25),
+        ("approach", "end", 16.0),
+        ("approach", "start", 30.0),  # a later attempt's motion changes nothing
+    ):
+        now[0] = at
+        timer.phase(name, event)
+    record = timer.record()
+    assert record["to_motion_s"] == 3.25
+    assert record["phases"][-1] == ["approach", "start", 3.25]
+    assert [row[:2] for row in record["phases"]].count(["observe", "start"]) == 2
+    outcome = PickOutcome(error_code="")
+    assert terminal_record(outcome, timer)["pre_motion"]["to_motion_s"] == 3.25
+
+
+def test_pre_motion_is_none_when_the_arm_never_moved():
+    timer = PreMotionTimer(clock=lambda: 0.0)
+    timer.phase("observe", "start")
+    assert timer.record()["to_motion_s"] is None
+    assert terminal_record(PickOutcome())["pre_motion"] is None
+
+
+def test_pre_motion_keeps_the_accepted_attempts_stage_spans():
+    outcome = PickOutcome()
+    outcome.report.update(
+        perceive={
+            "perception_timings_s": {"grasp": 0.6, "spans_s": [["grasp", 1.0, 1.6], ["scene", 1.0, 1.9]]},
+            "scene_host": {"prepare_wait_s": 0.0, "scene_s": 0.7},
+        },
+        plan={"request_timings_s": {"plan_candidates": 0.8}},
+    )
+    timer = PreMotionTimer(clock=lambda: 0.0)
+    record = terminal_record(outcome, timer)["pre_motion"]
+    assert record["perception_spans_s"] == [["grasp", 1.0, 1.6], ["scene", 1.0, 1.9]]
+    assert record["scene_host_s"]["scene_s"] == 0.7
+    assert record["plan_timings_s"] == {"plan_candidates": 0.8}

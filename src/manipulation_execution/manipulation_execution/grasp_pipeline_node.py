@@ -93,8 +93,50 @@ GRIP_PHASES = ("close", "lift", "hold_lifted")
 GRIP_LOG_KEYS = ("state", "reason", "held", "gripped", "contacts", "measured", "command", "touch_after")
 
 
-def terminal_record(outcome: PickOutcome) -> dict:
-    """The pick's one-line terminal log: the chosen arm, phases, and per attempt the watch summary and the grip."""
+#: The first arm motion of a pick: everything before it is the pick's wait.
+MOTION_PHASE = "approach"
+
+
+class PreMotionTimer:
+    """Seconds from the goal's start to each phase start/end, up to the first arm motion.
+
+    ``to_motion_s`` is when the first ``approach`` started (the arm's first command); None when the
+    arm never moved. Phases on the way (re-observations included) are kept in order.
+    """
+
+    def __init__(self, clock=time.monotonic):
+        self._clock, self._started = clock, clock()
+        self.to_motion_s: float | None = None
+        self.phases: list[tuple[str, str, float]] = []
+
+    def phase(self, name: str, event: str) -> None:
+        if self.to_motion_s is not None:
+            return
+        at = round(self._clock() - self._started, 3)
+        self.phases.append((name, event, at))
+        if name == MOTION_PHASE and event == "start":
+            self.to_motion_s = at
+
+    def record(self) -> dict:
+        return {"to_motion_s": self.to_motion_s, "phases": [list(row) for row in self.phases]}
+
+
+def thinking_report(report: Mapping) -> dict:
+    """The accepted attempt's stage timings: perception spans (side-by-side stages), the planning host's scene
+    stages and the planner's own timings. Earlier failed attempts appear only in ``phases``."""
+    perceive = report.get("perceive", {}) if isinstance(report.get("perceive"), Mapping) else {}
+    timings = perceive.get("perception_timings_s", {}) if isinstance(perceive, Mapping) else {}
+    plan = report.get("plan", {}) if isinstance(report.get("plan"), Mapping) else {}
+    return {
+        "perception_spans_s": timings.get("spans_s", []) if isinstance(timings, Mapping) else [],
+        "scene_host_s": perceive.get("scene_host", {}),
+        "plan_timings_s": plan.get("request_timings_s", {}),
+    }
+
+
+def terminal_record(outcome: PickOutcome, pre_motion: PreMotionTimer | None = None) -> dict:
+    """The pick's one-line terminal log: the chosen arm, phases, the wait before the arm first moved, and per
+    attempt the watch summary and the grip."""
     report = outcome.report
     return {
         "event": "grasp_pipeline_terminal",
@@ -105,6 +147,7 @@ def terminal_record(outcome: PickOutcome) -> dict:
         "released_after_success": outcome.released_after_success,
         "at_rest": outcome.at_rest,
         "error_code": outcome.error_code,
+        "pre_motion": None if pre_motion is None else {**pre_motion.record(), **thinking_report(report)},
         "watch": [
             {key: watch[key] for key in WATCH_LOG_KEYS if key in watch}
             for watch in report.get("watch", [])
@@ -218,6 +261,7 @@ class GraspPipelineNode(Node):
         goal = goal_handle.request
         goal_handle.phase_sequence = 0
         goal_handle.phase_history = deque(maxlen=256)
+        timer = PreMotionTimer()
         try:
             remaining = remaining_budget_s(goal, self._now_s())
             if remaining <= 0.0:
@@ -229,11 +273,11 @@ class GraspPipelineNode(Node):
                     ),
                 )
             else:
-                outcome = self._run(goal_handle, time.monotonic() + remaining)
+                outcome = self._run(goal_handle, time.monotonic() + remaining, timer)
             result = pick_result(outcome, self._identity)
             result.last_feedback_sequence = goal_handle.phase_sequence
             result.execution_history = list(goal_handle.phase_history)
-            self.get_logger().info(json.dumps(terminal_record(outcome), default=_json_value))
+            self.get_logger().info(json.dumps(terminal_record(outcome, timer), default=_json_value))
             if not outcome.at_rest:
                 self.get_logger().error(f"arm stopped in place: {outcome.error_code}: {outcome.message}")
             if outcome.success:
@@ -247,11 +291,13 @@ class GraspPipelineNode(Node):
             with self._goal_lock:
                 self._goal_active = False
 
-    def _run(self, goal_handle, deadline: float) -> PickOutcome:
+    def _run(self, goal_handle, deadline: float, timer: PreMotionTimer | None = None) -> PickOutcome:
         goal = goal_handle.request
         progress = {"value": 0.0, "attempt": 0}
 
         def on_phase(name: str, event: str, detail: dict) -> None:
+            if timer is not None:
+                timer.phase(name, event)
             if event == "start":
                 if name == "observe":
                     progress["attempt"] += 1
