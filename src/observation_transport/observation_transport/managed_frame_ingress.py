@@ -36,6 +36,16 @@ FRAME_INGRESS_READY_TAG = "[IBROBOT_TRANSPORT][FRAME_INGRESS_READY]"
 _MANAGED_CONTRACT_SCHEMA_VERSION = 1
 _KEYFRAME_RECOVERY_INTERVAL_NS = 250_000_000
 _KEYFRAME_RECOVERY_MAX_ATTEMPTS = 3
+# A frozen control loop (no steps -> no new frames) must not starve the
+# cloud-side video receivers: their readiness and freshness gates decay
+# without recent packets, which deadlocks in-flight inference assembly.
+# Re-sending the latest admitted frame keeps the wire warm until stepping
+# resumes. The idle re-send is reset-free (the idle keepalive path): hardware
+# encoders can fail to reopen mid-session and would kill the worker, and
+# receivers only need packet liveness. The re-send floor stays at 2s so
+# keepalive work can never starve real frame encodes on slow encoders.
+_WIRE_KEEPALIVE_IDLE_S = 0.5
+_WIRE_KEEPALIVE_MIN_INTERVAL_S = 2.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +125,12 @@ class ManagedFrameIngress(FrameIngress):
         self._receiver_statuses: dict[str, VideoStreamStatus] = {}
         self._recovery_attempts: dict[str, int] = {}
         self._last_recovery_monotonic_ns: dict[str, int] = {}
+        self._wire_last_activity: dict[str, tuple[int, float]] = {}
+        self._wire_keepalive_monotonic_ns: dict[str, int] = {}
+        self._wire_keepalive_counts: dict[str, int] = {}
+        self._wire_keepalive_announced: set[str] = set()
+        self._wire_diag_sent_bytes: dict[str, int] = {}
+        self._wire_diag_monotonic_ns: dict[str, int] = {}
         self._closed = False
         self._last_diagnostic_signatures: dict[str, tuple[object, ...]] = {}
         self._descriptor_pub: Any = None
@@ -223,6 +239,7 @@ class ManagedFrameIngress(FrameIngress):
         with self._lock:
             if self._closed:
                 return
+        self._wire_keepalive_tick()
         self._publish_worker_diagnostics()
         stamp = self._node.get_clock().now().to_msg()
         for descriptor in self._ingress.descriptors():
@@ -243,29 +260,112 @@ class ManagedFrameIngress(FrameIngress):
             message.mapping_capture_time.sec, message.mapping_capture_time.nanosec = divmod(capture_ns, 1_000_000_000)
             self._status_pub.publish(message)
 
+    def _wire_keepalive_tick(self) -> None:
+        """Re-send the latest admitted frame whenever the wire idles mid-session.
+
+        The reset-free idle keepalive re-encodes ``latest_frame`` onto the
+        wire without re-entering the observation provider and without
+        resetting the encoder epoch, so a world that is paused waiting for
+        inference keeps the cloud-side receivers ready and fresh instead of
+        decaying past their gates (hardware encoders can fail to reopen
+        mid-session, so the idle path must not touch the encoder epoch).
+        ``encoded_frames`` is the activity signal because keepalive re-sends
+        advance it (their admission ids are already consumed, so
+        ``sent_frames`` stays still).
+        """
+        try:
+            snapshot = self._ingress.snapshot()
+        except Exception:
+            return
+        if snapshot.session_generation < 1:
+            return
+        now = time.monotonic()
+        now_ns = time.monotonic_ns()
+        min_interval_ns = int(_WIRE_KEEPALIVE_MIN_INTERVAL_S * 1_000_000_000)
+        candidates: list[tuple[str, int]] = []
+        with self._lock:
+            for stream in snapshot.streams:
+                key = stream.observation_key
+                if stream.worker_failed or not stream.worker_alive:
+                    self._wire_keepalive_announced.discard(key)
+                    continue
+                last = self._wire_last_activity.get(key)
+                if last is None or last[0] != stream.encoded_frames:
+                    self._wire_last_activity[key] = (stream.encoded_frames, now)
+                    self._wire_keepalive_announced.discard(key)
+                    continue
+                if now - last[1] < _WIRE_KEEPALIVE_IDLE_S:
+                    continue
+                if now_ns - self._wire_keepalive_monotonic_ns.get(key, 0) < min_interval_ns:
+                    continue
+                self._wire_keepalive_monotonic_ns[key] = now_ns
+                self._wire_keepalive_counts[key] = self._wire_keepalive_counts.get(key, 0) + 1
+                candidates.append((key, self._wire_keepalive_counts[key]))
+        for observation_key, _count in candidates:
+            try:
+                requested = self._ingress.request_idle_keepalive(
+                    observation_key,
+                    session_generation=snapshot.session_generation,
+                )
+            except Exception:
+                requested = False
+            if not requested:
+                continue
+            with self._lock:
+                first_of_streak = observation_key not in self._wire_keepalive_announced
+                self._wire_keepalive_announced.add(observation_key)
+            if not first_of_streak:
+                continue
+            self._node.get_logger().info(
+                "[IBROBOT_TRANSPORT][WIRE_KEEPALIVE] "
+                f"observation={observation_key} wire idle >={_WIRE_KEEPALIVE_IDLE_S:.1f}s; "
+                "re-sending latest frame (reset-free) to keep cloud receivers ready"
+            )
+
     def _publish_worker_diagnostics(self) -> None:
         """Report transport worker failures/stalls without exposing media control to Benchmark."""
         snapshot = self._ingress.snapshot()
+        now_monotonic_ns = time.monotonic_ns()
         for stream in snapshot.streams:
             signature = (
                 stream.worker_alive,
                 stream.worker_failed,
                 stream.last_error,
                 stream.accepted_frames // 25,
+                stream.encoded_frames // 25,
                 stream.recovery_requested,
                 stream.recovery_attempts,
+                self._wire_keepalive_counts.get(stream.observation_key, 0) // 25,
             )
+            first_report = stream.observation_key not in self._last_diagnostic_signatures
             if signature == self._last_diagnostic_signatures.get(stream.observation_key):
                 continue
             self._last_diagnostic_signatures[stream.observation_key] = signature
+            # Achieved wire bitrate over the window since the previous emitted
+            # report: the configured bitrate_bps is a rate-control target, this
+            # is the measured value (full datagram octets, headers included).
+            prev_bytes = self._wire_diag_sent_bytes.get(stream.observation_key)
+            prev_ns = self._wire_diag_monotonic_ns.get(stream.observation_key)
+            self._wire_diag_sent_bytes[stream.observation_key] = stream.sent_payload_bytes
+            self._wire_diag_monotonic_ns[stream.observation_key] = now_monotonic_ns
+            if first_report or prev_bytes is None or prev_ns is None:
+                wire_kbps = "n/a"
+            else:
+                window_s = (now_monotonic_ns - prev_ns) / 1e9
+                wire_kbps = (
+                    "n/a" if window_s <= 0 else f"{(stream.sent_payload_bytes - prev_bytes) * 8 / window_s / 1000:.1f}"
+                )
             message = (
                 "[IBROBOT_TRANSPORT][FRAME_INGRESS_WORKER] "
                 f"observation={stream.observation_key} stream={stream.stream_id} "
                 f"failed={stream.worker_failed} alive={stream.worker_alive} "
                 f"accepted_frames={stream.accepted_frames} encoded_frames={stream.encoded_frames} "
                 f"sent_frames={stream.sent_frames} queue_depth={stream.queue_depth} "
+                f"sent_payload_bytes={stream.sent_payload_bytes} wire_kbps={wire_kbps} "
+                f"configured_kbps={stream.configured_bitrate_bps // 1000} "
                 f"recovery_requested={stream.recovery_requested} "
                 f"recovery_attempts={stream.recovery_attempts} "
+                f"wire_keepalives={self._wire_keepalive_counts.get(stream.observation_key, 0)} "
                 f"last_progress={stream.worker_last_progress_kind} "
                 f"last_error={stream.last_error!r}"
             )
@@ -310,6 +410,12 @@ class ManagedFrameIngress(FrameIngress):
                 self._receiver_statuses.clear()
                 self._recovery_attempts.clear()
                 self._last_recovery_monotonic_ns.clear()
+                self._wire_last_activity.clear()
+                self._wire_keepalive_monotonic_ns.clear()
+                self._wire_keepalive_counts.clear()
+                self._wire_keepalive_announced.clear()
+                self._wire_diag_sent_bytes.clear()
+                self._wire_diag_monotonic_ns.clear()
                 self._condition.notify_all()
             self.publish_control()
 

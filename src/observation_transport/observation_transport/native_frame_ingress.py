@@ -89,6 +89,7 @@ class _Stream:
     receiver_status: Mapping[str, Any] | None = None
     latest_frame: VideoFrame | None = None
     recovery_requested: bool = False
+    keepalive_requested: bool = False
     recovery_attempts: int = 0
     last_drop_reason: str = ""
     last_error: str = ""
@@ -352,8 +353,17 @@ class NativeFrameIngress:
                     recoverable=True,
                 )
             if capture_timestamp_ns <= stream.last_input_capture_timestamp_ns:
-                stream.dropped_frames += 1
-                self._record_drop_locked(stream, int(capture_timestamp_ns), "", "non_monotonic_timestamp")
+                # An equal capture is the observation heartbeat re-sending the
+                # last committed frame: reject the duplicate, but do not count
+                # it as a drop. Drop records travel to the compute side with
+                # the sender status, and the assembly checks the requested
+                # target timestamp against them; recording the idempotent
+                # re-send would mark the very frame a pending request is
+                # waiting on as dropped. Only a strictly decreasing capture is
+                # a real out-of-order submission.
+                if capture_timestamp_ns < stream.last_input_capture_timestamp_ns:
+                    stream.dropped_frames += 1
+                    self._record_drop_locked(stream, int(capture_timestamp_ns), "", "non_monotonic_timestamp")
                 raise FrameIngressError(
                     "non_monotonic_timestamp",
                     "frame capture timestamps must increase",
@@ -494,6 +504,32 @@ class NativeFrameIngress:
             stream.condition.notify()
             return True
 
+    def request_idle_keepalive(self, observation_key: str, *, session_generation: int) -> bool:
+        """Schedule one reset-free re-encode of the latest admitted frame.
+
+        Unlike keyframe recovery, an idle keepalive does NOT reset the encoder
+        epoch: hardware encoders (h264_nvenc) can fail to reopen mid-session,
+        which would kill the worker for the rest of the episode. The encoder
+        state stays continuous, so the re-encoded access unit is a plain
+        P-frame; that still puts packets on the wire (keeping the compute-side
+        timestamp mapping warm during an idle world) and the repeated capture
+        timestamp makes the compute-side buffer replace its entry instead of
+        growing a new one.
+        """
+        stream = self._streams.get(observation_key)
+        if stream is None:
+            raise FrameIngressError("unknown_stream", "unknown frame observation", observation_key=observation_key)
+        with stream.condition:
+            if stream.stopping or stream.failed:
+                return False
+            if stream.active_session_generation != session_generation:
+                return False
+            if stream.latest_frame is None:
+                return False
+            stream.keepalive_requested = True
+            stream.condition.notify()
+            return True
+
     def reset(self) -> None:
         for stream in self._streams.values():
             with stream.codec_lock, stream.condition:
@@ -598,13 +634,22 @@ class NativeFrameIngress:
     def _worker_loop(self, stream: _Stream) -> None:
         while True:
             with stream.condition:
-                while not stream.queue and not stream.recovery_requested and not stream.stopping:
+                while (
+                    not stream.queue
+                    and not stream.recovery_requested
+                    and not stream.keepalive_requested
+                    and not stream.stopping
+                ):
                     stream.condition.wait()
                 if stream.stopping:
                     return
                 recovery = not stream.queue and stream.recovery_requested
-                if recovery:
-                    stream.recovery_requested = False
+                keepalive = not stream.queue and not recovery and stream.keepalive_requested
+                if recovery or keepalive:
+                    if recovery:
+                        stream.recovery_requested = False
+                    else:
+                        stream.keepalive_requested = False
                     queued = None
                     frame = stream.latest_frame
                     session_generation = stream.active_session_generation
@@ -627,6 +672,9 @@ class NativeFrameIngress:
                     if recovery:
                         # Recreate the encoder epoch so every recovery attempt is
                         # an SPS/PPS-bearing IDR, independent of GOP position.
+                        # Idle keepalives deliberately skip this: hardware
+                        # encoders can fail to reopen mid-session and take the
+                        # worker down with them.
                         stream.encoder.reset()
                     encode_start = time.monotonic_ns()
                     packets = stream.encoder.encode(frame)
@@ -647,7 +695,9 @@ class NativeFrameIngress:
                         stream.encode_start_monotonic_ns = encode_start
                         stream.encode_end_monotonic_ns = encode_end
                         stream.worker_last_progress_monotonic_ns = encode_end
-                        stream.worker_last_progress_kind = "recovery_encode" if recovery else "encode"
+                        stream.worker_last_progress_kind = (
+                            "recovery_encode" if recovery else "keepalive_encode" if keepalive else "encode"
+                        )
                         if queued is not None:
                             assert stream.admission_by_capture is not None
                             stream.admission_by_capture[frame.capture_timestamp_ns] = queued.admission_id
@@ -801,6 +851,8 @@ class NativeFrameIngress:
                 encoded_frames=stream.encoded_frames,
                 sent_frames=stream.sent_frames,
                 sent_packets=int(sender_metrics.sent_packets),
+                sent_payload_bytes=int(sender_metrics.sent_payload_bytes),
+                configured_bitrate_bps=int(stream.config.bitrate_bps),
                 received_packets=int(receiver.get("received_packets", 0)),
                 decoded_frames=int(receiver.get("decoded_frames", 0)),
                 dropped_frames=stream.dropped_frames + int(sender_metrics.dropped_frames),
@@ -972,6 +1024,7 @@ class NativeFrameIngress:
         stream.receiver_status = None
         stream.latest_frame = None
         stream.recovery_requested = False
+        stream.keepalive_requested = False
         stream.recovery_attempts = 0
         stream.last_drop_reason = ""
         assert stream.admission_by_capture is not None

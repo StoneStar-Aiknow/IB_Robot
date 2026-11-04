@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import select
 import socket
 import threading
@@ -40,6 +42,37 @@ _DECODER_RESET_MIN_INTERVAL_S = 3.0
 # burst; handing the burst over in one step avoids a lock/notify/GIL handoff
 # per packet between the receive and decode threads.
 _RECEIVE_BATCH_DATAGRAMS = 64
+
+# Receiver sockets belong to the process that runs this node.  Model backends
+# may fork worker processes *after* a receiver has already bound its UDP port,
+# and fork duplicates every descriptor: when the distributed session is later
+# cleared, this process closes its own socket while the child keeps an inherited
+# copy, so the port stays occupied and every rebind fails with EADDRINUSE --
+# leaving the compute side permanently unable to accept a new video session.
+# Forked children never receive video, so drop their inherited copies right away.
+#
+# The registry deliberately holds plain file descriptors rather than socket
+# objects, and the child-side hook only issues ``os.close``.  An after-fork
+# handler runs in a child that has one live thread while every other thread's
+# lock state is frozen: calling ``socket.close()`` there would take the socket
+# object's internal lock and can block forever (or raise, which aborts the
+# child), so it must stay a bare syscall that cannot raise.
+_BOUND_RECEIVER_FDS: list[int] = []
+
+
+def _release_inherited_receiver_sockets() -> None:
+    """Close receiver descriptors inherited by a forked child (child-side hook)."""
+    try:
+        inherited = _BOUND_RECEIVER_FDS.copy()
+        del _BOUND_RECEIVER_FDS[:]
+        for fd in inherited:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+    except BaseException:  # an after-fork handler must never propagate
+        pass
+
+
+os.register_at_fork(after_in_child=_release_inherited_receiver_sockets)
 
 
 class H264RtpReceiver:
@@ -162,6 +195,7 @@ class H264RtpReceiver:
                     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
                     udp_socket.bind(self.endpoint)
+                    _BOUND_RECEIVER_FDS.append(udp_socket.fileno())
                     self._socket = udp_socket
                 self._socket.settimeout(0.1)
                 self._receive_thread = threading.Thread(
@@ -505,7 +539,12 @@ class H264RtpReceiver:
             self._stopping = True
             self._condition.notify_all()
         if self._socket is not None:
+            # Capture the descriptor before close(): fileno() reads -1 afterwards,
+            # and the after-fork registry must not keep a stale, recyclable number.
+            inherited_fd = self._socket.fileno()
             self._socket.close()
+            with contextlib.suppress(ValueError):
+                _BOUND_RECEIVER_FDS.remove(inherited_fd)
         deadline = time.monotonic() + timeout_s
         for thread in (self._receive_thread, self._process_thread):
             if thread is None:

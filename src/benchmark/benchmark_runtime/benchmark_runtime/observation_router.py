@@ -286,6 +286,7 @@ class ObservationRouter:
         self._active_transaction_id: str | None = None
         self._last_committed_sequence: int | None = None
         self._last_receipt: DeliveryReceipt | None = None
+        self._last_committed_batch: ObservationBatch | None = None
         self._poisoned_transaction_id: str | None = None
 
     @property
@@ -306,12 +307,28 @@ class ObservationRouter:
         with self._lock:
             self._require_open()
             self._validate_identity(batch)
+        return self._prepare_routes(batch, context)
 
+    def _prepare_routes(
+        self,
+        batch: ObservationBatch,
+        context: DeliveryContext,
+        keys: frozenset[str] | None = None,
+    ) -> PreparedBatch:
+        """Prepare routes without validating transaction identity.
+
+        ``keys`` restricts preparation to a subset of routes; required routes that are not
+        listed are skipped. The observation heartbeat uses this to re-send only the image
+        streams: re-stamping the state observation would push the state buffer past the
+        timestamp the policy is currently asking for.
+        """
         router_prepare_start_monotonic_ns = time.monotonic_ns()
         prepared: list[PreparedRoute] = []
         route_prepare_timings: dict[str, tuple[int, int]] = {}
         try:
             for route in self._routes:
+                if keys is not None and route.key not in keys:
+                    continue
                 if route.key not in batch:
                     if route.optional:
                         continue
@@ -347,12 +364,33 @@ class ObservationRouter:
             _cancel_fn=self._cancel,
         )
 
-    def _commit(self, prepared: PreparedBatch) -> DeliveryReceipt:
+    def republish(self, context: DeliveryContext, keys: frozenset[str] | None = None) -> DeliveryReceipt:
+        """Re-send the last committed batch with a fresh delivery timestamp.
+
+        The payload is identical to the last committed observation; only the delivery stamp
+        changes. Transaction identity and the sequence counter are deliberately left
+        untouched, so the next step batch keeps its expected sequence and the episode is not
+        disturbed. This is the environment observation heartbeat: it keeps the stream alive
+        while an idle episode waits for an action, so a policy that lost a frame can
+        resynchronise instead of deadlocking until the stall watchdog fires.
+        """
+        if not isinstance(context, DeliveryContext):
+            raise TypeError("context must be a DeliveryContext")
+        with self._lock:
+            self._require_open()
+            batch = self._last_committed_batch
+            if batch is None:
+                raise ObservationRouterError("no committed observation batch to republish")
+        prepared = self._prepare_routes(batch, context, keys)
+        return self._commit(prepared, republish=True)
+
+    def _commit(self, prepared: PreparedBatch, *, republish: bool = False) -> DeliveryReceipt:
         route_receipts: list[RouteDeliveryReceipt] = []
         router_commit_start_monotonic_ns = time.monotonic_ns()
         with self._lock:
             self._require_open()
-            self._validate_identity(prepared.batch)
+            if not republish:
+                self._validate_identity(prepared.batch)
             for item in prepared.routes:
                 route = self._route_map[item.key]
                 route_commit_start_monotonic_ns = time.monotonic_ns()
@@ -388,8 +426,9 @@ class ObservationRouter:
                         router_commit_start_monotonic_ns=router_commit_start_monotonic_ns,
                         router_commit_end_monotonic_ns=route_commit_end_monotonic_ns,
                     )
-                    self._last_receipt = receipt
-                    self._poisoned_transaction_id = prepared.batch.episode_transaction_id
+                    if not republish:
+                        self._last_receipt = receipt
+                        self._poisoned_transaction_id = prepared.batch.episode_transaction_id
                     raise ObservationCommitError(receipt) from exc
                 route_commit_end_monotonic_ns = time.monotonic_ns()
                 route_performance = {} if commit_performance is None else commit_performance
@@ -415,10 +454,12 @@ class ObservationRouter:
                 router_commit_start_monotonic_ns=router_commit_start_monotonic_ns,
                 router_commit_end_monotonic_ns=router_commit_end_monotonic_ns,
             )
-            self._active_transaction_id = prepared.batch.episode_transaction_id
-            self._last_committed_sequence = prepared.batch.sequence_id
-            self._last_receipt = receipt
-            self._poisoned_transaction_id = None
+            if not republish:
+                self._active_transaction_id = prepared.batch.episode_transaction_id
+                self._last_committed_sequence = prepared.batch.sequence_id
+                self._last_committed_batch = prepared.batch
+                self._last_receipt = receipt
+                self._poisoned_transaction_id = None
             return receipt
 
     def _cancel(self, prepared: PreparedBatch) -> DeliveryReceipt:

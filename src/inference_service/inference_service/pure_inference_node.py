@@ -3,11 +3,15 @@
 
 from __future__ import annotations
 
+import datetime
 import json
+import os
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 
+import numpy as np
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -53,6 +57,109 @@ from robot_config.contract_utils import contract_fingerprint, iter_specs
 # away from the RTP receive/decode threads in the same process.
 _VIDEO_STATUS_PERIOD_S = 0.25
 _VIDEO_DIAGNOSTICS_PERIOD_S = 2.0
+
+# First model-compile warmup. The first forward of a torch.compile-backed
+# cloud runtime traces and lowers the graph on the executor thread and
+# saturates the GIL for 70-160s; every ROS callback in this process starves
+# for that whole window (measured: the 2s diagnostics timer fragmented into
+# 10-24s gaps). When that window lands on an episode boundary the boundary
+# reset queues behind it, the episode barrier hangs for the compile's exact
+# duration, and the run can burn its watchdog. Compiling once against the
+# manifest input contract - before this node starts serving - moves the
+# entire cost in front of the runner's cloud-ready gate.
+#
+# Warmup is opt-in for the deployment that needs it: it runs by default only
+# when the node serves a benchmark runtime target (where episode boundaries
+# are watchdog-bounded), and stays off for every other deployment (real
+# robots, Ascend OM serving) so startup latency stays untouched.
+# IBROBOT_CLOUD_WARMUP=0 disables it even for benchmark targets, =1 forces it
+# on for any target. The prompt only exercises the language-conditioning
+# path, so the default is a neutral placeholder, overridable via
+# IBROBOT_CLOUD_WARMUP_PROMPT.
+_CLOUD_WARMUP_ENV = "IBROBOT_CLOUD_WARMUP"
+_CLOUD_WARMUP_PROMPT_ENV = "IBROBOT_CLOUD_WARMUP_PROMPT"
+_CLOUD_WARMUP_PROMPT_DEFAULT = "warm up before serving"
+_CLOUD_WARMUP_MIN_DEADLINE_S = 600.0
+
+
+def _cloud_warmup_prompt() -> str:
+    raw = os.environ.get(_CLOUD_WARMUP_PROMPT_ENV)
+    if raw is not None and raw.strip():
+        return raw.strip()
+    return _CLOUD_WARMUP_PROMPT_DEFAULT
+
+
+def _cloud_warmup_enabled(require_target_observation: bool) -> bool:
+    raw = os.environ.get(_CLOUD_WARMUP_ENV)
+    if raw is None:
+        return require_target_observation
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _synthetic_warmup_inputs(validated_manifest: object, n_obs_steps: int) -> dict[str, np.ndarray]:
+    """Build zero-filled inputs matching the manifest model contract.
+
+    Shapes follow the same conventions as the serving path: image channels
+    are CHW float frames, stacked with a leading time axis when the policy
+    consumes more than one observation step (compute_video_streams
+    assemble_inputs), everything else keeps the manifest shape verbatim.
+    """
+    inputs: dict[str, np.ndarray] = {}
+    for spec in validated_manifest.manifest.model.inputs:
+        shape = [int(dim) for dim in spec.shape]
+        dtype = np.dtype(spec.dtype)
+        if spec.semantic.startswith("observation.images."):
+            frames = [np.zeros(shape, dtype=dtype) for _ in range(max(1, n_obs_steps))]
+            value = frames[0] if n_obs_steps == 1 else np.ascontiguousarray(np.stack(frames)[None, ...])
+        else:
+            value = np.zeros(shape, dtype=dtype)
+        inputs[spec.semantic] = value
+    return inputs
+
+
+def _warmup_cloud_runtime(
+    logger,
+    runtime,
+    validated_manifest,
+    n_obs_steps: int,
+    request_timeout: float,
+    *,
+    require_target_observation: bool,
+) -> None:
+    """Run one throwaway forward (plus a cache-hit probe) before serving.
+
+    Never raises: a warmup failure must not stop the cloud from starting;
+    the mission then behaves exactly as before this hook existed.
+    """
+    logger.info(
+        f"Cloud model warmup enabled (target={'benchmark' if require_target_observation else 'override'}) "
+        f"via {_CLOUD_WARMUP_ENV}"
+    )
+    prompt = _cloud_warmup_prompt()
+    try:
+        inputs = _synthetic_warmup_inputs(validated_manifest, n_obs_steps)
+    except Exception as exc:
+        logger.warning(f"Cloud model warmup skipped: cannot synthesize manifest inputs: {exc}")
+        return
+    budget_s = max(_CLOUD_WARMUP_MIN_DEADLINE_S, float(request_timeout or 0.0))
+    deadline = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=budget_s)
+    for attempt, request_id in enumerate(("cloud-warmup-0", "cloud-warmup-1")):
+        started = time.monotonic()
+        try:
+            runtime.infer(request_id, inputs, prompt=prompt, deadline=deadline)
+        except Exception as exc:
+            logger.warning(
+                f"Cloud model warmup attempt {attempt} failed after {time.monotonic() - started:.1f}s: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        logger.info(f"Cloud model warmup attempt {attempt} done: elapsed={time.monotonic() - started:.3f}s")
+    try:
+        runtime.reset(deadline=deadline)
+    except Exception as exc:
+        logger.warning(f"Cloud model warmup reset failed: {type(exc).__name__}: {exc}")
+        return
+    logger.info("Cloud model warmup completed and runtime state reset")
 
 
 @dataclass(frozen=True)
@@ -105,13 +212,19 @@ class PureInferenceNode(Node):
 
         startup_error = None
         stream_manager = None
+        validated = None
         owns_runtime = runtime is None
         require_target_observation = False
         try:
             if config.robot_config_path:
                 from robot_config.runtime_target import RuntimeTarget, resolve_runtime_target
 
-                robot_config = load_robot_config_dict(config.robot_config_path)
+                # The launch orchestrator materializes the benchmark observation transport for
+                # the edge processes, but this node is handed only the config path.  Left
+                # unmaterialized every observation resolves to 'dds', so the cloud would expect
+                # no RTP streams at all, reject every descriptor the edge publishes, and derive
+                # a contract fingerprint that cannot match the edge's materialized one.
+                robot_config = load_robot_config_dict(config.robot_config_path, materialize_benchmark_transport=True)
                 require_target_observation = resolve_runtime_target(robot_config, "", None) is RuntimeTarget.BENCHMARK
                 if require_target_observation and metadata.policy.n_obs_steps != 1:
                     raise ValueError("benchmark exact observations currently require n_obs_steps=1")
@@ -261,6 +374,24 @@ class PureInferenceNode(Node):
             _VIDEO_DIAGNOSTICS_PERIOD_S, self._log_video_runtime_diagnostics
         )
         self._log_video_stream_diagnostics()
+        # ``validated`` stays None when startup failed before the manifest
+        # loaded; an injected runtime survives the failure path (it is only
+        # dropped when this node owns it), so guard the warmup on both.
+        # ``require_target_observation`` scopes the warmup to benchmark
+        # deployments; IBROBOT_CLOUD_WARMUP overrides it either way.
+        if runtime is not None and validated is not None and _cloud_warmup_enabled(require_target_observation):
+            _warmup_cloud_runtime(
+                self.get_logger(),
+                runtime,
+                validated,
+                metadata.policy.n_obs_steps,
+                config.request_timeout,
+                require_target_observation=require_target_observation,
+            )
+        elif runtime is not None and validated is not None:
+            self.get_logger().info(
+                f"Cloud model warmup skipped: non-benchmark target; set {_CLOUD_WARMUP_ENV}=1 to force it on"
+            )
         self.get_logger().info(
             f"Distributed cloud pipeline loaded: id={config.pipeline_id}, deployment={config.deployment}, "
             f"backend={metadata.deployment.backend}, request={config.request_topic}, result={config.result_topic}"

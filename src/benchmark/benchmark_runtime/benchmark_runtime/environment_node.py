@@ -71,6 +71,7 @@ STARTUP_ERROR_TAG = "[IBROBOT_BENCHMARK][ENVIRONMENT_NODE_STARTUP_ERROR]"
 RESET_TAG = "[IBROBOT_BENCHMARK][RESET_RESULT]"
 STEP_TAG = "[IBROBOT_BENCHMARK][STEP_RESULT]"
 CLOSE_TAG = "[IBROBOT_BENCHMARK][ENVIRONMENT_NODE_CLOSE]"
+HEARTBEAT_TAG = "[IBROBOT_BENCHMARK][OBSERVATION_HEARTBEAT]"
 
 
 class ScaffoldValidationError(RuntimeError):
@@ -202,6 +203,10 @@ class BenchmarkEnvironmentNode(Node):
         self.declare_parameter("lane_index", 0)
         self.declare_parameter("lane_count", 1)
         self.declare_parameter("run_id", "")
+        # Observation heartbeat: re-publish the latest observation at this rate while
+        # the episode is idle (waiting for an action). Keeps a retrying policy able to
+        # resynchronise when a streamed frame is lost; 0 disables the heartbeat.
+        self.declare_parameter("observation_heartbeat_hz", 4.0)
 
         # Production runtime state. Allocated eagerly so failure paths can
         # call close() without checking for None. Note: attribute names must
@@ -237,6 +242,17 @@ class BenchmarkEnvironmentNode(Node):
         self._close_lock = threading.Lock()
         self._closed = False
         self._production_ready = False
+        self._obs_heartbeat_timer: Any = None
+        self._obs_heartbeat_period_s = 0.0
+        self._obs_heartbeat_batch: Any = None
+        # Delivery context of the last real commit. Heartbeats must reuse it
+        # verbatim: a freshly minted stamp places the re-sent frame *after* the
+        # tick the policy is still asking for, which the cloud reports as
+        # newer_than_request and cannot assemble.
+        self._obs_heartbeat_context: DeliveryContext | None = None
+        self._obs_heartbeat_last_commit = 0.0
+        self._obs_heartbeat_warn_at = 0.0
+        self._obs_heartbeat_keys: frozenset[str] = frozenset()
 
     def read_parameters(self) -> dict[str, Any]:
         return {
@@ -647,6 +663,7 @@ class BenchmarkEnvironmentNode(Node):
             )
 
         self._production_ready = True
+        self._setup_observation_heartbeat()
         self.get_logger().info(
             f"{PRODUCTION_READY_TAG} adapter={adapter_name} "
             f"reset={reset_service} step={step_service} plan={plan_service} finalize={finalize_service} "
@@ -690,6 +707,8 @@ class BenchmarkEnvironmentNode(Node):
         ledger = self._ledger
         if ledger is None:
             return self._set_finalize_failure(response, "finalization ledger is unavailable")
+        # The episode (or the whole cell) is being collected: no more heartbeats.
+        self._clear_observation_heartbeat_cache()
         try:
             payload = finalization_payload_from_wire(
                 scope=request.scope,
@@ -809,6 +828,10 @@ class BenchmarkEnvironmentNode(Node):
         from ibrobot_msgs.srv import ResetBenchmark  # noqa: PLC0415
 
         assert isinstance(response, ResetBenchmark.Response)
+        # A new episode transaction is starting: stop heartbeating whatever the
+        # previous episode last committed, or the stale frames keep flowing
+        # while adapter.reset() runs (which can take seconds).
+        self._clear_observation_heartbeat_cache()
         plan = self._plan
         if (
             plan is not None
@@ -909,6 +932,7 @@ class BenchmarkEnvironmentNode(Node):
         # commit the new identity.
         stamp = self.get_clock().now()
         sec, nanosec = stamp_to_builtin_time(stamp)
+        delivery_context = DeliveryContext(timestamp_sec=sec, timestamp_nanosec=nanosec)
 
         router = self._observation_router
         if router is None:  # pragma: no cover - defensive
@@ -917,10 +941,7 @@ class BenchmarkEnvironmentNode(Node):
                 ledger.abort_reset()
             return self._set_reset_failure(response, "observation router is not configured")
         try:
-            prepared_batch = router.prepare(
-                observation_batch,
-                DeliveryContext(timestamp_sec=sec, timestamp_nanosec=nanosec),
-            )
+            prepared_batch = router.prepare(observation_batch, delivery_context)
         except (ObservationPrepareError, ObservationRouterError, TypeError, ValueError) as exc:
             self._runtime.commit_reset_failure()
             if ledger is not None:
@@ -953,6 +974,7 @@ class BenchmarkEnvironmentNode(Node):
                 response,
                 f"observation publish transport failure (episode invalidated): {receipt.error}",
             )
+        self._remember_observation_batch(observation_batch, delivery_context)
         try:
             metadata_json = _attach_delivery_receipt(metadata_json, delivery_receipt)
         except (JSONSerializationError, TypeError, ValueError) as exc:
@@ -1224,6 +1246,7 @@ class BenchmarkEnvironmentNode(Node):
         # undo a native step) and does NOT advance the public expected_step_id.
         stamp = self.get_clock().now()
         sec, nanosec = stamp_to_builtin_time(stamp)
+        delivery_context = DeliveryContext(timestamp_sec=sec, timestamp_nanosec=nanosec)
 
         router = self._observation_router
         if router is None:  # pragma: no cover - defensive
@@ -1232,10 +1255,7 @@ class BenchmarkEnvironmentNode(Node):
                 response, request, step_result, "observation router is not configured"
             )
         try:
-            prepared_batch = router.prepare(
-                observation_batch,
-                DeliveryContext(timestamp_sec=sec, timestamp_nanosec=nanosec),
-            )
+            prepared_batch = router.prepare(observation_batch, delivery_context)
         except (ObservationPrepareError, ObservationRouterError, TypeError, ValueError) as exc:
             self._runtime.poison_after_native_failure()
             self.get_logger().error(f"{STEP_TAG} observation route prepare failed: {exc}")
@@ -1273,6 +1293,11 @@ class BenchmarkEnvironmentNode(Node):
                 step_result,
                 f"observation publish transport failure (episode poisoned): {receipt.error}",
             )
+        self._remember_observation_batch(observation_batch, delivery_context)
+        if step_result.terminated or step_result.truncated:
+            # The episode is over: stop heartbeating the final frame while the run
+            # collects and finalizes this cell.
+            self._clear_observation_heartbeat_cache()
         try:
             info_json = _attach_delivery_receipt(info_json, delivery_receipt)
             info_json = _attach_step_performance(
@@ -1349,6 +1374,109 @@ class BenchmarkEnvironmentNode(Node):
         return response
 
     # ------------------------------------------------------------------ #
+    # Observation heartbeat
+    # ------------------------------------------------------------------ #
+
+    def _setup_observation_heartbeat(self) -> None:
+        """Start the idle-observation heartbeat when configured."""
+        try:
+            hz = float(self.get_parameter("observation_heartbeat_hz").value or 0.0)
+        except (TypeError, ValueError):
+            hz = 0.0
+        if hz <= 0.0:
+            return
+        # Only image routes take part in the heartbeat. Re-stamping the state observation
+        # would push its buffer past the timestamp the policy is asking for, which surfaces
+        # as "observation.state: newer_than_request" and stalls the episode.
+        self._obs_heartbeat_keys = frozenset(
+            spec.key for spec in self._obs_publisher_specs if spec.ros_type == "sensor_msgs/msg/Image"
+        )
+        if not self._obs_heartbeat_keys:
+            self.get_logger().info(f"{HEARTBEAT_TAG} skipped: no image routes")
+            return
+        self._obs_heartbeat_period_s = 1.0 / hz
+        self._obs_heartbeat_timer = self.create_timer(self._obs_heartbeat_period_s, self._publish_observation_heartbeat)
+        self.get_logger().info(
+            f"{HEARTBEAT_TAG} enabled period={self._obs_heartbeat_period_s:.3f}s hz={hz:.2f} "
+            f"keys={sorted(self._obs_heartbeat_keys)}"
+        )
+
+    def _remember_observation_batch(self, batch: Any, context: DeliveryContext) -> None:
+        """Cache the freshest observation batch and its delivery context for heartbeats."""
+        if self._obs_heartbeat_period_s <= 0.0:
+            return
+        self._obs_heartbeat_batch = batch
+        self._obs_heartbeat_context = context
+        self._obs_heartbeat_last_commit = time.monotonic()
+
+    def _clear_observation_heartbeat_cache(self) -> None:
+        """Stop heartbeating the cached batch.
+
+        Called at every episode boundary (reset entry, finalize, terminal step
+        result) and on close: an episode that ends without a terminal step
+        result must not keep re-publishing the previous episode's frames while
+        the next reset is in flight, or the cloud buffer keeps those stale
+        captures "live" and a fresh episode could select them as observations.
+        """
+        self._obs_heartbeat_batch = None
+        self._obs_heartbeat_context = None
+
+    def _publish_observation_heartbeat(self) -> None:
+        """Re-publish the latest observation while the episode is idle.
+
+        The step/reset handlers publish exactly one observation per transaction. When the
+        action pipeline stalls (a dropped or unreachable observation frame), the episode can
+        deadlock: the policy waits for a frame that will never arrive, and the environment
+        waits for an action that the policy will never send. Re-publishing the last
+        observation on a timer keeps the stream live so a retrying policy can resynchronise
+        instead of blocking until the stall watchdog kills the run.
+
+        Only the image routes are re-sent: the state observation must keep its original
+        timestamp or the policy's request for the current step would see a newer entry.
+
+        The re-sent frames carry the delivery context of the last real commit rather than
+        the current time. The whole point is to answer the tick the policy is still waiting
+        on; stamping them "now" instead moves them *past* that tick, so the cloud reports
+        newer_than_request and still cannot assemble. Reusing the committed context also
+        makes the re-send idempotent on the wire: same capture timestamp means the cloud's
+        stream buffer replaces the existing entry instead of growing a newer one.
+
+        Failures are swallowed on purpose: a heartbeat must never fault an episode. Delivery
+        transport failures are already reported by the authoritative reset/step transactions.
+        """
+        batch = self._obs_heartbeat_batch
+        context = self._obs_heartbeat_context
+        router = self._observation_router
+        if (
+            self._obs_heartbeat_period_s <= 0.0
+            or batch is None
+            or context is None
+            or router is None
+            or self._closed
+            or not self._production_ready
+        ):
+            return
+        now = time.monotonic()
+        # A fresh transaction just published: nothing to heartbeat yet.
+        if now - self._obs_heartbeat_last_commit < self._obs_heartbeat_period_s * 0.9:
+            return
+        try:
+            # republish() keeps the transaction identity and the sequence counter intact,
+            # so the next step batch still carries the sequence the router expects.
+            router.republish(context, keys=self._obs_heartbeat_keys)
+        except Exception as exc:  # noqa: BLE001 - a heartbeat must never fault an episode
+            self._warn_observation_heartbeat("republish", exc)
+            return
+        self._obs_heartbeat_last_commit = time.monotonic()
+
+    def _warn_observation_heartbeat(self, stage: str, exc: Exception) -> None:
+        now = time.monotonic()
+        if now - self._obs_heartbeat_warn_at < 5.0:
+            return
+        self._obs_heartbeat_warn_at = now
+        self.get_logger().warning(f"{HEARTBEAT_TAG} {stage} failed: {exc}")
+
+    # ------------------------------------------------------------------ #
     # Close / shutdown
     # ------------------------------------------------------------------ #
 
@@ -1383,6 +1511,12 @@ class BenchmarkEnvironmentNode(Node):
             self._step_srv_handle = None
             self._plan_srv_handle = None
             self._finalize_srv_handle = None
+            self._clear_observation_heartbeat_cache()
+            self._obs_heartbeat_last_commit = 0.0
+            if self._obs_heartbeat_timer is not None:
+                with contextlib.suppress(Exception):
+                    self.destroy_timer(self._obs_heartbeat_timer)
+                self._obs_heartbeat_timer = None
             if self._observation_router is not None:
                 self._observation_router.close()
                 self._observation_router = None

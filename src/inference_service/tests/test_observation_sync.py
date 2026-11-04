@@ -184,6 +184,46 @@ def test_select_synchronized_streams_reports_missing_and_stale_streams():
     }
 
 
+def test_select_synchronized_streams_preserves_raw_newer_than_request_reason():
+    """reason 仍报 missing，但 details 与摘要必须保留真实原因。"""
+
+    buffer = StreamBuffer("hold", 50)
+    buffer.push(200, "frame", receive_time_ns=200)
+    stream = StreamSelection("observation.images.top", "top", buffer)
+
+    with pytest.raises(ObservationSynchronizationError) as error:
+        select_synchronized_streams(
+            {stream.observation_key: stream},
+            100,
+            now_ns=200,
+            max_inter_camera_skew_ns=0,
+        )
+
+    issue = error.value.details["streams"][0]
+    assert issue["reason"] == "missing"
+    assert issue["reason_raw"] == "newer_than_request"
+    assert issue["first_timestamp_ns"] == 200
+    assert "raw=newer_than_request" in str(error.value)
+
+
+def test_select_synchronized_streams_omits_reason_raw_when_reason_is_not_remapped():
+    buffer = StreamBuffer("hold", 50)
+    stream = StreamSelection("observation.images.top", "top", buffer)
+
+    with pytest.raises(ObservationSynchronizationError) as error:
+        select_synchronized_streams(
+            {stream.observation_key: stream},
+            100,
+            now_ns=100,
+            max_inter_camera_skew_ns=0,
+        )
+
+    issue = error.value.details["streams"][0]
+    assert issue["reason"] == "missing"
+    assert "reason_raw" not in issue
+    assert "raw=" not in str(error.value)
+
+
 def _stream(
     observation_key: str,
     stream_id: str,

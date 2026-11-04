@@ -47,6 +47,7 @@ class ObservationSynchronizationError(RuntimeError):
                 if issue.reason == "skewed"
                 else ""
             )
+            + _format_issue_diag(issue)
             for issue in issues
         )
         super().__init__(f"streamed observations are not ready: {summary}")
@@ -333,6 +334,7 @@ def _select_stream_entries(
                     session_generation=stream.session_generation,
                     admission_id=dropped[1],
                     drop_reason=dropped[2],
+                    **_stream_buffer_diag(stream, target_timestamp_ns),
                 )
             )
             continue
@@ -343,6 +345,7 @@ def _select_stream_entries(
                     "unmapped",
                     target_timestamp_ns=target_timestamp_ns,
                     session_generation=stream.session_generation,
+                    **_stream_buffer_diag(stream, target_timestamp_ns),
                 )
             )
             continue
@@ -353,6 +356,7 @@ def _select_stream_entries(
                     "pre_keyframe",
                     target_timestamp_ns=target_timestamp_ns,
                     session_generation=stream.session_generation,
+                    **_stream_buffer_diag(stream, target_timestamp_ns),
                 )
             )
             continue
@@ -374,16 +378,23 @@ def _select_stream_entries(
                 item = future
                 issue = None
         if issue is not None:
-            reason = str(issue["reason"])
+            raw_reason = str(issue["reason"])
+            reason = raw_reason
             if reason == "newer_than_request":
+                # 对外仍报 missing（保持既有消费方语义），但把真实原因留在 details 与
+                # 日志摘要里，否则"帧太新"和"没有帧"在故障排查时无法区分。
                 reason = "missing"
+            details = {key: value for key, value in issue.items() if key != "reason"}
+            if raw_reason != reason:
+                details["reason_raw"] = raw_reason
             issues.append(
                 _stream_issue(
                     stream,
                     reason,
                     target_timestamp_ns=target_timestamp_ns,
                     session_generation=stream.session_generation,
-                    **{key: value for key, value in issue.items() if key != "reason"},
+                    **_stream_buffer_diag(stream, target_timestamp_ns),
+                    **details,
                 )
             )
             continue
@@ -408,3 +419,44 @@ def _stream_issue(stream: StreamSelection, reason: str, **details: object) -> Sy
         stream_id=stream.stream_id,
         details=details,
     )
+
+
+def _stream_buffer_diag(stream: StreamSelection, target_timestamp_ns: int) -> dict[str, object]:
+    """Snapshot the stream buffer for a failed selection (never called on success).
+
+    Answers the three questions that separate the failure modes:
+    is the buffer empty, is every retained frame newer than the request
+    (``first_minus_target_ms > 0``), or is the newest frame simply too old
+    (``target_minus_last_ms > 0``)?
+    """
+    entries = stream.buffer.entries()
+    if not entries:
+        return {"buffer_entries": 0}
+    first_ns, _first_receive_ns, _ = entries[0]
+    last_ns, last_receive_ns, _ = entries[-1]
+    return {
+        "buffer_entries": len(entries),
+        "buffer_first_capture_ns": first_ns,
+        "buffer_last_capture_ns": last_ns,
+        "buffer_last_receive_ns": last_receive_ns,
+        "target_minus_last_ms": (target_timestamp_ns - last_ns) / 1_000_000,
+        "first_minus_target_ms": (first_ns - target_timestamp_ns) / 1_000_000,
+    }
+
+
+def _format_issue_diag(issue: SynchronizationIssue) -> str:
+    details = issue.details
+    parts: list[str] = []
+    if "reason_raw" in details:
+        parts.append(f"raw={details['reason_raw']}")
+    if "buffer_entries" in details:
+        parts.append(f"buf={details['buffer_entries']}")
+    if "first_minus_target_ms" in details:
+        parts.append(f"first-tgt={float(details['first_minus_target_ms']):.1f}ms")
+    if "target_minus_last_ms" in details:
+        parts.append(f"tgt-last={float(details['target_minus_last_ms']):.1f}ms")
+    if "age_ms" in details:
+        parts.append(f"age={float(details['age_ms']):.1f}ms")
+    if "live_age_ms" in details:
+        parts.append(f"live={float(details['live_age_ms']):.1f}ms")
+    return f" [{', '.join(parts)}]" if parts else ""

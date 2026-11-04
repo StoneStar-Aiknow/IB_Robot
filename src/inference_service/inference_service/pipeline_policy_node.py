@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import os
 import threading
 import time
 import traceback
@@ -125,8 +126,69 @@ from robot_config.utils import (
 )
 from tensormsg.converter import TensorMsgConverter
 
+# PI0.5 declares synthetic empty-camera inputs for static image-token layout.
+# The LIBERO environment does not render an empty camera, so they are exempted
+# from both the contract gate and the environment IO compatibility check.
+_SYNTHETIC_EMPTY_CAMERA_PREFIX = "observation.images.empty_camera_"
+
+
+def _is_synthetic_empty_camera_input(key: str) -> bool:
+    return key.startswith(_SYNTHETIC_EMPTY_CAMERA_PREFIX) and key[len(_SYNTHETIC_EMPTY_CAMERA_PREFIX) :].isdigit()
+
+
 _CLOUD_HANDSHAKE_WARNING_DELAY_S = 5.0
 _CLOUD_HANDSHAKE_WARNING_THROTTLE_S = 10.0
+
+# The cloud publishes its pipeline status on the heartbeat topic from the same
+# ROS executor that serves inference requests, so any blocked cloud callback --
+# the first torch-npu request of a cloud process compiles for minutes, and GC or
+# decoder hiccups do the same on a smaller scale -- pauses heartbeats.  The
+# protocol default of 2.0 s sits far below that jitter: one hiccup clears the
+# distributed session, and the recovery path then rebinds the compute-side RTP
+# receivers.  Keep a tolerant default and let a deployment tighten it through
+# the environment variable the cross-machine scripts already document.
+_EDGE_HEARTBEAT_TIMEOUT_S = 10.0
+_EDGE_HEARTBEAT_TIMEOUT_ENV = "IBROBOT_HEARTBEAT_TIMEOUT_SEC"
+
+# Frame-starvation self-rescue (defensive fix #2).  An idle episode stops
+# stepping the environment, so every observation channel -- both RTP video
+# streams and the joint state -- ages past the freshness budget while
+# inference is awaited; the first inference is then rejected as stale
+# forever because fresh frames need a committed step and steps need
+# inference.  While inference goals are actively being attempted, the
+# policy re-asserts the newest retained observation so the freshness gates
+# keep evaluating a frozen (unchanged) world instead of starving.  The
+# window bounds the rescue to real goal-retry activity so a dead
+# environment is never masked as fresh indefinitely.
+_OBSERVATION_KEEPALIVE_IDLE_ENV = "IBROBOT_OBS_KEEPALIVE_IDLE_SEC"
+_OBSERVATION_KEEPALIVE_WINDOW_ENV = "IBROBOT_OBS_KEEPALIVE_WINDOW_SEC"
+_OBSERVATION_KEEPALIVE_IDLE_S = float(os.environ.get(_OBSERVATION_KEEPALIVE_IDLE_ENV, "2.0"))
+_OBSERVATION_KEEPALIVE_WINDOW_S = float(os.environ.get(_OBSERVATION_KEEPALIVE_WINDOW_ENV, "15.0"))
+_OBSERVATION_KEEPALIVE_PERIOD_S = 1.0
+_OBSERVATION_KEEPALIVE_TAG = "[IBROBOT_OBS_KEEPALIVE]"
+
+
+def _resolve_edge_heartbeat_timeout_s(logger: Any) -> float:
+    """Resolve the edge-side heartbeat tolerance, honouring the deployment override."""
+    raw = os.environ.get(_EDGE_HEARTBEAT_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _EDGE_HEARTBEAT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            f"{_EDGE_HEARTBEAT_TIMEOUT_ENV}={raw!r} is not a number; keeping the "
+            f"{_EDGE_HEARTBEAT_TIMEOUT_S:.1f}s cloud heartbeat tolerance"
+        )
+        return _EDGE_HEARTBEAT_TIMEOUT_S
+    if value <= 0.0:
+        logger.warning(
+            f"{_EDGE_HEARTBEAT_TIMEOUT_ENV}={raw!r} must be positive; keeping the "
+            f"{_EDGE_HEARTBEAT_TIMEOUT_S:.1f}s cloud heartbeat tolerance"
+        )
+        return _EDGE_HEARTBEAT_TIMEOUT_S
+    return value
+
 
 trace = get_trace_emitter("ib_trace.policy", component_id="inference_policy")
 
@@ -411,7 +473,10 @@ class PipelinePolicyNode(Node):
                 default_task=config.default_task or None,
             )
             self._edge_runtime.load()
-            self._edge_session = EdgeSession(build_pipeline_identity(config.pipeline_id, self._manifest))
+            self._edge_session = EdgeSession(
+                build_pipeline_identity(config.pipeline_id, self._manifest),
+                heartbeat_timeout=_resolve_edge_heartbeat_timeout_s(self.get_logger()),
+            )
             self._edge_session.start()
             from robot_config.observation_transport import effective_observation_transport
 
@@ -427,6 +492,13 @@ class PipelinePolicyNode(Node):
             # rejects an empty stream set, so the manager stays unset.
 
         self._action_pub = None
+        # Timers must live in a dedicated ReentrantCallbackGroup: entities in a
+        # Reentrant group are never filtered out of the executor wait set, so a
+        # busy default group (action server handlers) can no longer remove the
+        # timer deadline bound and leave MultiThreadedExecutor.wait_set.wait(-1)
+        # without any wakeup (lost rmw notification -> multi-second ingress
+        # stalls at chunk boundaries).
+        self._timer_callback_group = ReentrantCallbackGroup()
         if not config.scheduler_enabled:
             self._action_pub = self.create_publisher(VariantsList, config.action_topic, 10)
         self._health_pub = self.create_publisher(DiagnosticStatus, config.health_topic, 10)
@@ -463,8 +535,23 @@ class PipelinePolicyNode(Node):
                 status_qos,
                 callback_group=ReentrantCallbackGroup(),
             )
-            self._status_timer = self.create_timer(0.5, self._publish_distributed_status)
-            self._heartbeat_timer = self.create_timer(0.25, self._check_heartbeat)
+            self._status_timer = self.create_timer(
+                0.5, self._publish_distributed_status, callback_group=self._timer_callback_group
+            )
+            self._heartbeat_timer = self.create_timer(
+                0.25, self._check_heartbeat, callback_group=self._timer_callback_group
+            )
+        self._keepalive_last_messages: dict[str, tuple[int, object, float, int]] = {}
+        self._last_infer_activity_monotonic = 0.0
+        # Sample time carried by the most recent inference goal. The keepalive
+        # re-push anchors its capture timestamp here: with a frozen world the
+        # requested sample time stops advancing, so re-stamping "now" would
+        # push every buffer entry past the request and flip the gate from
+        # "stale" to "newer_than_request" (measured: 1572 hits in one run).
+        self._last_infer_sample_ns = 0
+        self._keepalive_timer = self.create_timer(
+            _OBSERVATION_KEEPALIVE_PERIOD_S, self._observation_keepalive_tick, callback_group=self._timer_callback_group
+        )
         self._action_server = None
         self._reset_server = None
         self._reset_callback_group = MutuallyExclusiveCallbackGroup()
@@ -488,7 +575,7 @@ class PipelinePolicyNode(Node):
                 self._reset_callback,
                 callback_group=self._reset_callback_group,
             )
-        self._health_timer = self.create_timer(1.0, self._publish_health)
+        self._health_timer = self.create_timer(1.0, self._publish_health, callback_group=self._timer_callback_group)
         self._log_video_stream_diagnostics()
 
         # Scheduled-path action servers and serving status.
@@ -599,7 +686,9 @@ class PipelinePolicyNode(Node):
             raise ValueError("benchmark exact observations currently require n_obs_steps=1")
         self._frequency = float(self._contract.rate_hz)
 
-        required_inputs = set(self._manifest.policy.input_features)
+        required_inputs = {
+            key for key in self._manifest.policy.input_features if not _is_synthetic_empty_camera_input(key)
+        }
         all_observations = [spec for spec in iter_specs(self._contract) if not spec.is_action]
         self._obs_specs = [spec for spec in all_observations if spec.key in required_inputs]
         missing_inputs = sorted(required_inputs - {spec.key for spec in self._obs_specs})
@@ -832,6 +921,20 @@ class PipelinePolicyNode(Node):
             except Exception as exc:
                 self._last_error = f"video stream {spec.key} failed: {exc}"
                 self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
+        if stored and (manager is None or spec.key not in manager.observation_keys):
+            with self._observation_lock:
+                # Retain the original capture timestamp: the keepalive re-push
+                # must stay aligned with the sample time a frozen request
+                # carries (see _observation_keepalive_tick). Video keys are
+                # excluded on purpose: the tick never consumes them (the
+                # transport layer owns the video wire), and pinning image
+                # message references here would only block garbage collection.
+                self._keepalive_last_messages[self._subscription_key(spec)] = (
+                    epoch,
+                    message,
+                    time.monotonic(),
+                    int(timestamp or receive_time),
+                )
         if stored and trace.enabled:
             source_timestamp_ns = int(timestamp or receive_time)
             trace.event(
@@ -1073,20 +1176,31 @@ class PipelinePolicyNode(Node):
         return buffer
 
     @staticmethod
-    def _rtp_video_send_issue(node: object, state: _SubState, now_ns: int) -> dict[str, object] | None:
-        """Gate RTP-video freshness on what the sender actually put on the wire.
+    def _rtp_video_send_issue(node: object, state: _SubState, sample_time_ns: int) -> dict[str, object] | None:
+        """Gate RTP-video freshness on coverage of the request's sample time.
 
         The local subscription buffer says what the device received; the
         compute side can only see frames that were encoded and sent.  Frames
         lost to encode failures, queue overflow, or session rollovers must
         therefore read as "not fresh" here, mirroring the compute side's
         snapshot instead of the local buffer.
+
+        Coverage is measured against the request's sample time, not the wall
+        clock: a world paused waiting for inference keeps its last frame
+        current for the request it is still answering, and the environment's
+        wire keepalive re-sends that frame with its original capture.  Aging
+        the capture against the wall clock misreads that legal pause as a
+        dead feed and deadlocks assembly -- the video-channel twin of the
+        state channel's request-anchored keepalive.  A feed that genuinely
+        falls behind an advancing sample time (lost encodes, a dead camera
+        while state keeps flowing) still outlives the budget and fails
+        closed here.
         """
         manager = getattr(node, "_video_stream_manager", None)
         sent_ns = manager.latest_sent_capture_ns(state.spec.key) if manager is not None else 0
         if sent_ns <= 0:
             return {"key": state.spec.key, "topic": state.spec.topic, "reason": "video_not_sent"}
-        age_ns = now_ns - sent_ns
+        age_ns = sample_time_ns - sent_ns
         if state.max_age_ns > 0 and age_ns > state.max_age_ns:
             return {
                 "key": state.spec.key,
@@ -1163,7 +1277,7 @@ class PipelinePolicyNode(Node):
             for key, state in self._subs.items():
                 if state.spec.key in rtp_video_keys:
                     selected[key] = None
-                    issue = PipelinePolicyNode._rtp_video_send_issue(self, state, now_ns)
+                    issue = PipelinePolicyNode._rtp_video_send_issue(self, state, sample_time_ns)
                     if source_timestamps is not None:
                         manager = getattr(self, "_video_stream_manager", None)
                         sent_ns = manager.latest_sent_capture_ns(state.spec.key) if manager is not None else 0
@@ -1327,13 +1441,110 @@ class PipelinePolicyNode(Node):
             for key, value in observations.items()
         }
 
+    def _observation_keepalive_tick(self, force: bool = False) -> None:
+        """Break the frame-starvation circular wait while goals are retried.
+
+        Benchmark-only by design: a paused simulation world is a legal state
+        (the control loop waits for inference, so no new observations are
+        produced), and this tick re-asserts the retained observations so the
+        freshness gates keep evaluating a frozen-but-valid world. On a real
+        robot a silent observation topic is a fault (dead driver, dropped
+        camera) and must stay fail-closed; the tick therefore returns early
+        unless the node resolved to the benchmark runtime target.
+
+        An idle episode never steps the environment, so the newest retained
+        observation stops refreshing; once it ages past the freshness budget,
+        every assembly attempt reads "stale" even though the world has not
+        changed, and the episode burns to its watchdog.  While inference
+        goals are actively being attempted (the retry storm window), this
+        re-asserts the newest retained non-video observation: it is re-pushed
+        into its buffer anchored to the request's frozen sample time with a
+        fresh receive timestamp. Video channels are deliberately NOT
+        re-submitted here: the ingress rejects a repeated capture as
+        non-monotonic, and re-stamping it "now" would push every cloud buffer
+        entry past the frozen request; the transport-layer wire keepalive
+        (managed frame ingress keyframe recovery) re-encodes latest_frame
+        with its original capture instead. The anchor matters because
+        StreamBuffer alignment bisects on capture timestamps while the
+        live-age gate reads receive timestamps: re-stamping both to "now"
+        satisfies freshness but breaks alignment against a frozen request
+        (the gate flips from "stale" to "newer_than_request"). Outside the
+        activity window the tick is a no-op, so a dead environment is never
+        disguised as fresh.
+
+        ``force`` bypasses only the goal-activity window: a reset completion
+        calls it because the reset's trigger outage (and any cloud-side delay
+        behind the reset round-trip) can freeze the sent-side past the
+        max-age budget before the first post-bound goal is even attempted -
+        the activity-gated path alone cannot rescue that first goal.
+        """
+        manager = self._video_stream_manager
+        now_mono = time.monotonic()
+        if (
+            manager is None
+            or not getattr(self, "_require_target_observation", False)
+            or _OBSERVATION_KEEPALIVE_IDLE_S <= 0
+            or (not force and now_mono - self._last_infer_activity_monotonic > _OBSERVATION_KEEPALIVE_WINDOW_S)
+        ):
+            return
+        now_ns = self.get_clock().now().nanoseconds
+        with self._observation_lock:
+            epoch = self._observation_epoch
+            entries = [
+                (key, value, stored_mono, capture_ns)
+                for key, (entry_epoch, value, stored_mono, capture_ns) in self._keepalive_last_messages.items()
+                if entry_epoch == epoch
+            ]
+        idle_s = _OBSERVATION_KEEPALIVE_IDLE_S
+        for key, value, stored_mono, capture_ns in entries:
+            state = self._subs.get(key)
+            if state is None:
+                continue
+            spec = state.spec
+            if spec.key in manager.observation_keys:
+                # Video channels are rescued by the transport-layer wire
+                # keepalive: re-submitting a retained frame here would either
+                # be rejected by the ingress (non-monotonic capture) or, if
+                # re-stamped "now", poison the cloud buffer against the very
+                # request the policy is still waiting on.
+                continue
+            if now_mono - stored_mono <= idle_s:
+                continue
+            # Anchor the re-push capture timestamp to the request's frozen
+            # sample time, not "now". StreamBuffer alignment bisects on
+            # capture timestamps: stamping "now" pushes every entry past the
+            # frozen request, so once the history window slides the gate
+            # flips from "stale" to "newer_than_request" and the keepalive
+            # perpetuates the very deadlock it exists to break. Receiving at
+            # "now" is what satisfies the live-age gate; anchoring capture to
+            # the request keeps the sample aligned. The frozen-world
+            # assumption is bounded by the goal-activity window above.
+            anchor_ns = self._last_infer_sample_ns or capture_ns
+            try:
+                with self._observation_lock:
+                    rescued = PipelinePolicyNode._store_observation_locked(self, key, epoch, anchor_ns, now_ns, value)
+                if rescued:
+                    self.get_logger().info(
+                        f"{_OBSERVATION_KEEPALIVE_TAG} re-asserted stale observation key={key} "
+                        f"source=buffer idle_s={now_mono - stored_mono:.1f} "
+                        f"anchor_ms={(now_ns - anchor_ns) / 1_000_000:.1f}",
+                        throttle_duration_sec=5.0,
+                    )
+            except Exception as exc:
+                self.get_logger().info(
+                    f"{_OBSERVATION_KEEPALIVE_TAG} keepalive for {key} raised: {type(exc).__name__}: {exc}",
+                    throttle_duration_sec=5.0,
+                )
+
     def _dispatch_infer_callback(self, goal_handle: object) -> DispatchInfer.Result:
+        self._last_infer_activity_monotonic = time.monotonic()
         request = goal_handle.request
         request_id = request.inference_id or f"{self._config.pipeline_id}-{time.monotonic_ns()}"
         self._goal_request_ids[id(goal_handle)] = request_id
         sample_time = request.obs_timestamp.sec * 1_000_000_000 + request.obs_timestamp.nanosec
         if sample_time <= 0:
             sample_time = self.get_clock().now().nanoseconds
+        self._last_infer_sample_ns = sample_time
         total_start = time.perf_counter()
         request_start_monotonic_ns = time.monotonic_ns()
 
@@ -1770,6 +1981,14 @@ class PipelinePolicyNode(Node):
                 response.success = True
                 response.message = f"pipeline {self._config.pipeline_id} reset"
                 self._last_error = ""
+                # A reset boundary can freeze the retained state observations
+                # past the freshness budget before the first post-bound goal
+                # is even attempted (the activity-gated tick alone cannot
+                # rescue that first goal). Re-assert the newest retained
+                # non-video observations now; video freshness is covered by
+                # the transport-layer wire keepalive, and a healthy boundary
+                # with a still-fresh buffer is a no-op.
+                PipelinePolicyNode._observation_keepalive_tick(self, force=True)
             return response
         finally:
             if visual_invalidated:
@@ -1966,7 +2185,9 @@ class PipelinePolicyNode(Node):
         self._serving_status_pub = self.create_publisher(
             InferenceServingStatus, self._config.scheduled_serving_status, status_qos
         )
-        self._serving_status_timer = self.create_timer(0.5, self._publish_serving_status)
+        self._serving_status_timer = self.create_timer(
+            0.5, self._publish_serving_status, callback_group=self._timer_callback_group
+        )
 
         # scheduled action servers (reentrant group — independent from legacy)
         group = ReentrantCallbackGroup()
@@ -2105,6 +2326,7 @@ class PipelinePolicyNode(Node):
         )
 
     def _scheduled_dispatch_callback(self, goal_handle) -> DispatchPipelineBinding.Result:
+        self._last_infer_activity_monotonic = time.monotonic()
         if not trace.enabled:
             return PipelinePolicyNode._scheduled_dispatch_callback_observed(self, goal_handle)
         goal = goal_handle.request

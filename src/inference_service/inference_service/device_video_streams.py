@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
@@ -26,6 +27,11 @@ from robot_config.observation_transport import effective_observation_transport
 from tensormsg.converter import ros_image_to_hwc_uint8
 
 _DEVICE_RAW_QUEUE_FRAMES = 4
+# Minimum spacing between idle keyframe recoveries triggered by a same-capture
+# heartbeat re-send: every recovery fire is an encoder reset plus a full
+# re-encode, so a tighter cadence would let keepalive work starve real frame
+# encodes on slow encoders.
+_IDLE_RECOVERY_MIN_INTERVAL_NS = 2_000_000_000
 
 
 class DeviceVideoStreamManager:
@@ -66,6 +72,7 @@ class DeviceVideoStreamManager:
         )
         self._diagnostic_started_monotonic_ns = time.monotonic_ns()
         self._diagnostic_baseline: dict[str, tuple[int, int, int, int, int]] = {}
+        self._idle_recovery_monotonic_ns: dict[str, int] = {}
         self._reset_diagnostic_window()
 
     @property
@@ -187,7 +194,30 @@ class DeviceVideoStreamManager:
                 pixel_format="rgb24",
             )
         except FrameIngressError as exc:
-            if exc.code in {"non_monotonic_timestamp", "session_not_ready", "stale_session"}:
+            if exc.code in {"session_not_ready", "stale_session"}:
+                return False
+            if exc.code == "non_monotonic_timestamp":
+                # A same-capture duplicate is the environment heartbeat's
+                # idempotent re-send of the last committed frame. Rejecting
+                # it silently would leave the RTP wire dark for the whole
+                # idle window, letting the compute-side timestamp mapping
+                # decay until every pending request reads target_not_ready.
+                # Turn the duplicate into a reset-free idle keepalive trigger
+                # instead: the ingress re-encodes the retained frame with its
+                # original capture timestamp, which keeps the wire warm
+                # without admitting a new buffer entry and without resetting
+                # the encoder (hardware encoders can fail to reopen
+                # mid-session). Floor at two seconds so keepalive work can
+                # never starve real frame encodes.
+                now_ns = time.monotonic_ns()
+                last_ns = self._idle_recovery_monotonic_ns.get(observation_key, 0)
+                if now_ns - last_ns >= _IDLE_RECOVERY_MIN_INTERVAL_NS:
+                    self._idle_recovery_monotonic_ns[observation_key] = now_ns
+                    with contextlib.suppress(Exception):
+                        self._producer.request_idle_keepalive(
+                            observation_key,
+                            session_generation=self.session.generation,
+                        )
                 return False
             raise
         return receipt.disposition is FrameAdmissionDisposition.ACCEPTED
@@ -230,6 +260,7 @@ class DeviceVideoStreamManager:
 
     def _reset_diagnostic_window(self) -> None:
         self._diagnostic_started_monotonic_ns = time.monotonic_ns()
+        self._idle_recovery_monotonic_ns.clear()
         statuses = {status.observation_key: status for status in self._producer.statuses()}
         self._diagnostic_baseline = {
             stream.observation_key: (

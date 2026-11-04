@@ -53,6 +53,11 @@ class StreamMetrics:
     queued_packets: int = 0
     sent_frames: int = 0
     sent_packets: int = 0
+    # Wire-octet accounting: sum of full UDP datagram lengths actually handed
+    # to the socket (RTP header + payload).  The configured bitrate_bps is
+    # only the encoder's rate-control target; this counter is what makes the
+    # achieved bitrate measurable (bytes / window -> kbps in diagnostics).
+    sent_payload_bytes: int = 0
     dropped_frames: int = 0
     received_packets: int = 0
     dropped_packets: int = 0
@@ -620,6 +625,9 @@ class H264RtpSender:
                     self._metrics,
                     sent_frames=self._metrics.sent_frames + 1,
                     sent_packets=self._metrics.sent_packets + len(datagrams),
+                    sent_payload_bytes=(
+                        self._metrics.sent_payload_bytes + sum(len(datagram) for datagram in datagrams)
+                    ),
                 )
             # Keep the epoch check inside the send lock so reset() cannot
             # rotate the session between the UDP send and this callback.

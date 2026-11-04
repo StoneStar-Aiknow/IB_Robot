@@ -277,16 +277,65 @@ def test_latest_sent_capture_ns_tracks_wire_sends_and_clears_on_rollover():
 
 
 def test_device_stream_manager_drops_non_monotonic_capture_timestamps():
-    manager, encoder, _senders = _manager()
+    manager, _encoder, _senders = _manager()
     manager.bind_session("session", 1)
     manager.submit_ros_image("observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=11)
 
     assert not manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=12
     )
-    assert manager.flush()
+    # An equal capture is the observation heartbeat re-sending the last
+    # committed frame. The duplicate is rejected, but it must not be counted
+    # as a drop: drop records travel to the compute side with the sender
+    # status, and the assembly looks the pending request's target timestamp
+    # up in them, so an idempotent re-send must never appear there.
+    status = manager.statuses()[0]
+    assert status.dropped_frames == 0
+    assert status.last_dropped_capture_timestamp_ns == 0
+
+    # A strictly decreasing capture is a genuine out-of-order submission and
+    # is both rejected and recorded.
+    assert not manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=9, receive_timestamp_ns=13
+    )
+    status = manager.statuses()[0]
+    assert status.dropped_frames == 1
+    assert status.last_dropped_capture_timestamp_ns == 9
+
+
+def test_heartbeat_duplicate_triggers_idle_keyframe_recovery():
+    manager, encoder, _senders = _manager()
+    manager.bind_session("session", 1)
+    assert manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=11
+    )
+    deadline = time.monotonic() + 5.0
+    while len(encoder.frames) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert len(encoder.frames) == 1
-    assert manager.statuses()[0].dropped_frames == 1
+
+    # The heartbeat's same-capture re-send is rejected as a duplicate but must
+    # trigger the reset-free idle keepalive: the idle wire stays warm via a
+    # re-encode of the retained frame instead of going dark, and the encoder
+    # epoch is untouched because hardware encoders can fail to reopen
+    # mid-session and would kill the worker for the rest of the episode.
+    assert not manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=12
+    )
+    deadline = time.monotonic() + 5.0
+    while len(encoder.frames) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(encoder.frames) == 2
+    assert encoder.frames[1].capture_timestamp_ns == 10, "keepalive re-encodes the retained original capture"
+    assert encoder.resets == 0, "idle keepalive must not reset the encoder epoch"
+
+    # The keepalive is floored: an immediate further duplicate must not fire
+    # another re-encode within the minimum interval.
+    assert not manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=13
+    )
+    time.sleep(0.2)
+    assert len(encoder.frames) == 2
 
 
 def test_device_stream_manager_rejects_frames_after_session_clear():

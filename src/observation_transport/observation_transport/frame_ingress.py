@@ -112,6 +112,8 @@ class FrameStreamSnapshot:
     encoded_frames: int = 0
     sent_frames: int = 0
     sent_packets: int = 0
+    sent_payload_bytes: int = 0
+    configured_bitrate_bps: int = 0
     received_packets: int = 0
     decoded_frames: int = 0
     dropped_frames: int = 0

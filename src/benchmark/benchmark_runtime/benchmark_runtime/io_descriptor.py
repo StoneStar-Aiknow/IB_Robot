@@ -23,6 +23,20 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+_SYNTHETIC_EMPTY_CAMERA_PREFIX = "observation.images.empty_camera_"
+
+
+def _is_synthetic_empty_camera_input(key: str) -> bool:
+    """Return True for model inputs the inference pipeline synthesizes itself.
+
+    PI0.5 declares ``observation.images.empty_camera_#`` input features as
+    static-layout placeholders for cameras the environment does not render. The
+    model fills them with a constant frame behind a zero image mask, so they are
+    never produced by an adapter, declared in the robot contract, subscribed,
+    or transported.
+    """
+    return key.startswith(_SYNTHETIC_EMPTY_CAMERA_PREFIX) and key[len(_SYNTHETIC_EMPTY_CAMERA_PREFIX) :].isdigit()
+
 
 class IODescriptorError(ValueError):
     """Raised when an I/O descriptor or payload is malformed."""
@@ -364,8 +378,12 @@ def _compare_descriptor_group(
     left_label: str,
     right_label: str,
 ) -> None:
-    left_map = {item.key: item for item in left}
-    right_map = {item.key: item for item in right}
+    # Synthetic empty-camera inputs are synthesized by the inference pipeline at
+    # batch-assembly time; they are never produced by an environment adapter nor
+    # declared in the robot contract. Exempt them so the adapter/robot/model
+    # descriptors can still agree exactly on every real observation.
+    left_map = {item.key: item for item in left if not _is_synthetic_empty_camera_input(item.key)}
+    right_map = {item.key: item for item in right if not _is_synthetic_empty_camera_input(item.key)}
     if left_map != right_map:
         raise IOCompatibilityError(
             f"{left_label}/{right_label} {group} descriptor mismatch: expected {left_map}, got {right_map}"
