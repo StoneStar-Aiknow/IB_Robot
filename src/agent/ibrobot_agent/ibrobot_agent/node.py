@@ -1271,7 +1271,7 @@ def _planner_from_config(raw: str):
             route="vlm",
             returned_model=config["model"],
             protocol=str(config.get("api_protocol", "chat_completions")),
-            prompt_version="agent-planner-v3",
+            prompt_version="agent-planner-v4",
             schema_version="1",
             config_digest=sha256_text(to_canonical_json(config)),
         ),

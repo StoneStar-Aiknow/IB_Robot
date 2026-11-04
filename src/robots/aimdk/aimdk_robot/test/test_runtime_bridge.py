@@ -100,8 +100,10 @@ class Harness:
             time.sleep(0.05)
         raise AssertionError(f"timed out waiting for {what} (last value: {last!r})")
 
-    def wait_active(self):
-        return self.wait_for(lambda: self.status().lifecycle == "ACTIVE", "the runtime to reach ACTIVE")
+    def wait_active(self, timeout_s: float = TIMEOUT_S):
+        return self.wait_for(
+            lambda: self.status().lifecycle == "ACTIVE", "the runtime to reach ACTIVE", timeout_s=timeout_s
+        )
 
     def enable_navigation(self, enable: bool = True):
         request = SetBool.Request()
@@ -2304,7 +2306,9 @@ def test_a_claw_contributes_no_tactile_frames():
 _RIGHT_PITCH = projection.VENDOR_ARM_ORDER.index("right_shoulder_pitch_joint")
 
 
-def _replay_harness(tmp_path: Path, *, duration_s: float, named_motion: dict | None = None, **mock_params) -> Harness:
+def _replay_harness(
+    tmp_path: Path, *, duration_s: float, named_motion: dict | None = None, runtime_mode: str = "stream", **mock_params
+) -> Harness:
     """The OmniHand profile on an X2 with only a left hand, ``wave`` recorded as a right shoulder
     pitch out-and-back to -0.3 rad."""
     import json
@@ -2328,8 +2332,14 @@ def _replay_harness(tmp_path: Path, *, duration_s: float, named_motion: dict | N
     profile["vendor"]["named_motion"].update(named_motion or {})
     (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
     harness = Harness(tmp_path / "profile.yaml", hand_type="dexterous", right_hand_type="none", **mock_params)
-    harness.wait_active()
-    assert harness.set_mode("stream").success
+    try:
+        # Initial DDS discovery, hand verification and ADD/ENABLE retries can
+        # outlast the ordinary RPC deadline on a cold test context.
+        harness.wait_active(timeout_s=2 * TIMEOUT_S)
+        assert harness.set_mode(runtime_mode).success
+    except BaseException:
+        harness.shutdown()
+        raise
     return harness
 
 
@@ -2343,10 +2353,11 @@ def _start_wave(harness, target: str = ""):
     return handle.get_result_async()
 
 
-def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path):
+@pytest.mark.parametrize("runtime_mode", ["stream", "policy_stream"])
+def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path, runtime_mode):
     """In the stream mode the gesture streams on the arm channel, no preset is asked for, and the
     public arm stream is refused rather than interleaved while it runs."""
-    harness = _replay_harness(tmp_path, duration_s=2.0)
+    harness = _replay_harness(tmp_path, duration_s=2.0, runtime_mode=runtime_mode)
     try:
         pitches: list[float] = []
         result_future = _start_wave(harness)
@@ -2370,6 +2381,8 @@ def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path):
         assert min(pitches) == pytest.approx(-0.3, abs=0.03)
         assert 0.9 not in pitches
         assert harness.mock.last_preset is None
+        assert harness.status().active_mode == runtime_mode
+        assert harness.mock.current_action() == "UPPERBODY_REMOTE_SPLIT"
         # The installed left hand is held, the absent right one gets dummies: the platform
         # drops an upper-body command whose hand_pos does not fit hand_sub_mode.
         sent = harness.mock.last_upper_body

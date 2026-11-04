@@ -418,3 +418,24 @@ def test_idle_mapped_skill_mode_never_requests_a_runtime_mode_switch():
     node._request_runtime_mode = forbidden
 
     assert node._ensure_skill_control_mode("handshake", SimpleNamespace(is_cancel_requested=False)) == (True, "")
+
+
+def test_gesture_pick_gesture_share_policy_stream_without_a_mode_switch():
+    """The site can alternate producers without requesting idle or the platform presets."""
+    node = object.__new__(SkillExecutorNode)
+    node._runtime_enabled = True
+    node._motion_mode_switch_lock = RLock()
+    node._runtime_mode_map = {"named_motion": "policy_stream", "moveit_planning": "policy_stream"}
+    node._skill_required_control_mode = "moveit_planning"
+    status = SimpleNamespace(active_mode="policy_stream", declared_modes=["idle", "stream", "policy_stream"])
+    node._runtime_status_for_admission = lambda: (status, "")
+    node._required_control_mode_for_skill = lambda name: "moveit_planning" if name == "pick_object" else "named_motion"
+    node._ensure_skill_capabilities = lambda _name: (True, "")
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("shared URS mode must not switch the runtime")
+
+    node._request_runtime_mode = forbidden
+    for skill in ("wave_hand", "pick_object", "handshake"):
+        assert node._ensure_skill_control_mode(skill, SimpleNamespace(is_cancel_requested=False)) == (True, "")
+        assert node._control_mode_for_runtime(status) == "moveit_planning"

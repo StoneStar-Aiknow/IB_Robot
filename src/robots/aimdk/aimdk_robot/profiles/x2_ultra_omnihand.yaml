@@ -515,6 +515,7 @@ vendor:
     # which is verified for dexterous hands only.
     trajectory_modes:
     - stream
+    - policy_stream
     trajectory_blend_speed_radps: 0.5
     trajectory_blend_min_s: 0.5
     # A recording faster than this anywhere is refused at startup. The
