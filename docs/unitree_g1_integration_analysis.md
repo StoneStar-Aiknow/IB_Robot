@@ -1,6 +1,8 @@
 # Unitree G1 接入可行性分析
 
-> 分析阶段文档，**不含任何实现**。
+> 分析阶段文档，**不含任何实现**。（历史记录：Q2 的“纯 ROS 2 消息”路线已在
+> AtomGit Issue #171 PR 2 被官方 `unitree_sdk2py` SDK 路线取代，vendored
+> `unitree_hg`/`unitree_go`/`unitree_api` 消息包已删除；本节其余内容保留为当时的分析依据。）
 > 基线：**upstream master `ca7b8c23`**（2026-10-12 重新对齐）。PR #422（运行时契约本体）与
 > PR #426（AgiBot X2 bridge）都已合入 master，合入版比 2026-09-18 分析时的 PR head 多出约 23k 行，
 > 本文已按合入版重新核对（变化汇总见 §2.3）。旧基线 `6835cc1c` 保留在 tag `backup/unitree-g1-pre-master`。

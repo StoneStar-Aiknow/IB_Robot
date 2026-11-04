@@ -8,23 +8,36 @@ transport — the in-repo vendor mock that stands in for the robot's own stack.
         [simulated:=true] [instance_id:=<id>] [initial_mode:=<mode>] \
         [network_interface:=<nic>] [peripherals:=<fragment.yaml>]
 
-DDS (design D2): the vendor tier speaks CycloneDDS. The launch does NOT set
-``RMW_IMPLEMENTATION``: a runtime pinned alone would strand every application
-node still on the ambient implementation — service calls do not interoperate
-across RMW implementations (topic data flows, request/response does not) —
-and a ``SetEnvironmentVariable`` inside an included launch leaks into whatever
-the parent launch does after the include, so its scope is uncontrollable. The
-deployment owns the choice: in real transport the environment must already
-carry ``RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`` — for the whole deployment,
-runtime and application nodes alike — and this entry verifies that and fails
-closed with a named error when it does not. Simulated transport performs no
-check: the mock serves whatever RMW the ambient environment provides.
+DDS (design D2, revised by Issue #171 PR 2): the vendor tier speaks
+CycloneDDS **inside the official SDK**, which binds its own cyclonedds-python
+participants independently of the ROS RMW. The in-process coexistence was
+verified end-to-end on this repository's CI host (vendor channels + rclpy
+traffic + clean teardown, on both rmw_cyclonedds_cpp and rmw_fastrtps_cpp
+deployments; see the PR 2 report), so the runtime no longer requires the
+whole deployment to run a specific RMW: the launch does not set or verify
+``RMW_IMPLEMENTATION`` — the deployment keeps whatever choice it already
+made, and the vendor tier works under either.
 
-``network_interface`` names the NIC the robot is wired to — a deployment fact,
-never hardcoded — and, when non-empty, is expanded into a CycloneDDS XML that
-binds DDS to that one interface (``CYCLONEDDS_URI``) in either transport; when
-empty, no ``CYCLONEDDS_URI`` is set and CycloneDDS keeps its default (or an
-externally provided) configuration.
+The vendor tier's domain and NIC are passed to the nodes as parameters
+(``vendor_domain_id``, ``vendor_network_interface``) and reach the SDK through
+``UnitreeSdk.initialize`` → ``ChannelFactoryInitialize``, which builds its own
+CycloneDDS domain configuration and hands it to ``Domain(id, config)``: that
+explicit configuration wins over ``CYCLONEDDS_URI``, so the environment
+variable is not how the vendor tier is isolated. Both transports therefore
+name their binding explicitly, and both nodes refuse to start when the pair is
+inconsistent (see ``vendor_dds_binding`` in the runtime node):
+
+- simulated transport: the profile's ``sim.vendor_domain_id`` (a nonzero
+  domain) on ``sim.vendor_network_interface`` (``lo``) — the mock and the
+  runtime share that private domain and never join the robot's production
+  domain;
+- real transport: domain ``0`` on the explicitly named ``network_interface``
+  (the NIC the robot is wired to, a deployment fact, never hardcoded).
+
+``network_interface`` keeps its other job — a deployment fact for the
+composed peripheral drivers and, when non-empty, the interface the deployment's
+own ROS participants are bound to via ``CYCLONEDDS_URI`` (CycloneDDS
+configuration only; harmless under any other RMW).
 
 ``robot_state_publisher`` renders the vendored URDF for TF only (design D6):
 the D435/MID-360 mounts and RViz need the frames, but the URDF is deliberately
@@ -44,7 +57,6 @@ synthetic publishers stand in for them on exactly the declared endpoints.
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 from pathlib import Path
 
@@ -65,14 +77,38 @@ from robot_runtime.peripherals import (
 )
 from robot_runtime.profile import load_profile
 
-#: The vendor DDS tier is CycloneDDS, so the whole deployment — this runtime
-#: and every application node calling its services — must run this
-#: implementation (design D2). The launch never sets it itself; in real
-#: transport it verifies the environment already carries it and fails closed.
-REQUIRED_RMW_IMPLEMENTATION = "rmw_cyclonedds_cpp"
-
 #: The vendored description ships exactly one URDF (29 DoF + Dex3 hands).
 URDF_NAME = "g1_29dof_with_hand_rev_1_0.urdf"
+
+
+def _sim_binding(profile: dict, *, override: str = "", what: str) -> tuple[int, str]:
+    """The simulated-transport vendor (domain, NIC) binding.
+
+    Read from ``sim.vendor_domain_id`` / ``sim.vendor_network_interface`` so the
+    deployment facts live with the rest of the profile instead of in this
+    entry: the mock and the runtime share that private domain on loopback and
+    never join the robot's production domain (domain 0).
+
+    ``override`` (the ``vendor_domain_id`` launch argument) replaces the
+    profile's default. It exists so several simulated deployments can run side
+    by side without meeting on one vendor graph — the domain is what separates
+    them — and the isolation rule (nonzero domain, loopback only) still applies:
+    the nodes refuse any other pair before opening a channel.
+    """
+    sim = profile.get("sim") or {}
+    domain_id = sim.get("vendor_domain_id")
+    network_interface = sim.get("vendor_network_interface")
+    if domain_id is None or network_interface is None:
+        raise RuntimeError(
+            f"profile declares no sim.vendor_domain_id/sim.vendor_network_interface ({what}); "
+            "simulated transport needs the private domain and the loopback NIC"
+        )
+    if str(override).strip():
+        try:
+            domain_id = int(override)
+        except ValueError as exc:
+            raise RuntimeError(f"vendor_domain_id must be an integer domain id, got {override!r}") from exc
+    return int(domain_id), str(network_interface)
 
 
 def _cyclonedds_uri(network_interface: str) -> str:
@@ -115,22 +151,89 @@ def _launch_setup(context, *_args, **_kwargs):
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
     network_interface = LaunchConfiguration("network_interface").perform(context).strip()
+    vendor_domain_override = LaunchConfiguration("vendor_domain_id").perform(context).strip()
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
 
-    # D2: the vendor DDS tier speaks CycloneDDS. The launch never sets the
-    # RMW itself (see the module docstring); in real transport it verifies the
-    # deployment made the choice and fails closed when it did not.
-    if not simulated:
-        current = os.environ.get("RMW_IMPLEMENTATION") or "unset"
-        if current != REQUIRED_RMW_IMPLEMENTATION:
+    if (profile.get("vendor") or {}).get("preset_only") is True:
+        if not simulated:
+            validation = profile["vendor"].get("operator_validation") or {}
+            nic = str(validation.get("network_interface", "")).strip()
+            if validation.get("confirmed") is not True or not nic or nic == "lo":
+                raise RuntimeError("PRESET_HARDWARE_DISABLED: explicit operator validation profile required")
+            if peripherals_file or (network_interface and network_interface != nic):
+                raise RuntimeError("preset commissioning has conflicting network/peripheral overrides")
+            description = build_description(profile, use_sim=False)
+            return [
+                Node(
+                    package="unitree_g1_robot",
+                    executable="runtime_node",
+                    parameters=[
+                        {
+                            "profile": str(profile_path),
+                            "initial_mode": initial_mode,
+                            "preset_operator_confirmed": True,
+                            "preset_test_transport": False,
+                            "vendor_domain_id": 0,
+                            "vendor_network_interface": nic,
+                            "interface_description_json": json.dumps(description),
+                        }
+                    ],
+                    output="screen",
+                )
+            ]
+        if network_interface not in ("", "lo") or peripherals_file:
+            raise RuntimeError("preset offline entry requires loopback and no peripherals")
+        description = build_description(profile, use_sim=True)
+        # Mock uses the full sensor fixture; the runtime exposes only this profile.
+        fixture = resolve_profile_argument("unitree_g1_robot", "g1_29dof_dex3")
+        vendor_domain_id, vendor_network_interface = _sim_binding(
+            profile, override=vendor_domain_override, what="preset simulated transport"
+        )
+        sim = profile.get("sim") or {}
+        initial_fsm_id = sim.get("mock_initial_fsm_id")
+        if initial_fsm_id is None:
             raise RuntimeError(
-                f"RMW_IMPLEMENTATION is {current!r}, but the G1 vendor DDS tier speaks CycloneDDS: "
-                "the whole deployment — this runtime and every application node that calls its "
-                "services — must run rmw_cyclonedds_cpp. Export "
-                "RMW_IMPLEMENTATION=rmw_cyclonedds_cpp before launching; service calls do not "
-                "interoperate across RMW implementations."
+                "profile declares no sim.mock_initial_fsm_id; the preset mock fixture needs the FSM it reports"
             )
+        # The arm service's advertised action table is the profile's own action
+        # table, not a second literal: `vendor.arm_actions` already names it.
+        action_list = [str(entry["action_name"]) for entry in (profile["vendor"].get("arm_actions") or {}).values()]
+        return [
+            SetEnvironmentVariable("CYCLONEDDS_URI", _cyclonedds_uri(str(vendor_network_interface))),
+            Node(
+                package="unitree_g1_robot",
+                executable="vendor_mock_node",
+                parameters=[
+                    {
+                        "profile": str(fixture),
+                        "vendor_domain_id": vendor_domain_id,
+                        "vendor_network_interface": vendor_network_interface,
+                        "initial_fsm_id": int(initial_fsm_id),
+                        "hand_missing": "both",
+                        "arm_service_status": 0,
+                        "action_list": action_list,
+                    }
+                ],
+            ),
+            Node(
+                package="unitree_g1_robot",
+                executable="runtime_node",
+                parameters=[
+                    {
+                        "profile": str(profile_path),
+                        "initial_mode": initial_mode,
+                        "preset_test_transport": True,
+                        "vendor_domain_id": vendor_domain_id,
+                        "vendor_network_interface": vendor_network_interface,
+                        "interface_description_json": json.dumps(description),
+                    }
+                ],
+            ),
+        ]
 
+    # D2 (revised): the vendor tier runs inside the official SDK's own
+    # cyclonedds participants — independent of the ROS RMW (see the module
+    # docstring for the coexistence evidence). No RMW check here.
     # D8: profile defaults merged with the deployment fragment by (type, name).
     # The same merged set feeds the interface description the runtime serves
     # and the drivers (or synthetic publishers) that serve those endpoints,
@@ -145,9 +248,30 @@ def _launch_setup(context, *_args, **_kwargs):
     # never passed, so no public model is published.
     description = build_description(profile, peripherals=peripherals, use_sim=simulated)
 
-    # The DDS action precedes every node so the spawned processes inherit it.
-    # It is CycloneDDS configuration only (harmless under any other RMW) and
-    # applies in either transport.
+    # E1: the vendor tier's domain/NIC binding is a node parameter, never a
+    # CYCLONEDDS_URI side effect — the SDK builds its own CycloneDDS domain
+    # configuration and hands it to Domain(id, config), which overrides the
+    # environment variable. Both transports therefore name their pair
+    # explicitly, and both nodes refuse to start on an inconsistent one.
+    if simulated:
+        vendor_domain_id, vendor_network_interface = _sim_binding(
+            profile, override=vendor_domain_override, what="simulated transport"
+        )
+    else:
+        vendor_domain_id = 0
+        vendor_network_interface = network_interface
+        if not vendor_network_interface:
+            raise RuntimeError(
+                "VENDOR_DDS_INTERFACE_REQUIRED: real transport needs network_interface:=<robot-facing NIC>; "
+                "the vendor tier is bound to that NIC as a parameter, not through CYCLONEDDS_URI"
+            )
+        if vendor_network_interface == "lo":
+            raise RuntimeError("VENDOR_DDS_ISOLATION: real transport must name the robot-facing NIC, not loopback")
+
+    # The DDS action precedes every node so the deployment's own ROS
+    # participants inherit it. It is CycloneDDS configuration only (harmless
+    # under any other RMW) and says nothing about the vendor tier's binding,
+    # which travels as the parameters above.
     dds_actions: list[SetEnvironmentVariable] = []
     if network_interface:
         dds_actions.append(SetEnvironmentVariable("CYCLONEDDS_URI", _cyclonedds_uri(network_interface)))
@@ -174,6 +298,8 @@ def _launch_setup(context, *_args, **_kwargs):
                 "profile": str(profile_path),
                 "initial_mode": initial_mode,
                 "interface_description_json": json.dumps(description),
+                "vendor_domain_id": vendor_domain_id,
+                "vendor_network_interface": vendor_network_interface,
             }
         ],
     )
@@ -200,7 +326,15 @@ def _launch_setup(context, *_args, **_kwargs):
         executable="vendor_mock_node",
         name="unitree_vendor_mock",
         output="screen",
-        parameters=[{"profile": str(profile_path)}],
+        parameters=[
+            {
+                "profile": str(profile_path),
+                # Same private vendor domain and loopback NIC as the runtime:
+                # the two share exactly one isolated vendor graph.
+                "vendor_domain_id": vendor_domain_id,
+                "vendor_network_interface": vendor_network_interface,
+            }
+        ],
     )
     return [*dds_actions, robot_state_publisher, mock, runtime, *synthetic_perception_nodes(peripherals)]
 
@@ -234,8 +368,16 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "network_interface",
                 default_value="",
-                description="Network interface the robot is wired to; binds CycloneDDS to it via CYCLONEDDS_URI "
-                "(empty: CycloneDDS default configuration)",
+                description="Network interface the robot is wired to. Real transport passes it to the vendor tier "
+                "as vendor_network_interface (required there) and binds the deployment's own ROS participants "
+                "to it via CYCLONEDDS_URI; simulated transport always uses loopback",
+            ),
+            DeclareLaunchArgument(
+                "vendor_domain_id",
+                default_value="",
+                description="Vendor DDS domain for simulated transport (empty: the profile's "
+                "sim.vendor_domain_id). Must be nonzero: simulated transport only binds loopback, and "
+                "both nodes refuse any other domain/NIC pair",
             ),
             DeclareLaunchArgument(
                 "peripherals",

@@ -1,12 +1,12 @@
-"""ROS-graph tests: the G1 vendor mock driven through the gateway's own conversions.
+"""ROS-graph tests: the G1 vendor mock speaking the official SDK's vendor wire.
 
-The mock speaks the vendored IDL on the profile's topics with the profile's
-QoS; these tests drive it the way the bridge will drive a robot — LowCmd in
-through ``lowcmd_from_dict``, LowState out through ``lowstate_q``, the RPC
-tier through ``RpcClient`` — so a regression here is a regression against the
-wire contract, not against a convenience mirror of it. The vendored message
-packages are this repository's own build products, so a missing overlay is a
-broken environment that fails loudly, not a skip. Fault injection is exercised
+The mock builds and reads the official ``unitree_sdk2py`` IDL frames through
+the adapter's converters on the profile's topics with the profile's QoS; these
+tests drive it the way the bridge drives a robot — arm_sdk/hand frames in
+through the adapter's frame mapping, LowState out through ``lowstate_q``, and
+the RPC tier through the REAL SDK clients (the adapter's ``UnitreeSdk`` typed
+clients) so the request/response contract is exercised end-to-end across the
+DDS wire, not against a convenience mirror of it. Fault injection is exercised
 both as construction overrides and, where the task demands runtime
 observability, through ``set_parameters`` on the live node.
 
@@ -21,6 +21,8 @@ to prove the *absence* of traffic, which cannot be polled for.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -28,61 +30,109 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import pytest as _pytest
 import rclpy
 import yaml
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
-from unitree_api.msg import Request, Response
+from unitree_g1_robot import vendor_gateway as _vg
+
+if not _vg.VENDOR_AVAILABLE:
+    # The vendor frames only exist with the official SDK installed (setup
+    # full profile). Skip the module at collection instead of failing it —
+    # mirrors the adapter suite's skip convention.
+    _pytest.skip("unitree_sdk2py is not installed", allow_module_level=True)
+
+from mock_process import MockProcess, vendor_test_domain
+from unitree_g1_adapter.runtime import UnitreeSdk
 from unitree_g1_robot import projection
 from unitree_g1_robot.vendor_gateway import (
-    RpcClient,
+    HandState,
+    LowState,
     RpcResult,
-    handcmd_from_dict,
     handstate_q,
-    lowcmd_from_dict,
     lowstate_imu,
     lowstate_mode_machine,
     lowstate_q,
-    qos_profile,
 )
-from unitree_g1_robot.vendor_mock_node import REJECT_CODE, UnitreeVendorMock
-from unitree_hg.msg import HandCmd, HandState, LowCmd, LowState
+from unitree_g1_robot.vendor_mock_node import REJECT_CODE
 
-#: Private DDS domain for these tests; 110/111 are the other worktrees' graphs.
-TEST_DOMAIN_ID = 147
+#: The vendor DDS domain this process owns (see the workspace conftest). The SDK
+#: factory is process-wide and cannot rebind between pytest modules, so
+#: test_runtime_bridge must read the same per-process value — both call
+#: ``vendor_test_domain()``.
+TEST_DOMAIN_ID = vendor_test_domain()
 
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "g1_29dof_dex3.yaml"
 with open(PROFILE) as _handle:
     _VENDOR: dict[str, Any] = yaml.safe_load(_handle)["vendor"]
 _TOPICS: dict[str, str] = _VENDOR["topics"]
-_QOS: dict[str, Any] = _VENDOR["qos"]
 _RPC_REQUEST_TOPICS: dict[str, str] = _VENDOR["rpc"]["request_topics"]
 _RPC_RESPONSE_TOPICS: dict[str, str] = _VENDOR["rpc"]["response_topics"]
+_LOCO_SET_FSM_ID = int(projection.LOCO_API_IDS["set_fsm_id"])
+
+
+class _MockFacade:
+    """Watermark-scoped view of the shared mock (records of THIS test only)."""
+
+    def __init__(self, mock: MockProcess, watermark: int) -> None:
+        self._mock = mock
+        self._watermark = watermark
+
+    def record(self, name: str) -> Any:
+        return self._mock.record(name, after_seq=self._watermark)
+
+    def apply(self, overrides: dict[str, Any]) -> None:
+        self._mock.apply(overrides)
+
+    def set_parameters(self, parameters: list) -> None:
+        self._mock.set_parameters(parameters)
 
 
 class MockHarness:
-    """One vendor mock plus a test client node, with bounded-wait helpers."""
+    """One vendor mock SUBPROCESS plus a test client node, with bounded waits.
 
-    def __init__(self, **mock_params: Any) -> None:
-        overrides = [Parameter("profile", value=str(PROFILE))]
-        overrides += [Parameter(name, value=value) for name, value in mock_params.items()]
-        self.mock = UnitreeVendorMock(parameter_overrides=overrides)
+    The mock runs in its own process exactly as the launch entry composes it:
+    the vendor binding's blocking writes must never share a GIL with this
+    process. Observation rides this process's SDK feeds (cross-process DDS),
+    fault injection rides the ROS parameter services, and the vendor-side
+    request records come back through the mock's JSON-Lines records file.
+    """
+
+    def __init__(self, mock: MockProcess, sdk_surface, **mock_params: Any) -> None:
         self.node = rclpy.create_node("g1_vendor_mock_test_client")
-        self._lowstate: LowState | None = None
-        self._lowstate_count = 0
+        self._mock = mock
+        self._mock.ensure_alive(node=mock.spawner_node, profile=PROFILE, domain_id=TEST_DOMAIN_ID)
+        self._record_watermark = mock.seq_snapshot()
+        self.mock = _MockFacade(mock, self._record_watermark)
         self._hands: dict[str, HandState | None] = {}
         self._hand_counts: dict[str, int] = {}
-        self._rpc: dict[str, RpcClient] = {}
+        self._watchers: dict[str, Any] = {}
+        self._hand_seen: dict[str, int] = {}
+        # The SDK facade, its writers and the RPC clients are MODULE-scoped
+        # (see the sdk_surface fixture): per-test channel churn is what the
+        # vendor binding does not survive.
+        surface, writers = sdk_surface
+        self._sdk_io = surface
+        self._sdk = surface
+        self._arm_sdk_writer = writers["arm_sdk"]
+        self._hand_writers = {side: writers[f"hand_{side}"] for side in ("left", "right")}
         self._executor = MultiThreadedExecutor()
-        for node in (self.mock, self.node):
-            self._executor.add_node(node)
+        self._executor.add_node(self.node)
         self._thread = threading.Thread(target=self._executor.spin, daemon=True)
         self._thread.start()
+        # Fault injection rides the parameter services: the executor above
+        # must already be spinning this node for the response to be serviced.
+        self.mock.apply(mock_params)
 
     def shutdown(self) -> None:
         self._executor.shutdown(timeout_sec=2.0)
-        for node in (self.node, self.mock):
-            node.destroy_node()
+        # Stop the executor and let in-flight DDS listener callbacks drain.
+        # The SDK surface and the mock subprocess are module-scoped.
+        time.sleep(0.2)
+        for feed in self._watchers.values():
+            feed.close()
+        self.node.destroy_node()
 
     # --- bounded waiting ------------------------------------------------------
 
@@ -96,90 +146,112 @@ class MockHarness:
             time.sleep(0.02)
         raise AssertionError(f"timed out waiting for {what} (last: {last!r})")
 
-    # --- observation ------------------------------------------------------------
+    # --- observation (SDK StateFeeds: rclpy cannot register the SDK IDL) ----
 
     def watch_lowstate(self) -> None:
-        def _on_lowstate(message: LowState) -> None:
-            self._lowstate = message
-            self._lowstate_count += 1
+        if "low_state" not in self._watchers:
+            self._watchers["low_state"] = self._sdk_io.state_feed(_TOPICS["low_state"], "low_state")
 
-        self.node.create_subscription(LowState, _TOPICS["low_state"], _on_lowstate, qos_profile(_QOS, "low_state"))
-
-    def latest_lowstate(self) -> LowState | None:
-        return self._lowstate
+    def latest_lowstate(self) -> Any | None:
+        feed = self._watchers.get("low_state")
+        return feed.last_sample if feed else None
 
     def lowstate_frame_count(self) -> int:
-        return self._lowstate_count
+        # StateFeed caches only the newest sample; the count is approximated
+        # by the mock's own tick, which increments once per frame.
+        sample = self.latest_lowstate()
+        return int(getattr(sample, "tick", 0)) if sample is not None else 0
 
     def lowstate_positions(self) -> dict[str, float]:
-        assert self._lowstate is not None, "no lowstate observed yet"
-        return projection.low_state_joint_positions(lowstate_q(self._lowstate))
+        assert self.latest_lowstate() is not None, "no lowstate observed yet"
+        return projection.low_state_joint_positions(lowstate_q(self.latest_lowstate()))
 
     def watch_hand(self, side: str) -> None:
-        def _on_hand(message: HandState) -> None:
-            self._hands[side] = message
-            self._hand_counts[side] = self._hand_counts.get(side, 0) + 1
+        if f"dex3_{side}_state" not in self._watchers:
+            self._watchers[f"dex3_{side}_state"] = self._sdk_io.state_feed(_TOPICS[f"dex3_{side}_state"], "hand_state")
 
-        self.node.create_subscription(
-            HandState, _TOPICS[f"dex3_{side}_state"], _on_hand, qos_profile(_QOS, "dex3_state")
-        )
-
-    def latest_hand(self, side: str) -> HandState | None:
-        return self._hands.get(side)
+    def latest_hand(self, side: str) -> Any | None:
+        feed = self._watchers.get(f"dex3_{side}_state")
+        return feed.last_sample if feed else None
 
     def hand_count(self, side: str) -> int:
+        # Same tick-approximation as lowstate_frame_count; HandState_.tick? the
+        # hand IDL carries no tick — use presence + sample identity counter.
+        sample = self.latest_hand(side)
+        if sample is None:
+            return self._hand_counts.get(side, 0)
+        key = id(sample)
+        if key != self._hand_seen.get(side):
+            self._hand_seen[side] = key
+            self._hand_counts[side] = self._hand_counts.get(side, 0) + 1
         return self._hand_counts.get(side, 0)
 
     # --- commanding -------------------------------------------------------------
 
     def send_arm_sdk(self, latch: dict[str, float], *, weight: float, count: int = 20) -> None:
-        publisher = self.node.create_publisher(LowCmd, _TOPICS["arm_sdk"], qos_profile(_QOS, "arm_sdk"))
-        message = lowcmd_from_dict(
-            projection.arm_sdk_lowcmd(
-                latch,
-                weight=weight,
-                mode_pr=int(_VENDOR["mode_pr"]),
-                mode_machine=int(_VENDOR["mode_machine"]),
-            )
+        frame = projection.arm_sdk_lowcmd(
+            latch,
+            weight=weight,
+            mode_pr=int(_VENDOR["mode_pr"]),
+            mode_machine=int(_VENDOR["mode_machine"]),
         )
         for _ in range(count):
-            publisher.publish(message)
+            assert self._arm_sdk_writer.write(frame), "the mock refused the arm_sdk frame"
             time.sleep(0.02)
 
     def send_hand_cmd(self, side: str, targets: dict[str, float], *, count: int = 15) -> None:
-        publisher = self.node.create_publisher(HandCmd, _TOPICS[f"dex3_{side}_cmd"], qos_profile(_QOS, "dex3_cmd"))
-        message = handcmd_from_dict(projection.dex3_handcmd(targets, side=side))
+        frame = projection.dex3_handcmd(targets, side=side)
         for _ in range(count):
-            publisher.publish(message)
+            assert self._hand_writers[side].write(frame["motor_cmd"]), "the mock refused the hand frame"
             time.sleep(0.02)
 
-    def rpc(self, service: str) -> RpcClient:
-        if service not in self._rpc:
-            request_pub = self.node.create_publisher(
-                Request, _RPC_REQUEST_TOPICS[service], qos_profile(_QOS, "rpc_request")
-            )
-            client = RpcClient(publish=request_pub.publish, now=time.monotonic)
-            self.node.create_subscription(
-                Response, _RPC_RESPONSE_TOPICS[service], client.on_response, qos_profile(_QOS, "rpc_response")
-            )
-            self._rpc[service] = client
-            # A request published before DDS matching completes is silently
-            # dropped; the mock's subscription must be visible first.
-            self.wait_until(
-                lambda: request_pub.get_subscription_count() > 0,
-                f"the {service} rpc subscription to appear",
-            )
-        return self._rpc[service]
+    def _sdk_clients(self) -> UnitreeSdk:
+        """The real SDK clients, wired once per harness (Issue #171: the RPC
+        request/response contract is exercised end-to-end through them)."""
+        if self._sdk is None:
+            self._sdk = self._sdk_io
+            # The mock's RPC subscriptions must exist before the first client
+            # write (a request published before DDS matching completes is
+            # silently dropped): create the clients eagerly so the stubs'
+            # own 0.5 s settle applies, then warm-probe one read-only call
+            # with bounded retries until the cross-process match is live.
+            self._sdk.loco(timeout_s=5.0)
+            self._sdk.arm_action(timeout_s=5.0)
+            self._sdk.audio(timeout_s=5.0)
+            deadline = time.monotonic() + 15.0
+            while True:
+                probe = self._sdk.loco(timeout_s=1.0).get_fsm_id()
+                if not probe.timed_out or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+            assert not probe.timed_out, "the mock's loco service never answered its warm probe"
+        return self._sdk
 
-    def rpc_call(self, service: str, api_id: int, parameter: Any, timeout_s: float = 5.0) -> RpcResult:
-        client = self.rpc(service)
-        identity_id = client.send(api_id, parameter, timeout_s=timeout_s)
-        while True:  # poll resolves to a result or a timeout within timeout_s
-            result = client.poll(identity_id)
-            if result is not None:
-                client.discard(identity_id)
-                return result
-            time.sleep(0.02)
+    def rpc_call(self, service: str, api_name: str, parameter: Any, timeout_s: float = 5.0) -> RpcResult:
+        """One call through the real SDK client (the runtime's own path)."""
+        sdk = self._sdk_clients()
+        client = {"loco": sdk.loco, "arm": sdk.arm_action, "audio": sdk.audio}[service](timeout_s=timeout_s)
+        method = {
+            "get_fsm_id": "get_fsm_id",
+            "set_fsm_id": "set_fsm_id",
+            "set_velocity": "set_velocity",
+            "switch_to_user_ctrl": "switch_to_user_ctrl",
+            "switch_to_internal_ctrl": "switch_to_internal_ctrl",
+            "execute_action": "execute_action",
+            "get_action_list": "get_action_list",
+            "tts": "tts_maker",
+            "set_rgb_led": "led_control",
+        }[api_name]
+        args = tuple(parameter) if parameter is not None else ()
+        outcome = getattr(client, method)(*args)
+        from unitree_g1_adapter.clients import SdkCallResult  # noqa: PLC0415
+
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            code, data = outcome
+            outcome = SdkCallResult(ok=int(code) == 0, code=int(code), data=data)
+        from unitree_g1_robot.vendor_gateway import rpc_result_from_sdk  # noqa: PLC0415
+
+        return rpc_result_from_sdk(outcome, api_id=api_name)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -193,19 +265,67 @@ def ros_context():
         rclpy.shutdown()
 
 
+@pytest.fixture(scope="module")
+def sdk_surface():
+    """One SDK facade for the whole module.
+
+    The vendor binding is not robust under repeated in-process channel
+    create/close churn (blocking writes holding the GIL, teardown
+    segfaults); the suites therefore create their writers, watchers and RPC
+    clients once and share them, exactly as a long-lived process would.
+    """
+    from unitree_g1_adapter.runtime import UnitreeSdk
+
+    surface = UnitreeSdk()
+    surface.initialize(TEST_DOMAIN_ID, "lo")
+    writers = {
+        "arm_sdk": surface.command_writer(_TOPICS["arm_sdk"], "low_cmd"),
+        **{
+            f"hand_{side}": surface.command_writer(_TOPICS[f"dex3_{side}_cmd"], "hand_cmd")
+            for side in ("left", "right")
+        },
+    }
+    yield surface, writers
+    surface.close()
+
+
+@pytest.fixture(scope="module")
+def mock_process():
+    """One mock subprocess per module — see test_runtime_bridge's note on
+    participant churn."""
+    spawner = rclpy.create_node("g1_mock_suite_spawner")
+    # The parameter client lives on the spawner: spin it or the mock's
+    # set_parameters calls never complete.
+
+    _spin_executor = rclpy.executors.SingleThreadedExecutor()
+    _spin_executor.add_node(spawner)
+    threading.Thread(target=_spin_executor.spin, daemon=True).start()
+    handle = MockProcess(
+        node=spawner,
+        profile=PROFILE,
+        domain_id=TEST_DOMAIN_ID,
+        records_file=Path(tempfile.gettempdir()) / f"g1_mock_suite_{os.getpid()}.jsonl",
+    )
+    handle.wait_ready()
+    yield handle
+    handle.terminate()
+    _spin_executor.shutdown()
+    spawner.destroy_node()
+
+
 @pytest.fixture
-def make_harness():
+def make_harness(mock_process, sdk_surface):
     """A harness factory; every harness it builds is torn down after the test."""
-    made: list[MockHarness] = []
+    running = []
 
     def _make(**mock_params: Any) -> MockHarness:
-        running = MockHarness(**mock_params)
-        made.append(running)
-        return running
+        harness = MockHarness(mock_process, sdk_surface, **mock_params)
+        running.append(harness)
+        return harness
 
     yield _make
-    for running in made:
-        running.shutdown()
+    for harness in reversed(running):
+        harness.shutdown()
 
 
 # --- lowstate -----------------------------------------------------------------
@@ -286,44 +406,43 @@ def test_hand_cmd_reaches_the_hand_state(make_harness):
 def test_set_fsm_id_then_get_fsm_id_round_trip(make_harness):
     harness = make_harness()
 
-    switch = harness.rpc_call("loco", projection.LOCO_API_IDS["set_fsm_id"], projection.fsm_id_parameter(4))
+    switch = harness.rpc_call("loco", "set_fsm_id", (4,))
     assert switch.ok and switch.code == 0
 
-    query = harness.rpc_call("loco", projection.LOCO_API_IDS["get_fsm_id"], {})
+    query = harness.rpc_call("loco", "get_fsm_id", None)
     assert query.ok
-    assert query.data == {"data": 4}
+    assert query.data == 4  # the SDK wrapper unwraps {"data": id} to the bare id
 
 
 def test_reject_fsm_ids_answers_nonzero_and_keeps_the_old_fsm(make_harness):
     harness = make_harness()
-    warm = harness.rpc_call("loco", projection.LOCO_API_IDS["get_fsm_id"], {})
+    warm = harness.rpc_call("loco", "get_fsm_id", None)
     assert warm.ok  # the request/response path is proven before the fault is injected
 
     harness.mock.set_parameters([Parameter("reject_fsm_ids", value=[3])])
-    result = harness.rpc_call("loco", projection.LOCO_API_IDS["set_fsm_id"], projection.fsm_id_parameter(3))
+    result = harness.rpc_call("loco", "set_fsm_id", (3,))
     assert not result.ok
     assert result.code == REJECT_CODE
 
-    after = harness.rpc_call("loco", projection.LOCO_API_IDS["get_fsm_id"], {})
+    after = harness.rpc_call("loco", "get_fsm_id", None)
     assert after.ok
-    assert after.data == {"data": 0}  # zero_torque, the initial fsm, was kept
+    assert after.data == 0  # zero_torque, the initial fsm, was kept (SDK unwraps {"data": id})
 
 
 def test_silent_api_ids_never_answer(make_harness):
     harness = make_harness()
-    warm = harness.rpc_call("loco", projection.LOCO_API_IDS["get_fsm_id"], {})
+    warm = harness.rpc_call("loco", "get_fsm_id", None)
     assert warm.ok
 
-    set_fsm_id = projection.LOCO_API_IDS["set_fsm_id"]
-    harness.mock.set_parameters([Parameter("silent_api_ids", value=[set_fsm_id])])
-    result = harness.rpc_call("loco", set_fsm_id, projection.fsm_id_parameter(4), timeout_s=1.5)
-    assert result.timed_out and result.code == -1  # no vendor code ever arrived
+    harness.mock.set_parameters([Parameter("silent_api_ids", value=[_LOCO_SET_FSM_ID])])
+    result = harness.rpc_call("loco", "set_fsm_id", (4,), timeout_s=1.5)
+    assert result.timed_out  # no vendor code ever arrived (the SDK's sentinel outcome)
 
 
 def test_get_action_list_returns_the_parameter_table(make_harness):
     harness = make_harness(action_list=["wave", "clap"])
 
-    result = harness.rpc_call("arm", projection.ARM_ACTION_API_IDS["get_action_list"], {})
+    result = harness.rpc_call("arm", "get_action_list", None)
     assert result.ok
     assert result.data == {"names": ["wave", "clap"]}
 
@@ -331,27 +450,29 @@ def test_get_action_list_returns_the_parameter_table(make_harness):
 def test_rpc_surface_answers_and_records_vendor_side_effects(make_harness):
     harness = make_harness()
 
-    velocity = harness.rpc_call(
-        "loco", projection.LOCO_API_IDS["set_velocity"], projection.velocity_parameter(0.2, 0.0, 0.1)
-    )
+    velocity = harness.rpc_call("loco", "set_velocity", (0.2, 0.0, 0.1, 1.0))
     assert velocity.ok
     assert harness.mock.record("last_velocity") == {"velocity": [0.2, 0.0, 0.1], "duration": 1.0}
 
-    for api_name in ("switch_to_user_ctrl", "switch_to_internal_ctrl"):
-        result = harness.rpc_call("loco", projection.LOCO_API_IDS[api_name], {})
+    for api_name in ("switch_to_user_ctrl",):
+        result = harness.rpc_call("loco", api_name, None)
         assert result.ok, api_name
+    # SwitchToInternalCtrl takes the vendor InternalFsmMode (0=last per the SDK).
+    result = harness.rpc_call("loco", "switch_to_internal_ctrl", (0,))
+    assert result.ok
 
-    action = harness.rpc_call(
-        "arm", projection.ARM_ACTION_API_IDS["execute_action"], projection.action_id_parameter(11)
-    )
+    action = harness.rpc_call("arm", "execute_action", (11,))
     assert action.ok
     assert harness.mock.record("last_action_id") == 11
 
-    tts = harness.rpc_call("audio", projection.AUDIO_API_IDS["tts"], projection.tts_parameter("hello"))
+    tts = harness.rpc_call("audio", "tts", ("hello", 0))
     assert tts.ok
-    assert harness.mock.record("last_tts") == {"index": 0, "speaker_id": 0, "text": "hello"}
+    # The SDK's TtsMaker sends its (stuck-at-0) index, the text and the
+    # speaker id — the documented upstream quirk lives inside the vendor
+    # client, so the mock records exactly that wire payload.
+    assert harness.mock.record("last_tts") == {"index": 0, "text": "hello", "speaker_id": 0}
 
-    led = harness.rpc_call("audio", projection.AUDIO_API_IDS["set_rgb_led"], projection.led_parameter(255, 0, 0))
+    led = harness.rpc_call("audio", "set_rgb_led", (255, 0, 0))
     assert led.ok
     assert harness.mock.record("last_led") == {"R": 255, "G": 0, "B": 0}
 

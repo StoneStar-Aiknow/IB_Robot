@@ -194,6 +194,10 @@ AUDIO_API_IDS: dict[str, int] = {
     "set_rgb_led": 1010,
 }
 
+#: The B2 robot-state service-list api id: used by the in-repo vendor mock to
+#: route the read-only ownership query the runtime sends through the SDK.
+ROBOT_STATE_API_IDS: dict[str, int] = {"service_list": 1003}
+
 # The FSM ids the SDK's own high-level LocoClient methods pass to SetFsmId.
 # Their acceptance latencies and preconditions are a hardware gate (6.2/6.4);
 # the ids themselves are SDK facts. "start" (500) enters the locomotion FSM.
@@ -372,8 +376,8 @@ def arm_sdk_lowcmd(
     vendor-default zeros, exactly as the example leaves them, because the
     vendor gates the whole message on the shared weight, not per-joint modes.
 
-    ``crc`` is emitted as 0: the arm_sdk example never computes one, and the
-    CRC-requiring rt/lowcmd tier stays disabled (design D11).
+    CRC is computed by the adapter after constructing the vendor IDL frame,
+    matching the pinned official Python arm7 example.
     """
     if len(latched) != ARM_SDK_FRAME_SIZE or any(name not in latched for name in ARM_SDK_FRAME):
         raise ProjectionError(
@@ -391,7 +395,6 @@ def arm_sdk_lowcmd(
         "mode_machine": int(mode_machine),
         "motor_cmd": motor_cmd_slots,
         "reserve": [0, 0, 0, 0],
-        "crc": 0,
     }
 
 
@@ -834,41 +837,6 @@ def resolve_stop_plan(policy: str, *, fsm_id: int, stop_config: Mapping[str, Any
         latch=True,
         downgraded_from="TORQUE_OFF",
     )
-
-
-# --- vendor QoS ---------------------------------------------------------------
-
-QOS_RELIABILITIES: frozenset[str] = frozenset({"reliable", "best_effort"})
-QOS_DURABILITIES: frozenset[str] = frozenset({"volatile", "transient_local"})
-
-
-def vendor_qos(
-    qos_config: Mapping[str, Any] | None,
-    key: str,
-    *,
-    reliability: str = "best_effort",
-    durability: str = "volatile",
-    depth: int = 10,
-) -> tuple[str, str, int]:
-    """Resolve the QoS for one vendor endpoint, as the profile declares it.
-
-    QoS is part of a vendor endpoint's contract, not a stylistic choice: a
-    BEST_EFFORT publisher cannot serve a RELIABLE subscription — every
-    message is silently dropped. unverified: the G1 endpoint profiles are
-    assumed from DDS high-rate-stream conventions and measured with
-    `ros2 topic info -v` on hardware (gate 6.1) before conformance.
-    """
-    entry = dict((qos_config or {}).get(key) or {})
-    resolved_reliability = str(entry.get("reliability", reliability))
-    resolved_durability = str(entry.get("durability", durability))
-    if resolved_reliability not in QOS_RELIABILITIES:
-        raise ProjectionError(f"vendor qos {key!r}: unknown reliability {resolved_reliability!r}")
-    if resolved_durability not in QOS_DURABILITIES:
-        raise ProjectionError(f"vendor qos {key!r}: unknown durability {resolved_durability!r}")
-    resolved_depth = int(entry.get("depth", depth))
-    if resolved_depth < 1:
-        raise ProjectionError(f"vendor qos {key!r}: depth must be positive, got {resolved_depth}")
-    return resolved_reliability, resolved_durability, resolved_depth
 
 
 # --- expert tier (design D11) ---------------------------------------------------

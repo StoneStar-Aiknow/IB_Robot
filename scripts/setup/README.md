@@ -99,6 +99,35 @@ libmujoco 完全一致，因此：
   没有 openEuler rpm）。`imu_sensor_broadcaster` 属于 ros2_controllers 家族
   （与 joint_state_broadcaster 同源），未加入 skip 键。
 
+## 厂商硬件 SDK（hardware 分支）
+
+`full` profile 的 hardware 分支在 `requirements/hardware.txt` 之外还安装一类厂商 SDK；
+`inference` / `training` profile 不装（它们本来就不进 hardware 分支）。
+
+| SDK | 来源与固定版本 | 安装方式 |
+|---|---|---|
+| Unitree G1（`unitree_sdk2py`） | **不在 PyPI**：gitcode 镜像 `unitreerobotics/unitree_sdk2_python` @ 固定 commit（BSD-3） | `scripts/setup/install_unitree_sdk.sh`（helper 由 `python_venv.sh` 的 hardware 分支调用） |
+
+Unitree helper 的行为约定：
+
+- **架构门禁**：首期只支持 x86_64（上游精确钉住的 `cyclonedds==0.10.2` 只有 x86_64 Linux
+  wheel）。其他架构打印明确的不支持信息后跳过——G1 runtime 在缺 SDK 的机器上会拒绝启动，
+  不会假装厂商层可用。
+- **固定 revision**：clone/fetch 后 `checkout --detach` 到 pin；已存在的干净 checkout 直接复用，
+  脏工作区（有 tracked 改动）**拒绝**而不是丢弃；untracked 的 `egg-info`/`__pycache__` 不算脏。
+- **缓存落位**：默认在激活 venv 的 `.cache/unitree_sdk2_python` 下（对齐 pointnet2_ops 的
+  非 PyPI Python 包缓存先例，与 venv 同生命周期；共享 venv 的各 worktree 天然共用一份）。
+  未设 `VENV_PYTHON` 直接调用 helper 时回退 `${HOME}/.cache/ibrobot/unitree_sdk2_python`
+  （graspgenx 先例）；可用 `UNITREE_SDK2_PYTHON_HOME` 覆盖。
+- **`--no-deps` 可编辑安装是必需的**：上游 `setup.py` 没有 `package_data`，普通安装会丢
+  `unitree_sdk2py/utils/lib/crc_*.so`；editable 安装让源码树里的这些资源可达，helper 的验证块
+  会检查它们存在。
+- **验证是 import 级的**：导入适配层用到的全部 vendor 模块、构造 `unitree_hg` IDL、核对
+  `cyclonedds` 版本与 CRC 资源——不做任何 DDS 初始化、不碰网络外设。
+- 覆盖开关：`UNITREE_SDK2_PYTHON_REPO` / `UNITREE_SDK2_PYTHON_REVISION` /
+  `UNITREE_SDK2_PYTHON_HOME` / `UNITREE_SDK2_PYTHON_CYCLONEDDS_PIN`。
+- 封闭回归：`scripts/setup/tests/test_unitree_sdk_install.sh`（git/pip/python 全桩，无网络）。
+
 ## 加速器轴依赖落位
 
 `SETUP_ACCEL_ID`（`cuda` / `cann` / `cpu`）由 `detect.sh::detect_accel_id` 探测**设备**得出

@@ -1,60 +1,50 @@
-"""The only module that imports vendor (``unitree_hg`` / ``unitree_api``) types.
+"""The runtime's vendor boundary: everything comes from the official SDK adapter.
 
-Keeping the vendor dependency here means the projection logic, the profile
-and the tests that cover them run without the vendored message packages
-built, and that no generic IB-Robot package ever links a vendor type. Every
-builder is a pure function of vendor message classes, so it is exercised
-against the real generated types without a robot and without a DDS
-participant; the RPC correlation core (``RpcClient``) is likewise
-constructor-injected with ``publish`` and ``now`` callables, so the
-timeout/motion/no-resend rules are unit-testable without a ROS graph.
+Since PR 1 (AtomGit Issue #171), the vendor surface is the official
+``unitree_sdk2py``, reached only through the ROS-free adapter package
+``unitree_g1_adapter``; the hand-written hand-rolled RPC/transport layer this
+module used to contain is gone. What remains here is the *naming and shape*
+layer between the runtime and that adapter:
 
-The vendored message classes are re-exported (``Request``, ``Response``,
-``LowCmd``, ``LowState``, ``HandCmd``, ``HandState``, ``MotorState``,
-``PressSensorState``) so the bridge and the mock wire the DDS graph without
-importing a vendor package themselves — this module stays the single place
-that names a vendor import.
+- the mock- and bridge-facing names of the vendor DDS frames
+  (``LowState_``/``LowCmd_``/``HandState_``/``HandCmd_`` and the
+  ``unitree_api`` RPC frames) come from the adapter's injectable surface, so
+  the runtime and the mock keep importing vendor types from exactly one place
+  (this module) while the adapter stays the only importer of vendor symbols;
+- the QoS resolution the mock needs (the runtime's own RPC clients now run on
+  the SDK's clients, which own their transport and need none);
+- :class:`RpcResult`, the outcome type the runtime's call sites consume,
+  mirrored from the adapter's :class:`~unitree_g1_adapter.clients.SdkCallResult`
+  with the timeout sentinel mapped the same way (the vendor's 3104).
 
-No ROS node, subscription or timer is defined here: this module only maps
-between the projection's plain values and the vendor IDL, and tracks pending
-RPC calls. Wiring the DDS graph is the bridge's own job.
+The legacy ``RpcClient`` (identity correlation over the raw RPC topics) was
+deleted with the vendored ``unitree_api`` messages it served: the SDK clients
+correlate internally and the mock answers on the same wire through the
+adapter's ``rpc_request``/``rpc_response`` converters.
 """
 
 from __future__ import annotations
 
-import threading
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Mapping
 from typing import Any
 
-import rclpy.qos
+from unitree_g1_adapter import vendor
+from unitree_g1_adapter.clients import SdkCallResult
 
-from unitree_g1_robot import projection
-
-try:  # pragma: no cover - import guard exercised by the missing-vendor test
-    # The plain imports are used inside this module; the redundant-alias ones
-    # (`import X as X`, PEP 484's explicit-re-export convention) are re-exports
-    # for the bridge and the mock, which wire the DDS graph with them.
-    from unitree_api.msg import Request
-    from unitree_api.msg import Response as Response
-    from unitree_hg.msg import HandCmd, HandState, LowCmd, LowState, MotorCmd
-    from unitree_hg.msg import MotorState as MotorState
-    from unitree_hg.msg import PressSensorState as PressSensorState
-
-    VENDOR_AVAILABLE = True
-    VENDOR_IMPORT_ERROR = ""
-except ImportError as exc:  # pragma: no cover - depends on the environment
-    VENDOR_AVAILABLE = False
-    VENDOR_IMPORT_ERROR = str(exc)
+#: The adapter is the vendor boundary; re-export its availability guard so the
+#: runtime's startup check keeps a single import site.
+VENDOR_AVAILABLE = vendor.vendor_available()
+VENDOR_IMPORT_ERROR = "" if VENDOR_AVAILABLE else "unitree_sdk2py is not installed"
 
 
 class VendorUnavailableError(RuntimeError):
-    """Raised when the vendored unitree interfaces are not on the ROS 2 path."""
+    """Raised when the official vendor SDK is not on the Python path."""
 
     def __init__(self) -> None:
         super().__init__(
-            "unitree_hg/unitree_api are not available: build the vendored message packages "
-            f"before launching the G1 runtime. Import error: {VENDOR_IMPORT_ERROR}"
+            "unitree_sdk2py is not available: run the workspace setup (scripts/setup.sh installs "
+            "the pinned SDK via scripts/setup/install_unitree_sdk.sh) before launching the G1 "
+            "runtime. Install error: " + VENDOR_IMPORT_ERROR
         )
 
 
@@ -63,341 +53,177 @@ def require_vendor() -> None:
         raise VendorUnavailableError()
 
 
-# --- dict -> vendor messages ---------------------------------------------------
+# --- vendor frame types (via the adapter's injectable IDL registry) -------------
 
 
-def lowcmd_from_dict(d: Mapping[str, Any]) -> LowCmd:
-    """Build a unitree_hg/LowCmd from :func:`projection.arm_sdk_lowcmd` output.
+def _idl(type_key: str) -> Any:
+    """One vendor IDL *class* through the adapter's registry.
 
-    Field names follow the vendored IDL exactly (unitree_hg/LowCmd.msg):
-    ``mode_pr``/``mode_machine`` are uint8 and ``crc`` is carried verbatim —
-    the projection emits 0 because the CRC-requiring rt/lowcmd tier stays
-    disabled (design D11).
+    The adapter resolves lazily and refuses an SDK-less host with a guided
+    error; this wrapper keeps that behavior but re-raises it as the runtime's
+    own :class:`VendorUnavailableError` so launch-time failures name the
+    runtime's setup path.
     """
-    require_vendor()
-    msg = LowCmd()
-    msg.mode_pr = int(d["mode_pr"])
-    msg.mode_machine = int(d["mode_machine"])
-    slots = list(d["motor_cmd"])
-    if len(slots) != projection.LOW_CMD_MOTOR_COUNT:
-        raise ValueError(
-            f"lowcmd carries {len(slots)} motor_cmd slots; the vendored LowCmd is fixed at "
-            f"{projection.LOW_CMD_MOTOR_COUNT}"
-        )
-    for slot, cmd in enumerate(slots):
-        target = msg.motor_cmd[slot]
-        target.mode = int(cmd["mode"])
-        target.q = float(cmd["q"])
-        target.dq = float(cmd["dq"])
-        target.tau = float(cmd["tau"])
-        target.kp = float(cmd["kp"])
-        target.kd = float(cmd["kd"])
-    msg.reserve = [int(value) for value in d.get("reserve", (0, 0, 0, 0))]
-    msg.crc = int(d.get("crc", 0))
-    return msg
+    try:
+        return vendor.idl_type(type_key)
+    except Exception as exc:  # noqa: BLE001 - the adapter raises a bare error type per its contract
+        if not vendor.vendor_available():
+            raise VendorUnavailableError() from exc
+        raise
 
 
-def handcmd_from_dict(d: Mapping[str, Any]) -> HandCmd:
-    """Build a unitree_hg/HandCmd from :func:`projection.dex3_handcmd` output.
+def low_state_type() -> Any:
+    return _idl("low_state")
 
-    HandCmd.motor_cmd is an unbounded sequence in the IDL (default empty),
-    unlike LowCmd's fixed 35 — one MotorCmd is built per input slot and
-    appended. The slot count must be exactly the Dex3 per-hand 7, because the
-    mode byte's motor id addresses the hand's motors by position.
+
+def low_cmd_type() -> Any:
+    return _idl("low_cmd")
+
+
+def hand_state_type() -> Any:
+    return _idl("hand_state")
+
+
+def hand_cmd_type() -> Any:
+    return _idl("hand_cmd")
+
+
+def rpc_request_type() -> Any:
+    return _idl("rpc_request")
+
+
+def rpc_response_type() -> Any:
+    return _idl("rpc_response")
+
+
+#: Backwards-compatible names for the runtime modules and the mock: resolved
+#: once on first attribute access through the adapter's IDL registry (module
+#: __getattr__, PEP 562), so importing this module stays SDK-free and the
+#: resolved value is the real vendor IDL class rclpy can wire.
+_TYPE_KEY_BY_NAME = {
+    "LowState": "low_state",
+    "LowCmd": "low_cmd",
+    "HandState": "hand_state",
+    "HandCmd": "hand_cmd",
+    "Request": "rpc_request",
+    "Response": "rpc_response",
+}
+
+
+def __getattr__(name: str) -> Any:  # PEP 562 module-level lazy attribute
+    if name in _TYPE_KEY_BY_NAME:
+        resolved = _idl(_TYPE_KEY_BY_NAME[name])
+        globals()[name] = resolved  # cache: later accesses skip the registry
+        return resolved
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def motor_state() -> Any:
+    """One vendor ``MotorCmd_``-shaped motor state slot factory (mock aid)."""
+    return vendor.motor_state_defaults()
+
+
+def motor_cmd_slot() -> Any:
+    """One vendor ``MotorCmd_`` slot factory (mock aid)."""
+    return vendor.motor_cmd_defaults()
+
+
+def press_sensor_state() -> Any:
+    """One vendor ``PressSensorState_`` slot factory (mock aid)."""
+    return vendor.press_sensor_defaults()
+
+
+# --- vendor sample readers (delegating to the adapter's converters) -------------
+
+
+def lowstate_q(message: Any) -> list[float]:
+    """The 35-entry ``q`` vector of a ``LowState_`` sample, as plain floats."""
+    return vendor.lowstate_q(message)
+
+
+def lowstate_mode_machine(message: Any) -> int:
+    """``LowState_.mode_machine`` (design D10's startup generation check reads this)."""
+    return vendor.lowstate_mode_machine(message)
+
+
+def lowstate_imu(message: Any) -> dict[str, list[float]]:
+    """``LowState_.imu_state`` as plain lists (the adapter copies arrays verbatim)."""
+    return vendor.lowstate_imu(message)
+
+
+def handstate_q(message: Any) -> list[float]:
+    """One ``HandState_`` sample's motor positions in vendor motor order."""
+    return vendor.handstate_motor_q(message)
+
+
+def rpc_request_to_dict(message: Any) -> dict[str, Any]:
+    """Flatten a vendor RPC ``Request_`` frame for a mock handler."""
+    return vendor.rpc_request_to_dict(message)
+
+
+def rpc_response_from_dict(payload: Mapping[str, Any]) -> Any:
+    """Build a vendor RPC ``Response_`` frame from a plain mapping."""
+    return vendor.rpc_response_from_dict(payload)
+
+
+# --- RPC outcome -----------------------------------------------------------------
+
+
+def rpc_result_from_sdk(result: SdkCallResult, *, motion: bool = False, api_id: str = "") -> RpcResult:
+    """Map the adapter's :class:`SdkCallResult` onto the runtime's outcome type.
+
+    ``ok``/``code``/``data``/``timed_out`` carry over verbatim (the adapter
+    already maps the vendor's timeout sentinel); ``motion`` is re-attached by
+    the call site because the SDK clients do not tag requests as
+    motion-changing — the runtime's stop contract needs the flag and the
+    runtime is where the motion/no-motion classification lives.
     """
-    require_vendor()
-    slots = list(d["motor_cmd"])
-    if len(slots) != projection.DEX3_MOTORS_PER_HAND:
-        raise ValueError(
-            f"handcmd carries {len(slots)} motor_cmd slots; a Dex3 hand commands exactly "
-            f"{projection.DEX3_MOTORS_PER_HAND}"
-        )
-    msg = HandCmd()
-    for cmd in slots:
-        target = MotorCmd()
-        target.mode = int(cmd["mode"])
-        target.q = float(cmd["q"])
-        target.dq = float(cmd["dq"])
-        target.tau = float(cmd["tau"])
-        target.kp = float(cmd["kp"])
-        target.kd = float(cmd["kd"])
-        msg.motor_cmd.append(target)
-    msg.reserve = [int(value) for value in d.get("reserve", (0, 0, 0, 0))]
-    return msg
-
-
-def request_from_dict(d: Mapping[str, Any]) -> Request:
-    """Build a unitree_api/Request from :func:`projection.rpc_request` output.
-
-    ``Request.binary`` is a uint8[] in the IDL, so Python bytes and the
-    projection's plain int list both assign; the int list is used because it
-    is what the projection emits and what round-trips through the message
-    unchanged.
-    """
-    require_vendor()
-    msg = Request()
-    header = d["header"]
-    identity = header["identity"]
-    msg.header.identity.id = int(identity["id"])
-    msg.header.identity.api_id = int(identity["api_id"])
-    msg.header.lease.id = int(header["lease"]["id"])
-    policy = header["policy"]
-    msg.header.policy.priority = int(policy["priority"])
-    msg.header.policy.noreply = bool(policy["noreply"])
-    msg.parameter = str(d["parameter"])
-    msg.binary = [int(value) for value in d.get("binary", ())]
-    return msg
-
-
-# --- vendor messages -> pure values ----------------------------------------------
-
-
-def lowstate_q(msg: LowState) -> list[float]:
-    """The 35-entry q vector of LowState.motor_state, as plain floats.
-
-    The projection's :func:`projection.low_state_joint_positions` consumes
-    indices 0-28 of exactly this vector.
-    """
-    return [float(state.q) for state in msg.motor_state]
-
-
-def lowstate_mode_machine(msg: LowState) -> int:
-    """LowState.mode_machine (design D10's startup generation check reads this)."""
-    return int(msg.mode_machine)
-
-
-def lowstate_imu(msg: LowState) -> dict[str, list[float]]:
-    """LowState.imu_state as a plain mapping for :func:`projection.imu_payload`.
-
-    The vendored IMUState carries quaternion/gyroscope/accelerometer/rpy;
-    the projection reads the first three and assumes (w, x, y, z) order
-    (unverified, gate 6.1), so no reordering happens here — neither side of
-    the boundary is allowed to guess the vendor's frame.
-    """
-    imu = msg.imu_state
-    return {
-        "quaternion": [float(value) for value in imu.quaternion],
-        "gyroscope": [float(value) for value in imu.gyroscope],
-        "accelerometer": [float(value) for value in imu.accelerometer],
-    }
-
-
-def handstate_q(msg: HandState) -> list[float]:
-    """One HandState's motor_state[].q, in vendor motor order.
-
-    HandState.motor_state is an unbounded sequence too — a hand reporting a
-    slot count other than the Dex3 7 has a different generation or a decoding
-    fault, and a silently truncated or extended position list would be mapped
-    onto the wrong joints by the projection. Refused instead.
-    """
-    if len(msg.motor_state) != projection.DEX3_MOTORS_PER_HAND:
-        raise ValueError(
-            f"hand state carries {len(msg.motor_state)} motor positions; a Dex3 hand reports exactly "
-            f"{projection.DEX3_MOTORS_PER_HAND}"
-        )
-    return [float(state.q) for state in msg.motor_state]
-
-
-def response_to_dict(msg: Any) -> dict[str, Any]:
-    """Flatten a unitree_api/Response into what the projection's RPC readers take.
-
-    The output shape is the Response.msg field tree: header.identity carries
-    the correlated request's ``id`` and ``api_id``, header.status.code is the
-    vendor result code (0 = success) and ``data`` is the JSON payload string.
-    :func:`projection.rpc_response_matches`, :func:`projection.rpc_response_code`
-    and :func:`projection.rpc_response_data` consume it directly.
-    """
-    return {
-        "header": {
-            "identity": {
-                "id": int(msg.header.identity.id),
-                "api_id": int(msg.header.identity.api_id),
-            },
-            "status": {"code": int(msg.header.status.code)},
-        },
-        "data": str(msg.data),
-        "binary": [int(value) for value in msg.binary],
-    }
-
-
-# --- QoS --------------------------------------------------------------------------
-
-
-def qos_profile(qos_config: Mapping[str, Any] | None, key: str) -> rclpy.qos.QoSProfile:
-    """Resolve one vendor endpoint's QoS into an ``rclpy`` profile.
-
-    The raw (reliability, durability, depth) triple comes from the projection,
-    which owns the profile-declared defaults and every validation rule.
-    """
-    reliability, durability, depth = projection.vendor_qos(qos_config, key)
-    return rclpy.qos.QoSProfile(
-        reliability=rclpy.qos.ReliabilityPolicy.RELIABLE
-        if reliability == "reliable"
-        else rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
-        durability=rclpy.qos.DurabilityPolicy.TRANSIENT_LOCAL
-        if durability == "transient_local"
-        else rclpy.qos.DurabilityPolicy.VOLATILE,
-        depth=depth,
+    return RpcResult(
+        ok=result.ok,
+        code=result.code,
+        data=result.data,
+        timed_out=result.timed_out,
+        motion=motion,
+        api_id=api_id,
     )
 
 
-# --- RPC client ---------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
 class RpcResult:
-    """Outcome of one RPC call.
+    """Outcome of one vendor RPC call (runtime-facing shape).
 
-    ``code`` is the vendor ResponseStatus.code for a call that was answered
-    (0 = success). A timeout result carries ``code=-1`` instead — a sentinel
-    meaning "no vendor code ever arrived", deliberately distinct from the
-    vendor success code 0 so the two can never be confused.
-
-    ``motion`` is echoed from the send call: a motion-changing request that
-    timed out must NOT be transparently retried (the vendor may already be
-    executing it); the layer above reads this flag to refuse the retry.
+    ``code`` is the vendor status for a call that was answered (0 = success);
+    ``timed_out`` marks the SDK's client-side timeout sentinel (3104) — the
+    "fate unknown" outcome that a motion request must never be re-sent from
+    (the adapter's clients never retry, and neither do the runtime's call
+    sites). ``dropped`` is the opposite of unknown: the runtime refused to send
+    this call (its guard saw a newer stop generation or a closed admission), so
+    the vendor never saw it and there is nothing to retry. ``api_id`` is a
+    symbolic name for logs, not the wire value.
     """
 
-    ok: bool
-    code: int
-    data: Any = None
-    timed_out: bool = False
-    motion: bool = False
-    api_id: int = 0
-
-
-@dataclass(slots=True)
-class _PendingCall:
-    api_id: int
-    timeout_s: float
-    motion: bool
-    sent_at: float
-    result: RpcResult | None = None
-
-
-def _timeout_result(call: _PendingCall) -> RpcResult:
-    """The timeout outcome of a pending call; ``code=-1`` is the sentinel, not a vendor code."""
-    return RpcResult(ok=False, code=-1, data=None, timed_out=True, motion=call.motion, api_id=call.api_id)
-
-
-class RpcClient:
-    """Correlate unitree_api requests with their responses.
-
-    The client is transport-agnostic: it is constructed with a ``publish``
-    callable (the bridge hands it the request topic's publisher) and a ``now``
-    callable returning seconds, so the correlation, timeout and no-resend
-    rules run in unit tests without a ROS graph, a DDS participant or a
-    robot. Identity ids are allocated strictly monotonically from 1, because
-    the vendor RPC tier correlates on header.identity.id alone.
-
-    A timed-out call is never re-sent here — re-issuing a motion request
-    whose fate is unknown is a decision the bridge owns, and the ``motion``
-    flag on the timeout result is what lets it refuse. Once the caller has
-    taken a finished result it should :meth:`discard` the call so the pending
-    table does not grow without bound.
-    """
+    __slots__ = ("ok", "code", "data", "timed_out", "motion", "api_id", "dropped")
 
     def __init__(
         self,
         *,
-        publish: Callable[[Any], None],
-        now: Callable[[], float],
+        ok: bool,
+        code: int,
+        data: Any = None,
+        timed_out: bool = False,
+        motion: bool = False,
+        api_id: str = "",
+        dropped: bool = False,
     ) -> None:
-        self._publish = publish
-        self._now = now
-        self._lock = threading.Lock()
-        self._next_identity_id = 1
-        self._pending: dict[int, _PendingCall] = {}
+        self.ok = bool(ok)
+        self.code = int(code)
+        self.data = data
+        self.timed_out = bool(timed_out)
+        self.motion = bool(motion)
+        self.api_id = str(api_id)
+        self.dropped = bool(dropped)
 
-    def send(self, api_id: int, parameter: Any, *, timeout_s: float, motion: bool = False) -> int:
-        """Allocate an identity id, publish the request, track it as pending.
-
-        The vendor check comes first so an unavailable overlay neither burns
-        an identity id nor leaves a pending entry behind. The identity id is
-        allocated under the lock before the request dict is built, because
-        :func:`projection.rpc_request` rejects a non-positive id — the real id
-        must already be known when the request is built.
-        """
-        require_vendor()
-        with self._lock:
-            identity_id = self._next_identity_id
-            self._next_identity_id += 1
-        request_dict = projection.rpc_request(identity_id, api_id, parameter)
-        with self._lock:
-            self._pending[identity_id] = _PendingCall(
-                api_id=int(api_id),
-                timeout_s=float(timeout_s),
-                motion=bool(motion),
-                sent_at=self._now(),
-            )
-        self._publish(request_from_dict(request_dict))
-        return identity_id
-
-    def on_response(self, msg: Any) -> None:
-        """Record the response for its pending call; unmatched responses are dropped.
-
-        Matching is by identity id AND api_id (the vendor echoes both in the
-        response header). A response whose call has already timed out — in
-        :meth:`poll` or merely because the timeout window has elapsed — lands
-        as a timeout result and the response itself is discarded: a late
-        answer is not evidence the call succeeded.
-        """
-        response = response_to_dict(msg)
-        try:
-            identity_id = int(response["header"]["identity"]["id"])
-        except (KeyError, TypeError, ValueError):
-            return
-        with self._lock:
-            pending = self._pending.get(identity_id)
-            if pending is None or pending.result is not None:
-                return
-            if not projection.rpc_response_matches(response, identity_id=identity_id, api_id=pending.api_id):
-                return
-            if self._now() - pending.sent_at >= pending.timeout_s:
-                pending.result = _timeout_result(pending)
-                return
-            code = projection.rpc_response_code(response)
-            try:
-                data: Any = projection.rpc_response_data(response) if response["data"] else None
-            except ValueError:
-                # The vendor's data field is declared a JSON string, but a
-                # malformed payload must not escape a receive callback; the
-                # caller gets the raw string to log instead of an exception.
-                data = response["data"]
-            pending.result = RpcResult(
-                ok=code == 0,
-                code=code,
-                data=data,
-                timed_out=False,
-                motion=pending.motion,
-                api_id=pending.api_id,
-            )
-
-    def poll(self, identity_id: int) -> RpcResult | None:
-        """The call's outcome, a timeout result, or None while still pending.
-
-        The timeout is resolved against the injected ``now``: a pending call
-        whose ``timeout_s`` has elapsed becomes a ``timed_out`` result and is
-        never re-sent by this client.
-        """
-        with self._lock:
-            pending = self._pending.get(int(identity_id))
-            if pending is None:
-                return None
-            if pending.result is not None:
-                return pending.result
-            if self._now() - pending.sent_at < pending.timeout_s:
-                return None
-            pending.result = _timeout_result(pending)
-            return pending.result
-
-    def discard(self, identity_id: int) -> None:
-        """Release a call's bookkeeping entry once its result has been taken.
-
-        Finished results are kept until discarded so the caller can poll
-        repeatedly; without this the pending table would grow without bound
-        over the life of the bridge. Discarding a still-pending call abandons
-        it — a later response for it is then simply dropped.
-        """
-        with self._lock:
-            self._pending.pop(int(identity_id), None)
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return (
+            f"RpcResult(ok={self.ok}, code={self.code}, timed_out={self.timed_out}, "
+            f"dropped={self.dropped}, motion={self.motion}, api_id={self.api_id!r})"
+        )

@@ -8,9 +8,10 @@ without a robot. Observation happens where the design pins behaviour: on the
 vendor wire (rt/arm_sdk frames, the mock's recorded RPC payloads) and on the
 contract surface (RuntimeStatus, /joint_states).
 
-The ROS context pins ``domain_id=148``: 110/111 are the other worktrees'
-running ROS graphs and 147 is the vendor-mock suite's, and a fixed private
-domain keeps these publishers and subscriptions from crossing any of them.
+The ROS context and the vendor tier both use the domain the workspace conftest
+reserved for THIS pytest process (``IBROBOT_TEST_ROS_DOMAIN_ID``), so a parallel
+suite cannot meet these publishers, subscriptions or vendor participants on a
+shared graph — and no test carries a domain literal of its own.
 Every wait is bounded: a missing publisher, a silent service or a stuck stream
 fails the test on its timeout instead of hanging it. A fixed short window is
 used only to prove the *absence* of traffic, which cannot be polled for.
@@ -18,13 +19,17 @@ used only to prove the *absence* of traffic, which cannot be polled for.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
+import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
 import pytest
+import pytest as _pytest
 import rclpy
 import yaml
 from geometry_msgs.msg import Twist
@@ -34,19 +39,39 @@ from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Float64MultiArray
-from unitree_api.msg import Request, Response
-from unitree_g1_robot import projection
-from unitree_g1_robot.runtime_node import UnitreeG1RuntimeNode
-from unitree_g1_robot.vendor_gateway import RpcClient, handstate_q, qos_profile
-from unitree_g1_robot.vendor_mock_node import UnitreeVendorMock
-from unitree_hg.msg import HandState, LowCmd, LowState
+from unitree_g1_robot import vendor_gateway as _vg
 
-from ibrobot_msgs.action import ExecuteNamedMotion
-from ibrobot_msgs.srv import GetRuntimeStatus, SetLedPattern, SetRuntimeMode, SpeakText, StopRuntime
+if not _vg.VENDOR_AVAILABLE:
+    # The vendor frames only exist with the official SDK installed (setup
+    # full profile). Skip the module at collection instead of failing it —
+    # mirrors the adapter suite's skip convention.
+    _pytest.skip("unitree_sdk2py is not installed", allow_module_level=True)
 
-#: Private DDS domain for these tests; 110/111 are the other worktrees' graphs
-#: and 147 is the vendor-mock suite's.
-TEST_DOMAIN_ID = 148
+from mock_process import (  # noqa: E402 - the module-level vendor-defect skip must run first
+    MockProcess,
+    vendor_test_domain,
+)
+from unitree_g1_adapter.runtime import UnitreeSdk  # noqa: E402 - the module-level vendor-defect skip must run first
+from unitree_g1_robot import projection  # noqa: E402 - the module-level vendor-defect skip must run first
+from unitree_g1_robot.runtime_node import (  # noqa: E402 - the module-level vendor-defect skip must run first
+    UnitreeG1RuntimeNode,
+)
+from unitree_g1_robot.vendor_gateway import (  # noqa: E402 - the module-level vendor-defect skip must run first
+    handstate_q,
+)
+
+from ibrobot_msgs.action import ExecuteNamedMotion  # noqa: E402 - the module-level vendor-defect skip must run first
+from ibrobot_msgs.srv import (  # noqa: E402 - the module-level vendor-defect skip must run first
+    GetRuntimeStatus,
+    SetLedPattern,
+    SetRuntimeMode,
+    SpeakText,
+    StopRuntime,
+)
+
+#: The vendor DDS domain this process owns (see the workspace conftest): the
+#: ROS context and the vendor tier share it so both are isolated together.
+TEST_DOMAIN_ID = vendor_test_domain()
 
 TIMEOUT_S = 15.0
 
@@ -55,7 +80,6 @@ with open(PROFILE) as _handle:
     _PROFILE: dict[str, Any] = yaml.safe_load(_handle)
 _VENDOR: dict[str, Any] = _PROFILE["vendor"]
 _TOPICS: dict[str, str] = _VENDOR["topics"]
-_QOS: dict[str, Any] = _VENDOR["qos"]
 _CHANNELS = {str(entry["channel"]): entry for entry in _PROFILE["command_channels"]}
 JOINTS = [str(joint) for joint in _PROFILE["joints"]]
 
@@ -83,67 +107,119 @@ def _send_goal(harness: RuntimeHarness, client, name: str, *, interrupt: bool = 
     return handle_future.result()
 
 
+class _MockFacade:
+    """Watermark-scoped view of the shared mock (records of THIS test only)."""
+
+    def __init__(self, mock: MockProcess, watermark: int) -> None:
+        self._mock = mock
+        self._watermark = watermark
+        self.records_file = mock.records_file
+
+    def record(self, name: str) -> Any:
+        return self._mock.record(name, after_seq=self._watermark)
+
+    def apply(self, overrides: dict[str, Any]) -> None:
+        self._mock.apply(overrides)
+
+    def set_parameters(self, parameters: list) -> None:
+        self._mock.set_parameters(parameters)
+
+
 class RuntimeHarness:
     """One vendor mock plus the runtime bridge and a test client, with bounded-wait helpers."""
 
-    def __init__(self, *, startup_timeout_s: float = 8.0, **mock_params: Any) -> None:
-        mock_overrides = [Parameter("profile", value=str(PROFILE))]
-        mock_overrides += [Parameter(name, value=value) for name, value in mock_params.items()]
-        self.mock = UnitreeVendorMock(parameter_overrides=mock_overrides)
-        self.runtime = UnitreeG1RuntimeNode(
-            parameter_overrides=[
-                Parameter("profile", value=str(PROFILE)),
-                Parameter("startup_timeout_s", value=startup_timeout_s),
-            ]
-        )
+    def __init__(
+        self,
+        mock: MockProcess,
+        *,
+        startup_timeout_s: float = 8.0,
+        runtime_profile: Path = PROFILE,
+        preset_test_transport: bool = False,
+        **mock_params: Any,
+    ) -> None:
+        # The mock runs as a SUBPROCESS shared module-wide (the launch
+        # composition; a per-test subprocess would leave undisposed vendor
+        # participants whose stale reader endpoints poison the next test's
+        # reliable writes for the whole discovery-lease window). Per-test
+        # fault injection goes through the parameter services instead, from
+        # the mock's profile baseline; records are isolated per test by a
+        # sequence watermark.
+        self._mock = mock
+        self._mock.ensure_alive(node=mock.spawner_node, profile=PROFILE, domain_id=TEST_DOMAIN_ID)
+        self._record_watermark = mock.seq_snapshot()
+        self._records_file = mock.records_file
+        self.mock = _MockFacade(mock, self._record_watermark)
         self.node = rclpy.create_node("g1_runtime_bridge_test_client")
         self.executor = MultiThreadedExecutor(num_threads=8)
-        for node in (self.mock, self.runtime, self.node):
-            self.executor.add_node(node)
+        self.executor.add_node(self.node)
         self._thread = threading.Thread(target=self.executor.spin, daemon=True)
         self._thread.start()
+        # Fault injection rides the parameter services and must land BEFORE
+        # the runtime node exists: its startup thread consumes the vendor
+        # streams immediately, so a late mode_machine/hand_missing override
+        # would race the D10 checks. The executor above services the
+        # parameter responses; the runtime joins the executor afterwards.
+        self.mock.apply({"initial_fsm_id": 500, **mock_params})
+        self.runtime = UnitreeG1RuntimeNode(
+            parameter_overrides=[
+                Parameter("profile", value=str(runtime_profile)),
+                Parameter("preset_test_transport", value=preset_test_transport),
+                Parameter("vendor_network_interface", value="lo"),
+                Parameter("startup_timeout_s", value=startup_timeout_s),
+                # The subprocess mock speaks the vendor tier on the test
+                # domain; the runtime's factory must bind the same one (the
+                # launch entry passes the deployment's choice the same way).
+                Parameter("vendor_domain_id", value=TEST_DOMAIN_ID),
+            ]
+        )
+        self.executor.add_node(self.runtime)
 
         # --- observation state (guarded by _watch_lock) ----------------------
         self._watch_lock = threading.Lock()
-        self._arm_sdk: list[LowCmd] = []
+        self._arm_sdk: list[Any] = []
         self._joint_states: list[JointState] = []
         self._imu: list[Imu] = []
-        self._lowstate: LowState | None = None
-        self._hands: dict[str, HandState | None] = {"left": None, "right": None}
-        self._loco_request_apis: list[int] = []
+        self._lowstate_sample: Any | None = None
+        self._hands: dict[str, Any | None] = {"left": None, "right": None}
         self._clients: dict[tuple[type, str], Any] = {}
         self._publishers: dict[str, Any] = {}
-        self._rpc: dict[str, RpcClient] = {}
-
-        self.node.create_subscription(LowCmd, _TOPICS["arm_sdk"], self._on_arm_sdk, qos_profile(_QOS, "arm_sdk"))
+        # Vendor-tier observation rides the SDK (rclpy cannot register the
+        # SDK's IdlStruct types): one facade per harness, feeds cache the
+        # newest samples and the loco-request watcher counts api ids.
+        self._sdk = UnitreeSdk()
+        self._sdk.initialize(TEST_DOMAIN_ID, "lo")
+        self._sdk.state_feed(_TOPICS["low_state"], "low_state", handler=self._on_lowstate_sample, queue_len=1)
+        for side in ("left", "right"):
+            self._sdk.state_feed(
+                _TOPICS[f"dex3_{side}_state"],
+                "hand_state",
+                handler=(lambda sample, side=side: self._on_hand_state_sample(side, sample)),
+                queue_len=1,
+            )
         self.node.create_subscription(JointState, "/joint_states", self._on_joint_state, 10)
         self.node.create_subscription(Imu, "/imu/data", self._on_imu, _SENSOR_QOS)
-        self.node.create_subscription(LowState, _TOPICS["low_state"], self._on_lowstate, qos_profile(_QOS, "low_state"))
-        for side in ("left", "right"):
-            self.node.create_subscription(
-                HandState,
-                _TOPICS[f"dex3_{side}_state"],
-                lambda message, side=side: self._on_hand_state(side, message),
-                qos_profile(_QOS, "dex3_state"),
-            )
-        self.node.create_subscription(
-            Request,
-            _VENDOR["rpc"]["request_topics"]["loco"],
-            self._on_loco_request,
-            qos_profile(_QOS, "rpc_request"),
-        )
 
     def shutdown(self) -> None:
         self.executor.shutdown(timeout_sec=2.0)
-        for node in (self.node, self.runtime, self.mock):
+        # Stop the executor, let in-flight DDS listener callbacks drain, then
+        # close the in-process runtime's channels BEFORE its rclpy node dies.
+        # The shared mock subprocess is owned by the module fixture.
+        time.sleep(0.2)
+        self._sdk.close()
+        with contextlib.suppress(Exception):  # a faulted runtime's teardown must not mask the test result
+            self.runtime._sdk.close()
+        for node in (self.node, self.runtime):
             node.destroy_node()
 
     # --- watcher callbacks ---------------------------------------------------
 
-    def _on_arm_sdk(self, message: LowCmd) -> None:
+    def _on_lowstate_sample(self, message: Any) -> None:
         with self._watch_lock:
-            self._arm_sdk.append(message)
-            del self._arm_sdk[:-200]
+            self._lowstate_sample = message
+
+    def _on_hand_state_sample(self, side: str, message: Any) -> None:
+        with self._watch_lock:
+            self._hands[side] = message
 
     def _on_joint_state(self, message: JointState) -> None:
         with self._watch_lock:
@@ -155,25 +231,21 @@ class RuntimeHarness:
             self._imu.append(message)
             del self._imu[:-20]
 
-    def _on_lowstate(self, message: LowState) -> None:
-        with self._watch_lock:
-            self._lowstate = message
-
-    def _on_hand_state(self, side: str, message: HandState) -> None:
-        with self._watch_lock:
-            self._hands[side] = message
-
-    def _on_loco_request(self, message: Request) -> None:
-        with self._watch_lock:
-            self._loco_request_apis.append(int(message.header.identity.api_id))
-            del self._loco_request_apis[:-500]
-
     # --- bounded waiting -------------------------------------------------------
 
     def wait_until(self, predicate, what: str, timeout_s: float = TIMEOUT_S):
         deadline = time.monotonic() + timeout_s
         last = None
         while time.monotonic() < deadline:
+            if not self._mock.alive():
+                # The vendor binding crashed its process mid-test (observed
+                # under sustained traffic plus reader churn). Respawn so the
+                # NEXT test starts clean, and fail THIS one with the reason.
+                self._mock.ensure_alive(node=self._mock.spawner_node, profile=PROFILE, domain_id=TEST_DOMAIN_ID)
+                raise AssertionError(
+                    f"the vendor mock subprocess died mid-test while waiting for {what!r} "
+                    "(vendor binding crash); it was respawned for the next test"
+                )
             last = predicate()
             if last:
                 return last
@@ -261,23 +333,24 @@ class RuntimeHarness:
     # --- observation --------------------------------------------------------------------
 
     def arm_sdk_count(self) -> int:
-        with self._watch_lock:
-            return len(self._arm_sdk)
+        """arm_sdk frames recorded since this harness started (mock readout).
+
+        The runtime writes rt/arm_sdk from THIS process, and the vendor
+        binding deadlocks when a same-process reader observes those writes —
+        so the frame readout comes from the mock's records file instead of a
+        local SDK feed.
+        """
+        entries = self._mock_records("arm_sdk_frame")
+        return len(entries)
 
     def arm_sdk_weight(self) -> float | None:
-        with self._watch_lock:
-            message = self._arm_sdk[-1] if self._arm_sdk else None
-        if message is None:
-            return None
-        return float(message.motor_cmd[projection.ARM_SDK_WEIGHT_INDEX].q)
+        entries = self._mock_records("arm_sdk_frame")
+        return entries[-1]["weight"] if entries else None
 
     def arm_sdk_targets(self) -> dict[str, float] | None:
         """The joint targets the bridge last put on rt/arm_sdk, by joint name."""
-        with self._watch_lock:
-            message = self._arm_sdk[-1] if self._arm_sdk else None
-        if message is None:
-            return None
-        return projection.low_state_joint_positions([slot.q for slot in message.motor_cmd])
+        entries = self._mock_records("arm_sdk_frame")
+        return entries[-1]["targets"] if entries else None
 
     def latest_joint_state(self) -> JointState | None:
         with self._watch_lock:
@@ -295,7 +368,7 @@ class RuntimeHarness:
 
     def vendor_position(self, name: str) -> float | None:
         with self._watch_lock:
-            message = self._lowstate
+            message = self._lowstate_sample
         if message is None:
             return None
         return projection.low_state_joint_positions([state.q for state in message.motor_state])[name]
@@ -308,43 +381,44 @@ class RuntimeHarness:
         return projection.dex3_joint_positions(handstate_q(message), side=side)
 
     def loco_requests(self, api_id: int) -> int:
-        with self._watch_lock:
-            return sum(1 for seen in self._loco_request_apis if seen == api_id)
+        return sum(1 for seen in self._mock_records("loco_request") if seen == api_id)
+
+    def _mock_records(self, name: str) -> list[Any]:
+        """All of this test's records for ``name`` (watermark-scoped)."""
+        if not self._records_file.exists():
+            return []
+        found: list[Any] = []
+        try:
+            with open(self._records_file, encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("name") == name and int(entry.get("seq", 0)) > self._record_watermark:
+                        found.append(entry.get("value"))
+        except OSError:
+            return found
+        return found
 
     # --- direct vendor RPC (to verify the vendor side of a switch) --------------------------
 
     def vendor_fsm_id(self) -> Any:
-        client = self._vendor_rpc("loco")
-        identity_id = client.send(projection.LOCO_API_IDS["get_fsm_id"], {}, timeout_s=3.0)
-        deadline = time.monotonic() + 3.0
+        """The mock's own FSM report, read through a real SDK LocoClient."""
+        deadline = time.monotonic() + 5.0
+        last_error: Exception | None = None
         while time.monotonic() < deadline:
-            result = client.poll(identity_id)
-            if result is not None:
-                client.discard(identity_id)
-                return result.data if result.ok else None
-            time.sleep(0.02)
-        raise AssertionError("the vendor never answered GetFsmId")
-
-    def _vendor_rpc(self, service: str) -> RpcClient:
-        if service not in self._rpc:
-            request_pub = self.node.create_publisher(
-                Request, _VENDOR["rpc"]["request_topics"][service], qos_profile(_QOS, "rpc_request")
-            )
-            client = RpcClient(publish=request_pub.publish, now=time.monotonic)
-            self.node.create_subscription(
-                Response,
-                _VENDOR["rpc"]["response_topics"][service],
-                client.on_response,
-                qos_profile(_QOS, "rpc_response"),
-            )
-            self._rpc[service] = client
-            # A request published before DDS matching completes is silently
-            # dropped; the mock's subscription must be visible first.
-            self.wait_until(
-                lambda: request_pub.get_subscription_count() > 0,
-                f"the {service} rpc subscription to appear",
-            )
-        return self._rpc[service]
+            try:
+                result = self._sdk.loco(timeout_s=3.0).get_fsm_id()
+                if not result.timed_out:
+                    return result.data if result.ok else None
+            except Exception as exc:  # noqa: BLE001 - the mock may not be matched yet
+                last_error = exc
+            time.sleep(0.05)
+        raise AssertionError(f"the vendor never answered GetFsmId (last error: {last_error})")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -358,18 +432,42 @@ def ros_context():
         rclpy.shutdown()
 
 
+@pytest.fixture(scope="module")
+def mock_process():
+    """One mock subprocess per module: churning subprocesses would leave
+    undisposed vendor participants whose stale reader endpoints poison the
+    next test's reliable writes for the discovery-lease window."""
+    spawner = rclpy.create_node("g1_bridge_mock_spawner")
+    # The parameter client lives on the spawner: spin it or the mock's
+    # set_parameters calls never complete.
+    spin_executor = rclpy.executors.SingleThreadedExecutor()
+    spin_executor.add_node(spawner)
+    threading.Thread(target=spin_executor.spin, daemon=True).start()
+    handle = MockProcess(
+        node=spawner,
+        profile=PROFILE,
+        domain_id=TEST_DOMAIN_ID,
+        records_file=Path(tempfile.gettempdir()) / f"g1_bridge_mock_{os.getpid()}.jsonl",
+    )
+    handle.wait_ready()
+    yield handle
+    handle.terminate()
+    spin_executor.shutdown()
+    spawner.destroy_node()
+
+
 @pytest.fixture
-def make_harness():
+def make_harness(mock_process):
     """A harness factory; every harness it builds is torn down after the test."""
-    made: list[RuntimeHarness] = []
+    running_harnesses = []
 
     def _make(**kwargs: Any) -> RuntimeHarness:
-        running = RuntimeHarness(**kwargs)
-        made.append(running)
+        running = RuntimeHarness(mock_process, **kwargs)
+        running_harnesses.append(running)
         return running
 
     yield _make
-    for running in made:
+    for running in reversed(running_harnesses):
         running.shutdown()
 
 
@@ -379,6 +477,39 @@ def harness(make_harness):
 
 
 # --- startup (design D10) --------------------------------------------------------
+
+
+def test_preset_only_reaches_active_without_hands_and_dispatches_only_15(make_harness):
+    harness = make_harness(
+        runtime_profile=PROFILE.with_name("g1_29dof_arm_presets.yaml"),
+        preset_test_transport=True,
+        hand_missing="both",
+        initial_fsm_id=802,
+        action_list=["both_hands_up"],
+    )
+    status = harness.wait_active()
+    assert status.active_mode == "idle"
+    assert "hand.multi_joint" not in status.capabilities
+    assert "base.cmd_vel" not in status.capabilities
+    assert "runtime.stop" not in status.capabilities
+    client = _named_client(harness)
+    goal = _send_goal(harness, client, "arms_horizontal")
+    assert goal.accepted
+    future = goal.get_result_async()
+    harness.wait_until(future.done, "preset result")
+    assert future.result().result.success
+    assert harness.mock.record("last_action_id") == 15
+    assert harness.arm_sdk_count() == 0
+    assert harness.mock.record("last_velocity") is None
+    assert harness.loco_requests(projection.LOCO_API_IDS["set_fsm_id"]) == 0
+    assert harness.loco_requests(projection.LOCO_API_IDS["switch_to_user_ctrl"]) == 0
+    assert not _send_goal(harness, client, "release_arm").accepted
+    assert not harness.set_mode("stream").success
+    stopped = harness.stop("HOLD")
+    assert not stopped.success and stopped.idle_latency_s == -1.0
+    assert not harness.set_mode("idle").success
+    assert harness.mock.record("last_action_id") == 15  # no automatic recovery
+    client.destroy()
 
 
 def test_startup_reaches_active_in_idle_mode(harness):
@@ -505,9 +636,8 @@ def test_hand_stream_reaches_the_vendor_hand(harness):
 def test_stream_entry_latches_the_measured_waist_not_a_default(harness):
     """The entry latch comes from the measured positions, not a default.
 
-    A waist that was commanded to 0.3 and left there through a stream exit
-    must be held at 0.3 on re-entry — a zero- or default-filled latch would
-    command a motion nobody asked for."""
+    A commanded waist must keep its targets during release; an unacknowledged
+    handover must block re-entry rather than seed a new default pose."""
     harness.wait_active()
     assert harness.set_mode("stream").success
     harness.publish_channel("waist_stream", [0.3, 0.3, 0.3])
@@ -519,10 +649,12 @@ def test_stream_entry_latches_the_measured_waist_not_a_default(harness):
         "the waist to converge on its commanded value",
         timeout_s=10.0,
     )
-    assert harness.set_mode("idle").success  # the weight ramps down; the mock holds 0.3
-    frames = harness.arm_sdk_count()
-    assert harness.set_mode("stream").success
-    harness.wait_until(lambda: harness.arm_sdk_count() > frames, "fresh arm_sdk frames after re-entry")
+    response = harness.set_mode("idle")
+    assert response.success, "the public mode contract holds once the weight is back to 0"
+    status = harness.status()
+    assert status.stop_latched, "admission stays closed until the operator clears it"
+    assert any("ARM_HANDOVER_UNCONFIRMED" in fault for fault in status.faults)
+    assert not harness.set_mode("stream").success, "re-entry needs the latch cleared first"
     targets = harness.arm_sdk_targets()
     for name in ("waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"):
         assert targets[name] == pytest.approx(0.3), f"{name} was not latched from its measured position"
@@ -569,7 +701,7 @@ def test_locomotion_confirms_the_fsm_and_streams_cmd_vel(harness):
     harness.wait_active()
     assert harness.set_mode("locomotion").success
     assert harness.status().active_mode == "locomotion"
-    assert harness.vendor_fsm_id() == {"data": projection.FSM_IDS["start"]}
+    assert harness.vendor_fsm_id() == projection.FSM_IDS["start"]
     harness.publish_cmd_vel(0.5, 0.0, 0.3)
     harness.wait_until(
         lambda: harness.mock.record("last_velocity") == {"velocity": [0.5, 0.0, 0.3], "duration": 1.0},
@@ -639,13 +771,13 @@ def test_fsm_rejection_fails_set_mode_with_the_vendor_reason(harness):
     assert f"SetFsmId({start})" in response.message
     assert "code" in response.message
     assert harness.status().active_mode == "idle"
-    assert harness.vendor_fsm_id() == {"data": 0}, "the rejected switch changed the vendor FSM"
+    assert harness.vendor_fsm_id() == 500, "the rejected switch changed the vendor FSM"
     # Once the vendor accepts it, the same switch succeeds.
     harness.mock.set_parameters([Parameter("reject_fsm_ids", value=[])])
     assert harness.set_mode("locomotion").success
 
 
-def test_stream_exit_ramps_the_weight_down_before_reporting_idle(harness):
+def test_stream_exit_ramps_down_and_reports_the_unconfirmed_handover(harness):
     harness.wait_active()
     assert harness.set_mode("stream").success
     harness.wait_until(lambda: (harness.arm_sdk_weight() or 0.0) >= 0.2, "the shared weight to start ramping up")
@@ -655,14 +787,18 @@ def test_stream_exit_ramps_the_weight_down_before_reporting_idle(harness):
     while not future.done() and time.monotonic() < deadline:
         weight = harness.arm_sdk_weight()
         if weight is not None and weight > 0.0:
-            assert harness.status().active_mode == "stream", "idle was reported before the weight reached 0"
+            assert harness.status().stop_latched, "exit must close admission during ramp-down"
             observed_stream_while_weighted = True
         time.sleep(0.05)
     assert future.done(), "the stream exit never answered"
     assert observed_stream_while_weighted, "the exit finished before the ramp-down was observable"
     response = future.result()
-    assert response.success, response.message
-    assert harness.status().active_mode == "idle"
+    assert response.success, "the exit is a settled mode switch once the weight is 0"
+    status = harness.status()
+    assert status.active_mode == "idle"
+    assert status.stop_latched, "admission stays closed until the operator clears it"
+    assert any("ARM_HANDOVER_UNCONFIRMED" in fault for fault in status.faults), status.faults
+    assert "not acknowledged" in response.message
     harness.wait_until(lambda: harness.arm_sdk_weight() == 0.0, "a final weight-0 frame", timeout_s=1.0)
     frames = harness.arm_sdk_count()
     time.sleep(0.3)  # a 50 Hz stream would have published ~15 more frames
@@ -672,7 +808,7 @@ def test_stream_exit_ramps_the_weight_down_before_reporting_idle(harness):
 # --- stop (design D5) -----------------------------------------------------------------------
 
 
-def test_hold_stop_closes_admission_then_zeroes_velocity_then_ramps_down(harness):
+def test_arm_hold_stop_closes_admission_without_base_command(harness):
     harness.wait_active()
     assert harness.set_mode("stream").success
     harness.publish_channel("arm_stream", [0.1] * 14)
@@ -681,32 +817,60 @@ def test_hold_stop_closes_admission_then_zeroes_velocity_then_ramps_down(harness
     # (1) admission closes first: latched while the stop is still working.
     harness.wait_until(lambda: harness.status().stop_latched, "the stop latch to engage")
     assert not future.done(), "the stop answered before its vendor steps completed"
-    # (2) the explicit zero reaches the vendor while the stop is still running.
-    harness.wait_until(
-        lambda: harness.mock.record("last_velocity") == {"velocity": [0.0, 0.0, 0.0], "duration": 1.0},
-        "the zero-velocity command to reach the vendor",
-    )
+    # An arm-only session must not send base commands.
+    assert harness.mock.record("last_velocity") is None
     assert not future.done(), "the stop answered before the weight handover completed"
-    # (3) the ramp-down runs inside the stop window, after the zero.
+    # The weight ramp continues while admission is closed.
     weight_at_zero = harness.arm_sdk_weight()
     assert weight_at_zero is not None and weight_at_zero > 0.0, "the weight was already 0 when the zero landed"
-    # (4) the response arrives only after the handover completed.
+    # The response waits for local publication, without claiming remote handover.
     deadline = time.monotonic() + TIMEOUT_S
     while not future.done() and time.monotonic() < deadline:
         time.sleep(0.02)
     assert future.done()
     response = future.result()
-    assert response.success, response.message
-    assert 0.0 <= response.cancel_latency_s <= response.idle_latency_s
+    assert not response.success and "not acknowledged" in response.message
+    assert response.cancel_latency_s >= 0.0 and response.idle_latency_s == -1.0
     assert harness.status().active_mode == "idle"
     harness.wait_until(lambda: harness.arm_sdk_weight() == 0.0, "a final weight-0 frame", timeout_s=1.0)
     frames = harness.arm_sdk_count()
     time.sleep(0.3)
     assert harness.arm_sdk_count() == frames, "arm_sdk frames kept leaving after the stop"
-    # Latched: only idle is accepted, and it clears the latch.
+    # Re-entry stays refused until the operator clears the latch, and clearing it
+    # is exactly what `idle` does — without claiming the vendor confirmed.
     assert not harness.set_mode("stream").success
+    assert any("ARM_HANDOVER_UNCONFIRMED" in fault for fault in harness.status().faults)
     assert harness.set_mode("idle").success
-    assert not harness.status().stop_latched
+    status = harness.status()
+    assert not status.stop_latched
+    assert not any("ARM_HANDOVER_UNCONFIRMED" in fault for fault in status.faults)
+    assert not status.faults
+
+
+def test_stop_after_a_cleared_stream_session_reports_success(harness):
+    """N1: "entered stream once" must not read as "is in stream now".
+
+    A stream session, its exit and the operator's idle clear leave no latched
+    frame behind, so the next HOLD is an ordinary idle stop: it reports success
+    and raises no handover warning, because there was no arm frame to hand back.
+    """
+    harness.wait_active()
+    assert harness.set_mode("stream").success
+    harness.wait_until(lambda: (harness.arm_sdk_weight() or 0.0) >= 0.2, "the shared weight to start ramping up")
+    assert harness.set_mode("idle").success, "the exit is a settled mode switch"
+    assert harness.status().stop_latched, "the exit closes admission until the operator clears it"
+    cleared = harness.set_mode("idle")
+    assert cleared.success, cleared.message
+    status = harness.status()
+    assert not status.stop_latched
+    assert not any("ARM_HANDOVER_UNCONFIRMED" in fault for fault in status.faults)
+
+    response = harness.stop("HOLD")
+
+    assert response.success, response.message
+    assert response.idle_latency_s >= 0.0, "no arm handover is expected, so the idle latency is measured"
+    assert not any("ARM_HANDOVER_UNCONFIRMED" in fault for fault in harness.status().faults)
+    assert not harness.status().faults
 
 
 def test_torque_off_is_refused_while_standing(harness):
@@ -715,9 +879,13 @@ def test_torque_off_is_refused_while_standing(harness):
     assert not response.success
     assert "TORQUE_OFF_UNSAFE_POSTURE" in response.message
     status = harness.status()
-    assert not status.stop_latched, "a refused stop must not latch"
+    # E3: admission closes before the FSM read, so the refusal covers the torque
+    # release only; it must never reopen admission.
+    assert status.stop_latched, "a stop request closes admission first"
+    assert "stays engaged" in response.message
     assert status.active_mode == "idle"
-    assert harness.vendor_fsm_id() == {"data": 0}, "the refused stop switched the FSM anyway"
+    assert harness.vendor_fsm_id() == 500, "the refused stop switched the FSM anyway"
+    assert harness.set_mode("idle").success and not harness.status().stop_latched
 
 
 def test_torque_off_from_sit_releases_through_damping(make_harness):
@@ -727,7 +895,7 @@ def test_torque_off_from_sit_releases_through_damping(make_harness):
     assert response.success, response.message
     assert "TORQUE_OFF" in response.message and "damping" in response.message
     assert response.torque_off_latency_s >= 0.0
-    assert harness.vendor_fsm_id() == {"data": projection.FSM_IDS["damping"]}
+    assert harness.vendor_fsm_id() == projection.FSM_IDS["damping"]
     assert harness.status().stop_latched
     assert harness.set_mode("idle").success
     assert not harness.status().stop_latched
@@ -741,8 +909,16 @@ def test_stop_preempts_a_mode_switch_waiting_on_the_vendor(make_harness):
     requested = time.monotonic()
     response = harness.stop("HOLD")
     answered = time.monotonic() - requested
-    assert response.success, response.message
     assert answered < 2.0, f"the stop queued behind the mode switch for {answered:.2f}s"
+    # The loco dispatcher is held by the mode switch's silent SetFsmId call,
+    # so the stop's zero-velocity could not be dispatched within its bounded
+    # priority window: the stop latched locally and reports the zero as
+    # unconfirmed instead of blocking for the mode switch (Q7: the latch and
+    # the admission close happen immediately, the vendor confirmation is
+    # best-effort while another caller is mid-request).
+    assert not response.success
+    assert "unconfirmed" in response.message
+    assert response.cancel_latency_s >= 0.0
     deadline = time.monotonic() + TIMEOUT_S
     while not future.done() and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -758,10 +934,10 @@ def test_stop_preempts_a_mode_switch_waiting_on_the_vendor(make_harness):
 
 
 def test_rpc_timeout_fails_the_call_and_is_not_resent(make_harness):
-    switch = projection.LOCO_API_IDS["switch_to_user_ctrl"]
+    switch = projection.LOCO_API_IDS["set_fsm_id"]
     harness = make_harness(silent_api_ids=[switch])
     harness.wait_active()
-    response = harness.set_mode("stream")
+    response = harness.set_mode("locomotion")
     assert not response.success
     assert "timed out" in response.message
     assert harness.status().active_mode == "idle"
@@ -808,7 +984,7 @@ def test_posture_is_confirmed_by_the_reported_fsm(harness):
     harness.wait_until(lambda: result_future.done(), "the posture result")
     result = result_future.result().result
     assert result.success, result.message
-    assert harness.vendor_fsm_id() == {"data": _VENDOR["postures"]["sit"]["fsm_id"]}
+    assert harness.vendor_fsm_id() == _VENDOR["postures"]["sit"]["fsm_id"]
 
 
 def test_named_motion_cancel_is_refused(make_harness):
@@ -906,3 +1082,44 @@ def test_led_rejects_what_the_vendor_call_cannot_map(harness):
     assert not response.success
     assert response.error_code == "INVALID_REQUEST"
     assert harness.mock.record("last_led") is None, "a rejected request reached the vendor"
+
+
+# --- E1/E3: vendor DDS binding and stop ordering -------------------------------
+
+
+def test_vendor_tier_binds_the_isolated_domain_on_loopback(harness):
+    """E1: the Dex3 main path hands the domain/NIC to the SDK itself.
+
+    The pair is a node parameter, not a ``CYCLONEDDS_URI`` side effect — the SDK
+    builds its own domain configuration, so only this assertion shows where the
+    vendor graph actually lives.
+    """
+    harness.wait_active()
+    assert TEST_DOMAIN_ID != 0, "the isolated vendor domain is never the robot's production domain"
+    assert harness.runtime._vendor_domain_id == TEST_DOMAIN_ID
+    assert harness.runtime._vendor_network_interface == "lo"
+    assert harness.runtime._sdk.initialized
+    assert harness.runtime._sdk._domain_id == TEST_DOMAIN_ID
+    assert harness.runtime._sdk._network_interface == "lo"
+
+
+def test_stop_closes_admission_before_a_blocking_fsm_read(make_harness):
+    """E3: the latch must never wait on a vendor query.
+
+    With the FSM query unanswered, the stop still has to close admission at
+    once — and the query must use its own 1 s bound, not the profile's 5 s.
+    """
+    harness = make_harness(
+        initial_fsm_id=projection.FSM_IDS["sit"],
+        silent_api_ids=[projection.LOCO_API_IDS["get_fsm_id"]],
+    )
+    harness.wait_active()
+    requested = time.monotonic()
+    response = harness.stop("TORQUE_OFF")
+    answered = time.monotonic() - requested
+
+    assert response.cancel_latency_s >= 0.0 and response.cancel_latency_s < 0.5
+    assert harness.status().stop_latched, "admission must close before the vendor query"
+    assert not response.success and "could not be read" in response.message
+    assert "stays engaged" in response.message
+    assert answered < 3.0, f"the FSM read used the profile timeout, not its own bound ({answered:.1f}s)"

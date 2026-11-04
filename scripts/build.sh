@@ -280,10 +280,10 @@ declare -A GROUP_PATHS=(
     # Only the X2 runtime needs the vendor AimDK overlay (aimdk_msgs);
     # see the aimdk_robot README. Simulation assets are prepared separately.
     [aimdk]="robots/aimdk"
-    # The G1's vendor messages (unitree_hg/unitree_go/unitree_api) and robot
-    # description are vendored under robots/unitree, so unlike aimdk no
-    # external overlay is needed; the sensor driver packages its closure
-    # pulls in (livox_ros_driver2, fast_lio) arrive via --packages-up-to.
+    # The G1's vendor adapter packages live under robots/unitree (ROS-free SDK
+    # adapters plus the runtime/description), so unlike aimdk no external
+    # overlay is needed; the sensor driver packages its closure pulls in
+    # (livox_ros_driver2, fast_lio) arrive via --packages-up-to.
     [unitree]="robots/unitree"
     [rosclaw]="rosclaw"
 )

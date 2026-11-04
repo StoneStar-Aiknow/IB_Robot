@@ -1,11 +1,11 @@
 # Unitree G1 (29 DoF + Dex3) runtime profile.
 #
 # The single source of runtime parameters for the G1 runtime bridge and the
-# conformance suite. Vendor facts are cited to the material vendored in this
-# repository: unitree_sdk2 headers (joint indices, arm_sdk weight slot, RPC
-# service names and API ids, FSM ids, Dex3 mode byte) and the vendored
-# unitree_ros2 messages (unitree_hg / unitree_api IDL), plus the vendored
-# g1_29dof_with_hand_rev_1_0 URDF (joint names and limits). See
+# conformance suite. Vendor facts are cited to upstream material: the official
+# unitree_sdk2 headers (joint indices, arm_sdk weight slot, RPC service names
+# and API ids, FSM ids, Dex3 mode byte — consumed through the pinned
+# unitree_sdk2py per Issue #171) and the vendored g1_29dof_with_hand_rev_1_0
+# URDF (joint names and limits). See
 # openspec/changes/unitree-g1-runtime-migration/design.md (D1-D12).
 #
 # UNVERIFIED marking: every value that cannot be established from the vendored
@@ -30,6 +30,14 @@ runtime:
 # (unitree_vendor_mock, phase 2). There is no vendor-provided physics
 # simulation here.
 simulated: false
+
+# Simulated-transport deployment facts the launch entry reads instead of
+# hardcoding them: the private vendor domain the mock and the runtime share,
+# and the loopback NIC that keeps that graph off the robot's production
+# domain. A nonzero domain is required (0 is the robot's own graph).
+sim:
+  vendor_domain_id: 148
+  vendor_network_interface: lo
 
 joint_state_topic: /joint_states
 
@@ -248,7 +256,7 @@ teleoperation:
 # Vendor-specific facts (read only by the G1 bridge; never by generic layers).
 # ---------------------------------------------------------------------------
 vendor:
-  sdk_version: "unitree_sdk2 + unitree_ros2 vendored at upstream 668d1ec5 (BSD-3)"
+  sdk_version: "unitree_sdk2_python pinned at 814556d1 (BSD-3), installed by scripts/setup/install_unitree_sdk.sh"
   description_version: "unitree_ros g1_29dof_with_hand_rev_1_0 (vendored subset)"
   # Design D10: the bridge reads LowState.mode_machine at startup and faults on
   # mismatch; it also requires both Dex3 state topics to be publishing.
@@ -289,41 +297,21 @@ vendor:
       loco: rt/api/sport/request
       arm: rt/api/arm/request
       audio: rt/api/voice/request
+      robot_state: rt/api/robot_state/request
     response_topics:
       loco: rt/api/sport/response
       arm: rt/api/arm/response
       audio: rt/api/voice/response
-  # API ids from the vendored SDK headers (g1_loco_api.hpp, g1_arm_action_api.hpp,
-  # g1_audio_api.hpp).
-  api_ids:
-    loco:
-      get_fsm_id: 7001
-      get_fsm_mode: 7002
-      get_balance_mode: 7003
-      get_swing_height: 7004
-      get_stand_height: 7005
-      fsm_api: 7100
-      set_fsm_id: 7101
-      set_balance_mode: 7102
-      set_swing_height: 7103
-      set_stand_height: 7104
-      set_velocity: 7105
-      set_speed_mode: 7107
-      switch_to_user_ctrl: 7110
-      switch_to_internal_ctrl: 7111
-    arm:
-      execute_action: 7106
-      get_action_list: 7107
-      execute_custom_action: 7108
-      stop_custom_action: 7113
-    audio:
-      tts: 1001
-      asr: 1002
-      start_play: 1003
-      stop_play: 1004
-      get_volume: 1005
-      set_volume: 1006
-      set_rgb_led: 1010
+      robot_state: rt/api/robot_state/response
+  # Service ownership read before stream entry admits the arm frame. Names and
+  # expected vendor status (0 running, 1 stopped) are vendor facts, so the
+  # runtime reads them here instead of hardcoding them: `ai_sport` must already
+  # run and `g1_arm_example` must already be stopped, or the frame would be
+  # taken from a service that still owns it.
+  arm_admission:
+    stream_entry:
+      ai_sport: 0
+      g1_arm_example: 1
   # FSM ids from the SDK's own high-level LocoClient methods (SetFsmId
   # argument). Their acceptance latencies and posture preconditions are a
   # hardware gate (6.2/6.4); the ids themselves are SDK facts.
@@ -363,6 +351,9 @@ vendor:
   # by 14 arm + 3 waist joints, so all 17 must carry targets whenever any
   # channel streams.
   arm_sdk:
+    # Sport Services DDS states: locked standing / motion control 1 and 2.
+    # Admission reads state only; it never selects an FSM or disables a service.
+    allowed_fsm_ids: [4, 500, 501]
     rate_hz: 50.0
     weight_index: 29
     # unverified: example ramp rate 0.2/s; tuned on a gantry (gate 6.2).
@@ -430,16 +421,6 @@ vendor:
   audio:
     start_play_api_id: 1003
     stop_play_api_id: 1004
-  # Per-endpoint QoS (design D9). unverified in full: assumed from DDS
-  # high-rate-stream conventions; measured with `ros2 topic info -v` on
-  # hardware (gate 6.1) and written back before conformance.
-  qos:
-    low_state: {reliability: best_effort, durability: volatile, depth: 10}
-    arm_sdk: {reliability: best_effort, durability: volatile, depth: 10}
-    dex3_cmd: {reliability: best_effort, durability: volatile, depth: 10}
-    dex3_state: {reliability: best_effort, durability: volatile, depth: 10}
-    rpc_request: {reliability: reliable, durability: volatile, depth: 10}
-    rpc_response: {reliability: reliable, durability: volatile, depth: 10}
   # URDF joint limits (g1_29dof_with_hand_rev_1_0), SI radians. Used by the
   # projection to refuse out-of-range targets; nothing is clamped, a clamp
   # would execute a motion the caller did not ask for.

@@ -1,26 +1,30 @@
-"""Unitree G1 runtime: the public runtime contract served over the vendor DDS tier.
+"""Unitree G1 runtime: the public runtime contract served over the official SDK.
 
 This is the wrapper layer. Generic IB-Robot packages talk only to contract
 names (``/runtime_status``, ``/runtime/set_mode``, ``/runtime/get_status``,
 ``/runtime/stop``, ``/joint_states``, ``/imu/data`` and the profile's declared
-command channels) and never link ``unitree_hg`` or ``unitree_api``; the
-vendor's topics, api ids, FSM ids and joint order stay behind this node.
+command channels) and never import a vendor symbol; the vendor's topics, FSM
+ids and joint order stay behind this node.
+
+Vendor integration (Issue #171 PR 2): the official ``unitree_sdk2py`` is the
+transport, reached only through the ROS-free adapter ``unitree_g1_adapter``.
+The vendor channel factory is initialized once per process through the
+adapter's ``UnitreeSdk`` facade (a conflicting second initialization fails
+loudly there); state feedback rides ``StateFeed`` subscribers (last-sample
+cached on the SDK's reader threads); the 17-joint arm_sdk frame and the Dex3
+hand frames go out through ``CommandWriter`` publishers; and the vendor RPCs
+run on the SDK's own typed clients (``LocoClient``/``G1ArmActionClient``/
+``AudioClient``), whose mixed return shapes the adapter normalizes onto
+``SdkCallResult``.
 
 What the node does NOT do (design D1/D11): instantiate a controller manager,
 load a ros2_control hardware component, or publish on the unprotected
 ``rt/lowcmd`` tier — ``expert_tier_gate`` refuses a profile that enables it.
 
-Wiring the vendor DDS graph (the ``rt/lowstate`` / Dex3 state subscriptions,
-the ``rt/arm_sdk`` / Dex3 command publishers and the ``rt/api/*`` RPC
-request/response pair) is this node's own job per ``vendor_gateway``'s
-contract; the vendor message classes themselves come re-exported from
-``vendor_gateway``, which stays the only module that imports a vendor package,
-and every value conversion goes through ``vendor_gateway`` and ``projection``.
-
 Key behaviours, per openspec design:
 
 * D4 shared-weight frame: entering stream latches fresh measured positions as
-  hold targets for all 17 arm_sdk joints, ``SwitchToUserCtrl`` hands the frame
+  hold targets for all 17 arm_sdk joints; read-only admission protects the frame
   over, and the shared weight ramps to 1; leaving stream ramps the weight back
   to 0 before the mode is reported inactive. A channel that goes quiet simply
   stops updating the latch — its slots keep the last commanded value, which is
@@ -33,6 +37,14 @@ Key behaviours, per openspec design:
   ``TORQUE_OFF`` maps to the damping FSM and is refused while the reported
   posture is not in the profile's safe set. A stop preempts a mode switch
   that is still waiting on the vendor.
+* Stop/blocking-RPC contract (Issue #171 Q7): stop latches admission closed
+  immediately, discards every unsent command, and NEVER re-sends a motion
+  request whose outcome is unknown — the SDK client does not retry and the
+  call sites honour that. Voice/LED calls run in their own callback group, so
+  a slow or timed-out TTS call cannot delay a motion stop. The SDK RPC client
+  objects are wrapped by one serialized dispatcher per client (the SDK's
+  clients are plain request/future objects without a documented thread-safety
+  guarantee), so concurrency stays inside this class.
 * D7 capability mapping: the profile's arm action table is compared against
   ``GetActionList`` at startup; actions the vendor does not report are not
   advertised and a warning names each one.
@@ -47,10 +59,11 @@ Key behaviours, per openspec design:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
-from functools import partial
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +77,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import Imu, JointState
 from std_msgs.msg import Float64MultiArray
+from unitree_g1_adapter.runtime import UnitreeSdk
 
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetLedPattern, SetRuntimeMode, SpeakText, StopRuntime
@@ -94,14 +108,21 @@ IMU_TOPIC = "/imu/data"
 SPEAK_SERVICE = "/speech/speak"
 LED_SERVICE = "/led/set_pattern"
 
-#: Vendor RPC services the bridge talks to: locomotion and FSM switches, arm
-#: actions, and the voice service behind TTS and the LED.
-RPC_SERVICES_IN_USE = ("loco", "arm", "audio")
-
 #: SetVelocity re-issue cadence check. The command itself carries the
 #: profile's duration; this tick only decides when a re-issue is due, and a
 #: tenth of that duration keeps the re-issue prompt without spamming the tier.
 _VELOCITY_TICK_S = 0.1
+
+#: Visible warning for an arm handover the platform cannot confirm. The local
+#: side — admission closed, latched targets frozen, published weight at 0 — is
+#: observable and proven; whether the vendor then hands the frame back to its
+#: own control is not, and the runtime keeps saying so in ``RuntimeStatus``
+#: instead of claiming a stop it cannot see. ``SetRuntimeMode("idle")`` clears
+#: it once the operator has taken the frame back (see ``_clear_stop_latch``).
+ARM_HANDOVER_WARNING = (
+    "ARM_HANDOVER_UNCONFIRMED: the zero-weight frame was published locally; the vendor's own arm "
+    "handover is not acknowledged by this interface"
+)
 
 #: How long startup waits for the vendor's RPC servers to match our request
 #: publishers. A request published before DDS matching completes is silently
@@ -128,6 +149,42 @@ def _default_profile() -> Path:
     return Path(get_package_share_directory("unitree_g1_robot")) / "profiles" / "g1_29dof_dex3.yaml"
 
 
+def vendor_dds_binding(domain_id: int, network_interface: str) -> tuple[int, str]:
+    """The vendor DDS (domain, NIC) pair, or a refusal to open the vendor tier.
+
+    The two halves of the binding only make sense together, so the pair — not
+    each half — is what is enforced. A nonzero domain is the isolated one
+    (simulation, tests) and may only bind loopback, so its traffic cannot reach
+    the robot's production graph. Domain 0 *is* the robot's graph and therefore
+    needs the explicit robot-facing NIC: binding it to loopback, or letting the
+    SDK autodetermine, would silently open the vendor tier on whatever interface
+    the host happens to have. There is no safe default, so an unset pair fails
+    closed instead of guessing — the launch entry always passes both, and the
+    mock enforces the same rule because a fake vendor on the robot's production
+    domain is exactly what a test double must never become.
+    """
+    domain_id = int(domain_id)
+    network_interface = str(network_interface or "").strip()
+    if domain_id != 0:
+        if network_interface != "lo":
+            raise RuntimeError(
+                f"VENDOR_DDS_ISOLATION_REQUIRED: vendor domain {domain_id} is an isolated domain and "
+                f"must bind loopback ('lo'), got {network_interface!r}"
+            )
+        return domain_id, network_interface
+    if not network_interface:
+        raise RuntimeError(
+            "VENDOR_DDS_INTERFACE_REQUIRED: vendor domain 0 is the robot's production domain and needs an "
+            "explicit vendor_network_interface naming the robot-facing NIC"
+        )
+    if network_interface == "lo":
+        raise RuntimeError(
+            "VENDOR_DDS_ISOLATION_REQUIRED: vendor domain 0 must not bind loopback; name the robot-facing "
+            "NIC, or use a nonzero isolated domain"
+        )
+    return domain_id, network_interface
+
+
 class UnitreeG1RuntimeNode(Node):
     """Bridge between the public runtime contract and the G1 vendor DDS tier."""
 
@@ -143,7 +200,7 @@ class UnitreeG1RuntimeNode(Node):
 
         self._profile = load_profile(str(self.get_parameter("profile").value))
         # Only idle can be initial on the G1: stream and locomotion are entered
-        # through vendor-side switches (SwitchToUserCtrl, SetFsmId), so a
+        # through checked admission (stream) or SetFsmId (locomotion), so a
         # runtime that boots "into" one would claim a control state the vendor
         # never entered.
         initial_mode = str(self.get_parameter("initial_mode").value or "")
@@ -157,6 +214,22 @@ class UnitreeG1RuntimeNode(Node):
         # status without one (a bare node run outside the launch entry).
         interface_description = json.loads(supplied) if supplied else None
         self._vendor: dict[str, Any] = self._profile.get("vendor") or {}
+        self._preset_only = self._vendor.get("preset_only") is True
+        self.declare_parameter("preset_test_transport", False)
+        self.declare_parameter("preset_operator_confirmed", False)
+        self._preset_physical = self._preset_only and self.get_parameter("preset_test_transport").value is not True
+        # Explicit, operator-supervised commissioning. The shipped
+        # profile stays disabled; simulation still requires loopback isolation.
+        if self._preset_only:
+            if self._preset_physical and self.get_parameter("preset_operator_confirmed").value is not True:
+                raise RuntimeError("PRESET_HARDWARE_DISABLED: on-site operator confirmation required")
+            if self._profile.get("command_channels") or self._vendor.get("postures"):
+                raise RuntimeError("preset-only profile cannot expose streams or postures")
+            allowed = (self._vendor.get("preset_commissioning") or {}).get("allowed_arm_actions")
+            if not allowed or self._vendor.get("arm_actions") != allowed:
+                raise RuntimeError(
+                    "preset-only commissioning permits only the profile's preset_commissioning.allowed_arm_actions"
+                )
         projection.expert_tier_gate(bool((self._vendor.get("expert_joint_tier") or {}).get("enabled", False)))
 
         modes = ModeModel(ModeModelConfig.from_profile(self._profile))
@@ -205,6 +278,16 @@ class UnitreeG1RuntimeNode(Node):
         self._joint_state_rate_hz = float(
             ((self._profile.get("capabilities") or {}).get("joint.state") or {}).get("rate_hz", 50.0)
         )
+        # The vendor channel factory is a process-wide singleton; its binding
+        # (domain, NIC) is deployment configuration, so the launch entry passes
+        # it as parameters. The pair is enforced for EVERY mode, not only the
+        # preset surface: without it the SDK falls back to DDS autodetermination
+        # on the robot's production domain (domain 0, any NIC), and
+        # ``CYCLONEDDS_URI`` cannot constrain the result because the SDK hands
+        # its own configuration to ``Domain(id, config)``, which overrides it.
+        self.declare_parameter("vendor_domain_id", 0)
+        self.declare_parameter("vendor_network_interface", "")
+        self._vendor_domain_id, self._vendor_network_interface = self._vendor_dds_binding()
 
         # --- shared mutable state (guarded by _lock) -------------------------
         self._lock = threading.RLock()
@@ -213,10 +296,14 @@ class UnitreeG1RuntimeNode(Node):
         self._latch: dict[str, float] = {}
         self._hand_latch: dict[str, dict[str, float]] = {"left": {}, "right": {}}
         self._weight = 0.0
+        self._arm_write_fault: str | None = None
+        self._arm_write_pending = False
+        self._arm_handover_unconfirmed = False
         self._weight_target = projection.MODE_WEIGHT_TARGETS[IDLE_MODE]
         self._twist: tuple[float, float, float] | None = None
         self._twist_stamp = 0.0
-        self._velocity_pending: int | None = None
+        self._velocity_inflight = False
+        self._locomotion_requested = False
         self._velocity_sent: tuple[float, float, float] | None = None
         self._last_velocity_sent_s = 0.0
         self._confirmed_actions: set[str] = set()
@@ -240,10 +327,8 @@ class UnitreeG1RuntimeNode(Node):
         # Vendor state feeds are high-rate and must never queue behind a
         # blocking service call; the output ticks must keep running while a
         # mode switch or a stop blocks its own callback waiting on the vendor.
-        self._vendor_cb = MutuallyExclusiveCallbackGroup()
         self._tick_cb = MutuallyExclusiveCallbackGroup()
         self._state_cb = MutuallyExclusiveCallbackGroup()
-        self._rpc_cb = ReentrantCallbackGroup()
         self._service_cb = MutuallyExclusiveCallbackGroup()
         self._stop_cb = ReentrantCallbackGroup()
         self._interaction_cb = MutuallyExclusiveCallbackGroup()
@@ -256,9 +341,10 @@ class UnitreeG1RuntimeNode(Node):
         self._setup_vendor_io()
         self._setup_contract_surface()
 
-        self.create_timer(self._arm_sdk_period_s, self._arm_sdk_tick, callback_group=self._tick_cb)
-        self.create_timer(self._dex3_period_s, self._dex3_tick, callback_group=self._tick_cb)
-        self.create_timer(_VELOCITY_TICK_S, self._velocity_tick, callback_group=self._tick_cb)
+        if not self._preset_only:
+            self.create_timer(self._arm_sdk_period_s, self._arm_sdk_tick, callback_group=self._tick_cb)
+            self.create_timer(self._dex3_period_s, self._dex3_tick, callback_group=self._tick_cb)
+            self.create_timer(_VELOCITY_TICK_S, self._velocity_tick, callback_group=self._tick_cb)
         self.create_timer(
             1.0 / max(self._joint_state_rate_hz, 1.0), self._publish_joint_states, callback_group=self._state_cb
         )
@@ -268,52 +354,99 @@ class UnitreeG1RuntimeNode(Node):
 
     # --- wiring -------------------------------------------------------------
 
-    def _setup_vendor_io(self) -> None:
-        """Subscribe to the vendor state feeds and create the command/RPC endpoints.
+    def _vendor_dds_binding(self) -> tuple[int, str]:
+        """The vendor DDS (domain, NIC) pair from this node's parameters."""
+        return vendor_dds_binding(
+            int(self.get_parameter("vendor_domain_id").value),
+            str(self.get_parameter("vendor_network_interface").value or ""),
+        )
 
-        The vendor message classes come re-exported from ``vendor_gateway``,
-        and ``require_vendor`` has already refused to start without them, so
-        this wiring is the only place vendor types are named in this module.
+    def _setup_vendor_io(self) -> None:
+        """Open the official SDK's channels/clients through the adapter facade.
+
+        The facade owns the process-wide vendor channel factory singleton; the
+        state feeds, command writers and typed RPC clients it hands out are
+        all tracked and released by ``UnitreeSdk.close`` at shutdown. When the
+        runtime is launched against the in-repo vendor mock (simulated
+        transport), the same facade is wired to the mock's injectable surface
+        by the entry point, so this method's code is identical either way.
         """
         vg.require_vendor()
         topics = self._vendor["topics"]
-        qos = self._vendor.get("qos")
-        self.create_subscription(
-            vg.LowState,
-            topics["low_state"],
-            self._on_lowstate,
-            vg.qos_profile(qos, "low_state"),
-            callback_group=self._vendor_cb,
+        self._sdk = UnitreeSdk(now=time.monotonic)
+        self._sdk.initialize(self._vendor_domain_id, self._vendor_network_interface)
+        self._feeds: dict[str, Any] = {}
+        # queue_len=1: the SDK delivers through its queue thread, so the
+        # writer's path never inlines our handler (an in-process writer whose
+        # ddspy_write holds the GIL while a python handler re-enters on the
+        # same delivery deadlocks both — observed against the in-repo mock).
+        self._feeds["low_state"] = self._sdk.state_feed(
+            topics["low_state"], "low_state", handler=self._on_lowstate_sample, queue_len=1
         )
+        if self._preset_only:
+            self._hand_writers = {}
+            self._rpc = {"arm": self._sdk.arm_action(timeout_s=self._rpc_timeout_s)}
+            if self._preset_physical:
+                self._rpc["loco"] = self._sdk.loco(timeout_s=self._rpc_timeout_s)
+                self._rpc["robot_state"] = self._sdk.robot_state(timeout_s=self._rpc_timeout_s)
+            self._rpc_dispatchers = {name: threading.Lock() for name in self._rpc}
+            return
         for side in ("left", "right"):
-            self.create_subscription(
-                vg.HandState,
+            self._feeds[f"dex3_{side}_state"] = self._sdk.state_feed(
                 topics[f"dex3_{side}_state"],
-                partial(self._on_hand_state, side),
-                vg.qos_profile(qos, "dex3_state"),
-                callback_group=self._vendor_cb,
+                "hand_state",
+                handler=(lambda sample, side=side: self._on_hand_state_sample(side, sample)),
+                queue_len=1,
             )
-        self._arm_sdk_pub = self.create_publisher(vg.LowCmd, topics["arm_sdk"], vg.qos_profile(qos, "arm_sdk"))
-        self._hand_pubs = {
-            side: self.create_publisher(vg.HandCmd, topics[f"dex3_{side}_cmd"], vg.qos_profile(qos, "dex3_cmd"))
-            for side in ("left", "right")
+        self._arm_sdk_writer = self._sdk.command_writer(topics["arm_sdk"], "low_cmd")
+        self._hand_writers = {
+            side: self._sdk.command_writer(topics[f"dex3_{side}_cmd"], "hand_cmd") for side in ("left", "right")
         }
-        self._rpc: dict[str, vg.RpcClient] = {}
-        self._rpc_publishers: dict[str, Any] = {}
-        for service in RPC_SERVICES_IN_USE:
-            request_pub = self.create_publisher(
-                vg.Request, self._vendor["rpc"]["request_topics"][service], vg.qos_profile(qos, "rpc_request")
-            )
-            client = vg.RpcClient(publish=request_pub.publish, now=time.monotonic)
-            self._rpc[service] = client
-            self._rpc_publishers[service] = request_pub
-            self.create_subscription(
-                vg.Response,
-                self._vendor["rpc"]["response_topics"][service],
-                client.on_response,
-                vg.qos_profile(qos, "rpc_response"),
-                callback_group=self._rpc_cb,
-            )
+        # The SDK's typed RPC clients block up to their timeout on the calling
+        # thread; they are created eagerly so startup's discovery wait happens
+        # once, and every call goes through the serialized dispatcher below.
+        self._rpc: dict[str, Any] = {
+            "loco": self._sdk.loco(timeout_s=self._rpc_timeout_s),
+            "arm": self._sdk.arm_action(timeout_s=self._rpc_timeout_s),
+            "audio": self._sdk.audio(timeout_s=self._rpc_timeout_s),
+            "robot_state": self._sdk.robot_state(timeout_s=self._rpc_timeout_s),
+        }
+        self._motion_switcher = self._sdk.motion_switcher(timeout_s=self._rpc_timeout_s)
+        # One dispatcher lock per service: the SDK clients have no documented
+        # thread-safety guarantee, so calls to one service serialize; calls to
+        # different services (e.g. voice while locomotion confirms) stay
+        # independent.
+        self._rpc_dispatchers: dict[str, threading.Lock] = {name: threading.Lock() for name in self._rpc}
+
+    # --- vendor feedback -------------------------------------------------------
+
+    def _on_lowstate_sample(self, sample: Any) -> None:
+        """SDK reader-thread callback: cache the newest LowState (never blocks)."""
+        try:
+            positions = projection.low_state_joint_positions(vg.lowstate_q(sample))
+            imu = projection.imu_payload(vg.lowstate_imu(sample))
+        except ValueError as exc:  # ProjectionError is a ValueError; keep the last good sample
+            self.get_logger().warning(f"dropping malformed LowState frame: {exc}", throttle_duration_sec=10.0)
+            return
+        clock = self.get_clock().now()
+        with self._lock:
+            self._lowstate_positions = positions
+            self._lowstate_stamp = time.monotonic()
+            self._lowstate_clock = clock
+            self._mode_machine_observed = vg.lowstate_mode_machine(sample)
+            self._imu_payload = imu
+
+    def _on_hand_state_sample(self, side: str, sample: Any) -> None:
+        """SDK reader-thread callback for one hand's state stream (never blocks)."""
+        try:
+            positions = projection.dex3_joint_positions(vg.handstate_q(sample), side=side)
+        except ValueError as exc:  # a wrong slot count or a non-finite position
+            self.get_logger().warning(f"dropping malformed {side} hand state: {exc}", throttle_duration_sec=10.0)
+            return
+        with self._lock:
+            self._hand_positions[side] = positions
+            self._hand_stamps[side] = time.monotonic()
+            self._hand_clocks[side] = self.get_clock().now()
 
     def _setup_contract_surface(self) -> None:
         self.create_service(SetRuntimeMode, SET_MODE_SERVICE, self._on_set_mode, callback_group=self._service_cb)
@@ -358,7 +491,7 @@ class UnitreeG1RuntimeNode(Node):
         while True:
             with self._lock:
                 have_lowstate = self._lowstate_stamp > 0.0
-                have_hands = all(self._hand_stamps[side] > 0.0 for side in ("left", "right"))
+                have_hands = self._preset_only or all(self._hand_stamps[side] > 0.0 for side in ("left", "right"))
                 observed = self._mode_machine_observed
             if have_lowstate and have_hands:
                 break
@@ -368,7 +501,8 @@ class UnitreeG1RuntimeNode(Node):
                     missing.append("the first LowState frame")
                 with self._lock:
                     quiet = [side for side in ("left", "right") if self._hand_stamps[side] <= 0.0]
-                missing += [f"the {side} Dex3 state stream" for side in quiet]
+                if not self._preset_only:
+                    missing += [f"the {side} Dex3 state stream" for side in quiet]
                 self._fail_startup(
                     "vendor feedback missing at startup: " + "; ".join(missing) + " (design D10); "
                     "not entering ACTIVE and serving no command channel"
@@ -381,8 +515,7 @@ class UnitreeG1RuntimeNode(Node):
             self._fail_startup(fault)
             return
 
-        for service in RPC_SERVICES_IN_USE:
-            self._wait_for_rpc_peer(service)
+        self._wait_for_rpc_peers()
         self._confirm_vendor_actions()
         self._state.set_lifecycle(LIFECYCLE_ACTIVE)
 
@@ -391,12 +524,35 @@ class UnitreeG1RuntimeNode(Node):
         self._startup_fault = detail
         self._state.set_status("FAULTED", [detail])
 
-    def _wait_for_rpc_peer(self, service: str) -> None:
-        """Wait until the vendor's RPC server matched our request publisher."""
-        publisher = self._rpc_publishers[service]
+    def _wait_for_rpc_peers(self) -> None:
+        """Wait until the SDK clients can reach their services.
+
+        A request published before DDS matching completes is silently dropped,
+        so the startup queries would otherwise observe timeouts that are
+        really a discovery race. The SDK client's request channel is created
+        inside ``ClientStub.Init`` (which already sleeps 0.5 s), and the
+        first bounded query doubles as the match probe: each service gets one
+        cheap read-only call whose timeout the wait absorbs.
+        """
+        probes = {
+            "loco": ("get_fsm_id", None),
+            "arm": ("get_action_list", None),
+            "audio": ("get_volume", None),
+        }
         deadline = time.monotonic() + _RPC_MATCH_TIMEOUT_S
-        while time.monotonic() < deadline and publisher.get_subscription_count() == 0:
-            time.sleep(0.05)
+        remaining = {key: value for key, value in probes.items() if key in self._rpc}
+        while remaining and time.monotonic() < deadline:
+            for service, (api_name, parameter) in list(remaining.items()):
+                result = self.rpc_call(service, api_name, parameter, timeout_s=0.5)
+                if not result.timed_out:
+                    remaining.pop(service)
+            if remaining:
+                time.sleep(0.05)
+        for service in remaining:
+            self.get_logger().warning(
+                f"the vendor {service!r} service did not answer its startup probe within "
+                f"{_RPC_MATCH_TIMEOUT_S:.0f}s; proceeding (calls will surface their own timeouts)"
+            )
 
     def _confirm_vendor_actions(self) -> None:
         """Compare the profile's action table with GetActionList (design D7).
@@ -407,9 +563,21 @@ class UnitreeG1RuntimeNode(Node):
         A query that never answers fails closed the same way.
         """
         table = {str(name): dict(entry) for name, entry in (self._vendor.get("arm_actions") or {}).items()}
-        result = self.rpc_call("arm", projection.ARM_ACTION_API_IDS["get_action_list"], {})
+        result = self.rpc_call("arm", "get_action_list", None)
         confirmed: set[str] = set()
-        if result.ok and isinstance(result.data, dict):
+        if result.ok and isinstance(result.data, list):
+            # Actual firmware returns [preset objects, custom-action objects].
+            presets = result.data[0] if result.data and isinstance(result.data[0], list) else result.data
+            for name, entry in table.items():
+                if any(
+                    isinstance(item, dict)
+                    and type(item.get("id")) is int
+                    and item["id"] == entry.get("action_id")
+                    and item.get("name") == entry.get("action_name")
+                    for item in presets
+                ):
+                    confirmed.add(name)
+        elif result.ok and isinstance(result.data, dict):
             reported = {str(name) for name in result.data.get("names", [])}
             for name, entry in table.items():
                 if str(entry.get("action_name", "")) in reported:
@@ -426,59 +594,89 @@ class UnitreeG1RuntimeNode(Node):
         self._state.set_capability_params("motion.named", {"names": sorted(confirmed)})
 
     # --- vendor feedback -------------------------------------------------------
-
-    def _on_lowstate(self, message: vg.LowState) -> None:
-        try:
-            positions = projection.low_state_joint_positions(vg.lowstate_q(message))
-            imu = projection.imu_payload(vg.lowstate_imu(message))
-        except ValueError as exc:  # ProjectionError is a ValueError; keep the last good sample
-            self.get_logger().warning(f"dropping malformed LowState frame: {exc}", throttle_duration_sec=10.0)
-            return
-        clock = self.get_clock().now()
-        with self._lock:
-            self._lowstate_positions = positions
-            self._lowstate_stamp = time.monotonic()
-            self._lowstate_clock = clock
-            self._mode_machine_observed = vg.lowstate_mode_machine(message)
-            self._imu_payload = imu
-
-    def _on_hand_state(self, side: str, message: vg.HandState) -> None:
-        try:
-            positions = projection.dex3_joint_positions(vg.handstate_q(message), side=side)
-        except ValueError as exc:  # a wrong slot count or a non-finite position
-            self.get_logger().warning(f"dropping malformed {side} hand state: {exc}", throttle_duration_sec=10.0)
-            return
-        with self._lock:
-            self._hand_positions[side] = positions
-            self._hand_stamps[side] = time.monotonic()
-            self._hand_clocks[side] = self.get_clock().now()
+    # (the sample callbacks live next to _setup_vendor_io; they run on the
+    # SDK's reader threads and only touch lock-guarded state)
 
     # --- RPC -------------------------------------------------------------------
 
-    def rpc_call(
-        self, service: str, api_id: int, parameter: Any, *, motion: bool = False, timeout_s: float | None = None
-    ) -> vg.RpcResult:
-        """One request/response round trip, bounded; the entry is always discarded after use.
+    #: The runtime's symbolic api names -> the SDK client methods they invoke.
+    #: The mapping IS the migration table from the vendored ``unitree_api`` ids:
+    #: every call site names its intent here, the dispatcher binds it to the
+    #: SDK client method, and the vendor's numeric ids stay inside the SDK.
+    RPC_METHODS: dict[str, str] = {
+        "loco:get_fsm_id": "get_fsm_id",
+        "loco:get_fsm_mode": "get_fsm_mode",
+        "loco:set_fsm_id": "set_fsm_id",
+        "loco:set_velocity": "set_velocity",
+        "robot_state:service_list": "service_list",
+        "arm:execute_action": "execute_action",
+        "arm:get_action_list": "get_action_list",
+        "audio:tts": "tts_maker",
+        "audio:set_rgb_led": "led_control",
+        "audio:get_volume": "get_volume",
+    }
 
-        The caller blocks in its own callback while the executor's other
-        threads deliver the response, so this is only used from service
-        handlers, the startup thread and the action server — never from a
-        timer (the velocity tick manages its pending call without blocking).
-        A timed-out call is a failure; ``motion`` calls are never re-sent here.
+    def rpc_call(
+        self,
+        service: str,
+        api_name: str,
+        parameter: Any,
+        *,
+        motion: bool = False,
+        timeout_s: float | None = None,
+        guard: Callable[[], bool] | None = None,
+    ) -> vg.RpcResult:
+        """One vendor RPC round trip on the SDK's typed client, serialized.
+
+        The SDK's client objects expose no thread-safety guarantee (plain
+        request/future objects over shared channels), so every call to one
+        service goes through that service's dispatcher lock — callers block in
+        their own callback while a call is in flight, which the callback-group
+        layout below already allows for. Which calls block which thread is the
+        stop contract's concern (Q7): motion calls ride the same dispatcher,
+        but a stop never queues behind them because it only zeroes/latches
+        local state and refuses further admission; voice/LED run on their own
+        callback group and can time out without touching motion paths.
+
+        ``api_name`` is the symbolic name from :data:`RPC_METHODS`; the
+        vendor's numeric api ids never leave the SDK.
+
+        ``timeout_s`` is a real per-call bound, not a hint: the adapter sets
+        the vendor client's timeout for this one call and restores it after
+        (inside the dispatcher, so two callers cannot interleave their
+        windows). The bounded queries — the startup peer probe, the stop's FSM
+        read, the locomotion/posture confirmation polls — depend on it: without
+        it every one of them would wait out the profile's full call timeout.
+
+        ``guard`` is the last word before the request goes out, and it runs
+        **inside** the dispatcher: a caller that had to queue behind another
+        vendor call re-checks there whether the command is still admitted. That
+        is what keeps a stale command from being sent *after* the stop that
+        superseded it — the dispatcher it waited on is the same one the stop's
+        zero uses. A refused guard returns ``dropped=True`` (nothing was sent,
+        so there is no unknown fate to latch).
         """
-        timeout = self._rpc_timeout_s if timeout_s is None else float(timeout_s)
+        try:
+            method_name = self.RPC_METHODS[f"{service}:{api_name}"]
+        except KeyError as exc:
+            raise RuntimeError(f"no vendor rpc mapping for {service}:{api_name}") from exc
         client = self._rpc[service]
-        identity_id = client.send(api_id, parameter, timeout_s=timeout, motion=motion)
-        deadline = time.monotonic() + timeout + 0.5
-        while True:
-            result = client.poll(identity_id)
-            if result is not None:
-                client.discard(identity_id)
-                return result
-            if time.monotonic() >= deadline:  # poll resolves its own timeout; this is a hard guard
-                client.discard(identity_id)
-                return vg.RpcResult(ok=False, code=-1, timed_out=True, motion=motion, api_id=api_id)
-            time.sleep(0.01)
+        method = getattr(client, method_name)
+        dispatcher = self._rpc_dispatchers[service]
+        # ``parameter`` is the SDK method's positional argument tuple (or None
+        # for the no-arg queries); the vendor's JSON shapes live inside the
+        # SDK wrappers, not at these call sites.
+        args = tuple(parameter) if parameter is not None else ()
+        with dispatcher, client.call_timeout(timeout_s):
+            if guard is not None and not guard():
+                return vg.RpcResult(ok=False, code=-1, motion=motion, api_id=api_name, dropped=True)
+            outcome = method(*args)
+        if isinstance(outcome, tuple) and len(outcome) == 2:
+            from unitree_g1_adapter.clients import SdkCallResult  # noqa: PLC0415 - single adapter import site
+
+            code, data = outcome
+            outcome = SdkCallResult(ok=int(code) == 0, code=int(code), data=data)
+        return vg.rpc_result_from_sdk(outcome, motion=motion, api_id=api_name)
 
     # --- contract services -------------------------------------------------------
 
@@ -500,16 +698,24 @@ class UnitreeG1RuntimeNode(Node):
             response.valid_transitions = sorted(self._modes.valid_transitions())
             return response
         if decision.reason == "already active":
-            if self._state.stop_latched and target == IDLE_MODE:
-                # A stop leaves the runtime in idle with the latch engaged, so
-                # requesting idle again is how the latch is cleared.
+            if target == IDLE_MODE and (self._state.stop_latched or self._arm_handover_unconfirmed):
+                # A stop (or a stream exit) leaves the runtime in idle with the
+                # latch engaged and, when the arm frame had weight, the
+                # unacknowledged-handover warning published. Requesting idle
+                # again is how the operator takes the frame back: it clears the
+                # latch and the warning once the local weight is 0.
+                unconfirmed = self._arm_handover_unconfirmed
                 if not self._clear_stop_latch():
                     response.success = False
-                    response.message = "stop still in progress; request 'idle' again once it has completed"
+                    response.message = "stop still in progress or arm publication unresolved; refusing to clear latch"
                     response.valid_transitions = [IDLE_MODE]
                     return response
                 response.success = True
-                response.message = "stop latch cleared"
+                response.message = "stop latch cleared" + (
+                    "; the remote arm handover was never acknowledged, and clearing this does not confirm it"
+                    if unconfirmed
+                    else ""
+                )
                 return response
             response.success = True
             response.message = "already active"
@@ -539,7 +745,13 @@ class UnitreeG1RuntimeNode(Node):
             response.valid_transitions = [IDLE_MODE]
             return response
         try:
-            if self._state.stop_epoch != epoch:
+            # A stream exit engages the stop latch by design (the arm frame had
+            # weight), and that latch is this switch's own doing — it moves the
+            # epoch the switch captured. A stop that completed after the vendor
+            # work moves it too. Both leave the runtime exactly where an ``idle``
+            # request wants it: idle, latched, weight target 0. Any other target
+            # still needs the epoch untouched, so no mode switch can mask a stop.
+            if self._state.stop_epoch != epoch and target != IDLE_MODE:
                 response.success = False
                 response.message = f"stop engaged while switching to {target!r}; request 'idle' to clear the latch"
                 response.valid_transitions = [IDLE_MODE]
@@ -556,6 +768,13 @@ class UnitreeG1RuntimeNode(Node):
         return response
 
     def _on_stop(self, request, response):
+        if self._preset_only:
+            self._state.engage_stop("HOLD")
+            response.success = False
+            response.cancel_latency_s = 0.0
+            response.idle_latency_s = response.torque_off_latency_s = -1.0
+            response.message = "admission closed locally; preset cancellation/physical stop is unverified"
+            return response
         policy = str(request.policy or STOP_POLICIES[0])
         response.cancel_latency_s = -1.0
         response.idle_latency_s = -1.0
@@ -564,45 +783,62 @@ class UnitreeG1RuntimeNode(Node):
             response.success = False
             response.message = f"unknown stop policy {policy!r}; supported: {list(STOP_POLICIES)}"
             return response
-        # The posture test needs the vendor's own FSM report, and only for the
-        # policy that releases torque: HOLD switches no FSM.
-        fsm_id: int | None = None
-        if policy == "TORQUE_OFF":
-            fsm_id = self._reported_fsm_id()
-            if fsm_id is None:
-                response.success = False
-                response.message = "the reported FSM could not be read; refusing TORQUE_OFF (fail closed)"
-                return response
-        try:
-            plan = projection.resolve_stop_plan(policy, fsm_id=fsm_id, stop_config=self._vendor.get("stop"))
-        except CommandRejected as rejected:
-            # A balancing biped cannot always honour TORQUE_OFF. Refusing is
-            # the honest answer; holding silently and reporting success is not.
-            response.success = False
-            response.message = f"{rejected.reason}: {rejected.detail}"
-            return response
 
         with self._stop_lock:
             started = time.monotonic()
-            # (1) Close admission first, atomically: the latch and the idle
-            #     commit stop the input callbacks and the output ticks before
-            #     anything else happens, and outlive a vendor failure below.
-            self._state.engage_stop(policy)
-            self._modes.commit(IDLE_MODE)
+            had_stream = bool(self._latch)
+            needs_base_stop = self._modes.mode == "locomotion" or self._velocity_inflight or self._locomotion_requested
+            # (1) Close admission FIRST, atomically, and put no vendor call in
+            #     front of it: the latch and the idle commit stop the input
+            #     callbacks and the output ticks, and they outlive every vendor
+            #     failure below. Every stop policy ramps the shared weight to 0,
+            #     so the local target is known before any query — a vendor read
+            #     that blocks or must time out can no longer delay the latch.
             with self._lock:
+                self._state.engage_stop(policy)
+                self._modes.commit(IDLE_MODE)
                 self._twist = None
                 self._twist_stamp = 0.0
-                self._weight_target = plan.weight_target
+                self._weight_target = projection.MODE_WEIGHT_TARGETS[IDLE_MODE]
             response.cancel_latency_s = time.monotonic() - started
 
-            # (2) Stop walking: an explicit zero, confirmed by the vendor.
-            zero = self.rpc_call(
-                "loco",
-                projection.LOCO_API_IDS["set_velocity"],
-                projection.velocity_parameter(0.0, 0.0, 0.0, self._velocity_duration_s),
-                motion=True,
-            )
-            if not zero.ok:
+            # (2) Only now ask the vendor for its own FSM report. Only the
+            #     torque-releasing policy needs it: HOLD switches no FSM. A
+            #     report that never arrives refuses that policy and keeps the
+            #     admission closed — a failed read must never reopen it.
+            fsm_id: int | None = None
+            if policy == "TORQUE_OFF":
+                fsm_id = self._reported_fsm_id()
+                if fsm_id is None:
+                    response.idle_latency_s = time.monotonic() - started
+                    response.success = False
+                    response.message = (
+                        "the reported FSM could not be read; refusing TORQUE_OFF (fail closed); "
+                        "admission is closed and the stop latch stays engaged"
+                    )
+                    return response
+            try:
+                plan = projection.resolve_stop_plan(policy, fsm_id=fsm_id, stop_config=self._vendor.get("stop"))
+            except CommandRejected as rejected:
+                # A balancing biped cannot always honour TORQUE_OFF. Refusing is
+                # the honest answer; holding silently and reporting success is
+                # not. The refusal covers the torque release only: admission is
+                # already closed and stays closed.
+                response.idle_latency_s = time.monotonic() - started
+                response.success = False
+                response.message = (
+                    f"{rejected.reason}: {rejected.detail}; admission is closed and the stop latch stays engaged"
+                )
+                return response
+
+            # (3) Stop walking: an explicit zero, confirmed by the vendor.
+            # Q7: the stop must not queue behind a mode switch that is
+            # waiting on the vendor, so the zero competes for the loco
+            # dispatcher with a SHORT bounded acquisition; losing that race
+            # is an honest, fail-closed outcome — admission is already closed
+            # and the message says the zero is unconfirmed.
+            zero = self._stop_zero_velocity() if needs_base_stop else None
+            if zero is not None and not zero.ok:
                 response.idle_latency_s = time.monotonic() - started
                 response.success = False
                 response.message = (
@@ -610,25 +846,27 @@ class UnitreeG1RuntimeNode(Node):
                     "stop latched locally, the zero-velocity stop is unconfirmed"
                 )
                 return response
+            if zero is not None:
+                self._locomotion_requested = False
 
-            # (3) The latched targets are already frozen (admission is closed),
+            # (4) The latched targets are already frozen (admission is closed),
             #     so what remains is handing the frame back: ramp the weight to 0.
             ramped, ramp_detail = self._await_weight_zero()
-            response.idle_latency_s = time.monotonic() - started
+            response.idle_latency_s = -1.0 if had_stream else time.monotonic() - started
             if not ramped:
                 response.success = False
                 response.message = f"{ramp_detail}; stop latched locally, the weight handover is unconfirmed"
                 return response
+            if had_stream:
+                # The same fact the exit path reports: the local frame is at
+                # zero weight, the vendor's own handover is not observable.
+                # Visible in status until the operator clears it with `idle`.
+                self._state.add_fault(ARM_HANDOVER_WARNING)
 
-            # (4) TORQUE_OFF releases torque through the damping FSM — never
+            # (5) TORQUE_OFF releases torque through the damping FSM — never
             #     the zero-torque FSM a caller might imagine.
             if plan.fsm_id is not None:
-                release = self.rpc_call(
-                    "loco",
-                    projection.LOCO_API_IDS["set_fsm_id"],
-                    projection.fsm_id_parameter(plan.fsm_id),
-                    motion=True,
-                )
+                release = self.rpc_call("loco", "set_fsm_id", (plan.fsm_id,), motion=True)
                 response.torque_off_latency_s = time.monotonic() - started
                 if not release.ok:
                     response.success = False
@@ -640,9 +878,10 @@ class UnitreeG1RuntimeNode(Node):
                     return response
 
         self._publish_status()
-        response.success = True
+        response.success = not had_stream
         response.message = (
-            "stopped: admission closed, velocity zeroed, streaming targets frozen, shared weight ramped to 0"
+            "local stop complete: admission closed, targets frozen, zero-weight publication complete; "
+            "remote arm handover is not acknowledged by this interface"
         )
         if plan.fsm_id is not None:
             response.message += (
@@ -653,21 +892,74 @@ class UnitreeG1RuntimeNode(Node):
 
     def _reported_fsm_id(self) -> int | None:
         """The vendor's own FSM report, or None when it does not answer."""
-        result = self.rpc_call(
-            "loco", projection.LOCO_API_IDS["get_fsm_id"], {}, timeout_s=min(self._rpc_timeout_s, 1.0)
-        )
-        if result.ok and isinstance(result.data, dict):
-            try:
-                return int(result.data["data"])
-            except (KeyError, TypeError, ValueError):
-                return None
+        result = self.rpc_call("loco", "get_fsm_id", None, timeout_s=min(self._rpc_timeout_s, 1.0))
+        # The SDK wrapper unwraps the vendor's {"data": id} to the bare id.
+        if result.ok and isinstance(result.data, int):
+            return result.data
         return None
 
+    _STOP_ZERO_DISPATCH_WAIT_S = 0.25
+
+    def _stop_zero_velocity(self) -> vg.RpcResult:
+        """The stop's zero-velocity call with bounded dispatcher priority.
+
+        A mode switch waiting on the vendor holds the loco dispatcher for up
+        to one call; the stop waits at most ``_STOP_ZERO_DISPATCH_WAIT_S`` for
+        it instead of the full call timeout, keeping the stop's latency
+        bounded while still serializing against every other loco caller (the
+        SDK clients have no thread-safety guarantee we could rely on).
+        """
+        dispatcher = self._rpc_dispatchers["loco"]
+        if not dispatcher.acquire(timeout=self._STOP_ZERO_DISPATCH_WAIT_S):
+            return vg.RpcResult(ok=False, code=-1, timed_out=True, motion=True, api_id="set_velocity")
+        try:
+            outcome = self._rpc["loco"].set_velocity(0.0, 0.0, 0.0, self._velocity_duration_s)
+        except Exception as exc:  # noqa: BLE001 - a dispatch failure is a failed stop, not a crash
+            self.get_logger().warning(f"the stop's zero-velocity dispatch failed: {exc}")
+            return vg.RpcResult(ok=False, code=-1, timed_out=True, motion=True, api_id="set_velocity")
+        finally:
+            dispatcher.release()
+        return vg.rpc_result_from_sdk(outcome, motion=True, api_id="set_velocity")
+
+    def _clear_handover_warning(self) -> None:
+        """Drop only the arm-handover warning; every other fault stays."""
+        faults = self._state.faults
+        remaining = [fault for fault in faults if fault != ARM_HANDOVER_WARNING]
+        if len(remaining) != len(faults):
+            self._state.set_status(None, remaining)
+
     def _clear_stop_latch(self) -> bool:
-        """Clear the latch, unless a stop is still holding it."""
+        """Clear the latch, unless a stop is still holding it.
+
+        This is also the operator's way out of an unacknowledged arm handover.
+        Once the shared weight is 0 and no publication is in flight, the local
+        side of the handover is complete: an explicit ``idle`` takes the
+        :data:`ARM_HANDOVER_WARNING` back and clears the latch. That is the
+        operator saying "the frame is mine", not a claim that the vendor
+        acknowledged the handover — and stream re-entry still runs the full
+        admission (hold latch, service ownership, FSM, fresh feedback), so
+        nothing about the fail-closed path gets weaker.
+        """
+        if self._preset_only:
+            return False
         if not self._stop_lock.acquire(blocking=False):
             return False
         try:
+            with self._lock:
+                if self._arm_write_fault or self._arm_write_pending or self._weight > 0.0:
+                    return False
+                # Local handover is settled (weight 0, nothing pending): the
+                # remaining unknown is the vendor's acknowledgement, which this
+                # interface cannot observe and must not keep claiming.
+                self._arm_handover_unconfirmed = False
+                # The session is over, so drop the 17-joint frame: leaving it
+                # here made "entered stream at some point" masquerade as "is in
+                # stream now" (a later stop then reported success=False and
+                # re-raised the warning for a stream that no longer exists).
+                # The weight is 0 and no publication is pending, so no tick
+                # consumes the frame any more.
+                self._latch = {}
+            self._clear_handover_warning()
             self._state.clear_stop()
             if self._startup_fault is not None:
                 # A stop never healed a generation mismatch.
@@ -711,11 +1003,10 @@ class UnitreeG1RuntimeNode(Node):
             response.message = "the vendor TTS call has no interrupt semantics; requests queue at the vendor"
             return response
         tts = self._vendor.get("tts") or {}
-        result = self.rpc_call(
-            "audio",
-            projection.AUDIO_API_IDS["tts"],
-            projection.tts_parameter(text, index=int(tts.get("index", 0)), speaker_id=int(tts.get("speaker_id", 0))),
-        )
+        # The adapter's TtsMaker wrapper takes (text, speaker_id); the profile's
+        # index stays profile data (the upstream index quirk is documented on
+        # the wrapper: the vendor's own counter never leaves 0).
+        result = self.rpc_call("audio", "tts", (str(text), int(tts.get("speaker_id", 0))))
         response.success = result.ok
         response.error_code = "" if result.ok else "REJECTED"
         response.message = (
@@ -750,11 +1041,7 @@ class UnitreeG1RuntimeNode(Node):
             response.success, response.error_code = False, "INVALID_REQUEST"
             response.message = "the vendor LED call carries no priority or preemption; only the neutral defaults map"
             return response
-        result = self.rpc_call(
-            "audio",
-            projection.AUDIO_API_IDS["set_rgb_led"],
-            projection.led_parameter(int(request.r), int(request.g), int(request.b)),
-        )
+        result = self.rpc_call("audio", "set_rgb_led", (int(request.r), int(request.g), int(request.b)))
         response.success = result.ok
         response.error_code = "" if result.ok else "REJECTED"
         response.message = (
@@ -780,7 +1067,7 @@ class UnitreeG1RuntimeNode(Node):
         current = self._modes.mode
         steps: list[str] = []
         if current == "stream" and mode != "stream":
-            ok, detail = self._exit_stream(epoch)
+            ok, detail = self._exit_stream(target_mode=mode)
             if not ok:
                 return False, detail
             steps.append(detail)
@@ -813,24 +1100,64 @@ class UnitreeG1RuntimeNode(Node):
         with self._lock:
             self._twist = None
             self._twist_stamp = 0.0
+
+        def guard() -> bool:
+            """The zero is a motion request too: admission must still hold."""
+            return self._state.stop_epoch == epoch and self._runtime_admitted()
+
         result = self.rpc_call(
-            "loco",
-            projection.LOCO_API_IDS["set_velocity"],
-            projection.velocity_parameter(0.0, 0.0, 0.0, self._velocity_duration_s),
-            motion=True,
+            "loco", "set_velocity", (0.0, 0.0, 0.0, self._velocity_duration_s), motion=True, guard=guard
         )
         if self._state.stop_epoch != epoch:
             return False, "stop engaged while the mode switch was waiting on the vendor"
+        if result.dropped:
+            return False, "the zero-velocity frame was dropped: admission closed before it could be sent"
         if not result.ok:
             detail = "timed out; not re-sent" if result.timed_out else f"failed with vendor code {result.code}"
             return False, f"SetVelocity(0,0,0) {detail}; refusing to leave locomotion with the base still commanded"
         with self._lock:
             self._velocity_sent = (0.0, 0.0, 0.0)
             self._last_velocity_sent_s = time.monotonic()
+            self._locomotion_requested = False
         return True, "locomotion left: the base velocity was zeroed and the vendor confirmed it"
 
     def _enter_stream(self, epoch: int) -> tuple[bool, str]:
-        """Fresh feedback -> latch the 17-joint hold -> SwitchToUserCtrl -> ramp up (D4)."""
+        """Read-only admission, fresh hold latch, then arm weight ramp; no FSM writes."""
+        with self._lock:
+            if self._arm_write_fault or self._arm_write_pending or self._weight > 0.0 or self._arm_handover_unconfirmed:
+                return False, "ARM_HANDOVER_UNKNOWN: previous stream has not completed locally"
+        try:
+            services = self.rpc_call("robot_state", "service_list", None)
+            if not services.ok or not isinstance(services.data, list):
+                return False, "ARM_OWNERSHIP_UNKNOWN: service list unavailable"
+            states = {}
+            for item in services.data:
+                if not isinstance(item, dict) or item.get("name") in states:
+                    return False, "ARM_OWNERSHIP_UNKNOWN: malformed service list"
+                states[item.get("name")] = item.get("status")
+            required = (self._vendor.get("arm_admission") or {}).get("stream_entry") or {}
+            if not required:
+                return False, (
+                    "ARM_OWNERSHIP_UNKNOWN: the profile declares no vendor.arm_admission.stream_entry "
+                    "service ownership, so the frame's owner cannot be established"
+                )
+            for name, expected in required.items():
+                reported = states.get(name)
+                if type(reported) is not int or reported != int(expected):
+                    # 0 running / 1 stopped, straight from the profile: the same
+                    # two refusals the hardcoded check produced, with the names
+                    # and expectations now owned by the profile.
+                    if int(expected) == 0:
+                        return False, f"ARM_OWNERSHIP_UNKNOWN: {name} must already be running"
+                    return False, f"ARM_OWNERSHIP_CONFLICT: {name} must already be stopped"
+            fsm = self.rpc_call("loco", "get_fsm_id", None)
+            allowed = (self._vendor.get("arm_sdk") or {}).get("allowed_fsm_ids", [])
+            if not fsm.ok or type(fsm.data) is not int or fsm.data not in allowed:
+                return False, "ARM_FSM_UNSUPPORTED: current FSM is not admitted for arm_sdk"
+        except Exception as exc:  # fail closed on malformed/unavailable vendor queries
+            return False, f"ARM_ADMISSION_UNAVAILABLE: {exc}"
+        if self._state.stop_epoch != epoch or self._state.stop_latched:
+            return False, "stop engaged while checking stream admission"
         with self._lock:
             stamp = self._lowstate_stamp
             positions = dict(self._lowstate_positions)
@@ -845,28 +1172,46 @@ class UnitreeG1RuntimeNode(Node):
                 "HOLD_TARGETS_INCOMPLETE: the measured positions do not cover the 17-joint arm_sdk "
                 "frame; a partial measurement is no basis for a hold target"
             )
-        result = self.rpc_call("loco", projection.LOCO_API_IDS["switch_to_user_ctrl"], {}, motion=True)
-        if self._state.stop_epoch != epoch:
-            return False, "stop engaged while the mode switch was waiting on the vendor"
-        if not result.ok:
-            detail = "timed out; not re-sent" if result.timed_out else f"failed with vendor code {result.code}"
-            return False, f"SwitchToUserCtrl {detail}"
         with self._lock:
+            if self._state.stop_epoch != epoch or self._state.stop_latched:
+                return False, "stop engaged before the stream latch was committed"
             self._latch = dict(zip(projection.ARM_SDK_FRAME, hold, strict=True))
             # A fresh stream session starts with no hand targets: a target from
             # a previous session would be a motion nobody commanded.
             self._hand_latch = {"left": {}, "right": {}}
             self._weight_target = projection.MODE_WEIGHT_TARGETS["stream"]
-        return True, "stream entered: hold targets latched, SwitchToUserCtrl confirmed, weight ramping to 1"
+        return True, "stream admitted: service ownership/FSM checked, hold latched; no vendor mode changed"
 
-    def _exit_stream(self, epoch: int) -> tuple[bool, str]:
-        """Ramp the shared weight back to 0 before the mode is reported inactive (D4)."""
+    def _exit_stream(self, *, target_mode: str = IDLE_MODE) -> tuple[bool, str]:
+        """Ramp the shared weight back to 0 before the mode is reported inactive (D4).
+
+        The ramp *is* the handover this platform can observe: admission closes,
+        every latched target stays frozen, and the published weight reaches 0.
+        Whether the vendor then hands the frame back to its own control is not
+        observable through this interface, so the switch to ``idle`` SUCCEEDS
+        (the public mode contract holds) while the unacknowledged remote
+        handover stays visible as :data:`ARM_HANDOVER_WARNING` in
+        ``RuntimeStatus``. ``idle`` is what clears that warning and the local
+        latch; every other target keeps the old refusal, because only a settled
+        handover may precede a new vendor mode.
+        """
         with self._lock:
+            self._state.engage_stop("HOLD")
+            self._modes.commit(IDLE_MODE)
             self._weight_target = projection.MODE_WEIGHT_TARGETS[IDLE_MODE]
+        # The latch just engaged is this exit's own generation: only a further
+        # bump means a stop arrived while the ramp was running.
+        latch_epoch = self._state.stop_epoch
         ramped, detail = self._await_weight_zero()
         if ramped:
-            return True, "stream exited: the shared weight reached 0 and the vendor's controller took over"
-        if self._state.stop_epoch != epoch:
+            self._state.add_fault(ARM_HANDOVER_WARNING)
+            if target_mode == IDLE_MODE:
+                return True, (
+                    "stream exited: admission closed, targets frozen, the zero-weight frame was published "
+                    "locally; the remote arm handover is not acknowledged and is reported in status"
+                )
+            return False, "zero-weight frame published locally; remote arm handover is unconfirmed"
+        if self._state.stop_epoch != latch_epoch:
             return False, "stop engaged while stream was exiting"
         return False, detail
 
@@ -874,7 +1219,11 @@ class UnitreeG1RuntimeNode(Node):
         """Wait (bounded) for the 50 Hz tick to ramp the shared weight to 0."""
         with self._lock:
             weight = self._weight
-        if weight <= 0.0:
+            fault = self._arm_write_fault
+            pending = self._arm_write_pending
+        if fault:
+            return False, fault
+        if weight <= 0.0 and not pending:
             return True, ""
         if self._weight_ramp_down_rate <= 0.0:
             return False, "the profile's weight ramp-down rate is not positive"
@@ -883,20 +1232,19 @@ class UnitreeG1RuntimeNode(Node):
         deadline = time.monotonic() + weight / self._weight_ramp_down_rate + 1.0
         while time.monotonic() < deadline:
             with self._lock:
-                if self._weight <= 0.0:
+                if self._arm_write_fault:
+                    return False, self._arm_write_fault
+                if self._weight <= 0.0 and not self._arm_write_pending:
                     return True, ""
             time.sleep(0.02)
         return False, "the shared weight did not ramp back to 0 within the expected time"
 
     def _enter_locomotion(self, epoch: int) -> tuple[bool, str]:
         """SetFsmId(start), then commit only once GetFsmId reports it (D5)."""
+        with self._lock:
+            self._locomotion_requested = True
         fsm_id = projection.FSM_IDS["start"]
-        result = self.rpc_call(
-            "loco",
-            projection.LOCO_API_IDS["set_fsm_id"],
-            projection.fsm_id_parameter(fsm_id),
-            motion=True,
-        )
+        result = self.rpc_call("loco", "set_fsm_id", (fsm_id,), motion=True)
         if self._state.stop_epoch != epoch:
             return False, "stop engaged while the mode switch was waiting on the vendor"
         if not result.ok:
@@ -906,8 +1254,10 @@ class UnitreeG1RuntimeNode(Node):
         while time.monotonic() < deadline:
             if self._state.stop_epoch != epoch:
                 return False, "stop engaged while waiting for the vendor to confirm the FSM"
-            answer = self.rpc_call("loco", projection.LOCO_API_IDS["get_fsm_id"], {}, timeout_s=0.5)
-            if answer.ok and isinstance(answer.data, dict) and answer.data.get("data") == fsm_id:
+            answer = self.rpc_call("loco", "get_fsm_id", None, timeout_s=0.5)
+            # The SDK wrapper unwraps the vendor's {"data": id} JSON to the
+            # bare id (adapter-verified behavior).
+            if answer.ok and answer.data == fsm_id:
                 return True, f"locomotion confirmed: the vendor reports FSM {fsm_id}"
             time.sleep(0.05)
         return False, f"the vendor did not report FSM {fsm_id} within {self._rpc_timeout_s:.0f}s"
@@ -1005,6 +1355,8 @@ class UnitreeG1RuntimeNode(Node):
         latch is frozen because admission is closed.
         """
         with self._lock:
+            if self._arm_write_fault:
+                return
             latch = dict(self._latch)
             weight = self._weight
             target = self._weight_target
@@ -1018,19 +1370,41 @@ class UnitreeG1RuntimeNode(Node):
         # back (stop, exit, closed admission) uses the stop section's rate.
         rate = self._weight_ramp_up_rate if target > weight else self._weight_ramp_down_rate
         new_weight = projection.ramp_weight(weight, target, rate_per_s=rate, dt_s=self._arm_sdk_period_s)
-        message = vg.lowcmd_from_dict(
-            projection.arm_sdk_lowcmd(
-                latch,
-                weight=new_weight,
-                mode_pr=self._mode_pr,
-                mode_machine=self._mode_machine_expected,
-                kp=self._arm_sdk_kp,
-                kd=self._arm_sdk_kd,
-            )
+        frame = projection.arm_sdk_lowcmd(
+            latch,
+            weight=new_weight,
+            mode_pr=self._mode_pr,
+            mode_machine=self._mode_machine_expected,
+            kp=self._arm_sdk_kp,
+            kd=self._arm_sdk_kd,
         )
+        # The adapter's CommandWriter accepts the projection's frame mapping
+        # (slot list + the frame-level mode_pr/mode_machine/crc) and builds
+        # the vendor LowCmd_ on the SDK path; a refused write is counted, not
+        # assumed delivered.
         with self._lock:
-            self._weight = new_weight
-        self._arm_sdk_pub.publish(message)
+            # Recheck after frame construction: a stop must discard unsent ramp-up.
+            if new_weight > weight and not (self._runtime_admitted() and self._modes.spec().allows_stream):
+                return
+            self._arm_write_pending = True
+            if new_weight > 0.0:
+                self._arm_handover_unconfirmed = True
+        try:
+            sent = self._arm_sdk_writer.write(frame)
+            detail = "writer refused the frame"
+        except Exception as exc:  # publication outcome unknown; never auto-retry
+            sent, detail = False, str(exc)
+        with self._lock:
+            self._arm_write_pending = False
+            if sent:
+                self._weight = new_weight
+            else:
+                self._arm_write_fault = f"ARM_HANDOVER_UNKNOWN: {detail}; no automatic retry"
+                self._weight_target = 0.0
+        if not sent:
+            self._state.engage_stop("HOLD")
+            self._modes.commit(IDLE_MODE)
+            self.get_logger().error(self._arm_write_fault)
 
     def _dex3_tick(self) -> None:
         """Publish latched hand targets at the profile's Dex3 rate, in stream mode."""
@@ -1041,9 +1415,12 @@ class UnitreeG1RuntimeNode(Node):
         for side, latched in targets.items():
             if not latched:
                 continue  # a hand nobody commanded is not commanded at all
-            self._hand_pubs[side].publish(
-                vg.handcmd_from_dict(projection.dex3_handcmd(latched, side=side, kp=self._dex3_kp, kd=self._dex3_kd))
-            )
+            frame = projection.dex3_handcmd(latched, side=side, kp=self._dex3_kp, kd=self._dex3_kd)
+            if not self._hand_writers[side].write(frame["motor_cmd"]):
+                self.get_logger().warning(
+                    f"the vendor refused the {side} hand command frame (write failed)",
+                    throttle_duration_sec=5.0,
+                )
 
     def _velocity_tick(self) -> None:
         """Issue SetVelocity for the current command at the profile's duration.
@@ -1052,54 +1429,97 @@ class UnitreeG1RuntimeNode(Node):
         waiting out the previous command's duration would delay a stop or a
         change of direction by up to that duration. The duration throttle
         applies only to repeating the SAME command, which is the renewal the
-        profile describes. One call is in flight at a time; while a call is
-        pending the latest command waits in the cache and is dispatched on a
-        later tick the moment the pending one resolves and the comparison
-        still shows a difference.
+        profile describes.
+
+        The SDK's ``SetVelocity`` blocks up to the client timeout on the
+        calling thread, so the tick does NOT call it directly: a 5 s stall
+        would freeze the 50 Hz tick group the stop ramp depends on. Instead
+        the tick hands the command to a single-flight worker thread
+        (:meth:`_velocity_worker`) and only records the dispatch. The worker
+        serializes through the loco dispatcher like every other loco call; a
+        command dispatched while an earlier one is still in flight is the
+        caller's (this tick's) problem and is dropped by the worker — the
+        latest command is always re-dispatched by the next tick, and a motion
+        request whose fate is unknown is never re-sent (Q7): a failed or
+        timed-out dispatch drops the cached command entirely, and only a
+        fresh upstream Twist re-arms the cadence.
+
+        Admission is checked twice: here (cheap, before a thread is worth
+        starting) and again in the worker, under the loco dispatcher, against
+        the ``(stop generation, mode)`` snapshot this tick records. A command
+        that had to wait behind the stop's zero must not be sent after it.
         """
         with self._lock:
-            pending = self._velocity_pending
+            inflight = self._velocity_inflight
             twist = self._twist
             twist_stamp = self._twist_stamp
             last_sent = self._last_velocity_sent_s
             sent = self._velocity_sent
         now = time.monotonic()
-        if pending is not None:
-            result = self._rpc["loco"].poll(pending)
-            if result is None:
-                return  # still in flight; the latest command is already cached
-            self._rpc["loco"].discard(pending)
-            with self._lock:
-                self._velocity_pending = None
-            if not result.ok:
-                # A motion call whose fate is unknown is not re-sent: the
-                # cached command is abandoned and only a fresh upstream Twist
-                # re-arms the cadence.
-                with self._lock:
-                    self._twist = None
-                    self._twist_stamp = 0.0
-                    self._velocity_sent = None
-                self.get_logger().warning(
-                    f"SetVelocity {'timed out' if result.timed_out else f'failed with code {result.code}'}; "
-                    "the cached velocity command was dropped, a fresh Twist re-arms it"
-                )
-                return
+        if inflight:
+            return  # one call at a time; the latest command is already cached or will re-tick
         if not (self._modes.spec().allows_base and self._runtime_admitted()):
             return
         if twist is None or now - twist_stamp > self._twist_staleness_s:
             return
         if twist == sent and now - last_sent < self._velocity_duration_s:
             return  # the same command is still within its issued duration
-        identity_id = self._rpc["loco"].send(
-            projection.LOCO_API_IDS["set_velocity"],
-            projection.velocity_parameter(twist[0], twist[1], twist[2], self._velocity_duration_s),
-            timeout_s=self._rpc_timeout_s,
-            motion=True,
-        )
+        payload = (twist[0], twist[1], twist[2], self._velocity_duration_s)
+        # The generation this command belongs to, captured where admission was
+        # granted: the worker may have to queue behind the loco dispatcher, and
+        # a command accepted before a stop must never be sent after it.
+        snapshot = (self._state.stop_epoch, self._modes.mode)
         with self._lock:
-            self._velocity_pending = identity_id
+            self._velocity_inflight = True
             self._velocity_sent = twist
             self._last_velocity_sent_s = now
+        thread = threading.Thread(target=self._velocity_worker, args=(payload, snapshot), daemon=True)
+        thread.start()
+
+    def _velocity_worker(self, payload: tuple[float, float, float, float], snapshot: tuple[int, str]) -> None:
+        """The single-flight SetVelocity executor; one thread per dispatch.
+
+        ``snapshot`` is the (stop generation, mode) pair the command was admitted
+        under. The guard re-checks it under the loco dispatcher, so a command
+        that waited behind the stop's zero-velocity call is dropped instead of
+        being sent afterwards — otherwise the base would keep walking for up to
+        ``command_duration_s`` on a command nobody admits any more.
+        """
+        epoch, mode = snapshot
+
+        def guard() -> bool:
+            return (
+                self._state.stop_epoch == epoch
+                and self._modes.mode == mode
+                and self._runtime_admitted()
+                and self._modes.spec().allows_base
+            )
+
+        try:
+            result = self.rpc_call("loco", "set_velocity", payload, motion=True, guard=guard)
+        except Exception as exc:  # noqa: BLE001 - a dispatch must never kill the runtime
+            self.get_logger().warning(f"SetVelocity dispatch failed: {exc}")
+            result = None
+        finally:
+            with self._lock:
+                self._velocity_inflight = False
+        if result is not None and not result.ok:
+            # A command that was never sent, or whose fate is unknown, is not
+            # re-sent: the cached command is abandoned and only a fresh upstream
+            # Twist re-arms it.
+            with self._lock:
+                self._twist = None
+                self._twist_stamp = 0.0
+                self._velocity_sent = None
+            if result.dropped:
+                self.get_logger().info(
+                    "SetVelocity not sent: admission closed or the mode changed while it waited for the vendor"
+                )
+            else:
+                self.get_logger().warning(
+                    f"SetVelocity {'timed out' if result.timed_out else f'failed with code {result.code}'}; "
+                    "the cached velocity command was dropped, a fresh Twist re-arms it"
+                )
 
     # --- state publication --------------------------------------------------------
 
@@ -1153,6 +1573,53 @@ class UnitreeG1RuntimeNode(Node):
 
     # --- accessors used by helper modules -------------------------------------------
 
+    def admit_preset_attempt(self) -> tuple[bool, str]:
+        """Read-only preflight for each independent request; dispatch is serialized."""
+        with self._lock:
+            if self._state.stop_latched:
+                return False, "preset stop latched or prior outcome unknown; no dispatch"
+        if not self._preset_physical:
+            return True, "mock transport"
+        try:
+            services = self.rpc_call("robot_state", "service_list", None)
+            if not services.ok:
+                failure = "timed out" if services.timed_out else "failed"
+                return False, (
+                    f"service ownership query failed: robot_state.service_list {failure} "
+                    f"(SDK code {services.code}); preset not dispatched"
+                )
+            if not isinstance(services.data, list):
+                return False, (
+                    "service ownership query failed: robot_state.service_list returned an invalid response "
+                    "(expected a service list); preset not dispatched"
+                )
+            required = (self._vendor.get("preset_commissioning") or {}).get("required_services") or {}
+            if not required:
+                return False, (
+                    "PRESET_ADMISSION_UNCONFIGURED: the profile declares no "
+                    "vendor.preset_commissioning.required_services ownership check"
+                )
+            for name, expected in required.items():
+                matches = [s for s in services.data if isinstance(s, dict) and s.get("name") == name]
+                if (
+                    len(matches) != 1
+                    or type(matches[0].get("status")) is not int
+                    or matches[0]["status"] != int(expected)
+                ):
+                    return False, f"{name} is not confirmed running"
+            fsm = self.rpc_call("loco", "get_fsm_id", None)
+            expected = (self._vendor.get("operator_validation") or {}).get("expected_fsm_id")
+            if not fsm.ok or type(expected) is not int or type(fsm.data) is not int or fsm.data != expected:
+                return False, "FSM changed or unavailable; no automatic mode switch"
+            with self._lock:
+                if not projection.is_fresh(self._lowstate_stamp, time.monotonic(), self._feedback_window_s):
+                    return False, "joint feedback is stale"
+                if self._state.stop_latched:
+                    return False, "stop engaged during preflight"
+            return True, f"operator-supervised preset attempt in observed FSM {fsm.data}"
+        except Exception as exc:
+            return False, f"preset preflight failed: {exc}"
+
     @property
     def profile(self) -> dict[str, Any]:
         return self._profile
@@ -1196,6 +1663,12 @@ def main(argv=None) -> int:
         pass
     finally:
         node.destroy_node()
+        # Release the adapter's channels; the vendor factory itself is a
+        # process-wide singleton with no teardown API (its reader threads
+        # are daemons), so closing the feeds/writers/clients is the full
+        # cleanup the SDK offers. Teardown must not mask the exit path.
+        with contextlib.suppress(Exception):
+            node._sdk.close()
         if rclpy.ok():
             rclpy.shutdown()
     return 0
