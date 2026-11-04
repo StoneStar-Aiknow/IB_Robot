@@ -79,6 +79,42 @@ def _json_value(value):
     return str(value)
 
 
+#: What each attempt's target watch summary keeps in the terminal log (its per-frame records never leave the head).
+WATCH_LOG_KEYS = ("mode", "state", "imu", "frames", "votes", "skipped", "moved", "halted", "fault", "error", "host")
+#: The end effector phases whose outcome explains a grip: the close, and where it was lost.
+GRIP_PHASES = ("close", "lift", "hold_lifted")
+GRIP_LOG_KEYS = ("state", "reason", "held", "gripped", "contacts", "measured", "command", "touch_after")
+
+
+def terminal_record(outcome: PickOutcome) -> dict:
+    """The pick's one-line terminal log: the chosen arm, phases, and per attempt the watch summary and the grip."""
+    report = outcome.report
+    return {
+        "event": "grasp_pipeline_terminal",
+        "success": outcome.success,
+        "arm_side": report.get("plan", {}).get("arm_side", ""),
+        "completed_phases": outcome.completed_phases,
+        "held": outcome.held,
+        "released_after_success": outcome.released_after_success,
+        "at_rest": outcome.at_rest,
+        "error_code": outcome.error_code,
+        "watch": [
+            {key: watch[key] for key in WATCH_LOG_KEYS if key in watch}
+            for watch in report.get("watch", [])
+            if isinstance(watch, Mapping)
+        ],
+        "grip": [
+            [
+                {"name": row["name"], **{key: row[key] for key in GRIP_LOG_KEYS if key in row}}
+                for row in execution.get("phases", [])
+                if isinstance(row, Mapping) and row.get("name") in GRIP_PHASES
+            ]
+            for execution in report.get("executions", [])
+            if isinstance(execution, Mapping)
+        ],
+    }
+
+
 def pick_result(outcome: PickOutcome, identity: dict[str, str]) -> PickObject.Result:
     result = PickObject.Result()
     result.success = bool(outcome.success)
@@ -178,6 +214,7 @@ class GraspPipelineNode(Node):
             else:
                 outcome = self._run(goal_handle, time.monotonic() + remaining)
             result = pick_result(outcome, self._identity)
+            self.get_logger().info(json.dumps(terminal_record(outcome), default=_json_value))
             if not outcome.at_rest:
                 self.get_logger().error(f"arm stopped in place: {outcome.error_code}: {outcome.message}")
             if outcome.success:

@@ -19,7 +19,12 @@ from embodied_common.dispatch_binding import delegated_executor_identity, fill_d
 from ibrobot_msgs.action import PickObject
 from manipulation_execution.grasp_pipeline.contracts import EffectorAction, GraspBackends, MotionOutcome, MotionState
 from manipulation_execution.grasp_pipeline.pipeline import PickOutcome
-from manipulation_execution.grasp_pipeline_node import GraspPipelineNode, pipeline_config, verification_status
+from manipulation_execution.grasp_pipeline_node import (
+    GraspPipelineNode,
+    pipeline_config,
+    terminal_record,
+    verification_status,
+)
 from manipulation_execution.pick_goal import pick_goal_rejection, remaining_budget_s
 
 ACTION = "/test/grasp_pipeline/execute_pick"
@@ -266,3 +271,55 @@ def test_goals_are_refused_until_the_backends_are_warm(ros, monkeypatch):
 def test_a_robot_without_a_backend_keeps_the_primitive_executor(ros):
     with pytest.raises(ValueError, match="pick_executor_node"):
         GraspPipelineNode(parameter_overrides=[Parameter("grasp_execution_json", value="{}")])
+
+
+def test_terminal_record_keeps_each_attempts_watch_summary_and_grip():
+    outcome = PickOutcome(error_code="GRASP_VERIFICATION_FAILED")
+    outcome.report.update(
+        plan={"arm_side": "right"},
+        watch=[
+            {
+                "mode": "stop",
+                "imu": False,
+                "frames": 27,
+                "votes": {"still": 0, "moved": 0, "unknown": 27},
+                "skipped": 1,
+                "config": {"large": True},
+                "crop": [0, 1, 2, 3],
+                "host": {"mode": "stop", "fault": None},
+            }
+        ],
+        executions=[
+            {
+                "phases": [
+                    {"name": "approach", "state": "succeeded", "reason": ""},
+                    {"name": "close", "state": "succeeded", "gripped": True, "contacts": {"thumb": {"by": "lag"}}},
+                    {"name": "lift", "state": "grip_lost", "reason": "the contact fingers no longer press"},
+                ],
+                "retreated": True,
+            }
+        ],
+    )
+    record = json.loads(json.dumps(terminal_record(outcome)))
+    assert record["event"] == "grasp_pipeline_terminal" and record["arm_side"] == "right"
+    assert record["watch"] == [
+        {
+            "mode": "stop",
+            "imu": False,
+            "frames": 27,
+            "votes": {"still": 0, "moved": 0, "unknown": 27},
+            "skipped": 1,
+            "host": {"mode": "stop", "fault": None},
+        }
+    ]
+    assert record["grip"] == [
+        [
+            {"name": "close", "state": "succeeded", "gripped": True, "contacts": {"thumb": {"by": "lag"}}},
+            {"name": "lift", "state": "grip_lost", "reason": "the contact fingers no longer press"},
+        ]
+    ]
+
+
+def test_terminal_record_without_watch_or_execution_is_empty_lists():
+    record = terminal_record(PickOutcome(error_code="NO_EXECUTABLE_CANDIDATE"))
+    assert record["watch"] == [] and record["grip"] == [] and record["arm_side"] == ""
