@@ -113,6 +113,14 @@ the suite.
 directions of the robot-runtime-packaging acceptance: `runtime <robot>_robot`
 builds the closure in isolation and certifies it, `core` builds the generic
 set with every robot package excluded and composes against the mock runtime.
+The runtime mode computes three closures with `scripts/runtime_closure.py`
+(catkin_pkg): the fixed allow-list audits the **execution** closure
+(exec/depend edges only, which must contain no simulation package), the
+isolated workspace is built from the **build** closure, and inside the
+isolated run the gate asserts `robot_runtime_sim` and `sim_models` are
+invisible — no importable module, no `ibrobot.sim_platforms` entry point, no
+ament share directory — so a leak from a surrounding full workspace install
+fails the gate instead of passing silently.
 
 ## Stop guarantees (facade)
 

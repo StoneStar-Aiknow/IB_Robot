@@ -150,7 +150,8 @@ sensors always sit exactly at the mount.
 accuracy gate for this runtime. It lives in `robot_navigation`, not here:
 it launches the generic application entry, and this package may not declare
 test dependencies on generic packages (the independence gate below audits
-the whole dependency closure, test dependencies included). It is
+the execution closure; test dependencies only reach its test closure, never
+the runtime's execution surface). It is
 parametrized over profile (`lekiwi_lidar`, `lekiwi_nav_grasp`) as well as
 platform: the mobile manipulator runs the SAME thresholds over the SAME
 route, staged from the gate's own

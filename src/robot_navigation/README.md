@@ -694,7 +694,7 @@ colcon test --packages-select robot_navigation --base-paths src --event-handlers
 `test/test_lidar_odometry_gate.py` 是 LeKiwi 的 FAST-LIO 精度门禁（openspec change
 `lekiwi-gazebo-runtime-platform` D14），说明见 `lekiwi_robot` README 的「Lidar-odometry regression gate」一节。
 该门禁通过 `robot_config` 的通用入口启动仿真器（Gazebo 与 MuJoCo 各一条腿）与 Nav2，所以放在本包，不放在 `lekiwi_robot`：运行时包的
-测试依赖也计入 `scripts/verify_runtime_independence.sh` 的依赖闭包审计。Ubuntu 上默认执行；openEuler 上或设置
+测试依赖计入 `scripts/verify_runtime_independence.sh` 的测试闭包（但不出现在其执行闭包审计里，运行时执行面不依赖仿真包）。Ubuntu 上默认执行；openEuler 上或设置
 `NAV_TEST_PROFILE=minimal` 时跳过。只跑该门禁：
 
 ```bash
