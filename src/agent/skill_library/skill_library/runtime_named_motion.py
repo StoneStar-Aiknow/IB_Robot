@@ -12,10 +12,12 @@ ROS graph:
   goal rejection;
 * every runtime result code maps to one explicit public error code.
 
-Named motions cannot be cancelled: the runtime refuses cancel requests because
-the platform offers no way to stop a preset motion and stopping a posture
-change half-way is a fall. The executor therefore never forwards a cancel; the
-operator path to interrupt motion is the runtime stop service.
+The executor forwards a cancel and the runtime decides whether it is honoured.
+It accepts one only for a replayed trajectory, which stops between ticks and
+hands back a resume token. It refuses presets and postures: the platform offers
+no way to stop a preset motion and stopping a posture change half-way is a
+fall. A refused cancel lets the motion end as it would; the operator path to
+interrupt it is the runtime stop service.
 """
 
 from __future__ import annotations

@@ -3,17 +3,70 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import http.client
 import json
 import os
 import pathlib
+import ssl
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any
 
 from embodied_common.model_timeout import resolve_model_output_idle_timeout
 
 _YAML_BASENAME = "vlm_models.yaml"
+
+#: Failures of a reused keep-alive socket before any response byte arrived: the
+#: peer closed it while idle (with or without a TLS close_notify). Only these,
+#: and only on a reused socket, are retried -- once a status line has arrived
+#: the request reached the model, and re-sending it would pay for it twice.
+_STALE_CONNECTION_ERRORS = (
+    http.client.RemoteDisconnected,
+    ConnectionResetError,
+    BrokenPipeError,
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+)
+
+
+def _close_quietly(connection: http.client.HTTPConnection | None) -> None:
+    if connection is not None:
+        with contextlib.suppress(OSError):
+            connection.close()
+
+
+def _merge_tool_call_deltas(calls: dict[int, dict[str, Any]], deltas: list[Any]) -> None:
+    """Fold streamed tool-call fragments into whole calls, keyed by ``index``.
+
+    A streamed call arrives as fragments: the first carries ``id``, ``type``
+    and the function name, later ones only pieces of ``function.arguments``.
+    Merging them gives the same shape a blocking call returns.
+    """
+    for delta in deltas:
+        if not isinstance(delta, dict):
+            continue
+        index = delta.get("index")
+        if index is None:
+            # Without an index, an id starts a new call and anything else
+            # continues the latest one.
+            index = len(calls) if delta.get("id") or not calls else max(calls)
+        if not isinstance(index, int) or isinstance(index, bool):
+            continue
+        call = calls.setdefault(index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+        if isinstance(delta.get("id"), str) and delta["id"]:
+            call["id"] = delta["id"]
+        if isinstance(delta.get("type"), str) and delta["type"]:
+            call["type"] = delta["type"]
+        function = delta.get("function")
+        if isinstance(function, dict):
+            if isinstance(function.get("name"), str) and function["name"]:
+                call["function"]["name"] = function["name"]
+            if isinstance(function.get("arguments"), str):
+                call["function"]["arguments"] += function["arguments"]
 
 
 def _default_yaml_path() -> pathlib.Path:
@@ -67,6 +120,41 @@ class VLMAPIClient:
         if api_protocol not in {"chat_completions", "responses"}:
             raise ValueError("api_protocol must be 'chat_completions' or 'responses'")
         self._api_protocol = api_protocol
+        # One idle keep-alive connection per client instance. A call borrows
+        # it for the whole request and hands it back afterwards; the lock only
+        # guards that slot, never the request. One client is shared by
+        # concurrent callers (perception_service runs a thread per request),
+        # so a call that finds the slot taken opens its own connection rather
+        # than waiting, unbounded, for another caller's model call to finish.
+        self._connection: http.client.HTTPConnection | None = None
+        self._connection_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Drop the idle keep-alive connection, if any."""
+        with self._connection_lock:
+            connection, self._connection = self._connection, None
+        _close_quietly(connection)
+
+    def _borrow_connection(self, timeout_sec: float) -> tuple[http.client.HTTPConnection, bool]:
+        """Take the idle connection, or open one; return it and whether it was reused."""
+        with self._connection_lock:
+            connection, self._connection = self._connection, None
+        if connection is None:
+            return self._open_connection(timeout_sec), False
+        # The timeout can differ from the call that created the socket.
+        connection.timeout = timeout_sec
+        if connection.sock is not None:
+            connection.sock.settimeout(timeout_sec)
+        return connection, True
+
+    def _return_connection(self, connection: http.client.HTTPConnection, *, reusable: bool) -> None:
+        """Park a connection whose response was read to its end, or close it."""
+        if reusable:
+            with self._connection_lock:
+                if self._connection is None:
+                    self._connection = connection
+                    return
+        _close_quietly(connection)
 
     def _build_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -87,33 +175,262 @@ class VLMAPIClient:
             headers["Authorization"] = f"Bearer {api_key}"
         return headers
 
+    def _request_target(self) -> tuple[urllib.parse.SplitResult, str]:
+        endpoint = "/responses" if self._api_protocol == "responses" else "/chat/completions"
+        split = urllib.parse.urlsplit(f"{self._base_url}{endpoint}")
+        path = split.path or "/"
+        if split.query:
+            path = f"{path}?{split.query}"
+        return split, path
+
+    def _proxy_route(self) -> tuple[str, int, dict[str, str]] | None:
+        """Return ``(host, port, auth headers)`` of the proxy for the target, if any.
+
+        Before keep-alive this client went through urllib, which honours
+        ``*_PROXY``; http.client does not, so the same choices are made here
+        explicitly, matching urllib rather than any other client (the X2
+        deployment reaches the model through a CONNECT proxy). urllib ignores
+        the proxy URL's scheme for an HTTPS target and CONNECTs in plain TCP,
+        defaults a missing proxy port to the target connection's (443 for
+        HTTPS), and sends credentials only when both user and password are
+        non-empty.
+        """
+        split, _ = self._request_target()
+        host = split.hostname or ""
+        proxy = urllib.request.getproxies().get(split.scheme) or ""
+        if not proxy or urllib.request.proxy_bypass(host):
+            return None
+        proxy_split = urllib.parse.urlsplit(proxy if "//" in proxy else f"http://{proxy}")
+        proxy_host = proxy_split.hostname or ""
+        if not proxy_host:
+            raise RuntimeError(f"VLM API proxy has no host: {proxy!r}")
+        if split.scheme == "http" and proxy_split.scheme not in {"", "http"}:
+            # urllib would speak TLS to such a proxy for a plain-HTTP target;
+            # nothing deployed needs that, so refuse it instead of guessing.
+            raise RuntimeError(f"VLM API proxy for an http:// target must be http://: {proxy!r}")
+        proxy_port = proxy_split.port or (443 if split.scheme == "https" else 80)
+        auth: dict[str, str] = {}
+        user = urllib.parse.unquote(proxy_split.username or "")
+        password = urllib.parse.unquote(proxy_split.password or "")
+        if user and password:
+            credentials = f"{user}:{password}".encode()
+            auth["Proxy-Authorization"] = "Basic " + base64.b64encode(credentials).decode("ascii")
+        return proxy_host, proxy_port, auth
+
+    def _forwarding(self) -> tuple[str, dict[str, str]]:
+        """Return the request-URI prefix and headers a forwarding proxy needs.
+
+        A plain-HTTP target behind a proxy is forwarded, as urllib does:
+        absolute-form request URI, credentials on the request itself. A
+        tunnelled HTTPS target needs neither.
+        """
+        split, _ = self._request_target()
+        route = self._proxy_route() if split.scheme == "http" else None
+        if route is None:
+            return "", {}
+        return f"{split.scheme}://{split.netloc}", route[2]
+
+    def _open_connection(self, timeout_sec: float) -> http.client.HTTPConnection:
+        split, _ = self._request_target()
+        if split.scheme not in {"http", "https"}:
+            raise RuntimeError(f"VLM API base_url must be http(s): {self._base_url!r}")
+        host = split.hostname or ""
+        if not host:
+            raise RuntimeError(f"VLM API base_url has no host: {self._base_url!r}")
+        route = self._proxy_route()
+        if route is not None:
+            proxy_host, proxy_port, auth = route
+            if split.scheme == "https":
+                # TLS end to end with the target: CONNECT through the proxy,
+                # then verify the target's certificate and SNI.
+                connection: http.client.HTTPConnection = http.client.HTTPSConnection(
+                    proxy_host, proxy_port, timeout=timeout_sec
+                )
+                connection.set_tunnel(host, split.port, headers=auth)
+                return connection
+            return http.client.HTTPConnection(proxy_host, proxy_port, timeout=timeout_sec)
+        if split.scheme == "https":
+            return http.client.HTTPSConnection(host, split.port, timeout=timeout_sec)
+        return http.client.HTTPConnection(host, split.port, timeout=timeout_sec)
+
+    def _send(
+        self,
+        path: str,
+        body: bytes,
+        headers: dict[str, str],
+        timeout_sec: float,
+    ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+        """Send one POST; return the borrowed connection and its response.
+
+        The status line has arrived when this returns. A keep-alive socket
+        the peer closed while idle fails on send or on the status line; that
+        is not a model error, so it is retried once on a fresh socket. Nothing
+        else is retried: a fresh socket that fails is a real network error,
+        and a failure after the status line means the model already received
+        the request. The caller owns the connection and must return or close
+        it.
+        """
+        prefix, proxy_headers = self._forwarding()
+        for attempt in (1, 2):
+            connection, reused = self._borrow_connection(timeout_sec)
+            try:
+                connection.request("POST", f"{prefix}{path}", body=body, headers={**headers, **proxy_headers})
+                return connection, connection.getresponse()
+            except _STALE_CONNECTION_ERRORS:
+                _close_quietly(connection)
+                if not reused or attempt == 2:
+                    raise
+            except BaseException:
+                _close_quietly(connection)
+                raise
+        raise AssertionError("unreachable")
+
+    def _post_once(
+        self,
+        path: str,
+        body: bytes,
+        headers: dict[str, str],
+        timeout_sec: float,
+    ) -> tuple[int, str]:
+        connection, response = self._send(path, body, headers, timeout_sec)
+        complete = False
+        try:
+            payload = response.read().decode("utf-8", errors="replace")
+            complete = True
+        finally:
+            self._return_connection(connection, reusable=complete and not response.will_close)
+        return response.status, payload
+
+    def _post_stream(
+        self,
+        path: str,
+        body: bytes,
+        headers: dict[str, str],
+        timeout_sec: float,
+        on_delta,
+    ) -> tuple[int, dict[str, Any]]:
+        """POST with ``stream: true`` and assemble the SSE deltas.
+
+        ``on_delta`` is called with the full content accumulated so far after
+        every content chunk. That is what streaming buys a planner that has to
+        produce a whole JSON document before anything downstream can start
+        here: a short field that closes early can be acted on before the rest
+        of the document exists.
+
+        Bytes are taken with ``read1``, which returns what has arrived.
+        ``read(n)`` on a chunked response keeps reading across chunks until it
+        has ``n`` bytes, so each event would wait for the next ~13 behind it
+        and a short answer would surface only when the stream ended.
+
+        The connection is kept only when the stream was read to its end. One
+        abandoned partway leaves unread bytes in the socket, and the next
+        request would read them as its own response.
+        """
+        connection, response = self._send(path, body, headers, timeout_sec)
+        if response.status >= 400:
+            try:
+                detail = response.read().decode("utf-8", errors="replace")
+            finally:
+                _close_quietly(connection)
+            return response.status, {"_error_body": detail}
+
+        content: list[str] = []
+        reasoning: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] = {}
+        pending = b""
+        complete = False
+        try:
+            while True:
+                block = response.read1(4096)
+                if not block:
+                    break
+                pending += block
+                while b"\n" in pending:
+                    raw, pending = pending.split(b"\n", 1)
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        pending = b""
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    # A malformed event is skipped like an unparsable one; it
+                    # must not escape complete() as an exception.
+                    if not isinstance(chunk, dict):
+                        continue
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices")
+                    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                        continue
+                    delta = choices[0].get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    thinking = delta.get("reasoning_content") or delta.get("thinking") or ""
+                    if isinstance(thinking, str) and thinking:
+                        reasoning.append(thinking)
+                    calls = delta.get("tool_calls")
+                    if isinstance(calls, list):
+                        _merge_tool_call_deltas(tool_calls, calls)
+                    piece = delta.get("content") or ""
+                    if not isinstance(piece, str) or not piece:
+                        continue
+                    content.append(piece)
+                    if on_delta is not None:
+                        # An observer must never be able to fail the call.
+                        with contextlib.suppress(Exception):
+                            on_delta("".join(content))
+            # read1 returning b"" ends a chunked body but not a Content-Length
+            # one (a buffering gateway, or a provider ignoring stream): before
+            # Python 3.13 that response stays open, and a connection parked
+            # with it makes the next request fail as ResponseNotReady after the
+            # model has already received it. read() finishes either kind.
+            response.read()
+            complete = response.isclosed()
+        finally:
+            self._return_connection(connection, reusable=complete and not response.will_close)
+        return response.status, {
+            "content": "".join(content),
+            "reasoning": "".join(reasoning),
+            "tool_calls": [tool_calls[index] for index in sorted(tool_calls)],
+            "usage": usage,
+        }
+
     def _http_post(
         self,
         payload: dict[str, Any],
         headers: dict[str, str],
         timeout_sec: float,
     ) -> dict[str, Any]:
-        endpoint = "/responses" if self._api_protocol == "responses" else "/chat/completions"
-        request = urllib.request.Request(
-            url=f"{self._base_url}{endpoint}",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
+        """POST one request over a connection kept alive across calls.
+
+        Each planning turn used to pay a fresh DNS lookup, TCP handshake and
+        TLS handshake before the model saw a single token. Reusing the
+        connection removes that from every turn after the first.
+        """
+        _, path = self._request_target()
+        body = json.dumps(payload).encode("utf-8")
+        request_headers = {
+            **headers,
+            "Host": urllib.parse.urlsplit(self._base_url).netloc,
+            "Connection": "keep-alive",
+            "Content-Length": str(len(body)),
+            "Accept": "application/json",
+        }
         try:
-            with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-                body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            try:
-                error_body = exc.read().decode("utf-8", errors="replace")[:200]
-            except Exception:
-                error_body = ""
-            raise RuntimeError(f"VLM API HTTP {exc.code}: {error_body}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"VLM API network error: {exc.reason}") from exc
+            status, response_body = self._post_once(path, body, request_headers, timeout_sec)
         except TimeoutError as exc:
             raise RuntimeError(f"VLM API timeout after {timeout_sec}s") from exc
-        return _parse_response_json(body)
+        except (http.client.HTTPException, OSError) as exc:
+            raise RuntimeError(f"VLM API network error: {exc}") from exc
+        if status >= 400:
+            raise RuntimeError(f"VLM API HTTP {status}: {response_body.strip()[:200]}")
+        return _parse_response_json(response_body)
 
     def analyze(
         self,
@@ -166,8 +483,19 @@ class VLMAPIClient:
         force_json: bool = False,
         enable_thinking: bool = True,
         extra_body: dict[str, Any] | None = None,
+        max_tokens: int | None = None,
+        stream: bool = False,
+        on_content_delta=None,
     ) -> dict[str, Any]:
-        """Call the configured API protocol and normalize its result."""
+        """Call the configured API protocol and normalize its result.
+
+        ``stream`` changes only the transport: the returned mapping has the
+        same shape either way, so a caller that ignores ``on_content_delta``
+        cannot tell the difference. Streaming exists for that callback -- it
+        receives the content accumulated so far on every chunk, which lets a
+        field that closes early be acted on before the rest of the answer
+        exists.
+        """
         t_start = time.monotonic()
 
         def _err(msg: str) -> dict[str, Any]:
@@ -184,6 +512,10 @@ class VLMAPIClient:
 
         if self._provider not in {"kimicode", "openai_compatible"}:
             return _err(f"unsupported VLM API provider: {self._provider}")
+        if stream and self._api_protocol == "responses":
+            # The SSE reader assembles chat-completions deltas; Responses
+            # events have another shape and would read as an empty answer.
+            return _err("VLM API streaming requires api_protocol=chat_completions")
 
         send_messages = messages
         if not self._multimodal:
@@ -209,9 +541,19 @@ class VLMAPIClient:
             else:
                 payload["response_format"] = {"type": "json_object"}
 
+        if max_tokens is not None:
+            # A planner answer is one small JSON object. An unbounded ceiling
+            # lets a chatty model keep generating, and in a non-streaming call
+            # every extra token is added to the wait before the first word is
+            # spoken.
+            payload["max_output_tokens" if self._api_protocol == "responses" else "max_tokens"] = int(max_tokens)
+
         if not enable_thinking and "dashscope.aliyuncs.com" in self._base_url:
             payload["enable_thinking"] = False
 
+        # Providers spell "do not think" differently and most reject an unknown
+        # field outright, so there is no safe neutral default: the per-provider
+        # switch is supplied as extra_body from configuration and applied last.
         if extra_body:
             payload.update(extra_body)
 
@@ -224,6 +566,44 @@ class VLMAPIClient:
             configured_timeout_sec=self._timeout_sec,
             override_timeout_sec=timeout_sec,
         )
+
+        if stream:
+            payload["stream"] = True
+            _, path = self._request_target()
+            body = json.dumps(payload).encode("utf-8")
+            request_headers = {
+                **headers,
+                "Host": urllib.parse.urlsplit(self._base_url).netloc,
+                "Content-Length": str(len(body)),
+                "Accept": "text/event-stream",
+            }
+            try:
+                status, assembled = self._post_stream(
+                    path, body, request_headers, output_idle_timeout_sec, on_content_delta
+                )
+            except (http.client.HTTPException, ConnectionError, OSError, TimeoutError) as exc:
+                return _err(f"VLM API stream error: {exc}")
+            if status >= 400:
+                return _err(f"VLM API HTTP {status}: {assembled.get('_error_body', '').strip()[:200]}")
+            content = assembled["content"]
+            tool_calls = assembled["tool_calls"]
+            if not content.strip() and not tool_calls:
+                return _err("VLM API stream returned empty content and no tool_calls")
+            usage_raw = assembled["usage"]
+            return {
+                "status": "ok",
+                "model": self._model,
+                "content": content,
+                "tool_calls": tool_calls,
+                "reasoning": assembled["reasoning"],
+                "usage": {
+                    "prompt_tokens": usage_raw.get("prompt_tokens", usage_raw.get("input_tokens", 0)),
+                    "completion_tokens": usage_raw.get("completion_tokens", usage_raw.get("output_tokens", 0)),
+                    "total_tokens": usage_raw.get("total_tokens", 0),
+                },
+                "timing_ms": int((time.monotonic() - t_start) * 1000),
+                "error": None,
+            }
 
         try:
             response_json = self._http_post(payload, headers, output_idle_timeout_sec)

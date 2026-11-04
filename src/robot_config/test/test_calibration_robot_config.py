@@ -9,15 +9,29 @@ from robot_config.loader import load_robot_config_dict
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_sensor_calib.yaml"
 
 
-def test_calibration_config_starts_mid360_fast_lio_and_default_realsense_driver():
+def test_calibration_config_selects_the_lekiwi_runtime_with_a_front_camera_addition():
     config = load_robot_config_dict(CONFIG_PATH)
 
+    # Runtime selection (openspec lekiwi-application-migration task 1.5): the
+    # base-only LeKiwi runtime profile owns the chassis, controllers and the
+    # MID-360; the fixed front camera is profile-declared (disabled by
+    # default) and this deployment opts in through an override entry.
+    assert config["runtime"]["provider"] == "lekiwi_robot"
+    assert config["runtime"]["profile"] == "lekiwi_lidar"
+    assert "require_model" not in config["runtime"]
+    assert "ros2_control" not in config
+
     peripherals = {item["name"]: item for item in config["peripherals"]}
-    lidar = peripherals["mid360"]
+    # The MID-360 mount forwards both pose keys into the runtime fragment
+    # (lekiwi-gazebo-runtime-platform D13): the front camera override joins
+    # the mount-created partial lidar entry.
+    assert set(peripherals) == {"front", "mid360"}
     camera = peripherals["front"]
-    assert lidar["driver"] == "livox_mid360"
-    assert lidar["pointcloud_topic"] == "/livox/lidar"
-    assert camera["driver"] == "realsense"
+    # runtime-peripheral-overrides: no driver key on the provider path — the
+    # lekiwi_lidar profile declares the realsense driver; the entry only
+    # enables the device and carries deployment settings.
+    assert camera["enabled"] is True
+    assert "driver" not in camera
     assert camera["driver_camera_name"] == "front"
     assert camera["streams"] == ["color", "depth"]
     assert (camera["width"], camera["height"], camera["fps"]) == (640, 480, 30)
@@ -25,20 +39,23 @@ def test_calibration_config_starts_mid360_fast_lio_and_default_realsense_driver(
     assert camera["enable_sync"] is False
     assert camera["initial_reset"] is False
     assert camera["transform"]["parent_frame"] == "base_link"
+    lidar = peripherals["mid360"]
+    assert lidar["type"] == "lidar"
+    assert lidar["transform"]["parent_frame"] == "body"
+    assert lidar["simulation"]["gazebo"]["transform"]["parent_frame"] == "base_link"
 
     navigation = config["navigation"]
     assert navigation["enabled"] is True
     assert navigation["fast_lio"]["enabled"] is True
     assert navigation["slam_toolbox"]["enabled"] is False
     assert navigation["nav2_bringup"]["enabled"] is False
-    assert navigation["cmd_vel_bridge"]["enabled"] is True
-    assert navigation["cmd_vel_bridge"]["publish_tf"] is False
-    assert navigation["cmd_vel_bridge"]["publish_odom"] is False
+    # Calibration teleoperation is admitted through the contract channel: the
+    # launch-time admission step opens the gate after the runtime is ready.
+    assert navigation["open_gate_on_startup"] is True
+    assert "cmd_vel_bridge" not in navigation
 
-    assert config["control_modes"]["teleop"]["controllers"] == [
-        "joint_state_broadcaster",
-        "base_velocity_controller",
-    ]
+    assert config["control_modes"]["teleop"]["runtime_mode"] == "base_navigation"
+    assert "controllers" not in config["control_modes"]["teleop"]
 
 
 def test_calibration_config_consumes_approved_camera_artifact(monkeypatch, tmp_path):
@@ -98,18 +115,24 @@ def test_calibration_config_rejects_installed_non_approved_artifact(monkeypatch,
         load_robot_config_dict(CONFIG_PATH)
 
 
-def test_calibration_launch_includes_only_base_teleop_control_components():
+def test_calibration_launch_delegates_to_the_runtime_for_migrated_configs():
     launch_path = Path(__file__).parents[1] / "launch/sensor_calibration.launch.py"
     content = launch_path.read_text(encoding="utf-8")
 
-    assert "generate_ros2_control_nodes" in content
-    assert "controller_startup_timeout=300.0" in content
-    assert "RegisterEventHandler" not in content
-    assert "OnProcessExit" not in content
-    assert "generate_cmd_vel_nodes" in content
-    assert "generate_static_tf_nodes" in content
+    # Provider branch: the runtime owns sensors, FAST-LIO, the chassis and the
+    # gate; the admission client fails the launch if mode/gate admission is
+    # rejected. The generic bridge builder is gone entirely.
+    assert "generate_runtime_provider_actions" in content
+    assert "navigation_admission" in content
+    assert "RegisterEventHandler" in content
+    assert "OnProcessExit" in content
+    assert "generate_cmd_vel_nodes" not in content
     assert "generate_navigation_nodes" not in content
     assert "generate_nav2_nodes" not in content
+    # Legacy branch for provider-less calibration configurations.
+    assert "generate_ros2_control_nodes" in content
+    assert "controller_startup_timeout=300.0" in content
+    assert "generate_static_tf_nodes" in content
 
 
 def test_calibration_config_contains_no_realsense_overlay_or_solver_runtime():

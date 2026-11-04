@@ -1,0 +1,7 @@
+schema_version: 1
+name: aimdk_x2_grasp
+robot_name: aimdk_x2_grasp
+enabled_skills:
+- name: pick_object
+  implementation: aimdk_x2_grasp
+  planner_visible: true

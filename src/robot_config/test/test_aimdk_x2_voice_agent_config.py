@@ -12,7 +12,9 @@ from robot_config.loader import load_robot_config_dict, validate_robot_config_di
 
 CONFIG = resolve_robot_config_path(config_name="aimdk_x2_voice_agent")
 # src/robot_config/test/ -> src/
-PROFILE = Path(__file__).resolve().parents[2] / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra.yaml"
+# aimdk_x2_skills selects the OmniHand runtime profile, so the description the real
+# runtime publishes is the one that profile builds.
+PROFILE = Path(__file__).resolve().parents[2] / "robots" / "aimdk" / "aimdk_robot" / "profiles" / "x2_ultra_omnihand.yaml"
 
 
 @pytest.fixture(scope="module")

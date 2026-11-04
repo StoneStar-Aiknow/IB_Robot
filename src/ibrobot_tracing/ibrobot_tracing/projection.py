@@ -561,14 +561,16 @@ def _timeline_from_records(
     lanes: dict[str, TimelineLane] = {}
     items: list[TimelineItem] = []
 
-    def component_lane(component_id: str) -> str:
+    def component_lane(component_id: str, source_origin: dict | None = None) -> str:
         identity = component_id or "unassigned"
         lane_id = f"lane:component:{identity}"
+        label = component_names.get(component_id, component_id or "Unassigned")
+        if source_origin:
+            lane_id += f":{source_origin.get('machine_id')}:{source_origin.get('boot_id')}:{source_origin.get('process_instance')}"
+            label += f" @ {source_origin.get('host')} pid={source_origin.get('process_id')}"
         lanes.setdefault(
             lane_id,
-            TimelineLane(
-                lane_id, component_names.get(component_id, component_id or "Unassigned"), "component", component_id
-            ),
+            TimelineLane(lane_id, label, "component", component_id),
         )
         return lane_id
 
@@ -578,7 +580,7 @@ def _timeline_from_records(
         items.append(
             TimelineItem(
                 stable_event_id(event),
-                component_lane(component_id),
+                component_lane(component_id, asdict(event.origin) if event.time_mapping else None),
                 "event",
                 event.name,
                 item_start,
@@ -588,7 +590,14 @@ def _timeline_from_records(
                 0,
                 event.request_id,
                 component_id,
-                fields=dict(event.fields),
+                fields={
+                    **event.fields,
+                    **(
+                        {"_trace_origin": asdict(event.origin), "_time_mapping": event.time_mapping}
+                        if event.time_mapping
+                        else {}
+                    ),
+                },
             )
         )
     for span in spans:
@@ -596,8 +605,8 @@ def _timeline_from_records(
         duration_ns = _span_duration_ns(span)
         items.append(
             TimelineItem(
-                stable_span_id(span),
-                component_lane(span.component_id),
+                span.occurrence_id or stable_span_id(span),
+                component_lane(span.component_id, span.time_mapping.get("source_origin")),
                 "span",
                 span.name,
                 span.start_ns,
@@ -608,7 +617,7 @@ def _timeline_from_records(
                 span.trace_id,
                 span.component_id,
                 span.status,
-                dict(span.fields),
+                {**span.fields, **({"_time_mapping": span.time_mapping} if span.time_mapping else {})},
             )
         )
     for flow in flows:
@@ -620,7 +629,7 @@ def _timeline_from_records(
         lanes.setdefault(lane_id, TimelineLane(lane_id, flow.edge_id, "flow", edge_id=flow.edge_id))
         items.append(
             TimelineItem(
-                stable_flow_id(flow),
+                flow.occurrence_id or stable_flow_id(flow),
                 lane_id,
                 "flow",
                 flow.edge_id,
@@ -631,7 +640,15 @@ def _timeline_from_records(
                 item_end - item_start,
                 flow.trace_id,
                 status=flow.status,
-                fields={"edge_id": flow.edge_id, "flow_id": flow.flow_id},
+                fields={
+                    "edge_id": flow.edge_id,
+                    "flow_id": flow.flow_id,
+                    **(
+                        {"uncertainty_ns": flow.uncertainty_ns, "provenance": flow.provenance}
+                        if flow.uncertainty_ns is not None
+                        else {}
+                    ),
+                },
             )
         )
     items.sort(key=lambda item: (item.start_ns, {"span": 0, "event": 1, "flow": 2}[item.kind]))
@@ -744,7 +761,7 @@ def project_span_call_tree(spans: list[SpanRecord]) -> CallTreeProjection:
     return _call_tree_from_spans(spans)
 
 
-_SPAN_PROFILE_SOURCE = "structured span instrumentation; monotonic duration_ns is preferred for geometry"
+_SPAN_PROFILE_SOURCE = "structured span instrumentation; calibrated endpoints define merged geometry, otherwise monotonic duration_ns is preferred"
 _SPAN_PROFILE_COVERAGE = "selected instrumented spans only; uninstrumented work is not represented"
 
 

@@ -82,7 +82,15 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
 # Drives a robot config whose perception services reference a gitignored model
 # bundle; without scripts/download_models.py the config cannot load. A missing
 # download is not a defect, so skip rather than fail. See root conftest.py.
-@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
+@pytest.mark.model_bundle(
+    "yolox_x_640",
+    "pear_parameter_network",
+    "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384",
+)
 def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
     from robot_skill_cli.catalog import compile_local_snapshot
 
@@ -123,8 +131,11 @@ def test_non_navigation_profile_keeps_v1_robot_context():
 @pytest.mark.model_bundle(
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
-    "grounded_sam2_swint_ogc_ascend",
+    "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384",
 )
 def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
     from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
@@ -170,8 +181,11 @@ def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
 @pytest.mark.model_bundle(
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
-    "grounded_sam2_swint_ogc_ascend",
+    "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384",
 )
 def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tmp_path):
     from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
@@ -1602,3 +1616,114 @@ def test_validate_uses_action_wire_zero_for_omitted_motion_distance(monkeypatch,
     assert response["data"]["payload"]["motion_distance"] == 0.0
     assert response["data"]["payload_hash"] == skill_payload_hash(response["data"]["payload"])
     assert bridge.validate_payloads == [response["data"]["payload"]]
+
+
+def test_planner_catalog_view_drops_what_the_planner_may_not_choose():
+    """The planner prompt must not advertise skills it is forbidden to pick.
+
+    The full view carries every enabled skill with a ``planner_visible`` flag.
+    Sending the invisible ones only invited the model to propose them, and it
+    paid for them in prompt tokens on every single turn.
+    """
+    from robot_skill_cli.catalog import planner_catalog_view
+
+    view = {
+        "robot_name": "so101",
+        "capability_digest": "digest",
+        "profile_name": "default",
+        "pose_names": ["home"],
+        "timeout_policy": {"default_sec": 180.0},
+        "control_plane_ready": True,
+        "active_control_mode": "idle",
+        "motion_authorized": False,
+        "skills": [
+            {
+                "name": "nod_yes",
+                "planner_visible": True,
+                "summary": "nod",
+                "domain": "social",
+                "semantic_level": "skill",
+                "moves_robot": True,
+                "required_control_mode": "idle",
+                "parameters": {"type": "object", "properties": {}},
+                "schema_version": 1,
+                "recovery_policy": {"on_failure": "stop"},
+                "timeout_sec": 30.0,
+            },
+            {
+                "name": "internal_probe",
+                "planner_visible": False,
+                "summary": "internal",
+                "domain": "diagnostics",
+                "parameters": {"type": "object"},
+            },
+        ],
+    }
+
+    projected = planner_catalog_view(view)
+
+    assert [skill["name"] for skill in projected["skills"]] == ["nod_yes"]
+    kept = projected["skills"][0]
+    # Enough to choose the skill and fill it in.
+    assert kept["parameters"] == {"type": "object", "properties": {}}
+    assert kept["semantic_level"] == "skill"
+    # Validation and execution details stay local.
+    assert "recovery_policy" not in kept
+    assert "timeout_sec" not in kept
+    # Control-plane state changes what may be proposed right now.
+    assert projected["control_plane_ready"] is True
+    assert projected["motion_authorized"] is False
+    assert projected["pose_names"] == ["home"]
+
+
+def test_planner_catalog_view_accepts_the_empty_offline_catalog():
+    """With the Gateway offline the Agent plans against ``{}`` so a
+    conversation can still be answered; the projection must not fail it."""
+    from robot_skill_cli.catalog import planner_catalog_view
+
+    projected = planner_catalog_view({})
+
+    assert projected["skills"] == []
+    assert projected["pose_names"] == []
+
+
+def test_planner_catalog_view_does_not_mutate_the_full_view():
+    """Workflow validation keeps using the full view; it must survive intact."""
+    from robot_skill_cli.catalog import planner_catalog_view
+
+    view = {
+        "robot_name": "so101",
+        "capability_digest": "digest",
+        "pose_names": [],
+        "skills": [
+            {
+                "name": "nod_yes",
+                "planner_visible": True,
+                "summary": "nod",
+                "parameters": {"type": "object", "properties": {"speed": {"type": "number"}}},
+                "recovery_policy": {"on_failure": "stop"},
+            }
+        ],
+    }
+    before = copy.deepcopy(view)
+
+    projected = planner_catalog_view(view)
+    projected["skills"][0]["parameters"]["properties"].clear()
+
+    assert view == before
+
+
+def test_planner_catalog_view_keeps_skills_that_predate_the_visibility_flag():
+    """A view without the flag must not silently lose every skill."""
+    from robot_skill_cli.catalog import planner_catalog_view
+
+    projected = planner_catalog_view(
+        {
+            "robot_name": "so101",
+            "capability_digest": "digest",
+            "pose_names": [],
+            "skills": [{"name": "nod_yes", "summary": "nod"}],
+        }
+    )
+
+    assert [skill["name"] for skill in projected["skills"]] == ["nod_yes"]

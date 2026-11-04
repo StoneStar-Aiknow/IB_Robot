@@ -10,6 +10,7 @@ const STAGE_LABELS: Record<string, string> = {
   refill_to_execute_ms: "队列补充至执行",
   execute_publish_ms: "执行发布",
   cloud_roundtrip_ms: "云端往返",
+  policy_total_reported_ms: "策略阶段报告耗时",
   total_ms: "分发至首次执行",
 };
 
@@ -18,7 +19,32 @@ export function stageLabel(value: string): string {
 }
 
 export function metricLabel(value: string): string {
-  return ({ minimum: "min", maximum: "max", mean: "mean", p50: "p50", p95: "p95", p99: "p99" })[value] ?? value;
+  return ({ minimum: "最小值", maximum: "最大值", mean: "均值", p50: "中位数 P50", p95: "高位 P95", p99: "高位 P99" })[value] ?? value;
+}
+
+export function boundaryLabel(value: string): string {
+  return ({
+    dispatch_request_to_first_action_execute: "请求分发 → 首次动作执行",
+    "Dispatch Request -> First Action Execute": "请求分发 → 首次动作执行",
+    partial_boundary_fallback: "部分业务端点缺失，使用观测记录补齐边界",
+    selected_record_bounds_fallback: "业务端点缺失，使用当前观测范围",
+    "fallback:selected_records": "当前选中记录的时间边界",
+    "fallback:preferred_anchor": "可用的业务端点",
+  })[value] ?? value;
+}
+
+const RECORD_STATUS_LABELS = new Map([
+  ["ok", "完整记录"], ["complete", "完整"], ["error", "错误记录"],
+  ["incomplete", "不完整"], ["invalid", "无效记录"], ["negative", "负耗时（检查时钟）"],
+  ["ambiguous", "关联不唯一"], ["uncalibrated", "未校准"],
+  ["cross_host_unsynchronized", "跨主机时钟未同步"], ["clock_mismatch", "时钟域不一致"],
+  ["clock_discontinuity", "时钟不连续"], ["uncertainty_exceeded", "时钟误差超出范围"],
+  ["calibrated", "已校准（条件工程估计）"],
+]);
+
+export function recordStatusLabel(value: unknown): string {
+  const status = value === null || value === undefined ? "" : String(value);
+  return RECORD_STATUS_LABELS.get(status) ?? (status || "未提供");
 }
 
 export function formatDuration(value: number | null | undefined, digits = 2): string {

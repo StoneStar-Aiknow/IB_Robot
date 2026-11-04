@@ -13,7 +13,7 @@ deployment-name resolution); prefer them over hand-rolling.
 ## Tier 1 — Unit & Contract Tests
 
 ```bash
-source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q src/inference_service/tests
+source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q src/inference_service/test
 ```
 
 Pass criteria: all tests pass (no collection errors).
@@ -72,7 +72,7 @@ source .shrc_local && export ROS_DOMAIN_ID=94 && source install/setup.zsh && \
   `torch_cpu`/`torch_cuda` for perception bundles). Config validation rejects
   any deployment missing from the manifest — resolve from the manifest, do not
   guess.
-- Ascend-only bundles (`grounding_dino_swint_seq8_1280x720_ascend`,
+- Ascend-only bundles (`sam2.1_hiera_tiny_prompt_ascend`,
   `models/grasp`) have no host deployment: skip them and note it in the report.
 
 ## Tier 4 — Perception ROS Typed Service

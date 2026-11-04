@@ -12,6 +12,11 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 - `config/skills/<name>/SKILL.md`: human/Agent documentation only; never executable configuration.
 - `config/profiles/<profile>.yaml`: enabled package, selected implementation, and planner visibility.
 
+When a manifest selects a `description_variants` entry for its implementation,
+that entry's summary is also the public capability summary sent to the Planner.
+For example, the X2 `pick_object` describes its own grasp-and-return sequence;
+it does not inherit another robot's container-transport summary.
+
 The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
 `lekiwi_handeye_realsense_grasp_lidar`,
@@ -81,9 +86,11 @@ required_args: []
 timeout_sec: 45.0     # above the runtime's own motion timeout
 ```
 
-Named motions cannot be cancelled once started (the runtime refuses it); see the
-`skill_library` README for the executor's cancel and deadline semantics. Postures
-and stairs are deliberately not exposed by `aimdk_x2_skills`.
+A replayed gesture (the runtime's trajectory mode, `stream` on the X2) stops on
+a cancel and can resume from that point; presets and postures cannot be
+cancelled once started (the runtime refuses it). See the `skill_library` README
+for the executor's cancel and deadline semantics. Postures and stairs are
+deliberately not exposed by `aimdk_x2_skills`.
 
 ## Mirror session skills
 

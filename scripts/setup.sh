@@ -7,7 +7,7 @@
 #   ./scripts/setup.sh --yes                         # Auto-yes mode
 #   ./scripts/setup.sh --with-diagnostics            # Install speech_direction report deps
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
-#   ./scripts/setup.sh --only-patch                  # Only apply LeRobot patches
+#   ./scripts/setup.sh --only-patch                  # Prepare sources and managed patches
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
 #   ./scripts/setup.sh --profile <name>              # Dependency scope: full (default),
 #                                                    # inference (edge-cloud inference
@@ -234,10 +234,10 @@ Options:
                           and skips unrelated GraspGen dependencies.
 
       --skip-verify      Skip final ROS/Python verification
-      --only-patch       Skip dependency/venv setup and verification; only
-                         apply the managed LeRobot patch stack. Use
-                         IBR_LEROBOT_FORCE_REBUILD=1 to rebuild from the
-                         recorded upstream base.
+      --only-patch       Prepare profile-selected submodules and managed patches;
+                         skip dependency/venv setup and final verification.
+                         Full profile includes ROS patches (including usb_cam);
+                         inference/training include LeRobot only. May download sources.
       --profile NAME     Dependency-scope profile (default: full; env:
                          IBR_SETUP_PROFILE).
                            full      complete development workspace
@@ -766,7 +766,7 @@ main() {
             log_done "Python environment configured"
         fi
     else
-        log_info "Only applying LeRobot patch stack (--only-patch); skipping dependency and venv setup."
+        log_info "Preparing managed patch stacks (--only-patch); skipping dependency and venv setup."
     fi
 
     if platform_supports_local_workspace_build; then
@@ -809,7 +809,7 @@ main() {
             ;;
     esac
     if [[ "${ONLY_PATCH}" == true ]]; then
-        completion_message="LeRobot patch stack check complete."
+        completion_message="Managed patch stack checks complete."
     fi
     if [[ "${ONLY_PATCH}" != true ]] && ! platform_supports_local_workspace_build; then
         completion_message="Setup complete! OpenHarmony runtime verified; cross-build deployables on the host."

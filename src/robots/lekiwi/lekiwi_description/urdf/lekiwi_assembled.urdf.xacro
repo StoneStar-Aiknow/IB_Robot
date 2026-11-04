@@ -19,13 +19,55 @@
   <xacro:arg name="simulated" default="false"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
   <xacro:arg name="mujoco_model" default=""/>
+  <!-- mujoco_sim_speed_factor: the mujoco_ros2_control <hardware>
+       "sim_speed_factor" parameter — the fraction of real time the physics
+       loop targets (0.25 => RTF ~0.25). Empty (the default) leaves the
+       simulator's own real-time sync untouched. Used by the chassis gate's
+       throttled-latency measurement (D3.4/D12); passed through the profile's
+       hardware.xacro_args by the test. -->
+  <xacro:arg name="mujoco_sim_speed_factor" default=""/>
+  <!-- mujoco_headless: the mujoco_ros2_control <hardware> "headless"
+       parameter (no Simulate UI window). Set from IBROBOT_MUJOCO_HEADLESS by
+       render_mujoco_description; the Gazebo treatment stays off under the
+       MuJoCo plugin (test_gazebo_platform.py). -->
+  <xacro:arg name="mujoco_headless" default="false"/>
+  <!-- root_link (lekiwi-nav-grasp-sim-platforms D8): the LeKiwi mounts the
+       SO-101 arm mid-chain (base_link -> <root> -> base), and the arm root
+       link must NOT be named `world`: sdformat lumps a mid-chain fixed-joint
+       link into a model-level frame, which gz-sim Fortress rejects for the
+       reserved name. Declared before the so101_base.xacro include so every
+       LeKiwi render (hardware, SDK, Gazebo, MuJoCo) uses the same frame set;
+       this removes a TF frame named `world` under base_link from the
+       physical robot (hardware-visible, checked in the README). -->
+  <xacro:arg name="root_link" default="arm_root"/>
+  <!-- gz_ros2_control: always passed by render_gazebo_description (accepted
+       even when unused); sim_effort_state is accepted and ignored here: this
+       profile advertises no joint.current interface (D2). -->
+  <xacro:arg name="gz_ros2_control_parameters_file" default=""/>
+  <xacro:arg name="sim_effort_state" default="false"/>
+  <!-- Gazebo-only chassis treatment (D2): gated by use_sim AND the gz plugin
+       so the MuJoCo platform (a different sim_plugin) and every physical/SDK
+       render (use_sim false) keep their exact pre-change output. -->
+  <xacro:property name="gz_sim" value="${'$(arg use_sim)' == 'true' and '$(arg sim_plugin)' == 'gz_ros2_control/GazeboSimSystem'}"/>
+  <!-- MuJoCo platform gate (D2a/D9): the hardware parameters and the wheel
+       transmissions below appear only when the MuJoCo system interface is
+       the selected plugin, so hardware/SDK/Gazebo renders are unchanged. -->
+  <xacro:property name="mujoco_sim" value="${'$(arg use_sim)' == 'true' and '$(arg sim_plugin)' == 'mujoco_ros2_control/MujocoSystemInterface'}"/>
+  <!-- Wheel joint axis under Gazebo: the SDK's mount angles (150/-90/30 deg)
+       are each wheel's POSITIVE-spin drive direction, which is antiparallel
+       to the URDF joints' +z rotation as simulated (positive rotation about
+       +z drives the base the opposite way). Flipping the axis under the gz
+       gate makes the simulated joint velocity/position convention match the
+       physical motors' — the same base_node kinematics then drive and
+       odometry-integrate identically on both executions (D3/D4). -->
+  <xacro:property name="wheel_axis_z" value="${-1 if gz_sim else 1}"/>
 
   <!-- Chassis geometry/control properties (does not emit links/joints) -->
   <xacro:include filename="$(find lekiwi_description)/urdf/base.common.xacro"/>
   <xacro:include filename="$(find lekiwi_description)/urdf/base.control.xacro"/>
 
   <xacro:unless value="$(arg base_only)">
-    <!-- SO101 arm (joints "1"-"6", links: world->base->shoulder->...->jaw) -->
+    <!-- SO101 arm (joints "1"-"6", links: arm_root->base->shoulder->...->jaw) -->
     <xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_base.xacro"/>
   </xacro:unless>
 
@@ -73,12 +115,23 @@
       </geometry>
       <material name="charcoal"/>
     </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
-      </geometry>
-    </collision>
+    <!-- Gazebo: cylinder collision (legacy macro sizes, D2) -->
+    <xacro:if value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="0.025"/>
+        </geometry>
+      </collision>
+    </xacro:if>
+    <xacro:unless value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+        </geometry>
+      </collision>
+    </xacro:unless>
     <inertial>
       <mass value="0.1"/>
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
@@ -94,12 +147,23 @@
       </geometry>
       <material name="charcoal"/>
     </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
-      </geometry>
-    </collision>
+    <!-- Gazebo: cylinder collision (legacy macro sizes, D2) -->
+    <xacro:if value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="0.025"/>
+        </geometry>
+      </collision>
+    </xacro:if>
+    <xacro:unless value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+        </geometry>
+      </collision>
+    </xacro:unless>
     <inertial>
       <mass value="0.1"/>
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
@@ -115,17 +179,56 @@
       </geometry>
       <material name="charcoal"/>
     </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
-      </geometry>
-    </collision>
+    <!-- Gazebo: cylinder collision (legacy macro sizes, D2) -->
+    <xacro:if value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="0.025"/>
+        </geometry>
+      </collision>
+    </xacro:if>
+    <xacro:unless value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+        </geometry>
+      </collision>
+    </xacro:unless>
     <inertial>
       <mass value="0.1"/>
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
     </inertial>
   </link>
+
+  <!-- Anisotropic friction approximating the omni wheels on Gazebo (D2):
+       the validated legacy treatment — high friction along each wheel's
+       rolling direction (fdir1 in the wheel link frame), low friction along
+       the spin axis — repeated per wheel link. -->
+  <xacro:if value="${gz_sim}">
+    <gazebo reference="left_wheel_link">
+      <mu1>0.8</mu1>
+      <mu2>0.05</mu2>
+      <fdir1>0 1 0</fdir1>
+      <kp>10000000.0</kp>
+      <kd>10.0</kd>
+    </gazebo>
+    <gazebo reference="back_wheel_link">
+      <mu1>0.8</mu1>
+      <mu2>0.05</mu2>
+      <fdir1>0 1 0</fdir1>
+      <kp>10000000.0</kp>
+      <kd>10.0</kd>
+    </gazebo>
+    <gazebo reference="right_wheel_link">
+      <mu1>0.8</mu1>
+      <mu2>0.05</mu2>
+      <fdir1>0 1 0</fdir1>
+      <kp>10000000.0</kp>
+      <kd>10.0</kd>
+    </gazebo>
+  </xacro:if>
 
   <!-- ============================================ -->
   <!-- Chassis Joints                               -->
@@ -136,7 +239,7 @@
     <parent link="base_link"/>
     <child link="left_wheel_link"/>
     <origin xyz="${wheel_base_radius * cos(offset)} ${wheel_base_radius * sin(offset)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset}"/>
-    <axis xyz="0 0 1"/>
+    <axis xyz="0 0 ${wheel_axis_z}"/>
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
@@ -145,7 +248,7 @@
     <parent link="base_link"/>
     <child link="back_wheel_link"/>
     <origin xyz="${wheel_base_radius * cos(offset + theta)} ${wheel_base_radius * sin(offset + theta)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset + theta}"/>
-    <axis xyz="0 0 1"/>
+    <axis xyz="0 0 ${wheel_axis_z}"/>
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
@@ -154,20 +257,34 @@
     <parent link="base_link"/>
     <child link="right_wheel_link"/>
     <origin xyz="${wheel_base_radius * cos(offset - theta)} ${wheel_base_radius * sin(offset - theta)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset - theta}"/>
-    <axis xyz="0 0 1"/>
+    <axis xyz="0 0 ${wheel_axis_z}"/>
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
   <xacro:unless value="$(arg base_only)">
     <!-- ============================================ -->
-    <!-- Arm Mounting: base_link -> world (arm base)  -->
+    <!-- Arm Mounting: base_link -> arm_root (D8)     -->
     <!-- ============================================ -->
     <joint name="base_to_arm" type="fixed">
       <parent link="base_link"/>
-      <child link="world"/>
+      <child link="$(arg root_link)"/>
       <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
     </joint>
   </xacro:unless>
+
+  <!-- ============================================ -->
+  <!-- Gazebo (gz_ros2_control)                     -->
+  <!-- ============================================ -->
+  <!-- The gz system plugin reads the profile's controller parameters (D2);
+       no sensors here — the runtime generates them from the peripheral
+       inventory (D5). -->
+  <xacro:if value="${gz_sim}">
+    <gazebo>
+      <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+        <parameters>$(arg gz_ros2_control_parameters_file)</parameters>
+      </plugin>
+    </gazebo>
+  </xacro:if>
 
   <!-- ============================================ -->
   <!-- ros2_control                                 -->
@@ -176,10 +293,53 @@
     <xacro:if value="$(arg use_sim)">
       <hardware>
         <plugin>$(arg sim_plugin)</plugin>
-        <xacro:if value="${'$(arg mujoco_model)' != ''}">
-          <param name="mujoco_model">$(arg mujoco_model)</param>
+        <xacro:if value="${mujoco_sim}">
+          <xacro:if value="${'$(arg mujoco_model)' != ''}">
+            <param name="mujoco_model">$(arg mujoco_model)</param>
+            <!-- Turn the deprecated URDF <sensor> camera auto-registration
+                 off: cameras are configured through the mujoco_plugins
+                 CameraPlugin parameters (mujoco_ros2_control >= 0.1.0); this
+                 model declares no cameras anyway. -->
+            <param name="auto_register_cameras">false</param>
+          </xacro:if>
+          <!-- Floating-base odometry (D9): the free-joint state the system
+               interface reports on its simulator-namespaced topic; the
+               constants match robot_runtime.mujoco
+               (ODOM_FREE_JOINT_NAME / FLOATING_BASE_STATE_TOPIC) and the
+               freejoint in mujoco/lekiwi_base.xml.template. Never advertised
+               or consumed by a runtime node. -->
+          <param name="odom_free_joint_name">floating_base_joint</param>
+          <param name="odom_topic">/simulator/floating_base_state</param>
+          <xacro:if value="${'$(arg mujoco_sim_speed_factor)' != ''}">
+            <param name="sim_speed_factor">$(arg mujoco_sim_speed_factor)</param>
+          </xacro:if>
+          <xacro:if value="$(arg mujoco_headless)">
+            <param name="headless">true</param>
+          </xacro:if>
         </xacro:if>
       </hardware>
+    </xacro:if>
+
+    <!-- D2a: the MJCF joints/actuators are named wheel_7/8/9 (a PidROS topic
+         token may not start with a digit), so the MuJoCo branch maps the
+         ros2_control joints 7/8/9 onto those actuators through
+         SimpleTransmission entries. Every ROS-facing name stays 7/8/9. -->
+    <xacro:if value="${mujoco_sim}">
+      <transmission name="wheel_7_transmission">
+        <plugin>transmission_interface/SimpleTransmission</plugin>
+        <joint name="7" role="wheel"/>
+        <actuator name="wheel_7" role="wheel"/>
+      </transmission>
+      <transmission name="wheel_8_transmission">
+        <plugin>transmission_interface/SimpleTransmission</plugin>
+        <joint name="8" role="wheel"/>
+        <actuator name="wheel_8" role="wheel"/>
+      </transmission>
+      <transmission name="wheel_9_transmission">
+        <plugin>transmission_interface/SimpleTransmission</plugin>
+        <joint name="9" role="wheel"/>
+        <actuator name="wheel_9" role="wheel"/>
+      </transmission>
     </xacro:if>
 
     <xacro:unless value="$(arg use_sim)">

@@ -12,8 +12,8 @@ describe("追踪值格式化", () => {
   it("本地化阶段名称并缩短长标识", () => {
     expect(stageLabel("inference_ms")).toBe("模型调用");
     expect(stageLabel("custom_ms")).toBe("custom_ms");
-    expect(metricLabel("minimum")).toBe("min");
-    expect(metricLabel("maximum")).toBe("max");
+    expect(metricLabel("minimum")).toBe("最小值");
+    expect(metricLabel("maximum")).toBe("最大值");
     expect(shortId("1234567890abcdef", 8)).toBe("12345678…");
   });
 });

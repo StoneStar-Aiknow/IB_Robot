@@ -15,9 +15,13 @@
 
   <depend>rclpy</depend>
   <depend>sensor_msgs</depend>
+  <!-- Dependency leaf (openspec cleanup-manipulation-so101-providers D4): no
+       dependency of any category on manipulation_execution or any other
+       IB-Robot generic package, so the LeKiwi runtime can exec_depend on this
+       suite without pulling the manipulation/inference closure. -->
+  <exec_depend>python3-numpy</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
-  <test_depend>manipulation_execution</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

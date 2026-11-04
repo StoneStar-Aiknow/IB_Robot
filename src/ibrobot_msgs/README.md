@@ -36,6 +36,41 @@ schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
 `mid_long_seg` 和 `seg_end` 输出；`seq_id` 仍是逐事件递增的去重序号。新增字段会改变 ROS type hash，
 升级时必须原子重建并部署 `voice_asr_service`、`embodied_agent` 和所有订阅者，不得混跑旧二进制。
 
+### `SpeakerEmbedding.msg`
+
+每段人声一条的声纹向量，由 `voice_asr_service` 的 `speaker_id_node` 发布、
+`agent_voice_bridge` 的寻址门控消费。`embedding` 已 L2 归一化（余弦即点积），`model_id`
+随向量一起传递，由 bundle 的 `semantic_identity`（模型修订、预处理契约、输出语义）决定、与部署无关——
+`model_id` 不同或维度不同的向量不可互相比较，门控视为「不可比较」（放行、不并入锚点）而非不匹配。
+`speech_seconds` 是本段人声实际时长，供消费者判断可信度。
+
+`(source_id, segment_sequence)` 唯一标识一段人声（`segment_sequence` 是开启该段的 BEGIN 块的
+`SpeechAudioChunk.sequence`），消费者用它与同一段的 `SpeechTranscript` 配对，而不是按到达时间。
+向量通常先于转写到达：向量在人声结束时发布，转写还要等 VAD 静音加尾部补静音。哪些段被保留、丢弃由
+`voice_asr_service/speech_segments.py` 统一决定，ASR 与声纹节点共用；没有转写的段（ASR 丢弃了它）的向量
+不会判定任何一句，过期后丢弃。
+每段人声至多一条：过短或无法提取（返回空）的段发**空** `embedding`，表示「这段没有可用声纹」，消费者收到即可判定、
+不必等待超时；空向量不能参与比较。推理出错时这一段不发布，消费者等满宽限期后按缺失处理（fail-open）。
+
+**向量是生物特征数据**：只存在于进程内存与消息中，不落盘、不跨会话保留、不写日志。
+
+### `SpeechWakeEvent.msg`
+
+音源报告自己的唤醒词（X2 由 `aimdk_robot` 从厂商助手的应答推导，发布在 runtime 接口 `audio.wake_event` 上）。
+音源在释放人声之前就吃掉了唤醒词，文本里看不到；这条消息用 `(source_id, segment_sequence)` 指明唤醒词
+所在的那一段人声，与 `SpeakerEmbedding` 同一段标识。判定在该段 BEGIN 前后才成立，消息可能晚于 BEGIN 块到达。
+`agent_voice_bridge` 在 `vendor_session` 下只认它开会话：同一音源、从该段起的第一条 `SpeechTranscript` 是唤醒后的首句
+（音源有时先为唤醒词残留单开一段再丢弃，所以不要求恰好是这一段）；序号更早的段即使转写晚到也不是。
+它与转写走不同话题、没有先后保证：没有会话时到达的转写等它一个宽限期；该段（或同源更晚的段）的转写已经处理过才到的
+唤醒事件作废，不转给之后的段。
+
+### `SpeechTranscript.msg`
+
+一段人声的最终转写，带上它所属的段：`voice_asr_node` 在外部分段输入（`input_mode: external_vad`）下，
+每个产出文本的段发一条，与 `output_topic` 上的纯文本 `std_msgs/String` 同时发布、文本相同（纯文本话题的
+其他订阅者不受影响）。`(source_id, segment_sequence)` 与 `SpeakerEmbedding`、`SpeechWakeEvent` 同一标识，
+`agent_voice_bridge` 的寻址门控据此把转写、声纹与唤醒事件按段配对。本地 VAD 输入没有段标识，不发布。
+
 ### `MHandProFrame.msg` / `HumanHandState.msg`
 
 `MHandProFrame` 是可选的 mHandPro 厂商原始数据边界，保存左右侧、帧序号、设备电量、

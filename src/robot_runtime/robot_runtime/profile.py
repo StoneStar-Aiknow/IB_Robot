@@ -33,6 +33,7 @@ Facade-relevant shape::
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,50 @@ SIM_PLATFORMS = ("sdk", "gazebo", "mujoco")
 #: must test membership here instead; tests about Gazebo specifics (entity
 #: creation, gz bridges) keep the literal platform.
 PHYSICS_SIM_PLATFORMS = ("gazebo", "mujoco")
+
+#: Physics platforms whose sensor injection stands in for a lidar
+#: (lekiwi-gazebo-runtime-platform D14.2): the rendering path consults this
+#: next to the driver check (``LIDAR_SIM_DRIVERS``) before injecting a lidar
+#: sensor, and the lidar-odometry gate reads it as the "the runtime simulates
+#: lidar here" capability — a platform outside it renders no lidar, so the
+#: constant cannot drift from production behaviour.
+LIDAR_SIM_PLATFORMS = ("gazebo", "mujoco")
+
+
+def lidar_driver_simulated(driver: str, sim_platform: str | None) -> bool:
+    """Whether a physics platform's lidar injection stands in for ``driver`` (D5).
+
+    The driver sets are platform-specific (Gazebo simulates every driver in
+    ``robot_runtime.gazebo.LIDAR_SIM_DRIVERS``, MuJoCo only the MID-360 —
+    ``robot_runtime.mujoco.MUJOCO_LIDAR_SIM_DRIVERS``); a driver the selected
+    platform does not stand in for is neither simulated nor advertised there.
+    Imported lazily so the platform modules keep importing this one.
+    """
+    if sim_platform == "gazebo":
+        from robot_runtime.gazebo import LIDAR_SIM_DRIVERS
+
+        return driver in LIDAR_SIM_DRIVERS
+    if sim_platform == "mujoco":
+        from robot_runtime.mujoco import MUJOCO_LIDAR_SIM_DRIVERS
+
+        return driver in MUJOCO_LIDAR_SIM_DRIVERS
+    return False
+
+
+def resolve_sensor_pose(periph: dict, platform: str = "gazebo") -> dict:
+    """A non-camera sensor's simulator attachment transform (D5/D13).
+
+    The shared resolution for every physics platform (D5.2): the peripheral's
+    ``simulation.<platform>.transform`` (the simulator attachment pose, D13)
+    over the plain ``transform`` (the public static TF). The resolved
+    transform's ``parent_frame`` is the model frame the sensor attaches to.
+    """
+    section = (periph.get("simulation") or {}).get(platform) or {}
+    declared = section.get("transform") if isinstance(section, dict) else None
+    if isinstance(declared, dict) and declared:
+        return dict(declared)
+    return dict(periph.get("transform") or {})
+
 
 _REQUIRED_TOP_LEVEL = ("runtime", "modes", "capabilities", "joints")
 _REQUIRED_RUNTIME = ("name", "version")
@@ -170,6 +215,32 @@ def validate_profile(data: dict[str, Any], source: str | Path = "<profile>") -> 
     joints = data["joints"]
     if not isinstance(joints, list) or not joints or not all(str(j).strip() for j in joints):
         raise ProfileError(f"runtime profile 'joints' must be a non-empty list of names: {source}")
+
+    conformance = data.get("conformance")
+    if conformance is not None:
+        if not isinstance(conformance, dict):
+            raise ProfileError(f"runtime profile 'conformance' must be a mapping: {source}")
+        start_positions = conformance.get("start_positions")
+        if start_positions is not None:
+            if not isinstance(start_positions, dict) or not start_positions:
+                raise ProfileError(
+                    f"runtime profile 'conformance.start_positions' must be a non-empty mapping of joint names to radians: {source}"
+                )
+            # The conformance reset drives the arm joints only (D9: a subset
+            # of arm joints), with the same arm_joints-or-joints rule the
+            # suite's harness uses — a gripper joint would be silently ignored.
+            arm_joints = data.get("arm_joints", joints)
+            non_arm = sorted(str(joint) for joint in start_positions if str(joint) not in {str(j) for j in arm_joints})
+            if non_arm:
+                raise ProfileError(
+                    f"runtime profile 'conformance.start_positions' names non-arm joints {non_arm}: {source}"
+                )
+            for joint, value in start_positions.items():
+                # bool is an int subclass; true/false must not become 1.0/0.0 rad targets
+                if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+                    raise ProfileError(
+                        f"runtime profile 'conformance.start_positions.{joint}' must be a finite number: {source}"
+                    )
 
     _validate_sim_selection(data, source)
 

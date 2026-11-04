@@ -91,7 +91,12 @@ class AutoDecoder(FrameDecoder):
         try:
             return self._transport.decode(message)
         except Exception as exc:
-            self._transport.last_error = f"{type(exc).__name__}: {exc}"
+            # Keep the first root cause only. Wrapping an exception whose
+            # message already is ``last_error`` would grow the string every
+            # frame; the transport records its own raise reasons, so an empty
+            # value here means it could not.
+            if not self._transport.last_error:
+                self._transport.last_error = f"{type(exc).__name__}: {exc}"
             return None
 
     def close(self) -> None:

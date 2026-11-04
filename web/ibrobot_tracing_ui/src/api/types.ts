@@ -29,7 +29,7 @@ export interface ApiList<T> {
 export interface TraceSource {
   id: string;
   name: string;
-  kind: "ctf" | "log";
+  kind: "ctf" | "log" | "merged";
   version: string;
   size_bytes: number;
   file_count: number;
@@ -208,7 +208,7 @@ export interface AnalysisSummary {
     id: string;
     source_id: string;
     source_name: string;
-    source_kind: "ctf" | "log";
+    source_kind: "ctf" | "log" | "merged";
     source_version: string;
     created_at: string;
     event_count: number;
@@ -286,6 +286,11 @@ export interface EventOrigin {
   process_id: number | null;
   thread_id: number | null;
   node: string;
+  machine_id?: string;
+  boot_id?: string;
+  process_instance?: string;
+  capture_session?: string;
+  event_sequence?: JsSafeInteger | null;
 }
 
 export interface TraceEvent {
@@ -299,6 +304,8 @@ export interface TraceEvent {
   sequence: number;
   request_id: string;
   component_id: string;
+  monotonic_ns?: JsSafeInteger | null;
+  time_mapping?: Record<string, unknown>;
 }
 
 export interface TracepointDefinition {
@@ -323,6 +330,7 @@ export interface SpanRecord {
   status: string;
   origin: string;
   fields: Record<string, unknown>;
+  time_mapping?: Record<string, unknown>;
 }
 
 export interface FlowRecord {
@@ -334,6 +342,8 @@ export interface FlowRecord {
   receive_ns: string | number | null;
   duration_ms: number | null;
   status: string;
+  uncertainty_ns?: JsSafeInteger | null;
+  provenance?: Record<string, unknown>;
 }
 
 export interface GraphNode {
@@ -636,11 +646,12 @@ export interface CriticalPathFilters {
   maxSegments?: number;
 }
 
-export type SelectionKind = "request" | "event" | "span" | "flow" | "critical-path" | "component" | "edge" | "warning" | "comparison";
+export type SelectionKind = "request" | "event" | "span" | "span-summary" | "span-aggregate" | "flow" | "critical-path" | "component" | "edge" | "warning" | "comparison";
 
 export interface InspectorSelection {
   kind: SelectionKind;
   title: string;
   subtitle?: string;
   data: Record<string, unknown>;
+  previous?: InspectorSelection;
 }

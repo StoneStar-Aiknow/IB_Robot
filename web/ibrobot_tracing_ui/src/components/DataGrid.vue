@@ -36,11 +36,22 @@ watch(
 function move(delta: number): void {
   if (!visibleRows.value.length) return;
   cursor.value = Math.max(0, Math.min(visibleRows.value.length - 1, cursor.value + delta));
-  document.getElementById(`grid-row-${String(visibleRows.value[cursor.value][props.rowKey])}`)?.scrollIntoView({ block: "nearest" });
+  const row = document.getElementById(`grid-row-${String(visibleRows.value[cursor.value][props.rowKey])}`);
+  row?.focus({ preventScroll: true });
+  row?.scrollIntoView({ block: "nearest" });
 }
 
 function activate(): void {
   if (cursor.value >= 0 && visibleRows.value[cursor.value]) emit("select", visibleRows.value[cursor.value]);
+}
+
+function onKey(event: KeyboardEvent): void {
+  const target = event.target as HTMLElement;
+  if (target !== event.currentTarget && !target.matches("tr[data-grid-row]")) return;
+  if (["j", "ArrowDown", "k", "ArrowUp", "Enter", " "].includes(event.key)) event.preventDefault();
+  if (event.key === "j" || event.key === "ArrowDown") move(1);
+  else if (event.key === "k" || event.key === "ArrowUp") move(-1);
+  else if (event.key === "Enter" || event.key === " ") activate();
 }
 </script>
 
@@ -48,23 +59,24 @@ function activate(): void {
   <div
     class="data-grid-wrap"
     tabindex="0"
-    @keydown.j.prevent="move(1)"
-    @keydown.k.prevent="move(-1)"
-    @keydown.down.prevent="move(1)"
-    @keydown.up.prevent="move(-1)"
-    @keydown.enter.prevent="activate"
+    role="region"
+    :aria-label="visibleRows.length ? '记录表格，方向键移动，回车查看记录' : '空记录表格'"
+    @keydown="onKey"
   >
-    <table class="data-grid">
+    <div v-if="!visibleRows.length" class="grid-empty" role="status">{{ emptyText }}<slot name="empty-actions" /></div>
+    <table v-else class="data-grid">
       <colgroup><col v-for="column in columns" :key="column.key" :style="{ width: column.width }" /></colgroup>
       <thead><tr><th v-for="column in columns" :key="column.key" :class="`align-${column.align || 'left'}`">{{ column.label }}</th></tr></thead>
       <tbody>
-        <tr v-if="!visibleRows.length"><td :colspan="columns.length" class="empty-cell">{{ emptyText }}</td></tr>
         <tr
           v-for="(row, index) in visibleRows"
-          v-else
           :id="`grid-row-${String(row[rowKey])}`"
           :key="String(row[rowKey])"
+          data-grid-row
+          :tabindex="index === cursor ? 0 : -1"
+          :aria-current="index === cursor ? 'true' : undefined"
           :class="{ selected: String(row[rowKey]) === selectedKey, cursor: index === cursor }"
+          @focus="cursor = index"
           @click="cursor = index; emit('select', row)"
         >
           <td

@@ -288,6 +288,85 @@ def test_full_api_lifecycle_and_host_protection(tmp_path):
     asyncio.run(run())
 
 
+def test_merged_archive_preserves_clock_provenance_through_web_api(tmp_path):
+    from ibrobot_tracing.merging import write_merged_trace
+    from ibrobot_tracing.model import EventOrigin, TraceDataset, TraceEvent
+
+    base = 1_700_000_000_000_000_000
+    reference = ["generic-capture", 97, "grandmaster"]
+    metadata = {"kind": "ibrobot-merged-trace", "reference_id": reference}
+    events = []
+    for index, (name, host, offset, fields) in enumerate(
+        [
+            ("flow_send", "host-a", 0, {"edge_id": "rpc", "flow_id": "call"}),
+            ("flow_receive", "host-b", 1_000_000, {"edge_id": "rpc", "flow_id": "call"}),
+            ("span_begin", "host-b", 2_000_000, {"span_id": "work", "span_name": "work"}),
+            (
+                "span_end",
+                "host-b",
+                5_000_000,
+                {"span_id": "work", "span_name": "work", "status": "ok", "duration_ns": 3_000_000},
+            ),
+        ]
+    ):
+        events.append(
+            TraceEvent(
+                base + offset,
+                name,
+                {"request_id": "request", "component_id": "worker", **fields},
+                origin=EventOrigin(
+                    host=host,
+                    machine_id=host,
+                    boot_id="boot",
+                    process_instance=host,
+                    capture_session="generic-capture",
+                    event_sequence=index,
+                ),
+                monotonic_ns=base + offset,
+                schema_version=1,
+                clock="ptp_reference",
+                time_mapping={
+                    "status": "calibrated",
+                    "reference_id": reference,
+                    "uncertainty_ns": 1000,
+                    "calibration_sha256": host,
+                    "segment_id": 1,
+                    "source_id": host,
+                    "original_timestamp_ns": base + offset + 42,
+                },
+            )
+        )
+    path = tmp_path / "generic.ibtrace"
+    write_merged_trace(path, TraceDataset(events=events, metadata=metadata))
+
+    async def run():
+        app = create_app(WebConfig(trace_roots=(tmp_path,), allowed_hosts=("testserver",)))
+        async with app.router.lifespan_context(app):
+            sources = (await _request(app, "GET", "/api/v1/sources")).json()["items"]
+            assert len(sources) == 1 and sources[0]["kind"] == "merged"
+            response = await _request(app, "POST", "/api/v1/analysis-jobs", body={"source_id": sources[0]["id"]})
+            job = await _wait_for_job(app, response.json()["id"])
+            assert job["status"] == "completed", job
+            prefix = f"/api/v1/analyses/{job['analysis_id']}"
+            analysis = (await _request(app, "GET", prefix)).json()
+            assert analysis["source_kind"] == "merged"
+            points = (await _request(app, "GET", prefix + "/events")).json()["items"]
+            assert len(points) == 4
+            assert {event["origin"]["machine_id"] for event in points} == {"host-a", "host-b"}
+            assert all(isinstance(event["monotonic_ns"], str) for event in points)
+            assert all(event["time_mapping"]["uncertainty_ns"] == 1000 for event in points)
+            spans = (await _request(app, "GET", prefix + "/spans")).json()["items"]
+            assert spans[0]["duration_ms"] == 3.0 and spans[0]["time_mapping"]["status"] == "calibrated"
+            flows = (await _request(app, "GET", prefix + "/flows")).json()["items"]
+            assert flows[0]["duration_ms"] == 1.0 and flows[0]["uncertainty_ns"] == 2000
+            assert flows[0]["provenance"]["receive"]["origin"]["machine_id"] == "host-b"
+            for view in ("summary", "timeline", "graph", "critical-path"):
+                response = await _request(app, "GET", prefix + f"/{view}?request_id=request")
+                assert response.status_code == 200, response.text
+
+    asyncio.run(run())
+
+
 def test_span_profile_api_modes_filters_limits_and_path_safety(tmp_path):
     async def run():
         trace = tmp_path / "span-profile.log"

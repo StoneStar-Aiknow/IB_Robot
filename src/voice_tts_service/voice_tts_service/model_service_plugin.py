@@ -89,6 +89,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         allowed = {
             "device_id",
             "prompt_profile",
+            "num_steps",
             "segment_max_chars",
             "segment_pause_ms",
             "max_request_chars",
@@ -104,7 +105,9 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         # Service limits belong to TTSServiceCore, not to the vendor model
         # session. Keep the full options for the core but narrow the context
         # passed to Ascend/Torch session builders to their own contract.
-        session_options = {name: options[name] for name in ("device_id", "prompt_profile") if name in options}
+        session_options = {
+            name: options[name] for name in ("device_id", "prompt_profile", "num_steps") if name in options
+        }
         runtime_profile = getattr(validated, "runtime_profile", None)
         if runtime_profile is None:
             role_profiles = getattr(validated, "role_runtime_profiles", {})

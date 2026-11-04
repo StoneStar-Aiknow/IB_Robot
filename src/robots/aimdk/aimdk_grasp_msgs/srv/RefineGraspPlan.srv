@@ -1,0 +1,10 @@
+# Revise the steps after plan steps[completed] from what the X2 grasp head measures now.
+
+string plan_id
+int32 completed
+float64 timeout_s
+---
+bool success
+string error_code
+string message
+GraspPlan plan

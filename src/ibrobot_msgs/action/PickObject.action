@@ -46,9 +46,17 @@ DelegatedExecutorIdentity actual_executor
 int32 candidate_index
 bool released_after_success
 string pipeline_timings_json
+ExecutionDetail execution_detail
+# Last emitted phase feedback; zero for executors without sequenced feedback.
+uint64 last_feedback_sequence
+# Bounded tail, ordered by sequence; first = last_feedback_sequence - length + 1.
+# Recovers feedback overtaken by the Action result (no prose parsing).
+ExecutionDetail[<=256] execution_history
 ---
 # --- Feedback ---
 string phase
 float32 progress
 uint32 attempt
 string detail
+ExecutionDetail execution_detail
+uint64 sequence

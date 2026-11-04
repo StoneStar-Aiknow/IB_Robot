@@ -27,20 +27,7 @@ export interface ProfileLayout<T> {
   contentHeight: number;
 }
 
-const COMPONENT_COLORS = [
-  "#3158b8",
-  "#087f8c",
-  "#6746b3",
-  "#b45117",
-  "#18774a",
-  "#9b365a",
-  "#4e708f",
-  "#7b6414",
-  "#36509b",
-  "#00706e",
-  "#74407e",
-  "#995027",
-];
+const COMPONENT_COLOR_COUNT = 12;
 
 export function numericNs(value: number | string | null | undefined): number {
   const parsed = typeof value === "number" ? value : Number(value ?? 0);
@@ -110,7 +97,7 @@ export function componentColor(componentId: string): string {
     hash ^= componentId.charCodeAt(index);
     hash = Math.imul(hash, 16777619);
   }
-  return COMPONENT_COLORS[(hash >>> 0) % COMPONENT_COLORS.length];
+  return `var(--chart-component-${(hash >>> 0) % COMPONENT_COLOR_COUNT})`;
 }
 
 export function layoutRequestProfile(

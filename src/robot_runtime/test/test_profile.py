@@ -176,3 +176,48 @@ def test_mock_default_profile_is_valid():
         data = default_profile(base=base)
         validate_profile(data, "mock")
         assert ("base.cmd_vel" in data["capabilities"]) is base
+
+
+# ---------------------------------------------------------------------------
+# Conformance start pose (issue #194, upgrade-mujoco D9): optional
+# conformance.start_positions shape validation.
+# ---------------------------------------------------------------------------
+
+
+def test_conformance_start_positions_accepts_arm_joints_with_int_and_float():
+    data = _minimal()
+    data["arm_joints"] = ["a", "b"]
+    data["conformance"] = {"start_positions": {"a": 0, "b": -1.5}}  # int and float both fine
+    validate_profile(data, "unit")
+
+
+def test_conformance_start_positions_rejects_non_arm_joints():
+    # the conformance reset drives arm joints only (D9); a gripper joint
+    # would be accepted against `joints` but silently ignored by the suite
+    data = _minimal()
+    data["arm_joints"] = ["a"]
+    data["conformance"] = {"start_positions": {"b": 0.0}}
+    with pytest.raises(ProfileError, match="names non-arm joints \\['b'\\]"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": {"nope": 0.0}}
+    with pytest.raises(ProfileError, match="names non-arm joints \\['nope'\\]"):
+        validate_profile(data, "unit")
+
+
+def test_conformance_start_positions_rejects_bools_nonfinite_and_nonmapping():
+    data = _minimal()
+    data["conformance"] = {"start_positions": {"a": True}}
+    with pytest.raises(ProfileError, match="conformance\\.start_positions\\.a' must be a finite number"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": {"a": False}}
+    with pytest.raises(ProfileError, match="conformance\\.start_positions\\.a' must be a finite number"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": {"a": float("nan")}}
+    with pytest.raises(ProfileError, match=r"conformance\.start_positions\.a' must be a finite number"):
+        validate_profile(data, "unit")
+    data["conformance"] = {"start_positions": ["a"]}
+    with pytest.raises(ProfileError, match="must be a non-empty mapping"):
+        validate_profile(data, "unit")
+    data["conformance"] = []
+    with pytest.raises(ProfileError, match="'conformance' must be a mapping"):
+        validate_profile(data, "unit")

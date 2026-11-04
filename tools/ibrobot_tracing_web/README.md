@@ -52,6 +52,19 @@ mkdir -p ~/.ros/tracing
 scp -r root@<openeuler-board>:/root/.ros/tracing/<session> ~/.ros/tracing/
 ```
 
+### 1.4 查看校准合并后的 Trace
+
+Web 同时支持 CTF 目录、原始 log 和通用 `.ibtrace` 合并文件。先按
+[合并流程](../../src/ibrobot_tracing/docs/trace_merge.md) 使用各主机同期时钟校准合并，再将输出
+放入 Web 配置的 `--trace-root`，扫描并载入分析即可。文件沿用目录扫描、路径/符号链接限制和
+内容快照检查；解析仍由 `ibrobot_tracing` 的通用 merged reader 完成。
+
+Events、Spans、Flows API 保留主机/boot/进程来源、原始单调时间与时钟映射/误差信息，
+大整数沿用既有 JS-safe 序列化。Timeline、Flow 和 critical path 使用原有分析能力。
+本支持不依赖 LIBERO、客户 t1/t2/t3 命名或任何诊断 patch，也不生成派生 trace。
+未能校准的事件保留在原合并文件中，summary 显示 coverage/rejection 信息；详细查看仍可使用
+`ibrobot-trace events run.ibtrace --uncalibrated`。
+
 ## 2. 构建 Web UI
 
 Ubuntu 构建需要 Node.js 18 或更高版本。`setup.sh` 不安装 Node.js；请先确认系统已有
@@ -93,6 +106,18 @@ npm run build --prefix web/ibrobot_tracing_ui
 生成的 `web/ibrobot_tracing_ui/dist` 由 Git 忽略。首次 clone 或前端源码变化后，都需要重新执行
 `build_tracing_web.sh`；前端依赖变化时先显式重跑 `npm ci`。Node.js 只用于构建，Web server
 运行阶段不需要 Node.js。
+
+### 静态资源交付
+
+服务对可压缩且超过500字节的响应按客户端 `Accept-Encoding` 协商gzip，保留未压缩客户端支持，
+并由中间件设置 `Vary: Accept-Encoding`。API响应的JSON语义不变。
+交付适配层尊重gzip的q值（含q=0），Range请求和206响应保留原始表示，HEAD不压缩。
+gzip响应使用弱ETag，避免与identity字节不同却共用强validator；静态GET/HEAD支持
+If-None-Match和If-Modified-Since的304（ETag条件优先）。本地和已部署Starlette版本本已跳过206，
+适配层用于明确不同受支持版本的共同契约，而非声称此前生产分片已损坏。
+`assets/` 内含构建hash的资源使用 `Cache-Control: public, max-age=31536000, immutable`；
+HTML首页、SPA深链接及非hash文件使用 `no-cache`，以便发布后读取新入口。生产发布先复制全部hash资源，
+再原子替换index，并保留旧hash资源供已有页面继续加载。不要用相同hash文件名发布不同内容。
 
 构建后可从仓库根目录验证（需已有 pytest 和 Web 测试依赖）：
 

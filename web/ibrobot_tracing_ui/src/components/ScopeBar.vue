@@ -1,71 +1,37 @@
 <script setup lang="ts">
 import { storeToRefs } from "pinia";
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 import { useProfilerStore } from "../stores/profiler";
-import { shortId } from "../utils/format";
-import AppIcon from "./AppIcon.vue";
+import RequestFinder from "./RequestFinder.vue";
+import { boundaryLabel } from "../utils/format";
 
 const store = useProfilerStore();
-const { requests, components, requestId, componentId, metric, graphView, searchQuery, motionPaused } = storeToRefs(store);
-const scopeComponents = computed(() => components.value.filter((component) => !["operation", "instant_event"].includes(component.kind)));
-
-function clearScope(): void {
-  requestId.value = "";
-  componentId.value = "";
-  searchQuery.value = "";
-  store.selection = null;
-}
+const toolsOpen = ref(false);
+watch(() => store.requestId, () => { toolsOpen.value = false; });
+const { summary } = storeToRefs(store);
+const machineIds = computed(() => {
+  const sources = summary.value?.metadata.sources;
+  if (!Array.isArray(sources)) return [];
+  return [...new Set(sources.map((source) => source?.calibration_identity?.machine_id).filter((id): id is string => typeof id === "string" && Boolean(id)))];
+});
+const reference = computed(() => summary.value?.metadata.reference_id);
 </script>
 
 <template>
-  <section class="scope-bar" aria-label="分析范围">
-    <span class="scope-title">分析范围</span>
-    <label>
-      <span>请求</span>
-      <select v-model="requestId" aria-label="请求范围">
-        <option value="">全部请求</option>
-        <option v-for="request in requests" :key="request.request_id" :value="request.request_id">
-          {{ shortId(request.request_id, 18) }}
-        </option>
-      </select>
-    </label>
-    <label>
-      <span>组件</span>
-      <select v-model="componentId" aria-label="组件范围">
-        <option value="">全部组件</option>
-        <option v-for="component in scopeComponents" :key="component.component_id" :value="component.component_id">
-          {{ component.name }}
-        </option>
-      </select>
-    </label>
-    <label>
-      <span>指标</span>
-      <select v-model="metric" aria-label="拓扑聚合指标">
-        <option value="minimum">min</option>
-        <option value="p50">p50</option>
-        <option value="p95">p95</option>
-        <option value="p99">p99</option>
-        <option value="maximum">max</option>
-        <option value="mean">mean</option>
-      </select>
-    </label>
-    <label>
-      <span>拓扑</span>
-      <select v-model="graphView" aria-label="拓扑层级">
-        <option value="nodes">ROS 节点</option>
-        <option value="components">组件</option>
-        <option value="tracepoints">埋点</option>
-      </select>
-    </label>
-    <label class="scope-search">
-      <AppIcon name="search" :size="14" />
-      <input id="global-trace-search" v-model="searchQuery" type="search" placeholder="过滤拓扑与当前表格" aria-label="过滤拓扑与当前表格" />
-      <kbd>/</kbd>
-    </label>
-    <button class="icon-button" type="button" :title="motionPaused ? '恢复流向动画' : '暂停流向动画'" @click="motionPaused = !motionPaused">
-      <AppIcon :name="motionPaused ? 'play' : 'pause'" />
-      <span class="sr-only">{{ motionPaused ? "恢复流向动画" : "暂停流向动画" }}</span>
-    </button>
-    <button v-if="requestId || componentId || searchQuery" class="text-button" type="button" @click="clearScope">清除范围</button>
+  <section class="scope-bar" aria-label="请求查找与 trace 文件信息">
+    <button id="scope-tools-toggle" class="text-button compact-only" type="button" :aria-expanded="toolsOpen" aria-controls="scope-tools" @click="toolsOpen = !toolsOpen">查找请求与 trace 文件信息</button>
+    <div id="scope-tools" class="scope-tools" :class="{ expanded: toolsOpen }">
+    <RequestFinder />
+    <details class="capture-info" data-popover>
+      <summary>trace 文件信息与计时边界</summary>
+      <dl v-if="summary">
+        <dt>已载入 trace 文件</dt><dd>{{ summary.analysis.source_name }}</dd>
+        <dt>主要计时边界</dt><dd>{{ boundaryLabel(summary.coverage.boundary || '') || "未提供；请查看具体记录起终点" }}</dd>
+        <dt>trace 文件来源主机</dt><dd>{{ machineIds.length ? machineIds.join("、") : "汇总元数据未提供；记录来源可在详情查看" }}</dd>
+        <dt>跨主机校准</dt><dd>{{ reference ? `PTP 参考 ${JSON.stringify(reference)}；条件工程估计，以记录误差为准` : "未提供校准信息" }}</dd>
+        <dt>来源版本</dt><dd><code>{{ summary.analysis.source_version }}</code></dd>
+      </dl>
+    </details>
+    </div>
   </section>
 </template>

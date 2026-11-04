@@ -15,6 +15,12 @@ string target
 
 # true: interrupt a motion already playing. false: reject while one is playing.
 bool interrupt
+
+# "" plays the motion from its start. Otherwise the resume_token of an earlier
+# result that this runtime cancelled part-way: the motion continues from where
+# it stopped if the runtime still vouches for that point (nothing moved the arm
+# since), and plays from its start otherwise, saying so in the message.
+string resume_token
 ---
 uint16 NONE=0
 uint16 UNKNOWN_MOTION=1
@@ -32,6 +38,11 @@ uint16 INTERNAL_ERROR=255
 bool success
 uint16 error_code
 string message
+# Set when a cancel stopped the motion part-way and the runtime can continue it:
+# pass it back as Goal.resume_token. "" when the motion cannot be resumed.
+string resume_token
+# Share of the motion completed when the result was produced, in [0, 1].
+float32 progress
 ---
 # "accepted", "running", "completing"
 string state

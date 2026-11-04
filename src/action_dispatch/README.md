@@ -8,7 +8,9 @@
 跨帧融合可缓和重叠预测之间的变化，但不保证物理运动连续或推理供应无间隙。
 
 本包包含两个互斥 executable，具体选择只来自
-`control_modes.<mode>.inference.scheduler.enable`：
+`robot.runtime_scheduler.enable`：
+
+SIM/benchmark 始终使用直通 dispatcher；此开关仅在 hardware 目标下选择调度路径。
 
 - 缺失或 `false`：启动 `action_dispatcher_node`，沿
   `executor.inference_pipeline -> DispatchInfer /dispatch + /reset` 工作，行为与原路径一致。
@@ -595,6 +597,25 @@ control_modes:
 scheduled 路径的 `~/start_evaluate`、`~/stop_evaluate` 和 `~/restart_session` 在生命周期操作竞争时
 返回 `success=false`、`message="lifecycle operation in progress"`，表示本次请求的操作**未执行**。
 这同样适用于 Stop：busy 响应不代表停止成功。调用方必须检查响应，并根据状态决定是否重试。
+
+**provider 路径的启动语义**：当 robot_config 声明了 `runtime.provider`（例如 SO-101 的
+`so101_robot`）时，dispatcher 初始化为 stopped，默认（`control_modes.model_inference.auto_start`，
+缺省 `true`）会在观察到健康且处于 idle 的 runtime 后自动完成 admission 并开始推理输出；
+保守的真机部署可设 `auto_start: false`，改为显式调用 `~/start_evaluate`。没有 provider 的
+普通 legacy 路径则启动即自动运行（benchmark 由 `RunPolicy` 驱动，`navigation_mode=true` 需要显式
+`~/start_evaluate`）。注意：任何 stop（`~/stop_evaluate`、撤销、`/runtime/stop` 锁定）
+之后**不会**自动恢复，必须重新显式调用 `~/start_evaluate`：
+
+```bash
+ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger "{}"
+```
+
+admission 失败时，若 mode 切换已经发出，dispatcher 先等待该切换请求的结果，再确认 runtime 仍处于 policy
+模式后请求回到 idle；读到的状态显示 stop 锁定时不请求 idle（idle 会清除锁定）。读取状态与请求 idle 之间不是原子的：
+这期间并发的 `/runtime/stop` 仍可能被 idle 请求清除锁定，需要 runtime 契约提供条件切换才能消除（见 #198）。
+`~/stop_evaluate` 只有确认 runtime 已离开 policy 模式才返回 `success=true`，否则返回
+`runtime idle transition failed`；它不会向身份不符的 runtime 请求 idle。若 policy 模式的切换请求在回退时限内
+一直没有应答，dispatcher 会保持 fail-closed：拒绝新的 start、stop 返回失败，直到该请求应答（之后自动重新检查并回退）。
 
 ### 与 ros2_control 通信
 

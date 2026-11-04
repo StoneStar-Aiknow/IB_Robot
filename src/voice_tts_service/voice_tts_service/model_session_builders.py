@@ -19,6 +19,11 @@ def build_zipvoice_session(
     """Construct the manifest-selected ZipVoice session without loading it."""
 
     options = context.runtime_options
+    # None means "use the value the bundle shipped with". The flow-matching
+    # loop runs once per step and dominates synthesis time, so this is the
+    # deployment's main latency/quality dial.
+    num_steps = options.get("num_steps")
+    num_steps = None if num_steps is None else int(num_steps)
     if context.backend == "ascend":
         if context.target_runtime != "acl":
             raise ValueError("ZipVoice Ascend requires target.runtime='acl'")
@@ -30,6 +35,7 @@ def build_zipvoice_session(
         return ZipVoiceAscendSession(
             device_id=int(device_id),
             prompt_profile=str(options.get("prompt_profile", VOICE_TTS_DEFAULTS["prompt_profile"])),
+            num_steps=num_steps,
             runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
         )
     if context.backend == "torch":
@@ -37,6 +43,7 @@ def build_zipvoice_session(
             raise ValueError("ZipVoice ONNX requires a typed cpu Torch profile")
         return ZipVoiceOnnxSession(
             prompt_profile=str(options.get("prompt_profile", VOICE_TTS_DEFAULTS["prompt_profile"])),
+            num_steps=num_steps,
         )
     raise ValueError(f"ZipVoice plugin does not support backend: {context.backend}")
 

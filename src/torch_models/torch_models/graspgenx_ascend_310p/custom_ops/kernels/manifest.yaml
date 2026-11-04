@@ -64,9 +64,13 @@ build:
     - cmake
     - a C++17 host compiler
     - the workspace venv, for the Torch headers and ABI flag
+    - write access to the CANN installation's opp/vendors/
   output_layout: >
-    <root>/<vendor_name>/torch_bridge.so and <root>/vendors/<vendor_name>/ for
-    ASCEND_CUSTOM_OPP_PATH, where <root> is IBROBOT_GRASPGENX_ASCEND_OPS. See
+    <root>/<vendor_name>/torch_bridge.so, where <root> is
+    IBROBOT_GRASPGENX_ASCEND_OPS. The vendor packages go to the CANN tree's own
+    $ASCEND_HOME_PATH/opp/vendors/<vendor_name>/ instead, which is the only
+    location CANN reuses their binary kernels from; ASCEND_CUSTOM_OPP_PATH must
+    not name them. See
     src/torch_models/torch_models/graspgenx_ascend_310p/custom_ops/__init__.py.
 
 licensing:

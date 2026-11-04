@@ -5,15 +5,19 @@ from __future__ import annotations
 import contextvars
 import functools
 import inspect
+import itertools
 import json
 import logging
 import math
 import os
+import socket
+import threading
 import time
 import uuid
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, ParamSpec, TypeVar
 
 _TRACE_PREFIX = "IBTRACE1 "
@@ -41,6 +45,80 @@ _span_stack_var: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVa
 
 P = ParamSpec("P")
 R = TypeVar("R")
+_provenance_lock = threading.Lock()
+_provenance_state: tuple[int, dict[str, Any], itertools.count] | None = None
+
+
+def _reset_provenance_after_fork():
+    global _provenance_lock, _provenance_state
+    _provenance_state = None
+    _provenance_lock = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_provenance_after_fork)
+
+
+def _process_provenance(pid: int):
+    """Hot-path lookup only: no identity I/O, lock acquisition or initialization."""
+    state = _provenance_state
+    return state[1:] if state is not None and state[0] == pid else None
+
+
+def _prepare_process_provenance():
+    """Best-effort enabled-emitter setup; concurrent/reentrant callers never wait.
+
+    Construct emitters before the workload. Inherited emitters after fork emit
+    local-only records until an enabled emitter is constructed in the child.
+    """
+    global _provenance_state
+    pid = os.getpid()
+    if _process_provenance(pid) is not None:
+        return
+    lock = _provenance_lock
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        if _process_provenance(pid) is None:
+            provenance, counter = _load_process_provenance(pid)
+            # A fork during initialization must not republish the parent's
+            # identity in the child after its at-fork reset.
+            if os.getpid() == pid and lock is _provenance_lock:
+                _provenance_state = (pid, provenance, counter)
+    except (MemoryError, SystemError):
+        raise
+    except Exception:
+        # Metadata failure must not disable local tracing or escape into the
+        # caller. Only a later explicit emitter construction may retry setup.
+        pass
+    finally:
+        lock.release()
+
+
+def _load_process_provenance(pid: int):
+    """Read identity only during enabled-emitter construction, never emission."""
+
+    def identity_file(path):
+        try:
+            with Path(path).open(encoding="utf-8") as stream:
+                value = stream.read(129)
+            return value.strip() if len(value) <= 128 else ""
+        except (OSError, UnicodeError):
+            return ""
+
+    session = os.environ.get("IB_TRACE_SESSION_ID", "")
+    session = session if 0 < len(session) <= 256 and session.strip() == session else ""
+    return (
+        {
+            "host": socket.gethostname(),
+            "machine_id": identity_file("/etc/machine-id"),
+            "boot_id": identity_file("/proc/sys/kernel/random/boot_id"),
+            "process_id": pid,
+            "process_instance": uuid.uuid4().hex,
+            "capture_session": session,
+        },
+        itertools.count(),
+    )
 
 
 def _level() -> int:
@@ -284,6 +362,10 @@ class TraceEmitter:
     enabled: bool = True
     _emitted_definitions: set[tuple[str, str, str, str]] | None = field(default=None, init=False, repr=False)
 
+    def __post_init__(self):
+        if self.enabled:
+            _prepare_process_provenance()
+
     def _write_record(self, name, fields, timestamp_ns=None) -> bool:
         identities = {key: _identity(fields[key]) for key in _IDENTITY_FIELDS if key in fields}
         attributes = _json_value({key: value for key, value in fields.items() if key not in identities})
@@ -301,6 +383,14 @@ class TraceEmitter:
         for key in ("timestamp_ns", "monotonic_ns"):
             if type(payload[key]) is not int or payload[key].bit_length() > 64:
                 return False
+        process = _process_provenance(os.getpid())
+        if process is not None:
+            provenance, counter = process
+            payload["provenance"] = {
+                **provenance,
+                "thread_id": threading.get_native_id(),
+                "event_sequence": next(counter),
+            }
         encoded = json.dumps(payload, separators=(",", ":"), sort_keys=True, allow_nan=False)
         if len(encoded) + len(_TRACE_PREFIX) > _MAX_RECORD_BYTES:
             return False

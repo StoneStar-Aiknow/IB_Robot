@@ -8,6 +8,7 @@ from robot_config.observation_transport import (
     require_valid_observation_transports,
     resolve_observation_transport,
 )
+from robot_config.voice_contract import VOICE_TRANSCRIPT_TOPIC
 
 if TYPE_CHECKING:
     from robot_config.contract_utils import Contract
@@ -220,10 +221,17 @@ class VoiceASRConfig:
     vad_sensitivity: float = 0.6
     vad_bundle_path: str = "models/silero-vad"
     vad_deployment: str = "torch_cpu"
+    vad_min_silence_duration: float = 0.5
+    vad_post_roll_ms: float = 500.0
+    vad_pre_roll_ms: float = 300.0
+    vad_min_speech_duration: float = 0.3
     realtime_pre_roll_seconds: float = 0.5
     final_tail_padding_seconds: float = 1.5
     publish_partial: bool = True
     output_topic: str = "/voice_command"
+    #: external_vad 下同一最终文本再按段发布一份（ibrobot_msgs/SpeechTranscript，带 source_id 与
+    #: segment_sequence），供寻址门控把转写、声纹与唤醒事件按段配对；voice_bridge 的订阅由此推导。
+    transcript_topic: str = VOICE_TRANSCRIPT_TOPIC
     sample_rate: int = 16000
     chunk_size: int = 512
     buffer_seconds: float = 5.0
@@ -237,6 +245,8 @@ class VoiceASRConfig:
     audio_input: dict[str, Any] | None = None
     external_min_samples: int = 3200
     external_idle_timeout: float = 2.0
+    #: 音源没发 END 就停止发送时，按空闲超时收尾并发布转写，而不是丢弃整段（X2 实测如此）。
+    external_finalize_on_idle: bool = False
 
 
 @dataclass

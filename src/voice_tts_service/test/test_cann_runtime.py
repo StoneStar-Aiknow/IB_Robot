@@ -78,6 +78,39 @@ def test_environment_keeps_the_callers_entries_behind_the_toolkit(tmp_path, monk
     assert ascend_node_environment(root)["LD_LIBRARY_PATH"] == f"{root / 'lib64'}:/caller/lib"
 
 
+def test_foreign_toolkit_entries_are_dropped_from_every_path_variable(tmp_path, monkeypatch):
+    """A caller that sourced another toolkit must not leave that ABI behind this one.
+
+    ld.so and Python resolve in order, so the selected root wins for what it ships -- but a library
+    or module that only the other version has would still load from it.
+    """
+    selected = tmp_path / "8.1.RC1"
+    foreign = tmp_path / "8.0.RC2"
+    for root in (selected, foreign):
+        (root / "bin").mkdir(parents=True)
+        (root / "lib64").mkdir()
+        (root / "pyACL" / "python" / "site-packages").mkdir(parents=True)
+    monkeypatch.setenv("PATH", f"{foreign / 'bin'}:/usr/bin")
+    monkeypatch.setenv("LD_LIBRARY_PATH", str(foreign / "lib64"))
+    monkeypatch.setenv("PYTHONPATH", str(foreign / "pyACL" / "python" / "site-packages"))
+
+    environment = ascend_node_environment(selected)
+
+    assert environment["PATH"] == f"{selected / 'bin'}:/usr/bin"
+    assert environment["LD_LIBRARY_PATH"] == str(selected / "lib64")
+    assert environment["PYTHONPATH"] == str(selected / "pyACL" / "python" / "site-packages")
+
+
+def test_inherited_entries_of_the_selected_toolkit_are_not_duplicated(tmp_path, monkeypatch):
+    root = tmp_path / "8.1.RC1"
+    site = root / "pyACL" / "python" / "site-packages"
+    site.mkdir(parents=True)
+    # An empty entry (a trailing or doubled separator) names nothing and must not survive.
+    monkeypatch.setenv("PYTHONPATH", f"{site}::")
+
+    assert ascend_node_environment(root)["PYTHONPATH"] == str(site)
+
+
 @pytest.mark.model_bundle("zipvoice")
 def test_real_zipvoice_manifest_declares_the_abi_the_builder_reads():
     """Pin the manifest attribute path: a rename there would silently stop selecting a toolkit."""

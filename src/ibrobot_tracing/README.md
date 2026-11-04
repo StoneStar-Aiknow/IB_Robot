@@ -12,7 +12,13 @@ Dispatch Request -> First Action Execute
 
 该边界同时适用于 scheduler 关闭时的 legacy `DispatchInfer` 路径，以及 scheduler 开启时经过
 `ScheduledActionDispatcher -> Global Scheduler -> Pipeline` 的 scheduled 路径。Topology 会根据
-robot YAML 中的 `scheduler.enable` 记录实际 dispatch path。
+展开后的 robot YAML 声明生成 dispatch path；`ibrobot-trace-topology` 由 robot_config 统一解析
+`robot.runtime_scheduler.enable` 和运行目标，再交给 tracing 构图。
+这是声明拓扑（`provenance=declared`、`runtime_verified=false`），不代表已启动节点清单，
+也不读取启动命令的覆盖参数。分析 simulation/benchmark 等覆盖启动时，应使用对应的有效配置，
+而不是据原始 YAML 推断实际运行路径。
+直接调用 Python `bind_robot_topology()` 时，调用方通过 `scheduler_enabled` 传入已解析的调度结果
+（缺省为直通）；该参数是构图输入，不是额外的 YAML 配置开关。
 多 pipeline scheduler 在图中聚合为 `Policy Pipelines` 逻辑路径，Topology metadata 的 `pipeline_ids`、
 `pipeline_nodes` 与事件字段 `pipeline_id` 用于区分 primary/fallback；transport flow ID 还包含 ROS action
 goal UUID，使同一 request 的幂等重放保持为独立 flow pair。
@@ -990,6 +996,49 @@ Web 接入注意：request DTO 的字典形状不变，但表格需显示 `*_sta
 时也显示 coverage/count warnings 和 flame 截断诊断。上述展示继续复用现有 QueryService/Projection，
 无需另建查询或 retry 关联框架。
 
+### 4.12 跨主机时钟校准基础
+
+新增独立的 `ibrobot-clock capture/inspect` 工具与 `ClockCalibration` 离线 API：
+采集同一 PTP grandmaster 下的 PHC、monotonic、monotonic raw、realtime 及同步状态，
+携带主机/boot/session 身份、读取窗口和显式误差预算。映射拒绝失锁、过期、身份不匹配、
+采样缺口、时钟跳变和误差超标区间；原始时间戳始终保留。
+
+工具只读时钟，PTP 进程由实验环境管理，不改变系统 NTP/realtime。
+精度结果是预算假设下的工程估计，不能只用 servo residual 代替绝对精度验证。
+配置、命令、误差公式及使用边界见 [clock_calibration.md](docs/clock_calibration.md)。
+两端 PTP 主从完整配置、权限准备、锁定检查、同步采集和清理步骤见
+[Ubuntu / Ascend310P 时钟对齐操作手册](docs/ptp_two_host_runbook.md)。
+两端 CTF/log 可通过下面的合并入口应用映射；逐帧 RTP 指标使用独立的同帧 journal 分析入口。
+
+### 4.13 两端 trace 合并与分析
+
+在所有 trace 生产进程中设置与校准采集相同的 `IB_TRACE_SESSION_ID`，然后将两端原始 trace
+及其各自校准文件交给 `ibrobot-trace merge`：
+
+```bash
+source .shrc_local
+ros2 run ibrobot_tracing ibrobot-trace merge \
+    --input /absolute/edge-ctf /absolute/edge-clock.jsonl \
+    --input /absolute/cloud-ctf /absolute/cloud-clock.jsonl \
+    --output /absolute/run.ibtrace
+ros2 run ibrobot_tracing ibrobot-trace summary /absolute/run.ibtrace
+ros2 run ibrobot_tracing ibrobot-trace events /absolute/run.ibtrace --uncalibrated
+```
+
+合并保留主机/boot/进程身份、原始时间、校准依据与误差；不合格事件单独保留，
+不进入共同时间轴。既有 timeline、flow、critical-path 和 JSON 导出可读取 `.ibtrace`，
+本地 span 的单调时钟 duration 不会因跨机对时而改写。
+完整步骤、无效区间策略及测量边界见 [trace_merge.md](docs/trace_merge.md)。
+
+### 4.14 同帧 RTP 传输指标
+
+`ibrobot-rtp-metrics` 只分析外部工具或历史实验已经生成的同帧 journal，并结合时钟校准文件
+配对计算。本仓当前不提供 RTP journal 生产器；设置 `IB_RTP_METRICS_PATH` 或
+`IB_RTP_METRICS_SESSION_ID` 不会启用发送/接收侧记录，也没有改变业务侧 `network_latency_ns`
+的计算方式。接入运行时生产器属于独立任务，不能把周期 video status 当作同帧校准输入。
+报告区分帧投递区间、发送调用、接收排队/重组和编解码调用，保留未匹配、失效与误差原因。
+输入契约、命令与边界见 [rtp_metrics.md](docs/rtp_metrics.md)。
+
 ## 5. 推荐分析工作流
 
 1. 用 `summary` 判断主要瓶颈位于哪个 Stage，并观察 p50/p95/max 差异。
@@ -1007,7 +1056,7 @@ Web 接入注意：request DTO 的字典形状不变，但表格需显示 `*_sta
 - 自定义 instrumentation 目前只支持 Python。
 - 分析是离线模式，尚不支持 LTTng Live。
 - 手动创建的新线程需要显式传播 `ContextVar`。
-- 跨主机 flow 需要时钟同步才能把 realtime 差值解释为可靠网络时延。
+- 跨主机 flow 必须使用同期校准合并及匹配的来源身份；其耗时是应用事件边界之间的估计，不能等同于纯网络传播时延。
 - 当前端到端边界止于首次 action publish，尚未覆盖 Hardware Write 或 Physical Actuation。
 - Web UI 与 CLI 复用同一 Query/Projection 模型；Web 服务仅支持 Ubuntu，当前局域网服务尚未提供认证。
 - openEuler 保留 `ibrobot_tracing` 的 trace 采集与离线分析能力，但不构建 `ibrobot_tracing_web`；可将
@@ -1051,6 +1100,6 @@ Web 服务只允许读取配置的 trace root，不接受客户端文件路径�
 - 扩展到 Sensor Capture -> Hardware Write / Physical Actuation。
 - 支持 C++ 和原生 UST 自定义埋点。
 - 支持 LTTng Live 实时分析。
-- 支持跨主机时钟同步和 Edge/Cloud trace 合并。
+- 将已有跨主机校准与合并能力接入传输时延字段，并补齐完整业务端到端边界。
 - 支持手动创建的新线程传播 trace context。
 - 增加 Web API 认证和 HTTPS 部署指南。

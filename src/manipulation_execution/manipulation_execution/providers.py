@@ -3,8 +3,11 @@
 Generic pipeline phases consume robot-specific behaviors (gripper mesh
 geometry, wrist-orientation guards) through provider modules declared in the
 robot configuration instead of direct robot-suite imports, so the generic
-packages stay robot-agnostic and a robot without a suite provider runs with
-those grasp features disabled (design D8).
+packages stay robot-agnostic. Every grasp robot config must declare the
+providers its enabled features need: when the orientation guard or the
+tabletop filter is enabled without its provider, node startup fails fast
+naming the missing configuration field (design D8 + openspec change
+``cleanup-manipulation-so101-providers``).
 """
 
 from __future__ import annotations

@@ -7,9 +7,11 @@ tests for ``robot_config.perception_runtime_config``.
 """
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
+import yaml
 
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.perception_runtime_config import PerceptionRuntimeConfigError, parse_perception_runtime_config
@@ -155,3 +157,65 @@ def test_service_list_rejects_duplicate_ids_and_malformed_plugin_identity(tmp_pa
     malformed["perception_services"]["services"][0]["adapter_class"] = "not an import"
     with pytest.raises(PerceptionRuntimeConfigError, match="canonical module:Class"):
         parse_perception_runtime_config(malformed)
+
+
+def test_a_host_that_does_not_serve_the_models_validates_metadata_only(tmp_path: Path) -> None:
+    """with_model_services:=false hosts: identity still validates, weights need not exist.
+
+    The consumer host of a split deployment holds the bundle directory and its
+    manifest, but the weights and deployment artifacts live on the machine that
+    runs the services.
+    """
+    bundle = _bundle(tmp_path / "depth", "metric_depth")
+    shutil.rmtree(bundle / "assets")  # only the manifest came along
+
+    with pytest.raises(PerceptionRuntimeConfigError, match="failed bundle validation"):
+        parse_perception_runtime_config(_config(bundle))  # the hosting default demands the artifacts
+
+    runtime = parse_perception_runtime_config(_config(bundle), require_local_artifacts=False)
+    service = runtime.services[0]
+    assert service.validated_manifest is not None
+    assert service.validated_manifest.deployment_name == "torch_cpu"
+    assert 0 < runtime.configuration_generation({"depth": "depth_front"}) < 2**63
+
+
+def test_a_non_hosting_launch_loads_a_real_config_without_local_artifacts(tmp_path: Path) -> None:
+    """The real loader path of a consumer host: same YAML, metadata-only validation."""
+    from robot_config.loader import load_robot_config_dict
+
+    bundle = _bundle(tmp_path / "depth", "metric_depth")
+    shutil.rmtree(bundle / "assets")
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"robot": {"name": "split_consumer", "type": "test", **_config(bundle)}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="failed bundle validation"):
+        load_robot_config_dict(config_path)
+
+    loaded = load_robot_config_dict(config_path, require_local_model_artifacts=False)
+    assert loaded["name"] == "split_consumer"
+    assert loaded["perception_services"]["services"][0]["endpoint"] == "/depth/front"
+
+
+def test_a_contract_reader_loads_by_metadata_and_the_hosting_opt_in_demands_artifacts(tmp_path: Path) -> None:
+    """The typed loader's callers read their contract: dispatchers, recorders and
+    viewers never load the weights, so the manifest metadata is enough for them;
+    a tool that answers for this machine opts back into the artifact check."""
+    from robot_config.loader import load_robot_config
+
+    bundle = _bundle(tmp_path / "depth", "metric_depth")
+    shutil.rmtree(bundle / "assets")
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"robot": {"name": "split_consumer", "type": "test", **_config(bundle)}}), encoding="utf-8"
+    )
+
+    typed = load_robot_config(config_path)
+
+    assert typed.name == "split_consumer"
+    assert typed.perception_services is not None
+    assert [service.instance_id for service in typed.perception_services.services] == ["depth_front"]
+
+    with pytest.raises(ValueError, match="failed bundle validation"):
+        load_robot_config(config_path, require_local_model_artifacts=True)

@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>aimdk_description</name>
+  <version>0.1.0</version>
+  <description>
+    AgiBot X2 robot description: the official X2 URDF and meshes from
+    AgibotTech/agibot_x2_urdf at a pinned commit, copied byte-for-byte by
+    scripts/sync_x2_description.py (Mulan PSL v2). Upper body of the X2 Ultra
+    (v1.3.0) plus the left OmniHand (v1.4.0); see README.md.
+  </description>
+  <maintainer email="zhufei26@huawei.com">weixin_54906338</maintainer>
+  <license>MulanPSL-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

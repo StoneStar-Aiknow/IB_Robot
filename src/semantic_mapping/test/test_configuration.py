@@ -95,6 +95,36 @@ def test_standalone_launch_rejects_disabled_mapping_config() -> None:
         load_semantic_mapping_robot_config("unused", str(CONFIG_PATH))
 
 
+def test_a_manifest_only_host_still_builds_the_mapping_node(tmp_path: Path) -> None:
+    """with_model_services:=false hosts: the registry's mapping builder runs on manifest metadata alone.
+
+    The generic launch on a consumer host validates the services by metadata and
+    still runs the semantic_mapping builder; the mapping node consumes the model
+    services through their endpoints, so the weights only need to exist on the
+    machine that runs them.
+    """
+    import shutil
+
+    from robot_config.loader import load_robot_config_dict
+    from semantic_mapping.launch_builders.semantic_mapping import generate_semantic_mapping_nodes
+
+    path = _write_enabled_config(tmp_path)
+    for bundle in sorted((tmp_path / "bundles").iterdir()):  # only the manifests came along
+        shutil.rmtree(bundle / "assets")
+
+    config = load_robot_config_dict(path, require_local_model_artifacts=False)
+    nodes = generate_semantic_mapping_nodes(config)
+
+    assert [vars(node)["_Node__node_executable"] for node in nodes] == ["semantic_mapping_node"]
+    parameters = semantic_mapping_parameters(config)
+    assert parameters["mapping_backend"] == "service"
+    assert 0 < parameters["configuration_generation"] < 2**63
+    assert parameters["gdino_confirmation_service"] == "/semantic_perception/semantic_gdino_confirmation"
+
+    with pytest.raises(ValueError, match="failed bundle validation"):
+        load_robot_config_dict(path)  # the hosting load still demands the artifacts
+
+
 def test_embedded_backend_does_not_require_service_bundles_or_identities(tmp_path: Path) -> None:
     data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     mapping = data["robot"]["semantic_mapping"]

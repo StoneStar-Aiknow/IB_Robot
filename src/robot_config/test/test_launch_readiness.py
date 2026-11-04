@@ -17,7 +17,6 @@ from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.inference_config import InferenceConfigError
-from robot_config.launch_builders import control as control_builder
 from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import (
     generate_auxiliary_actuator_nodes,
@@ -26,7 +25,6 @@ from robot_config.launch_builders.control import (
     validate_runtime_resources,
 )
 from robot_config.launch_builders.execution import (
-    _attention_viz_request,
     generate_action_dispatcher_node,
     generate_execution_nodes,
     generate_inference_node,
@@ -258,32 +256,31 @@ def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
     assert "120.0" in _text(deferred_spawners[0]._Node__arguments)
 
 
-# Drives a robot config whose perception services reference a gitignored model
-# bundle; without scripts/download_models.py the config cannot load. A missing
-# download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
-def test_hybrid_real_hardware_spawner_keeps_arm_state_stream_active():
+def test_hybrid_arm_state_stream_is_a_runtime_profile_broadcaster():
+    """lekiwi_nav_grasp delegates the ros2_control chain to the runtime.
+
+    The hybrid stage's old spawner test asserted that
+    arm_joint_state_broadcaster stays active while base_velocity_controller
+    owns the base. Under the provider (openspec
+    lekiwi-application-migration task 1.2) that guarantee moved to the runtime
+    profile: broadcasters are always-on, mode controllers are scoped, and the
+    application configuration restates none of it.
+    """
     config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    profile_path = Path(__file__).resolve().parents[3] / "src/robots/lekiwi/lekiwi_robot/profiles/lekiwi_nav_grasp.yaml"
     robot_config = load_robot_config_dict(config_path)
+    profile = __import__("yaml").safe_load(profile_path.read_text(encoding="utf-8"))
 
-    _nodes, controller_names, deferred_spawners, _robot_description = generate_ros2_control_nodes(
-        robot_config,
-        use_sim=False,
-        auto_start_controllers="true",
-        controller_startup_timeout=120.0,
-    )
-
-    assert controller_names == [
-        "joint_state_broadcaster",
-        "arm_joint_state_broadcaster",
-        "base_velocity_controller",
+    assert "ros2_control" not in robot_config
+    assert profile["ros2_control"]["broadcasters"] == ["joint_state_broadcaster", "arm_joint_state_broadcaster"]
+    assert profile["modes"]["base_navigation"]["controllers"] == ["base_velocity_controller"]
+    assert profile["modes"]["trajectory"]["controllers"] == [
+        "arm_trajectory_controller",
+        "gripper_trajectory_controller",
     ]
-    assert len(deferred_spawners) == 1
-    arguments = [_text(argument) for argument in deferred_spawners[0]._Node__arguments]
-    inactive_controllers = [
-        arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--inactive-controller"
-    ]
-    assert inactive_controllers == ["arm_trajectory_controller", "gripper_trajectory_controller"]
+    for mode in robot_config["control_modes"].values():
+        assert "controllers" not in mode
 
 
 def test_controller_startup_processes_are_serialized():
@@ -752,8 +749,14 @@ def test_tracing_keeps_startup_error_when_cleanup_raises(monkeypatch, tmp_path, 
     assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
 
 
-def test_lekiwi_sim_uses_sim_controller_override():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi.yaml"
+def test_sim_controllers_override_drops_hardware_only_controllers():
+    """Simulation replaces the mode's controller set with sim_controllers.
+
+    Generic behaviour (D11): moved from the retired ``lekiwi.yaml`` onto the
+    minimal fixture — the hardware-only ``imu_sensor_broadcaster`` is absent
+    from the simulation set.
+    """
+    config_path = Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
     robot_config = load_robot_config_dict(config_path)
 
     _nodes, controller_names, _deferred_spawners, _robot_description = generate_ros2_control_nodes(
@@ -802,7 +805,12 @@ def test_launch_setup_enables_navigation_when_requested(monkeypatch):
 
     monkeypatch.setattr(robot_launch, "build_launch_registry", build_with_synthetic_navigation)
     context = LaunchContext()
-    context.launch_configurations["robot_config"] = "lekiwi"
+    # D11: the retired lekiwi.yaml was a plain legacy config here; the
+    # minimal fixture serves the same role without the retired asset
+    context.launch_configurations["robot_config"] = "sim_controllers_fixture"
+    context.launch_configurations["config_path"] = str(
+        Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
+    )
     context.launch_configurations["use_sim"] = "false"
     context.launch_configurations["auto_start_controllers"] = "false"
     context.launch_configurations["control_mode"] = "teleop"
@@ -905,7 +913,12 @@ def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
 
     def _launch(extension_mode):
         context = LaunchContext()
-        context.launch_configurations["robot_config"] = "lekiwi"
+        # D11: the retired lekiwi.yaml was a plain legacy config here; the
+        # minimal fixture serves the same role without the retired asset
+        context.launch_configurations["robot_config"] = "sim_controllers_fixture"
+        context.launch_configurations["config_path"] = str(
+            Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
+        )
         context.launch_configurations["use_sim"] = "false"
         # auto_start_controllers=true arms the REAL controller readiness
         # barrier (the controller group spawner) of this hardware launch.
@@ -960,32 +973,105 @@ def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
     assert extension_action not in disabled_actions
 
 
-def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
-    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
-    # The migrated provider config binds logical interfaces against the live
-    # runtime at launch time; offline structural loads defer that binding.
-    robot_config = load_robot_config_dict(src_config_path, defer_interface_binding=True)
-    robot_config.pop("_config_path", None)
-    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": True}
-    config_path = tmp_path / "scheduled_sim.yaml"
-    config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
-    context = LaunchContext()
-    context.launch_configurations.update(
-        config_path=str(config_path),
-        use_sim="true",
-        # The migrated provider config supports the SDK simulated transport;
-        # the scheduler/simulation rejection below must fire before any nodes.
-        sim_platform="sdk",
-        control_mode="model_inference",
-        with_inference="true",
+@pytest.mark.parametrize(
+    ("target", "execution_mode", "transport_mode"),
+    [
+        (None, "monolithic", "dds"),  # simulation selected by CLI use_sim alone
+        ("simulation", "monolithic", "dds"),
+        ("benchmark", "monolithic", "dds"),
+        ("benchmark", "distributed", "dds"),
+        ("benchmark", "distributed", "rtp"),
+    ],
+)
+def test_virtual_target_launch_keeps_robot_scheduler_dormant(
+    tmp_path, monkeypatch, target, execution_mode, transport_mode
+):
+    from copy import deepcopy
+
+    from robot_config.launch_builders.benchmark import BENCHMARK_BUILDER
+    from robot_config.launch_builders.execution import EXECUTION_BUILDER
+    from robot_config.launch_registry.registry import LaunchBuilderRegistry
+
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {"policy": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": execution_mode}},
+        selection="policy",
     )
+    config["runtime"] = {"target": "hardware"}
+    if target is None:
+        config.pop("runtime")
+    config["default_control_mode"] = "model_inference"
+    config["runtime_scheduler"] = {"enable": True}  # dormant tuning needs no scheduled endpoints
+    config["contract"] = {
+        "observations": [
+            {
+                "key": "observation.images.image",
+                "topic": "/camera/image",
+                "type": "sensor_msgs/msg/Image",
+                "image": {"encoding": "rgb8", "resize": [32, 32]},
+            }
+        ],
+        "actions": [],
+    }
+    if target == "benchmark":
+        config["benchmark"] = {
+            "type": "libero",
+            "adapter": "libero",
+            "evaluation": {
+                "enabled": True,
+                "suite": "libero_spatial",
+                "observation_transport": {"mode": transport_mode},
+                "output": {"root": str(tmp_path / "output")},
+            },
+        }
+        mode = config["control_modes"]["model_inference"]
+        mode["executor"]["type"] = "benchmark"
+        mode["dispatch"] = {"scheduler": "wait_for_feedback"}
+    original = deepcopy(config)
+    registry = LaunchBuilderRegistry()
+    registry.add(BENCHMARK_BUILDER)
+    registry.add(EXECUTION_BUILDER)
+    # Isolate registration and local DDS admission; the production preparation,
+    # orchestrator, benchmark and execution builders all run without stubs.
+    monkeypatch.setattr(robot_launch, "build_launch_registry", lambda: registry)
+    monkeypatch.setattr(robot_launch, "check_launch_dds", lambda context: None)
+    monkeypatch.delenv("WORKSPACE", raising=False)  # materialize run YAML inside tmp_path
+    context = LaunchContext()
+    context.launch_configurations.update(config_path=str(tmp_path / "robot.yaml"), with_inference="true")
+    if target is not None:
+        context.launch_configurations.update(runtime_target=target, sim_platform="mock")
+    else:
+        context.launch_configurations.update(use_sim="true")
 
-    def unexpected_control_generation(*args, **kwargs):
-        pytest.fail("control generation must not run for unsupported scheduled simulation")
-
-    monkeypatch.setattr(control_builder, "generate_ros2_control_nodes", unexpected_control_generation)
-    with pytest.raises(ValueError, match="simulation does not support"):
-        robot_launch.launch_setup(context)
+    actions = robot_launch.launch_setup(context, loaded_config=config)
+    nodes = {node.node_executable: node for node in actions if isinstance(node, Node)}
+    expected = {"pipeline_policy_node", "action_dispatcher_node"}
+    if target == "benchmark":
+        expected.update({"benchmark_environment_node", "benchmark_evaluator_node"})
+    if execution_mode == "distributed":
+        expected.add("pure_inference_node")
+    assert set(nodes) == expected
+    policy = _node_parameters(nodes["pipeline_policy_node"])
+    assert "runtime_policy_json" not in policy
+    assert config == original
+    if target == "benchmark":
+        evaluator = _node_parameters(nodes["benchmark_evaluator_node"])
+        assert evaluator["inference_health_topic"] == policy["health_topic"] == "/inference/policy/health"
+        assert evaluator["prepare_policy_episode_service"] == "/action_dispatcher/prepare_episode"
+        assert evaluator["run_policy_action_server"] == "/action_dispatcher/run_policy"
+        run_config = yaml.safe_load(Path(evaluator["robot_config_path"]).read_text())["robot"]
+        assert run_config["runtime"] == config["runtime"]
+        assert "use_sim" not in run_config
+        assert run_config["runtime_scheduler"]["enable"] is True
+        assert policy["robot_config_path"] == evaluator["robot_config_path"]
+        environment = _node_parameters(nodes["benchmark_environment_node"])
+        assert environment["frame_ingress_enabled"] is (transport_mode == "rtp")
+        if transport_mode == "rtp":
+            ingress = json.loads(environment["frame_ingress_contract_json"])
+            assert ingress["pipeline_id"] == "policy"
+            assert ingress["heartbeat_topic"] == policy["heartbeat_topic"]
+            assert len(ingress["streams"]) == 1
 
 
 @pytest.mark.parametrize("enable_tracing", [False, True])
@@ -1043,10 +1129,14 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
 
 
 def test_launch_loader_preserves_config_path_for_runtime_consumers():
-    robot_config = robot_launch.load_robot_config("lekiwi")
+    """Generic behaviour (D11): moved from the retired ``lekiwi.yaml`` onto
+    the minimal fixture — the loader records the resolved config path so the
+    runtime consumers can find sibling assets."""
+    config_path = Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
+    robot_config = robot_launch.load_robot_config("sim_controllers_fixture", str(config_path))
 
-    assert robot_config["name"] == "lekiwi"
-    assert robot_config["_config_path"].endswith("config/robots/lekiwi.yaml")
+    assert robot_config["name"] == "sim_controllers_fixture"
+    assert robot_config["_config_path"] == str(config_path)
 
 
 def test_inference_execution_mode_cli_override_targets_one_pipeline():
@@ -1242,13 +1332,6 @@ def test_launch_generation_rejects_pipeline_endpoint_conflicts(tmp_path):
 
     with pytest.raises(InferenceConfigError, match="endpoint conflict"):
         generate_inference_node(robot_config, "model_inference")
-
-
-def test_attention_viz_request_uses_robot_config_only():
-    enabled, mode, _viz_config = _attention_viz_request({"attention_viz": {"enabled": False, "mode": "file"}})
-
-    assert enabled is False
-    assert mode == "file"
 
 
 def test_generate_auxiliary_aero_hand_node_uses_configured_topics_and_rates():

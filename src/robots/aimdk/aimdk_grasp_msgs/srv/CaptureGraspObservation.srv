@@ -1,0 +1,23 @@
+# Capture one registered RGB-D observation on the X2 grasp head, which keeps it
+# under capture_id for the scene, plan and watch requests that follow.
+
+float64 timeout_s
+---
+bool success
+# Empty on success; a grasp pipeline failure code otherwise (e.g.
+# OBSERVATION_UNAVAILABLE, or NOT_READY while the host warms up).
+string error_code
+string message
+string capture_id
+# Registered to the colour camera: colour as JPEG; depth as "16UC1; zstd",
+# millimetres, 0 for no measurement.
+sensor_msgs/CompressedImage rgb
+sensor_msgs/CompressedImage depth
+# Row-major 3x3 camera matrix.
+float64[9] intrinsics
+int64 stamp_ns
+string base_frame
+# Row-major 4x4 transform from the camera into base_frame at stamp_ns.
+float64[16] base_from_camera
+# JSON object: what the capture measured.
+string report_json

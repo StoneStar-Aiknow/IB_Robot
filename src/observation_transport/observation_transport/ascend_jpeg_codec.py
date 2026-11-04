@@ -112,6 +112,15 @@ class AscendJpegDecoder(VideoDecoder):
                 frame = self._decode_frame(packet)
             finally:
                 self._free_frames()
+        except VideoCodecError as exc:
+            self._metrics = replace(self._metrics, errors=self._metrics.errors + 1)
+            if not exc.recoverable:
+                # Only runtime failures poison the channel: a recoverable
+                # input error leaves no resources behind (the finally above
+                # already freed them), and rebuilding the DVPP channel per bad
+                # frame costs far more than the decode itself.
+                self._state = CodecLifecycleState.FAILED
+            raise
         except Exception:
             self._state = CodecLifecycleState.FAILED
             self._metrics = replace(self._metrics, errors=self._metrics.errors + 1)
@@ -126,7 +135,13 @@ class AscendJpegDecoder(VideoDecoder):
         source = self._allocate(len(padded))
         _check(acl.rt.memcpy(source, len(padded), acl.util.bytes_to_ptr(padded), len(padded), 1), "memcpy JPEG")
         width, height, _components, result = media.dvpp_jpeg_get_image_info(source, len(jpeg))
-        _check(result, "dvpp_jpeg_get_image_info")
+        if result not in (None, 0):
+            # A truncated or corrupt JPEG is an input problem: the buffers
+            # allocated above are released by the decode finally, so the next
+            # frame can reuse the channel instead of rebuilding it.
+            raise VideoCodecError(
+                "invalid_frame", "dvpp_jpeg_get_image_info rejected the JPEG", backend=_BACKEND, recoverable=True
+            )
         if width <= 0 or height <= 0 or width % 2 or height % 2:
             raise VideoCodecError("invalid_frame", "JPEG NV12 dimensions must be positive and even", backend=_BACKEND)
         size, result = media.dvpp_jpeg_predict_dec_size(source, len(jpeg), 1)

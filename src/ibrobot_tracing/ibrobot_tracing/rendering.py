@@ -183,8 +183,23 @@ def render_timeline(events: list[TraceEvent] | TimelineProjection, stream: TextI
         details = " ".join(
             f"{key}={value}"
             for key, value in item.fields.items()
-            if key not in {"component_id", "trace_id", "request_id", "span_id", "parent_span_id"}
+            if key
+            not in {
+                "component_id",
+                "trace_id",
+                "request_id",
+                "span_id",
+                "parent_span_id",
+                "_trace_origin",
+                "_time_mapping",
+            }
         )
+        if item.fields.get("_time_mapping"):
+            provenance = item.fields["_trace_origin"]
+            mapping = item.fields["_time_mapping"]
+            details += (
+                f" host={provenance['host']} pid={provenance['process_id']} clock_error_ns={mapping['uncertainty_ns']}"
+            )
         stream.write(f"{relative:>10.3f}ms {delta:>10.3f}ms {component:<30} {item.label} {details}\n")
 
 

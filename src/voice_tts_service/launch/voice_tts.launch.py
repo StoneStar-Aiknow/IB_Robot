@@ -5,6 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -21,6 +22,8 @@ def generate_launch_description():
             DeclareLaunchArgument("resample_to_playback_rate", default_value="false"),
             DeclareLaunchArgument("audio_message_type", default_value="audio_common_msgs/msg/AudioData"),
             DeclareLaunchArgument("chunk_ms", default_value="50"),
+            # JSON object of adapter runtime options, e.g. '{"num_steps": 4}'.
+            DeclareLaunchArgument("runtime_options_json", default_value="{}"),
             DeclareLaunchArgument("prebuffer_ms", default_value="0"),
             LogInfo(
                 msg=(
@@ -41,7 +44,9 @@ def generate_launch_description():
                         "adapter_class": "voice_tts_service.model_service_plugin:ZipVoiceSynthesizePlugin",
                         "service_type": "ibrobot_msgs/srv/SynthesizeSpeech",
                         "service_endpoint": LaunchConfiguration("service_name"),
-                        "runtime_options_json": "{}",
+                        "runtime_options_json": ParameterValue(
+                            LaunchConfiguration("runtime_options_json"), value_type=str
+                        ),
                     }
                 ],
             ),

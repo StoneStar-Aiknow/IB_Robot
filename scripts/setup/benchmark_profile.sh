@@ -122,6 +122,10 @@ ${BENCHMARK_TORCHVISION_VERSION}"
 torch==${BENCHMARK_TORCH_VERSION}
 torchvision==${BENCHMARK_TORCHVISION_VERSION}
 torchcodec==${BENCHMARK_TORCHCODEC_VERSION}
+# hf-libero 0.1.4 caps mujoco<3.9 (robosuite 1.4 breaks on MuJoCo >= 3.10).
+# Applied to the lerobot[libero] install so a venv that already holds the
+# 3.12.0 simulation pin is downgraded here, never left mixed.
+mujoco<3.9
 EOF_CONSTRAINTS
     export BENCHMARK_PIP_CONSTRAINTS="${constraints_file}"
 

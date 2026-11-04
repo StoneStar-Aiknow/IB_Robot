@@ -326,6 +326,138 @@ def test_malformed_pcm_is_forwarded_for_the_consumer_to_abort(vendor_module):
     assert list(pub.messages[0].audio_data) == [0]
 
 
+def test_oversized_vendor_chunk_is_bounded(vendor_module):
+    node = runtime()
+    node._setup_processed_audio({"processed_audio": "/agent/process_audio_output"})
+    node._on_processed_audio(vendor_message(pcm=b"\x00" * 40000, state=2))
+    pub = next(p for p in node._rec_publishers if p.topic == "/audio/speech_chunk")
+    assert len(pub.messages[0].audio_data) == 16000
+
+
+# --- the wake event read off the platform's own acknowledgement ---
+
+WAKE_INTERFACE = {
+    "capability": "interaction.audio_capture",
+    "kind": "topic",
+    "direction": "publish",
+    "endpoint": "/audio/wake_event",
+    "message_type": "ibrobot_msgs/msg/SpeechWakeEvent",
+    "qos": {"reliability": "reliable", "durability": "volatile", "history": "keep_last", "depth": 10},
+}
+VENDOR_WITH_PLAYBACK = {
+    "topics": {"processed_audio": "/agent/process_audio_output", "audio_playback": "/aima/hal/audio/playback"},
+    "qos": {"processed_audio": {"reliability": "best_effort", "durability": "volatile"}},
+    "wake_ack": {"pkg_names": ["tts"], "pair_window_s": 1.5, "token_pattern": "^_[0-9]+_"},
+}
+
+
+@pytest.fixture()
+def playback_module(vendor_module):
+    sys.modules["aimdk_msgs.msg"].AudioPlayback = type("AudioPlayback", (), {})
+
+
+def _playback(pkg_name, token_id):
+    return types.SimpleNamespace(pkg_name=pkg_name, token_id=token_id)
+
+
+def test_a_profile_without_the_wake_interface_does_not_read_the_playback_topic(playback_module):
+    node = runtime(vendor=dict(VENDOR_WITH_PLAYBACK))
+    node._setup_processed_audio(VENDOR_WITH_PLAYBACK["topics"])
+
+    assert not any(topic == "/aima/hal/audio/playback" for _type, topic, _cb, _qos in node._rec_subscriptions)
+    assert not any(p.topic == "/audio/wake_event" for p in node._rec_publishers)
+
+
+def test_the_wake_interface_needs_the_vendor_playback_topic(playback_module):
+    node = runtime(interfaces={"audio.wake_event": dict(WAKE_INTERFACE)})
+    with pytest.raises(RuntimeError, match="audio_playback"):
+        node._setup_processed_audio({"processed_audio": "/agent/process_audio_output"})
+
+
+def test_the_wake_interface_must_be_a_speech_wake_event(playback_module):
+    node = runtime(
+        interfaces={"audio.wake_event": {**WAKE_INTERFACE, "message_type": "std_msgs/msg/String"}},
+        vendor=dict(VENDOR_WITH_PLAYBACK),
+    )
+    with pytest.raises(RuntimeError, match="ibrobot_msgs/msg/SpeechWakeEvent"):
+        node._setup_processed_audio(VENDOR_WITH_PLAYBACK["topics"])
+
+
+def test_the_wake_interface_needs_the_acknowledgement_token_form(playback_module):
+    """Without it any playback token pairs, the platform's dialog answers included."""
+    vendor = {**VENDOR_WITH_PLAYBACK, "wake_ack": {"pkg_names": ["tts"], "pair_window_s": 1.5}}
+    node = runtime(interfaces={"audio.wake_event": dict(WAKE_INTERFACE)}, vendor=vendor)
+    with pytest.raises(RuntimeError, match="token_pattern"):
+        node._setup_processed_audio(VENDOR_WITH_PLAYBACK["topics"])
+
+
+def _wake_paths(node):
+    node._setup_processed_audio(VENDOR_WITH_PLAYBACK["topics"])
+    wake_pub = next(p for p in node._rec_publishers if p.topic == "/audio/wake_event")
+    speech_pub = next(p for p in node._rec_publishers if p.topic == "/audio/speech_chunk")
+    on_playback = next(cb for _type, topic, cb, _qos in node._rec_subscriptions if topic == "/aima/hal/audio/playback")
+    return wake_pub, speech_pub, on_playback
+
+
+def test_an_acknowledged_speech_begin_publishes_one_wake_event_naming_its_segment(playback_module):
+    """The event names the woken segment the way SpeakerEmbedding names one: the
+    source and the sequence of its BEGIN chunk."""
+    node = runtime(interfaces={"audio.wake_event": dict(WAKE_INTERFACE)}, vendor=dict(VENDOR_WITH_PLAYBACK))
+    wake_pub, speech_pub, on_playback = _wake_paths(node)
+
+    on_playback(_playback("tts", "_1792835430393_1ack"))
+    node._on_processed_audio(vendor_message(state=1))
+    node._on_processed_audio(vendor_message(state=2, sequence=2))
+    on_playback(_playback("tts", "_1792835430393_1ack"))
+
+    begin = next(chunk for chunk in speech_pub.messages if chunk.state == 1)
+    assert len(wake_pub.messages) == 1
+    event = wake_pub.messages[0]
+    assert event.header.stamp == Time(sec=1, nanosec=2)
+    assert event.source_id == begin.source_id
+    assert event.segment_sequence == begin.sequence
+
+
+def test_an_acknowledgement_after_the_begin_still_names_that_segment(playback_module):
+    """Measured on the X2, the acknowledgement can land up to 1.0 s after the BEGIN,
+    by which time later chunks of the segment have been published."""
+    node = runtime(interfaces={"audio.wake_event": dict(WAKE_INTERFACE)}, vendor=dict(VENDOR_WITH_PLAYBACK))
+    wake_pub, speech_pub, on_playback = _wake_paths(node)
+
+    node._on_processed_audio(vendor_message(state=1))
+    node._on_processed_audio(vendor_message(state=2, sequence=2))
+    node._on_processed_audio(vendor_message(state=2, sequence=3))
+    on_playback(_playback("tts", "_1792835430393_1ack"))
+
+    begin = next(chunk for chunk in speech_pub.messages if chunk.state == 1)
+    assert [event.segment_sequence for event in wake_pub.messages] == [begin.sequence]
+
+
+def test_the_acknowledgement_is_read_best_effort_even_though_playback_is_published_reliable(playback_module):
+    """Both X2 profiles set vendor.qos.audio_playback RELIABLE for the runtime's
+    own publisher on that topic; the wake-ack subscription used to inherit it."""
+    qos = {**VENDOR_WITH_PLAYBACK["qos"], "audio_playback": {"reliability": "reliable", "durability": "volatile"}}
+    node = runtime(interfaces={"audio.wake_event": dict(WAKE_INTERFACE)}, vendor={**VENDOR_WITH_PLAYBACK, "qos": qos})
+    node._setup_processed_audio(VENDOR_WITH_PLAYBACK["topics"])
+
+    (subscription_qos,) = [
+        qos for _type, topic, _cb, qos in node._rec_subscriptions if topic == "/aima/hal/audio/playback"
+    ]
+    assert subscription_qos.reliability.name == "BEST_EFFORT"
+
+
+def test_speech_without_an_acknowledgement_publishes_no_wake_event(playback_module):
+    node = runtime(interfaces={"audio.wake_event": dict(WAKE_INTERFACE)}, vendor=dict(VENDOR_WITH_PLAYBACK))
+    node._setup_processed_audio(VENDOR_WITH_PLAYBACK["topics"])
+    wake_pub = next(p for p in node._rec_publishers if p.topic == "/audio/wake_event")
+    on_playback = next(cb for _type, topic, cb, _qos in node._rec_subscriptions if topic == "/aima/hal/audio/playback")
+
+    node._on_processed_audio(vendor_message(state=1))
+    on_playback(_playback("ibrobot.aimdk_robot", "own-playback"))
+
+    assert wake_pub.messages == []
+
+
 @pytest.mark.parametrize(("pcm_bytes", "state"), [(19200, 1), (20800, 3)])
 def test_a_vendor_backfill_burst_is_forwarded_whole(vendor_module, pcm_bytes, state):
     # Measured on the X2 (2026-10-20): segments open and close with bursts of up to 20800 bytes,

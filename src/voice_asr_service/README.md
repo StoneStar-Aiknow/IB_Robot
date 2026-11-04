@@ -21,6 +21,148 @@ stop 丢弃当前段并释放 stream，恢复后等待新 BEGIN。丢包、源�
 X2 通过 runtime profile 的 `audio.speech` 逻辑接口绑定输入（部署用叠加 profile `aimdk_x2_voice`；手势 profile `aimdk_x2_skills` 不带语音，因此不需要本 bundle），模型仍使用下文 schema-v3 bundle 流程。
 完整设计见 [X2 语音接入](../../docs/x2_voice_asr_integration_design.md)。
 
+## Speaker ID 独立节点（声纹，可选）
+
+`speaker_id_node` 属于 `voice_asr_service`，与 `VoiceASRNode` 并列、消费**同一条**
+`SpeechAudioChunk` 流（因此只在 `voice_asr.input_mode: external_vad` 下可用——只有这条路径带
+人声边界）。它每段人声发布一条 `ibrobot_msgs/msg/SpeakerEmbedding`（已 L2 归一化，余弦即点积），
+不做 ASR、不做判决。
+
+它是**独立节点而非 ASR 内的一步**，原因是时延：并行提取恰好在人声结束时发布，而转写还要等
+VAD 静音加尾部补静音，所以消费者（`agent_voice_bridge` 的寻址门控）通常不必等声纹。放进 ASR 里提取
+则每句都要多等一次推理。
+
+消费者按语音段 `(source_id, segment_sequence)` 把向量与转写配对，而不是按到达时间：外部分段输入下
+`voice_asr_node` 在 `output_topic` 的纯文本之外，再在 `transcript_topic`（默认 `/voice/transcript`）上按段发布
+同一文本的 `ibrobot_msgs/msg/SpeechTranscript`，段标识与 `SpeakerEmbedding`、唤醒事件 `SpeechWakeEvent` 相同。
+
+**两个节点保留、丢弃同样的段**，这样每句转写都有它的声纹。哪些块属于一段
+（换源、重复/乱序块、序号跳变、BEGIN 打断未结束的段、只有带 PCM 的块续期）由
+`voice_asr_service/speech_segments.py` 统一决定，ASR 外部输入与声纹节点共用，
+`test/test_speech_segments.py` 用同一串块序列喂两边做契约测试。刻意保留的差异有两处：声纹节点的
+空闲收尾（`idle_timeout_sec`）短于 ASR 的 `external_idle_timeout`，好让声纹先于转写到达、转写不必等——
+因此没有 END 的段若在两个超时之间被下一个 BEGIN 打断，ASR 丢弃而声纹已发出；超过
+`max_recording_duration` 的段 ASR 丢弃，声纹节点仍取开头几秒。按段配对之后，这两种没有转写的声纹
+不会判定任何一句，过期即丢弃。
+
+**推理出错不拖垮节点**：模型在某一段上抛异常时，这一段**不发布**（消费者等满宽限期后按缺失处理，fail-open），
+节点继续处理后续各段；连续 3 段出错时重新加载部署，加载失败则节点不带模型继续运行、不发布任何声纹，
+每 30 s 重试一次；重新加载出来的模型身份（`model_id`）与原来不同时拒绝使用，以免新向量与消费者已有的锚点不可比。
+
+**隐私**：向量是生物特征数据，只存在于进程内存和消息中，**不落盘、不跨会话保留**，也不写任何日志。
+
+配置挂在 `voice_asr` 下（复用它已绑定好的音频输入，避免对同一条流出现第二份意见）：
+
+```yaml
+voice_asr:
+  enabled: true
+  input_mode: external_vad
+  speaker_embedding:
+    enabled: true
+    bundle_path: models/campplus-speaker         # 必填，schema-v3 bundle
+    deployment: torch_cpu                        # 必填，bundle 内的部署名
+    output_topic: /voice/speaker_embedding       # 可选
+    min_speech_seconds: 1.0   # 低于此时长发空向量（「这段没有声纹」），不出不可信的向量
+    max_speech_seconds: 6.0   # 只取开头这么长（唤醒词在开头），兼作内存上界
+    idle_timeout_sec: 1.2     # 音源没发 END 时兜底收尾，语义同 external_idle_timeout 但必须更短（loader 校验），好让声纹先于转写到达；只有带 PCM 的块续期，runtime 的空心跳不算
+```
+
+模型与 ASR 一样是 **schema-v3 bundle**，在仓库外 provision，经统一推理运行时加载：部署名显式给出、
+artifact 摘要记在 manifest 里并由 `scripts/download_models.py` 在下载时校验、线程预算写在部署里
+（`intra_op_num_threads: 2`，见下）。加载时**不**重新哈希（`load_inference_manifest` 默认 `declared_only`，
+与仓库其他模型一致），所以本地替换文件不会被发现——模型身份靠 `model_id` 在消费侧比对。
+没有 `model_path` / `num_threads` 这类裸模型字段：上面列出的键之外，launch 时一律按未知键拒绝——
+声纹只在向量之间比较，换一个同样 192 维的模型不会报错只会悄悄改变每一次判定，
+所以模型身份必须由 manifest 固定，而不是文件名。
+
+`SpeakerEmbedding.model_id` 因此是 `<model_type>@<semantic_identity 摘要>`：由 manifest 的
+`logical_model_revision`、`preprocessing_contract`（含切窗）与 `output_semantics` 决定，**不含部署**——
+各部署按设计产出同一向量空间（OM 与 CPU 同一组窗口最差 0.999976，1 与 2 线程逐位相同），
+把部署指纹算进去只会让相同的向量显得不可比。两条向量可比，当且仅当 `model_id` 相同；
+`agent_voice_bridge` 的门控据此比对，`model_id` 不同的向量按「不可比」处理（放行、不并入锚点）。
+
+取得并打包（bundle 已发布在 `openEuler/campplus-speaker`，`./scripts/download_models.py --models campplus-speaker` 直接拉取）：
+
+```bash
+curl -L -o models/speaker_id/campplus_zh.onnx \
+  https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+ros2 run voice_asr_service package_campplus_bundle \
+  --bundle-root models/campplus-speaker --workspace .
+```
+
+模型吃的是 **80 维 Kaldi log-mel 特征而不是 PCM**，所以特征由主机计算：
+`voice_asr_service/kaldi_fbank.py` 是包内唯一一份 Kaldi fbank（25 ms/10 ms、Povey 窗、pre-emphasis 0.97、
+`snip_edges=false`），Ascend 流式 transducer 的 `OnlineFbank` 也用它；`speaker_id/features.py` 在其上做
+global-mean 与定长切窗。`test/test_speaker_features.py` 在装有 sherpa-onnx 时
+把它钉在 sherpa-onnx 自带提取器上（实测逐例 cos = 1.000000）。
+
+**定长切窗（`utterance_windows`，属于预处理契约的一部分）**：模型按 **200 帧（2.0 s）** 一窗推理。
+短于一窗的话语用**自身帧平铺**而非补零（静音不是说话人的声音特征；225 条实测，平铺的中位一致性
+0.974 优于补零 0.963，远离值少四分之三）；长话语切成连续窗、**末窗对齐句尾**保证全覆盖，各窗嵌入
+L2 归一后取平均（与整句嵌入的一致性 p5 **0.964**，而只取首窗只有 p5 0.712）。
+为何定长是模型的自然单位：导出图把上下文池化的核长写死，Ascend 的 ATC **只能在 200 帧这个长度编译**
+（其他定长与动态维度都会让 `AvgPoolV2FusionPass` 失败），而不完整的池化窗口正是各 onnxruntime
+版本除数语义分歧之处（见下一节）。
+**两个部署执行同一套切窗**，所以锚点与被判定句始终可比，一次标定同时服务 CPU 与 NPU：
+Ascend 310P 实测同一组窗口经 OM 与经 CPU ONNX 的嵌入最差一致 **0.999976**。
+切窗已写进 `preprocessing_contract`（`...-tile200-v2`），加载时不匹配即拒绝——
+切窗前打的 bundle 对同一段音频产出不同向量，不能互相比较。
+
+**切窗同时消除了 onnxruntime 版本分歧（2026-10-29 实测定位）。** 模型把 CAM 层的上下文池化导成了
+`AveragePool`，核长在导出时被写死（`kernel_shape=[100]`、`strides=[100]`、`ceil_mode=1`、
+`count_include_pad=1`，52 个节点全部如此）。整句推理时，**凡是池化长度不是 100 的整数倍的话语**都会多出一个越界的
+不完整窗口，而各运行时对它的除数不一致：onnxruntime **1.23.2 除以整核（100）**，**1.31.0 除以实际元素数**
+（PyTorch 的 `AvgPool1d` 同 1.31.0；sherpa-onnx 自带旧版 ORT，所以与 1.23.2 一致）。
+整句推理时的长度扫描（x86 ORT 1.23.2 vs aarch64 ORT 1.31.0，同一份特征）：
+
+| 音频 | 池化长度 | 长度 % 100 | 两者余弦 |
+|---|---|---|---|
+| 1.0 s | 50 | 50 | 0.946 |
+| 1.5 s | 75 | 75 | 0.979 |
+| **2.0 s** | **100** | **0** | **1.000000** |
+| 2.5 s | 125 | 25 | 0.941 |
+| 3.0 s | 150 | 50 | 0.965 |
+| **4.0 s** | **200** | **0** | **1.000000** |
+| 5.0 s | 250 | 50 | 0.982 |
+
+200 帧一窗时池化长度恰为 100，不再有不完整窗口：切窗后两个版本逐例余弦 **1.000000000**、成对偏移最大 1.3e-8，
+所以**不需要也不应固定 onnxruntime 版本**（Ubuntu 22.04 的 Python 3.10 上 onnxruntime 最高只有 1.23.2）。
+`test_speaker_features.py::test_the_pooling_divisor_is_one_of_the_two_known_readings` 仍记录各版本的除数，
+出现第三种行为时失败；与 sherpa-onnx 整句提取器的端到端比对只在除数一致时才断言。
+
+**Ascend OM 部署（`ascend_310p_cann81`）。** 2026-10-29 在 CANN 8.1.RC1 / Ascend310P1 上实测：ATC 只能把这张图编成
+**T=200 定长**（其他定长、`dynamic_dims` 与关掉 fusion pass 都报 `E20007 AvgPoolV2FusionPass`），这正是上面切窗选
+200 帧的原因；整图 OM 还会在统计池化 `Concat` 边界损坏 4 个元素（实测某元素返回 1638、参考值 0.769，足以毁掉向量方向），
+所以 OM **只编到 mean/std 两路**，concat + dense + BN 留在主机。主机头部的权重直接读 bundle 自带的那份 ONNX
+（`head_source` artifact，不执行、只取权重），两个部署因此不会漂移。按这样切开，732 个可比节点与 CPU ONNX
+全部一致到 1e-3 以内，成品向量与 CPU fp32 最差 **0.999976**；X2 算力板上单句 embed 中位 **357 ms → 113 ms**（约 3.1×）。
+
+OM 按 CANN 版本放进 `artifacts/ascend_310p_cann81/`：ATC 产物不跨 CANN 版本通用，部署的 `runtime_abi`
+（`cann-8.1.RC1`）在加载时由 `inference_service.backends.ascend.host_runtime.runtime_abi_matches` 与板上实际 CANN 版本比对，
+不符立即报错，而不是等 ACL 推理时报 `500002`。在目标板上编译并打包（中间产物按约定放
+`models/_work/campplus-speaker/ascend/`，不进发布 bundle）：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+atc --model=models/campplus-speaker/assets/campplus_zh.onnx --framework=5 \
+    --input_shape="x:1,200,80" --soc_version=Ascend310P1 --precision_mode_v2=fp16 \
+    --out_nodes="/xvector/stats/ReduceMean:0;/xvector/stats/Sqrt:0" \
+    --output=models/_work/campplus-speaker/ascend/campplus_trunk_t200
+ros2 run voice_asr_service package_campplus_bundle \
+  --bundle-root models/campplus-speaker --workspace . \
+  --om-source models/_work/campplus-speaker/ascend/campplus_trunk_t200.om
+```
+
+该 OM **已随 bundle 发布**：`openEuler/campplus-speaker` 的
+`artifacts/ascend_310p_cann81/campplus_trunk_t200.om`，
+`./scripts/download_models.py --models campplus-speaker` 直接取到，无需自行编译。
+上面的 ATC + 打包流程是换 CANN 版本或换 checkpoint 时重建用的；没有 `--om-source` 时打出的就是 CPU-only bundle。
+换 CANN 版本重建后要放进对应的 `artifacts/ascend_310p_cann<版本>/` 并在打包器里加相应 deployment，
+因为 `runtime_abi` 在加载时与主机实际版本比对。
+
+阈值（`speaker_min_similarity`）属于**消费者侧**配置，见 `src/agent/ibrobot_agent/README.md`，
+且必须用真人录音现场标定（方法见同一 README）。
+
 ## Speech Direction 独立节点
 
 `speech_direction_node` 属于 `voice_asr_service`，与上文所述的 `VoiceASRNode` 是两个独立节点。它负责多通道人声音频增强、语音门控和方向估计，不执行 ASR，也不控制底盘。
@@ -521,6 +663,7 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 | 话题 | 类型 | 含义 |
 | --- | --- | --- |
 | `output_topic`（默认 `/voice_command`） | `std_msgs/String` | 最终识别文本 |
+| `transcript_topic`（默认 `/voice/transcript`） | `ibrobot_msgs/SpeechTranscript` | 同一最终文本，带语音段标识；仅 `external_vad` 输入发布 |
 | `/voice_partial` | `std_msgs/String` | 中间识别结果 |
 | `/voice_status` | `std_msgs/String` | 当前节点状态 |
 | `/voice_confidence` | `std_msgs/Float32` | 最终结果置信度 |
@@ -582,6 +725,7 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 | `max_recording_duration` | `10.0` | 实时识别最长录音时长，超时后强制收尾 |
 | `publish_partial` | `true` | 是否发布中间解码结果 |
 | `output_topic` | `/voice_command` | 最终命令输出 topic |
+| `transcript_topic` | `/voice/transcript` | 按段的最终文本（`SpeechTranscript`），仅 `external_vad` |
 | `exit_on_init_failure` | `true` | 初始化失败时是否直接抛错退出 |
 
 ### 音频 / VAD 参数
@@ -589,6 +733,10 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `vad_sensitivity` | `0.6` | VAD 灵敏度 |
+| `vad_min_silence_duration` | `0.5` | SPEAKING 状态下连续静音多久判定为句末；见下方「判停时延」 |
+| `vad_post_roll_ms` | `500.0` | 判定句末后继续喂给 ASR 的尾部缓冲时长 |
+| `vad_pre_roll_ms` | `300.0` | `VADModule` 自身的预录缓冲，仅用于文件分段识别 |
+| `vad_min_speech_duration` | `0.3` | 连续语音多久才从 STARTING 进入 SPEAKING |
 | `realtime_pre_roll_seconds` | `0.5` | 识别启动时补回的实时缓存时长，用于减少句首丢字 |
 | `final_tail_padding_seconds` | `1.5` | 最终解码前补入的静音时长，冲刷分块编码器尚未输出的末尾语音，避免句尾丢字（480 ms 分块模型需 ≥ 1.5 s） |
 | `sample_rate` | `16000` | 当前完整 Voice ASR 链路仅支持 16000 Hz；其他值属于无效配置，节点会拒绝初始化 |
@@ -600,6 +748,33 @@ Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models
 
 当前 16kHz/512 是实时麦克风、文件识别、VAD 后端和 ASR 模型共同遵守的系统级硬限制；
 Silero ONNX 后端会在 512 样本音频帧前额外拼接 64 个内部 context 样本，该 context 由 VAD 内部跨帧维护，不应配置到 `chunk_size` 中。
+
+#### 判停时延
+
+节点只在 VAD 回到 SILENCE 时才调用 `end_streaming()` 出最终结果，所以从最后一个
+语音帧到 `/voice_command` 的固定延迟是：
+
+```
+ceil(vad_min_silence_duration / 0.032) + int(vad_post_roll_ms / 1000 / 0.032) 帧
+```
+
+帧长 512 样本 @ 16 kHz = 32 ms。默认值 = 16 + 15 = 31 帧 = 992 ms；调优值
+`0.3` / `150.0` = 10 + 4 = 14 帧 = **448 ms**（在工作站 X-ASR 上实测通过；板端整句触发词复核前
+不改全局默认，由 profile 的 `voice_asr.vad_min_silence_duration` / `vad_post_roll_ms` 按部署开启）。
+这两个值只对本节点自己跑 VAD 的部署生效（`audio_input` 绑定 `audio.capture`，或无 provider 的
+`audio_io`）：`input_mode=external_vad`（如 X2）由 runtime 分段，不经过本地 VAD；SO-101 的
+`so101_robot` runtime 没有声明麦克风，provider 路径上无法启用 `voice_asr`，所以
+`so101_voice_latency` 不配置它们。
+
+`vad_post_roll_ms` 只需覆盖 VAD 自身的判停迟疑：解码器的尾部上下文由
+`final_tail_padding_seconds` 在最终解码前补静音承担，是样本而不是墙钟时间，
+所以两者可以独立取值。把尾部上下文从 post_roll 里拿走之后，判停从 608 ms
+降到 448 ms，实测句尾字不丢。
+调大这两个参数会按上式直接拖慢整条语音链路的响应。若关闭了
+`final_tail_padding_seconds`，ENDING 期间的帧就重新成为解码器唯一的尾部上下文，
+此时 `vad_post_roll_ms` 压到 250 ms 以下会丢尾字（"挥个手" -> "挥个"）。
+`vad_min_silence_duration` 不宜低于 0.3 s：0.25 s 时句中 400 ms 的停顿会把长句切成三段。
+`src/voice_asr_service/test/test_vad_endpointing_latency.py` 锁定了这个帧数。
 
 ## 10. 状态机
 

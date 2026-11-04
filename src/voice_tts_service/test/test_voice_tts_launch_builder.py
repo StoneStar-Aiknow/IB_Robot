@@ -8,7 +8,6 @@ import path changed.
 
 import pytest
 
-from robot_config.launch_registry.registry import LaunchBuildContext
 from voice_tts_service.launch_builders import voice_tts
 
 
@@ -22,6 +21,16 @@ def _node_parameters(node):
                 raw_value = raw_value[:-4].rstrip()
         parameters[key] = raw_value
     return parameters
+
+
+def _runtime_options(node):
+    """Parse runtime_options_json out of the YAML-wrapped launch parameter."""
+    import json
+
+    raw = _node_parameters(node)["runtime_options_json"].strip()
+    if raw.startswith("'") and raw.endswith("'"):
+        raw = raw[1:-1]
+    return json.loads("".join(line.strip() for line in raw.splitlines()))
 
 
 def test_voice_tts_builder_does_not_open_bundle_before_node_start(monkeypatch, tmp_path):
@@ -77,10 +86,6 @@ def test_voice_tts_builder_routes_shared_playback_format(monkeypatch, tmp_path):
     assert playback["audio_topic"] == "/shared/play"
     assert playback["playback_sample_rate"] == 24000
     assert playback["playback_channels"] == 1
-    # Without a runtime binding the local audio_play contract is unchanged.
-    assert playback["audio_message_type"] == "audio_common_msgs/msg/AudioData"
-    assert playback["resample_to_playback_rate"] is False
-    assert playback["chunk_ms"] == 50
 
 
 def test_voice_tts_builder_forwards_tts_limits_to_the_plugin(monkeypatch, tmp_path):
@@ -219,27 +224,83 @@ def test_voice_tts_resampling_to_the_speaker_rate_is_opt_in(tmp_path, monkeypatc
     assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is True
 
 
-def test_runtime_bound_playback_forwards_the_resample_settings(tmp_path, monkeypatch):
-    """The bound sink's topic/rate/pacing, the declared type and the opt-in resample knob reach the node."""
-    config = _bound_tts_config(
-        _bound_audio_output(topic="/instance_x/play", sample_rate_hz=16000, channels=1, write_chunk_ms=100)
+def _decode_launch_json_string(raw_value):
+    """Launch quotes a string that holds YAML-special characters; strip that before parsing."""
+    normalized = raw_value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1]
+    import json
+
+    return json.loads(normalized)
+
+
+def test_voice_tts_forwards_the_bound_speaker_qos(tmp_path, monkeypatch):
+    """The speaker's subscription QoS is part of the contract: the X2 runtime subscribes best_effort."""
+    speaker_qos = {"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 10}
+    config = _bound_tts_config(_bound_audio_output(qos=speaker_qos))
+
+    parameters = _playback_parameters(voice_tts.generate_voice_tts_nodes(config))
+
+    assert _decode_launch_json_string(parameters["audio_qos_json"]) == speaker_qos
+
+
+def test_voice_tts_without_a_declared_qos_keeps_the_node_default(tmp_path, monkeypatch):
+    # A speaker that declares no qos must keep the node's rclpy default rather than inherit one.
+    config = _bound_tts_config(_bound_audio_output())
+
+    assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["audio_qos_json"].strip("'") == ""
+
+
+def test_voice_tts_builder_passes_num_steps_to_the_session(monkeypatch, tmp_path):
+    """The flow step count must be reachable from YAML.
+
+    It is ~98% of synthesis time and linear in the step count, but it lives in
+    a digest-verified bundle asset, so the only way to pick a different
+    latency/quality point is to send it as a runtime option.
+    """
+    from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
+
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: VOICE_TTS_DEFAULTS)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "bundle"),
+                "deployment": "ubuntu_onnx",
+                "num_steps": 2,
+            },
+            "audio_io": {"enabled": True},
+        }
     )
-    config["voice_tts"]["audio_message_type"] = "audio_common_msgs/msg/AudioDataStamped"
-    config["voice_tts"]["resample_to_playback_rate"] = True
+    options = _runtime_options(nodes[0])
 
-    nodes = voice_tts.generate_voice_tts_nodes(config)
-
-    parameters = _playback_parameters(nodes)
-    assert parameters["audio_topic"] == "/instance_x/play"
-    assert parameters["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
-    assert parameters["playback_sample_rate"] == 16000
-    assert parameters["resample_to_playback_rate"] is True
-    assert parameters["chunk_ms"] == 100
+    assert options["num_steps"] == 2
 
 
-# --- CANN environment for Ascend deployments -------------------------------------
+def test_voice_tts_builder_leaves_num_steps_to_the_bundle_when_unset(monkeypatch, tmp_path):
+    """Unset in YAML, the session uses the step count its bundle ships with.
 
+    Fewer steps is a measured trade a profile opts into; it must not change
+    every deployment that never asked for it.
+    """
+    from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
 
+    monkeypatch.setattr(voice_tts, "_load_voice_tts_service", lambda: VOICE_TTS_DEFAULTS)
+
+    nodes = voice_tts.generate_voice_tts_nodes(
+        {
+            "voice_tts": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "bundle"),
+                "deployment": "ubuntu_onnx",
+            },
+            "audio_io": {"enabled": True},
+        }
+    )
+    options = _runtime_options(nodes[0])
+
+    assert "num_steps" not in options
 def _additional_env(node):
     """Node.additional_env holds (name, value) substitution pairs, not plain strings."""
 
@@ -301,7 +362,25 @@ def test_the_playback_node_writes_pcm_the_way_the_bound_speaker_asks(tmp_path, m
     assert "chunk_ms" not in unpaced and "prebuffer_ms" not in unpaced
 
 
-# --- launch failure tolerance (voice_tts.exit_on_init_failure) --------------------
+def test_runtime_bound_playback_forwards_the_resample_settings(tmp_path, monkeypatch):
+    """The bound sink's topic/rate/pacing, the declared type and the opt-in resample knob reach the node."""
+    config = _bound_tts_config(
+        _bound_audio_output(topic="/instance_x/play", sample_rate_hz=16000, channels=1, write_chunk_ms=100)
+    )
+    config["voice_tts"]["audio_message_type"] = "audio_common_msgs/msg/AudioDataStamped"
+    config["voice_tts"]["resample_to_playback_rate"] = True
+
+    nodes = voice_tts.generate_voice_tts_nodes(config)
+
+    parameters = _playback_parameters(nodes)
+    assert parameters["audio_topic"] == "/instance_x/play"
+    assert parameters["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
+    assert parameters["playback_sample_rate"] == 16000
+    assert parameters["resample_to_playback_rate"] is True
+    assert parameters["chunk_ms"] == 100
+
+
+# --- CANN environment for Ascend deployments -------------------------------------
 
 
 def _broken(_config):
@@ -338,6 +417,8 @@ def test_build_failure_is_skipped_when_exit_on_init_failure_is_false(monkeypatch
     ],
     ids=["true", "default", "string", "none", "missing"],
 )
+
+
 def test_build_failure_stops_the_launch_otherwise(monkeypatch, config):
     monkeypatch.setattr(voice_tts, "generate_voice_tts_nodes", _broken)
 

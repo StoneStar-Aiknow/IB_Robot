@@ -23,7 +23,7 @@ the business override steps into registered hooks on the generic
 3. inference-override — inference pipeline/execution_mode overrides.
 4. mock-check — ``validate_mock_control_mode``.
 5. inference-derived — ``with_inference`` and teleop fallback derivation.
-6. scheduler-check — scheduler derivation; reject simulation+scheduler.
+6. scheduler-check — scheduler derivation; virtual targets stay direct.
 7. benchmark-check — in-memory transport materialization and inference
    closure validation (no run_id allocation here; that belongs to the
    benchmark build adapter).
@@ -109,6 +109,7 @@ CORE_HOOK_FORBIDDEN_KEYS: frozenset[str] = frozenset(
         "control_modes",  # phase 3 pipeline execution_mode override
         "runtime_target",  # reserved core derivation namespace
         "scheduler",  # phase 6 derivation namespace
+        "runtime_scheduler",  # robot-level scheduling policy
         "benchmark",  # phase 7 transport materialization / run identity
         "contract",  # binding requirements must not be changed after validation
         "peripherals",  # resource validation and provider ownership
@@ -182,6 +183,16 @@ def compose_registry_arguments(registry: LaunchBuilderRegistry) -> tuple[Argumen
     return compose_argument_specs(registry.contributed_arguments())
 
 
+def _model_artifacts_hosted_locally(arguments: Mapping[str, str]) -> bool:
+    """Read ``with_model_services``: does this host run the configured model services?
+
+    The argument belongs to the ``perception_models`` entry, so it is absent in
+    registries without that entry; "true" then keeps the existing single-host
+    behaviour of validating every enabled service's local bundle and artifacts.
+    """
+    return parse_bool(arguments.get("with_model_services", "true"), default=True)
+
+
 def _load_config(arguments: Mapping[str, str], loaded_config: Mapping[str, Any] | None) -> dict[str, Any]:
     if loaded_config is not None:
         config = isolated_config(loaded_config)
@@ -191,6 +202,10 @@ def _load_config(arguments: Mapping[str, str], loaded_config: Mapping[str, Any] 
             arguments["config_path"] or None,
             arguments["nav_stage"],
             defer_interface_binding=True,
+            # A host whose models are served elsewhere still validates service
+            # identity, endpoints and the semantic contract, but the weights
+            # and deployment artifacts only have to exist where they run.
+            require_local_model_artifacts=_model_artifacts_hosted_locally(arguments),
         )
     config["_config_path"] = readiness.resolve_config_path(arguments["robot_config"], arguments["config_path"])
     return config
@@ -367,15 +382,11 @@ def _derive_inference(arguments: Mapping[str, str], robot_config: dict[str, Any]
 
 
 def _check_scheduler(robot_config: dict[str, Any], control_mode: str, with_inference: bool, runtime_target) -> bool:
-    """Design phase 6: scheduler derivation; reject simulation+scheduler."""
+    """Design phase 6: scheduler derivation; virtual targets stay direct."""
     from robot_config.inference_config import scheduler_enabled_from_raw_config
 
-    scheduler_enabled = with_inference and scheduler_enabled_from_raw_config(robot_config, control_mode)
-    if scheduler_enabled and runtime_target is RuntimeTarget.SIMULATION:
-        raise PreparationError(
-            "simulation does not support inference.scheduler.enable=true; set scheduler.enable=false"
-        )
-    return scheduler_enabled
+    enabled = scheduler_enabled_from_raw_config(robot_config, control_mode, runtime_target=runtime_target)
+    return with_inference and enabled
 
 
 def _check_benchmark(
@@ -408,7 +419,9 @@ def _check_benchmark(
             raise PreparationError("benchmark evaluation requires dispatch.scheduler=wait_for_feedback")
 
         try:
-            inference = parse_inference_config(robot_config, control_mode)
+            inference = parse_inference_config(
+                robot_config, control_mode, scheduler_enabled=False, runtime_target=RuntimeTarget.BENCHMARK
+            )
         except InferenceConfigError as exc:
             raise PreparationError(f"benchmark evaluation inference configuration is invalid: {exc}") from exc
         if not inference.enabled or not inference.pipelines:
@@ -646,8 +659,7 @@ def prepare_launch(
     # exactly-once, never rewriting configuration.
     _run_phase_hooks("preflight", hooks_by_phase["preflight"], robot_config, arguments, hook_target_state)
 
-    # 13a. binding-target: the write-back belongs to the forced snapshot
-    # data flow and only applies to the legacy live-binding branch.
+    # 13a. binding-target: write back only for the live-binding snapshot.
     live_binding_required = bool(
         required_interface_ids(robot_config) or (robot_config.get("runtime") or {}).get("require_model")
     )

@@ -26,6 +26,8 @@ from inference_service.backends.errors import BackendInferenceError, BackendLoad
 from inference_service.model_sessions import AscendOmModelSession
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
+from .adapter_support import imagenet_image_tensor
+
 _MASK_THRESHOLD = 0.0
 _STABILITY_OFFSET = 1.0
 _DEFAULT_POINTS_PER_SIDE = 32
@@ -97,11 +99,7 @@ class SAM2AutomaticAscendSession(AscendOmModelSession):
         resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
         canvas = np.zeros((_CANVAS_SIZE, _CANVAS_SIZE, 3), dtype=np.uint8)
         canvas[:new_h, :new_w] = resized
-        normalized = canvas.astype(np.float32) / np.float32(255.0)
-        normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
-            [0.229, 0.224, 0.225], dtype=np.float32
-        )
-        return np.ascontiguousarray(normalized.transpose(2, 0, 1)), scale, new_h, new_w
+        return imagenet_image_tensor(canvas)[0], scale, new_h, new_w
 
     def _point_grid(self, side: int) -> np.ndarray:
         offset = 1.0 / (2 * side)

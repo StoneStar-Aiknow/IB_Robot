@@ -229,11 +229,11 @@ def test_preparation_sets_gazebo_world_caps_for_a_provider():
 
 
 # ---------------------------------------------------------------------------
-# 3.1b: toggle-only deployment peripherals on the provider path
+# runtime-peripheral-overrides: configuration overrides on the provider path
 # ---------------------------------------------------------------------------
 
 
-def test_toggle_only_peripherals_are_accepted_for_require_model_providers():
+def test_toggle_entries_are_accepted_for_require_model_providers():
     config = _provider_config()
     config["peripherals"] = [
         {"type": "camera", "name": "front", "disabled": True},
@@ -243,19 +243,35 @@ def test_toggle_only_peripherals_are_accepted_for_require_model_providers():
     assert not errors
 
 
-@pytest.mark.parametrize(
-    "entry",
-    [
-        {"type": "camera", "name": "front", "driver": "opencv"},
-        {"type": "camera", "name": "front", "index": 2},
-        {"type": "camera", "name": "front", "transform": {"parent_frame": "base"}},
-    ],
-)
-def test_non_toggle_peripheral_keys_are_rejected(entry):
+def test_device_fields_are_accepted_for_require_model_providers():
+    # revision 2: an entry may set the enabled state and device settings of a
+    # runtime-declared peripheral; only driver stays runtime-owned.
     config = _provider_config()
-    config["peripherals"] = [entry]
+    config["peripherals"] = [
+        {
+            "type": "camera",
+            "name": "top",
+            "width": 1280,
+            "height": 720,
+            "fps": 15,
+            "pixel_format": "yuyv",
+            "depth_width": 640,
+            "depth_height": 480,
+            "depth_fps": 30,
+        },
+        {"type": "camera", "name": "front", "disabled": True},
+    ]
     errors = validate_runtime_provider_config(config)
-    assert any("may only toggle" in error for error in errors), errors
+    assert not errors, errors
+
+
+def test_driver_is_rejected_for_require_model_providers():
+    config = _provider_config()
+    config["peripherals"] = [{"type": "camera", "name": "front", "driver": "opencv"}]
+    errors = validate_runtime_provider_config(config)
+    assert any(
+        "may not set driver: driver is runtime-owned; change the runtime profile" in error for error in errors
+    ), errors
 
 
 def test_ros2_control_still_rejected_for_provider_configs():
@@ -610,13 +626,15 @@ def test_bound_consumers_follow_the_platform_clock(monkeypatch, use_sim, sim_pla
 
     captured = {}
 
-    def spy(robot_config, control_mode, use_sim, use_sim_time=None, runtime_target=None):
+    def spy(robot_config, control_mode, use_sim, use_sim_time=None, runtime_target=None, *, scheduler_enabled=None):
         captured["use_sim_time"] = use_sim_time
+        captured["scheduler_enabled"] = scheduler_enabled
         return []
 
     monkeypatch.setattr(execution_module, "generate_execution_nodes", spy)
     build_execution(prepared.context)
     assert captured["use_sim_time"] is expected
+    assert captured["scheduler_enabled"] is prepared.scheduler_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -709,9 +727,10 @@ def test_scene_task_emits_exactly_one_node_per_launch(sim_platform):
     assert parameters["gripper_joint_names"] == ("6",)
 
     if sim_platform == "mujoco":
-        from sim_models.scene_compiler import composed_model_path
-
-        assert parameters["scene_model_path"] == str(composed_model_path("pick_banana"))
+        # issue #195: no model path crosses the boundary — the backend places
+        # through ResetWorld state overrides and observes the scene through
+        # the provider-configured FreeJointStatePublisherPlugin topic.
+        assert "scene_model_path" not in parameters
         assert "world_name" not in parameters
         assert not [n for n in outputs.actions if isinstance(n, Node) and n._Node__package == "ros_gz_bridge"]
     else:

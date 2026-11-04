@@ -390,6 +390,7 @@ CANONICAL_MODEL_MAPPING: dict[str, dict[str, Any]] = {
     "fullsubnet": {"interface": "tensor_model", "operations": ("enhance",)},
     "silero_vad": {"interface": "tensor_model", "operations": ("vad",)},
     "sherpa_onnx": {"interface": "tensor_model", "operations": ("recognize",)},
+    "campplus": {"interface": "tensor_model", "operations": ("embed",)},
     "speech_direction": {"interface": "tensor_model", "operations": ("enhance_and_vad",)},
 }
 
@@ -724,12 +725,26 @@ class HisiliconRuntimeProfile(BackendRuntimeProfile):
 
 class ONNXRuntimeProfile(BackendRuntimeProfile):
     backend_name: ClassVar[str] = "onnx"
-    deployment_field_names: ClassVar[frozenset[str]] = frozenset({"provider", "optimization_level"})
+    deployment_field_names: ClassVar[frozenset[str]] = frozenset(
+        {"provider", "optimization_level", "intra_op_num_threads"}
+    )
     instance_field_names: ClassVar[frozenset[str]] = frozenset({"device"})
 
     provider: StrictString | None = None
     optimization_level: StrictString | None = None
+    #: Threads ONNX Runtime may use inside one operator. Part of the deployment
+    #: because it is a property of the compiled model on its target, not of the
+    #: host: a model whose consumer has a latency budget (the voiceprint has to
+    #: be published before its transcript) needs the same thread count wherever
+    #: that deployment runs. Absent means ONNX Runtime's own default.
+    intra_op_num_threads: Annotated[int, Field(strict=True, gt=0)] | None = None
     device: StrictString | None = None
+
+    @property
+    def execution_provider(self) -> str:
+        """Canonical provider name for physical-device identity."""
+        requested = (self.provider or self.device or "cpu").strip()
+        return {"cpu": "CPUExecutionProvider", "cuda": "CUDAExecutionProvider"}.get(requested.lower(), requested)
 
 
 class TensorRTRuntimeProfile(BackendRuntimeProfile):
@@ -857,6 +872,16 @@ class RoleRuntimeProfile(StrictFrozenModel):
         instance_metadata: Mapping[str, Any] | None = None,
     ) -> RuntimeInstanceProjection:
         return self.profile.runtime_instance_projection(self.runtime_abi, instance_metadata)
+
+
+def _runtime_profiles(
+    runtime_profile: RoleRuntimeProfile | None,
+    role_runtime_profiles: Mapping[str, RoleRuntimeProfile] | None,
+) -> tuple[RoleRuntimeProfile, ...]:
+    """Collect validated profiles; composite and single-model forms are exclusive."""
+    if role_runtime_profiles:
+        return tuple(role_runtime_profiles.values())
+    return (runtime_profile,) if runtime_profile is not None else ()
 
 
 class ArtifactBindings(StrictFrozenModel):

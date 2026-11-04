@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 DEFAULT_MAX_CRITICAL_PATH_SEGMENTS = 1_000
 MAX_CRITICAL_PATH_SEGMENTS = 10_000
 _FLOW_STATUS_ALLOWLIST = frozenset({"complete"})
-_FLOW_CLOCK_ALLOWLIST = frozenset({"realtime"})
+_FLOW_CLOCK_ALLOWLIST = frozenset({"realtime", "ptp_reference"})
 _DIAGNOSTIC_ID_LIMIT = 20
 _DIAGNOSTIC_RANK = {code: index for index, code in enumerate(DIAGNOSTIC_ORDER)}
 
@@ -223,8 +223,20 @@ def _flow_exclusion(
     receive = pair.get("flow_receive")
     if send is None or receive is None:
         return None
-    if send.origin.host and receive.origin.host and send.origin.host != receive.origin.host:
+    calibrated = (
+        send.time_mapping.get("status") == "calibrated"
+        and receive.time_mapping.get("status") == "calibrated"
+        and bool(send.time_mapping.get("reference_id"))
+        and send.time_mapping.get("reference_id") == receive.time_mapping.get("reference_id")
+        and (
+            send.time_mapping.get("uncertainty_ns", 100_001) + receive.time_mapping.get("uncertainty_ns", 100_001)
+            <= 100_000
+        )
+    )
+    if send.origin.host and receive.origin.host and send.origin.host != receive.origin.host and not calibrated:
         return "flow_cross_host_unsynchronized", "cross-host flow has no shared-clock guarantee"
+    if send.clock == "ptp_reference" and not calibrated:
+        return "flow_cross_host_unsynchronized", "calibrated flow lacks valid reference or error budget"
     if send.clock != receive.clock:
         return "flow_clock_mismatch", "flow endpoints use different clocks"
     if send.clock not in _FLOW_CLOCK_ALLOWLIST:
@@ -256,6 +268,8 @@ def _edge_fields(edge: DataFlowEdge | None, pair: dict[str, TraceEvent], flow_id
         "source_component_id": edge.source_id if edge is not None else (send.component_id if send else ""),
         "target_component_id": edge.target_id if edge is not None else (receive.component_id if receive else ""),
     }
+    if send is not None and receive is not None and send.time_mapping and receive.time_mapping:
+        fields["clock_calibration"] = {"send": send.time_mapping, "receive": receive.time_mapping}
     if edge is not None:
         fields.update(
             {
@@ -515,7 +529,9 @@ def project_critical_path(result: AnalysisResult, query: CriticalPathQuery) -> C
     diagnostics = _DiagnosticAccumulator()
     request_events = [event for event in result.dataset.events if event.request_id == query.request_id]
     request_spans = [span for span in result.spans if span.trace_id == query.request_id]
-    request_flows = [flow for flow in result.flows if flow.trace_id == query.request_id]
+    from .query import flow_occurrences
+
+    request_flows = [flow for flow in flow_occurrences(result.flows) if flow.trace_id == query.request_id]
     hierarchy = build_span_hierarchy(request_spans)
     selected_nodes = [
         node for node in hierarchy.nodes if not query.component_id or node.span.component_id == query.component_id
@@ -631,15 +647,12 @@ def project_critical_path(result: AnalysisResult, query: CriticalPathQuery) -> C
         )
         for node in valid_nodes
     ]
-    flow_occurrences: Counter[str] = Counter()
     for flow, pair in sorted(
         valid_flows,
         key=lambda item: (item[0].send_ns, item[0].receive_ns, stable_flow_id(item[0])),
     ):
         assert flow.send_ns is not None and flow.receive_ns is not None
-        base_id = stable_flow_id(flow)
-        flow_occurrences[base_id] += 1
-        source_id = base_id if flow_occurrences[base_id] == 1 else f"{base_id}:{flow_occurrences[base_id]}"
+        source_id = flow.occurrence_id
         edge = edge_by_id.get(flow.edge_id)
         owners.append(
             _Owner(

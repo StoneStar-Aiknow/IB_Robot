@@ -270,3 +270,31 @@ def test_missing_media_api_does_not_prevent_releasing_an_unused_lease():
     decoder.close()
     assert decoder.state == CodecLifecycleState.CLOSED
     assert fake.events == ["lease_close"]
+
+
+@pytest.mark.parametrize("payload, complete", [(b"not jpeg", True), (b"\xff\xd8jpeg", False)])
+def test_recoverable_bad_frame_keeps_the_channel_for_the_next_good_frame(payload, complete):
+    fake = FakeDvpp()
+    decoder = AscendJpegDecoder(fake.lease, media=fake)
+    good = EncodedPacket(b"\xff\xd8jpeg", 0, 1, keyframe=True)
+    assert decoder.decode(good)
+    with pytest.raises(VideoCodecError, match="complete JPEG"):
+        decoder.decode(EncodedPacket(payload, 0, 2, keyframe=True, end_of_frame=complete))
+    assert decoder.state == CodecLifecycleState.RUNNING
+    assert decoder.decode(good)
+    assert "destroy_channel" not in fake.events
+    assert "destroy_stream" not in fake.events
+    decoder.close()
+
+
+def test_truncated_jpeg_rejection_reuses_the_channel_without_reset():
+    fake = FakeDvpp("info")
+    decoder = AscendJpegDecoder(fake.lease, media=fake)
+    with pytest.raises(VideoCodecError, match="get_image_info"):
+        decoder.decode(EncodedPacket(b"\xff\xd8jpeg", 0, 1, keyframe=True))
+    assert decoder.state == CodecLifecycleState.RUNNING
+    fake.fail = None
+    assert decoder.decode(EncodedPacket(b"\xff\xd8jpeg", 0, 2, keyframe=True))[0].width == 1344
+    assert "destroy_channel" not in fake.events
+    assert fake.events.count("create_channel") == 1
+    decoder.close()

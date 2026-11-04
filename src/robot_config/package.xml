@@ -12,6 +12,10 @@
   <depend>sensor_msgs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>robot_runtime</depend>
+  <!-- docs/testing.md: every sibling imported by tests is declared as an
+       explicit test_depend; <depend> covers build+exec scope only. -->
+  <test_depend>robot_runtime</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp_components</depend>
   <depend>rosgraph_msgs</depend>
@@ -41,7 +45,6 @@
   <exec_depend>pointcloud_to_laserscan</exec_depend>
   <exec_depend>livox_ros_driver2</exec_depend>
   <exec_depend>fast_lio</exec_depend>
-  <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <!-- ALSA audio device owners for the provider-less legacy audio_io entry
        (runtime-owned-audio-io). Delete both once every deployment sets
@@ -59,9 +62,13 @@
 
   <!-- Gazebo simulation -->
   <exec_depend>gz_ros2_control</exec_depend>
+  <!-- Every Gazebo world the generic launch runs comes from sim_models scenes
+       (the empty scene is the fallback when simulation.scene is unset). -->
+  <exec_depend>sim_models</exec_depend>
 
-  <!-- MuJoCo simulation -->
-  <exec_depend>mujoco_ros2_control</exec_depend>
+  <!-- MuJoCo simulation. 0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1);
+       rosdep does not enforce versions, the runtime check is the guard. -->
+  <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
 
   <!-- TF -->
   <exec_depend>tf2_ros</exec_depend>

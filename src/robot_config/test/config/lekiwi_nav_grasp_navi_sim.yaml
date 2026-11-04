@@ -1,0 +1,55 @@
+# Navigation simulation overlay on the LeKiwi mobile manipulator
+# configuration (lekiwi-nav-grasp-sim-platforms D7, task 4.0).
+#
+# base_config selects the shipped production lekiwi_nav_grasp.yaml; every
+# override below sits INSIDE nav_stages.navigation, so the stage merge (which
+# happens after the base/overlay merge) applies them to the production
+# navigation stage: the physics platform with the nav_room scene and its
+# spawn pose, the simulation map, the mobile-manipulator Nav2 parameters
+# (robot_radius 0.28 — the stowed arm's measured planar extent 0.240 m /
+# conservative 0.277 m vs the base-only 0.22; see
+# nav2_params_navgrasp_sim.yaml), deterministic localisation, and every
+# application consumer bound to an interface the platform does not simulate
+# turned off: the microphone and speaker are excluded on both physics
+# platforms by the runtime profile (simulation.<platform>.enabled: false,
+# D3), so speech_direction (audio.capture) and voice_tts (audio.play) must
+# not run there; voice_asr, embodied and RViz follow the lekiwi_lidar
+# overlay's pattern. The unknown_interface binding check stays strict — a
+# consumer left enabled for an excluded interface must fail the launch.
+# FAST-LIO, the scan converter and the navigation admission stay exactly as
+# in production; the loader resolves sibling bases only, so tests stage this
+# overlay next to the shipped configuration (the staging helper does that).
+robot:
+  base_config: lekiwi_nav_grasp
+
+  nav_stages:
+    navigation:
+      simulation:
+        platform: gazebo
+        scene: nav_room
+        robot_spawn:
+          x: -1.5
+          y: -1.5
+          z: 0.05
+          yaw: 0.0
+
+      navigation:
+        nav2_bringup:
+          map_file: $(find robot_navigation)/config/maps/sim_map.yaml
+          params_file: $(find robot_navigation)/config/nav2_params_navgrasp_sim.yaml
+          auto_global_localization: false
+
+      speech_direction:
+        enabled: false
+
+      voice_tts:
+        enabled: false
+
+      voice_asr:
+        enabled: false
+
+      embodied:
+        enabled: false
+
+      rviz:
+        enabled: false

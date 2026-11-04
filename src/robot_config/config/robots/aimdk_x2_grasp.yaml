@@ -1,0 +1,160 @@
+# AgiBot X2 grasp, shared by its host deployments: the OmniHand X2 and the grasp
+# pipeline, without the models. Launch a host deployment, never this file:
+#
+#   aimdk_x2_grasp_cuda.yaml  robot-side host with an NVIDIA GPU (203): Torch CUDA models
+#   aimdk_x2_grasp_310p.yaml  robot-side host with an Ascend 310P: OM detection and
+#                             segmentation, GraspGen-X on torch_npu
+#
+# Both hosts launch the same deployment: the robot-side host runs the runtime,
+# the Gateway, the models and manipulation_execution's grasp_pipeline_node with
+# the X2 backends (aimdk_grasp.remote_head); the Orin runs the grasp head
+# (aimdk_grasp's x2_grasp_head.launch.py): the head camera's capture and
+# registration, the collision scene, cuRobo and the target watch, beside the
+# camera's raw depth and its CUDA GPU. The robot-side host needs no CUDA for
+# that. The split is temporary and the X2's alone (aimdk_grasp.split); without
+# it the X2 runs aimdk_grasp.backend:x2_grasp_backends with no backend_options.head.
+#
+# The vendor forbids subscribing raw camera streams across compute units, so
+# the pipeline sends images to the model services rather than the services
+# subscribing to the head camera. The X2 backends refuse this file on its own:
+# it names no model deployment.
+
+robot:
+  base_config: aimdk_x2.yaml
+  name: aimdk_x2_grasp
+  # Must match the selected runtime profile's public robot identity.
+  type: x2_ultra_omnihand
+
+  runtime:
+    profile: x2_ultra_omnihand
+
+  capabilities:
+    # The OmniHand profile declares dexterous-hand capabilities instead of
+    # gripper.1d; every other requirement is the base configuration's.
+    requires:
+      - joint.state
+      - joint.position_stream
+      - hand.multi_joint
+      - hand.gesture
+      - base.cmd_vel
+      - base.navigation_gate
+      - motion.named
+      - motion.posture
+      - perception.camera
+      - perception.imu
+      - power.state
+      - diagnostics.codes
+      - interaction.tts
+      - interaction.expression
+      - interaction.led
+      - runtime.stop
+
+  # Arm travel the motion-control unit enforces, in radians, keyed by joint
+  # name. From the vendor SDK's extra/mc-rl/x2_urdf/X2_URDF-v1.3.0/x2_ultra.urdf,
+  # not from aimdk_description: the published URDF carries the same version
+  # label with different values on shoulder_roll, wrist_pitch and wrist_roll.
+  # aimdk_grasp narrows the planning model to the left arm's entries, never
+  # widens it, so planning stays inside both ranges. The same values are the
+  # mirror's motion_imitation_stream.mock_playback.arm_limits
+  # (aimdk_x2_magicmirror.yaml); they become one entry when the grasp and mirror
+  # configurations merge, and test_aimdk_x2_grasp_config keeps them equal until then.
+  arm_limits:
+    left_shoulder_pitch_joint: [-3.0800, 2.0400]
+    left_shoulder_roll_joint: [-0.0610, 2.9930]
+    left_shoulder_yaw_joint: [-2.5560, 2.5560]
+    left_elbow_joint: [-2.3556, 0.0000]
+    left_wrist_yaw_joint: [-2.5560, 2.5560]
+    left_wrist_pitch_joint: [-0.5580, 0.5580]
+    left_wrist_roll_joint: [-1.5710, 0.7240]
+    right_shoulder_pitch_joint: [-3.0800, 2.0400]
+    right_shoulder_roll_joint: [-2.9930, 0.0610]
+    right_shoulder_yaw_joint: [-2.5560, 2.5560]
+    right_elbow_joint: [-2.3556, 0.0000]
+    right_wrist_yaw_joint: [-2.5560, 2.5560]
+    right_wrist_pitch_joint: [-0.5580, 0.5580]
+    right_wrist_roll_joint: [-0.7240, 1.5710]
+
+  # pick_object requires the moveit_planning control mode by name (the skill
+  # catalog's vocabulary). Nothing on the X2 runs MoveIt: the grasp pipeline
+  # plans with cuRobo and streams the left arm and hand itself, in the
+  # runtime's policy_stream (UPPERBODY_REMOTE_SPLIT), which the Gateway
+  # switches to before the pick.
+  skill_required_control_mode: "moveit_planning"
+  control_modes:
+    moveit_planning:
+      description: "Grasp pipeline streams the left arm and hand"
+      description_cn: "抓取流水线流式控制左臂和左手"
+      runtime_mode: policy_stream
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+
+  embodied:
+    enabled: true
+    arm_surface: false
+    skill_catalog_profile: aimdk_x2_grasp
+    skill_catalog_source_mode: development
+    runtime_named_motion:
+      enabled: false
+
+  grasp_execution:
+    enabled: true
+    action_name: /manipulation/execute_pick
+    # The pipeline runs beside the runtime and the models; its grasp head on the
+    # Orin: only compressed captures, target masks, grasp candidates, plans and
+    # the watch's status cross between them.
+    backend: "aimdk_grasp.remote_head:x2_remote_grasp_backends"
+    # The GraspGen-X bundle the generate_grasps service serves: the executor
+    # identity pins it together with model_deployment (each host deployment
+    # sets the one its service runs), and its gripper description is what the
+    # planner mounts on the left palm.
+    model_bundle_path: "$(env WORKSPACE)/models/graspgenx_omnihand_left_x2"
+    # The runtime streams the X2 backends command (aimdk_grasp.backend):
+    # bound against the live runtime description at launch, which the pipeline
+    # node then receives and checks its camera and joint inputs against.
+    command_interfaces:
+      - joint.arm_stream
+      - joint.hand_stream
+    backend_options:
+      # Pick with the arm on the target's side; left/right force one arm.
+      arm_side: auto
+      detect_service: /perception/grasp/grounding_detect
+      generate_grasps_service: /perception/grasp/generate_grasps
+      # Halt the approach when the target moves, and replan once it is back.
+      # A watch that cannot look stops the arm where it is instead.
+      watch: stop
+      # Evidence for these in aimdk_grasp.execution_watch.WatchTimeouts (123
+      # armed executions on the robot): frames every 0.21 s (p99 0.47 s); the
+      # hand hid the target for up to 2.62 s at the end of the grasp segment.
+      watch_frame_timeout_s: 1.0
+      watch_unknown_timeout_s: 4.0
+      watch_image_age_s: 0.5
+      # The grasp head on the Orin (aimdk_grasp.split).
+      head:
+        namespace: /x2_grasp_head
+        # Ten of the head's 0.1 s status periods, on the robot-side host's clock.
+        status_timeout_s: 1.0
+        # cuRobo gets cores 4-7, as the X2 pipeline ran its planner and
+        # observation (taskset -c 4-7); the rest of the head's launch goes to
+        # 1-3. Core 0 serves the robot network card's only interrupt. Plan-only
+        # on the robot (2026-10-22): 7.7-10 s unpinned, 5.2-5.4 s pinned.
+        cpu_isolation:
+          node: "4-7"
+          others: "1-3"
+    pipeline:
+      # The X2 puts a picked object back where it was, retracing the plan.
+      release_after_success: true
+      # Observations a goal may plan from. Live 2026-11-03 (48 picks, 310P):
+      # 12 failed before the arm moved, 7 with no executable candidate for
+      # that view and 5 with feedback missing at capture; each costs 3-15 s of
+      # the 120 s goal and a new view samples new candidates.
+      max_attempts: 3
+      # A grasp that held nothing or let the object slip (4 of 48, all
+      # oranges), with the arm back at home and the hand open, is tried once
+      # more from a new observation.
+      max_regrasps: 1
+      # A pick ran 33-50 s from goal to put-back (same 48): a plan is not
+      # started with less goal time left, so a retry late in the goal cannot
+      # be cancelled by the goal's timeout mid-motion.
+      execute_reserve_s: 50.0

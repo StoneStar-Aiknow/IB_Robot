@@ -1,0 +1,109 @@
+# AgiBot X2 voice Agent with the addressee gate: the voice chain of
+# aimdk_x2_voice, the Kimi planner, and a voiceprint check that keeps the
+# vendor's wake-word session for the person who opened it.
+#
+# The vendor consumes its own wake word before releasing speech; the runtime
+# reports it as audio.wake_event, naming the speech segment it opened. Only that
+# utterance opens a session (addressee_trigger: vendor_session) and sets the
+# voiceprint anchor; every later utterance of the session is compared to it, and
+# after session_gap_sec of silence nothing is accepted until the next wake word.
+# Transcripts, voiceprints and wake events are paired by speech segment
+# (voice_asr.transcript_topic). Values are the ones the robot was tested at
+# (2026-10-24 to 2026-10-27); speaker_min_similarity still has to be calibrated
+# against the actual users (ibrobot_agent/README.md describes how).
+#
+# The X-ASR bundle is provisioned outside the repo (as for aimdk_x2_voice); the
+# speaker embedding bundle comes from scripts/download_models.py
+# (campplus-speaker), see voice_asr_service/README.md ("Speaker ID 独立节点").
+# The planner reads its key from KIMICODE_API_KEY. Launch with
+# control_mode:=named_motion and authorize_motion:=true.
+robot:
+  # The skill catalog validates the robot context name against the catalog
+  # profile's robot_name; this is the same robot, so it keeps that identity.
+  name: aimdk_x2_skills
+  base_config: aimdk_x2_voice.yaml
+
+  embodied:
+    entry_mode: agent
+    execution_store_path: /tmp/ibrobot-x2-addressee/executions.sqlite3
+    agent:
+      enabled: true
+      incubation: true
+      execution_enabled: true
+      channel_id: voice_asr
+      principal_id: local_operator
+      test_allowlist:
+        - wave_hand
+        - handshake
+        - raise_hand
+        - blow_kiss
+        - clap_hands
+      ledger_path: /tmp/ibrobot-x2-addressee/requests.sqlite3
+      conversation_path: /tmp/ibrobot-x2-addressee/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-x2-addressee/agent.lock
+      max_session_turns: 12
+      clarification_ttl_sec: 300.0
+      event_queue_size: 128
+      # The planner the gate was verified end to end with on the robot
+      # (2026-10-25/26, 13 of 13 gestures). Kimi thinks before it answers, so
+      # it gets a long timeout and no token cap.
+      planner:
+        mode: vlm
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-for-coding
+        timeout_sec: 120.0
+        # kimi-for-coding accepts only temperature=1.
+        temperature: 1.0
+        catalog_view: planner
+      voice_bridge:
+        enabled: true
+        confirm_mode: auto
+        tts_enabled: false
+        addressee_trigger: vendor_session
+        # Silence that ends a session; the next utterance then needs the wake
+        # word. Measured between finals: consecutive transcripts sat ~16 s
+        # apart even with 9 s of real silence, so 15 s would make the user
+        # repeat the wake word mid-conversation.
+        session_gap_sec: 25.0
+        speaker_check_enabled: true
+        # Through this microphone, >=2 s segments: the user's own follow-ups
+        # 0.67-0.84 against an accumulated anchor, other speakers 0.28-0.56.
+        speaker_min_similarity: 0.60
+        speaker_max_age_sec: 6.0
+        # Upper bound only: a follow-up waits for its voiceprint just until it
+        # lands (median 0.14 s before the transcript on the X2); one lagged its
+        # transcript by 1.13 s once (2026-10-23).
+        measurement_grace_sec: 1.5
+        # Real people's commands are about a second of speech ("握手握手");
+        # letting those through unchecked let a second person drive the robot
+        # (2026-10-26). With an anchor set they are rejected instead.
+        speaker_reject_short: true
+        # The runtime marks the utterances its platform's wake word preceded,
+        # so a new speaker naming the robot mid-session re-anchors instead of
+        # being checked against the previous speaker.
+        wake_event:
+          interface: audio.wake_event
+          type: ibrobot_msgs/msg/SpeechWakeEvent
+
+  voice_asr:
+    # The X2 source sometimes stops sending without an END; without this the
+    # ASR discards the whole utterance (measured 2026-10-23: BEGIN 1 / END 0).
+    external_finalize_on_idle: true
+    speaker_embedding:
+      enabled: true
+      # Schema-v3 bundle (scripts/download_models.py --models campplus-speaker);
+      # the manifest carries the artifact digest and the model identity that
+      # travels with every vector, the deployment its thread budget.
+      bundle_path: models/campplus-speaker
+      deployment: torch_cpu
+      # Lowered from 2.0 after real people were tested (2026-10-26): their
+      # commands are 1-2 s of speech and below the floor they get no
+      # voiceprint at all. Shorter vectors are noisier, so the user's own short
+      # follow-ups may now score under speaker_min_similarity.
+      min_speech_seconds: 1.0
+      max_speech_seconds: 6.0
+      # Below voice_asr.external_idle_timeout (2.0), so the voiceprint is
+      # published before its transcript; the loader enforces this.
+      idle_timeout_sec: 1.2

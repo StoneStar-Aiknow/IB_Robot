@@ -256,6 +256,10 @@ class MotionImitationStreamNode(Node):
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
         )
         self._status_timer = self.create_timer(self._status_period_sec, self._publish_status)
+        # count_publishers queries the rclpy graph; doing it per frame while
+        # holding the stats lock contends with the decode and vision workers.
+        # A slow timer owns the probe; frame paths read the cached boolean.
+        self._source_health_timer = self.create_timer(0.2, self._refresh_source_health)
         self.get_logger().info(
             f"motion imitation stream ready: in={self._rgb_topic} "
             f"interface={self._frame_source_interface or '(explicit topic)'} decoder={self._decoder_name} "
@@ -313,6 +317,44 @@ class MotionImitationStreamNode(Node):
                 self._invalidate_source_locked()
             self._source_healthy = available
         return available
+
+    def _invalidate_source_locked(self) -> None:
+        """Retire cache, queue entries and RPCs together while holding the state lock."""
+        self._source_generation += 1
+        self._yolox_detections = None
+        self._yolox_result_ready = False
+        self._source_geometry = None
+        self._last_capture_stamp = None
+        self._last_encoded_at = 0.0
+        self._next_pear_at = 0.0
+        for slot in (self._decode_queue, self._pear_queue, self._yolox_queue):
+            with contextlib.suppress(queue.Empty):
+                slot.get_nowait()
+
+    def _frame_current_locked(self, message: Image, generation: int) -> bool:
+        return generation == self._source_generation and (
+            self._source_geometry is None or self._source_geometry == (message.width, message.height)
+        )
+
+    def _refresh_source_health(self) -> None:
+        """Probe source availability at a slow rate; frame paths read the cache."""
+        if not self._require_unique_publisher:
+            return
+        available = self.count_publishers(self._rgb_topic) == 1
+        with self._stats_lock:
+            if not available and self._source_healthy is not False:
+                self._invalidate_source_locked()
+            self._source_healthy = available
+
+    def _source_available(self) -> bool:
+        if not self._require_unique_publisher:
+            return True
+        if self._source_healthy is None:
+            # Before the health timer's first tick the cache is empty; probe
+            # once here so early frames are not rejected. Callers already hold
+            # the stats lock, which is reentrant for this thread.
+            self._refresh_source_health()
+        return self._source_healthy is True
 
     def _invalidate_source_locked(self) -> None:
         """Retire cache, queue entries and RPCs together while holding the state lock."""
@@ -772,6 +814,15 @@ class MotionImitationStreamNode(Node):
             reason = "source produced no decodable frames"
         elif self._last_frame_at and now - self._last_frame_at >= self._status_period_sec:
             reason = "source timed out: no recent decodable frame"
+        elif (
+            status["decoder_error"]
+            and status["cpu_frames"] > 0
+            and status["dvpp_frames"] == 0
+            and self._decoder_name in ("auto", "dvpp")
+        ):
+            # auto falls back to CPU decode when hardware is unavailable; the
+            # 30 FPS target only holds with DVPP, so surface the degradation.
+            reason = "hardware decoder unavailable: decoding on CPU"
         else:
             reason = ""
         if reason:
@@ -785,12 +836,20 @@ class MotionImitationStreamNode(Node):
 
     def destroy_node(self) -> bool:
         self._stop.set()
+        stuck = False
         for worker in (self._decode_worker, self._pear_worker, self._yolox_worker):
             if worker.is_alive():
                 worker.join(timeout=max(5.0, self._rpc_timeout + 1.0))
             if worker.is_alive():
-                raise RuntimeError(f"worker {worker.name} did not stop; decoder resources remain owned")
-        self._decoder.close()
+                stuck = True
+                self.get_logger().error(
+                    f"worker {worker.name} did not stop; its decoder resources stay owned"
+                    " and the shared decoder will not be closed"
+                )
+        if not stuck:
+            self._decoder.close()
+        # Finish teardown even when a worker is stuck: skipping super() would
+        # leak every subscription, timer, client and publisher.
         return super().destroy_node()
 
 

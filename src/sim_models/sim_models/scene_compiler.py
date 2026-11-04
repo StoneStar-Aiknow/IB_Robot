@@ -19,23 +19,64 @@ Public API
       Generate the resolved Gazebo world file.
       Used by GazeboAdapter.start_backend() when simulation.scene is set.
 
-  randomization_grid(layout) -> list[(x, y, z, yaw)]
+  randomization_placements(layout) -> list[(x, y, z, yaw)]
       The single randomisation generator shared by both physics platforms
-      (so101-mujoco-runtime-platform D9): randomisation index *k* maps to
-      the same banana placement on MuJoCo (keyframe ``random_KKK``) and on
-      Gazebo (``SetEntityPose`` with the same index).
+      (so101-mujoco-runtime-platform D9 / issue #195): randomisation index
+      *k* maps to the same banana placement on MuJoCo (``ResetWorld`` state
+      overrides) and on Gazebo (``SetEntityPose`` with the same index).
+      ``mode: grid`` (default) is bit-identical to the historical keyframe
+      grid; ``mode: uniform`` samples deterministically from ``seed``.
+      Every input is validated (finite ordered ranges, positive-integer
+      divisions, integer seed/count with count >= 1) — ValueError names the
+      offending key and fires in the consumer's constructor.
+
+  arm_rest_pairs(layout) -> list[(joint_name, rest_qpos)]
+      The validated arm rest pairs (``arm_joint_names`` /
+      ``arm_rest_qpos``): both fields arrays, unique non-empty names,
+      equal-length arrays, finite values. Shared by the scene task's rest
+      trajectories and the MuJoCo backend's ``ResetWorld`` joint override.
+
+  scene_dynamic_objects(scene_name) -> list[str]
+      Names of the scene's dynamic objects (``type: dynamic`` in layout.yaml).
+
+  free_joint_states_topic(scene) -> str
+      The scene-namespaced free-joint observation topic the MuJoCo
+      FreeJointStatePublisherPlugin publishes to (and the scene task's
+      MuJoCo backend subscribes to); the Gazebo counterpart is
+      ``/sim/<scene>/object_poses``.
 
   composed_model_path(scene) -> Path
       The single composed-model location (D3), keyed by ``ROS_DOMAIN_ID`` so
       concurrent launches on different domains never overwrite each other's
-      model. Used by the provider (writer) and the scene task (reader).
+      model. Used by the provider (writer); the scene task no longer reads
+      the composed model since placements moved to ``ResetWorld`` state
+      overrides (issue #195).
+
+  mjcf_engine_extensions(source) -> list[str]
+      The engine-extension names an MJCF document declares
+      (``<extension><plugin plugin="..."/>``), from a path or a string.
+
+  load_mujoco_engine_plugins(required_extensions) -> None
+      Load every library registered under the ament ``mujoco_plugins``
+      resource index (D5.1): ``ctypes.CDLL(..., RTLD_GLOBAL)`` once per
+      process, then verify each required extension with a probe parse of a
+      minimal MJCF declaring it. Missing library or unregistered extension
+      raises naming the apt package to install.
 
   compose_mujoco_model(robot_mjcf_path, scene, sdf_mesh_names) -> Path
       Robot-agnostic composition (D3): substitute the robot MJCF into the
-      named scene (or compile it alone when ``scene`` is None), inject the
-      shared keyframes, apply SDF collision to the given meshes, compile and
-      save the ``.mjb``. Falls back to the ``.xml`` only when the ``mujoco``
-      package is missing; the provider treats that as fatal.
+      named scene (or compile it alone when ``scene`` is None), apply SDF
+      collision to the given meshes, compile and save the ``.mjb``. Falls
+      back to the ``.xml`` only when the ``mujoco`` package is missing; the
+      provider treats that as fatal. When the composed MJCF declares engine
+      extensions (lekiwi-mujoco-runtime-platform D5.1) the Python compiler
+      loads them and fully compiles as validation — compile errors raise the
+      original MuJoCo error — but the DELIVERED artifact is the XML
+      (``MjSpec.to_xml()``): ``mj_saveModel`` serialises the compiling
+      process's global plugin slot ids into the ``.mjb``, which the C++
+      node (its own registration order) cannot read back (spike evidence
+      /tmp/lekiwi-mujoco-evidence/spike/SUMMARY.md). Extension-free models
+      keep the ``.mjb`` path byte-for-byte.
 
   get_scene_layout(scene_name) -> dict
       The parsed layout.yaml of a scene (or {}).
@@ -47,6 +88,7 @@ Public API
 import logging
 import math
 import os
+import random
 import tempfile
 from pathlib import Path
 
@@ -63,29 +105,129 @@ _PLATFORM_EXT = {
 }
 
 
-def randomization_grid(layout: dict) -> list[tuple[float, float, float, float]]:
-    """The single randomisation generator shared by both physics platforms (D9).
+def _finite_number(value, label: str) -> float:
+    """A finite YAML number (bools are ints in Python but not valid here)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{label} must be a number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be finite, got {value!r}")
+    return number
+
+
+def _positive_int(value, label: str) -> int:
+    """A strictly positive integer (rejects floats, bools and zero)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"{label} must be >= 1, got {value}")
+    return value
+
+
+def _validated_range(value, label: str) -> tuple[float, float]:
+    """A finite [min, max] pair with min <= max."""
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        raise ValueError(f"{label} must be a [min, max] pair, got {value!r}")
+    low = _finite_number(value[0], f"{label}[0]")
+    high = _finite_number(value[1], f"{label}[1]")
+    if low > high:
+        raise ValueError(f"{label} must satisfy min <= max, got {value!r}")
+    return low, high
+
+
+def randomization_placements(layout: dict) -> list[tuple[float, float, float, float]]:
+    """The single randomisation generator shared by both physics platforms (D9, issue #195).
 
     Index *k* of the returned list maps to the same banana placement on every
-    platform: MuJoCo keyframe ``random_{k:03d}`` and the Gazebo backend's
-    ``SetEntityPose`` with the same index. The order is stable: x outer,
-    y middle, yaw inner, exactly as the previous keyframe-only generator
-    produced, so existing randomisation indices keep their meaning.
+    platform: the MuJoCo backend's ``ResetWorld`` state overrides and the
+    Gazebo backend's ``SetEntityPose`` both consume ``placements[k]``.
+
+    ``randomization.banana.mode`` selects the generator:
+
+    - ``grid`` (default, also when the key is absent): the historical
+      keyframe-era grid — x outer, y middle, yaw inner, values from
+      ``numpy.linspace`` — reproduced bit-identically, so existing
+      randomisation indices keep their meaning.
+    - ``uniform``: ``count`` poses sampled deterministically from ``seed``
+      across the x/y/yaw ranges (``z`` stays ``z_spawn``); the same seed and
+      count give the same sequence on every platform, so index *k* is still
+      platform-independent.
+
+    Every input is validated here so a bad layout fails in the consumer's
+    constructor — before any motion is commanded —
+    with a message naming the offending key: ranges must be finite ordered
+    pairs, ``z_spawn`` finite, grid divisions positive integers, uniform
+    ``seed``/``count`` integers (bools and floats rejected) with
+    ``count >= 1``.
     """
-    rand = layout.get("randomization", {})
-    banana_cfg = rand.get("banana", {})
+    rand = layout.get("randomization", {}) or {}
+    banana_cfg = rand.get("banana", {}) or {}
     if not banana_cfg:
         return []
-    x_min, x_max = banana_cfg.get("x_range", [-0.03, 0.10])
-    y_min, y_max = banana_cfg.get("y_range", [-0.02, 0.10])
-    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
-    grid_cols = int(banana_cfg.get("grid_cols", 5))
-    grid_rows = int(banana_cfg.get("grid_rows", 7))
-    yaw_steps = int(banana_cfg.get("yaw_steps", 6))
-    xs = np.linspace(x_min, x_max, grid_cols)
-    ys = np.linspace(y_min, y_max, grid_rows)
-    yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
-    return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+    x_min, x_max = _validated_range(banana_cfg.get("x_range", [-0.03, 0.10]), "randomization.banana.x_range")
+    y_min, y_max = _validated_range(banana_cfg.get("y_range", [-0.02, 0.10]), "randomization.banana.y_range")
+    z_spawn = _finite_number(banana_cfg.get("z_spawn", 0.05), "randomization.banana.z_spawn")
+    mode = str(banana_cfg.get("mode", "grid")).lower()
+    if mode == "grid":
+        grid_cols = _positive_int(banana_cfg.get("grid_cols", 5), "randomization.banana.grid_cols")
+        grid_rows = _positive_int(banana_cfg.get("grid_rows", 7), "randomization.banana.grid_rows")
+        yaw_steps = _positive_int(banana_cfg.get("yaw_steps", 6), "randomization.banana.yaw_steps")
+        xs = np.linspace(x_min, x_max, grid_cols)
+        ys = np.linspace(y_min, y_max, grid_rows)
+        yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
+        return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+    if mode == "uniform":
+        if "seed" not in banana_cfg or "count" not in banana_cfg:
+            raise ValueError("randomization.banana uniform mode requires 'seed' and 'count'")
+        seed = banana_cfg["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(f"randomization.banana.seed must be an integer, got {seed!r}")
+        count = _positive_int(banana_cfg["count"], "randomization.banana.count")
+        rng = random.Random(seed)
+        return [
+            (
+                rng.uniform(x_min, x_max),
+                rng.uniform(y_min, y_max),
+                z_spawn,
+                rng.uniform(0.0, 2.0 * math.pi),
+            )
+            for _ in range(count)
+        ]
+    raise ValueError(f"randomization.banana mode must be 'grid' or 'uniform', got {mode!r}")
+
+
+def arm_rest_pairs(layout: dict) -> list[tuple[str, float]]:
+    """The validated (arm joint name, rest qpos) pairs from the layout.
+
+    The randomisation section's ``arm_joint_names`` / ``arm_rest_qpos`` feed
+    both the scene task's rest trajectories and the MuJoCo backend's
+    ``ResetWorld`` joint override, so the two arrays are parsed and validated
+    once here: both fields must be arrays (a string would otherwise be
+    iterated character by character), names must be unique non-empty
+    strings, the arrays equally long, every rest value a finite number.
+    ``ValueError`` surfaces in the consumer's constructor — before any
+    motion is commanded.
+    """
+    rand = (layout or {}).get("randomization", {}) or {}
+    names = rand.get("arm_joint_names")
+    qpos = rand.get("arm_rest_qpos")
+    names = [] if names is None else names
+    qpos = [] if qpos is None else qpos
+    for field, value in (("randomization.arm_joint_names", names), ("randomization.arm_rest_qpos", qpos)):
+        if not isinstance(value, list | tuple):
+            raise ValueError(f"{field} must be a list, got {value!r}")
+    if len(names) != len(qpos):
+        raise ValueError(
+            f"randomization.arm_joint_names ({len(names)}) and arm_rest_qpos ({len(qpos)}) must have the same length"
+        )
+    pairs = []
+    for name, value in zip(names, qpos, strict=True):
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"randomization.arm_joint_names entries must be non-empty strings, got {name!r}")
+        pairs.append((name, _finite_number(value, "randomization.arm_rest_qpos entries")))
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise ValueError("randomization.arm_joint_names must be unique")
+    return pairs
 
 
 def _quat_from_extrinsic_xyz(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -118,84 +260,28 @@ def _layout_dynamic_objects(layout: dict) -> list[tuple[str, list[float], list[f
     return out
 
 
-def _inject_random_keyframes(xml_content: str, layout: dict) -> str:
-    """Inject the shared randomisation keyframes plus a named default (D3/D9).
+def scene_dynamic_objects(scene_name: str) -> list[str]:
+    """Names of the scene's dynamic objects (``type: dynamic`` in layout.yaml).
 
-    ``random_KKK`` keyframes come from ``randomization_grid`` (index k → pose);
-    the ``default`` keyframe holds the layout's default object poses and
-    ``arm_rest_qpos``, so a default reset and the trajectory controller's
-    hold setpoint agree. Uses the mujoco Python API to resolve qpos addresses
-    by joint name so the ordering is inferred from the model, not hardcoded.
-    If mujoco is unavailable or the model cannot compile, returns
-    xml_content unchanged.
+    The MuJoCo runtime provider publishes exactly these bodies through the
+    FreeJointStatePublisherPlugin, and the scene task's MuJoCo backend
+    observes them on the resulting topic. Unknown scenes (or scenes without
+    dynamic objects) return an empty list — no plugin is configured for them.
     """
-    try:
-        import mujoco  # noqa: PLC0415
-    except ImportError:
-        logging.warning("mujoco not available; skipping keyframe injection")
-        return xml_content
+    return [name for name, _position, _rpy in _layout_dynamic_objects(get_scene_layout(scene_name))]
 
-    grid = randomization_grid(layout)
-    if not grid:
-        return xml_content
 
-    rand = layout.get("randomization", {})
-    arm_joint_names = rand.get("arm_joint_names", [])
-    arm_rest_qpos = rand.get("arm_rest_qpos", [])
-    dynamics = _layout_dynamic_objects(layout)
+def free_joint_states_topic(scene: str) -> str:
+    """The scene-namespaced free-joint observation topic on the MuJoCo platform.
 
-    try:
-        spec = mujoco.MjSpec.from_string(xml_content)
-        model = spec.compile()
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Keyframe injection: model compile failed (%s); skipping", exc)
-        return xml_content
-
-    data = mujoco.MjData(model)
-
-    def _adr(name: str) -> int:
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        return int(model.jnt_qposadr[jid]) if jid >= 0 else -1
-
-    def _set_arm(qpos) -> None:
-        for jname, qval in zip(arm_joint_names, arm_rest_qpos, strict=False):
-            adr = _adr(jname)
-            if adr >= 0:
-                qpos[adr] = float(qval)
-
-    def _set_freejoint(qpos, name: str, position: list[float], rpy: list[float]) -> None:
-        adr = _adr(f"{name}_free")
-        if adr < 0:
-            return
-        qw, qx, qy, qz = _quat_from_extrinsic_xyz(rpy[0], rpy[1], rpy[2])
-        qpos[adr : adr + 7] = [position[0], position[1], position[2], qw, qx, qy, qz]
-
-    banana = next((entry for entry in dynamics if entry[0] == "banana"), None)
-
-    lines = ["  <keyframe>"]
-
-    def _emit(name: str, qpos) -> None:
-        qstr = " ".join(f"{v:.6f}" for v in qpos)
-        lines.append(f'    <key name="{name}" qpos="{qstr}"/>')
-
-    # named default: the arm at rest and every dynamic object at its layout pose
-    qpos = data.qpos.copy()
-    _set_arm(qpos)
-    for obj_name, position, rpy in dynamics:
-        _set_freejoint(qpos, obj_name, position, rpy)
-    _emit("default", qpos)
-
-    # randomisation grid: index k → random_KKK (banana at grid[k], arm at rest)
-    for idx, (x, y, z, yaw) in enumerate(grid):
-        qpos = data.qpos.copy()
-        _set_arm(qpos)
-        if banana is not None:
-            # banana_free freejoint: [tx, ty, tz, qw, qx, qy, qz]
-            _set_freejoint(qpos, banana[0], [x, y, z], [0.0, 0.0, yaw])
-        _emit(f"random_{idx:03d}", qpos)
-    lines.append("  </keyframe>")
-
-    return xml_content.replace("</mujoco>", "\n".join(lines) + "\n</mujoco>")
+    ``/sim/<scene>/free_joint_states`` mirrors Gazebo's
+    ``/sim/<scene>/object_poses``: one scene-namespaced absolute stream with
+    every dynamic object's live pose. Both the runtime provider (which
+    configures the plugin's ``topic`` parameter) and the scene task's
+    ``MujocoBackend`` (which subscribes) resolve the name through this
+    function, so the two ends can never drift apart.
+    """
+    return f"/sim/{scene}/free_joint_states"
 
 
 def get_scene_file(scene_name: str, platform: str) -> Path:
@@ -260,16 +346,131 @@ def composed_model_path(scene: str | None) -> Path:
     return Path(tempfile.gettempdir()) / "ibrobot_sim_models" / domain / f"{name}.mjb"
 
 
+def mjcf_engine_extensions(source: str | Path) -> list[str]:
+    """The engine-extension names an MJCF document declares (D5.1).
+
+    ``source`` is a file path or the document text; the result is the sorted
+    ``plugin`` attributes of every ``<extension><plugin>`` element. Includes
+    are followed (the composed scene template declares nothing itself — the
+    robot it includes does); a document without an ``<extension>`` section
+    declares none.
+    """
+    import xml.etree.ElementTree as ET
+
+    seen: set[Path] = set()
+    names: set[str] = set()
+
+    def _collect(text: str, origin: Path | None) -> None:
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return
+        if root.tag != "mujoco":
+            return
+        extension = root.find("extension")
+        if extension is not None:
+            names.update(str(plugin.get("plugin")) for plugin in extension.findall("plugin") if plugin.get("plugin"))
+        for include in root.findall("include"):
+            target = include.get("file")
+            if not target:
+                continue
+            resolved = (Path(target) if os.path.isabs(target) else (origin.parent / target)) if origin else Path(target)
+            resolved = resolved.resolve()
+            if resolved in seen or not resolved.is_file():
+                continue
+            seen.add(resolved)
+            _collect(resolved.read_text(encoding="utf-8"), resolved)
+
+    if isinstance(source, Path) or (isinstance(source, str) and os.path.isfile(source)):
+        origin = Path(source).resolve()
+        if origin.is_file():
+            seen.add(origin)
+            _collect(origin.read_text(encoding="utf-8"), origin)
+    else:
+        _collect(str(source), None)
+    return sorted(names)
+
+
+#: Libraries already loaded into this process by :func:`load_mujoco_engine_plugins`
+#: (one RTLD_GLOBAL load per path, per process).
+_LOADED_ENGINE_LIBRARIES: set[str] = set()
+
+
+def load_mujoco_engine_plugins(required_extensions: list[str] | tuple[str, ...]) -> None:
+    """Load the ament-registered MuJoCo engine extensions into this process (D5.1).
+
+    Mirrors what the C++ simulator does at startup: every library under the
+    ``mujoco_plugins`` ament resource index is ``ctypes.CDLL``-loaded with
+    ``RTLD_GLOBAL`` (once per process), then each required extension name is
+    verified with a probe parse of a minimal MJCF declaring it — no plugin-table
+    API is assumed. A missing resource index or an extension that stays
+    unregistered raises naming the apt package to install.
+    """
+    import ctypes
+
+    try:
+        from ament_index_python import get_resource, get_resources
+    except ImportError as exc:  # pragma: no cover - the runtime image always has it
+        raise RuntimeError(
+            "ament_index_python is needed to load the MuJoCo engine extensions "
+            "(pip install ament-index-python or run inside the ROS environment)"
+        ) from exc
+
+    resources = get_resources("mujoco_plugins")
+    if not resources:
+        raise RuntimeError(
+            "no mujoco_plugins ament resources found; the MuJoCo engine extensions need them "
+            "(install ros-humble-mujoco-3d-lidar for mujoco.plugin.lidar)"
+        )
+    for package in sorted(resources):
+        content, prefix = get_resource("mujoco_plugins", package)
+        for library in sorted((Path(prefix) / content).glob("*.so")):
+            if str(library) in _LOADED_ENGINE_LIBRARIES:
+                continue
+            try:
+                ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:
+                raise RuntimeError(f"cannot load the MuJoCo engine extension library {library}: {exc}") from exc
+            _LOADED_ENGINE_LIBRARIES.add(str(library))
+    if not required_extensions:
+        return
+    import mujoco  # noqa: PLC0415
+
+    for name in required_extensions:
+        probe = f'<mujoco><extension><plugin plugin="{name}"/></extension><worldbody/></mujoco>'
+        try:
+            mujoco.MjSpec.from_string(probe)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"the MuJoCo engine extension {name!r} is not registered after loading "
+                f"{sorted(_LOADED_ENGINE_LIBRARIES)}; install the package providing it "
+                "(ros-humble-mujoco-3d-lidar provides mujoco.plugin.lidar)"
+            ) from exc
+
+
 def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names) -> Path:
     """Robot-agnostic robot+scene composition for the MuJoCo provider (D3).
 
     Substitutes the robot MJCF into the named scene template (``scene=None``
-    compiles the robot MJCF alone), injects the shared keyframes when the
-    layout has randomisation, enables SDF collision on the given mesh names,
-    compiles and saves the ``.mjb`` at ``composed_model_path(scene)``. The
-    intermediate XML is kept beside it for debugging. Falls back to the
+    compiles the robot MJCF alone), enables SDF collision on the given mesh
+    names, compiles and saves the ``.mjb`` at ``composed_model_path(scene)``.
+    The intermediate XML is kept beside it for debugging. Falls back to the
     ``.xml`` path only when the ``mujoco`` package is missing; the provider
-    treats that as fatal.
+    treats that as fatal. Issue #195: no keyframes are injected any more —
+    scene placements travel through ``ResetWorld`` state overrides built
+    from the layout, not through compiled-in ``random_KKK`` keys.
+
+    When the composed MJCF declares engine extensions (D5.1): the extensions
+    are loaded first, the full compile validates the model (compile errors
+    raise the original MuJoCo error — nothing is silently swallowed) and the
+    DELIVERED artifact is the compiled spec's XML (``MjSpec.to_xml()``),
+    written to the ``.xml`` path beside the would-be ``.mjb``. A ``.mjb``
+    bakes the compiling process's GLOBAL plugin slot ids, which the C++ node
+    (which registers the extensions in its own order) cannot read back — it
+    segfaults on the mismatched slot (spike evidence
+    /tmp/lekiwi-mujoco-evidence/spike/SUMMARY.md). Extension-free models
+    keep the ``.mjb`` path byte-for-byte. SDF mesh names combined with an
+    engine extension fail closed: ``to_xml()`` cannot carry ``needsdf``.
 
     Args:
         robot_mjcf_path:  Absolute path to the fully substituted robot MJCF.
@@ -279,7 +480,8 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
                           (robot-specific input, e.g. the gripper fingers).
 
     Returns:
-        :class:`pathlib.Path` to the compiled ``.mjb`` (or the ``.xml``
+        :class:`pathlib.Path` to the compiled ``.mjb`` (or the delivered
+        ``.xml`` when the model declares engine extensions; the ``.xml``
         fallback when the ``mujoco`` package is unavailable).
     """
     robot_path = Path(robot_mjcf_path)
@@ -288,26 +490,51 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
         meshes_dir = tmpl.parent / "meshes"
         content = tmpl.read_text().replace(_MESHES_PLACEHOLDER, str(meshes_dir))
         content = content.replace(_ROBOT_XML_PLACEHOLDER, str(robot_path))
-        layout = get_scene_layout(scene)
     else:
         content = robot_path.read_text()
-        layout = {}
-    if layout.get("randomization"):
-        content = _inject_random_keyframes(content, layout)
 
     xml_out = composed_model_path(scene).with_suffix(".xml")
     xml_out.parent.mkdir(parents=True, exist_ok=True)
     xml_out.write_text(content)
+    engine_extensions = mjcf_engine_extensions(content)
 
     try:
         import mujoco  # noqa: PLC0415
     except ImportError:
+        if engine_extensions:
+            # D5.1 (review round 1): an extension-declaring model is only
+            # valid after a real compile in this process; returning the
+            # unvalidated XML would hand the C++ node a model whose
+            # extension parameters were never checked.
+            raise ImportError(
+                "the composed model declares engine extensions ("
+                + ", ".join(sorted(engine_extensions))
+                + ") and cannot be delivered uncompiled: the mujoco Python package is required"
+            ) from None
         logging.warning("mujoco not available; composed model left as XML at %s", xml_out)
+        return xml_out
+
+    sdf_names = {str(name) for name in sdf_mesh_names}
+    if engine_extensions:
+        # D5.1: the extension must be registered before the parse that
+        # declares it, and the compile validates the model for real.
+        if sdf_names:
+            raise ValueError(
+                "an MJCF declaring engine extensions cannot also use SDF mesh collision: "
+                "MjSpec.to_xml() does not serialise needsdf, so the delivered XML would "
+                "silently drop it (no current model combines the two; fail closed)"
+            )
+        load_mujoco_engine_plugins(engine_extensions)
+        spec = mujoco.MjSpec.from_string(content)
+        model = spec.compile()
+        # the delivered artifact: the compiled spec's XML, recompilable by the
+        # C++ node with ITS OWN (correct) extension registration
+        xml_out.write_text(spec.to_xml())
+        del model  # the compile was validation; the artifact is the XML
         return xml_out
 
     try:
         spec = mujoco.MjSpec.from_string(content)
-        sdf_names = {str(name) for name in sdf_mesh_names}
         for mesh in spec.meshes:
             if mesh.name in sdf_names:
                 mesh.needsdf = True

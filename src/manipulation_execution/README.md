@@ -5,6 +5,8 @@ GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安�
 `ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。采集窗口内每一条 PEAR 结果都会逐帧留存在节点内存里，供后续重定向阶段消费；
 窗口关闭后 executor 把录到的 PEAR 帧重定向成 SO-101 手臂关节轨迹（`imitation_retargeting` 子包），驱动**真实机械臂**回放；重定向失败时回退为预置动画。也就是说该 executor 既消费视频也产生运动输出。
 
+配置了 `grasp_execution.backend` 的机器人不经 GraspGen/IK 这条链，改用 `grasp_pipeline_node` 和机器人自己的抓取后端服务 `PickObject`，见「通用抓取管线：为机器人接入新后端」一节。
+
 ### HRI RGB 输入与人体感知链
 
 HRI executor 复用统一 pipeline 和 `qos_profile_sensor_data` 订阅配置，不启动或管理 RealSense 设备。
@@ -199,9 +201,10 @@ Gateway 自行构造 delegated `PickObject` 请求。
 
 `pick_executor_node.py` 只管理 ROS action、service client、TF 和 joint-state 生命周期。抓取行为按职责拆分到
 `phases/flow.py`、`planning.py`、`preparation.py` 和 `execution.py`；共享状态模型与纯转换函数分别位于
-`pick_executor_models.py` 和 `pick_executor_helpers.py`。`pipeline_worker.py` 只提供与机器人无关的动态 worker
-队列；SO101 joint5 分支、归一化、闭合轴修正和 IK 重试集中在 `so101_kinematics_guard.py`，
-不混入通用 pipeline 工具。阶段 mixin 保留原有方法入口，便于隔离测试且不改变 action 行为。
+`pick_executor_models.py` 和 `pick_executor_helpers.py`。机器人特有的抓取几何（STL 网格、桌面间隙）与
+SO-101 joint5 分支/闭合轴守卫不在本包：它们由 robot YAML 声明的 provider 模块提供（见下文「Provider 声明」），
+节点对两种 kinematics backend 一视同仁地只从配置读取。阶段 mixin 保留原有方法入口，便于隔离测试且不改变
+action 行为。
 
 ## 公开接口
 
@@ -242,6 +245,34 @@ prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节�
 
 所有抓取运行参数来自 robot YAML 的 `robot.grasp_execution`。关键配置包括：
 
+- **Provider 声明（必填，按功能分开）**：节点对 `runtime` 和 `legacy_moveit` 两种 backend 一致，
+  不提供任何机器人默认值。两项功能各自声明各自的字段，互不连带：
+
+  - 方向守卫（joint-5 约束）需要 `target_gripper.ik_orientation_guard.wrist_guard_provider`；
+  - tabletop filter 需要 `target_geometry.grasp_geometry_provider`，外加网格位置字段
+    `mesh_package` 与 `mesh_directory`。
+
+  ```yaml
+  grasp_execution:
+    ik:
+      # 仅 providerless（legacy_moveit）且 auto-start worker 时需要
+      workers_launch: $(find so101_motion)/launch/ik_workers.launch.py
+    target_geometry:
+      grasp_geometry_provider: so101_suite.gripper_geometry
+      mesh_package: so101_description
+      mesh_directory: meshes/lerobot/so101
+    target_gripper:
+      ik_orientation_guard:
+        wrist_guard_provider: so101_suite.wrist_guard
+  ```
+
+  上例中的 `so101_suite.*` 模块名只是本机器人（SO-101）的示例：任何满足 provider 契约的
+  模块都可以。功能启用而对应字段缺失时，节点构造立即失败并点名缺失字段（fail fast），
+  不会以降级方式启动。
+  runtime backend 另外拒绝 `ik.group_name` / `ik.worker_count` / `ik.worker_namespace_prefix` /
+  `ik.auto_start_workers` 和任何与绑定公共接口不一致的 `ik_service` / `fk_service` /
+  `move_configuration_service` / `joint_state_topic` 覆写；worker 数量来自 runtime profile
+  （如 `lekiwi_robot` 的 `motion.ik_worker_count`）。
 - GraspGen、验证器、IK/FK 服务名。
 - 相机 topic 和 base/EE frame。
 - source gripper 到目标夹爪的几何适配。
@@ -249,7 +280,8 @@ prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节�
 - approach、速度、候选数量和物理执行重试次数；IK/FK 准备失败不消耗物理重试次数。
 - `ik.worker_count` 个隔离 MoveIt worker 从同一个动态队列准备候选；所有 worker 使用同一份
   `/joint_states` seed，空闲 worker 立即领取下一个候选，结果仍按原候选顺序合并，并在每次抓取前校验
-  主 MoveIt 与全部 worker 的 IK 解一致。
+  主 MoveIt 与全部 worker 的 IK 解一致。runtime backend 下该 worker 池来自 runtime profile 的
+  `motion.ik_worker_count` 与绑定的公共 IK 端点，不在 robot YAML 中重复声明。
 - `candidate_selection.selection_attempts` 控制整批候选无安全 IK 解或规划暂时失败时重新获取新帧并规划；
   `TARGET_NOT_VISIBLE`（目标未检测到、置信度不足或没有生成候选）和
   `TARGET_OUTSIDE_WORKSPACE`（目标可见但所有候选均超出工作范围）会立即报错，不继续规划；不可恢复的
@@ -300,6 +332,113 @@ timeout_sec: 240.0
 `model_deployment` 必须指向可由 `inference_manifest` 严格校验的 bundle；Gateway 与本节点分别加载同一
 manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment name、fingerprint 和 bundle digest。
 模型 identity 缺失、manifest 不可用或两端不一致时 fail closed，不接受抓取 goal。
+
+## 通用抓取管线：为机器人接入新后端
+
+`manipulation_execution` 有两个 `PickObject` 执行器，按 `grasp_execution.backend` 选择：
+
+| 执行器 | 启用条件 | 抓取链 |
+| --- | --- | --- |
+| `pick_executor_node` | `backend` 未配置 | GraspGen 规划、SO101 夹爪几何、IK/FK 接触补偿、primitive 执行、抓后验证（见上文） |
+| `grasp_pipeline_node` | `backend` 命名了后端工厂 | 机器人无关的 observe / perceive / plan / 执行流程，机器人差异全部在后端 |
+
+节点选择规则（embodied launch）：
+
+- 配置了 `backend` 的机器人，launch 启动 `grasp_pipeline_node`，不启动 `pick_executor_node`、
+  GraspGen planner 和 gripper verifier。
+- 未配置 `backend` 的机器人，launch 行为与旧版一致。
+- Gateway 与节点用同一个函数（`delegated_grasp_execution`）推导 executor identity，两侧对
+  `grasp_execution` 的哈希保持一致。
+
+### 最小配置
+
+```yaml
+robot:
+  grasp_execution:
+    enabled: true
+    backend: "my_robot_grasp.backends:make_backends"
+    backend_options:
+      stream: joint.arm_stream        # 内容由该工厂自行校验
+    pipeline:
+      max_attempts: 2
+      max_moved_replans: 1
+      home_tolerance_rad: 0.02
+      release_after_success: false
+```
+
+`robot_config` 在配置加载时校验：
+
+- `backend` 必须是 `package.module:callable` 形式。
+- `backend_options` 是传给工厂的映射。配置 `backend_options` 时必须同时配置 `backend`。
+- `pipeline` 只接受上表的 4 个键，范围：`max_attempts` 不小于 1，`max_moved_replans` 不小于 0，
+  `home_tolerance_rad` 大于 0，`release_after_success` 是布尔值。
+
+### 后端工厂的签名与生命周期
+
+```python
+def make_backends(*, node, grasp_execution, description) -> GraspBackends:
+    ...
+```
+
+| 参数 | 内容 |
+| --- | --- |
+| `node` | `grasp_pipeline_node` 自身。后端用它创建 service client 和订阅。 |
+| `grasp_execution` | 完整的 `grasp_execution` 配置映射，含 `backend_options`。 |
+| `description` | 绑定到机器人的 interface description。`runtime.provider` 已配置时取 `runtime.interface_description`。 |
+
+`GraspBackends` 的字段（`grasp_pipeline/contracts.py`）：
+
+- 必填 5 个：`observation`、`proposer`、`planner`、`executor`、`effector`。
+- `watch` 可选。没有 `watch` 时，管线不检查目标移动。
+- `close()` 在节点销毁时调用一次，后端在这里释放它创建的 ROS 资源。
+- `prepare()` 可选，见下节。
+
+节点拥有所有机器人共享的部分：goal 准入（`pick_goal.py`，规则与 `pick_executor_node` 一致）、
+单 goal 串行、预算、取消、feedback 和 result 映射。close 步骤的结果映射为
+`verification_status`，管线报告写入 `pipeline_timings_json`。
+
+后端的 `proposer` 通过 `grasp_pipeline/perception.py` 的 client 调用 3 个感知服务：
+GroundingDetect、SegmentDetections 和 GenerateGrasps。模型跑在哪个加速器上由服务部署决定，
+后端不加载模型。
+
+### 预热
+
+后端给出 `prepare()` 时，节点在 goal 线程外重试调用它：
+
+1. `prepare()` 抛出异常时，节点记录警告，1 秒后重试。
+2. `prepare()` 正常返回后，节点开始接受 goal。
+3. 预热完成前，节点拒绝所有 goal，拒绝原因写明「still warming up」。
+
+目的：机器人的第一个 goal 不承担加载规划器和模型的时间。
+
+### 预算与放回
+
+预算：
+
+- 节点取 `goal.timeout_sec` 与共享 task budget 剩余时间的较小值，作为执行 deadline。
+- deadline 门控 observe、perceive、plan 的每个阶段边界，以及是否启动执行。
+- 某个阶段正常返回时预算已耗尽，goal 以 `SKILL_TIMEOUT` 结束；已取消则以 `CANCELED` 结束。
+- 执行开始后，只有 goal 自身的取消会停止机械臂。deadline 不再中断执行，避免物体悬在空中。
+- 执行中 deadline 已过导致的运动失败，映射为 `SKILL_TIMEOUT`。
+
+放回：
+
+- `release_after_success` 为真（goal 请求，或 `pipeline.release_after_success` 配置）时，
+  成功的抓取放回物体。
+- plan 自带 release 步骤时执行该步骤。plan 没有 release 步骤时，按原路径回放，在支撑面开爪。
+- result 的 `released_after_success` 报告是否放回。
+
+### 流式执行器与 ROS 绑定
+
+机器人 runtime 支持关节位置流（joint.position_stream）时，后端用 `grasp_pipeline/streaming.py`
+的 `StreamExecutor` 执行轨迹，用 `grasp_pipeline/ros_stream.py` 的 `RosStreamIO` 绑定运行时接口：
+
+- `bind_stream` 按 interface ID 绑定命令流、反馈视图、命令回显和 runtime status。接口的 kind、
+  direction 或 message type 不匹配时，绑定失败并指出第一个不匹配的接口。
+- 反馈视图用不同的关节名时，用 `feedback_names` 映射。反馈在返回前已重命名为流的关节名，
+  执行器只读流自己的关节名。
+- 执行器持有流期间，最后一条命令每 0.1 秒重发一次。`release()` 停止重发，机器人保持最后一条命令；
+  `release()` 返回后不再发送任何旧命令。
 
 ## 安全边界
 
@@ -367,8 +506,20 @@ source .shrc_local && source install/setup.bash && \
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q --import-mode=importlib src/manipulation_execution/test
 ```
 
-通用 worker 调度由 `test_pipeline_worker.py` 覆盖；SO101 joint5 运动学约束由
-`test_so101_kinematics_guard.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
+SO101 joint5 运动学约束由 `so101_suite/test/test_wrist_guard.py` 覆盖；SO101 provider 是否满足本包契约由组装根
+`embodied_bringup/test/test_so101_provider_contract.py` 检查。本包不依赖任何机器人套件（含 test_depend），
+节点测试一律使用 fake/stub provider；通用网格/平面几何由
+`test_geometry.py`、`test_grasp_geometry.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
+
+### Providerless 部署前置（手眼抓取配置）
+
+`lekiwi_handeye_realsense_grasp{,_pc}` 没有 `runtime.provider`，走 `legacy_moveit` 后端，但其
+`grasp_execution` 声明的 provider、网格与 worker launch 来自机器人套件包：部署这些配置时必须一并
+构建/安装 `so101_suite`（provider 模块）、`so101_description`（STL 网格）和 `so101_motion`
+（`ik_workers.launch.py`），例如 `./scripts/build.sh -- --packages-up-to embodied_bringup so101_suite
+so101_description so101_motion`。通用包不为此声明任何机器人依赖：缺失时节点构造按上文规则 fail fast。
+
+通用 worker 调度由 `test_pipeline_worker.py` 覆盖；phases 测试继续验证配置解析、错误码和执行编排。
 
 ### X2 前中半分辨率 JPEG
 

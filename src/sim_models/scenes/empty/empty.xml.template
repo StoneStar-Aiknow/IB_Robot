@@ -21,9 +21,21 @@
 
   <worldbody>
     <light pos="0.0 0.0 3.5" dir="0.0 0.0 -1.0" directional="true"/>
+    <!--
+      Support surfaces (floor, table_surface) carry geom priority="1" with
+      moderate friction (issue #190 D8): MuJoCo mixes contact friction
+      element-wise max unless one geom outranks the other, and the
+      grasp-tuned gripper contacts (friction 10, so101.xml.template
+      gripper_col) would weld the arm onto any plane they touch — the
+      contact constraint then cancels the saturated ±2.75 Nm actuator limit.
+      With priority, the surface's friction governs every pair it is in
+      (gripper–surface, object–surface) while gripper–object contacts keep
+      the max-mixed grasp tuning.
+    -->
     <geom name="floor" size="0 0 0.05" pos="0 0 -0.274" type="plane"
-          material="groundplane"/>
+          material="groundplane" priority="1" friction="0.8 0.1 0.01"/>
     <geom name="table_surface" type="plane" pos="0 0 0.0" size="0 0 0.05"
-          rgba="0 0 0 0" contype="1" conaffinity="1"/>
+          rgba="0 0 0 0" contype="1" conaffinity="1"
+          priority="1" friction="0.8 0.1 0.01"/>
   </worldbody>
 </mujoco>

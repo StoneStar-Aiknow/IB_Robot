@@ -64,7 +64,7 @@ from robot_runtime.contract import (
     STOP_SERVICE,
     STOP_TORQUE_OFF,
 )
-from robot_runtime.interface_description import build_description
+from robot_runtime.interface_description import build_description, platform_peripherals
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.peripherals import (
@@ -180,14 +180,18 @@ class MockRuntime(Node):
         )
         fragment = load_peripherals_file(peripherals_path) if peripherals_path else {}
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
+        # D3: the same platform-filtered inventory the real facade projects
+        peripherals = platform_peripherals(peripherals, sim_platform or None)
         capabilities = dict(self._profile["capabilities"])
-        capabilities.update(perception_capabilities(peripherals))
+        capabilities.update(perception_capabilities(peripherals, sim_platform=sim_platform or None))
         capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         description = build_description(self._profile, peripherals, use_sim=use_sim, sim_platform=sim_platform or None)
         self._interface_monitor = InterfaceMonitor(self, description)
         self._synthetic_streams = SyntheticStreams(self, description)
-        self._modes = ModeModel(ModeModelConfig.from_profile(self._profile))
+        # D3.1: same platform-resolved mode table as the real facade, so the
+        # mock's reported active controllers cannot disagree with it.
+        self._modes = ModeModel(ModeModelConfig.from_profile(self._profile, sim_platform or None))
         self._state = RuntimeState(
             str(self._profile["runtime"]["name"]),
             str(self._profile["runtime"]["version"]),

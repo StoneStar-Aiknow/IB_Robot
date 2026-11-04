@@ -7,12 +7,16 @@ explicit full-range NV12 for updated HRI services, retaining source geometry.
 from __future__ import annotations
 
 import array
+import logging
+import time
 
 import cv2
 import numpy as np
 from sensor_msgs.msg import CompressedImage, Image
 
 from observation_transport.video_codec import CodecLifecycleState, EncodedPacket
+
+_LOGGER = logging.getLogger(__name__)
 
 # Pixel encodings that are not 8-bit colour. These matter because
 # ``cv2.imdecode(..., IMREAD_COLOR)`` on a 16-bit single-channel PNG -- how
@@ -30,6 +34,11 @@ _NON_COLOR_ENCODINGS = (
 )
 
 _BGR8_CHANNELS = 3
+
+# Retry cadence for a failed DVPP decoder factory: 1 s doubling up to 30 s, so
+# a device that recovers is picked back up without per-frame create attempts.
+_CREATE_RETRY_MIN_SEC = 1.0
+_CREATE_RETRY_MAX_SEC = 30.0
 
 
 def is_decodable_format(format_text: str) -> bool:
@@ -102,7 +111,8 @@ class CompressedImageDecoder:
         self.device_id = device_id
         self._factory = factory or self._create_dvpp
         self._decoder = None
-        self._attempted = False
+        self._next_create_attempt_at = 0.0
+        self._create_retry_backoff_sec = _CREATE_RETRY_MIN_SEC
         self._closed = False
         self.last_error = ""
         self.cpu_frames = 0
@@ -118,6 +128,35 @@ class CompressedImageDecoder:
         register_ascend_jpeg_backend(registry, lease_factory=lambda: manager.acquire(self.device_id))
         return registry.resolve("ascend_jpeg", "decoder", codec="jpeg").create()
 
+    def _ensure_decoder(self) -> None:
+        """Create the DVPP decoder, retrying a failed factory with capped backoff."""
+        now = time.monotonic()
+        if now < self._next_create_attempt_at:
+            if self.backend == "dvpp":
+                raise RuntimeError(self.last_error)
+            return
+        self._next_create_attempt_at = now + self._create_retry_backoff_sec
+        self._create_retry_backoff_sec = min(_CREATE_RETRY_MAX_SEC, self._create_retry_backoff_sec * 2.0)
+        try:
+            self._decoder = self._factory()
+        except Exception as exc:
+            first_failure = not self.last_error
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            if self.backend == "auto" and first_failure:
+                _LOGGER.warning(
+                    "DVPP JPEG decode unavailable on device %d, falling back to CPU; next retry in %.0f s: %s",
+                    self.device_id,
+                    self._create_retry_backoff_sec,
+                    self.last_error,
+                )
+            if self.backend == "dvpp":
+                raise
+        else:
+            self._create_retry_backoff_sec = _CREATE_RETRY_MIN_SEC
+            if self.last_error:
+                _LOGGER.info("DVPP JPEG decode recovered on device %d", self.device_id)
+            self.last_error = ""
+
     def decode(self, message):
         if self._closed:
             raise RuntimeError("compressed image decoder is closed")
@@ -125,14 +164,8 @@ class CompressedImageDecoder:
             return None
         is_jpeg = bytes(message.data[:2]) == b"\xff\xd8"
         if self.backend != "cpu" and is_jpeg:
-            if not self._attempted:
-                self._attempted = True
-                try:
-                    self._decoder = self._factory()
-                except Exception as exc:
-                    self.last_error = f"{type(exc).__name__}: {exc}"
-                    if self.backend == "dvpp":
-                        raise
+            if self._decoder is None:
+                self._ensure_decoder()
             if self._decoder is not None:
                 try:
                     if self._decoder.state == CodecLifecycleState.FAILED:

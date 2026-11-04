@@ -5,28 +5,47 @@ import pytest
 from perception_service.api_client import VLMAPIClient
 
 
-class _FakeResponse:
-    def __init__(self, body: str):
+@pytest.fixture(autouse=True)
+def _no_host_proxy(monkeypatch):
+    """A host exporting http_proxy would rewrite the request target as an absolute URI."""
+    for name in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.upper(), raising=False)
+
+
+class _FakeHTTPResponse:
+    """``http.client.HTTPResponse``-shaped stand-in."""
+
+    def __init__(self, body: str, status: int = 200):
         self._body = body.encode("utf-8")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
+        self.status = status
+        self.will_close = False
 
     def read(self):
         return self._body
 
 
-def test_openai_compatible_allows_empty_api_key_env():
-    captured = {}
+class _FakeConnection:
+    """Records the requests the client makes over one kept-alive connection."""
 
-    def fake_urlopen(request, timeout):
-        captured["url"] = request.full_url
-        captured["headers"] = dict(request.header_items())
-        captured["timeout"] = timeout
-        return _FakeResponse('{"choices":[{"message":{"content":"scene summary"}}]}')
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.requests = []
+        self.timeout = None
+        self.sock = None
+
+    def request(self, method, path, body=None, headers=None):
+        self.requests.append({"method": method, "path": path, "headers": dict(headers or {})})
+
+    def getresponse(self):
+        return self._responses.pop(0)
+
+    def close(self):
+        return None
+
+
+def test_openai_compatible_allows_empty_api_key_env():
+    connection = _FakeConnection([_FakeHTTPResponse('{"choices":[{"message":{"content":"scene summary"}}]}')])
 
     client = VLMAPIClient(
         provider="openai_compatible",
@@ -36,21 +55,21 @@ def test_openai_compatible_allows_empty_api_key_env():
         timeout_sec=120.0,
     )
 
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch.object(VLMAPIClient, "_open_connection", return_value=connection):
         content, response = client.analyze([{"role": "user", "content": "describe"}])
 
     assert content == "scene summary"
     assert response["choices"][0]["message"]["content"] == "scene summary"
-    assert captured["url"] == "http://localhost:8000/v1/chat/completions"
-    assert "Authorization" not in captured["headers"]
+    assert connection.requests[0]["path"] == "/v1/chat/completions"
+    assert connection.requests[0]["headers"]["Host"] == "localhost:8000"
+    assert "Authorization" not in connection.requests[0]["headers"]
 
 
 def test_invalid_json_response_raises_friendly_runtime_error():
     """Non-JSON HTTP bodies (e.g. HTML error pages) must surface as a
     :class:`RuntimeError` carrying a body preview, not a raw JSONDecodeError."""
 
-    def fake_urlopen(_request, **_kwargs):
-        return _FakeResponse("<html>500 Internal Server Error</html>")
+    connection = _FakeConnection([_FakeHTTPResponse("<html>500 Internal Server Error</html>")])
 
     client = VLMAPIClient(
         provider="openai_compatible",
@@ -60,7 +79,10 @@ def test_invalid_json_response_raises_friendly_runtime_error():
         timeout_sec=120.0,
     )
 
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen), pytest.raises(RuntimeError) as exc_info:
+    with (
+        patch.object(VLMAPIClient, "_open_connection", return_value=connection),
+        pytest.raises(RuntimeError) as exc_info,
+    ):
         client.analyze([{"role": "user", "content": "describe"}])
 
     message = str(exc_info.value)

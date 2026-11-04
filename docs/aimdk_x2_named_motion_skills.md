@@ -19,14 +19,21 @@
 ```text
 Hermes / planner / robot-skill
   -> /embodied/execute_skill
-     Gateway：motion_authorized、root lease、运行时状态（ACTIVE、未锁存 stop、模式 idle）、
+     Gateway：motion_authorized、root lease、运行时状态（ACTIVE、未锁存 stop、模式 stream；idle 时先切一次）、
               required_capabilities（motion.named）、safety_guard（拒绝一切请求参数）
   -> skill_executor_node 的 runtime_named_motion 执行器
      预检：绑定名必须在 RuntimeStatus.capabilities_json 的 motion.named.names 中
   -> /motion/execute_named（ibrobot_msgs/action/ExecuteNamedMotion，target 为空、不打断）
-  -> aimdk_runtime（唯一 aimdk_msgs 边界；准入：生命周期、仲裁、模式、平台处于稳定站立）
+  -> aimdk_runtime（唯一 aimdk_msgs 边界；准入：生命周期、仲裁、模式、平台处于 UPPERBODY_REMOTE_SPLIT）
+     stream 模式下回放从厂商预设录下的手臂轨迹（/mc/upper_body_command），不调用 SetMcPresetMotion
   -> 厂商 MC 层
 ```
+
+技能跑在 `stream`（厂商 `UPPERBODY_REMOTE_SPLIT`）里，和遥操作、抓取共用同一个平台模式，手势前后都不切模式。
+部署选用 `x2_ultra_omnihand` profile（适用于装一只或两只 OmniHand 的 X2；装夹爪的 X2 不适用），回放配置只在该 profile 中声明。
+平台在该模式下不播放预设动作，所以运行时回放的是事先在稳定站立下录制的手臂轨迹（见 aimdk_robot README
+“In the stream mode, named motions are replayed recordings”）：只动手臂，头和手保持不动；没有录制文件的动作名
+在 `stream` 下被拒绝。
 
 - 没有新增 primitive，SO-101 / LeKiwi 的执行路径不变。
 - 动作名只有一个真源：技能目录的 `binding.motion`，并在执行前对照运行时实时上报的列表检查。
@@ -100,16 +107,21 @@ robot-skill --config-path "$SNAP" cancel --task-id demo-1
 | 未授权运动 | `MOTION_NOT_AUTHORIZED`（Gateway 拒绝，不派发） |
 | 已有技能在执行 | `SKILL_BUSY` |
 | 运行时 stop 已锁存 | `CONTROL_MODE_MISMATCH`：“runtime stop is latched; explicit idle rearm is required”；技能链路不会清除锁存 |
-| 运行时处于 `stream` 等其他模式 | `CONTROL_MODE_MISMATCH`：另一个指令源处于活动状态；不会抢切模式 |
+| 运行时处于 `idle` | 执行器先请求一次 `stream`，之后保持在 `stream` |
+| 运行时处于 `policy_stream`、`head`、`locomotion` 等其他模式 | `CONTROL_MODE_MISMATCH`：另一个指令源处于活动状态；不会抢切模式 |
+| `stream` 下另一指令源（遥操作、抓取）正在发手臂流 | `NAMED_MOTION_BUSY`：不抢占正在工作的指令源；对方停发超过 `stream_staleness_s` 后可再试 |
+| 动作名没有录制轨迹 | `CONTROL_MODE_MISMATCH`，如“mode 'stream' replays only recorded motions [...]; 'clap' has none” |
 | 名字不在运行时上报列表 | `NAMED_MOTION_UNKNOWN`（不派发） |
 | 平台拒绝 | `NAMED_MOTION_REJECTED`，透传厂商原因 |
-| 平台不在稳定站立 | `NAMED_MOTION_PLATFORM_NOT_READY`，如“platform is in JOINT_DEFAULT; preset motions require STAND_DEFAULT” |
+| 平台不在 `UPPERBODY_REMOTE_SPLIT` | `NAMED_MOTION_PLATFORM_NOT_READY`，如“platform is in STAND_DEFAULT; replaying wave requires UPPERBODY_REMOTE_SPLIT” |
 | 运行时超时 | `NAMED_MOTION_TIMEOUT` |
-| 成功 | `success=true`，如“preset motion handshake completed (task N)” |
+| 成功 | `success=true`，如“replayed handshake in stream (6.6s)” |
 
-**取消**：Gateway 接受取消请求，但执行器不会把取消转发给运行时（运行时拒绝取消命名动作）。动作照常完成，
-结果按真实情况上报（成功时 message 以 `cancel not supported;` 开头）；动作结束前其他技能都返回
-`SKILL_BUSY`。技能 deadline 先到时同样保留占用，直到运行时报告终态。
+**取消**：执行器把取消请求转发给运行时。`stream` 下回放的手势接受取消：手臂当场停住，技能以
+`SKILL_CANCELLED` 结束，Gateway 账本记下断点，之后的「继续」从停下处接着做（断点失效则从头做）。其他模式
+（如 `idle`）下的预设动作与姿态切换被运行时拒绝取消：动作照常完成，结果按真实情况上报（成功时 message 以
+`cancel not supported;` 开头），动作结束前其他技能都返回 `SKILL_BUSY`。技能 deadline 先到时同样保留占用，
+直到运行时报告终态。
 
 ## 真机验收（操作员在场，机器人上吊架）
 
@@ -122,5 +134,5 @@ robot-skill --config-path "$SNAP" cancel --task-id demo-1
    `/runtime/stop`（`HOLD`），记录动画是否中止及时延。X2 profile 的 `hold_action` 为空，HOLD 可能不会
    打断动画；若不能中止，停在这一步，与运行时作者确认 stop 策略后再继续。
 3. `authorize_motion:=true` 启动，执行单个技能（建议 `raise_hand`），记录时长与结果。
-4. 让平台离开稳定站立后执行，确认得到 `NAMED_MOTION_PLATFORM_NOT_READY` 而不是动作。
+4. 让平台离开 `UPPERBODY_REMOTE_SPLIT` 后执行，确认得到 `NAMED_MOTION_PLATFORM_NOT_READY` 而不是动作。
 5. 用实测值回填各技能的 `duration_sec_estimate` 与 `timeout_sec`（须大于运行时 `preset_timeout_s` 30 秒）。

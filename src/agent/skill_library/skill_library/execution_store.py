@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from embodied_common.execution_detail import ExecutionDetail, short_message
 from embodied_common.program_contracts import CanonicalProgram
 
 TERMINAL_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELED", "UNKNOWN"})
@@ -53,6 +54,16 @@ class ExecutionRecord:
     actual_registry_digest: str
     created_at: str
     updated_at: str
+    #: JSON {step_index, skill_name, resume_token, progress} when the step a
+    #: cancel interrupted stopped at a point it can resume from; "" otherwise.
+    resume_checkpoint_json: str = ""
+    execution_detail_json: str = "{}"
+    current_skill: str = ""
+    workflow_step_index: int = 0
+
+    @property
+    def execution_detail(self) -> dict:
+        return ExecutionDetail.from_value(json.loads(self.execution_detail_json)).to_dict()
 
     @property
     def terminal(self) -> bool:
@@ -61,6 +72,10 @@ class ExecutionRecord:
     @property
     def program(self) -> dict[str, Any]:
         return json.loads(self.program_json)
+
+    @property
+    def resume_checkpoint(self) -> dict[str, Any] | None:
+        return json.loads(self.resume_checkpoint_json) if self.resume_checkpoint_json else None
 
 
 @dataclass(frozen=True)
@@ -72,6 +87,13 @@ class ExecutionEventRecord:
     error_code: str
     message: str
     created_at: str
+    execution_detail_json: str = "{}"
+    current_skill: str = ""
+    workflow_step_index: int = 0
+
+    @property
+    def execution_detail(self) -> dict:
+        return ExecutionDetail.from_value(json.loads(self.execution_detail_json)).to_dict()
 
 
 class SQLiteExecutionStore:
@@ -171,8 +193,19 @@ class SQLiteExecutionStore:
                 """
             )
             columns = {str(row["name"]) for row in connection.execute("PRAGMA table_info(executions)").fetchall()}
+            for table in ("executions", "execution_events"):
+                existing = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})")}
+                for name, definition in (
+                    ("execution_detail_json", "TEXT NOT NULL DEFAULT '{}'"),
+                    ("current_skill", "TEXT NOT NULL DEFAULT ''"),
+                    ("workflow_step_index", "INTEGER NOT NULL DEFAULT 0"),
+                ):
+                    if name not in existing:
+                        connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
             if "workflow_digest" not in columns:
                 connection.execute("ALTER TABLE executions ADD COLUMN workflow_digest TEXT NOT NULL DEFAULT ''")
+            if "resume_checkpoint_json" not in columns:
+                connection.execute("ALTER TABLE executions ADD COLUMN resume_checkpoint_json TEXT NOT NULL DEFAULT ''")
             connection.execute(
                 """CREATE TABLE IF NOT EXISTS execution_stop_intents (
                     caller_scope TEXT NOT NULL, robot_id TEXT NOT NULL,
@@ -309,6 +342,9 @@ class SQLiteExecutionStore:
         actual_registry_epoch: str = "",
         actual_registry_generation: int = 0,
         actual_registry_digest: str = "",
+        execution_detail: object = None,
+        current_skill: str | None = None,
+        workflow_step_index: int | None = None,
     ) -> ExecutionRecord:
         if state not in TERMINAL_STATES:
             raise ValueError("terminal execution state is invalid")
@@ -321,6 +357,9 @@ class SQLiteExecutionStore:
             actual_registry_epoch=actual_registry_epoch,
             actual_registry_generation=actual_registry_generation,
             actual_registry_digest=actual_registry_digest,
+            execution_detail=execution_detail,
+            current_skill=current_skill,
+            workflow_step_index=workflow_step_index,
         )
 
     def transition(
@@ -334,6 +373,9 @@ class SQLiteExecutionStore:
         actual_registry_epoch: str | None = None,
         actual_registry_generation: int | None = None,
         actual_registry_digest: str | None = None,
+        execution_detail: object = None,
+        current_skill: str | None = None,
+        workflow_step_index: int | None = None,
     ) -> ExecutionRecord:
         with self._transaction() as connection:
             return self._transition_in_transaction(
@@ -346,7 +388,61 @@ class SQLiteExecutionStore:
                 actual_registry_epoch=actual_registry_epoch,
                 actual_registry_generation=actual_registry_generation,
                 actual_registry_digest=actual_registry_digest,
+                execution_detail=execution_detail,
+                current_skill=current_skill,
+                workflow_step_index=workflow_step_index,
             )
+
+    def record_progress(
+        self,
+        execution_id: str,
+        *,
+        current_skill: str,
+        workflow_step_index: int,
+        execution_detail: object,
+        message: str = "",
+    ) -> ExecutionRecord:
+        """Commit an ordered phase snapshot without changing lifecycle state.
+
+        Late child feedback cannot overwrite a terminal or a newer child step.
+        The transition and its event share one SQLite transaction.
+        """
+        with self._transaction() as connection:
+            current = self._get_in_transaction(connection, execution_id)
+            if current.terminal or workflow_step_index < current.workflow_step_index:
+                return current
+            return self._transition_in_transaction(
+                connection,
+                execution_id,
+                state=current.state,
+                current_skill=current_skill,
+                workflow_step_index=workflow_step_index,
+                execution_detail=execution_detail,
+                message=message,
+            )
+
+    def record_resume_checkpoint(self, execution_id: str, checkpoint: dict[str, Any]) -> None:
+        """Attach the interrupted step's resume point; only before the execution is terminal."""
+        with self._transaction() as connection:
+            if self._get_in_transaction(connection, execution_id).terminal:
+                raise ExecutionConflictError("terminal execution result is immutable")
+            connection.execute(
+                "UPDATE executions SET resume_checkpoint_json=? WHERE execution_id=?",
+                (json.dumps(checkpoint, sort_keys=True, separators=(",", ":")), execution_id),
+            )
+
+    def latest_execution_id(self, robot_id: str, *, before: str) -> str:
+        """The robot's most recent execution created before ``before``, or ""."""
+        with self._lock:
+            row = self._connection.execute(
+                """
+                SELECT execution_id FROM executions
+                 WHERE robot_id=? AND rowid < (SELECT rowid FROM executions WHERE execution_id=?)
+                 ORDER BY rowid DESC LIMIT 1
+                """,
+                (robot_id, before),
+            ).fetchone()
+        return "" if row is None else str(row["execution_id"])
 
     def request_stop(self, execution_id: str) -> ExecutionRecord:
         """Persist a monotonic stop request independently from worker progress."""
@@ -477,6 +573,9 @@ class SQLiteExecutionStore:
                     error_code=str(row["error_code"]),
                     message=str(row["message"]),
                     created_at=str(row["created_at"]),
+                    execution_detail_json=str(row["execution_detail_json"]),
+                    current_skill=str(row["current_skill"]),
+                    workflow_step_index=int(row["workflow_step_index"]),
                 )
                 for row in rows
             )
@@ -514,27 +613,39 @@ class SQLiteExecutionStore:
         actual_registry_epoch: str | None = None,
         actual_registry_generation: int | None = None,
         actual_registry_digest: str | None = None,
+        execution_detail: object = None,
+        current_skill: str | None = None,
+        workflow_step_index: int | None = None,
     ) -> ExecutionRecord:
         current = self._get_in_transaction(connection, execution_id)
-        if state == "UNKNOWN":
-            self._unknown_pending = True
         if current.terminal:
             requested = (
                 state,
                 current.completed_step_count if completed_step_count is None else completed_step_count,
                 current.error_code if error_code is None else error_code,
-                current.message if message is None else message,
+                current.message if message is None else short_message(message),
             )
             actual = (current.state, current.completed_step_count, current.error_code, current.message)
             if requested != actual:
                 raise ExecutionConflictError("terminal execution result is immutable")
+            if (
+                (
+                    execution_detail is not None
+                    and ExecutionDetail.from_value(execution_detail).to_dict() != current.execution_detail
+                )
+                or (current_skill is not None and current_skill != current.current_skill)
+                or (workflow_step_index is not None and workflow_step_index != current.workflow_step_index)
+            ):
+                raise ExecutionConflictError("terminal execution detail is immutable")
             return current
+        if state == "UNKNOWN":
+            self._unknown_pending = True
         values = {
             "completed_step_count": current.completed_step_count
             if completed_step_count is None
             else int(completed_step_count),
             "error_code": current.error_code if error_code is None else str(error_code),
-            "message": current.message if message is None else str(message),
+            "message": current.message if message is None else short_message(message),
             "actual_registry_epoch": current.actual_registry_epoch
             if actual_registry_epoch is None
             else str(actual_registry_epoch),
@@ -547,6 +658,19 @@ class SQLiteExecutionStore:
         }
         if current.stop_requested and state not in TERMINAL_STATES:
             state = "STOPPING"
+        detail_json = (
+            current.execution_detail_json
+            if execution_detail is None
+            else json.dumps(ExecutionDetail.from_value(execution_detail).to_dict(), sort_keys=True)
+        )
+        skill = current.current_skill if current_skill is None else current_skill
+        index = current.workflow_step_index if workflow_step_index is None else workflow_step_index
+        if not isinstance(skill, str) or type(index) is not int or not 0 <= index <= 0xFFFFFFFF:
+            raise ValueError("invalid execution step context")
+        connection.execute(
+            "UPDATE executions SET execution_detail_json=?, current_skill=?, workflow_step_index=? WHERE execution_id=?",
+            (detail_json, skill, index, execution_id),
+        )
         now = _utc_now()
         connection.execute(
             """
@@ -588,7 +712,8 @@ class SQLiteExecutionStore:
         message: str,
     ) -> None:
         row = connection.execute(
-            "SELECT last_event_sequence FROM executions WHERE execution_id=?", (execution_id,)
+            "SELECT last_event_sequence, execution_detail_json, current_skill, workflow_step_index FROM executions WHERE execution_id=?",
+            (execution_id,),
         ).fetchone()
         if row is None:
             raise KeyError(execution_id)
@@ -597,10 +722,22 @@ class SQLiteExecutionStore:
         connection.execute(
             """
             INSERT INTO execution_events (
-                execution_id, sequence, state, completed_step_count, error_code, message, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                execution_id, sequence, state, completed_step_count, error_code, message, created_at,
+                execution_detail_json, current_skill, workflow_step_index
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (execution_id, sequence, state, completed_step_count, error_code, message, created_at),
+            (
+                execution_id,
+                sequence,
+                state,
+                completed_step_count,
+                error_code,
+                short_message(message),
+                created_at,
+                row["execution_detail_json"],
+                row["current_skill"],
+                row["workflow_step_index"],
+            ),
         )
         connection.execute(
             "UPDATE executions SET last_event_sequence=?, updated_at=? WHERE execution_id=?",
@@ -636,6 +773,10 @@ class SQLiteExecutionStore:
             actual_registry_digest=str(row["actual_registry_digest"]),
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
+            resume_checkpoint_json=str(row["resume_checkpoint_json"]),
+            execution_detail_json=str(row["execution_detail_json"]),
+            current_skill=str(row["current_skill"]),
+            workflow_step_index=int(row["workflow_step_index"]),
         )
 
     def _transaction(self):

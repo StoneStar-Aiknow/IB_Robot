@@ -19,6 +19,7 @@ from .model import (
     TraceTopology,
 )
 from .parsing import parse_trace
+from .query import flow_occurrences, span_occurrences
 from .statistics import summarize
 from .topology import TopologyMetadataError, enrich_topology_with_observed_operations, read_topology_manifest
 
@@ -135,6 +136,7 @@ class AnalysisResult:
             "topology": self.topology.to_dict() if self.topology else None,
             "coverage": self.coverage,
             "warnings": self.warnings,
+            "uncalibrated_events": [event.to_dict() for event in self.dataset.uncalibrated_events],
         }
 
     def requests(self, *, sort_by: str = "total_ms", limit: int | None = None) -> list[dict[str, Any]]:
@@ -207,12 +209,32 @@ def _requests(dataset: TraceDataset, spans: list[SpanRecord], warnings: list[str
     for event in dataset.events:
         if event.request_id:
             grouped.setdefault(event.request_id, []).append(event)
+    uncalibrated_requests = {}
+    for event in dataset.uncalibrated_events:
+        if event.request_id:
+            uncalibrated_requests[event.request_id] = uncalibrated_requests.get(event.request_id, 0) + 1
+            grouped.setdefault(event.request_id, [])
     rows = []
     spans_by_request: dict[str, list[SpanRecord]] = {}
     for span in spans:
         spans_by_request.setdefault(span.trace_id, []).append(span)
     for request_id, events in grouped.items():
         row: dict[str, Any] = {"request_id": request_id}
+        clock_domains = {
+            (event.origin.machine_id or event.origin.host, event.origin.boot_id)
+            for event in events
+            if event.origin.machine_id or event.origin.host
+        }
+        if len(clock_domains) > 1 and not all(event.time_mapping.get("status") == "calibrated" for event in events):
+            row["clock_status"] = "cross_host_unsynchronized"
+            warnings.append(f"request {request_id}: multiple host clocks without calibrated merge; metrics excluded")
+            rows.append(row)
+            continue
+        if request_id in uncalibrated_requests:
+            row.update(clock_status="uncalibrated_events", uncalibrated_event_count=uncalibrated_requests[request_id])
+            warnings.append(f"request {request_id}: uncalibrated events; excluded from shared-clock request metrics")
+            rows.append(row)
+            continue
         spans_by_name: dict[str, list[SpanRecord]] = {}
         for span in spans_by_request.get(request_id, []):
             if TracepointDefinition("span", span.component_id, span.name, span.origin).identity in _SUMMARY_IDENTITIES:
@@ -299,6 +321,29 @@ def _requests(dataset: TraceDataset, spans: list[SpanRecord], warnings: list[str
         ):
             selected = unique(metric, [starts, ends], "structured")
             if selected:
+                mappings = [record.time_mapping for record in selected]
+                if any(mappings):
+                    if not all(mapping.get("status") == "calibrated" for mapping in mappings) or mappings[0].get(
+                        "reference_id"
+                    ) != mappings[1].get("reference_id"):
+                        row[f"{metric}_status"] = "clock_mismatch"
+                        row[f"{metric}_source"] = "structured"
+                        continue
+                    if mappings[0].get("calibration_sha256") == mappings[1].get("calibration_sha256") and mappings[
+                        0
+                    ].get("segment_id") != mappings[1].get("segment_id"):
+                        row[f"{metric}_status"] = "clock_discontinuity"
+                        row[f"{metric}_source"] = "structured"
+                        continue
+                    error = sum(
+                        mapping.get(f"{attr}_uncertainty_ns", mapping.get("uncertainty_ns", 0))
+                        for mapping, attr in zip(mappings, (start_attr, end_attr), strict=True)
+                    )
+                    row[f"{metric}_uncertainty_ns"] = error
+                    if error > 100_000:
+                        row[f"{metric}_status"] = "uncertainty_exceeded"
+                        row[f"{metric}_source"] = "structured"
+                        continue
                 points = []
                 for record, attr in ((selected[0], start_attr), (selected[1], end_attr)):
                     if isinstance(record, TraceEvent) and attr == "end_ns":
@@ -373,7 +418,20 @@ def _observations(dataset: TraceDataset) -> dict[str, dict[str, list[float]]]:
 def _spans(dataset: TraceDataset, warnings: list[str]) -> list[SpanRecord]:
     begins: dict[tuple[str, str], TraceEvent] = {}
     spans: list[SpanRecord] = []
-    for event in dataset.events:
+    # Calibrated wall timestamps can overlap within their uncertainty. Preserve
+    # a process's original emission order when pairing local spans.
+    events = dataset.events
+    if dataset.metadata.get("kind") == "ibrobot-merged-trace":
+        events = sorted(
+            events,
+            key=lambda event: (
+                event.origin.machine_id,
+                event.origin.boot_id,
+                event.origin.process_instance,
+                event.origin.event_sequence or 0,
+            ),
+        )
+    for event in events:
         span_id = str(event.field("span_id", ""))
         key = (event.request_id, span_id)
         if event.name == "span_begin" and span_id:
@@ -385,6 +443,20 @@ def _spans(dataset: TraceDataset, warnings: list[str]) -> list[SpanRecord]:
             if begin is None:
                 warnings.append(f"span_end without span_begin: {event.request_id}/{span_id}")
                 continue
+            mapping = {}
+            status = str(event.field("status", "ok"))
+            if begin.time_mapping or event.time_mapping:
+                mapping = {
+                    **event.time_mapping,
+                    "start_ns_uncertainty_ns": begin.time_mapping.get("uncertainty_ns"),
+                    "end_ns_uncertainty_ns": event.time_mapping.get("uncertainty_ns"),
+                    "source_origin": asdict(event.origin),
+                }
+                if begin.time_mapping.get("segment_id") != event.time_mapping.get(
+                    "segment_id"
+                ) or begin.time_mapping.get("calibration_sha256") != event.time_mapping.get("calibration_sha256"):
+                    status = "clock_discontinuity"
+                    mapping["status"] = "uncalibrated"
             spans.append(
                 SpanRecord(
                     name=str(event.field("span_name", begin.field("span_name", "span"))),
@@ -393,10 +465,11 @@ def _spans(dataset: TraceDataset, warnings: list[str]) -> list[SpanRecord]:
                     parent_span_id=str(event.field("parent_span_id", begin.field("parent_span_id", ""))),
                     component_id=str(event.field("component_id", begin.field("component_id", ""))),
                     start_ns=begin.timestamp_ns,
-                    end_ns=event.timestamp_ns,
-                    status=str(event.field("status", "ok")),
+                    end_ns=event.timestamp_ns if status != "clock_discontinuity" else None,
+                    status=status,
                     origin=str(event.field("origin", begin.field("origin", "user"))),
                     fields=dict(event.fields),
+                    time_mapping=mapping,
                 )
             )
     for (trace_id, span_id), begin in begins.items():
@@ -413,14 +486,17 @@ def _spans(dataset: TraceDataset, warnings: list[str]) -> list[SpanRecord]:
                 status="incomplete",
                 origin=str(begin.field("origin", "user")),
                 fields=dict(begin.fields),
+                time_mapping={**begin.time_mapping, "source_origin": asdict(begin.origin)}
+                if begin.time_mapping
+                else {},
             )
         )
     return spans
 
 
 def _flows(dataset: TraceDataset, warnings: list[str]) -> list[FlowRecord]:
-    grouped: dict[tuple[str, str, str], dict[str, TraceEvent]] = {}
-    for event in dataset.events:
+    grouped: dict[tuple[str, str, str], dict[str, list[TraceEvent]]] = {}
+    for event in [*dataset.events, *dataset.uncalibrated_events]:
         if event.name not in {"flow_send", "flow_receive"}:
             continue
         edge_id = str(event.field("edge_id", ""))
@@ -430,13 +506,54 @@ def _flows(dataset: TraceDataset, warnings: list[str]) -> list[FlowRecord]:
             pair = grouped.setdefault(key, {})
             if event.name in pair:
                 warnings.append(f"duplicate {event.name}: {event.request_id}/{edge_id}/{flow_id}")
-            pair[event.name] = event
+            pair.setdefault(event.name, []).append(event)
     records = []
     for (trace_id, edge_id, flow_id), pair in grouped.items():
-        send = pair.get("flow_send")
-        receive = pair.get("flow_receive")
+        send = (pair.get("flow_send") or [None])[0]
+        receive = (pair.get("flow_receive") or [None])[0]
         status = "complete" if send and receive else "incomplete"
-        if send and receive and receive.timestamp_ns < send.timestamp_ns:
+        uncertainty = None
+        provenance = {
+            name: {"origin": asdict(event.origin), "time_mapping": event.time_mapping}
+            for name, event in (("send", send), ("receive", receive))
+            if event is not None
+        }
+        calibrated = dataset.metadata.get("kind") == "ibrobot-merged-trace"
+        invalid = any(
+            event is not None and event.time_mapping.get("status") == "uncalibrated" for event in (send, receive)
+        )
+        if any(len(values) > 1 for values in pair.values()):
+            status = "ambiguous"
+        elif invalid:
+            status = "uncalibrated"
+        elif send and receive and calibrated:
+            if send.time_mapping.get("reference_id") != receive.time_mapping.get("reference_id"):
+                status = "clock_mismatch"
+            elif send.time_mapping.get("calibration_sha256") == receive.time_mapping.get(
+                "calibration_sha256"
+            ) and send.time_mapping.get("segment_id") != receive.time_mapping.get("segment_id"):
+                status = "clock_discontinuity"
+            else:
+                uncertainty = send.time_mapping["uncertainty_ns"] + receive.time_mapping["uncertainty_ns"]
+                if uncertainty > 100_000:
+                    status = "uncertainty_exceeded"
+        elif send and receive and send.clock != receive.clock:
+            status = "clock_mismatch"
+        elif (
+            send
+            and receive
+            and (
+                (
+                    send.origin.machine_id
+                    and receive.origin.machine_id
+                    and (send.origin.machine_id, send.origin.boot_id)
+                    != (receive.origin.machine_id, receive.origin.boot_id)
+                )
+                or (send.origin.host and receive.origin.host and send.origin.host != receive.origin.host)
+            )
+        ):
+            status = "cross_host_unsynchronized"
+        if status == "complete" and send and receive and receive.timestamp_ns < send.timestamp_ns:
             status = "negative"
             warnings.append(f"negative flow duration: {edge_id}/{flow_id}")
         records.append(
@@ -444,9 +561,13 @@ def _flows(dataset: TraceDataset, warnings: list[str]) -> list[FlowRecord]:
                 edge_id=edge_id,
                 flow_id=flow_id,
                 trace_id=trace_id,
-                send_ns=send.timestamp_ns if send else None,
-                receive_ns=receive.timestamp_ns if receive else None,
+                send_ns=send.timestamp_ns if send and send.time_mapping.get("status") != "uncalibrated" else None,
+                receive_ns=receive.timestamp_ns
+                if receive and receive.time_mapping.get("status") != "uncalibrated"
+                else None,
                 status=status,
+                uncertainty_ns=uncertainty,
+                provenance=provenance,
             )
         )
     return records
@@ -514,7 +635,7 @@ class AnalysisService:
         _bind_components(dataset, topology)
         warnings = _Warnings()
         warnings.extend(dataset.warnings)
-        spans = _spans(dataset, warnings)
+        spans = span_occurrences(_spans(dataset, warnings))
         rows = _requests(dataset, spans, warnings)
         topology = enrich_topology_with_observed_operations(topology, spans, dataset.events)
         definitions, definition_warnings = resolve_tracepoint_definitions(
@@ -524,7 +645,7 @@ class AnalysisService:
             spans,
         )
         warnings.extend(definition_warnings)
-        flows = _flows(dataset, warnings)
+        flows = flow_occurrences(_flows(dataset, warnings))
         stage_names = {key for row in rows for key in row if key.endswith("_ms") and not key.endswith("_source")}
         stage_summary = {
             name: summarize(float(row[name]) for row in rows if name in row) for name in sorted(stage_names)
@@ -543,6 +664,14 @@ class AnalysisService:
                 "Add C++ and native UST custom instrumentation",
             ],
         }
+        if dataset.metadata.get("kind") == "ibrobot-merged-trace":
+            coverage["clock_calibration"] = {
+                "reference_id": dataset.metadata["reference_id"],
+                "calibrated_events": len(dataset.events),
+                "uncalibrated_events": len(dataset.uncalibrated_events),
+                "rejection_reasons": dataset.metadata.get("rejection_reasons", {}),
+                "quality": dataset.metadata.get("quality"),
+            }
         return AnalysisResult(
             dataset=dataset,
             request_rows=rows,

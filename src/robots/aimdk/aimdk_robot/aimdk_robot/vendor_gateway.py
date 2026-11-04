@@ -86,6 +86,8 @@ MC_ACTION_VALUES: dict[str, int] = {
 # HEAD_ONLY and UPPERBODY_REMOTE_SPLIT are documented by name only; the SDK
 # examples switch modes with action_desc, which is the supported path.
 MC_ACTION_BY_VALUE: dict[int, str] = {value: name for name, value in MC_ACTION_VALUES.items()}
+#: McActionStatus: the action is running (0 idle, 200 transition, 300 uninterruptible transition).
+MC_ACTION_RUNNING = 100
 
 INPUT_ACTION_ADD = 1001
 INPUT_ACTION_ENABLE = 2001
@@ -180,6 +182,19 @@ LED_PRIORITY_LEVEL_NAMES: tuple[str, ...] = ("background", "normal", "foreground
 
 def _stamp(node: Any) -> Any:
     return node.get_clock().now().to_msg()
+
+
+def message_stamp(header: Any) -> Any:
+    """A vendor header's time as an rclpy Time: ``meas_stamp`` (measurement time)
+    if set, else ``stamp``; None when it carries neither. The X2 HAL sets only
+    ``stamp``."""
+    from rclpy.time import Time
+
+    for field in ("meas_stamp", "stamp"):
+        stamp = getattr(header, field, None)
+        if stamp is not None and (stamp.sec or stamp.nanosec):
+            return Time(seconds=stamp.sec, nanoseconds=stamp.nanosec)
+    return None
 
 
 def message_header(node: Any, *, frame_id: str, sequence: int) -> Any:
@@ -347,38 +362,6 @@ def hand_statuses(runtime_model: Any) -> list[int]:
         int(getattr(getattr(runtime_model, "left_hand_status", None), "value", 0) or 0),
         int(getattr(getattr(runtime_model, "right_hand_status", None), "value", 0) or 0),
     ]
-
-
-def hand_touch_frames(message: Any) -> dict[str, list[int]]:
-    """Flatten the touch arrays of hands that actually have them, into named pads.
-
-    ``HandTouchSensorData`` carries a 36-cell palm and back plus five 16-cell
-    fingertips per hand. The arrays are fixed-length for the widest supported
-    hand, so a narrower one (the Leisai hand has no back pad and 12-cell tips)
-    simply leaves the tail zeroed.
-
-    The fields exist on every hand state message, including a gripper's, where
-    they are all zeros. A gripper has no tactile array, so those zeros are the
-    absence of a sensor and not a measurement of no contact — publishing them
-    would invent a sensor. Only a hand whose reported type belongs to the
-    dexterous family contributes.
-    """
-    pads = ("palm", "back_of_hand", "thumb", "index_finger", "middle_finger", "ring_finger", "little_finger")
-    frames: dict[str, list[int]] = {}
-    sides = (
-        ("left", "left_touch_sensors", "left_hand_type"),
-        ("right", "right_touch_sensors", "right_hand_type"),
-    )
-    for side, sensor_attribute, type_attribute in sides:
-        sensors = getattr(message, sensor_attribute, None)
-        reported = int(getattr(getattr(message, type_attribute, None), "value", HAND_TYPE_NONE))
-        if sensors is None or hand_type_family(reported) != "dexterous":
-            continue
-        for pad in pads:
-            data = getattr(sensors, f"{pad}_touch_data", None)
-            if data is not None:
-                frames[f"{side}_{pad}"] = [int(cell) for cell in data]
-    return frames
 
 
 def tts_request(node: Any, *, text: str, priority: int, interrupt: bool, trace_id: str, domain: str) -> Any:

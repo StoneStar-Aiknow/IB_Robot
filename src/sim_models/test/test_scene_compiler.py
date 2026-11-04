@@ -1,8 +1,11 @@
 """Scene composition tests (so101-mujoco-runtime-platform tasks 2.1/2.2).
 
-Covers the robot-agnostic composition API, the shared randomisation grid, the
-domain-keyed composed-model path, the layout task declaration and the
-dependency direction (sim_models never imports robot_runtime).
+Covers the robot-agnostic composition API, the shared randomisation
+placements (grid bit-compatibility with the historical keyframe grid, seeded
+uniform sampling, and the issue #195 requirement that the composed model
+carries no injected keyframes), the domain-keyed composed-model path, the
+layout task declaration, the shared scene helpers and the dependency
+direction (sim_models never imports robot_runtime).
 """
 
 from __future__ import annotations
@@ -11,17 +14,24 @@ import ast
 import importlib
 import math
 import pkgutil
+import random
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from sim_models.scene_compiler import (
+    arm_rest_pairs,
     compose_mujoco_model,
     composed_model_path,
+    free_joint_states_topic,
     get_scene_layout,
     get_scene_task,
-    randomization_grid,
+    load_mujoco_engine_plugins,
+    mjcf_engine_extensions,
+    randomization_placements,
+    scene_dynamic_objects,
 )
 
 mujoco = pytest.importorskip("mujoco")
@@ -83,51 +93,212 @@ def _model_of(path: Path):
     return mujoco.MjModel.from_binary_path(str(path))
 
 
-def _keyframe_id(model, name: str) -> int:
-    kid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, name)
-    assert kid >= 0, f"keyframe {name!r} missing (nkey={model.nkey})"
-    return kid
-
-
-def _free_qpos(model, key_id: int, joint: str):
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
-    adr = int(model.jnt_qposadr[jid])
-    return model.key_qpos[key_id][adr : adr + 7]
-
-
-def _scalar_qpos(model, key_id: int, joint: str):
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
-    adr = int(model.jnt_qposadr[jid])
-    return model.key_qpos[key_id][adr]
-
-
 # ---------------------------------------------------------------------------
-# 2.1: randomization_grid
+# 2.1: randomization_placements
 # ---------------------------------------------------------------------------
+
+
+def _historical_grid(banana_cfg: dict) -> list[tuple[float, float, float, float]]:
+    """The pre-issue-195 keyframe grid computation, inlined verbatim."""
+    x_min, x_max = banana_cfg["x_range"]
+    y_min, y_max = banana_cfg["y_range"]
+    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
+    xs = np.linspace(x_min, x_max, int(banana_cfg.get("grid_cols", 5)))
+    ys = np.linspace(y_min, y_max, int(banana_cfg.get("grid_rows", 7)))
+    yaws = [2.0 * math.pi * i / int(banana_cfg.get("yaw_steps", 6)) for i in range(int(banana_cfg.get("yaw_steps", 6)))]
+    return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+
+
+def test_grid_placements_are_bit_identical_to_the_historical_grid():
+    layout = get_scene_layout("pick_banana")
+    placements = randomization_placements(layout)
+    assert placements == _historical_grid(layout["randomization"]["banana"]), (
+        "grid mode must reproduce the historical keyframe grid exactly (old indices keep their meaning)"
+    )
 
 
 def test_grid_size_and_order_are_stable():
     layout = get_scene_layout("pick_banana")
-    grid = randomization_grid(layout)
+    placements = randomization_placements(layout)
     # 5 x divisions × 7 y divisions × 6 yaw steps
-    assert len(grid) == 5 * 7 * 6
+    assert len(placements) == 5 * 7 * 6
     rand = layout["randomization"]["banana"]
     x_min, x_max = rand["x_range"]
     y_min, y_max = rand["y_range"]
     yaw_step = 2.0 * math.pi / 6
     # index 0 → (x_min, y_min, z_spawn, 0); the innermost loop is yaw
-    assert grid[0] == pytest.approx((x_min, y_min, 0.05, 0.0), abs=1e-9)
-    assert grid[1] == pytest.approx((x_min, y_min, 0.05, yaw_step), abs=1e-9)
+    assert placements[0] == pytest.approx((x_min, y_min, 0.05, 0.0), abs=1e-9)
+    assert placements[1] == pytest.approx((x_min, y_min, 0.05, yaw_step), abs=1e-9)
     # after yaw_steps indices the y advances
-    assert grid[6] == pytest.approx((x_min, y_min + (y_max - y_min) / 6, 0.05, 0.0), abs=1e-9)
+    assert placements[6] == pytest.approx((x_min, y_min + (y_max - y_min) / 6, 0.05, 0.0), abs=1e-9)
     # the last entry is (x_max, y_max, last yaw)
-    assert grid[-1] == pytest.approx((x_max, y_max, 0.05, 5 * yaw_step), abs=1e-9)
+    assert placements[-1] == pytest.approx((x_max, y_max, 0.05, 5 * yaw_step), abs=1e-9)
 
 
-def test_grid_is_empty_without_randomization():
-    assert randomization_grid({}) == []
-    assert randomization_grid({"randomization": {}}) == []
-    assert randomization_grid({"randomization": {"banana": {}}}) == []
+def test_placements_are_empty_without_randomization():
+    assert randomization_placements({}) == []
+    assert randomization_placements({"randomization": {}}) == []
+    assert randomization_placements({"randomization": {"banana": {}}}) == []
+
+
+def test_uniform_mode_is_deterministic_and_seeded():
+    base = {
+        "x_range": [-0.03, 0.10],
+        "y_range": [-0.02, 0.10],
+        "z_spawn": 0.05,
+        "mode": "uniform",
+        "seed": 42,
+        "count": 25,
+    }
+    first = randomization_placements({"randomization": {"banana": dict(base)}})
+    second = randomization_placements({"randomization": {"banana": dict(base)}})
+    assert len(first) == 25
+    assert first == second, "same seed + count must give the same sequence"
+
+    # an independent reference implementation with the same seed agrees
+    rng = random.Random(42)
+    expected = [
+        (
+            rng.uniform(-0.03, 0.10),
+            rng.uniform(-0.02, 0.10),
+            0.05,
+            rng.uniform(0.0, 2.0 * math.pi),
+        )
+        for _ in range(25)
+    ]
+    assert first == expected
+
+    other_seed = randomization_placements({"randomization": {"banana": {**base, "seed": 43}}})
+    assert other_seed != first, "a different seed changes the sequence"
+
+
+def test_uniform_mode_rejects_missing_seed_or_count():
+    with pytest.raises(ValueError, match="seed"):
+        randomization_placements({"randomization": {"banana": {"mode": "uniform", "count": 5}}})
+    with pytest.raises(ValueError, match="seed"):
+        randomization_placements({"randomization": {"banana": {"mode": "uniform"}}})
+
+
+# ---------------------------------------------------------------------------
+# input validation fires in the shared parser
+# ---------------------------------------------------------------------------
+
+
+def _uniform_banana(**overrides):
+    config = {
+        "mode": "uniform",
+        "seed": 42,
+        "count": 10,
+        "x_range": [-0.03, 0.10],
+        "y_range": [-0.02, 0.10],
+        "z_spawn": 0.05,
+    }
+    config.update(overrides)
+    return {"randomization": {"banana": config}}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("count", 0), ("count", -3), ("count", 2.9), ("count", True), ("seed", 42.9), ("seed", True)],
+)
+def test_uniform_mode_rejects_non_positive_or_non_integer_seed_and_count(field, value):
+    # count=0 used to be accepted and crashed later with ZeroDivisionError in
+    # randomize(); floats and bools were silently truncated.
+    with pytest.raises(ValueError, match=f"randomization.banana.{field}"):
+        randomization_placements(_uniform_banana(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("x_range", [0.10, -0.03]),  # min > max
+        ("x_range", [float("nan"), 0.10]),
+        ("x_range", [-0.03, float("inf")]),
+        ("x_range", [-0.03]),  # wrong length
+        ("x_range", "wide"),  # not a pair at all
+        ("y_range", [0.10, -0.02]),
+        ("z_spawn", float("nan")),
+        ("z_spawn", float("inf")),
+        ("z_spawn", "high"),
+    ],
+)
+def test_ranges_and_spawn_must_be_finite_ordered_numbers(field, value):
+    # NaN ranges used to silently generate NaN coordinates.
+    with pytest.raises(ValueError, match=f"randomization.banana.{field}"):
+        randomization_placements(_uniform_banana(**{field: value}))
+
+
+@pytest.mark.parametrize("field", ["grid_cols", "grid_rows", "yaw_steps"])
+@pytest.mark.parametrize("value", [0, -1, 2.5, True])
+def test_grid_divisions_must_be_positive_integers(field, value):
+    layout = {"randomization": {"banana": {"x_range": [0, 0.1], "y_range": [0, 0.1], field: value}}}
+    with pytest.raises(ValueError, match=f"randomization.banana.{field}"):
+        randomization_placements(layout)
+
+
+def test_grid_division_validation_also_applies_to_the_default_mode():
+    # grid is the default mode, so the validation must fire without `mode:`.
+    layout = {"randomization": {"banana": {"x_range": [0, 0.1], "y_range": [0, 0.1], "grid_cols": 0}}}
+    with pytest.raises(ValueError, match="grid_cols"):
+        randomization_placements(layout)
+
+
+# ---------------------------------------------------------------------------
+# arm_rest_pairs
+# ---------------------------------------------------------------------------
+
+
+def test_arm_rest_pairs_returns_the_validated_pairs():
+    layout = {
+        "randomization": {
+            "arm_joint_names": ["1", "2", "3"],
+            "arm_rest_qpos": [0.0, -1.58, 2],
+        }
+    }
+    assert arm_rest_pairs(layout) == [("1", 0.0), ("2", -1.58), ("3", 2.0)]
+    assert arm_rest_pairs({}) == []
+    assert arm_rest_pairs({"randomization": {}}) == []
+
+
+@pytest.mark.parametrize(
+    "names,qpos,match",
+    [
+        ("12", [0.0, 1.0], "arm_joint_names must be a list"),  # a string would iterate per character
+        (["1", "2"], 0.0, "arm_rest_qpos must be a list"),
+        (["1", "2"], "01", "arm_rest_qpos must be a list"),
+        (["1", "2"], [0.0, -1.0, 1.5], "same length"),
+        (["1", "1"], [0.0, -1.0], "unique"),
+        (["1", ""], [0.0, -1.0], "non-empty strings"),
+        (["1", 2], [0.0, -1.0], "non-empty strings"),
+        (["1", "2"], [0.0, float("nan")], "arm_rest_qpos entries"),
+        (["1", "2"], [0.0, True], "arm_rest_qpos entries"),
+        (["1", "2"], [0.0, "down"], "arm_rest_qpos entries"),
+    ],
+)
+def test_arm_rest_pairs_rejects_invalid_layouts(names, qpos, match):
+    with pytest.raises(ValueError, match=match):
+        arm_rest_pairs({"randomization": {"arm_joint_names": names, "arm_rest_qpos": qpos}})
+
+
+def test_unknown_mode_is_rejected():
+    with pytest.raises(ValueError, match="mode"):
+        randomization_placements({"randomization": {"banana": {"mode": "spiral", "seed": 1, "count": 2}}})
+
+
+# ---------------------------------------------------------------------------
+# 2.1: the shared scene helpers (issue #195)
+# ---------------------------------------------------------------------------
+
+
+def test_scene_dynamic_objects_lists_dynamic_bodies_only():
+    assert scene_dynamic_objects("pick_banana") == ["plate", "banana"]
+    assert scene_dynamic_objects("empty") == []
+    assert scene_dynamic_objects("does_not_exist") == []
+
+
+def test_free_joint_states_topic_is_scene_namespaced():
+    assert free_joint_states_topic("pick_banana") == "/sim/pick_banana/free_joint_states"
+    assert free_joint_states_topic("other_scene") == "/sim/other_scene/free_joint_states"
 
 
 # ---------------------------------------------------------------------------
@@ -150,37 +321,19 @@ def test_composed_model_path_is_keyed_by_domain(monkeypatch):
     assert composed_model_path(None).name == "robot.mjb"
 
 
-def test_compose_with_pick_banana_compiles_and_injects_keyframes(robot_mjcf, clean_domain):
+def test_compose_with_pick_banana_compiles_without_injected_keyframes(robot_mjcf, clean_domain):
+    """Issue #195: placements travel through ResetWorld state overrides, not
+    compiled-in keyframes — the composed model must carry no injected keys."""
     out = compose_mujoco_model(robot_mjcf, "pick_banana", ())
     assert out == composed_model_path("pick_banana")
     assert out.exists() and out.suffix == ".mjb"
     model = _model_of(out)
-    assert model.nkey == 1 + 5 * 7 * 6  # default + random grid
-
-    grid = randomization_grid(get_scene_layout("pick_banana"))
-    for k in (0, 1, 17, 209):
-        kid = _keyframe_id(model, f"random_{k:03d}")
-        banana = _free_qpos(model, kid, "banana_free")
-        x, y, z, yaw = grid[k]
-        assert list(banana[:3]) == pytest.approx([x, y, z], abs=1e-5)
-        assert list(banana[3:]) == pytest.approx([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], abs=1e-5)
-
-
-def test_compose_default_keyframe_holds_layout_poses_and_rest(robot_mjcf, clean_domain):
-    out = compose_mujoco_model(robot_mjcf, "pick_banana", ())
-    model = _model_of(out)
-    kid = _keyframe_id(model, "default")
-    layout = get_scene_layout("pick_banana")
-    objects = {obj["name"]: obj for obj in layout["objects"]}
-    banana = _free_qpos(model, kid, "banana_free")
-    assert list(banana[:3]) == pytest.approx(objects["banana"]["position"], abs=1e-5)
-    plate = _free_qpos(model, kid, "plate_free")
-    assert list(plate[:3]) == pytest.approx(objects["plate"]["position"], abs=1e-5)
-    # plate rotation [pi/2, 0, 0] → quaternion w-x-y-z (0.7071, 0.7071, 0, 0)
-    assert list(plate[3:]) == pytest.approx([0.7071068, 0.7071068, 0.0, 0.0], abs=1e-5)
-    rest = layout["randomization"]["arm_rest_qpos"]
-    for j in range(1, 7):
-        assert _scalar_qpos(model, kid, str(j)) == pytest.approx(rest[j - 1], abs=1e-5)
+    assert model.nkey == 0, "no random_KKK/default keyframes may be injected any more"
+    # the placement targets themselves are still part of the composed world
+    for body in ("banana", "plate"):
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0
+    grid = randomization_placements(get_scene_layout("pick_banana"))
+    assert len(grid) == 5 * 7 * 6
 
 
 def test_compose_with_empty_scene_includes_the_robot(robot_mjcf, clean_domain):
@@ -255,3 +408,158 @@ def test_no_sim_models_module_imports_robot_runtime():
 def test_package_xml_declares_no_robot_runtime_dependency():
     content = (PKG_ROOT / "package.xml").read_text(encoding="utf-8")
     assert "robot_runtime" not in content
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D5.1: engine extensions in the compiler and
+# the XML artifact for extension-declaring models
+# ---------------------------------------------------------------------------
+
+LIDAR_ROBOT_TEMPLATE = """<mujoco model="lidar_probe">
+  <extension><plugin plugin="mujoco.plugin.lidar"/></extension>
+  <worldbody>
+    <body name="base_link" pos="0 0 0.05">
+      <freejoint name="floating_base_joint"/>
+      <site name="probe_lidar_site" pos="0 0 0.2"/>
+      <geom type="box" size="0.1 0.1 0.03"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <plugin name="probe_lidar" plugin="mujoco.plugin.lidar" objtype="site" objname="probe_lidar_site">
+      <config key="resolution" value="8 2"/>
+      <config key="azimuth_range" value="-3.14159265 3.14159265"/>
+      <config key="elevation_range" value="0 0.5"/>
+      <config key="max_range" value="20"/>
+    </plugin>
+    <framequat name="probe_imu_quat" objtype="site" objname="probe_lidar_site"/>
+    <gyro name="probe_imu_gyro" site="probe_lidar_site"/>
+    <accelerometer name="probe_imu_accel" site="probe_lidar_site"/>
+  </sensor>
+</mujoco>
+"""
+
+
+@pytest.fixture
+def lidar_robot_mjcf(tmp_path):
+    path = tmp_path / "lidar_robot.xml"
+    path.write_text(LIDAR_ROBOT_TEMPLATE, encoding="utf-8")
+    return str(path)
+
+
+def test_mjcf_engine_extensions_reads_path_and_content(lidar_robot_mjcf):
+    assert mjcf_engine_extensions(lidar_robot_mjcf) == ["mujoco.plugin.lidar"]
+    assert mjcf_engine_extensions(LIDAR_ROBOT_TEMPLATE) == ["mujoco.plugin.lidar"]
+    # no <extension> section: none declared; unparseable text is not a model
+    assert mjcf_engine_extensions(ROBOT_MJCF_TEMPLATE.format(meshes_dir="x", joints_and_geoms="", actuators="")) == []
+    assert mjcf_engine_extensions("<not-mujoco/>") == []
+
+
+def test_compose_delivers_xml_for_engine_extension_models(lidar_robot_mjcf, clean_domain):
+    """D5.1: an extension-declaring model is validated by a full compile and
+    delivered as the compiled spec's XML (never a .mjb — the binary bakes the
+    compiling process's global plugin slot ids)."""
+    # earlier tests in this domain may have left a robot .mjb behind
+    composed_model_path("empty").unlink(missing_ok=True)
+    out = compose_mujoco_model(lidar_robot_mjcf, "empty", ())
+    assert out.suffix == ".xml"
+    assert out == composed_model_path("empty").with_suffix(".xml")
+    delivered = out.read_text(encoding="utf-8")
+    assert mjcf_engine_extensions(delivered) == ["mujoco.plugin.lidar"]
+    # no .mjb artifact is written next to it
+    assert not composed_model_path("empty").exists()
+    # the delivered XML recompiles in THIS process (extension already loaded)
+    spec = mujoco.MjSpec.from_string(delivered)
+    model = spec.compile()
+    assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "probe_lidar_site") >= 0
+    names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SENSOR, i) for i in range(model.nsensor)]
+    assert "probe_lidar" in names and "probe_imu_gyro" in names
+
+
+def test_extension_free_models_keep_the_mjb_artifact(robot_mjcf, clean_domain):
+    """The rule, pinned: the same composition call produces a .mjb without an
+    extension declaration and an .xml with one (D5.1)."""
+    plain = compose_mujoco_model(robot_mjcf, "empty", ())
+    assert plain.suffix == ".mjb" and plain.exists()
+
+
+def test_extension_with_sdf_meshes_fails_closed(lidar_robot_mjcf, clean_domain):
+    with pytest.raises(ValueError, match="cannot also use SDF mesh collision"):
+        compose_mujoco_model(lidar_robot_mjcf, "empty", ("some_mesh"))
+
+
+def test_extension_model_compile_error_raises(tmp_path, clean_domain):
+    """D5.1 compile-error policy: an extension-declaring model that fails to
+    compile RAISES the original MuJoCo error — the silent XML fallback stays
+    reserved for extension-free models (there it is debugging support, here
+    it would hand the node an unvalidated model)."""
+    bad = LIDAR_ROBOT_TEMPLATE.replace(
+        '<gyro name="probe_imu_gyro" site="probe_lidar_site"/>',
+        '<gyro name="probe_imu_gyro" site="no_such_site"/>',
+    )
+    path = tmp_path / "bad_lidar_robot.xml"
+    path.write_text(bad, encoding="utf-8")
+    with pytest.raises(ValueError, match="no_such_site"):
+        compose_mujoco_model(str(path), "empty", ())
+
+
+def test_extension_model_without_the_mujoco_package_raises(robot_mjcf, tmp_path, clean_domain, monkeypatch):
+    """Review round 1: with the mujoco package unavailable, an
+    extension-declaring model must RAISE — returning the unvalidated XML
+    would defeat the D5.1 compile-error policy through the ImportError path.
+    An extension-free model keeps the documented XML fallback."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "mujoco", None)  # import mujoco now fails
+    lidar = tmp_path / "lidar_robot.xml"
+    lidar.write_text(LIDAR_ROBOT_TEMPLATE, encoding="utf-8")
+    with pytest.raises(ImportError, match="engine extensions.*mujoco Python package"):
+        compose_mujoco_model(str(lidar), "empty", ())
+    out = compose_mujoco_model(robot_mjcf, "empty", ())
+    assert out.suffix == ".xml"
+
+
+def test_load_mujoco_engine_plugins_names_the_apt_package_for_unknown_extensions():
+    with pytest.raises(RuntimeError, match="ros-humble-mujoco-3d-lidar"):
+        load_mujoco_engine_plugins(("mujoco.plugin.not_a_thing",))
+
+
+def test_fresh_process_compose_and_recompile(lidar_robot_mjcf, clean_domain, tmp_path):
+    """The real compose path in a FRESH process produces the XML, and a second
+    fresh process (its own plugin registration state) recompiles it — the
+    artifact carries no compile-process state (D5.1)."""
+    import subprocess
+    import sys
+
+    compose_script = (
+        "from sim_models.scene_compiler import compose_mujoco_model, composed_model_path\n"
+        f"out = compose_mujoco_model({lidar_robot_mjcf!r}, 'empty', ())\n"
+        "assert out.suffix == '.xml', out\n"
+        "assert out == composed_model_path('empty').with_suffix('.xml'), out\n"
+        "print(out)\n"
+    )
+    first = subprocess.run(
+        [sys.executable, "-c", compose_script], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert first.returncode == 0, first.stderr
+    delivered = Path(first.stdout.strip().splitlines()[-1])
+    assert delivered.exists() and delivered.suffix == ".xml"
+
+    recompile_script = (
+        "import ctypes\n"
+        "from pathlib import Path\n"
+        "import mujoco\n"
+        "from ament_index_python import get_resource\n"
+        "content, prefix = get_resource('mujoco_plugins', 'mujoco_3d_lidar')\n"
+        "ctypes.CDLL(str(Path(prefix) / content / 'libmujoco_3d_lidar.so'), mode=ctypes.RTLD_GLOBAL)\n"
+        f"spec = mujoco.MjSpec.from_string(Path({str(delivered)!r}).read_text())\n"
+        "model = spec.compile()\n"
+        "names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SENSOR, i) for i in range(model.nsensor)]\n"
+        "assert 'probe_lidar' in names and 'probe_imu_accel' in names, names\n"
+        "assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'probe_lidar_site') >= 0\n"
+        "print('RECOMPILED', model.nbody, model.nsensor, model.nplugin)\n"
+    )
+    second = subprocess.run(
+        [sys.executable, "-c", recompile_script], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert second.returncode == 0, second.stderr
+    assert "RECOMPILED" in second.stdout

@@ -13,7 +13,9 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
-  <exec_depend>mujoco_ros2_control_msgs</exec_depend>
+  <!-- 0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1); rosdep does not
+       enforce versions, the runtime check is the guard. -->
+  <exec_depend version_gte="0.1.2">mujoco_ros2_control_msgs</exec_depend>
   <!-- pick_banana scene task (so101-mujoco-runtime-platform D9): the runtime
        arm reset drives the facade services and trajectory actions; the
        Gazebo backend uses the bridged entity-pose service and pose stream. -->

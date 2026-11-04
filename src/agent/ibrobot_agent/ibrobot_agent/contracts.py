@@ -628,7 +628,16 @@ class Planner(Protocol):
         context: Mapping[str, Any],
         catalog: Mapping[str, Any],
         cancel_token: threading.Event,
-    ) -> PlannerOutcome: ...
+        *,
+        on_preview: Callable[[str], None] | None = None,
+    ) -> PlannerOutcome:
+        """Plan one request.
+
+        ``on_preview`` may be called at most once, before this returns, with
+        the reply text the model is producing. It is advisory: the outcome is
+        validated afterwards exactly as if no preview had been made.
+        """
+        ...
 
 
 class CatalogPort(Protocol):
@@ -677,7 +686,10 @@ class ExecutionPort(Protocol):
         presentation_callback: Callable[[Presentation], None],
         submission_callback: Callable[[TaskRef, Mapping[str, object]], None],
         stop_event: threading.Event,
-    ) -> ExecutionResult: ...
+        continues_from_execution_id: str = "",
+    ) -> ExecutionResult:
+        """``continues_from_execution_id`` names the execution whose interrupted step this resumes."""
+        ...
 
     def request_stop(self, request_key: RequestKey | None) -> None: ...
 
@@ -740,7 +752,9 @@ class RequestStore(Protocol):
 
     def finish(self, key: RequestKey, *, expected_generation: int, result: ExecutionResult) -> RequestRecord: ...
 
-    def quarantine(self, key: RequestKey, *, expected_generation: int, reason: str) -> RequestRecord: ...
+    def quarantine(
+        self, key: RequestKey, *, expected_generation: int, reason: str, detail: Mapping | None = None
+    ) -> RequestRecord: ...
 
     def record_event(self, key: RequestKey, *, event_type: str, state: str, detail_json: str) -> int: ...
 

@@ -257,6 +257,8 @@ class SourceCatalog:
     def _candidate(self, root: Path, path: Path) -> SourceRecord | None:
         with _open_path(path) as fd:
             if stat.S_ISREG(os.fstat(fd).st_mode):
+                if path.suffix.lower() == ".ibtrace":
+                    return self._record(root, path, "merged", self._scan(fd))
                 if path.suffix.lower() not in _LOG_SUFFIXES:
                     return None
                 return self._record(root, path, "log", self._scan(fd))
@@ -341,7 +343,7 @@ class SourceCatalog:
         except ValueError as exc:
             raise UnsafeSourceError("Trace source is outside its configured root") from exc
         with _open_path(source.path, directory=source.kind == "ctf") as fd:
-            if source.kind == "log" and not stat.S_ISREG(os.fstat(fd).st_mode):
+            if source.kind in {"log", "merged"} and not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise UnsafeSourceError("Only regular trace files are allowed")
             yield fd
 

@@ -11,7 +11,9 @@ from PIL import Image
 
 from inference_service.unified_runtime import ModelResult
 
+from .adapter_support import imagenet_image_tensor as _imagenet_image_tensor
 from .adapter_support import output_tensor as _output
+from .adapter_support import raw_image_tensor as _raw_image_tensor
 from .adapter_support import read_adapter_identity as _read_adapter_identity
 from .grounding_dino_tokenizer import BertWordPieceTokenizer
 from .model_contracts import MAX_MASK_BATCH, MAX_TEXT_BATCH
@@ -320,6 +322,30 @@ def _input_shape(deployment, model, semantic: str, default: tuple[int, ...]) -> 
     return tuple(tensor.shape) if tensor is not None else default
 
 
+def _image_is_raw(deployment, model, semantic: str, layout: str) -> bool:
+    """Does the compiled graph normalize the frame itself?
+
+    An Ascend deployment built with an AIPP stage takes the camera's uint8 pixels and
+    performs the scale, shift and channel reordering in hardware, so the adapter must
+    hand over the frame untouched. A graph that declares a float input expects the host
+    to have normalized it. The declared dtype is what distinguishes the two.
+
+    A raw input is also necessarily NHWC: AIPP consumes interleaved RGB rows, and the
+    host sends the frame in the camera's own order without a transpose. The two layouts
+    hold identical byte counts, so the Ascend size check cannot catch a mismatch here -
+    an NCHW uint8 declaration would silently transpose the image. Reject it at load.
+    """
+    tensor = _resolve_input(deployment, model, semantic)
+    if tensor is None or str(getattr(tensor, "dtype", "")) != "uint8":
+        return False
+    if layout != "NHWC":
+        raise ValueError(
+            f"image input {semantic!r} declares uint8 pixels in {layout} layout; a deployment whose "
+            "AIPP stage normalizes in hardware takes the frame as interleaved NHWC rows"
+        )
+    return True
+
+
 def _image_geometry(
     deployment, model, semantic: str, default_shape: tuple[int, ...], default_layout: str
 ) -> tuple[int, int, str]:
@@ -338,12 +364,6 @@ def _image_geometry(
     if layout == "NHWC":
         return int(shape[1]), int(shape[2]), layout
     raise ValueError(f"image input {semantic!r} declares unsupported layout {layout!r}")
-
-
-def _arrange_image(image_hwc: np.ndarray, layout: str) -> np.ndarray:
-    """Add the batch axis in the channel order the compiled graph declares."""
-    ordered = image_hwc.transpose(2, 0, 1) if layout == "NCHW" else image_hwc
-    return np.ascontiguousarray(ordered[None], dtype=np.float32)
 
 
 class GroundingDINORawAdapter(PerceptionAdapter):
@@ -370,6 +390,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
         self.image_height, self.image_width, self.image_layout = _image_geometry(
             None, None, "image", self._DEFAULT_IMAGE_SHAPE, self._DEFAULT_IMAGE_LAYOUT
         )
+        self.image_is_raw = False
 
     @classmethod
     def from_bundle(
@@ -393,6 +414,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
         instance.image_height, instance.image_width, instance.image_layout = _image_geometry(
             deployment, model, "image", cls._DEFAULT_IMAGE_SHAPE, cls._DEFAULT_IMAGE_LAYOUT
         )
+        instance.image_is_raw = _image_is_raw(deployment, model, "image", instance.image_layout)
         return instance
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
@@ -400,14 +422,12 @@ class GroundingDINORawAdapter(PerceptionAdapter):
         image = np.asarray(image_rgb, dtype=np.uint8)
         if image.shape[:2] != (self.image_height, self.image_width):
             image = cv2.resize(image, (self.image_width, self.image_height), interpolation=cv2.INTER_LINEAR)
-        normalized = image.astype(np.float32) / np.float32(255.0)
-        normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
-            [0.229, 0.224, 0.225], dtype=np.float32
-        )
         tokenized = self.tokenizer.encode(str(prompt))
         del box_threshold, text_threshold
         return {
-            "image": _arrange_image(normalized, self.image_layout),
+            "image": _raw_image_tensor(image)
+            if self.image_is_raw
+            else _imagenet_image_tensor(image, self.image_layout),
             "input_ids": tokenized["gdino.input_ids"],
             "token_type_ids": tokenized["gdino.token_type_ids"],
             "position_ids": tokenized["gdino.position_ids"],
@@ -505,9 +525,10 @@ class SAM2PromptAdapter(PerceptionAdapter):
     def __init__(self) -> None:
         self.batch_size = int(self._DEFAULT_POINT_COORDS_SHAPE[0])
         self.mask_input_shape = self._DEFAULT_MASK_INPUT_SHAPE
-        self.image_size, _, self.image_layout = _image_geometry(
+        self.canvas_height, self.canvas_width, self.image_layout = _image_geometry(
             None, None, "image", self._DEFAULT_IMAGE_SHAPE, self._DEFAULT_IMAGE_LAYOUT
         )
+        self.image_is_raw = False
 
     @classmethod
     def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None) -> SAM2PromptAdapter:
@@ -516,10 +537,6 @@ class SAM2PromptAdapter(PerceptionAdapter):
         height, width, layout = _image_geometry(
             deployment, model, "image", cls._DEFAULT_IMAGE_SHAPE, cls._DEFAULT_IMAGE_LAYOUT
         )
-        if height != width:
-            raise ValueError(
-                f"SAM2 box-prompt letterboxes onto a square canvas but the deployment declares a {height}x{width} image"
-            )
         point_coords_shape = _input_shape(deployment, model, "point_coords", cls._DEFAULT_POINT_COORDS_SHAPE)
         mask_input_shape = _input_shape(deployment, model, "mask_input", cls._DEFAULT_MASK_INPUT_SHAPE)
         batch_size = int(point_coords_shape[0])
@@ -534,25 +551,31 @@ class SAM2PromptAdapter(PerceptionAdapter):
             )
         instance.batch_size = batch_size
         instance.mask_input_shape = mask_input_shape
-        instance.image_size = height
+        instance.canvas_height = height
+        instance.canvas_width = width
         instance.image_layout = layout
+        instance.image_is_raw = _image_is_raw(deployment, model, "image", layout)
         return instance
+
+    def _fit(self, height: int, width: int) -> tuple[float, int, int]:
+        """Scale a frame to fit the compiled canvas without distorting it.
+
+        A canvas compiled with the camera's own aspect ratio is filled exactly and
+        carries no padding, which is the point of compiling one; a square canvas
+        leaves the remainder of the frame's shorter side as padding, which the
+        postprocessing then crops back off. One rule covers both.
+        """
+        scale = min(float(self.canvas_width) / width, float(self.canvas_height) / height)
+        return scale, max(1, int(round(height * scale))), max(1, int(round(width * scale)))
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
         image_rgb, boxes = value
         image = np.asarray(image_rgb, dtype=np.uint8)
         height, width = image.shape[:2]
-        canvas_size = int(self.image_size)
-        scale = float(canvas_size) / max(height, width)
-        resized_width = max(1, int(round(width * scale)))
-        resized_height = max(1, int(round(height * scale)))
+        scale, resized_height, resized_width = self._fit(height, width)
         resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-        canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+        canvas = np.zeros((self.canvas_height, self.canvas_width, 3), dtype=np.uint8)
         canvas[:resized_height, :resized_width] = resized
-        normalized = canvas.astype(np.float32) / np.float32(255.0)
-        normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
-            [0.229, 0.224, 0.225], dtype=np.float32
-        )
         all_boxes = [np.asarray(box, dtype=np.float32).reshape(4) for box in boxes]
         if len(all_boxes) > self.batch_size:
             raise ValueError(
@@ -572,7 +595,9 @@ class SAM2PromptAdapter(PerceptionAdapter):
             coords[index] = coords[len(selected) - 1]
             labels[index] = labels[len(selected) - 1]
         return {
-            "image": _arrange_image(normalized, self.image_layout),
+            "image": _raw_image_tensor(canvas)
+            if self.image_is_raw
+            else _imagenet_image_tensor(canvas, self.image_layout),
             "point_coords": coords,
             "point_labels": labels,
             "mask_input": np.zeros((self.batch_size, *self.mask_input_shape[1:]), dtype=np.float32),
@@ -583,14 +608,11 @@ class SAM2PromptAdapter(PerceptionAdapter):
         logits = np.asarray(_output(result, "mask_logits"), dtype=np.float32)
         if logits.ndim != 4 or logits.shape[1] != 1:
             raise RuntimeError(f"SAM2 prompt output has incompatible mask shape {logits.shape}")
-        canvas_size = int(self.image_size)
-        height, width = tuple(image_shape or (canvas_size, canvas_size))
-        scale = float(canvas_size) / max(height, width)
-        resized_width = max(1, int(round(width * scale)))
-        resized_height = max(1, int(round(height * scale)))
+        height, width = tuple(image_shape or (self.canvas_height, self.canvas_width))
+        _, resized_height, resized_width = self._fit(height, width)
         logits_height, logits_width = logits.shape[-2:]
-        valid_width = min(logits_width, max(1, int(round(resized_width * logits_width / canvas_size))))
-        valid_height = min(logits_height, max(1, int(round(resized_height * logits_height / canvas_size))))
+        valid_width = min(logits_width, max(1, int(round(resized_width * logits_width / self.canvas_width))))
+        valid_height = min(logits_height, max(1, int(round(resized_height * logits_height / self.canvas_height))))
         return [
             (
                 cv2.resize(

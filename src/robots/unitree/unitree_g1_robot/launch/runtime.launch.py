@@ -55,7 +55,7 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import resolve_profile_argument, resolve_simulated
+from robot_runtime.launch_support import resolve_profile_argument, resolve_sim_selection
 from robot_runtime.peripherals import (
     fast_lio_nodes,
     load_peripherals_file,
@@ -104,7 +104,14 @@ def _cyclonedds_uri(network_interface: str) -> str:
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("unitree_g1_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
-    simulated = resolve_simulated(profile, LaunchConfiguration("simulated").perform(context))
+    use_sim, _sim_platform = resolve_sim_selection(
+        profile,
+        LaunchConfiguration("use_sim").perform(context),
+        LaunchConfiguration("sim_platform").perform(context),
+        LaunchConfiguration("simulated").perform(context),
+        source=str(profile_path),
+    )
+    simulated = use_sim
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
     network_interface = LaunchConfiguration("network_interface").perform(context).strip()
@@ -136,7 +143,7 @@ def _launch_setup(context, *_args, **_kwargs):
         profile["runtime"]["instance_id"] = instance_id
     # D6: the description is projected from the profile alone — the URDF is
     # never passed, so no public model is published.
-    description = build_description(profile, peripherals=peripherals, simulated=simulated)
+    description = build_description(profile, peripherals=peripherals, use_sim=simulated)
 
     # The DDS action precedes every node so the spawned processes inherit it.
     # It is CycloneDDS configuration only (harmless under any other RMW) and
@@ -203,9 +210,20 @@ def generate_launch_description() -> LaunchDescription:
         [
             DeclareLaunchArgument("profile", description="Runtime profile path or shipped profile name (required)"),
             DeclareLaunchArgument(
+                "use_sim",
+                default_value="",
+                description="Run simulated (true: the in-repo vendor mock) or physical (false); "
+                "default: the profile's selection",
+            ),
+            DeclareLaunchArgument(
+                "sim_platform",
+                default_value="",
+                description="Simulation platform (sdk); implies use_sim:=true when given alone",
+            ),
+            DeclareLaunchArgument(
                 "simulated",
                 default_value="",
-                description="Override profile.simulated: run against the in-repo vendor mock",
+                description="Deprecated alias of use_sim (a warning names use_sim)",
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument(

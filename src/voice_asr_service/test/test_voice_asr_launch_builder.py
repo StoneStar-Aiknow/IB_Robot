@@ -18,11 +18,13 @@ import pytest
 
 import voice_asr_service.launch_builders.voice_asr as voice_asr
 from robot_config.config import VoiceASRConfig
+from robot_config.voice_contract import SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC, SPEAKER_EMBEDDING_OUTPUT_TOPIC
 from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
 from voice_asr_service.launch_builders.voice_asr import (
     generate_voice_asr_nodes,
     resolve_voice_asr_path,
 )
+from voice_asr_service.speaker_id.defaults import SPEAKER_ID_DEFAULTS
 
 
 def _block_voice_asr_service_import(monkeypatch):
@@ -82,15 +84,34 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.vad_bundle_path == VOICE_ASR_DEFAULTS["vad_bundle_path"]
     assert config_defaults.vad_deployment == VOICE_ASR_DEFAULTS["vad_deployment"]
     assert config_defaults.realtime_pre_roll_seconds == VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
+    assert config_defaults.vad_min_silence_duration == VOICE_ASR_DEFAULTS["vad_min_silence_duration"]
+    assert config_defaults.vad_post_roll_ms == VOICE_ASR_DEFAULTS["vad_post_roll_ms"]
+    assert config_defaults.vad_pre_roll_ms == VOICE_ASR_DEFAULTS["vad_pre_roll_ms"]
+    assert config_defaults.vad_min_speech_duration == VOICE_ASR_DEFAULTS["vad_min_speech_duration"]
     assert config_defaults.final_tail_padding_seconds == VOICE_ASR_DEFAULTS["final_tail_padding_seconds"]
     assert config_defaults.publish_partial == VOICE_ASR_DEFAULTS["publish_partial"]
     assert config_defaults.output_topic == VOICE_ASR_DEFAULTS["output_topic"]
+    assert config_defaults.transcript_topic == VOICE_ASR_DEFAULTS["transcript_topic"]
     assert config_defaults.sample_rate == VOICE_ASR_DEFAULTS["sample_rate"]
     assert config_defaults.chunk_size == VOICE_ASR_DEFAULTS["chunk_size"]
     assert config_defaults.buffer_seconds == VOICE_ASR_DEFAULTS["buffer_seconds"]
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
     assert config_defaults.input_mode == VOICE_ASR_DEFAULTS["input_mode"]
     assert config_defaults.external_min_samples == VOICE_ASR_DEFAULTS["external_min_samples"]
+
+
+def test_speaker_id_idle_default_matches_the_loader_and_precedes_the_asr():
+    """robot_config validates an absent idle_timeout_sec as this node's default, and
+    rejects a voiceprint that would not finalize before its transcript."""
+    assert SPEAKER_ID_DEFAULTS["idle_timeout_sec"] == SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC
+    assert SPEAKER_ID_DEFAULTS["idle_timeout_sec"] < VOICE_ASR_DEFAULTS["external_idle_timeout"]
+    assert VoiceASRConfig().external_idle_timeout == VOICE_ASR_DEFAULTS["external_idle_timeout"]
+
+
+def test_speaker_id_output_topic_default_is_the_one_the_launch_subscribes_the_bridge_to():
+    """The embodied launch derives the bridge's subscription from robot_config's copy;
+    a node publishing elsewhere by default would leave the check listening to nothing."""
+    assert SPEAKER_ID_DEFAULTS["output_topic"] == SPEAKER_EMBEDDING_OUTPUT_TOPIC
 
 
 # --- external-VAD node parameters (from robot_config's test_external_vad_config) ---
@@ -275,10 +296,15 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
             "vad_sensitivity": 0.6,
             "vad_bundle_path": "models/silero-vad",
             "vad_deployment": "torch_cpu",
+            "vad_min_silence_duration": 0.5,
+            "vad_post_roll_ms": 500.0,
+            "vad_pre_roll_ms": 300.0,
+            "vad_min_speech_duration": 0.3,
             "realtime_pre_roll_seconds": 0.5,
             "final_tail_padding_seconds": 1.5,
             "publish_partial": True,
             "output_topic": "/voice_command",
+            "transcript_topic": "/voice/transcript",
             "sample_rate": 16000,
             "chunk_size": 512,
             "buffer_seconds": 5.0,
@@ -440,3 +466,166 @@ def test_speech_direction_rejects_an_unbound_audio_input(monkeypatch, tmp_path):
     }
     with pytest.raises(ValueError, match="must be bound to a runtime description"):
         speech_direction.generate_speech_direction_actions(config)
+
+
+# --- the optional per-utterance voiceprint node (addressee gate, stage B) ---
+
+
+def _speaker_bundle(tmp_path, monkeypatch) -> str:
+    """A speaker bundle directory whose manifest the launch builder accepts.
+
+    The manifest is stubbed rather than written: packaging a real one needs the
+    ONNX file itself, and what is under test here is the launch wiring.
+    """
+    bundle = tmp_path / "campplus-speaker"
+    bundle.mkdir(exist_ok=True)
+    monkeypatch.setattr(voice_asr, "_validate_speaker_embedding_bundle", lambda *_args: None)
+    return str(bundle)
+
+
+def _speaker_embedding(tmp_path, monkeypatch) -> dict:
+    return {"enabled": True, "bundle_path": _speaker_bundle(tmp_path, monkeypatch), "deployment": "torch_cpu"}
+
+
+def test_speaker_embedding_node_is_absent_unless_enabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(voice_asr_overrides={"bundle_path": str(tmp_path)})
+
+    nodes = voice_asr.generate_voice_asr_nodes(config)
+
+    assert [node.node_executable for node in nodes] == ["voice_asr_node"]
+
+
+def test_speaker_embedding_node_shares_the_voice_asr_chunk_stream(monkeypatch, tmp_path):
+    """One bound input, two consumers: a second opinion on the topic could only disagree."""
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={
+            "bundle_path": str(tmp_path),
+            "chunk_topic": "/aima/hal/audio/speech",
+            "audio_input": _bound_audio_input("/aima/hal/audio/speech"),
+            "speaker_embedding": _speaker_embedding(tmp_path, monkeypatch),
+        }
+    )
+
+    nodes = voice_asr.generate_voice_asr_nodes(config)
+    parameters = _parameters(nodes[1])
+
+    assert [node.node_executable for node in nodes] == ["voice_asr_node", "speaker_id_node"]
+    assert parameters["chunk_topic"] == "/aima/hal/audio/speech"
+    assert parameters["output_topic"] == "/voice/speaker_embedding"
+    assert int(parameters["sample_rate"]) == VOICE_ASR_DEFAULTS["sample_rate"]
+
+
+def test_speaker_embedding_node_takes_the_configured_thresholds(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={
+            "bundle_path": str(tmp_path),
+            "speaker_embedding": {
+                "enabled": True,
+                **_speaker_embedding(tmp_path, monkeypatch),
+                "output_topic": "/voice/prints",
+                "min_speech_seconds": 1.5,
+                "max_speech_seconds": 4.0,
+            },
+        }
+    )
+
+    parameters = _parameters(voice_asr.generate_voice_asr_nodes(config)[1])
+
+    assert parameters["output_topic"] == "/voice/prints"
+    assert float(parameters["min_speech_seconds"]) == 1.5
+    assert float(parameters["max_speech_seconds"]) == 4.0
+    assert "num_threads" not in parameters
+
+
+def test_speaker_embedding_rejects_a_missing_bundle(monkeypatch, tmp_path):
+    """The node would come up and then refuse every utterance; fail at launch instead."""
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={
+            "bundle_path": str(tmp_path),
+            "speaker_embedding": {
+                "enabled": True,
+                "bundle_path": str(tmp_path / "absent"),
+                "deployment": "torch_cpu",
+            },
+        }
+    )
+
+    with pytest.raises(FileNotFoundError, match="Speaker embedding bundle not found"):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_speaker_embedding_requires_a_bundle_and_deployment(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={"bundle_path": str(tmp_path), "speaker_embedding": {"enabled": True}}
+    )
+
+    with pytest.raises(ValueError, match="bundle_path and .deployment are required"):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_speaker_embedding_rejects_the_raw_model_fields(monkeypatch, tmp_path):
+    """The model is the bundle's: a raw model_path or thread count is not a key the
+    node takes, and is rejected rather than ignored."""
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={
+            "bundle_path": str(tmp_path),
+            "speaker_embedding": {
+                **_speaker_embedding(tmp_path, monkeypatch),
+                "model_path": str(tmp_path / "campplus.onnx"),
+                "num_threads": 2,
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="unknown keys: model_path, num_threads"):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_speaker_embedding_node_is_given_the_bundle_and_deployment(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    speaker = _speaker_embedding(tmp_path, monkeypatch)
+    config = _robot_config_dict(voice_asr_overrides={"bundle_path": str(tmp_path), "speaker_embedding": speaker})
+
+    parameters = _parameters(voice_asr.generate_voice_asr_nodes(config)[1])
+
+    assert parameters["bundle_path"] == speaker["bundle_path"]
+    assert parameters["deployment"] == "torch_cpu"
+
+
+def test_speaker_embedding_needs_the_external_vad_input(monkeypatch, tmp_path):
+    """Only that path carries SpeechAudioChunk, so only it has utterance boundaries."""
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={
+            "bundle_path": str(tmp_path),
+            "input_mode": "shared_audio",
+            "speaker_embedding": _speaker_embedding(tmp_path, monkeypatch),
+        }
+    )
+
+    with pytest.raises(ValueError, match="requires voice_asr.input_mode=external_vad"):
+        voice_asr.generate_voice_asr_nodes(config)
+
+
+def test_speaker_embedding_rejects_an_unknown_key(monkeypatch, tmp_path):
+    """A misspelled key would reach declare_parameter and fail far from its cause."""
+    monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
+    config = _robot_config_dict(
+        voice_asr_overrides={
+            "bundle_path": str(tmp_path),
+            "speaker_embedding": {
+                "enabled": True,
+                **_speaker_embedding(tmp_path, monkeypatch),
+                "min_similarity": 0.5,
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="unknown keys: min_similarity"):
+        voice_asr.generate_voice_asr_nodes(config)

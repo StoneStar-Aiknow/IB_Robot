@@ -89,6 +89,7 @@ class _Publisher:
 
 class _StreamHarness:
     _invalidate_source_locked = MotionImitationStreamNode._invalidate_source_locked
+    _refresh_source_health = MotionImitationStreamNode._refresh_source_health
     _frame_current_locked = MotionImitationStreamNode._frame_current_locked
     _publish_status = MotionImitationStreamNode._publish_status
     _source_available = MotionImitationStreamNode._source_available
@@ -259,12 +260,59 @@ def test_source_recovers_from_missing_publisher_without_restarting(monkeypatch):
     harness = _status_harness(monkeypatch, publishers=0, frames=0, last_frame_at=0.0)
     harness._publish_status()
     harness.count_publishers = lambda _topic: 1
+    # The health timer, not the status callback, owns the graph probe; the
+    # recovery between two status periods is exactly one of its ticks.
+    harness._refresh_source_health()
     harness._frames = 1
     harness._last_frame_at = 19.0
     harness._publish_status()
     assert len(harness._logger.warnings) == 1
     assert len(harness._logger.infos) == 1
     assert len(harness._status_publisher.published) == 2
+
+
+def test_expected_hardware_decoder_on_cpu_is_a_status_warning(monkeypatch):
+    harness = _status_harness(monkeypatch, publishers=1, frames=3, last_frame_at=19.0)
+    harness._decoder_name = "auto"
+    harness._decoder = SimpleNamespace(cpu_frames=3, dvpp_frames=0, last_error="ImportError: ACL not loaded")
+    harness._publish_status()
+    assert len(harness._logger.warnings) == 1
+    warning = harness._logger.warnings[0]
+    assert "hardware decoder unavailable: decoding on CPU" in warning
+
+
+def test_source_health_is_probed_by_the_timer_not_the_frame_path():
+    harness = _harness()
+    harness._require_unique_publisher = True
+    probes = []
+
+    def counting_probe(_topic):
+        probes.append(1)
+        return 1
+
+    harness.count_publishers = counting_probe
+    harness._source_healthy = True
+    with harness._stats_lock:
+        # The frame path reads the cache only: thirty frames, zero probes.
+        for _ in range(30):
+            assert harness._source_available()
+    assert probes == []
+
+    harness.count_publishers = lambda _topic: 2
+    harness._refresh_source_health()
+    assert harness._source_healthy is False
+    assert not harness._source_available()
+    assert harness._source_generation == 1
+
+
+def test_first_source_check_probes_once_before_the_timer_ticks():
+    harness = _harness()
+    harness._require_unique_publisher = True
+    probes = []
+    harness.count_publishers = lambda _topic: probes.append(1) or 1
+    assert harness._source_available() is True
+    assert harness._source_available() is True
+    assert probes == [1]
 
 
 def test_resolution_change_invalidates_actor_detections():
@@ -307,8 +355,12 @@ def test_source_fault_and_recovery_during_rpc_rejects_old_result(metric, publish
 
     def result_after_fault(_client, _request, *, metric):
         publishers[0] = publisher_count
+        # The health timer, not the frame path, notices the fault and retires
+        # the generation; the frame callback then reads the cached verdict.
+        harness._refresh_source_health()
         harness._on_compressed_frame(CompressedImage())
         publishers[0] = 1
+        harness._refresh_source_health()
         assert harness._source_available()
         return _yolox_response() if metric == "yolox" else _pear_response()
 
@@ -440,8 +492,12 @@ def test_fresh_detection_and_pear_resume_after_source_recovery(publisher_count):
     assert harness._process_yolox_frame(initial.message, initial.generation)
     harness._process_pear_frame(initial.message, initial.generation)
     publishers[0] = publisher_count
+    # The timer probe retires the generation; the frame paths only read the
+    # cached verdict, so they see the fault and the recovery through it.
+    harness._refresh_source_health()
     assert not harness._source_available()
     publishers[0] = 1
+    harness._refresh_source_health()
     recovered = _image()
     recovered.header.stamp.sec = 4
     harness._decode_frame(recovered)
@@ -488,6 +544,9 @@ def test_publisher_conflict_during_pear_call_discards_the_inflight_result():
     def conflicting_response(client, request, *, metric):
         result = call_vision(client, request, metric=metric)
         publishers[0] = 2
+        # The timer probe records the conflict so the publish check that
+        # follows the RPC reads the refreshed cache and discards the result.
+        harness._refresh_source_health()
         return result
 
     harness._call_vision = conflicting_response

@@ -11,6 +11,7 @@ import uuid
 from typing import Any
 
 from embodied_common.agent_execution_contract import INTERACTIVE_CONFIRMATION
+from embodied_common.execution_detail import execution_context, short_message
 from embodied_common.skill_request import skill_goal_uuid, validate_request_schema_version
 from robot_skill_cli.output import EXIT_ROS_UNAVAILABLE, EXIT_TIMEOUT
 
@@ -129,6 +130,7 @@ class RosBridge:
             from rclpy.callback_groups import ReentrantCallbackGroup
             from rclpy.context import Context
             from rclpy.executors import MultiThreadedExecutor
+            from rclpy.qos import QoSProfile
 
             from embodied_common.wire_contracts import validate_public_request_wire_contracts
             from ibrobot_msgs.action import ExecuteAgentPlan, ExecuteProgram, PrimitiveCommand, SkillCommand
@@ -242,7 +244,11 @@ class RosBridge:
                 callback_group=callback_group,
             )
             self._program_client = ActionClient(
-                self._node, ExecuteProgram, self._execute_program_action, callback_group=callback_group
+                self._node,
+                ExecuteProgram,
+                self._execute_program_action,
+                callback_group=callback_group,
+                feedback_sub_qos_profile=QoSProfile(depth=256),
             )
             self._get_execution_client = self._node.create_client(
                 GetExecution, self._get_execution_service, callback_group=callback_group
@@ -281,18 +287,51 @@ class RosBridge:
             return False
         return True
 
-    @staticmethod
-    def _wait_future(future, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
+    #: How often a pending future is re-checked for the deadline and for an
+    #: interrupt. Completion itself does not wait for this tick -- it is
+    #: delivered by the future's done callback -- so this only bounds how
+    #: quickly a cancellation or a timeout is noticed.
+    _WAIT_POLL_SEC = 0.01
+
+    @classmethod
+    def _wait_future(cls, future, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
+        """Wait for a future, returning as soon as it completes.
+
+        This used to sleep in 10 ms steps and re-check ``future.done()``, which
+        added up to a full step to every call. The round trip itself is about
+        1 ms for even a six-figure payload, so most of the observed RPC time
+        was this sleep -- and the request path makes several calls in series.
+
+        Waiting on a done callback instead returns immediately on completion
+        while keeping the same 10 ms responsiveness to an interrupt, so
+        cancellation latency does not regress.
+        """
         deadline = time.monotonic() + timeout_sec
+        completed = threading.Event()
+        try:
+            future.add_done_callback(lambda _future: completed.set())
+        except Exception:
+            # A future implementation without done callbacks (some test
+            # doubles) still has to work; fall back to polling it.
+            while True:
+                if future.done():
+                    return True
+                if interrupt_event is not None and interrupt_event.is_set():
+                    return False
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                time.sleep(min(cls._WAIT_POLL_SEC, remaining))
         while True:
+            remaining = deadline - time.monotonic()
+            if completed.wait(min(cls._WAIT_POLL_SEC, remaining) if remaining > 0 else 0):
+                return True
             if future.done():
                 return True
             if interrupt_event is not None and interrupt_event.is_set():
                 return False
-            remaining = deadline - time.monotonic()
             if remaining <= 0.0:
                 return False
-            time.sleep(min(0.01, remaining))
 
     def wait_future(self, future, *, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
         return self._wait_future(future, timeout_sec, interrupt_event)
@@ -452,12 +491,25 @@ class RosBridge:
         request.schema_version = 1
         request.registry_epoch = registry_epoch
         request.generation = int(generation)
-        response = self._call_service(
-            self._snapshot_client,
-            request,
-            service_name=self._snapshot_service,
-            timeout_sec=timeout_sec,
-        )
+        try:
+            response = self._call_service(
+                self._snapshot_client,
+                request,
+                service_name=self._snapshot_service,
+                timeout_sec=timeout_sec,
+            )
+        except BridgeError as exc:
+            if exc.code != "RESULT_TIMEOUT":
+                raise
+            # A read-only query before any goal is sent, so asking once more is
+            # safe. Live 2026-11-03 (X2 Gateway on a loaded 310P): one of 49 pick
+            # commands got no snapshot reply right after its status call was answered.
+            response = self._call_service(
+                self._snapshot_client,
+                request,
+                service_name=self._snapshot_service,
+                timeout_sec=timeout_sec,
+            )
         return {
             "success": bool(response.success),
             "registry_epoch": str(response.registry_epoch),
@@ -769,6 +821,7 @@ class RosBridge:
         registry: dict[str, Any],
         task_budget_sec: float,
         feedback_callback=None,
+        continues_from_execution_id: str = "",
     ):
         if self._ExecuteProgram is None or self._program_client is None:
             raise BridgeError("ROS_UNAVAILABLE", "program action client is not started", exit_code=EXIT_ROS_UNAVAILABLE)
@@ -785,6 +838,7 @@ class RosBridge:
         goal.trace_id = request_id
         goal.workflow_steps = [self._workflow_step_message(step) for step in workflow_steps]
         goal.task_budget_sec = float(task_budget_sec)
+        goal.continues_from_execution_id = str(continues_from_execution_id)
         if hasattr(goal, "caller_token"):
             goal.caller_token = self._caller_token
         try:
@@ -814,12 +868,17 @@ class RosBridge:
             "execution_id": str(response.execution_id),
             "state": str(response.state),
             "error_code": str(response.error_code),
-            "message": str(response.message),
+            "message": short_message(response.message),
+            "last_event_sequence": int(response.last_event_sequence),
+            **execution_context(response),
             # Progress as the Gateway ledger recorded it; callers deciding a continuation need it.
             "completed_step_count": int(response.completed_step_count),
             "stop_requested": bool(response.stop_requested),
             "reconciled": bool(response.reconciled),
             "canonical_steps": [self._workflow_step_dict(step) for step in response.canonical_steps],
+            # Whether the interrupted step can continue from where it stopped, and how far it got.
+            "step_resumable": bool(response.step_resumable),
+            "step_progress": float(response.step_progress),
         }
 
     def get_execution_events(

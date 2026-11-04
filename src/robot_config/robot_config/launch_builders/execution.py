@@ -15,7 +15,7 @@ from robot_config.dispatch_strategies import (
 )
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
-from robot_config.runtime_target import RuntimeTarget
+from robot_config.runtime_target import RuntimeTarget, resolve_runtime_target
 from robot_config.utils import parse_bool, prepare_lerobot_env
 
 if TYPE_CHECKING:
@@ -71,19 +71,20 @@ def _benchmark_external_video_producer(
     return runtime_target is RuntimeTarget.BENCHMARK
 
 
-def _attention_viz_request(inference_config: dict) -> tuple[bool, str, dict]:
-    """Compatibility helper for the inactive attention sidecar configuration."""
-
-    config = inference_config.get("attention_viz", {}) or {}
-    return parse_bool(config.get("enabled", False), default=False), str(config.get("mode") or "file"), config
-
-
-def _validated_inference(robot_config: dict, control_mode: str) -> ControlModeInferenceConfig:
+def _validated_inference(
+    robot_config: dict,
+    control_mode: str,
+    *,
+    scheduler_enabled: bool | None = None,
+    runtime_target: RuntimeTarget | None = None,
+) -> ControlModeInferenceConfig:
     # Function-local import: keep registry construction free of the
     # inference_manifest dependency chain.
     from robot_config.inference_config import parse_inference_config
 
-    return parse_inference_config(robot_config, control_mode)
+    return parse_inference_config(
+        robot_config, control_mode, scheduler_enabled=scheduler_enabled, runtime_target=runtime_target
+    )
 
 
 def _selected_executor_pipeline(
@@ -118,6 +119,17 @@ def _selected_executor_pipeline(
             f"executor.inference_pipeline selects unknown pipeline {selection!r}; "
             f"available pipelines: {list(validated.pipelines)}"
         ) from exc
+
+
+def _resolve_execution_target(
+    robot_config: dict, runtime_target: RuntimeTarget | None, use_sim: object
+) -> tuple[RuntimeTarget, bool]:
+    """Resolve optional builder overrides with the same rules as launch preparation."""
+    requested_use_sim = None if use_sim is None else parse_bool(use_sim, default=False)
+    target = resolve_runtime_target(
+        robot_config, runtime_target.value if runtime_target is not None else "", requested_use_sim
+    )
+    return target, target is not RuntimeTarget.HARDWARE
 
 
 class ExecutorSchedulerPairingError(ValueError):
@@ -391,13 +403,26 @@ def _resolve_benchmark_step_service(robot_config: dict) -> str:
 def generate_inference_node(
     robot_config: dict,
     control_mode: str,
-    use_sim: object = False,
+    use_sim: object = None,
     use_sim_time: object | None = None,
-    runtime_target: RuntimeTarget = RuntimeTarget.HARDWARE,
+    runtime_target: RuntimeTarget | None = None,
 ) -> list[Node]:
     """Create one unified local or distributed-edge process per pipeline."""
 
-    inference = _validated_inference(robot_config, control_mode)
+    use_sim_time = _resolve_use_sim_time(use_sim, use_sim_time)
+    runtime_target, use_sim = _resolve_execution_target(robot_config, runtime_target, use_sim)
+    inference = _validated_inference(robot_config, control_mode, runtime_target=runtime_target)
+    return _generate_inference_nodes(robot_config, inference, use_sim, use_sim_time, runtime_target)
+
+
+def _generate_inference_nodes(
+    robot_config: dict,
+    inference: ControlModeInferenceConfig,
+    use_sim: bool,
+    use_sim_time: object | None,
+    runtime_target: RuntimeTarget,
+) -> list[Node]:
+    """Build pipeline nodes from the resolved target and validated configuration."""
     if not inference.enabled:
         return []
     robot_config_path = robot_config.get("_config_path", "")
@@ -406,7 +431,7 @@ def generate_inference_node(
 
     environment = prepare_lerobot_env()
     use_sim_clock = _resolve_use_sim_time(use_sim, use_sim_time)
-    is_sim = parse_bool(use_sim, default=False)
+    scheduler = inference.scheduler
     nodes: list[Node] = []
     for pipeline in inference.pipelines.values():
         transport = pipeline.transport
@@ -419,7 +444,7 @@ def generate_inference_node(
             "default_task": pipeline.default_task,
             "runtime_options_json": json.dumps(dict(pipeline.runtime_options), sort_keys=True, separators=(",", ":")),
             "robot_config_path": str(robot_config_path),
-            "use_sim": is_sim,
+            "use_sim": use_sim,
             "use_sim_time": use_sim_clock,
             "node_name": transport.node_name,
             "action_server": transport.action_server,
@@ -437,7 +462,6 @@ def generate_inference_node(
         # Scheduled-path endpoints are passed to the pipeline node only
         # when the scheduler is enabled; the node registers the scheduled
         # action servers + serving status iff scheduler_enabled=true.
-        scheduler = inference.scheduler if inference.scheduler is not None else None
         if scheduler is not None and scheduler.enable:
             parameters["scheduled_open_session"] = transport.open_session
             parameters["scheduled_dispatch"] = transport.dispatch
@@ -527,7 +551,14 @@ def generate_inference_node(
     return nodes
 
 
-def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_sim: object = False) -> Node:
+def generate_action_dispatcher_node(
+    robot_config: dict,
+    control_mode: str,
+    use_sim: object = False,
+    *,
+    inference: ControlModeInferenceConfig | None = None,
+) -> Node:
+    """Build the dispatcher, reusing validated inference when supplied by the graph builder."""
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
         raise ValueError("robot_config dict is missing '_config_path'; load it through robot_config.loader")
@@ -544,7 +575,8 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
             "robot configuration (see docs/robot_interface_schema.md)"
         )
 
-    inference = _validated_inference(robot_config, control_mode)
+    if inference is None:
+        inference = _validated_inference(robot_config, control_mode)
     pipeline = _selected_executor_pipeline(robot_config, control_mode, inference)
     mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
     executor_config = mode_config.get("executor", {}) or {}
@@ -724,9 +756,11 @@ def _benchmark_process_exit_shutdown_factory(node: object):
 def generate_execution_nodes(
     robot_config: dict,
     control_mode: str = "model_inference",
-    use_sim: object = False,
+    use_sim: object = None,
     use_sim_time: object | None = None,
-    runtime_target: RuntimeTarget = RuntimeTarget.HARDWARE,
+    runtime_target: RuntimeTarget | None = None,
+    *,
+    scheduler_enabled: bool | None = None,
 ) -> list:
     """Generate the execution subgraph for one control mode.
 
@@ -739,62 +773,44 @@ def generate_execution_nodes(
     from launch.actions import RegisterEventHandler
     from launch.event_handlers import OnProcessExit
 
-    # Function-local import: keep registry construction free of the
-    # inference_manifest dependency chain.
-    from robot_config.inference_config import InferenceConfigError
-
     if not control_mode or control_mode == "default":
         control_mode = robot_config.get("default_control_mode", "model_inference")
 
-    inference = _validated_inference(robot_config, control_mode)
-    scheduler = inference.scheduler if inference.scheduler is not None else None
+    use_sim_time = _resolve_use_sim_time(use_sim, use_sim_time)
+    runtime_target, use_sim = _resolve_execution_target(robot_config, runtime_target, use_sim)
+    inference = _validated_inference(
+        robot_config, control_mode, scheduler_enabled=scheduler_enabled, runtime_target=runtime_target
+    )
+    scheduler = inference.scheduler
 
-    # scheduler.enable=true selects the scheduled topology.
+    # robot.runtime_scheduler.enable=true selects the scheduled topology.
     if scheduler is not None and scheduler.enable:
         if not _executor_enabled(robot_config, control_mode):
             raise ValueError(
-                f"control mode {control_mode!r} sets executor.enabled=false with inference.scheduler.enable=true; "
+                f"control mode {control_mode!r} sets executor.enabled=false with robot.runtime_scheduler.enable=true; "
                 "the scheduled topology exists to feed a dispatcher, so disable one or the other rather than "
                 "leaving the switch to mean two different things"
             )
-        if runtime_target is RuntimeTarget.SIMULATION or (
-            runtime_target is not RuntimeTarget.BENCHMARK and parse_bool(use_sim, default=False)
-        ):
-            raise InferenceConfigError(
-                "simulation does not support inference.scheduler.enable=true; set scheduler.enable=false"
-            )
-        inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
+        inference_nodes = _generate_inference_nodes(robot_config, inference, use_sim, use_sim_time, runtime_target)
         scheduler_node = generate_global_inference_scheduler_node(
-            robot_config, control_mode, scheduler, _resolve_use_sim_time(use_sim, use_sim_time)
+            robot_config, control_mode, scheduler, use_sim_time, inference=inference
         )
         scheduled_dispatcher = generate_scheduled_action_dispatcher_node(
-            robot_config, control_mode, scheduler, _resolve_use_sim_time(use_sim, use_sim_time)
+            robot_config, control_mode, scheduler, use_sim_time, inference=inference
         )
-        benchmark_lifecycle = runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config)
-        if benchmark_lifecycle:
-            # Benchmark distributed inference may add a separate loopback cloud
-            # process for each pipeline. All of its execution nodes are required
-            # for the evaluation/action closure.
-            required_nodes = [*inference_nodes, scheduler_node, scheduled_dispatcher]
-        else:
-            required_pipeline_nodes = [
-                node
-                for node, pipeline in zip(inference_nodes, inference.pipelines.values(), strict=True)
-                if pipeline.required
-            ]
-            # Optional pipelines may disappear without killing required serving.
-            # Global readiness/routing already excludes their stale or missing status.
-            required_nodes = [*required_pipeline_nodes, scheduler_node, scheduled_dispatcher]
-        exit_handler_factory = (
-            _benchmark_process_exit_shutdown_factory
-            if benchmark_lifecycle
-            else _scheduled_process_exit_shutdown_factory
-        )
+        required_pipeline_nodes = [
+            node
+            for node, pipeline in zip(inference_nodes, inference.pipelines.values(), strict=True)
+            if pipeline.required
+        ]
+        # Optional pipelines may disappear without killing required serving.
+        # Global readiness/routing already excludes their stale or missing status.
+        required_nodes = [*required_pipeline_nodes, scheduler_node, scheduled_dispatcher]
         exit_handlers = [
             RegisterEventHandler(
                 event_handler=OnProcessExit(
                     target_action=node,
-                    on_exit=exit_handler_factory(node),
+                    on_exit=_scheduled_process_exit_shutdown_factory(node),
                 )
             )
             for node in required_nodes
@@ -802,7 +818,7 @@ def generate_execution_nodes(
         return [*inference_nodes, scheduler_node, scheduled_dispatcher, *exit_handlers]
 
     # False or absent selects the unchanged legacy behavior.
-    inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
+    inference_nodes = _generate_inference_nodes(robot_config, inference, use_sim, use_sim_time, runtime_target)
     if not _executor_enabled(robot_config, control_mode):
         # A recording-only deployment streams video but has no inference backend
         # to answer a request. Dispatching one anyway lets it time out, and the
@@ -812,12 +828,13 @@ def generate_execution_nodes(
     dispatcher = generate_action_dispatcher_node(
         robot_config,
         control_mode,
-        _resolve_use_sim_time(use_sim, use_sim_time),
+        use_sim_time,
+        inference=inference,
     )
     nodes = [*inference_nodes, dispatcher]
     if runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config):
         # The benchmark configuration uses the legacy dispatcher topology
-        # (dispatch.scheduler is a benchmark contract, not inference.scheduler).
+        # (dispatch.scheduler selects the benchmark dispatch strategy).
         # Add the same required-process policy without changing native launches.
         handlers = [
             RegisterEventHandler(
@@ -837,12 +854,15 @@ def generate_global_inference_scheduler_node(
     control_mode: str,
     scheduler: object,
     use_sim_time: bool,
+    *,
+    inference: ControlModeInferenceConfig | None = None,
 ) -> Node:
     """Independent GlobalInferenceScheduler process and single writable Scheduler."""
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
         raise ValueError("robot_config dict is missing '_config_path'; load it through robot_config.loader")
-    inference = _validated_inference(robot_config, control_mode)
+    if inference is None:
+        inference = _validated_inference(robot_config, control_mode)
     # Read-only per-pipeline status and transport parameters keep Scheduler and
     # pipeline endpoint names aligned.
     pipeline_endpoints: list[dict] = []
@@ -925,13 +945,16 @@ def generate_scheduled_action_dispatcher_node(
     control_mode: str,
     scheduler: object,
     use_sim_time: bool,
+    *,
+    inference: ControlModeInferenceConfig | None = None,
 ) -> Node:
     """ScheduledActionDispatcher executable. Shares node name
     `/action_dispatcher` with the legacy dispatcher; the two never coexist."""
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
         raise ValueError("robot_config dict is missing '_config_path'; load it through robot_config.loader")
-    inference = _validated_inference(robot_config, control_mode)
+    if inference is None:
+        inference = _validated_inference(robot_config, control_mode)
     mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
     executor_config = mode_config.get("executor", {}) or {}
     scheduler_mode, _execution_timeout_sec, chunking_yaml, blending_yaml = _resolve_dispatch_section(mode_config)
@@ -1001,6 +1024,7 @@ def build_execution(context: LaunchBuildContext) -> BuildResult:
         context.use_sim,
         use_sim_time=context.node_use_sim_time,
         runtime_target=context.runtime_target,
+        scheduler_enabled=context.scheduler_enabled,
     )
     logger.info(f"Prepared {len(nodes)} execution nodes")
     return BuildResult(actions=list(nodes))

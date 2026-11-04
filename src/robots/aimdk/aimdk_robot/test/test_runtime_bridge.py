@@ -9,26 +9,29 @@ independence gate applies.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("aimdk_msgs", reason="AimDK overlay not sourced; source the vendor workspace to run these")
 
-from aimdk_robot import projection  # noqa: E402
+from aimdk_robot import dataplane, projection  # noqa: E402
+from aimdk_robot import vendor_gateway as vendor  # noqa: E402
 from aimdk_robot.runtime_node import AimdkRuntimeNode  # noqa: E402
 from aimdk_robot.vendor_mock_node import AimdkVendorMock  # noqa: E402
 from geometry_msgs.msg import Twist  # noqa: E402
 from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from sensor_msgs.msg import JointState  # noqa: E402
-from std_msgs.msg import Float64MultiArray  # noqa: E402
+from std_msgs.msg import Float64MultiArray, String  # noqa: E402
 from std_srvs.srv import SetBool  # noqa: E402
 
 from ibrobot_msgs.action import ExecuteNamedMotion  # noqa: E402
-from ibrobot_msgs.msg import PowerState  # noqa: E402
+from ibrobot_msgs.msg import JointCommandState, PowerState  # noqa: E402
 from ibrobot_msgs.srv import (  # noqa: E402
     GetRuntimeStatus,
     PlayExpression,
@@ -37,6 +40,7 @@ from ibrobot_msgs.srv import (  # noqa: E402
     SpeakText,
     StopRuntime,
 )
+from robot_runtime.profile import load_profile  # noqa: E402
 
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_ultra.yaml"
 OMNIHAND_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "x2_ultra_omnihand.yaml"
@@ -44,11 +48,12 @@ TIMEOUT_S = 15.0
 
 
 class Harness:
-    """A running bridge + vendor mock pair, with client helpers."""
+    """A running bridge + data plane + vendor mock, with client helpers."""
 
     def __init__(self, profile: Path = PROFILE, **mock_params) -> None:
         overrides = [rclpy.parameter.Parameter(name, value=value) for name, value in mock_params.items()]
         self.mock = AimdkVendorMock(parameter_overrides=overrides)
+        self.dataplane = dataplane.start_process(load_profile(profile))
         self.runtime = AimdkRuntimeNode(
             parameter_overrides=[
                 rclpy.parameter.Parameter("profile", value=str(profile)),
@@ -64,6 +69,8 @@ class Harness:
         self._thread.start()
 
     def shutdown(self) -> None:
+        self.dataplane.terminate()
+        self.dataplane.wait(timeout=5.0)
         self.executor.shutdown(timeout_sec=2.0)
         for node in (self.node, self.runtime, self.mock):
             node.destroy_node()
@@ -111,6 +118,9 @@ class Harness:
 
     def publish(self, topic: str, message, message_type=Float64MultiArray, count: int = 15):
         publisher = self.node.create_publisher(message_type, topic, 10)
+        # The channels are the data plane's, another process: a sample published
+        # before it has matched this new publisher is lost (best effort).
+        self.wait_for(lambda: publisher.get_subscription_count() > 0, f"a subscriber on {topic}")
         for _ in range(count):
             publisher.publish(message)
             time.sleep(0.02)
@@ -126,6 +136,13 @@ def _sensor_qos():
         history=HistoryPolicy.KEEP_LAST,
         depth=10,
     )
+
+
+def _vendor_qos(key: str):
+    """What the platform publishes ``key`` with: a test standing in for it must match, or nothing is delivered."""
+    from aimdk_robot.vendor_mock_node import _qos
+
+    return _qos(key)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -494,6 +511,50 @@ def test_stop_keeps_admission_closed_when_the_platform_rejects_it(harness):
     harness.mock.set_parameters([rclpy.parameter.Parameter("reject_action_code", value=0)])
     assert harness.set_mode("idle").success
     assert not harness.status().stop_latched
+
+
+def test_a_stop_the_data_plane_did_not_confirm_is_not_reported_as_stopped(harness):
+    """A stop that heard no acknowledgement has not proven the output closed.
+
+    The word that carries the explicit zero velocity went nowhere; the answer
+    must say so, keep the latch and keep admission closed, and the pending
+    safe word must still reach the platform once the wiring answers again.
+    """
+    harness.wait_active()
+    assert harness.set_mode("stream").success
+    real_pub = harness.runtime._control_pub
+    harness.runtime._control_pub = SimpleNamespace(publish=lambda _message: None)
+    try:
+        request = StopRuntime.Request()
+        request.policy = "HOLD"
+        response = harness.call(StopRuntime, "/runtime/stop", request)
+        assert not response.success
+        assert "did not confirm the safe command" in response.message
+        status = harness.status()
+        assert status.stop_latched, "an unconfirmed safe command must not reopen admission"
+        assert status.active_mode == "idle"
+        assert any("did not confirm the safe command" in fault for fault in status.faults)
+    finally:
+        harness.runtime._control_pub = real_pub
+    # The heartbeat re-sends the word the data plane never saw, the safe counter
+    # still ahead of what it applied: once the wiring is back the data plane
+    # confirms it and the zero it asks for reaches the platform.
+    harness.wait_for(
+        lambda: (
+            harness.runtime._dataplane.control_seq >= harness.runtime._control.seq
+            and harness.runtime._dataplane.control_seq > 0
+        ),
+        "the data plane to confirm the pending control word",
+    )
+    harness.wait_for(
+        lambda: (
+            harness.mock.last_locomotion is not None
+            and harness.mock.last_locomotion.forward_velocity == 0.0
+            and harness.mock.last_locomotion.lateral_velocity == 0.0
+            and harness.mock.last_locomotion.angular_velocity == 0.0
+        ),
+        "the zero velocity the stop asked for",
+    )
 
 
 def test_idle_cannot_clear_a_stop_that_is_still_in_progress():
@@ -916,9 +977,15 @@ def test_vendor_audio_playback_is_published_reliable(harness):
     playback = harness.runtime._playback_pub.qos_profile
     assert playback.reliability == ReliabilityPolicy.RELIABLE
     assert playback.durability == DurabilityPolicy.VOLATILE
-    # The vendor's command tier is BEST_EFFORT, and stays that way.
-    assert harness.runtime._upper_body_pub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
-    assert harness.runtime._locomotion_pub.qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
+    # The vendor's command tier is BEST_EFFORT, and stays that way; the data plane publishes it.
+    for topic in ("/mc/upper_body_command", "/aima/mc/locomotion/velocity"):
+        publishers = harness.wait_for(
+            lambda topic=topic: [
+                info for info in harness.node.get_publishers_info_by_topic(topic) if info.node_name == "aimdk_dataplane"
+            ],
+            f"the data plane publishing {topic}",
+        )
+        assert publishers[0].qos_profile.reliability == ReliabilityPolicy.BEST_EFFORT
 
 
 def test_vendor_audio_capture_is_read_best_effort(harness):
@@ -1060,11 +1127,19 @@ def test_hand_state_stream_confirms_what_the_service_does_not_know():
 def test_hand_subsystem_error_is_reported_without_claiming_a_mismatch():
     harness = Harness(hand_type="error")
     try:
+        # Wait for this fault by name: while the data plane's first report is on its
+        # way, a stale-feedback fault can be listed first.
         status = harness.wait_for(
-            lambda: harness.status() if harness.status().faults else None,
+            lambda: next(
+                (
+                    status
+                    for status in [harness.status()]
+                    if status.lifecycle != "CONNECTING" and any("hand subsystem error" in f for f in status.faults)
+                ),
+                None,
+            ),
             "the hand error to be reported",
         )
-        assert any("hand subsystem error" in fault for fault in status.faults)
         assert not any("mismatch" in fault for fault in status.faults)
         assert status.lifecycle == "DEGRADED", "a hand fault is not a wrong declaration"
     finally:
@@ -1077,6 +1152,67 @@ def test_a_dexterous_family_variant_still_matches_the_dexterous_profile():
     try:
         harness.wait_active()
         assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_the_microphones_and_the_speaker_are_served_under_their_own_capabilities():
+    """Each audio capability wires its own side, so a profile may declare one without the other."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        subscribed = {subscription.topic_name for subscription in harness.runtime.subscriptions}
+        published = {publisher.topic_name for publisher in harness.runtime.publishers}
+        assert {"/aima/hal/audio/capture", "/agent/process_audio_output"} <= subscribed
+        assert "/audio/capture_stamped" in published
+        capabilities = json.loads(harness.status().capabilities_json)
+        assert "interaction.audio_capture" in capabilities
+        assert "interaction.audio_playback" in capabilities
+        # The speaker is wired by the playback capability, not by the capture one.
+        assert "/audio/play" in subscribed and "/aima/hal/audio/playback" in published
+        assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_a_mode_whose_action_the_platform_already_runs_is_entered_without_a_switch():
+    """The firmware refuses a switch to the action it runs (MotionBusy): a robot left in URS must still stream."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", initial_action="UPPERBODY_REMOTE_SPLIT")
+    try:
+        harness.wait_active()
+        response = harness.set_mode("policy_stream")
+        assert response.success, response.message
+        assert harness.status().active_mode == "policy_stream"
+        assert harness.platform_action() == "UPPERBODY_REMOTE_SPLIT"
+        assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_an_action_report_older_than_the_last_switch_or_stale_is_not_trusted():
+    """Skipping SetMcAction needs a fresh report taken after this runtime last asked for an action."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", initial_action="UPPERBODY_REMOTE_SPLIT")
+    try:
+        harness.wait_active()
+        runtime = harness.runtime
+        calls = []
+        real_call = runtime._set_action.call
+        runtime._set_action.call = lambda request: calls.append(request) or real_call(request)
+        runtime._on_mc_state = lambda message: None  # freeze the cached report
+        now = time.monotonic()
+        with runtime._lock:
+            runtime._vendor_action, runtime._vendor_action_running = "UPPERBODY_REMOTE_SPLIT", True
+            runtime._vendor_action_at, runtime._action_requested_at = now, now - 1.0
+        ok, message = runtime._request_vendor_mode("policy_stream", runtime._state.stop_epoch)
+        assert ok and "already in" in message and calls == []
+        with runtime._lock:
+            runtime._action_requested_at = now + 0.01  # a stop asked for another action since
+        runtime._request_vendor_mode("policy_stream", runtime._state.stop_epoch)
+        assert len(calls) == 1
+        with runtime._lock:
+            runtime._vendor_action_at, runtime._action_requested_at = now - 2.0, now - 3.0  # stale
+        runtime._request_vendor_mode("policy_stream", runtime._state.stop_epoch)
+        assert len(calls) == 2
     finally:
         harness.shutdown()
 
@@ -1347,7 +1483,9 @@ def test_joint_states_are_published_at_the_declared_rate_not_the_vendor_rate(har
     harness.wait_for(lambda: len(stamps) > 5, "joint states to flow")
     stamps.clear()
     time.sleep(2.0)
-    declared = harness.runtime._joint_state_rate_hz
+    from robot_runtime.profile import load_profile
+
+    declared = projection.joint_state_rate_hz(load_profile(PROFILE))
     observed = len(stamps) / 2.0
     assert declared * 0.7 <= observed <= declared * 1.3, f"declared {declared} Hz, observed {observed:.1f} Hz"
 
@@ -1374,14 +1512,23 @@ def test_an_interaction_service_call_does_not_look_like_a_clock_drift(harness):
     assert not [fault for fault in status.faults if "clock" in fault]
 
 
-def test_platform_state_is_read_off_the_feedback_torrents_callback_group(harness):
-    """Low-rate state must not queue behind ~2500 joint callbacks a second."""
+def test_the_runtime_takes_none_of_the_platforms_high_rate_state_itself(harness):
+    """~2800 samples a second are the data plane's; the Python runtime subscribes none of them.
+
+    Converting them under this process's GIL held the 310P's /joint_states at
+    0.5 Hz, and every way of reading fewer of them left a one-frame fault unseen.
+    """
     harness.wait_active()
-    telemetry = harness.runtime._telemetry_cb
-    joint_publish = harness.runtime._joint_pub_cb
-    assert telemetry is not joint_publish
-    assert telemetry is not harness.runtime.default_callback_group
-    assert joint_publish is not harness.runtime.default_callback_group
+    for topic in (
+        "/aima/hal/joint/arm/state",
+        "/aima/hal/joint/head/state",
+        "/aima/hal/joint/waist/state",
+        "/aima/hal/joint/leg/state",
+        "/aima/hal/joint/hand/state",
+    ):
+        readers = {info.node_name for info in harness.node.get_subscriptions_info_by_topic(topic)}
+        assert "aimdk_dataplane" in readers, (topic, readers)
+        assert not any(name.startswith("aimdk_runtime") for name in readers), (topic, readers)
 
 
 def test_hand_state_is_not_taken_up_behind_the_feedback_torrent(harness):
@@ -1579,12 +1726,12 @@ def test_a_preemption_is_seen_from_the_state_stream_without_waiting_for_a_poll()
     """The holder arrives ten times a second; waiting for the poll drops commands."""
     harness = Harness(arbitration_holder="rc", arbitration_holder_priority=80)
     try:
-        # Faster than the 1 Hz arbitration poll: this can only come from the
+        # The arbitration poll is silenced, so a degrade can only come from the
         # state message, which carries the same fact.
+        harness.runtime._get_input.ready = lambda _timeout: False
         status = harness.wait_for(
             lambda: harness.status() if harness.status().lifecycle == "DEGRADED" else None,
             "the runtime to degrade from the state stream",
-            timeout_s=0.9,
         )
         assert any("held by 'rc'" in fault for fault in status.faults)
     finally:
@@ -1628,6 +1775,176 @@ def test_head_targets_are_checked_against_the_platform_travel(harness):
     assert any("HEAD_COMMAND_RANGE" in channel for channel in status.rejected_channels)
 
 
+def test_the_arm_command_is_republished_with_its_gains_in_the_declared_order():
+    """What the motion-control unit drives the arm to, apart from where the arm is."""
+    received: list[JointCommandState] = []
+    # A loaded arm settles below its target; the mock models that gap as an offset.
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", arm_command_offset=0.05)
+    try:
+        harness.node.create_subscription(JointCommandState, "/aimdk/arm/command_state", received.append, _sensor_qos())
+        echo = harness.wait_for(lambda: received[-1] if received else None, "an arm command echo")
+        assert list(echo.name) == list(projection.VENDOR_ARM_ORDER)
+        assert echo.stiffness.tolist() == [40.0] * 14 and echo.damping.tolist() == [2.0] * 14
+        # Stamped with the HAL's own time, not this host's receipt.
+        assert echo.header.stamp.sec > 0
+        measured = harness.mock._positions.get("left_elbow_joint", 0.0)
+        assert echo.position[echo.name.index("left_elbow_joint")] == pytest.approx(measured + 0.05)
+
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        command = Float64MultiArray()
+        command.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", command)
+        echo = harness.wait_for(
+            lambda: received[-1] if received and received[-1].position[0] == pytest.approx(0.2) else None,
+            "the echo to follow the streamed target",
+        )
+        assert list(echo.position) == pytest.approx([0.2] * 14)  # the target; the arm settles below it
+    finally:
+        harness.shutdown()
+
+
+def test_a_quiet_hand_channel_holds_the_measured_hand_instead_of_voiding_the_arm():
+    """In the dexterous joint sub-mode the platform drops a command without hand targets, arm included."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        command = Float64MultiArray()
+        command.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", command)  # no hand command at all
+        sent = harness.wait_for(
+            lambda: (m := harness.mock.last_upper_body) is not None and m.arm_pos[0] == pytest.approx(0.2) and m,
+            "the arm command to reach the platform",
+        )
+        assert int(sent.hand_sub_mode) == projection.HAND_SUB_MODE_DEXTEROUS_JOINT and len(sent.hand_pos) == 20
+        measured = [harness.mock._positions[f"L_{part}_joint"] for part in projection.DEXTEROUS_JOINT_ORDER]
+        assert list(sent.hand_pos[:10]) == pytest.approx(measured, abs=1e-6)
+        assert harness.mock.discarded_upper_body == 0
+    finally:
+        harness.shutdown()
+
+
+def test_a_quiet_hand_channel_keeps_its_last_command_so_a_grip_stays_squeezed():
+    """A hand closed on an object stops short of its target; sending back where it stopped would let go."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", follow_commands=False)  # the object blocks it
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        closed = Float64MultiArray()
+        closed.data = [0.6] * 10 + [0.0] * 10
+        harness.publish("/aimdk/hand/joint_commands", closed, count=10)  # then the hand executor goes quiet
+        arm = Float64MultiArray()
+        arm.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", arm, count=50)  # a one-second lift, well past the hand's staleness
+        sent = harness.mock.last_upper_body
+        measured = [harness.mock._positions.get(f"L_{part}_joint", 0.0) for part in projection.DEXTEROUS_JOINT_ORDER]
+        assert measured != pytest.approx([0.6] * 10)
+        assert list(sent.hand_pos) == pytest.approx([0.6] * 10 + [0.0] * 10)
+        assert harness.set_mode("idle").success and harness.set_mode("policy_stream").success
+        harness.publish("/aimdk/arm/commands", arm, count=5)  # a new mode starts from the measured hand again
+        assert list(harness.mock.last_upper_body.hand_pos[:10]) == pytest.approx(measured, abs=1e-6)
+    finally:
+        harness.shutdown()
+
+
+def test_without_a_fresh_board_a_quiet_arm_repeats_what_was_last_sent():
+    """A board that goes quiet must not stop head and hand streams; the platform holds the last arm target."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", arm_command_offset=0.05)
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        arm = Float64MultiArray()
+        arm.data = [0.2] * 14
+        harness.publish("/aimdk/arm/commands", arm, count=10)
+        harness.mock.set_parameters([rclpy.parameter.Parameter("publish_arm_command", value=False)])
+        time.sleep(0.6)  # the arm channel and the board both go quiet
+        hand = Float64MultiArray()
+        hand.data = [0.1] * 10 + [0.0] * 10
+        before = harness.mock.upper_body_count
+        harness.publish("/aimdk/hand/joint_commands", hand, count=10)
+        assert harness.mock.upper_body_count > before
+        assert list(harness.mock.last_upper_body.arm_pos) == pytest.approx([0.2] * 14)
+        assert list(harness.mock.last_upper_body.hand_pos[:10]) == pytest.approx([0.1] * 10)
+        # A new mode has sent nothing yet: without a board there is no arm target to hold.
+        assert harness.set_mode("idle").success and harness.set_mode("policy_stream").success
+        before = harness.mock.upper_body_count
+        harness.publish("/aimdk/hand/joint_commands", hand, count=10)
+        assert harness.mock.upper_body_count == before
+    finally:
+        harness.shutdown()
+
+
+def test_a_quiet_arm_channel_holds_the_controllers_target_not_the_sagging_arm():
+    """Holding the measured arm re-targets it below where it hangs, every tick: it sank on the robot."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", arm_command_offset=0.05)
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        before = harness.mock._positions.get("left_elbow_joint", 0.0)
+        hand = Float64MultiArray()
+        left = [harness.mock._positions.get(f"L_{part}_joint", 0.0) for part in projection.DEXTEROUS_JOINT_ORDER]
+        hand.data = left + [0.0] * 10
+        harness.publish("/aimdk/hand/joint_commands", hand, count=50)  # one second of hand only
+        sent = harness.wait_for(lambda: harness.mock.last_upper_body, "a hand command to reach the platform")
+        index = projection.VENDOR_ARM_ORDER.index("left_elbow_joint")
+        assert sent.arm_pos[index] == pytest.approx(before + 0.05)  # the board, not the measured arm
+        assert harness.mock._positions.get("left_elbow_joint", 0.0) == pytest.approx(before)
+    finally:
+        harness.shutdown()
+
+
+def test_an_incomplete_or_nonfinite_arm_command_is_not_a_target():
+    """Only a command board that covers every declared joint with finite values is echoed (and held)."""
+    from aimdk_msgs.msg import JointCommand, JointCommandArray
+
+    from ibrobot_msgs.msg import JointCommandState
+
+    names = list(projection.VENDOR_ARM_ORDER)
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", publish_arm_command=False)
+    try:
+        harness.wait_active()
+        echoes: list = []
+        harness.node.create_subscription(JointCommandState, "/aimdk/arm/command_state", echoes.append, _sensor_qos())
+        board = harness.node.create_publisher(
+            JointCommandArray, "/aima/hal/joint/arm/command", _vendor_qos("arm_command")
+        )
+        harness.wait_for(lambda: board.get_subscription_count() > 0, "the data plane on the command board")
+
+        def send(joints, times=10):
+            message = JointCommandArray(joints=joints)
+            message.header.stamp.sec = 5
+            for _ in range(times):
+                board.publish(message)
+                time.sleep(0.02)
+
+        def joint(name, position):
+            return JointCommand(name=name, position=position, stiffness=40.0, damping=2.0)
+
+        send([joint(name, 0.1) for name in names[:13]])  # one declared joint missing
+        send([joint(name, float("nan") if name == names[0] else 0.1) for name in names])
+        send([joint(names[0], 0.1), joint(names[0], 0.2), *(joint(name, 0.1) for name in names[1:])])
+        time.sleep(0.2)
+        assert echoes == []
+        send([joint(name, 0.1) for name in reversed(names)])
+        echo = harness.wait_for(lambda: echoes, "the echo of a complete board")[-1]
+        assert list(echo.name) == names and list(echo.position) == [0.1] * 14
+        assert list(echo.stiffness) == [40.0] * 14 and echo.header.stamp.sec == 5
+    finally:
+        harness.shutdown()
+
+
+def test_only_a_profile_that_declares_the_arm_command_echo_publishes_one():
+    from aimdk_robot.dataplane import ARM_COMMAND_STATE
+    from aimdk_robot.dataplane import arm_command_state as _arm_command_state
+
+    from robot_runtime.profile import load_profile
+
+    assert _arm_command_state(load_profile(OMNIHAND_PROFILE))[0] == "/aimdk/arm/command_state"
+    assert ARM_COMMAND_STATE not in (load_profile(PROFILE).get("interfaces") or {})
+    assert _arm_command_state(load_profile(PROFILE)) is None
+
+
 def test_dexterous_hand_touch_is_republished_with_named_pads():
     """The densest contact sensor on the robot rides on a message already subscribed."""
     received: list[Float64MultiArray] = []
@@ -1649,6 +1966,288 @@ def test_dexterous_hand_touch_is_republished_with_named_pads():
         harness.shutdown()
 
 
+def test_dexterous_hand_joint_states_are_published_in_the_declared_order():
+    """Grasping needs the finger pose at image time; the hands are not in /joint_states."""
+    received: list[JointState] = []
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.node.create_subscription(JointState, "/aimdk/hand/joint_states", received.append, 10)
+        message = harness.wait_for(lambda: received[-1] if received else None, "a hand joint state message")
+        import yaml
+
+        declared = yaml.safe_load(OMNIHAND_PROFILE.read_text())["interfaces"]["joint.hand_state"]["joint_names"]
+        # The mock reports the platform's finger joints; the runtime publishes all of
+        # them in the declared order, so the profile and the mock cannot drift apart.
+        assert list(message.name) == declared
+        assert len(declared) == 20 and declared[10] == "R_thumb_roll_joint"
+        assert len(message.position) == len(message.velocity) == len(message.effort) == 20
+        assert message.header.stamp.sec > 0
+    finally:
+        harness.shutdown()
+
+
+def test_a_slow_group_does_not_hold_back_the_stamp_of_views_it_does_not_feed():
+    """The hand view is stamped from the hand group only, not from the legs.
+
+    With the leg feed stopped, its last receipt stays fresh for the staleness
+    window. A stamp taken across every group would freeze there, and a consumer
+    keeping an ordered history would drop every newer finger sample as a repeat.
+    """
+    received: list[JointState] = []
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        harness.mock.set_parameters(
+            [rclpy.parameter.Parameter("publish_joint_groups", value=["arm", "head", "waist", "hand"])]
+        )
+        time.sleep(0.05)
+        harness.node.create_subscription(JointState, "/aimdk/hand/joint_states", received.append, 10)
+        harness.wait_for(lambda: len(received) >= 8, "eight hand joint state messages", timeout_s=3.0)
+        stamps = [message.header.stamp.sec * 10**9 + message.header.stamp.nanosec for message in received[:8]]
+        # Eight 50 Hz messages span ~140 ms. A stamp pinned to the stopped leg feed
+        # would not move at all; one may repeat when no new hand sample arrived.
+        assert stamps == sorted(stamps)
+        assert stamps[-1] - stamps[0] >= 80_000_000, f"hand view stamp held back: {stamps}"
+    finally:
+        harness.shutdown()
+
+
+def test_a_profile_listed_joint_fault_degrades_the_runtime_and_clears_when_healthy():
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=5)])
+        status = harness.wait_for(
+            lambda: harness.status() if harness.status().lifecycle == "DEGRADED" else None,
+            "the arm joint fault to be reported",
+        )
+        fault = next(fault for fault in status.faults if fault.startswith("arm joint fault"))
+        assert "left_shoulder_pitch_joint=5" in fault
+
+        harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=0)])
+        harness.wait_active()
+        assert not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_a_fault_code_in_a_single_sample_between_reads_is_still_seen():
+    """The runtime reads platform state at 50 Hz; a fault the HAL reports for one 2 ms sample must not slip past."""
+    from aimdk_msgs.msg import JointStateArray
+    from rclpy.qos import qos_profile_sensor_data
+
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        captured: list = []
+        harness.node.create_subscription(
+            JointStateArray, "/aima/hal/joint/arm/state", captured.append, qos_profile_sensor_data
+        )
+        harness.wait_for(lambda: captured, "an arm state from the platform")
+        burst = harness.node.create_publisher(JointStateArray, "/aima/hal/joint/arm/state", _vendor_qos("joint_state"))
+        seen: list = []
+        report = harness.runtime._report_joint_faults
+
+        def recording(group, codes):
+            seen.extend(code for _name, code in codes if code)
+            report(group, codes)
+
+        harness.runtime._report_joint_faults = recording
+        message = captured[-1]
+        for _ in range(5):
+            message.joints[0].error_code = 7
+            message.header.stamp = harness.node.get_clock().now().to_msg()
+            burst.publish(message)  # one faulted sample, then healthy ones right behind it
+            message.joints[0].error_code = 0
+            for _ in range(5):
+                message.header.stamp = harness.node.get_clock().now().to_msg()
+                burst.publish(message)
+            time.sleep(0.1)
+        assert seen.count(7) >= 4, seen  # best effort on loopback may drop one
+    finally:
+        harness.shutdown()
+
+
+def test_the_mock_dexterous_hand_follows_its_joint_commands():
+    """With follow_commands, the mock's fingers go where the hand stream sends them."""
+    received: list[JointState] = []
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        harness.node.create_subscription(JointState, "/aimdk/hand/joint_states", received.append, 10)
+        command = [0.1 * (index + 1) for index in range(10)] + [0.0] * 10
+        described = json.loads(harness.status().interface_description_json)["interfaces"]
+        stream = described["joint.hand_stream"]["endpoint"]
+        harness.publish(stream, Float64MultiArray(data=command), count=25)
+
+        def thumb_abad():
+            latest = received[-1] if received else None
+            return (
+                latest is not None
+                and abs(dict(zip(latest.name, latest.position, strict=False))["L_thumb_abad_joint"] - 0.2) < 1e-6
+            )
+
+        harness.wait_for(thumb_abad, "the left thumb abduction to follow the command", timeout_s=3.0)
+        positions = dict(zip(received[-1].name, received[-1].position, strict=False))
+        assert positions["L_pinky_pip_joint"] == pytest.approx(1.0)
+    finally:
+        harness.shutdown()
+
+
+def test_hand_faultcodes_do_not_stop_commands():
+    """OmniHand faultcodes are set while a finger presses an object: a grasp."""
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        harness.mock.set_parameters([rclpy.parameter.Parameter("hand_joint_faultcode", value=1)])
+        time.sleep(0.5)
+        assert harness.status().lifecycle == "ACTIVE" and not harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+def test_a_fault_that_closes_admission_revokes_the_cached_velocity_itself():
+    """The vendor tier has no fail-safe, and the runtime's heartbeat keeps the
+    data plane's control fresh, so its quiet watchdog never fires: closing
+    admission on a fault must drop the cached velocity and send the zero itself,
+    and recovery must wait for fresh input instead of resuming the stale one.
+    """
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("locomotion").success
+        assert harness.enable_navigation(True).success
+        twist = Twist()
+        twist.linear.x = 0.3
+        harness.publish("/cmd_vel", twist, message_type=Twist)
+        harness.wait_for(
+            lambda: (
+                harness.mock.last_locomotion is not None
+                and harness.mock.last_locomotion.forward_velocity == pytest.approx(0.3)
+            ),
+            "the velocity to reach the platform",
+        )
+        harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=5)])
+        harness.wait_for(lambda: harness.status().lifecycle == "DEGRADED", "the arm joint fault to degrade the runtime")
+        harness.wait_for(
+            lambda: (
+                harness.mock.last_locomotion.forward_velocity == 0.0
+                and harness.mock.last_locomotion.lateral_velocity == 0.0
+                and harness.mock.last_locomotion.angular_velocity == 0.0
+            ),
+            "an explicit zero velocity once admission closed",
+        )
+        harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=0)])
+        harness.wait_active()
+        settled = harness.mock.locomotion_count
+        time.sleep(0.4)
+        assert harness.mock.locomotion_count == settled, "recovery must not resume the dropped velocity"
+        harness.publish("/cmd_vel", twist, message_type=Twist)
+        harness.wait_for(
+            lambda: harness.mock.last_locomotion.forward_velocity == pytest.approx(0.3),
+            "a fresh velocity to be forwarded again",
+        )
+    finally:
+        harness.shutdown()
+
+
+# --- the data plane's report -------------------------------------------------
+
+
+def _status_report(**overrides) -> str:
+    """A data plane status report as the data plane writes it, with fields overridden."""
+    report = {
+        "control_seq": 0,
+        "at": time.monotonic(),
+        "groups": {"arm": 0.001},
+        "hand_types": [],
+        "arm_measured": [0.0] * len(projection.VENDOR_ARM_ORDER),
+        "arm_measured_age_s": 0.001,
+        "faults": {},
+        "rejected": [],
+        "public_arm_count": 0,
+        "public_arm_age_s": None,
+        "arm_owner": None,
+    }
+    report.update(overrides)
+    return json.dumps(report)
+
+
+def test_a_report_queued_past_the_window_is_not_judged_fresh(harness):
+    """The report carries when it was generated; a report that spent longer than
+    the window queued is stale however young its groups claimed to be, and
+    however late its callback happened to run."""
+    harness.wait_active()
+    stale = String()
+    stale.data = _status_report(at=time.monotonic() - 10.0)
+    with harness.runtime._lock:
+        harness.runtime._on_dataplane_status(stale)
+        reporting = harness.runtime._dataplane_reporting()
+        ages = harness.runtime._feedback_ages_locked()
+        measured = harness.runtime.measured_arm_positions()
+    assert not reporting
+    assert ages["arm"] > 9.0
+    assert measured is None
+    fresh = String()
+    fresh.data = _status_report()
+    with harness.runtime._lock:
+        harness.runtime._on_dataplane_status(fresh)
+        assert harness.runtime._dataplane_reporting()
+        assert harness.runtime.measured_arm_positions() is not None
+
+
+def test_the_report_is_stamped_with_the_monotonic_clock_both_processes_share(harness):
+    """The runtime ages the report against ``time.monotonic()``; the stamp must
+    be that same clock, or every report would read as infinitely old or new."""
+    harness.wait_active()
+    received: list[String] = []
+    harness.node.create_subscription(String, dataplane.STATUS_TOPIC, received.append, 20)
+    message = harness.wait_for(lambda: received[-1] if received else None, "a data plane report")
+    status = dataplane.Status.decode(message.data)
+    assert abs(status.at - time.monotonic()) < 1.0
+    assert status.arm_measured_age_s is not None
+
+
+def test_a_profile_without_fault_groups_ignores_joint_fault_codes(harness):
+    harness.wait_active()
+    harness.mock.set_parameters([rclpy.parameter.Parameter("arm_joint_error_code", value=5)])
+    time.sleep(0.5)
+    assert harness.status().lifecycle == "ACTIVE" and not harness.status().faults
+
+
+def test_joint_states_carry_the_platform_stamp():
+    """Joint states share the platform clock its cameras stamp images with."""
+    offset_s = 0.08  # within the runtime's 0.1 s clock skew limit
+    harness = Harness(clock_offset_s=offset_s)
+    try:
+        harness.wait_active()
+        received = []
+        harness.node.create_subscription(JointState, "/joint_states", received.append, 10)
+        message = harness.wait_for(lambda: received[-1] if received else None, "a joint state message")
+        local_ns = harness.node.get_clock().now().nanoseconds
+        stamp_ns = message.header.stamp.sec * 10**9 + message.header.stamp.nanosec
+        # Stamped on the platform clock: ahead of this host by the offset, less
+        # delivery; a receipt stamp would be behind.
+        assert 0.02 < (stamp_ns - local_ns) * 1e-9 < offset_s + 0.005
+    finally:
+        harness.shutdown()
+
+
+def test_a_measurement_stamp_is_preferred_and_a_missing_stamp_falls_back():
+    from aimdk_robot import vendor_gateway as vendor
+
+    def header(stamp, meas):
+        return SimpleNamespace(
+            stamp=SimpleNamespace(sec=stamp, nanosec=0), meas_stamp=SimpleNamespace(sec=meas, nanosec=0)
+        )
+
+    assert vendor.message_stamp(header(10, 0)).nanoseconds == 10 * 10**9
+    assert vendor.message_stamp(header(10, 9)).nanoseconds == 9 * 10**9
+    assert vendor.message_stamp(header(0, 0)) is None
+    assert vendor.message_stamp(None) is None
+
+
 def test_a_claw_contributes_no_tactile_frames():
     """The gripper has no touch array; publishing its zeros would invent a sensor.
 
@@ -1657,18 +2256,541 @@ def test_a_claw_contributes_no_tactile_frames():
     measurement of no contact, so that hand contributes nothing.
     """
     from aimdk_msgs.msg import HandStateArray, HandType
-    from aimdk_robot import vendor_gateway as vendor
 
-    message = HandStateArray()
-    message.left_hand_type = HandType(value=vendor.HAND_TYPE_CLAW)
-    message.right_hand_type = HandType(value=vendor.HAND_TYPE_CLAW)
-    message.left_touch_sensors.palm_touch_data = [5] * 36
-    assert vendor.hand_touch_frames(message) == {}
+    harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous")
+    try:
+        harness.wait_active()
+        # The hand state below stands in for the platform's.
+        harness.mock.set_parameters(
+            [rclpy.parameter.Parameter("publish_joint_groups", value=["arm", "head", "waist", "leg"])]
+        )
+        touches: list = []
+        harness.node.create_subscription(Float64MultiArray, "/aimdk/hand_touch", touches.append, _sensor_qos())
+        hands = harness.node.create_publisher(HandStateArray, "/aima/hal/joint/hand/state", _vendor_qos("hand_state"))
+        harness.wait_for(lambda: hands.get_subscription_count() > 0, "the data plane on the hand state")
+        message = HandStateArray()
+        message.left_hand_type = HandType(value=vendor.HAND_TYPE_CLAW)
+        message.right_hand_type = HandType(value=vendor.HAND_TYPE_CLAW)
+        message.left_touch_sensors.palm_touch_data = [5] * 36
+        time.sleep(0.2)
+        touches.clear()
+        for _ in range(10):
+            hands.publish(message)
+            time.sleep(0.02)
+        time.sleep(0.1)
+        assert touches == []
 
-    # One dexterous hand contributes its own pads and only its own.
-    message.right_hand_type = HandType(value=vendor.HAND_TYPE_NIMBLE)
-    message.right_touch_sensors.palm_touch_data = [5] * 36
-    frames = vendor.hand_touch_frames(message)
-    assert frames, "the dexterous hand must contribute its pads"
-    assert all(pad.startswith("right_") for pad in frames)
-    assert frames["right_palm"] == [5] * 36
+        # One dexterous hand contributes its own pads and only its own.
+        message.right_hand_type = HandType(value=vendor.HAND_TYPE_NIMBLE)
+        message.right_touch_sensors.palm_touch_data = [5] * 36
+
+        def touched():
+            hands.publish(message)
+            return touches
+
+        touch = harness.wait_for(touched, "the dexterous hand's pads")[-1]
+        pads = [dimension.label for dimension in touch.layout.dim]
+        assert pads and all(pad.startswith("right_") for pad in pads)
+        palm = pads.index("right_palm")
+        offset = sum(dimension.size for dimension in touch.layout.dim[:palm])
+        assert list(touch.data[offset : offset + 36]) == [5.0] * 36
+    finally:
+        harness.shutdown()
+
+
+# --- named motions replayed in the upper-body stream mode --------------------
+
+# Index of right_shoulder_pitch_joint in UpperBodyCommandArray.arm_pos.
+_RIGHT_PITCH = projection.VENDOR_ARM_ORDER.index("right_shoulder_pitch_joint")
+
+
+def _replay_harness(tmp_path: Path, *, duration_s: float, named_motion: dict | None = None, **mock_params) -> Harness:
+    """The OmniHand profile on an X2 with only a left hand, ``wave`` recorded as a right shoulder
+    pitch out-and-back to -0.3 rad."""
+    import json
+
+    import yaml
+
+    rows = [[0.0] * len(projection.VENDOR_ARM_ORDER) for _ in range(3)]
+    rows[1][_RIGHT_PITCH] = -0.3
+    (tmp_path / "wave.json").write_text(
+        json.dumps(
+            {
+                "target": "right",
+                "joints": list(projection.VENDOR_ARM_ORDER),
+                "time_from_start_s": [0.0, duration_s / 2, duration_s],
+                "positions": rows,
+            }
+        )
+    )
+    profile = yaml.safe_load(OMNIHAND_PROFILE.read_text())
+    profile["vendor"]["named_motion"]["trajectories"] = {"wave": "wave.json"}
+    profile["vendor"]["named_motion"].update(named_motion or {})
+    (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
+    harness = Harness(tmp_path / "profile.yaml", hand_type="dexterous", right_hand_type="none", **mock_params)
+    harness.wait_active()
+    assert harness.set_mode("stream").success
+    return harness
+
+
+def _start_wave(harness, target: str = ""):
+    from rclpy.action import ActionClient
+
+    client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+    assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+    handle = _send_named(harness, client, "wave", target=target)
+    assert handle.accepted
+    return handle.get_result_async()
+
+
+def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path):
+    """In the stream mode the gesture streams on the arm channel, no preset is asked for, and the
+    public arm stream is refused rather than interleaved while it runs."""
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        pitches: list[float] = []
+        result_future = _start_wave(harness)
+        # The claim takes the arm before the intruder's first target: a public
+        # target that reached the data plane first would keep the arm and the
+        # replay would be refused BUSY instead of owning the channel.
+        harness.wait_for(lambda: harness.runtime._dataplane.arm_owner is not None, "the replay to own the arm channel")
+        intruder = Float64MultiArray()
+        intruder.data = [0.9] * len(projection.VENDOR_ARM_ORDER)
+        publisher = harness.node.create_publisher(Float64MultiArray, "/aimdk/arm/commands", 10)
+        last = None
+        while not result_future.done():
+            publisher.publish(intruder)
+            message = harness.mock.last_upper_body
+            if message is not None and message is not last:
+                pitches.append(message.arm_pos[_RIGHT_PITCH])
+                last = message
+            time.sleep(0.01)
+        result = result_future.result().result
+        assert result.success, result.message
+        assert min(pitches) == pytest.approx(-0.3, abs=0.03)
+        assert 0.9 not in pitches
+        assert harness.mock.last_preset is None
+        # The installed left hand is held, the absent right one gets dummies: the platform
+        # drops an upper-body command whose hand_pos does not fit hand_sub_mode.
+        sent = harness.mock.last_upper_body
+        assert (sent.hand_sub_mode, len(sent.hand_pos), list(sent.hand_pos[10:])) == (2, 20, [0.0] * 10)
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("target", ["left", "both", "sideways"])
+def test_a_replay_refuses_a_side_it_was_not_recorded_for(tmp_path, target):
+    """``wave`` was recorded on the right arm: asked for another side it moves nothing."""
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        sent = harness.mock.upper_body_count
+        result_future = _start_wave(harness, target=target)
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        result = result_future.result().result
+        assert result.error_code == ExecuteNamedMotion.Result.INVALID_TARGET, result.message
+        time.sleep(0.3)
+        assert harness.mock.upper_body_count == sent
+    finally:
+        harness.shutdown()
+
+
+def test_a_replay_asked_for_its_recorded_side_plays(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        result_future = _start_wave(harness, target="right")
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        assert result_future.result().result.success, result_future.result().result.message
+    finally:
+        harness.shutdown()
+
+
+class _GoalHandle:
+    """The part of a server goal handle the named-motion server uses."""
+
+    is_cancel_requested = False
+
+    def __init__(self, name: str, interrupt: bool) -> None:
+        self.request = ExecuteNamedMotion.Goal()
+        self.request.name, self.request.interrupt = name, interrupt
+
+    def publish_feedback(self, _feedback) -> None:
+        pass
+
+    def succeed(self) -> None:
+        pass
+
+    def abort(self) -> None:
+        pass
+
+
+def test_two_goals_that_both_passed_admission_do_not_interrupt_each_other(tmp_path):
+    """Two ``interrupt=false`` goals accepted before either took anything over: the second is
+    refused BUSY instead of taking the arm from the first."""
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    server = harness.runtime._named_motion
+    register = harness.runtime.ensure_input_source
+    callers: list[str] = []
+    second_arrived = threading.Event()
+
+    def ensure_input_source():
+        # Hold the first goal at the dispatch step, before _take_over, until the second one
+        # has had the chance to arrive at the same point.
+        callers.append(threading.current_thread().name)
+        if len(callers) == 1:
+            second_arrived.wait(1.0)
+        else:
+            second_arrived.set()
+        return register()
+
+    harness.runtime.ensure_input_source = ensure_input_source
+    try:
+        results: dict[str, object] = {}
+
+        def run(label: str) -> None:
+            results[label] = server._execute(_GoalHandle("wave", interrupt=False))
+
+        first = threading.Thread(target=run, args=("first",), name="first")
+        first.start()
+        harness.wait_for(lambda: callers, "the first goal to reach the dispatch step")
+        second = threading.Thread(target=run, args=("second",), name="second")
+        second.start()
+        first.join(timeout=TIMEOUT_S)
+        second.join(timeout=TIMEOUT_S)
+        assert results["first"].success, results["first"].message
+        assert results["second"].error_code == ExecuteNamedMotion.Result.BUSY, results["second"].message
+        assert callers == ["first"]
+    finally:
+        harness.shutdown()
+
+
+def test_a_replay_does_not_preempt_a_live_public_arm_stream(tmp_path):
+    """Teleop streaming on the arm channel keeps it: the gesture is refused BUSY, not interleaved."""
+    import threading
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    teleop = Float64MultiArray()
+    teleop.data = [0.2] * len(projection.VENDOR_ARM_ORDER)
+    publisher = harness.node.create_publisher(Float64MultiArray, "/aimdk/arm/commands", 10)
+    done = threading.Event()
+
+    def stream():
+        while not done.wait(0.02):
+            publisher.publish(teleop)
+
+    streamer = threading.Thread(target=stream, daemon=True)
+    streamer.start()
+    try:
+        harness.wait_for(
+            lambda: getattr(harness.mock.last_upper_body, "arm_pos", [0.0] * 14)[_RIGHT_PITCH] == pytest.approx(0.2),
+            "the public arm stream to reach the platform",
+        )
+        result_future = _start_wave(harness)
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        result = result_future.result().result
+        assert result.error_code == ExecuteNamedMotion.Result.BUSY, result.message
+        assert harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(0.2)
+    finally:
+        done.set()
+        streamer.join(timeout=1.0)
+        harness.shutdown()
+
+
+def test_a_claim_does_not_take_the_arm_from_a_target_the_status_has_not_shown(tmp_path):
+    """The claim is judged by the data plane, in the step that applies it.
+
+    A public arm target the data plane accepted after the runtime's last status
+    report is invisible to the snapshot; the claim must still be refused there,
+    atomically, and the public stream must keep the arm until it goes quiet.
+    """
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        teleop = Float64MultiArray()
+        teleop.data = [0.2] * len(projection.VENDOR_ARM_ORDER)
+        harness.publish("/aimdk/arm/commands", teleop)
+        harness.wait_for(
+            lambda: getattr(harness.mock.last_upper_body, "arm_pos", [0.0] * 14)[_RIGHT_PITCH] == pytest.approx(0.2),
+            "the public arm stream to reach the platform",
+        )
+        # The exact gap: the runtime's snapshot predates the target.
+        with harness.runtime._lock:
+            harness.runtime._dataplane.public_arm_age_s = None
+            claimed = harness.runtime.claim_arm(99)
+        assert not claimed, "the data plane must refuse the claim while the stream is live"
+        assert harness.runtime._arm_owner is None
+        # The public stream keeps the arm: its next target is still applied.
+        teleop.data = [0.25] * len(projection.VENDOR_ARM_ORDER)
+        harness.publish("/aimdk/arm/commands", teleop)
+        harness.wait_for(
+            lambda: getattr(harness.mock.last_upper_body, "arm_pos", [0.0] * 14)[_RIGHT_PITCH] == pytest.approx(0.25),
+            "the public arm stream to keep the arm",
+        )
+        # Once the stream is quiet the claim takes the arm, and gives it back.
+        time.sleep(0.6)  # past stream_staleness_s (0.5 s)
+        assert harness.runtime.claim_arm(99)
+        assert harness.runtime._arm_owner == 99
+        harness.runtime.release_arm(99)
+    finally:
+        harness.shutdown()
+
+
+def test_a_replay_the_platform_does_not_follow_fails_instead_of_succeeding(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=1.0, follow_commands=False)
+    try:
+        result_future = _start_wave(harness)
+        harness.wait_for(lambda: result_future.done(), "the named motion result")
+        result = result_future.result().result
+        assert result.error_code == ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM
+        assert "did not follow" in result.message
+    finally:
+        harness.shutdown()
+
+
+def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
+    """A claw profile on an X2 with one dexterous hand: speech and presets stay usable."""
+    harness = Harness(hand_type="dexterous", right_hand_type="none")
+    try:
+        harness.wait_active()
+        response = harness.set_mode("stream")
+        assert not response.success
+        assert "hand type mismatch" in response.message
+        assert harness.status().lifecycle == "ACTIVE"
+    finally:
+        harness.shutdown()
+
+
+def test_a_view_fed_by_stamped_and_unstamped_groups_still_publishes():
+    """A view carries the oldest stamp among its groups, whether the platform stamped them or not.
+
+    A group without a platform stamp is stamped with the host's time on arrival;
+    the body view below is fed by a stamped head and an unstamped waist, so it
+    carries the head's stamp.
+    """
+    from aimdk_msgs.msg import JointState as VendorJoint
+    from aimdk_msgs.msg import JointStateArray
+
+    harness = Harness()
+    try:
+        harness.wait_active()
+        # Keep the mock's own head and waist from replacing the ones published below.
+        harness.mock.set_parameters([rclpy.parameter.Parameter("publish_joint_groups", value=["arm", "leg", "hand"])])
+        views: list[JointState] = []
+        harness.node.create_subscription(JointState, "/aimdk/body_joint_states", views.append, 10)
+        head = harness.node.create_publisher(JointStateArray, "/aima/hal/joint/head/state", _vendor_qos("joint_state"))
+        waist = harness.node.create_publisher(
+            JointStateArray, "/aima/hal/joint/waist/state", _vendor_qos("joint_state")
+        )
+        stamped = JointStateArray(joints=[VendorJoint(name="head_yaw_joint", position=0.1)])
+        stamped.header.stamp.sec = 5
+        unstamped = JointStateArray(joints=[VendorJoint(name="waist_yaw_joint", position=0.2)])
+
+        def carries_both():
+            head.publish(stamped)
+            waist.publish(unstamped)
+            return [view for view in views if "head_yaw_joint" in view.name and "waist_yaw_joint" in view.name]
+
+        both = harness.wait_for(carries_both, "a body view fed by the stamped head and the unstamped waist")
+        assert both[-1].header.stamp.sec == 5 and both[-1].header.stamp.nanosec == 0
+    finally:
+        harness.shutdown()
+
+
+def test_stop_ends_a_replay_and_no_further_arm_target_is_sent(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=3.0)
+    try:
+        result_future = _start_wave(harness)
+        harness.wait_for(lambda: harness.mock.upper_body_count > 10, "the replay to be streaming")
+        request = StopRuntime.Request()
+        request.policy = "HOLD"
+        assert harness.call(StopRuntime, "/runtime/stop", request).success
+        harness.wait_for(lambda: result_future.done(), "the named motion result", timeout_s=3.0)
+        assert result_future.result().result.error_code == ExecuteNamedMotion.Result.STOP_LATCHED
+        count = harness.mock.upper_body_count
+        time.sleep(0.5)
+        # HOLD may publish one explicit safe command; the replay must not continue.
+        assert harness.mock.upper_body_count - count <= 1
+    finally:
+        harness.shutdown()
+
+
+# --- cancelling a replay part-way and resuming it ------------------------------
+
+
+def _wave_goal(harness, resume_token: str = ""):
+    from rclpy.action import ActionClient
+
+    client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+    assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+    goal = ExecuteNamedMotion.Goal()
+    goal.name, goal.resume_token = "wave", resume_token
+    handle_future = client.send_goal_async(goal)
+    harness.wait_for(lambda: handle_future.done(), "the goal decision")
+    handle = handle_future.result()
+    assert handle.accepted
+    return handle
+
+
+def _right_pitch(harness) -> float | None:
+    message = harness.mock.last_upper_body
+    return None if message is None else message.arm_pos[_RIGHT_PITCH]
+
+
+def _cancel(harness, handle):
+    from action_msgs.msg import GoalStatus
+
+    cancel_future = handle.cancel_goal_async()
+    harness.wait_for(lambda: cancel_future.done(), "the cancel decision")
+    assert cancel_future.result().goals_canceling
+    result_future = handle.get_result_async()
+    harness.wait_for(lambda: result_future.done(), "the cancelled result", timeout_s=3.0)
+    assert result_future.result().status == GoalStatus.STATUS_CANCELED
+    return result_future.result().result
+
+
+def _play_to_the_end(harness, handle) -> tuple[object, list[float]]:
+    result_future = handle.get_result_async()
+    pitches: list[float] = []
+    deadline = time.time() + TIMEOUT_S
+    while not result_future.done() and time.time() < deadline:
+        pitch = _right_pitch(harness)
+        if pitch is not None:
+            pitches.append(pitch)
+        time.sleep(0.01)
+    assert result_future.done(), "the replay did not finish"
+    return result_future.result().result, pitches
+
+
+def _cancel_past_the_turn(harness):
+    """Start ``wave`` and cancel it on the way back from its -0.3 rad turning point."""
+    handle = _wave_goal(harness)
+    lowest = [0.0]
+
+    def past_the_turn() -> bool:
+        pitch = _right_pitch(harness)
+        if pitch is None:
+            return False
+        lowest[0] = min(lowest[0], pitch)
+        return lowest[0] < -0.28 and pitch > -0.2
+
+    harness.wait_for(past_the_turn, "the replay to pass its turning point")
+    return _cancel(harness, handle)
+
+
+def test_a_cancelled_replay_holds_where_it_is_and_hands_back_a_resume_token(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        handle = _wave_goal(harness)
+        harness.wait_for(lambda: (_right_pitch(harness) or 0.0) < -0.1, "the replay to be under way")
+        result = _cancel(harness, handle)
+        assert result.error_code == ExecuteNamedMotion.Result.CANCELLED, result.message
+        assert result.resume_token
+        assert 0.0 < result.progress < 1.0
+        held = _right_pitch(harness)
+        time.sleep(0.3)
+        assert _right_pitch(harness) == pytest.approx(held, abs=1e-6)
+    finally:
+        harness.shutdown()
+
+
+def test_a_resumed_replay_continues_from_where_it_stopped(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        cancelled = _cancel_past_the_turn(harness)
+        assert cancelled.progress > 0.5
+        result, pitches = _play_to_the_end(harness, _wave_goal(harness, resume_token=cancelled.resume_token))
+        assert result.success, result.message
+        assert "resumed from" in result.message
+        assert result.progress == pytest.approx(1.0)
+        # The turning point it had already played is not played again.
+        assert min(pitches) > -0.25
+        assert pitches[-1] == pytest.approx(0.0, abs=0.02)
+    finally:
+        harness.shutdown()
+
+
+def test_a_resume_token_is_not_honoured_once_the_arm_was_commanded(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=2.0)
+    try:
+        cancelled = _cancel_past_the_turn(harness)
+        command = Float64MultiArray()
+        command.data = [0.0] * len(projection.VENDOR_ARM_ORDER)
+        harness.publish("/aimdk/arm/commands", command, count=5)
+        # A fresh public arm stream is not preempted; let it go stale first.
+        time.sleep(0.7)
+        result, pitches = _play_to_the_end(harness, _wave_goal(harness, resume_token=cancelled.resume_token))
+        assert result.success, result.message
+        assert "arm was commanded since" in result.message
+        assert min(pitches) < -0.28
+    finally:
+        harness.shutdown()
+
+
+def test_a_cancel_holds_the_target_sent_one_tracking_lag_ago(tmp_path):
+    """The arm trails the command: it is told to stay where it is, a target sent one lag earlier,
+    instead of carrying on to the latest target."""
+    harness = _replay_harness(tmp_path, duration_s=2.0, named_motion={"trajectory_hold_lag_s": 0.3})
+    try:
+        handle = _wave_goal(harness)
+        sent: list[tuple[int, float]] = []
+        while not sent or sent[-1][1] > -0.15:
+            message = harness.mock.last_upper_body
+            if message is not None and (not sent or harness.mock.upper_body_count != sent[-1][0]):
+                sent.append((harness.mock.upper_body_count, message.arm_pos[_RIGHT_PITCH]))
+            time.sleep(0.002)
+        count_at_cancel = harness.mock.upper_body_count
+        _cancel(harness, handle)
+        last_target = [pitch for count, pitch in sent if count <= count_at_cancel][-1]
+        # Still on the way out, so a target sent 0.3 s earlier is well short of the latest.
+        assert _right_pitch(harness) > last_target + 0.05
+    finally:
+        harness.shutdown()
+
+
+def test_a_mode_whose_platform_action_is_already_active_is_entered_without_asking_again(tmp_path):
+    """The platform refuses a request for the action it is already in (MOTION_BUSY), e.g. one an
+    earlier run left it in: entering that mode must not depend on that request."""
+    harness = Harness(
+        OMNIHAND_PROFILE,
+        hand_type="dexterous",
+        right_hand_type="none",
+        initial_action="UPPERBODY_REMOTE_SPLIT",
+        reject_action_code=9,
+    )
+    try:
+        harness.wait_active()
+        response = harness.set_mode("stream")
+        assert response.success, response.message
+        assert "already in UPPERBODY_REMOTE_SPLIT" in response.message
+        assert harness.status().active_mode == "stream"
+    finally:
+        harness.shutdown()
+
+
+def test_the_views_keep_their_rate_under_a_burst_of_platform_state():
+    """At ~400 Hz of arm state the views keep their 50 Hz (a code in any one sample: the single-sample test)."""
+    from aimdk_msgs.msg import JointStateArray
+    from rclpy.qos import qos_profile_sensor_data
+
+    harness = Harness()
+    try:
+        harness.wait_active()
+        captured: list = []
+        harness.node.create_subscription(
+            JointStateArray, "/aima/hal/joint/arm/state", captured.append, qos_profile_sensor_data
+        )
+        harness.wait_for(lambda: captured, "an arm state from the platform")
+        burst = harness.node.create_publisher(JointStateArray, "/aima/hal/joint/arm/state", _vendor_qos("joint_state"))
+        views = []
+        harness.node.create_subscription(JointState, "/joint_states", views.append, 10)
+        started = time.monotonic()
+        sent = 0
+        while time.monotonic() - started < 1.0:
+            message = captured[-1]
+            message.header.stamp = harness.node.get_clock().now().to_msg()
+            burst.publish(message)
+            sent += 1
+            time.sleep(0.0025)
+        assert sent > 250, sent
+        assert len(views) >= 35, len(views)  # 50 Hz
+        assert harness.status().lifecycle == "ACTIVE", harness.status().faults
+    finally:
+        harness.shutdown()

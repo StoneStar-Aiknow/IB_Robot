@@ -41,8 +41,10 @@ from launch_ros.actions import Node
 
 from robot_config.interface_binding import (
     bind_robot_interfaces,
+    event_interface_ids,
     required_interface_ids,
     required_interface_requirements,
+    semantic_mapping_interface_ids,
 )
 from robot_config.logger_utils import get_colored_logger
 
@@ -96,13 +98,23 @@ def resolve_runtime_launch(provider: str) -> str:
 def _write_peripherals_fragment(robot_config: dict[str, Any]) -> str:
     """Serialize the deployment peripherals/fast_lio inventory for the runtime.
 
+    The application layer is ``peripherals`` followed by the loader-recorded
+    ``runtime._disabled_peripherals`` (runtime-peripheral-overrides D2; a
+    missing key means none). The runtime applies this single override layer
+    to its profile with ``merge_peripherals``, yielding profile < robot
+    configuration; without device fields the serialisation is unchanged
+    (byte-identical for shipped configurations).
+
     Returns "" when the configuration declares nothing beyond profile defaults.
     """
-    fragment: dict[str, Any] = {}
-    peripherals = robot_config.get("peripherals") or []
+    runtime = robot_config.get("runtime") or {}
+    application = list(robot_config.get("peripherals") or []) + list(
+        (runtime.get("_disabled_peripherals") if isinstance(runtime, dict) else None) or []
+    )
     fast_lio = (robot_config.get("navigation") or {}).get("fast_lio") or {}
-    if peripherals:
-        fragment["peripherals"] = peripherals
+    fragment: dict[str, Any] = {}
+    if application:
+        fragment["peripherals"] = application
     if fast_lio.get("enabled"):
         fragment["fast_lio"] = fast_lio
     if not fragment:
@@ -190,8 +202,9 @@ def generate_runtime_provider_actions(
     elif platform == "mujoco":
         # so101-mujoco-runtime-platform D3: the world owner hands the provider
         # the resolved scene NAME and spawn pose — no file path crosses the
-        # boundary and nothing is recomputed. An empty scene name means the
-        # robot model runs alone (the provider-alone behaviour).
+        # boundary and nothing is recomputed. An empty scene name composes the
+        # shared sim_models ``empty`` scene (ground + light): the provider
+        # renders the robot into a scene either way, never alone.
         startup = simulation_startup
         scene_name = str(getattr(startup, "scene_name", "") or "")
         spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
@@ -222,10 +235,36 @@ def generate_runtime_provider_actions(
         PythonLaunchDescriptionSource(launch_path),
         launch_arguments=include_arguments.items(),
     )
+    waiter = runtime_ready_waiter(
+        robot_config, readiness_timeout_s=readiness_timeout_s, description_output=description_output
+    )
+    return [include], waiter
+
+
+def runtime_ready_waiter(
+    robot_config: dict[str, Any], *, readiness_timeout_s: float = 60.0, description_output: str | None = None
+) -> Node:
+    """``wait_for_runtime`` for the configured provider, wherever it runs: exits 0 once it is ready."""
+    provider = runtime_provider(robot_config)
+    if not provider:
+        raise RuntimeError("robot.runtime.provider is required to wait for a runtime")
     required = required_capabilities(robot_config)
+    # runtime-peripheral-overrides review round 2 (Major 1, corrected): the
+    # online semantic-mapping consumer needs the configured camera's colour,
+    # aligned-depth and camera-info interfaces to EXIST. The waiter checks
+    # them as declared interfaces only — no readiness, freshness or graph
+    # gate — because this waiter is the shared barrier for every
+    # runtime_ready action on non-binding provider paths, and a slow driver
+    # or a late-publishing simulator must not block the whole startup. The
+    # IDs do NOT feed required_interface_ids, so provider configurations
+    # without require_model keep their non-binding startup flow.
+    semantic_interface_ids = semantic_mapping_interface_ids(robot_config)
+    # Event streams (audio.wake_event) are declared-only for the same reason:
+    # they publish nothing until their event happens, so readiness never comes.
+    declared_interface_ids = list(dict.fromkeys([*semantic_interface_ids, *event_interface_ids(robot_config)]))
     interface_ids = required_interface_ids(robot_config) if description_output else []
     instance_id = (robot_config.get("runtime") or {}).get("instance_id")
-    waiter = Node(
+    return Node(
         package="robot_runtime",
         executable="wait_for_runtime",
         name="wait_for_runtime",
@@ -238,6 +277,7 @@ def generate_runtime_provider_actions(
             *(["--required", *required] if required else []),
             *(["--description-output", description_output] if description_output else []),
             *(["--require-interfaces", *interface_ids] if interface_ids else []),
+            *(["--declared-interfaces", *declared_interface_ids] if declared_interface_ids else []),
             *(
                 ["--interface-requirements", json.dumps(required_interface_requirements(robot_config))]
                 if interface_ids
@@ -246,16 +286,35 @@ def generate_runtime_provider_actions(
             *(["--instance-id", instance_id] if instance_id else []),
         ],
     )
-    return [include], waiter
 
 
-def materialize_interface_config(robot_config: dict[str, Any], descriptor: dict, destination: Path) -> dict:
-    """Validate then atomically publish one complete, bound consumer configuration."""
+def materialize_interface_config(
+    robot_config: dict[str, Any], descriptor: dict, destination: Path, *, require_local_model_artifacts: bool = True
+) -> dict:
+    """Validate then atomically publish one complete, bound consumer configuration.
+
+    The serialised snapshot drops the framework-private
+    ``runtime._disabled_peripherals`` (runtime-peripheral-overrides D2; the
+    filtered entries are an in-memory hand-off to the fragment builder). The
+    input configuration is not mutated.
+
+    ``require_local_model_artifacts=False`` carries the launch's
+    ``with_model_services:=false``: the bound snapshot then validates the
+    perception services by metadata, so a host that only calls the remotely
+    served endpoints does not need their weights and artifacts.
+    """
+    from copy import deepcopy
+
     from robot_config.loader import validate_robot_config_dict
 
     effective = bind_robot_interfaces(robot_config, descriptor, require_ready=True)
-    validate_robot_config_dict(effective)
+    validate_robot_config_dict(effective, require_local_model_artifacts=require_local_model_artifacts)
     snapshot = {key: value for key, value in effective.items() if key != "_config_path"}
+    runtime = snapshot.get("runtime")
+    if isinstance(runtime, dict):
+        runtime = deepcopy(runtime)
+        runtime.pop("_disabled_peripherals", None)
+        snapshot["runtime"] = runtime
     encoded = yaml.safe_dump({"robot": snapshot}, sort_keys=False)
     temporary_path = None
     try:
@@ -281,6 +340,8 @@ def generate_bound_runtime_actions(
     simulation_startup=None,
     display: bool = False,
     readiness_timeout_s: float = 60.0,
+    start_provider: bool = True,
+    require_local_model_artifacts: bool = True,
 ) -> list:
     """Start the provider once; only construct consumers after the live description is bound.
 
@@ -288,20 +349,34 @@ def generate_bound_runtime_actions(
     (runtime-simulation-transport D3): the world generic launch started ahead
     of this call is passed to the provider as ``gazebo_world`` plus the full
     spawn pose instead of being recomputed or re-launched.
+
+    ``start_provider=False`` binds to the runtime another host already runs
+    (as the X2's grasp pipeline on the Orin does to the robot-side stack).
+
+    ``require_local_model_artifacts=False`` carries the launch's
+    ``with_model_services:=false``: the bound snapshot validates the perception
+    services by metadata, so a host that only calls the remotely served
+    endpoints does not need their weights and artifacts.
     """
     directory = Path(tempfile.mkdtemp(prefix="ibrobot_interfaces_"))
     description_path = directory / "description.yaml"
     effective_path = directory / "robot.yaml"
     try:
-        providers, waiter = generate_runtime_provider_actions(
-            robot_config,
-            use_sim=use_sim,
-            sim_platform=sim_platform,
-            simulation_startup=simulation_startup,
-            display=display,
-            readiness_timeout_s=readiness_timeout_s,
-            description_output=str(description_path),
-        )
+        if start_provider:
+            providers, waiter = generate_runtime_provider_actions(
+                robot_config,
+                use_sim=use_sim,
+                sim_platform=sim_platform,
+                simulation_startup=simulation_startup,
+                display=display,
+                readiness_timeout_s=readiness_timeout_s,
+                description_output=str(description_path),
+            )
+        else:
+            providers = []
+            waiter = runtime_ready_waiter(
+                robot_config, readiness_timeout_s=readiness_timeout_s, description_output=str(description_path)
+            )
     except Exception:
         shutil.rmtree(directory)
         raise
@@ -316,7 +391,12 @@ def generate_bound_runtime_actions(
         try:
             from robot_runtime.interface_description import load_description
 
-            effective = materialize_interface_config(robot_config, load_description(description_path), effective_path)
+            effective = materialize_interface_config(
+                robot_config,
+                load_description(description_path),
+                effective_path,
+                require_local_model_artifacts=require_local_model_artifacts,
+            )
             logger.info(f"Runtime interfaces bound; consumer snapshot: {effective_path}")
             return construct_consumers(effective)
         except Exception as exc:

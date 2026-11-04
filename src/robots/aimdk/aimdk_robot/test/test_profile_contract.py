@@ -8,6 +8,7 @@ produces is accepted by the contract layer as-is.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -190,17 +191,29 @@ def test_only_firmware_verified_sensor_endpoints_are_declared(profile):
 def test_vendor_endpoint_qos_matches_the_documented_profiles(profile):
     """QoS is part of the endpoint contract; a mismatch drops messages silently.
 
-    The platform subscribes RELIABLE on audio playback, so publishing
-    BEST_EFFORT there delivers nothing (observed on the robot). Audio capture
-    runs the other way: the platform publishes it RELIABLE with a 1000-deep
-    history, and a RELIABLE reader lets it retransmit from that history on
-    every lost fragment, so it is read BEST_EFFORT as the SDK examples do. Its
-    state topics publish TRANSIENT_LOCAL, so subscribing TRANSIENT_LOCAL picks
-    up the current value on subscribe instead of waiting for the next sample.
+    Which side we are on decides what the contract demands. Where the runtime
+    publishes, the platform's own subscription sets the floor: it subscribes
+    RELIABLE on audio playback, so publishing BEST_EFFORT there delivers
+    nothing (observed on the robot). Its state topics publish TRANSIENT_LOCAL,
+    so subscribing TRANSIENT_LOCAL picks up the current value on subscribe
+    instead of waiting for the next sample.
+
+    Where the runtime only subscribes, RELIABLE is not automatically the safer
+    choice, and on the microphone capture it is the worse one. Each message is
+    5760 B (480 samples across 6 channels), so every one is IP-fragmented, and
+    RELIABLE asks for every lost fragment again: on an Ascend 310P compute pack
+    sharing the host with a grasp pipeline (2026-10-27) that measured 29557
+    fragment reassembly attempts/s at 98% failure, and the retransmits starved
+    the processed-audio stream the voice deployment does need. BEST_EFFORT
+    delivered the capture in full instead (0.5 Hz -> 33 Hz). A BEST_EFFORT
+    subscription of a RELIABLE publisher is compatible, so nothing is dropped
+    by the choice itself. See issue #201.
     """
     qos = profile["vendor"]["qos"]
     assert qos["audio_playback"]["reliability"] == "reliable"
     assert qos["audio_capture"]["reliability"] == "best_effort"
+    # The same playback topic, but the runtime's listening side (wake acknowledgement).
+    assert qos["audio_playback_monitor"] == {"reliability": "best_effort", "durability": "volatile"}
     for key in ("mc_state", "system_state", "joint_state", "hand_state", "power_state"):
         assert qos[key]["durability"] == "transient_local", key
     # The vendor's own command topics are BEST_EFFORT + VOLATILE.
@@ -209,6 +222,16 @@ def test_vendor_endpoint_qos_matches_the_documented_profiles(profile):
     for key, entry in qos.items():
         assert entry["reliability"] in projection.QOS_RELIABILITIES, key
         assert entry.get("durability", "volatile") in projection.QOS_DURABILITIES, key
+
+
+@pytest.mark.parametrize("name", ["x2_ultra.yaml", "x2_ultra_omnihand.yaml"])
+def test_a_declared_wake_event_comes_with_the_acknowledgement_token_form(name):
+    """The runtime refuses audio.wake_event without it; a shipped profile must not trip that."""
+    shipped = load_profile(PROFILE_PATH.with_name(name))
+    assert "audio.wake_event" in shipped["interfaces"]
+    pattern = shipped["vendor"]["wake_ack"]["token_pattern"]
+    assert re.match(pattern, "_1792835430393_7ack")
+    assert not re.match(pattern, "hds_tts_36IUknWjEw0NVKL7L4RGgK3")
 
 
 def test_audio_playback_declares_the_focus_it_has_to_hold(profile):
@@ -323,27 +346,24 @@ def test_runtime_node_builds_its_own_description_without_injection():
             rclpy.shutdown()
 
 
-@pytest.mark.parametrize("name", ["x2_ultra.yaml", "x2_ultra_omnihand.yaml"])
-def test_every_declared_audio_format_agrees_with_the_stream_the_bridge_moves(name):
-    """The same PCM format is written in up to three places, and they drift independently.
+def test_shipped_trajectories_load_and_replay_advertised_motions():
+    """A recording that fails validation would stop the runtime at startup."""
+    from aimdk_robot.named_motion import CONTROL_AREAS
+    from aimdk_robot.trajectory import load_trajectory
 
-    Consumers size their PCM from the public capability, bindings read the interface metadata,
-    and the bridge stamps the vendor playback format from its private vendor block. Audio sized
-    from one and played under another plays at the wrong pitch and speed, or with the wrong
-    channels, with nothing in the description to catch it.
-    """
-    profile = load_profile(PROFILE_PATH.parent / name)
-    capabilities = profile["capabilities"]
-    interfaces = profile["interfaces"]
-    vendor = profile["vendor"]["audio"]
-
-    playback = capabilities["interaction.audio_playback"]
-    assert playback["sample_rate_hz"] == interfaces["audio.play"]["sample_rate_hz"] == vendor["playback_sample_rate"]
-    assert playback["channels"] == interfaces["audio.play"]["channels"] == vendor["playback_channels"]
-
-    capture = capabilities["interaction.audio_capture"]
-    assert capture["sample_rate_hz"] == interfaces["audio.capture"]["sample_rate_hz"]
-    assert capture["channels"] == interfaces["audio.capture"]["channels"]
+    path = PROFILE_PATH.with_name("x2_ultra_omnihand.yaml")
+    profile = load_profile(path)
+    config = profile["vendor"]["named_motion"]
+    assert {profile["vendor"]["mc_actions"][mode] for mode in config["trajectory_modes"]} == {"UPPERBODY_REMOTE_SPLIT"}
+    assert set(config["trajectories"]) <= set(profile["capabilities"]["motion.named"]["names"])
+    areas = {area: name for name, area in CONTROL_AREAS.items()}
+    for name, path_in_profile in config["trajectories"].items():
+        recorded = load_trajectory(
+            path.parent / path_in_profile, max_speed_radps=float(config["trajectory_max_speed_radps"])
+        )
+        # The recording plays the side the preset it was recorded from plays.
+        preset = profile["vendor"]["preset_motions"][name]
+        assert recorded.target == (areas[preset["area"]] if "area" in preset else preset["target"]), name
 
 
 def test_both_x2_profiles_ask_for_the_same_playback_pacing():

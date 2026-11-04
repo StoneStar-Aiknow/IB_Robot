@@ -28,6 +28,19 @@ import type {
 
 const API_ROOT = "/api/v1";
 
+export interface PageFilters {
+  offset?: number;
+  limit?: number;
+  requestId?: string;
+  componentId?: string;
+  name?: string;
+}
+
+export interface RequestFilters extends PageFilters {
+  sortBy?: string;
+  descending?: boolean;
+}
+
 export class ApiError extends Error {
   constructor(
     message: string,
@@ -73,10 +86,11 @@ export const tracingApi = {
   capabilities: (signal?: AbortSignal) => request<CapabilitiesResponse>("/capabilities", { signal }),
   sources: (signal?: AbortSignal) => request<SourceListResponse>("/sources", { signal }),
   refreshSources: (signal?: AbortSignal) => request<SourceListResponse>("/sources/refresh", { method: "POST", signal }),
-  createAnalysis: (sourceId: string) =>
+  createAnalysis: (sourceId: string, signal?: AbortSignal) =>
     request<LoadJob>("/analysis-jobs", {
       method: "POST",
       body: JSON.stringify({ source_id: sourceId }),
+      signal,
     }),
   job: (jobId: string, signal?: AbortSignal) => request<LoadJob>(`/analysis-jobs/${encodeURIComponent(jobId)}`, { signal }),
   createComparison: (payload: ComparisonJobCreate, signal?: AbortSignal) =>
@@ -95,9 +109,9 @@ export const tracingApi = {
   },
   summary: (analysisId: string, signal?: AbortSignal) =>
     request<AnalysisSummary>(`/analyses/${encodeURIComponent(analysisId)}/summary`, { signal }),
-  requests: (analysisId: string, signal?: AbortSignal) =>
+  requests: (analysisId: string, signal?: AbortSignal, filters: RequestFilters = {}) =>
     request<ApiList<RequestRecord>>(
-      `/analyses/${encodeURIComponent(analysisId)}/requests${query({ limit: 1000, sort_by: "total_ms", descending: "true" })}`,
+      `/analyses/${encodeURIComponent(analysisId)}/requests${query({ offset: filters.offset ?? 0, limit: filters.limit ?? 100, sort_by: filters.sortBy ?? "total_ms", descending: String(filters.descending ?? true), request_id: filters.requestId })}`,
       { signal },
     ),
   distribution: (analysisId: string, filters: LatencyDistributionFilters = {}, signal?: AbortSignal) =>
@@ -135,30 +149,36 @@ export const tracingApi = {
       })}`,
       { signal },
     ),
-  events: (analysisId: string, filters: { requestId?: string; componentId?: string }, signal?: AbortSignal) =>
+  events: (analysisId: string, filters: PageFilters, signal?: AbortSignal) =>
     request<ApiList<TraceEvent>>(
       `/analyses/${encodeURIComponent(analysisId)}/events${query({
         request_id: filters.requestId,
         component_id: filters.componentId,
-        limit: 1000,
+        offset: filters.offset ?? 0,
+        limit: filters.limit ?? 100,
+        event_name: filters.name,
       })}`,
       { signal },
     ),
-  spans: (analysisId: string, filters: { requestId?: string; componentId?: string }, signal?: AbortSignal) =>
+  spans: (analysisId: string, filters: PageFilters, signal?: AbortSignal) =>
     request<ApiList<SpanRecord>>(
       `/analyses/${encodeURIComponent(analysisId)}/spans${query({
         request_id: filters.requestId,
         component_id: filters.componentId,
-        limit: 1000,
+        offset: filters.offset ?? 0,
+        limit: filters.limit ?? 100,
+        name: filters.name,
       })}`,
       { signal },
     ),
-  flows: (analysisId: string, filters: { requestId?: string; componentId?: string }, signal?: AbortSignal) =>
+  flows: (analysisId: string, filters: PageFilters, signal?: AbortSignal) =>
     request<ApiList<FlowRecord>>(
       `/analyses/${encodeURIComponent(analysisId)}/flows${query({
         request_id: filters.requestId,
         component_id: filters.componentId,
-        limit: 1000,
+        offset: filters.offset ?? 0,
+        limit: filters.limit ?? 100,
+        edge_id: filters.name,
       })}`,
       { signal },
     ),
@@ -207,6 +227,27 @@ export const tracingApi = {
   warnings: (analysisId: string, signal?: AbortSignal) =>
     request<{ items: string[]; total: number; limit: number; truncated: boolean }>(`/analyses/${encodeURIComponent(analysisId)}/warnings`, { signal }),
 };
+
+/** Resolve the exact occurrence ID, even when repeated names span several pages. */
+export async function findSourceRecord(
+  analysisId: string,
+  kind: "span" | "flow",
+  sourceId: string,
+  filters: PageFilters,
+  signal: AbortSignal,
+): Promise<SpanRecord | FlowRecord | null> {
+  let offset = 0;
+  while (!signal.aborted) {
+    const page = kind === "span"
+      ? await tracingApi.spans(analysisId, { ...filters, offset, limit: 100 }, signal)
+      : await tracingApi.flows(analysisId, { ...filters, offset, limit: 100 }, signal);
+    const record = page.items.find((item) => item.id === sourceId);
+    if (record) return record;
+    if (page.next_offset == null || page.next_offset <= offset) return null;
+    offset = page.next_offset;
+  }
+  return null;
+}
 
 export async function pollJob(
   initial: LoadJob,

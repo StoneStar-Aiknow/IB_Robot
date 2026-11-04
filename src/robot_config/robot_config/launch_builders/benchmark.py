@@ -37,6 +37,7 @@ from robot_config.observation_transport import (
     effective_observation_transport,
     validate_robot_config_observation_transports,
 )
+from robot_config.runtime_target import RuntimeTarget
 
 logger = get_colored_logger("robot_config.benchmark")
 
@@ -271,7 +272,9 @@ def _resolve_evaluator_endpoints(robot_config: dict) -> dict[str, str]:
 
     control_mode = str(robot_config.get("default_control_mode", "model_inference"))
     try:
-        inference = parse_inference_config(robot_config, control_mode)
+        inference = parse_inference_config(
+            robot_config, control_mode, scheduler_enabled=False, runtime_target=RuntimeTarget.BENCHMARK
+        )
     except InferenceConfigError:
         inference_health = ""
     else:
@@ -294,7 +297,9 @@ def _selected_benchmark_pipeline(robot_config: dict):
     from robot_config.inference_config import parse_inference_config
 
     control_mode = str(robot_config.get("default_control_mode", "model_inference"))
-    inference = parse_inference_config(robot_config, control_mode)
+    inference = parse_inference_config(
+        robot_config, control_mode, scheduler_enabled=False, runtime_target=RuntimeTarget.BENCHMARK
+    )
     if not inference.enabled or not inference.pipelines:
         raise BenchmarkLaunchError("benchmark RTP requires an enabled inference pipeline")
     executor = robot_config.get("control_modes", {}).get(control_mode, {}).get("executor", {}) or {}

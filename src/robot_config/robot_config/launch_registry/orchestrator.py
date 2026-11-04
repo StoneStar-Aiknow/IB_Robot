@@ -217,5 +217,9 @@ def build_prepared_launch(
         readiness_timeout_s=_readiness_attribute("resolve_controller_startup_timeout")(
             robot_config, prepared.use_sim, prepared.sim_platform
         ),
+        # The bound snapshot revalidates the config: a host whose models are
+        # served elsewhere (with_model_services:=false) revalidates them by
+        # metadata, without demanding the artifacts it does not host.
+        require_local_model_artifacts=parse_bool(prepared.arguments.get("with_model_services", "true"), default=True),
     )
     return [*world_prelude, *bound_actions]

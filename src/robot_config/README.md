@@ -32,6 +32,9 @@ external_vad 模式不接受任何音频或分段 topic 兜底参数：它只消
 X2 语音链位于叠加 profile `aimdk_x2_voice.yaml`（`base_config: aimdk_x2_skills.yaml`），因此手势
 profile 保持无语音，既不依赖仓库外的 X-ASR bundle，也不受 `audio.speech` 就绪准入影响。逻辑接口
 在 runtime description 缺失时，语音 profile 会在 launch 前失败并说明该 runtime 不发布它。
+`aimdk_x2_voice_addressee.yaml` 再叠加语音 Agent 与寻址门控（声纹校验、`audio.wake_event` 唤醒事件、
+`external_finalize_on_idle`），参数为 2026-10-24 至 10-27 真机测试所用值；声纹模型与 X-ASR 一样
+是仓库外提供的 schema-v3 bundle（`voice_asr.speaker_embedding.bundle_path` / `.deployment`）。
 `audio_io.source` 已删除（runtime-owned-audio-io）：设置 `runtime.provider` 的部署音频设备由 runtime
 拥有——`peripherals` 中的 `microphone`/`speaker` 由机器人 runtime 启动同一组 ALSA 节点，并投影为带格式
 元数据的 `audio.capture` / `audio.play` 接口；voice_asr（流式）、speech_direction、voice_tts 通过
@@ -299,6 +302,21 @@ bringup）时缺失键回落到 `absent_fallback`。两者刻意不同（`robot_
 `with_moveit`），所有权只决定由谁声明。与核心表或其他业务贡献重名在 `compose_argument_specs`
 聚合时拒绝，发生在任何副作用阶段之前。
 
+### 绑定另一台主机上的运行时（Python API）
+
+`generate_bound_runtime_actions()` 等待 runtime 描述并构造消费者，默认同时启动本机的 runtime
+provider。`start_provider=False` 表示 runtime 已由另一台主机运行：launch 只等待其就绪并绑定接口
+描述，不再启动第二个 runtime。`runtime_ready_waiter()` 单独导出该等待节点，两条路径共用同一个
+等待器。
+
+使用约束：
+
+- 这两个参数属于 Python API（`robot_config.launch_builders.runtime`）。它们不是通用的
+  launch CLI 参数。
+- 需要跨主机绑定的入口在自己的 launch 文件中调用该 API，并传入 `start_provider=False`。
+- 等待节点要求 `robot.runtime.provider` 已配置。provider 缺失时启动失败。
+- 就绪失败或超时按返回码结束启动，消费者不会启动。
+
 ### 通用模型服务 SSOT
 
 模型服务使用顶层 `perception_services`，不属于具体消费者。每个 enabled entry 必须显式选择 manifest 中的命名
@@ -331,6 +349,17 @@ service entry 由消费功能自行注册。
 精确 service type、required/optional policy、manifest semantic identity，以及 SigLIP image/text embedding
 metadata 兼容性；通用 parser 仍不维护模型 family 词表。有效 role bindings、service declarations、deployment
 fingerprint 和 semantic identity fingerprint 共同生成与路径和列表顺序无关的正 63-bit configuration generation。
+
+`with_model_services` launch 参数（`inference_service` 的 `perception_models` 条目声明，默认 `true`）
+决定本机是否启动这些服务节点。参数为 `false` 时，配置加载和 live binding 按元数据校验
+enabled service。身份、endpoint、deployment 名称和语义契约照常校验。bundle 文件和
+deployment artifacts 只在托管主机校验。
+
+消费端主机只需要每个 enabled service 的 bundle 目录和 `inference_manifest.json`，
+不需要权重文件。semantic mapping 的参数构造与 `load_robot_config()` 的契约读取同样
+按元数据校验。scheduled dispatcher 和 recording node 这类消费者只读取自己的契约。
+验证配置的工具显式要求本机 artifacts。详见
+[inference_service README](../inference_service/README.md)。
 
 ## Sim camera pose override（仅限仿真标定，opt-in）
 
@@ -668,25 +697,47 @@ moveit:
 `pose_diagnostics.settle_sec` 可设为 `0.0`；相机与夹爪稳定等待不在此屏障覆盖范围内。仿真启动会
 清空硬件心跳话题，只保留关节与 TF 屏障。
 
-LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令授权 SSOT：
+### LeKiwi 配置与底盘门控
 
-```yaml
-motion_mode:
-  enabled: true
-  navigation_enabled_on_startup: false
-  navigation_enabled_topic: motion_mode/navigation_enabled
-  navigation_mode_ack_topic: motion_mode/base_navigation_enabled
-  set_navigation_enabled_service: motion_mode/set_navigation_enabled
-  manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
-  navigation_controllers: [base_velocity_controller]
-  manipulation_control_mode: moveit_planning
-  navigation_control_mode: base_navigation
-  transition_timeout_s: 2.0
-```
+LeKiwi 的底盘与机械臂由 `lekiwi_robot` runtime 负责（`runtime.provider: lekiwi_robot`）。受支持的
+LeKiwi 配置及其状态：
 
-默认抓取模式激活机械臂/夹爪控制器并把底盘控制器保持 inactive。任务切换只调用上述服务；
-MoveIt Gateway 按顺序停止当前运动域、切换 controller manager 中的 active/inactive 控制器集合，并等待
-底盘 bridge 的零速确认。硬件节点不重启，且 1～6 轴与 7～9 轴始终互斥。
+| 配置 | 状态 | 说明 |
+|---|---|---|
+| `lekiwi_lidar` | 受支持（runtime provider，profile `lekiwi_lidar`） | MID-360 建图/导航，纯底盘 |
+| `lekiwi_nav_grasp` | 受支持（runtime provider，profile `lekiwi_nav_grasp`） | 移动抓取 + 导航 + hybrid |
+| `lekiwi_hybrid_switch_test`、`lekiwi_nav_grasp_sound_real` | 受支持（经 `base_config: lekiwi_nav_grasp` 继承） | overlay |
+| `lekiwi_sensor_calib` | 受支持（runtime provider） | `lekiwi_calibration` 工作流启动它 |
+| `lekiwi_handeye_realsense_grasp`、`lekiwi_handeye_realsense_grasp_pc` | 不支持（底盘已关闭，仅保留供测试加载） | 改用 `lekiwi_nav_grasp` 的 `grasp` stage |
+| `lekiwi_realsense_mapping`、`lekiwi_realsense_navigation`、`lekiwi_semantic_capture` | 不支持（底盘已关闭） | 改用 `lekiwi_lidar` / `lekiwi_nav_grasp` 的对应 stage |
+| `lekiwi_rtp_distributed` | 不支持（动作空间未迁移） | 底盘动作直写轮速控制器、绕过 runtime 门控；runtime 底盘动作契约由后续变更定义 |
+| `lekiwi` | 不可启动，刻意保留 | 缺少 `sts_hardware_interface` 插件与驱动；仍是 `sim_controllers`、EKF 导航块和 `imu_sensor_broadcaster` 的唯一测试夹具 |
+
+绑定 runtime provider 的配置不再声明 `motion_mode`、`ros2_control`、`navigation.cmd_vel_bridge` 或
+`navigation_enabled_on_startup`；加载时出现这些字段会报错并指出字段名和替代来源。底盘通过 runtime 的
+公共通道驱动：
+
+- 速度只走 `/cmd_vel`（`geometry_msgs/Twist`），runtime 仅在 `base_navigation` 模式且导航门打开时接收，
+  超过 `base.cmd_vel.staleness_s` 未收到指令即置零，速度包络由 runtime profile 发布。
+- runtime 启动时导航门关闭。stage 用 `navigation.open_gate_on_startup` 声明意图，启动后由
+  `robot_navigation navigation_admission` 切到 stage 的 runtime 模式、调用
+  `/motion_mode/set_navigation_enabled` 并等待 `/motion_mode/base_navigation_enabled` 确认；任何一步失败都会
+  终止启动。
+- `/runtime/stop` 的停止锁存优先于导航门，需 `SetRuntimeMode("idle")` 才能解除。
+- 启用碰撞监测（`dyn_avoid_enabled`）的 stage 中，Nav2 链路为 controller → `/cmd_vel_nav` → velocity
+  smoother → `/cmd_vel_smoothed` → collision monitor → `/cmd_vel`。
+
+**手柄（`lekiwi_gamepad`，`joy_teleop`）**：`lekiwi_lidar` 与 `lekiwi_nav_grasp` 声明了该设备，在接手柄的主机上把
+`teleoperation.active_device` 设为 `lekiwi_gamepad` 即可启用。启动时会对照 runtime 绑定的 `base.cmd_vel`
+校验：话题和消息类型一致、有 deadman、各轴 scale 不超过发布的限速、服务命令只能是 `/runtime/stop`。
+注意两点：
+
+- 手柄与碰撞监测的输出共用 `/cmd_vel`，**启用碰撞监测的 stage 中手柄指令不经过碰撞监测**（迁移前手柄与
+  Nav2 共用碰撞监测输入，顺带被过滤）。模式、导航门、停止锁存、超时置零和速度包络仍约束每条手柄指令。
+- 松开 deadman 只在手柄是唯一指令来源时让底盘停下；Nav2 目标仍在执行时，操作员的停止手段是 B 键
+  （`/runtime/stop`，锁存）或取消导航。
+
+机械臂遥操作（`motion.arm.*`）尚未接入 LeKiwi runtime，由后续变更提供。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
@@ -795,11 +846,14 @@ V3 额外包含 `supported_control_modes`。切换 `context_schema_version` 会�
 robot:
   base_config: aimdk_x2.yaml          # 运行时作者的基础配置保持不变
   name: aimdk_x2_skills
+  type: x2_ultra_omnihand             # 选用 OmniHand profile，它声明了回放用的手势录制轨迹
+  runtime:
+    profile: x2_ultra_omnihand
   default_control_mode: named_motion
   skill_required_control_mode: named_motion
   control_modes:
     named_motion:
-      runtime_mode: idle              # 运行时只在 idle（稳定站立）准入命名动作
+      runtime_mode: stream            # 运行时在 stream（UPPERBODY_REMOTE_SPLIT）回放录制的手势轨迹
       inference: {enabled: false}
       executor: {enabled: false}      # 必须显式关闭：缺省视为启用，会启动 action_dispatcher
   embodied:
@@ -823,7 +877,11 @@ robot:
   配置交给 embodied 节点。要求 `runtime.provider`，且 `capabilities.requires` 含 `motion.named` 或
   `motion.posture`。因为是实时绑定，离线 `load_robot_config_dict()` 需要 `defer_interface_binding=True`；
   robot-skill CLI 请用 launch 日志里 `consumer snapshot:` 给出的绑定后配置（`--config-path`）。
-- `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。
+- `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。它和 `aimdk_x2.yaml` 的
+  `teleop` 共用运行时 `stream`：运行时处于 `idle` 时执行器先切一次 `stream`，之后保持在 `stream`；
+  运行时不让手势抢占正在发手臂流的指令源（返回 `BUSY`）。
+- 适用硬件：`aimdk_x2_skills` 与叠加其上的 `aimdk_x2_voice` 只适用于装 OmniHand 的 X2（一只或两只）。
+  装夹爪的 X2 用 `aimdk_x2.yaml`；选错时运行时启动即报手型不匹配（`hand type mismatch`）并进入 FAULTED。
 
 ## X2 照镜子（motion_imitation_stream / mirror_session）
 
@@ -1098,7 +1156,7 @@ robot:
   `temporal_ensemble_coeff`、`chunk_size`、`smoothing_device` 等调参字段保持不变。
 - 历史 `executor.type: action` 仅由 launch 边界映射为 `topic`。直接节点参数
   `executor_type` 不接受此别名。ROS 参数类型约束仍适用，YAML null 默认语义不适用于 ROS CLI override。
-- `inference.scheduler.enable` 选择产品入口，不等同于 `dispatch.scheduler`。
+- `robot.runtime_scheduler.enable` 选择产品入口，不等同于 `dispatch.scheduler`。
   scheduled 显式选择 benchmark 或 wait_for_feedback 会报错，不再静默忽略。
 - 两节点的 `~/toggle_smoothing`（Empty）先校验有效组合，拒绝时保留配置及计划并记日志，
   不伪造响应错误字段；start/stop/get_status 为 Trigger。legacy reset 为 Empty，scheduled
@@ -1122,12 +1180,22 @@ robot:
 
 ### 推理调度控制面
 
-调度只有一个功能开关：`control_modes.<mode>.inference.scheduler.enable`，缺失时按 `false` 处理。
-仿真暂不支持启用该开关：`runtime_target=simulation`（含 Gazebo、MuJoCo、mock）运行推理时必须设置
-`scheduler.enable=false`，否则 launch 在生成控制与仿真节点前报错。仿真场景不管理调度 session/binding。
+调度只有一个功能开关：`robot.runtime_scheduler.enable`，缺失时按 `false` 处理。
+开关位于机器人级，统一控制各控制模式下的 policy 推理调度。
+SIM（含 Gazebo、MuJoCo、mock）和 benchmark 始终直通，即使开关为 true，也不创建调度 session/binding。
+目标按 CLI `runtime_target`、YAML `runtime.target`、CLI `use_sim`、hardware 默认值的顺序解析；
+YAML `use_sim` 不参与目标选择。显式 CLI 目标与具身参数冲突时拒绝启动，单独 CLI `sim_platform` 选择虚拟具身。
+准备阶段将调度决策与有效目标传给 execution；显式 `scheduler_enabled` 仅作一致性校验，
+与机器人开关、当前推理模式或有效目标矛盾时拒绝解析。benchmark 专用配置解析始终采用直通策略。
+只有 live-binding 分支将目标写入绑定配置副本，源 YAML 不变。
+独立 execution builder 可显式接收目标和时钟；未传 `use_sim_time` 时，保留原有规则，跟随调用者的
+`use_sim` 参数（两者均未传时为 `false`），不根据后端另行推断。通用 launch 仍由 preparation
+统一选择后端时钟并显式传入。声明拓扑 CLI 只解释 YAML 中的目标，不读取 launch 覆盖参数。
+本阶段仍使用既有 policy 调度器，不将感知、语音或进程内模型自动纳管。
 `inference.enabled` 仍只表示该控制模式是否启用推理，不是调度模式开关。
 
-当 `scheduler.enable` 缺失或为 `false` 时，launch graph 与原路径相同：
+`robot.runtime_scheduler.enable` 缺失或为 `false` 时，通用 launch 的目标解析和直通执行路径保持不变
+（包括节点参数、名称、环境、remapping、输出设置和 action 顺序）：
 
 ```text
 executor.inference_pipeline
@@ -1137,9 +1205,9 @@ executor.inference_pipeline
 ```
 
 该分支不创建 Global Scheduler、ScheduledActionDispatcher、product session、scheduled endpoint 或 serving
-status。显式保留 `scheduler` 块并设置 `enable: false` 时，完整调度配置可以原样保留为 dormant 配置，
+status。显式保留 `runtime_scheduler` 块并设置 `enable: false` 时，完整调度配置可以原样保留为 dormant 配置，
 不会生成 runtime policy，也不会改变 legacy launch graph、节点参数、接口、线程数或 backend 执行方式，
-因此启停只需修改这一处开关。若整个 `scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留
+因此启停只需修改这一处开关。若整个 `runtime_scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留
 旧配置的严格拼写检查。
 仓库当前发布的机器人 YAML 都未启用该开关，因此默认生产启动仍是这条 legacy 路径；下面的 `true` 片段是配置
 契约示例，不是默认切流。
@@ -1148,17 +1216,18 @@ status。显式保留 `scheduler` 块并设置 `enable: false` 时，完整调�
 `profile_path` 可选；只有实际参与 priority-0 deadline 准入的候选才需要有效的离线 profile：
 
 ```yaml
+# 以下为 robot: 下的配置
+runtime_scheduler:
+  enable: true
+  global_endpoints:
+    readiness: /inference/scheduler/ready
+    open_session: /inference/session/open
+    dispatch: /inference/dispatch
+    close_session: /inference/session/close
 control_modes:
   model_inference:
     inference:
       enabled: true
-      scheduler:
-        enable: true
-        global_endpoints:
-          readiness: /inference/scheduler/ready
-          open_session: /inference/session/open
-          dispatch: /inference/dispatch
-          close_session: /inference/session/close
       pipelines:
         policy:
           model_path: models/policy
@@ -1194,7 +1263,7 @@ Scheduler 开启时只接受 schema v3 whole-graph monolithic deployment，生�
 `max_snapshot_age_ms: 5000`（默认值，正整数）。producer 是 manifest `execution` 中的第一个角色；
 terminal 或 sequential stage 不允许设置该字段。时效从观测采样开始计算，包含 producer 排队与执行时间，
 阈值进入 runtime policy fingerprint 并经 launch 下发。刷新不能使过期的同一观测重新有效。
-分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
+分布式 pipeline 保持 legacy protocol v2；hardware 目标下不能与 `robot.runtime_scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
 最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
 默认 `global_policy: fifo` 且 `priority_zero_deadline_admission.enable: false` 时，priority-0 直接下发 target，
 不建立资源等待队列、不使用 profile，也不接受非空 fallback chain；启用 scheduler 后该无效组合会在配置加载时报错。
@@ -1536,7 +1605,71 @@ robot:
         api_key_env: KIMICODE_API_KEY   # 密钥只允许环境变量名；字面 api_key 会被校验拒绝
         model: kimi-for-coding
         temperature: 1.0          # kimi-for-coding 强制 temperature=1
+        timeout_sec: 120.0        # 非流式调用，等价于「等首字」上限
+        enable_thinking: true     # 仅 dashscope 原生识别；其他 provider 用 extra_body
+        max_tokens: null          # 正整数；planner 只需一个小 JSON
+        extra_body: {}            # provider 私有字段，最后合并进请求体
+        catalog_view: planner     # planner（精简，默认）| full（完整 catalog 进 prompt）
+        stream: false             # 本轮新增；见下方「流式与提前出声」
 ```
+
+##### 规划时延相关字段
+
+规划是一次非流式调用，整段生成完才返回，所以「等首字」就是整段耗时。影响它的字段：
+
+| 字段 | 作用 |
+| --- | --- |
+| `timeout_sec` | 传给 socket 的空闲超时。非流式下服务端生成完才发第一个字节，所以它实际是「等首字」上限。默认 120 s 对对话偏宽 |
+| `enable_thinking` | 思考 token 会整段算进等待时间。**只有 base_url 含 `dashscope.aliyuncs.com` 时客户端才会下发原生的 `enable_thinking: false`**；其他 provider 各有各的写法，用 `extra_body` 下发 |
+| `max_tokens` | 规划输出只是一个小 JSON 对象。不设上限时模型可以一直写下去，每个多余 token 都加在说出第一句话之前 |
+| `extra_body` | 原样合并进请求体（最后合并），用于 provider 私有开关。不允许覆盖 `model`/`messages`/`input`/`stream` |
+| `catalog_view` | `planner` 只把 planner 可选的技能和它们的必要字段放进 prompt；`full` 保留旧行为（整个 catalog，含 `planner_visible=false` 的技能与校验用字段）。**无论取哪个值，workflow 校验与只读应答始终使用完整 catalog** |
+
+HTTP 连接在同一个 client 实例内复用（keep-alive），所以第一轮之后不再重复付
+DNS、TCP 与 TLS 握手。空闲连接只有一条：并发调用（如 `perception_service` 每个请求一个线程）
+发现它正被占用时各自新开连接，不排队等别人的模型调用。代理按改动前所用的 urllib 处理：
+`HTTPS_PROXY` 下 https 目标走 CONNECT（代理 URL 的 scheme 被忽略，缺省端口 443），
+账号与密码都非空才发送代理凭据。
+
+##### 流式与提前出声
+
+`stream: true` 把规划改成 SSE，并在模型吐出 `user_message` 这一个字段、它刚闭合时
+就把它作为 `/agent/event` 的 `reply_preview` 事件（`state=PLANNING`）发布，而不等整段
+计划生成完。Agent 自己不出声：由请求所属的通道决定怎么呈现——`agent_voice_bridge`
+在启用 TTS 时播报它，最终回答与它相同时不再重复；`chat_tui` 只显示一行事件。
+**只有回复提前，执行没有**：完整 JSON 到达后仍然走原来那套严格校验
+（`parse_planner_outcome` + `validate_workflow_steps`），任何不合法的计划照旧被拒。
+预告要等 `kind` 也到达才发布，且 `read_only` 不预告：它的回复会被 Gateway 的真实状态
+替换，先说模型自己的文字可能与之矛盾。
+
+代价是明确的：语音通道在计划通过校验**之前**就播报了回复，所以一个随后校验失败的计划
+会留下「说了但没做」——随后的 FAILED 终态会播报「执行失败」，ledger 里也留有这条
+`reply_preview` 记录。这比「每次都等着不说话」好，但比「错的计划就该沉默」差——
+这是有意选择的权衡，所以默认关闭，由部署显式开启。
+
+实测（`doubao-seed-2-1-lite`，真实 planner 请求，交替采样）：
+
+| 环境 | 非流式整段 | 流式可出声 | 提前 |
+| --- | --- | --- | --- |
+| 开发机 | 2478 ms | **1575 ms** | 803 ms |
+| 灵犀 X2（经 CONNECT 代理） | 1836 ms | **1443 ms** | 431 ms |
+
+X2 那一行同时验证了它的 CONNECT 代理不会缓冲 SSE（单次 51 个 chunk）——代理一旦缓冲，
+流式在机器人上就会静默失效，而在开发机上看起来一切正常。
+
+**流式的价值取决于模型**。它省下的是「答案生成」那一段，所以模型必须把时间花在生成上
+而不是花在思考上。实测对比：
+
+| 模型 | 思考阶段 | 答案阶段 | 流式可省 |
+| --- | --- | --- | --- |
+| `kimi-for-coding` | 2375 ms（99%） | 15 ms | **8 ms** |
+| `doubao-seed-2-1-lite`（关思考） | 852 ms 首字 | 1216 ms | **803 ms** |
+
+Kimi 的时间几乎全在出第一个字之前，答案本身 15 ms 就吐完，所以在它上面开流式没有意义。
+
+每次规划会记录一行 `planner call status=... timing_ms=... prompt_tokens=...
+completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）。
+**content 很短而 `completion_tokens` 很大，就是思考没关掉的特征。**
 
 #### Agent 孵化入口（entry_mode: agent）
 
@@ -1560,6 +1693,15 @@ robot:
 | `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
 | `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
 | `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
+| `agent.planner.enable_thinking` | 布尔 |
+| `agent.planner.max_tokens` | 未设置或正整数 |
+| `agent.planner.extra_body` | 映射；不得覆盖 `model`/`messages`/`input`/`stream` |
+| `agent.planner.catalog_view` | `planner` 或 `full` |
+| `agent.planner.stream` | 布尔；为 `true` 时提前发布 `reply_preview` 事件（由语音通道决定是否播报），执行仍需完整校验；要求 `api_protocol` 为 `chat_completions` |
+| `agent.planner.direct_commands` | 映射 `整句话语: 技能名`；整句精确匹配时不调用模型、直接生成单步计划（否定/假设句不触发，技能须在 live catalog 中且 planner 可选），提案的 `planner_identity` 记为 `route=direct_command`；`execution_enabled` 时每个技能都必须在 `test_allowlist` 内 |
+| `voice_asr.transcript_topic` | 绝对 topic，默认 `/voice/transcript`，仅 `external_vad` 下发布：同一最终文本按段再发一份 `ibrobot_msgs/SpeechTranscript`（带 `source_id` 与 `segment_sequence`），`output_topic` 上的纯文本照旧。寻址门控按段配对时桥接从这里读 |
+| `voice_asr.external_finalize_on_idle` | 布尔，默认 false，仅 `external_vad` 下生效。音源发了 BEGIN 却从不发 END 时，按 `external_idle_timeout` 收尾并发布转写，而不是丢弃整段；X2 固件如此（2026-10-23 实测 BEGIN 1 / END 0），`aimdk_x2_voice_addressee` 开启它。会发 END 的音源应保持关闭：那里的空闲超时意味着话说到一半卡住，发布截断的指令比不发更糟 |
+| `voice_asr.vad_*` / `voice_tts.num_steps` | 只校验 profile 实际配置的值：VAD 时长为有限正数（`post_roll` / `pre_roll` 可为 0），`num_steps` 为正整数；默认值归属 `voice_asr_service` / `voice_tts_service` |
 | `agent.voice_bridge.enabled` | 布尔；为 `true` 时启动 `agent_voice_bridge`，把 ASR 最终文本接入 Agent（默认关闭） |
 | `agent.voice_bridge.confirm_mode` | `auto` 或 `voice_confirm`，**只对旧 Agent Plan 的展示回执路径生效**：typed Program（经 Gateway 的默认路径）不等待回执，桥接只播报计划、不询问确认，语音对运动的控制手段是停止词。未配置时启用 TTS 取 `auto`、未启用 TTS 取 `voice_confirm` |
 | `agent.voice_bridge.input_topic` | 绝对 topic；默认跟随 `voice_asr.output_topic` |
@@ -1567,6 +1709,19 @@ robot:
 | `agent.voice_bridge.busy_message` | 非空字符串；执行中提示语。播报时 ASR 仍在监听停止词，**不得包含停止词**（否则机器人会被自己的提示中断），违反即报错 |
 | `agent.voice_bridge.stop_phrases` / `bypass_phrases` / `confirm_phrases` / `cancel_phrases` | 非空字符串列表；`stop_phrases` 不能为空，未配置时取 `embodied_common.control_phrases.STOP_PHRASES` |
 | `agent.voice_bridge.confirm_timeout_sec` / `session_idle_sec` / `request_timeout_sec` / `tts_timeout_sec` | 有限正数 |
+| `agent.voice_bridge.addressee_trigger` | `wake_phrase`（默认）或 `vendor_session`。前者要求话语以 `wake_phrases` 开头；后者用于**先吃掉自身唤醒词再放行语音**的平台（X2 实测如此），此时唤醒词到不了文本层，**只有唤醒事件能开会话**（必须配 `wake_event`），会话首句是唤醒事件指明那一段的转写；静默 `session_gap_sec` 后会话结束，下一句没有新唤醒就被拒绝。`vendor_session` 下配 `wake_phrases` 会被拒绝 |
+| `agent.voice_bridge.session_gap_sec` | 有限正数，默认 15 秒。仅 `vendor_session` 下生效：会话内转写间隔超过它即结束会话，之后需要新的唤醒事件。必须大于最长话语加 ASR 定稿延迟（间隔在最终转写之间测量）；偏小会让用户停顿后的追问也要重说唤醒词 |
+| `agent.voice_bridge.wake_phrases` | 非空字符串列表，省略该键表示**接受每一句话**（现有部署的行为）。配置后，一句话必须以其中之一**开头**才算是对机器人说的；命中后唤醒词会被**从文本中剥离**再送给 planner。空列表会被拒绝（那是一道没人能打开的门）。停止词**不受此门控**，安全优先 |
+| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；窗口**只被真正被处理的话续期**，被忽略的话不会把它撑开。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
+| `agent.voice_bridge.speaker_check_enabled` | 布尔，默认 false。开启后窗口内的话要与**会话首句**（说唤醒词那句，或 `vendor_session` 下唤醒事件指明的那一句）的声纹匹配才转发。要求门控已开启（配 `wake_phrases` 或 `addressee_trigger: vendor_session`，锚点来自会话首句），且要求 `voice_asr.speaker_embedding.enabled: true`（否则没人发布可比对的声纹，门看起来在过滤实际全放行）——两条都 fail closed |
+| `agent.voice_bridge.speaker_min_similarity` | `(0, 1]`，默认 0.60。余弦相似度下限。默认值是 X2 真机测试用的值（2026-10-24，campplus，≥2 s 片段）：旁人与锚点 0.28–0.56，用户本人在锚点累积后 0.67–0.84。离线语料的数字不能作依据——其分组标签并非同一个人。**仍须用真人录音现场标定**（方法见 `ibrobot_agent/README.md`）：取决于模型、麦克风、房间与说话人相似度 |
+| `agent.voice_bridge.speaker_max_age_sec` | 有限正数，默认 2.5 秒。声纹按语音段与转写配对；某段的声纹超过这个时长仍没有等到它的转写（ASR 丢弃了该段）即丢弃，只限制内存，不决定谁判定谁 |
+| `agent.voice_bridge.measurement_grace_sec` | 非负有限数，默认 0.4 秒（X2 配置 1.5 秒）。转写等待自身声纹的**上限**：只有要和锚点比对、而测量尚未到达的转写才会等，测量一到立即判定；会话首句、停止词、确认回答不等 |
+| `agent.voice_bridge.speaker_merge_margin` | `[0, 1)`，默认 0.10。放行的话只有相似度至少达到 `speaker_min_similarity + speaker_merge_margin` 才并入声纹锚点；刚过阈值的话放行但不改动锚点，避免锚点被音色相近的旁人带偏。设为 0 即每句放行的话都并入 |
+| `agent.voice_bridge.speaker_reject_short` | 布尔，默认 false。开启后，已有声纹锚点时，`speaker_id_node` 报告「太短、没有声纹」（空向量）的后续话被挡，而不是按 fail-open 放行。会话首句、停止词、确认回答不受影响；声纹消息根本没到时仍放行。X2 真人实测指令多为 1 s 左右人声，默认放行会让第二个人的指令全部通过 |
+| `agent.voice_bridge.speaker_embedding_topic` | **不可配置**：桥接订阅的声纹话题由 `voice_asr.speaker_embedding.output_topic` 决定（默认 `/voice/speaker_embedding`），launch 只从那里推导，出现即报错——两份配置一旦不一致，桥接收不到声纹，校验会静默放行所有人 |
+| `agent.voice_bridge.input_topic`（按段配对时） | 启用 `speaker_check_enabled` 或 `vendor_session` 时门控按语音段配对转写、声纹与唤醒事件，桥接改订阅 `voice_asr.transcript_topic` 上的 `ibrobot_msgs/SpeechTranscript`（launch 推导），此时**不可配置** `input_topic`，且要求 `voice_asr.input_mode: external_vad`（只有自带分段的音源能说出转写属于哪一段） |
+| `agent.voice_bridge.wake_event` | `{interface: audio.wake_event, type: ibrobot_msgs/msg/SpeechWakeEvent}`，仅 `vendor_session` 下可配，且 `vendor_session` **必须**配（只有唤醒事件能开会话，缺了机器人对谁都不响应）。绑定 runtime 发布的唤醒事件（X2 见 `aimdk_robot/README.md`）：同一音源、从被唤醒段起的第一句转写成为会话首句并重设锚点，用于开会话与窗口内换人接管。话题名由 runtime 接口描述决定，**不接受** `wake_event_topic` 字面话题。事件型接口不等就绪（说唤醒词之前不会有消息），启动时只检查 runtime 已声明 |
 | `agent.voice_bridge.min_text_chars` | 正整数，过滤“嗯”“啊”等过短话语 |
 | `agent.voice_bridge.text_corrections` | 映射 `领域词: [误识别写法, ...]`，在停止/确认匹配和送入 Agent 前整句字面替换（如 `夹爪: [家长, 家找]`）；每项至少一个非空写法。只填本机器人语境下无歧义的写法 |
 | `agent.voice_bridge.resume_settle_sec` | 正数，默认 1 秒；TTS 播报结束恢复 ASR 后的静默窗口，期间丢弃识别结果 |
@@ -1577,7 +1732,12 @@ robot:
 （rule Planner 无运动测试）、`so101_single_arm_agent_gazebo`（Gazebo 执行）、
 `so101_single_arm_agent_hardware`（真机执行）、`so101_single_arm_agent_hardware_stop`
 （真机停止验证）、`so101_single_arm_agent_voice_gazebo`（仿真语音入口：ASR → voice bridge → Agent）、
-`so101_agent_voice_hardware`（真机语音入口：Kimi Planner，规划完成即执行，技能白名单继承 `so101_agent_manual_hardware`）。
+`so101_agent_voice_hardware`（真机语音入口：Kimi Planner，规划完成即执行，技能白名单继承 `so101_agent_manual_hardware`）、
+`so101_voice_latency`（语音时延测量：豆包关思考 + 流式 `reply_preview` + `num_steps: 4`，
+需要 `ARK_API_KEY`；其余 profile 的 Planner 与默认值不受影响。`so101_robot` runtime 没有麦克风，
+provider 路径上不能启用 ASR，文本经 `/voice_command` 注入，调优判停留给本地 VAD 部署按 `voice_asr.vad_*`
+开启（见 `voice_asr_service` README「判停时延」）；TTS 在旁单独启动，`num_steps` 要经 `runtime_options_json`
+一并传入，见 profile 注释）。
 运行时行为与安全边界见 `ibrobot_agent` README。
 
 #### Capability Gateway 接线契约
@@ -1853,6 +2013,62 @@ ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_si
 相对 `model_path` 只相对于绝对路径环境变量 `WORKSPACE` 解析。Pipeline ID 决定默认 Action、
 reset、health 和分布式 topic；多个 pipeline 时 `executor.inference_pipeline` 必须明确选择一个。
 
+### Provider 配置覆盖 runtime 外设（runtime-peripheral-overrides）
+
+runtime.provider 配置（如 `so101_single_arm` 及其全部 overlay）可以在**机器人配置自己的
+`peripherals:` 列表**里覆盖 runtime 已声明外设的设备参数：相机分辨率、帧率、像素格式、
+`depth_*` 等，与同文件里的观测契约 `requires: {width, height, min_fps}` 放在一起。分层为
+**runtime profile < 机器人配置**（overlay 间按 `base_config` 叠加）。每台机器的差异写成
+sibling overlay（同时改相机参数和匹配的 `requires`）：
+
+```yaml
+# config/robots/so101_single_arm_720p.yaml — per-machine overlay
+robot:
+  base_config: so101_single_arm
+  name: so101_single_arm_720p
+
+  peripherals:
+    - type: camera
+      name: top
+      width: 1280
+      height: 720
+      fps: 15
+
+  contract:
+    observations:
+      - key: observation.images.top
+        interface: camera.top.color
+        requires: {width: 1280, height: 720, min_fps: 15}
+        image:
+          resize: [720, 1280]
+```
+
+生效规则（runtime-peripheral-overrides spec）：
+
+- **条目按 `(type, name)` 匹配 runtime 声明的外设**：可设 `enabled`/`disabled` 与设备
+  参数（未知字段在合并阶段保留、不按白名单拒绝；是否生效取决于具体 runtime 驱动适配器的
+  字段映射）。配置层在每个字段上胜出，**包括 enabled 状态**（配置可以
+  重新启用 profile 禁用的相机）。每层内 `disabled: X` 等价于 `enabled: not X`，同一
+  entry 同时写两个且语义矛盾会被拒绝。
+- **runtime 保留的权限**：`driver` 不允许出现在**任何** provider 配置（含
+  `require_model` 与非 `require_model`，如 LeKiwi）的条目里（加载即拒绝，点名条目）；
+  runtime 未声明的外设名也会被 runtime 的完整性规则拒绝（配置不能写 driver，因此无法
+  借此新增设备）。新增设备的正确路径是在 runtime profile 里声明（可默认
+  `enabled: false`，部署配置用覆盖条目开启——如 LeKiwi 的 speaker）。
+  `ros2_control` 与 controller 激活集仍归 require_model 配置的 runtime profile。
+- **观测契约仍然 fail closed**：配置把相机改成 1280x720 而契约 `requires` 仍是 640x480
+  时，绑定按接口点名失败（`requires.width=640, source=1280`），不会有任何 bound
+  consumer 启动——改相机参数时把 `requires` 一起改掉。
+- **值校验**：非法相机值（非正整数 `width/height`、非正有限数 `fps`、
+  `depth_width/depth_height` 必须成对、`depth_fps` 依赖两者）在 provider 启动时点名
+  报错；拼写错误的名字（如 `tpo`）同样在 provider 启动 setup 阶段失败，live-binding
+  配置下不会有任何 consumer 被构造。
+- **AimDK 边界**：`aimdk_robot` 的相机是厂商公共接口，非空 peripherals fragment 会被
+  显式拒绝。
+- **仿真限制**：Gazebo 的 depth/aligned-depth 流按 RGB-D 传感器实际渲染的 colour
+  尺寸/帧率广告（物理 depth_* 覆盖不生效）；MuJoCo 的相机帧率是插件全局速率
+  （`simulation.mujoco.camera_publish_rate`），单相机 `fps` 被其取代。
+
 ### 验证配置
 
 ```bash
@@ -1865,8 +2081,11 @@ python3 src/robot_config/robot_config/scripts/validate_config.py \
 
 `peripherals[]` 条目支持 `disabled: true` 标志：设置后该外设在 `load_robot_config()`
 与 perception launch builder 中被整体跳过（不加载配置、不生成相机节点）。用于
-Agent 孵化等无视觉 profile 显式关闭继承自 base config 的相机。注意统一的禁用开关
-是 `disabled`（极性为 true=禁用），不要使用 `enabled: false`（该键不被识别）。
+Agent 孵化等无视觉 profile 显式关闭继承自 base config 的相机。注意 provider-less 路径
+统一的禁用开关是 `disabled`（极性为 true=禁用），不要使用 `enabled: false`（该键在
+provider-less 的加载/构建路径不被识别）；**runtime.provider 路径上两种写法等价**
+（runtime merge 会把 `disabled: X` 规范化为 `enabled: not X`，见「Provider 配置覆盖
+runtime 外设」一节）。
 
 ### USB 相机（通过 `usb_cam`）
 
@@ -2033,7 +2252,7 @@ camera_info_url: file:///home/user/.ros/camera_info/top.yaml
 
 ## 仿真依赖（MuJoCo）
 
-`use_sim:=true` 模式依赖 `ros-humble-mujoco-ros2-control`，通过 rosdep 声明为运行时依赖：
+`use_sim:=true` 开启仿真，仿真后端由 `sim_platform` 选择，与 profile 的 `sim_platforms` 对齐：`gazebo`/`mujoco` 是物理仿真器平台；`sdk`（默认）是厂商 SDK 虚拟总线仿真（生产硬件适配层后的虚拟总线，无物理仿真器）——它与 `use_sim:=false`（真实硬件执行）是两回事。选择 MuJoCo 后端时依赖 `ros-humble-mujoco-ros2-control`，通过 rosdep 声明为运行时依赖；Gazebo 后端依赖 gz/ign 仿真器栈：
 
 ```bash
 # 安装所有依赖（含 MuJoCo 仿真包）

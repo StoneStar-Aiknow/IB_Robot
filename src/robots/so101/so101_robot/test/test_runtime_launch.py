@@ -164,16 +164,22 @@ def test_gazebo_platform_applies_a_peripheral_toggle_exactly_once(tmp_path):
 
 
 def test_teleop_executor_follows_the_platform_clock():
-    """The runtime-owned placo servo runs on sim time only on Gazebo (PR !515 P2).
+    """The runtime-owned teleop nodes run on sim time only on Gazebo (PR !515 P2).
 
     Managed mode compares the node clock against JointState stamps; a wall
-    clock under Gazebo drops every sim-stamped feedback sample.
+    clock under Gazebo drops every sim-stamped feedback sample. The leader
+    source stamps its samples with its own node clock, so it must follow the
+    same clock as the servo and the mapper checking those stamps (issue #197).
     """
     gazebo = _render({"use_sim": "true", "sim_platform": "gazebo"})
     servo = next(
         node for node in gazebo if isinstance(node, Node) and node._Node__node_executable == "so101_placo_servo_node.py"
     )
     assert _params(servo)["use_sim_time"] is True
+    leader_source = next(
+        node for node in gazebo if isinstance(node, Node) and node._Node__node_executable == "leader_arm_pub"
+    )
+    assert _params(leader_source)["use_sim_time"] is True
 
     physical = _render({"use_sim": "false"})
     servo = next(
@@ -182,6 +188,10 @@ def test_teleop_executor_follows_the_platform_clock():
         if isinstance(node, Node) and node._Node__node_executable == "so101_placo_servo_node.py"
     )
     assert _params(servo)["use_sim_time"] is False
+    leader_source = next(
+        node for node in physical if isinstance(node, Node) and node._Node__node_executable == "leader_arm_pub"
+    )
+    assert _params(leader_source)["use_sim_time"] is False
 
 
 def test_physical_selection_passes_no_platform_to_the_facade():
@@ -295,9 +305,29 @@ def test_shipped_profile_declares_mujoco_and_keeps_the_golden_camera_poses():
     assert (front["roll"], front["pitch"], front["yaw"]) == (0.0, 0.0, 3.1415)
 
 
+def _inject_simulator_versions(monkeypatch):
+    """Pin the version discovery for structure tests (task 1.4).
+
+    The check itself stays real: only the ament-index lookups are faked, and
+    the fake MuJoCo version follows the machine's Python mujoco so the strict
+    equality inside check_simulator_versions still holds. Pure structure
+    tests must not depend on the machine's simulator install.
+    """
+    import mujoco
+
+    import robot_runtime.mujoco as mujoco_helpers
+
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+
+
 def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
     import sim_models.scene_compiler as scene_compiler
 
+    _inject_simulator_versions(monkeypatch)
     captured = {}
 
     def fake_compose(robot_mjcf_path, scene, sdf_mesh_names):
@@ -319,6 +349,7 @@ def test_mujoco_without_a_scene_composes_the_empty_scene(monkeypatch):
     """5b.2 revision: no scene composes the `empty` scene (lit ground), never robot-only."""
     import sim_models.scene_compiler as scene_compiler
 
+    _inject_simulator_versions(monkeypatch)
     captured = {}
 
     def fake_compose(robot_mjcf_path, scene, sdf_mesh_names):
@@ -328,6 +359,68 @@ def test_mujoco_without_a_scene_composes_the_empty_scene(monkeypatch):
     monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
     _render({"use_sim": "true", "sim_platform": "mujoco"})
     assert captured["scene"] == "empty"
+
+
+def test_mujoco_version_mismatch_fails_the_launch_setup(monkeypatch):
+    """D2: a simulator/python MuJoCo mismatch fails before model composition."""
+    import mujoco
+    import pytest
+
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+    from robot_runtime.launch_support import RuntimeProfileError
+
+    # both sides pinned so the mismatch holds on any installed stack
+    monkeypatch.setattr(mujoco, "__version__", "3.12.0")
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco="3.4.0"),
+    )
+    monkeypatch.setattr(
+        scene_compiler,
+        "compose_mujoco_model",
+        lambda *args, **kwargs: pytest.fail("composition must not run on a version mismatch"),
+    )
+    with pytest.raises(RuntimeProfileError, match="the composed .mjb would not load"):
+        _render({"use_sim": "true", "sim_platform": "mujoco"})
+
+
+def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
+    """D3/D6: the camera plugin parameters ride a params file keyed under the
+    upstream mujoco_ros2_control_node name."""
+    import sim_models.scene_compiler as scene_compiler
+    from robot_runtime.launch_support import MUJOCO_SIMULATION_NODE
+    from robot_runtime.mujoco import CAMERA_PLUGIN_INSTANCE, CAMERA_PLUGIN_TYPE
+
+    _inject_simulator_versions(monkeypatch)
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco"})
+    simulator_nodes = [
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "ros2_control_node"
+    ]
+    assert [node._Node__package for node in simulator_nodes] == ["mujoco_ros2_control"]
+    from launch_ros.parameter_descriptions import ParameterFile
+
+    def _param_file_paths(node):
+        # launch_ros normalizes a parameter-file path to a list of substitutions
+        return [
+            "".join(getattr(part, "text", None) or str(part) for part in entry.param_file)
+            for entry in node._Node__parameters
+            if isinstance(entry, ParameterFile)
+        ]
+
+    param_files = _param_file_paths(simulator_nodes[0])
+    keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in Path(path).read_text(encoding="utf-8")]
+    assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
+    tree = yaml.safe_load(Path(keyed[0]).read_text(encoding="utf-8"))[MUJOCO_SIMULATION_NODE]["ros__parameters"]
+    instance = tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert instance["type"] == CAMERA_PLUGIN_TYPE
+    # the shipped profile's cameras: one entry per MJCF camera name
+    assert set(key for key in instance if key.endswith("_camera")) == {"top_camera", "wrist_camera", "front_camera"}
+    assert instance["camera_publish_rate"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -378,13 +471,205 @@ def test_advertised_camera_frames_are_identical_on_every_platform():
     assert frames["wrist"]["mujoco"] == "camera_wrist_frame"
     assert frames["front"]["mujoco"] == "camera_front_optical_frame"
 
-    # the MuJoCo sensor blocks stamp exactly the advertised frame
+    # the MuJoCo CameraPlugin parameters stamp exactly the advertised frame
+    # (the URDF carries no camera <sensor> blocks any more, D3)
     description = render_mujoco_description(profile, _PROFILE, profile.get("peripherals"), scene="")
     root = ET.fromstring(description)
-    sensor_frames = {
-        sensor.get("name").removesuffix("_camera"): param.text
-        for sensor in root.findall(".//ros2_control/sensor")
-        for param in sensor.findall("param")
-        if param.get("name") == "frame_name"
+    assert root.findall(".//ros2_control/sensor") == []
+    from robot_runtime.mujoco import camera_plugin_parameters
+
+    instance = camera_plugin_parameters(profile, profile.get("peripherals"))["mujoco_plugins"]["ibrobot_cameras"]
+    plugin_frames = {
+        key.removesuffix("_camera"): entry["frame_name"] for key, entry in instance.items() if isinstance(entry, dict)
     }
-    assert sensor_frames == {name: frames[name]["mujoco"] for name in cameras}
+    assert plugin_frames == {name: frames[name]["mujoco"] for name in cameras}
+
+
+# ---------------------------------------------------------------------------
+# runtime-peripheral-overrides: D7 fragment application, D8 effective-value
+# consistency and D9 fail-fast on this provider (the fragment is the
+# serialized robot-configuration layer handed to the runtime)
+# ---------------------------------------------------------------------------
+
+
+def _node_params(node):
+    from launch import LaunchContext
+    from launch_ros.utilities import evaluate_parameters
+
+    params = {}
+    for entry in evaluate_parameters(LaunchContext(), node._Node__parameters):
+        params.update(entry)
+    return params
+
+
+def _fragment(tmp_path, peripherals):
+    path = tmp_path / "peripheral_overrides.yaml"
+    path.write_text(yaml.safe_dump({"peripherals": peripherals}), encoding="utf-8")
+    return str(path)
+
+
+def _facade_description(actions):
+    import json
+
+    facade = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "runtime_facade"
+    )
+    return json.loads(_node_params(facade)["interface_description_json"])
+
+
+def _synthetic_description(actions):
+    import json
+
+    synthetic = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "synthetic_perception"
+    )
+    return json.loads(_node_params(synthetic)["description_json"])
+
+
+def test_fragment_disabling_a_camera_removes_it_from_description_and_actions(tmp_path):
+    """D7: a fragment disabling the declared `front` camera removes it from
+    the live description and from the physical and synthetic actions alike."""
+    fragment = _fragment(tmp_path, [{"type": "camera", "name": "front", "disabled": True}])
+
+    # physical: no realsense driver chain for front, description omits it
+    actions = _render({"use_sim": "false", "peripherals": fragment})
+    description = _facade_description(actions)
+    assert not any(name.startswith("camera.front.") for name in description["interfaces"])
+    executables = {node._Node__node_executable for node in actions if isinstance(node, Node)}
+    assert "realsense2_camera_node" not in executables
+    assert not any("front" in str(node._Node__node_name) for node in actions if isinstance(node, Node))
+
+    # sdk: the synthetic perception description omits the camera too
+    actions = _render({"use_sim": "true", "peripherals": fragment})
+    synthetic = _synthetic_description(actions)
+    assert not any(name.startswith("camera.front.") for name in synthetic["interfaces"])
+    # and the other cameras stay
+    assert "camera.top.color" in synthetic["interfaces"]
+
+
+def test_override_top_resolution_reaches_every_consumer(tmp_path):
+    """D8: one composed value (top -> 1280x720@15) reaches the live
+    description, the SDK synthetic-perception description, the physical driver
+    parameters and the rendered Gazebo sensor identically."""
+    fragment = _fragment(tmp_path, [{"type": "camera", "name": "top", "width": 1280, "height": 720, "fps": 15}])
+
+    # physical: the usb_cam driver parameters carry the value
+    actions = _render({"use_sim": "false", "peripherals": fragment})
+    driver = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "usb_cam_node_exe"
+    )
+    params = _node_params(driver)
+    assert (params["image_width"], params["image_height"], params["framerate"]) == (1280, 720, 15.0)
+    description = _facade_description(actions)
+    assert description["interfaces"]["camera.top.color"]["configured_profile"] == {
+        "width": 1280,
+        "height": 720,
+        "fps": 15,
+        "encoding": "rgb8",
+    }
+
+    # sdk: the synthetic publishers serve exactly the same profile
+    actions = _render({"use_sim": "true", "peripherals": fragment})
+    synthetic = _synthetic_description(actions)
+    assert synthetic["interfaces"]["camera.top.color"]["configured_profile"]["width"] == 1280
+    assert synthetic["interfaces"]["camera.top.color"]["configured_profile"]["fps"] == 15
+
+    # gazebo: the rendered URDF sensor carries the dimensions and rate
+    actions = _render({"use_sim": "true", "sim_platform": "gazebo", "peripherals": fragment})
+    publisher = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "robot_state_publisher"
+    )
+    urdf = _node_params(publisher)["robot_description"]
+    sensor = re.search(r'<sensor type="camera" name="top_camera">.*?</sensor>', urdf, re.S).group(0)
+    assert "<width>1280</width>" in sensor and "<height>720</height>" in sensor
+    assert "<update_rate>15</update_rate>" in sensor
+    gazebo_description = _facade_description(actions)
+    assert gazebo_description["interfaces"]["camera.top.color"]["configured_profile"]["width"] == 1280
+
+    # mujoco: the description carries the rendered dimensions; the rate is the
+    # plugin's single camera rate (so101-mujoco D5), not the per-camera fps
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "peripherals": fragment})
+    mujoco_description = _facade_description(actions)
+    configured = mujoco_description["interfaces"]["camera.top.color"]["configured_profile"]
+    assert (configured["width"], configured["height"]) == (1280, 720)
+    from robot_runtime.mujoco import mujoco_camera_publish_rate
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(_PROFILE)
+    merged = merge_peripherals_for_test(profile, fragment)
+    assert configured["fps"] == float(mujoco_camera_publish_rate({**profile, "peripherals": merged}))
+
+
+def merge_peripherals_for_test(profile, fragment_path):
+    from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
+
+    return merge_peripherals(profile.get("peripherals"), load_peripherals_file(fragment_path).get("peripherals"))
+
+
+def test_override_front_depth_settings_reach_driver_and_description(tmp_path):
+    """D8: depth_* values reach the physical RealSense driver and the
+    description identically; on Gazebo the depth streams advertise the colour
+    dimensions the sensor renders."""
+    fragment = _fragment(
+        tmp_path,
+        [
+            {
+                "type": "camera",
+                "name": "front",
+                "width": 1280,
+                "height": 720,
+                "fps": 30,
+                "depth_width": 640,
+                "depth_height": 480,
+                "depth_fps": 30,
+            }
+        ],
+    )
+
+    actions = _render({"use_sim": "false", "peripherals": fragment})
+    driver = next(
+        node for node in actions if isinstance(node, Node) and node._Node__node_executable == "realsense2_camera_node"
+    )
+    params = _node_params(driver)
+    assert params["rgb_camera.color_profile"] == "1280x720x30"
+    assert params["depth_module.depth_profile"] == "640x480x30"
+    description = _facade_description(actions)
+    depth = description["interfaces"]["camera.front.depth"]["configured_profile"]
+    assert (depth["width"], depth["height"], depth["fps"]) == (640, 480, 30)
+
+    # gazebo renders one camera at the colour dims; the depth streams advertise
+    # exactly that (D8), never the physical depth_* overrides
+    actions = _render({"use_sim": "true", "sim_platform": "gazebo", "peripherals": fragment})
+    gazebo_description = _facade_description(actions)
+    depth = gazebo_description["interfaces"]["camera.front.depth"]["configured_profile"]
+    assert (depth["width"], depth["height"], depth["fps"]) == (1280, 720, 30)
+
+
+def test_misspelled_partial_fragment_fails_the_runtime_launch_setup(tmp_path):
+    """D9: a misspelled partial entry raises inside the runtime launch setup
+    (the OpaqueFunction), before any process starts — the same error the
+    runtime merge reports through generic launch."""
+    import pytest
+
+    from robot_runtime.interface_description import InterfaceDescriptionError
+
+    fragment = _fragment(tmp_path, [{"type": "camera", "name": "tpo", "width": 1280}])
+    with pytest.raises(InterfaceDescriptionError, match=r"\('camera', 'tpo'\) is not declared"):
+        _render({"use_sim": "true", "peripherals": fragment})
+
+
+def test_launch_declares_the_peripherals_argument():
+    """D7 (m3): the provider's real launch description declares the
+    peripherals argument every provider contract requires."""
+    from launch.actions import DeclareLaunchArgument
+
+    def text(value):
+        return "".join(part.text if hasattr(part, "text") else str(part) for part in value)
+
+    description = _launch_module().generate_launch_description()
+    names = {
+        text(action._DeclareLaunchArgument__name)
+        for action in description.entities
+        if isinstance(action, DeclareLaunchArgument)
+    }
+    assert "peripherals" in names

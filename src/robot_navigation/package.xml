@@ -12,7 +12,7 @@
        ``migrate-business-launch-builders``): launch_builders/navigation.py
        contributes the navigation entry to robot_config's launch registry
        through the ibrobot.launch_builders entry point group and imports
-       robot_config's retained helpers (cmd_vel / fast_lio / static_tf /
+       robot_config's retained helpers (fast_lio / static_tf /
        runtime provider lookup) at build time. The dependency is one way:
        robot_config does not depend on this package. -->
   <depend>robot_config</depend>
@@ -49,6 +49,8 @@
   <exec_depend>nav2_mppi_controller</exec_depend>
   <exec_depend>nav2_rviz_plugins</exec_depend>
   <exec_depend>ibrobot_msgs</exec_depend>
+  <!-- Navigation admission client: contract names + RuntimeStatus -->
+  <exec_depend>robot_runtime</exec_depend>
   <exec_depend>robot_localization</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>
@@ -66,6 +68,31 @@
   <!-- The migrated launch-builder tests import robot_config's loader and
        registry (openspec change ``migrate-business-launch-builders``). -->
   <test_depend>robot_config</test_depend>
+  <!-- LeKiwi lidar-odometry gate (test/test_lidar_odometry_gate.py, openspec
+       lekiwi-gazebo-runtime-platform D14.3, MuJoCo leg since
+       lekiwi-mujoco-runtime-platform D14): the gate launches the composed
+       robot_config navigation stage with this package's Nav2 chain on the
+       lekiwi_robot runtime's physics platforms (Gazebo and MuJoCo, one leg
+       each), inside a sim_models scene; on Gazebo, fast_lio is bridged over
+       ros_gz_sim/ros_gz_bridge. It lives here, not in lekiwi_robot, so the
+       runtime's dependency closure stays free of generic packages
+       (scripts/verify_runtime_independence.sh). -->
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>python3-matplotlib</test_depend>
+  <test_depend>lekiwi_robot</test_depend>
+  <test_depend>sim_models</test_depend>
+  <test_depend>fast_lio</test_depend>
+  <test_depend>ros_gz_sim</test_depend>
+  <test_depend>ros_gz_bridge</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+  <!-- The gate's direct imports (<depend> covers build+exec scope only, the
+       robot_config precedent): the environment probe, the require-or-skip
+       rule, the collection-safety helper and ground truth come from
+       robot_runtime.testing; the gate probes RuntimeStatus from
+       ibrobot_msgs. -->
+  <test_depend>robot_runtime</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

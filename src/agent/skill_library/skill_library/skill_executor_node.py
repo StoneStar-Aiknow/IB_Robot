@@ -22,7 +22,7 @@ from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose, PoseStamped
 from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
-from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -47,6 +47,12 @@ from embodied_common.dispatch_binding import (
     delegated_executor_identity_matches,
     fill_delegated_executor_identity,
     load_delegated_model_identity,
+)
+from embodied_common.execution_detail import (
+    ExecutionDetail,
+    fill_execution_context,
+    fill_execution_detail,
+    short_message,
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
 from embodied_common.program_contracts import canonicalize_program
@@ -245,14 +251,30 @@ class _EePoseSnapshotExpired(Exception):
     pass
 
 
+def _cancel_accepted(cancel_future) -> bool:
+    """Whether a completed cancel request was accepted by the action server."""
+    try:
+        return bool(getattr(cancel_future.result(), "goals_canceling", []))
+    except Exception:
+        return False
+
+
 class _ProgramGoalHandle:
     """Adapter that gives the existing Skill Gateway a typed Program child."""
 
-    def __init__(self, request, root_handle, execution_store=None, execution_id="") -> None:
+    def __init__(self, request, root_handle, execution_store=None, execution_id="", resume_token="") -> None:
         self.request = request
         self._root_handle = root_handle
         self._execution_store = execution_store
         self._program_execution_id = execution_id
+        # Set by the Program for a step that continues an interrupted one; the
+        # executor that ran the step leaves its resume point in motion_checkpoint.
+        self.resume_token = resume_token
+        self.motion_checkpoint: dict | None = None
+        self.feedback_closed = False
+
+    def record_motion_checkpoint(self, checkpoint: dict) -> None:
+        self.motion_checkpoint = dict(checkpoint)
 
     @property
     def is_cancel_requested(self):
@@ -264,7 +286,28 @@ class _ProgramGoalHandle:
         return bool(record is not None and record.stop_requested)
 
     def publish_feedback(self, message) -> None:
-        return None
+        if self.feedback_closed or self._execution_store is None or not self._program_execution_id:
+            return
+        record = self._execution_store.record_progress(
+            self._program_execution_id,
+            current_skill=self.request.skill_name,
+            workflow_step_index=int(self.request.dispatch_binding.workflow_step_index),
+            execution_detail=getattr(message, "execution_detail", None),
+            message=short_message(message.detail),
+        )
+        if record.terminal:
+            return
+        feedback = ExecuteProgram.Feedback(
+            execution_id=record.execution_id,
+            sequence=record.last_event_sequence,
+            state=record.state,
+            workflow_step_index=record.workflow_step_index,
+            current_skill=record.current_skill,
+            detail=record.message,
+            program_digest=record.program_digest,
+        )
+        fill_execution_detail(feedback.execution_detail, record.execution_detail)
+        self._root_handle.publish_feedback(feedback)
 
     def succeed(self) -> None:
         return None
@@ -967,7 +1010,13 @@ class SkillExecutorNode(Node):
             self, PrimitiveCommand, self._primitive_action_name, callback_group=callback_group
         )
         self._motion_mode_client = self.create_client(SetBool, self._motion_mode_service, callback_group=callback_group)
-        self._pick_client = ActionClient(self, PickObject, self._pick_action_name, callback_group=callback_group)
+        self._pick_client = ActionClient(
+            self,
+            PickObject,
+            self._pick_action_name,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+            feedback_sub_qos_profile=QoSProfile(depth=256),
+        )
         self._place_client = ActionClient(self, PlaceObject, self._place_action_name, callback_group=callback_group)
         self._imitate_human_motion_client = ActionClient(
             self,
@@ -1029,6 +1078,7 @@ class SkillExecutorNode(Node):
             if self.has_parameter("execute_program_action")
             else "/embodied/execute_program",
             execute_callback=self._execute_program,
+            feedback_pub_qos_profile=QoSProfile(depth=256),
             cancel_callback=self._handle_cancel,
             callback_group=callback_group,
         )
@@ -1168,7 +1218,7 @@ class SkillExecutorNode(Node):
                 "actual_registry_generation": bundle.generation,
                 "actual_registry_digest": bundle.snapshot.registry_digest,
             }
-        self._execution_store.finish(
+        finished = self._execution_store.finish(
             record.execution_id,
             state=state,
             completed_step_count=completed,
@@ -1178,8 +1228,9 @@ class SkillExecutorNode(Node):
         )
         result.state = state
         result.error_code = error_code
-        result.message = message
+        result.message = short_message(message)
         result.completed_step_count = completed
+        fill_execution_context(result, finished)
 
     def _execute_program(self, goal_handle):
         goal = goal_handle.request
@@ -1205,6 +1256,7 @@ class SkillExecutorNode(Node):
                 expected_registry_digest=goal.expected_registry_digest,
                 workflow_steps=goal.workflow_steps,
                 task_budget_sec=goal.task_budget_sec,
+                continues_from_execution_id=goal.continues_from_execution_id,
             )
             record, created = self._execution_store.begin(program)
             result.execution_id = record.execution_id
@@ -1216,10 +1268,11 @@ class SkillExecutorNode(Node):
             result.actual_registry_digest = record.actual_registry_digest
             result.state = record.state
             result.completed_step_count = record.completed_step_count
+            fill_execution_context(result, record)
             if record.terminal:
                 result.success = record.state == "SUCCEEDED"
                 result.error_code = record.error_code
-                result.message = record.message
+                result.message = short_message(record.message)
                 goal_handle.succeed() if result.success else goal_handle.abort()
                 return result
             if not created:
@@ -1260,6 +1313,15 @@ class SkillExecutorNode(Node):
                 )
                 goal_handle.abort()
                 return result
+            resume_token, resume_error = self._program_resume_token(program, record)
+            if resume_error:
+                self._finish_program(
+                    record, result, state="FAILED", error_code="RESUME_CHECKPOINT_INVALID", message=resume_error
+                )
+                goal_handle.abort()
+                return result
+            goal_handle._program_resume_token = resume_token
+            goal_handle._program_step_checkpoint = None
             self._execution_store.mark_committing(record.execution_id)
             program_owner = ExecutionOwner.workflow(program.root_task_id)
             workflow_error, lease_token = self._gateway_policy.admit_workflow(
@@ -1406,6 +1468,13 @@ class SkillExecutorNode(Node):
                 skill_goal.y = step.y or 0.0
                 skill_goal.has_yaw = step.yaw is not None
                 skill_goal.yaw = step.yaw or 0.0
+                record = self._execution_store.record_progress(
+                    record.execution_id,
+                    current_skill=step.skill_name,
+                    workflow_step_index=index,
+                    execution_detail=ExecutionDetail(),
+                    message=f"executing step {index + 1} of {len(program.steps)}",
+                )
                 feedback = ExecuteProgram.Feedback()
                 feedback.execution_id = record.execution_id
                 feedback.sequence = record.last_event_sequence
@@ -1416,11 +1485,21 @@ class SkillExecutorNode(Node):
                 feedback.program_digest = program.program_digest
                 goal_handle.publish_feedback(feedback)
                 child_result = self._execute_program_child(skill_goal, goal_handle, record.execution_id)
+                child_detail = ExecutionDetail.from_value(getattr(child_result, "execution_detail", None))
+                result.current_skill = step.skill_name
+                result.workflow_step_index = index
+                fill_execution_detail(result.execution_detail, child_detail)
+                result.message = short_message(child_result.message)
                 if not child_result.success:
                     cleanup_pending = child_result.error_code in {
                         PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                         SKILL_CANCEL_TIMEOUT,
-                    }
+                    } or (child_detail.schema_version == 1 and child_detail.recovery_state == "UNKNOWN")
+                    checkpoint = getattr(goal_handle, "_program_step_checkpoint", None)
+                    if child_result.error_code == "SKILL_CANCELLED" and checkpoint:
+                        self._execution_store.record_resume_checkpoint(
+                            record.execution_id, {"step_index": index, "skill_name": step.skill_name, **checkpoint}
+                        )
                     self._execution_store.finish(
                         record.execution_id,
                         state="UNKNOWN"
@@ -1429,12 +1508,15 @@ class SkillExecutorNode(Node):
                         completed_step_count=completed,
                         error_code=child_result.error_code,
                         message=child_result.message,
+                        execution_detail=child_detail,
+                        current_skill=step.skill_name,
+                        workflow_step_index=index,
                         actual_registry_epoch=bundle.registry_epoch,
                         actual_registry_generation=bundle.generation,
                         actual_registry_digest=bundle.snapshot.registry_digest,
                     )
                     result.error_code = child_result.error_code
-                    result.message = child_result.message
+                    result.message = short_message(child_result.message)
                     result.state = (
                         "UNKNOWN"
                         if cleanup_pending
@@ -1450,10 +1532,23 @@ class SkillExecutorNode(Node):
                         self._finalize_program_admission(program_child_admission, program_owner)
                     return result
                 completed += 1
+                self._execution_store.transition(
+                    record.execution_id,
+                    state="ACTIVE",
+                    completed_step_count=completed,
+                    execution_detail=child_detail,
+                    current_skill=step.skill_name,
+                    workflow_step_index=index,
+                    message=result.message,
+                )
             self._execution_store.finish(
                 record.execution_id,
                 state="SUCCEEDED",
                 completed_step_count=completed,
+                message=result.message,
+                execution_detail=result.execution_detail,
+                current_skill=result.current_skill,
+                workflow_step_index=result.workflow_step_index,
                 actual_registry_epoch=bundle.registry_epoch,
                 actual_registry_generation=bundle.generation,
                 actual_registry_digest=bundle.snapshot.registry_digest,
@@ -1493,12 +1588,61 @@ class SkillExecutorNode(Node):
             if program_child_admission is not None and program_owner is not None:
                 self._finalize_program_admission(program_child_admission, program_owner)
             goal_handle.abort()
+        finally:
+            result.message = short_message(result.message)
+            if record is not None:
+                final_record = self._execution_store.get(execution_id=record.execution_id)
+                if final_record is not None:
+                    result.last_event_sequence = final_record.last_event_sequence
+                    fill_execution_context(result, final_record)
         return result
 
+    def _program_resume_token(self, program, record) -> tuple[str, str]:
+        """The resume token step 0 continues from, or why the continuation is refused.
+
+        A continuation is honoured only against this robot's latest execution,
+        cancelled with a checkpoint, whose interrupted step is exactly the new
+        Program's first step. Whether the arm is still where it stopped is the
+        runtime's to judge when it is handed the token.
+        """
+        previous_id = program.continues_from_execution_id
+        if not previous_id:
+            return "", ""
+        previous = self._execution_store.get(
+            execution_id=previous_id, caller_scope=program.caller_scope, robot_id=program.robot_id
+        )
+        if previous is None:
+            return "", f"execution {previous_id} is not this caller's on this robot"
+        if self._execution_store.latest_execution_id(program.robot_id, before=record.execution_id) != previous_id:
+            return "", f"execution {previous_id} is not this robot's latest execution"
+        checkpoint = previous.resume_checkpoint
+        if previous.state != "CANCELED" or not checkpoint:
+            return "", f"execution {previous_id} was not cancelled at a resumable point"
+        steps = previous.program["workflow_steps"]
+        index = int(checkpoint.get("step_index", -1))
+        if index != previous.completed_step_count or not 0 <= index < len(steps):
+            return "", f"execution {previous_id} has an inconsistent resume checkpoint"
+        if program.steps[0].to_dict() != steps[index]:
+            return "", f"the first step does not match the step execution {previous_id} interrupted"
+        return str(checkpoint.get("resume_token", "")), ""
+
     def _execute_program_child(self, goal, root_goal_handle, execution_id):
-        """Execute one canonical child through the existing workflow lifecycle."""
-        child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id)
-        return self._execute_workflow_skill_gateway(child_handle)
+        """Execute one canonical child through the existing workflow lifecycle.
+
+        A validated continuation leaves the interrupted step's resume token on
+        the root handle for step 0; the child's own resume point, if it stopped
+        part-way, is left there for the Program to record.
+        """
+        resume_token = ""
+        if int(goal.dispatch_binding.workflow_step_index) == 0:
+            resume_token = str(getattr(root_goal_handle, "_program_resume_token", "") or "")
+        child_handle = _ProgramGoalHandle(goal, root_goal_handle, self._execution_store, execution_id, resume_token)
+        try:
+            result = self._execute_workflow_skill_gateway(child_handle)
+        finally:
+            child_handle.feedback_closed = True
+        root_goal_handle._program_step_checkpoint = child_handle.motion_checkpoint
+        return result
 
     def _program_cancel_requested(self, root_goal_handle, execution_id: str) -> bool:
         if bool(getattr(root_goal_handle, "is_cancel_requested", False)):
@@ -1558,13 +1702,18 @@ class SkillExecutorNode(Node):
         response.stop_requested = record.stop_requested
         response.last_event_sequence = record.last_event_sequence
         response.error_code = record.error_code
-        response.message = record.message
+        response.message = short_message(record.message)
+        fill_execution_context(response, record)
         response.actual_registry_epoch = record.actual_registry_epoch
         response.actual_registry_generation = record.actual_registry_generation
         response.actual_registry_digest = record.actual_registry_digest
         reconciliation = self._execution_store.reconciliation(record.execution_id)
         response.reconciled = reconciliation is not None
         response.reconciliation_evidence = reconciliation["evidence"] if reconciliation else ""
+        checkpoint = record.resume_checkpoint
+        if record.state == "CANCELED" and checkpoint and checkpoint.get("step_index") == record.completed_step_count:
+            response.step_resumable = True
+            response.step_progress = float(checkpoint.get("progress", 0.0))
         return response
 
     def _get_execution_events(self, request, response):
@@ -1595,7 +1744,7 @@ class SkillExecutorNode(Node):
 
     @staticmethod
     def _execution_event_message(record, event, canonical_steps):
-        return ExecutionEvent(
+        message = ExecutionEvent(
             schema_version=1,
             execution_id=record.execution_id,
             request_id=record.request_id,
@@ -1607,9 +1756,11 @@ class SkillExecutorNode(Node):
             canonical_steps=canonical_steps,
             completed_step_count=event.completed_step_count,
             error_code=event.error_code,
-            message=event.message,
+            message=short_message(event.message),
             created_at=_time_message(event.created_at),
         )
+        fill_execution_context(message, event)
+        return message
 
     def _publish_execution_events(self, execution_ids) -> None:
         """Publish committed ledger events in sequence order, exactly once per process."""
@@ -1933,10 +2084,14 @@ class SkillExecutorNode(Node):
     ) -> SkillCommand.Result:
         """Run the named motion the catalog binds through the runtime's neutral action.
 
-        The runtime refuses cancellation of named motions, so a cancel request is
-        recorded but never forwarded and the motion is reported as it ends. If
-        the skill deadline passes first, the admission is retained until the
-        runtime reports a terminal state; the runtime bounds every motion itself.
+        A cancel request is forwarded. The runtime accepts it only where it can
+        stop the motion part-way (a replayed trajectory); the skill then ends
+        cancelled and hands the runtime's resume token to a Program step's
+        handle for the ledger. Where the runtime refuses, the motion is reported
+        as it ends. If the skill deadline passes first, the admission is
+        retained until the runtime reports a terminal state; the runtime bounds
+        every motion itself. A Program child that continues an interrupted
+        step carries that step's resume token on ``goal_handle``.
         """
         goal = goal_handle.request
         result = SkillCommand.Result()
@@ -1989,6 +2144,7 @@ class SkillExecutorNode(Node):
         motion_goal.target = ""
         # Never pre-empt a motion that is already playing.
         motion_goal.interrupt = False
+        motion_goal.resume_token = str(getattr(goal_handle, "resume_token", "") or "")
 
         def feedback_cb(feedback_msg) -> None:
             feedback = SkillCommand.Feedback()
@@ -2007,6 +2163,7 @@ class SkillExecutorNode(Node):
         late_cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, cleanup_key))
         send_future = None
         result_future = None
+        cancel_future = None
         try:
             send_future = client.send_goal_async(motion_goal, feedback_callback=feedback_cb)
             if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
@@ -2030,14 +2187,10 @@ class SkillExecutorNode(Node):
                 )
             result_future = motion_handle.get_result_async()
             deadline = time.monotonic() + timeout_sec
-            cancel_recorded = False
             while rclpy.ok() and not result_future.done():
-                if goal_handle.is_cancel_requested and not cancel_recorded:
-                    cancel_recorded = True
-                    self._audit("cancel_not_supported", **self._public_audit_context_copy())
-                    self.get_logger().warning(
-                        f"named motion {motion} cannot be cancelled; waiting for it to finish (use the runtime stop)"
-                    )
+                if goal_handle.is_cancel_requested and cancel_future is None:
+                    cancel_future = motion_handle.cancel_goal_async()
+                    cancel_future.add_done_callback(lambda done: self._note_named_motion_cancel(motion, done))
                 if time.monotonic() >= deadline:
                     late_cleanup.watch_result_future(result_future)
                     return self._abort_skill(
@@ -2084,6 +2237,21 @@ class SkillExecutorNode(Node):
                 result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} returned no result"
             )
         message = str(motion_result.message).strip()
+        if (
+            cancel_future is not None
+            and self._wait_for_future(cancel_future, timeout_sec=self._rpc_timeout)
+            and _cancel_accepted(cancel_future)
+            and motion_result.error_code == ExecuteNamedMotion.Result.CANCELLED
+        ):
+            # The runtime honoured the cancel and stopped the motion part-way.
+            # A method, not an attribute: the Gateway's terminal proxy forwards
+            # reads to the Program handle but would keep a write for itself.
+            record = getattr(goal_handle, "record_motion_checkpoint", None)
+            if record is not None and motion_result.resume_token:
+                record({"resume_token": str(motion_result.resume_token), "progress": float(motion_result.progress)})
+            self._cancel_skill(result, goal_handle, executed, goal.skill_name)
+            result.message = message or result.message
+            return result
         if not motion_result.success:
             return self._abort_skill(
                 result,
@@ -2102,6 +2270,15 @@ class SkillExecutorNode(Node):
         result.diagnostics = []
         goal_handle.succeed()
         return result
+
+    def _note_named_motion_cancel(self, motion: str, cancel_future) -> None:
+        if _cancel_accepted(cancel_future):
+            self._audit_cancel_propagated()
+            return
+        self._audit("cancel_not_supported", **self._public_audit_context_copy())
+        self.get_logger().warning(
+            f"named motion {motion} cannot be cancelled; waiting for it to finish (use the runtime stop)"
+        )
 
     def _execute_sound_following_skill(self, goal_handle, *, effective_timeout_sec: float | None = None):
         result = SkillCommand.Result()
@@ -2354,9 +2531,10 @@ class SkillExecutorNode(Node):
         clears it. A session that did take over sees the mode change and
         revokes on its own; it is not asked to stop.
         """
-        required_mode = self._required_control_mode_for_skill(skill_name) or str(
-            getattr(self, "_skill_required_control_mode", "")
-        ).strip()
+        required_mode = (
+            self._required_control_mode_for_skill(skill_name)
+            or str(getattr(self, "_skill_required_control_mode", "")).strip()
+        )
         runtime_mode = self._runtime_mode_for(required_mode)
         with self._motion_mode_switch_lock:
             status, reason = self._runtime_status_for_admission()
@@ -2669,16 +2847,25 @@ class SkillExecutorNode(Node):
     def _handle_joint_state(self, msg: JointState) -> None:
         self._latest_joint_state = msg
 
+    def _control_mode_for_runtime(self, status) -> str:
+        """The control mode a runtime status shows active, or "" without one.
+
+        Control modes may share a runtime mode (X2 teleop and named motions
+        both run in stream); the one this executor serves is the one reported.
+        """
+        if status is None:
+            return ""
+        if self._runtime_mode_map.get(self._skill_required_control_mode) == status.active_mode:
+            return self._skill_required_control_mode
+        return next((name for name, mode in self._runtime_mode_map.items() if mode == status.active_mode), "")
+
     def _runtime_snapshot(self) -> RuntimeSnapshot:
         owner = self._gateway_lease.owner
         active_workflow = self._active_workflow
         active_control_mode = self._active_control_mode
         if getattr(self, "_runtime_enabled", False):
             status, _ = self._runtime_status_for_admission()
-            active_control_mode = next(
-                (name for name, mode in self._runtime_mode_map.items() if status and mode == status.active_mode),
-                "",
-            )
+            active_control_mode = self._control_mode_for_runtime(status)
         return RuntimeSnapshot(
             motion_authorized=self._motion_authorized,
             active_control_mode=active_control_mode,
@@ -3684,7 +3871,29 @@ class SkillExecutorNode(Node):
         result.diagnostics = []
         result.success = False
         result.error_code = error_code
-        result.message = message
+        result.message = short_message(message)
+        if getattr(goal_handle.request, "skill_name", "") == "pick_object":
+            detail = ExecutionDetail.from_value(result.execution_detail)
+            if error_code in {"PICK_SERVER_UNAVAILABLE", "PICK_GOAL_REJECTED"}:
+                detail = ExecutionDetail(
+                    1, "dispatch", "FAILED", "dispatch", error_code, "NOT_NEEDED", 0, "WAIT_SERVICE"
+                )
+            elif error_code in {
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                "MISSING_PICK_RESULT",
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+            }:
+                detail = ExecutionDetail(
+                    1,
+                    detail.phase or "dispatch",
+                    "UNKNOWN",
+                    detail.failed_phase or detail.phase or "dispatch",
+                    detail.reason_code or error_code,
+                    "UNKNOWN",
+                    detail.retry_count,
+                    "MANUAL_CHECK",
+                )
+            fill_execution_detail(result.execution_detail, detail)
         result.executed_primitives = executed_primitives
         goal_handle.abort()
         return result
@@ -5304,16 +5513,38 @@ class SkillExecutorNode(Node):
 
         completed_phases: list[str] = []
 
-        def _feedback_cb(feedback_msg) -> None:
-            pick_feedback = feedback_msg.feedback
+        def publish_pick_feedback(pick_feedback) -> None:
             phase = str(pick_feedback.phase)
-            if phase and (not completed_phases or completed_phases[-1] != phase):
+            detail = ExecutionDetail.from_value(pick_feedback.execution_detail)
+            fill_execution_detail(result.execution_detail, detail)
+            if detail.phase_state == "SUCCEEDED" and phase and (not completed_phases or completed_phases[-1] != phase):
                 completed_phases.append(phase)
             feedback = SkillCommand.Feedback()
             feedback.state = "executing"
-            feedback.detail = f"pick:{phase}:{pick_feedback.detail}"
+            feedback.detail = short_message(pick_feedback.detail)
+            fill_execution_detail(feedback.execution_detail, detail)
             goal_handle.publish_feedback(feedback)
 
+        def _feedback_cb(feedback_msg) -> None:
+            nonlocal feedback_sequence
+            with feedback_lock:
+                if feedback_finished.is_set():
+                    return
+                sequence = int(getattr(feedback_msg.feedback, "sequence", 0))
+                if not sequence:  # Legacy executor: only the terminal has guaranteed facts.
+                    publish_pick_feedback(feedback_msg.feedback)
+                    return
+                if sequence <= feedback_sequence or len(pending_feedback) >= 256:
+                    return
+                pending_feedback[sequence] = feedback_msg.feedback
+                while feedback_sequence + 1 in pending_feedback:
+                    publish_pick_feedback(pending_feedback.pop(feedback_sequence + 1))
+                    feedback_sequence += 1
+
+        feedback_sequence = 0
+        feedback_lock = threading.RLock()
+        pending_feedback = {}
+        feedback_finished = threading.Event()
         pick_goal = PickObject.Goal()
         pick_goal.dispatch_binding = copy_binding(goal.dispatch_binding)
         pick_goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
@@ -5387,6 +5618,7 @@ class SkillExecutorNode(Node):
 
             result_future = pick_handle.get_result_async()
             deadline = time.monotonic() + timeout_sec
+            timed_out = False
             while rclpy.ok() and not result_future.done():
                 if goal_handle.is_cancel_requested:
                     if not self._cancel_goal(pick_handle, result_future, late_cleanup):
@@ -5397,13 +5629,9 @@ class SkillExecutorNode(Node):
                             PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                             "pick cancellation state is unknown",
                         )
-                    delegated_terminal = True
-                    result.success = False
-                    result.error_code = "SKILL_CANCELLED"
-                    result.message = "pick skill cancelled"
-                    result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in completed_phases]
-                    goal_handle.canceled()
-                    return result
+                    # A terminal acknowledgement is not the result: preserve the
+                    # executor's recovery facts, including a failed stop.
+                    break
                 if time.monotonic() >= deadline:
                     if not self._cancel_goal(pick_handle, result_future, late_cleanup):
                         return self._abort_skill(
@@ -5413,14 +5641,8 @@ class SkillExecutorNode(Node):
                             PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                             "pick timeout cleanup state is unknown",
                         )
-                    delegated_terminal = True
-                    return self._abort_skill(
-                        result,
-                        goal_handle,
-                        [f"grasp_pipeline:{phase}" for phase in completed_phases],
-                        "SKILL_TIMEOUT",
-                        "pick skill deadline exceeded",
-                    )
+                    timed_out = True
+                    break
                 time.sleep(_WAIT_POLL_SEC)
             if not result_future.done():
                 return self._abort_skill(
@@ -5434,6 +5656,28 @@ class SkillExecutorNode(Node):
             late_cleanup.confirm()
             action_result = result_future.result()
             pick_result = action_result.result if action_result is not None else None
+            # ROS can deliver the result before queued feedback and unregister
+            # its callback. Reconcile the typed bounded tail, in source order,
+            # before committing the terminal. No sleep or TTS gate is needed.
+            if pick_result is not None and delegated_executor_identity_matches(
+                pick_result.actual_executor, expected_executor
+            ):
+                history = list(getattr(pick_result, "execution_history", ()))
+                last_sequence = int(getattr(pick_result, "last_feedback_sequence", 0))
+                if len(history) > min(256, last_sequence):
+                    self.get_logger().warning("invalid pick history metadata; authoritative result retained")
+                    history = []
+                first_sequence = last_sequence - len(history) + 1
+                with feedback_lock:
+                    if history and first_sequence > feedback_sequence + 1:
+                        self.get_logger().warning("pick feedback exceeded history window; older stages unavailable")
+                        pending_feedback.clear()
+                        feedback_sequence = first_sequence - 1
+                    for sequence, detail in enumerate(history, start=first_sequence):
+                        recovered = PickObject.Feedback(
+                            sequence=sequence, phase=detail.phase, attempt=detail.retry_count, execution_detail=detail
+                        )
+                        _feedback_cb(SimpleNamespace(feedback=recovered))
         except Exception:
             self.get_logger().error(f"delegated pick execution failed:\n{traceback.format_exc()}")
             if (
@@ -5451,6 +5695,8 @@ class SkillExecutorNode(Node):
                 "delegated pick execution state is unknown",
             )
         finally:
+            with feedback_lock:
+                feedback_finished.set()
             if delegated_terminal:
                 late_cleanup.confirm()
         result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in completed_phases]
@@ -5471,17 +5717,24 @@ class SkillExecutorNode(Node):
                 "pick executor identity does not match the registry snapshot",
             )
         if not pick_result.success:
+            fill_execution_detail(result.execution_detail, pick_result.execution_detail)
+            code = pick_result.error_code or "PICK_FAILED"
+            if code == "CANCELED":
+                code = "SKILL_TIMEOUT" if timed_out else "SKILL_CANCELLED"
             return self._abort_skill(
                 result,
                 goal_handle,
                 result.executed_primitives,
-                pick_result.error_code or "PICK_FAILED",
-                pick_result.message,
+                code,
+                short_message(pick_result.message),
             )
 
         result.success = True
         result.error_code = ""
-        result.message = pick_result.message
+        result.message = short_message(pick_result.message)
+        fill_execution_detail(result.execution_detail, pick_result.execution_detail)
+        result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in pick_result.completed_phases]
+        result.debug_output_dir = pick_result.debug_output_dir
         self._set_result_catalog_identity(result)
         result.diagnostics = []
         goal_handle.succeed()

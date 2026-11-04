@@ -66,17 +66,17 @@ function inspect(index: number): void {
       <div class="tree-header"><span>调用</span><span>组件</span><span>来源</span><span>状态</span><span>耗时</span></div>
       <div class="tree-scroll">
         <div v-if="!rows.length" class="empty-cell">过滤条件未命中 Span</div>
-        <button v-for="(row, index) in rows" :key="row.node.id" class="tree-row" type="button" @click="inspect(index)">
+        <div v-for="(row, index) in rows" :key="row.node.id" class="tree-row">
           <span class="tree-name" :style="{ paddingLeft: `${8 + row.depth * 18}px` }">
-            <i v-if="row.hasChildren" :class="{ collapsed: collapsed.has(row.node.id) }" @click.stop="toggle(row.node.id)"><AppIcon name="chevron" :size="13" /></i>
+            <button v-if="row.hasChildren" class="tree-toggle" type="button" :aria-expanded="!collapsed.has(row.node.id)" :aria-label="`${collapsed.has(row.node.id) ? '展开' : '折叠'} ${row.node.name}`" @click="toggle(row.node.id)"><AppIcon name="chevron" :size="14" /></button>
             <i v-else class="tree-leaf" />
-            <strong>{{ row.node.name }}</strong>
+            <button class="tree-inspect" type="button" :aria-label="`查看调用 ${row.node.name}`" @click="inspect(index)">{{ row.node.name }}</button>
           </span>
           <code :title="row.node.component_id">{{ row.node.component_id || "—" }}</code>
           <span>{{ row.node.origin === "user" ? "用户" : "内置" }}</span>
           <span :class="`status-${row.node.status}`">{{ row.node.cycle ? "父链成环" : row.node.orphan ? "父项缺失" : row.node.status === "ok" ? "正常" : row.node.status === "incomplete" ? "未完成" : row.node.status }}</span>
           <b class="numeric" :title="row.node.self_duration_ns === null ? '' : `自身 ${formatDuration(row.node.self_duration_ns / 1_000_000, 3)}`">{{ formatDuration(row.node.duration_ns === null ? null : row.node.duration_ns / 1_000_000, 3) }}</b>
-        </button>
+        </div>
       </div>
     </div>
   </AsyncState>

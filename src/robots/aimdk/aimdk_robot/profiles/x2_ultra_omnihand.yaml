@@ -324,6 +324,9 @@ vendor:
       waist: /aima/hal/joint/waist/state
       leg: /aima/hal/joint/leg/state
     hand_state: /aima/hal/joint/hand/state
+    # The arm's position targets and gains as the motion-control unit drives
+    # them, republished as joint.arm_command_state.
+    arm_command: /aima/hal/joint/arm/command
   qos:
     processed_audio: {reliability: best_effort, durability: volatile}
     upper_body_command:
@@ -344,6 +347,9 @@ vendor:
     hand_state:
       reliability: best_effort
       durability: transient_local
+    arm_command:
+      reliability: best_effort
+      durability: volatile
     power_state:
       reliability: best_effort
       durability: transient_local
@@ -354,13 +360,32 @@ vendor:
       reliability: best_effort
       durability: transient_local
     audio_capture:
-      # The platform publishes this one; subscribe BEST_EFFORT like the SDK's
-      # raw-audio examples (rationale in x2_ultra.yaml).
+      # Best effort on purpose. Each message carries 480 samples across 6
+      # channels (5760 B), so every one is IP-fragmented, and a RELIABLE
+      # subscription asks for every lost fragment again. On a host shared with
+      # another skill that turns into a storm instead of reliability: measured
+      # on an Ascend 310P compute pack (2026-10-27) with a grasp pipeline
+      # co-resident, 29557 fragment reassembly attempts/s at 98% failure, which
+      # also starved the processed-audio path the voice deployment actually
+      # needs -- no wake word reached the gate at all. Best effort delivered
+      # the stream in full instead (0.5 Hz -> 33 Hz, 19.8 s of audio per 20 s).
+      # Nothing here consumes the raw capture: no X2 profile enables
+      # speech_direction, and the addressee gate has no direction check. The
+      # republished /audio/capture_stamped stays reliable, so consumers of the
+      # project's own contract are unaffected. See issue #201.
+      depth: 500
       reliability: best_effort
       durability: volatile
       depth: 500
     audio_playback:
       reliability: reliable
+      durability: volatile
+    audio_playback_monitor:
+      # Our subscription to the same topic, to read the native assistant's
+      # wake acknowledgement (vendor.wake_ack). We only listen there, so it is
+      # best effort like audio_capture; it cannot share audio_playback, which
+      # the runtime's own publisher needs RELIABLE.
+      reliability: best_effort
       durability: volatile
     audio_focus_response:
       reliability: reliable
@@ -375,6 +400,17 @@ vendor:
     name: ibrobot.aimdk_robot
     priority: 30
     timeout_ms: 1000
+  # The platform's assistant starts a reply (a new token_id under this pkg_name)
+  # on every wake word and only then; paired with the vendor speech BEGIN it is
+  # the wake event the vendor does not publish itself. 14/14 on the robot
+  # (2026-10-24), acknowledgement 1.2 s before to 1.0 s after the BEGIN.
+  wake_ack:
+    pkg_names: [tts]
+    pair_window_s: 1.5
+    # The acknowledgement's token form (9/9 observed); the dialog subsystem's
+    # unprompted answers use hds_tts_..., and one paired with a bystander's
+    # BEGIN before this was added.
+    token_pattern: "^_[0-9]+_"
   command:
     rate_hz: 50.0
     stamp_window_s: 0.2
@@ -388,6 +424,13 @@ vendor:
     required_groups:
     - arm
     - hand
+    # Groups whose vendor joint fault codes degrade the runtime. Arm and head
+    # error codes stay 0 in normal operation on the robot. OmniHand faultcodes
+    # do not: a finger pressing an object reports one for as long as it grips,
+    # so the hand is left to the grasp executor's own policy.
+    fault_groups:
+    - arm
+    - head
   # Head travel, from the platform's own McServoStatus comments
   # (yaw -0.38..0.38, pitch -0.35..0.35 rad). A target outside it is refused,
   # not clamped: clamping would execute a motion the caller did not ask for.
@@ -463,6 +506,42 @@ vendor:
     required_action: STAND_DEFAULT
     preset_timeout_s: 30.0
     poll_s: 0.2
+    # In the upper-body stream mode (UPPERBODY_REMOTE_SPLIT) the platform plays
+    # no preset, so named motions are replayed there from arm trajectories
+    # recorded off the presets (aimdk_record_named_motion), eased in from the
+    # measured pose. Only the arms move; head and hands hold. A name without a
+    # recording is refused in these modes with MODE_NOT_ALLOWED. Declared here
+    # and not in x2_ultra: the hands must hold in every upper-body command,
+    # which is verified for dexterous hands only.
+    trajectory_modes:
+    - stream
+    trajectory_blend_speed_radps: 0.5
+    trajectory_blend_min_s: 0.5
+    # A recording faster than this anywhere is refused at startup. The
+    # platform's own presets peak at 4.7 rad/s (raise_hand, 2026-10-20).
+    trajectory_max_speed_radps: 6.0
+    # A replay fails unless the measured arm moved at least this share of the
+    # commanded motion on its most-moving joint: the platform drops commands it
+    # cannot use without saying so. Replays track at ~0.9 (2026-10-20).
+    trajectory_follow_min_ratio: 0.3
+    # A replay cancelled part-way can be resumed from where it stopped for this
+    # long, as long as nothing has moved the arm or changed the mode since.
+    trajectory_resume_ttl_s: 120.0
+    # A cancel holds the target sent this long ago, the one the arm is
+    # realizing: holding the latest target lets the arm carry on towards it,
+    # holding the measured pose lets it sag by the error the platform needs to
+    # hold it against gravity (0.05-0.19 rad on the right shoulder pitch).
+    # 0.05 s stopped a 2.3-2.6 rad/s wave within 0.1 rad and 0.4 s, settling
+    # within 0.03 rad of the pose at the cancel (2026-10-22).
+    trajectory_hold_lag_s: 0.05
+    # name -> JSON file relative to this profile, recorded off the presets on
+    # firmware release-lx2501_3_t2d5-soc1-v1.1.1 (2026-10-20).
+    trajectories:
+      wave: trajectories/wave.json
+      handshake: trajectories/handshake.json
+      raise_hand: trajectories/raise_hand.json
+      blow_kiss: trajectories/blow_kiss.json
+      clap: trajectories/clap.json
   expressions:
     blink: 1
     calm: 10
@@ -545,6 +624,16 @@ interfaces:
     endpoint: /audio/speech_chunk
     message_type: ibrobot_msgs/msg/SpeechAudioChunk
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 50}
+  # The platform consumes its wake word before releasing speech; this names the
+  # speech segment one opened (see aimdk_robot/wake_ack.py), so a consumer can
+  # tell a new speaker taking over from a follow-up.
+  audio.wake_event:
+    capability: interaction.audio_capture
+    kind: topic
+    direction: publish
+    endpoint: /audio/wake_event
+    message_type: ibrobot_msgs/msg/SpeechWakeEvent
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
   audio.enhanced_capture:
     capability: interaction.audio_capture
     kind: topic
@@ -552,6 +641,68 @@ interfaces:
     endpoint: /audio/enhanced_capture_stamped
     message_type: audio_common_msgs/msg/AudioDataStamped
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  # Measured finger positions of both OmniHands. The hands are not public
+  # joint-group members (they are commanded through hand.multi_joint), so their
+  # state is published on its own topic rather than inside /joint_states. Grasp
+  # perception needs the finger pose at image time to exclude the hand from the
+  # scene and to check that the hand is open before an approach.
+  joint.hand_state:
+    capability: hand.multi_joint
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/hand/joint_states
+    message_type: sensor_msgs/msg/JointState
+    joint_names:
+    - L_thumb_roll_joint
+    - L_thumb_abad_joint
+    - L_thumb_mcp_joint
+    - L_index_abad_joint
+    - L_index_pip_joint
+    - L_middle_pip_joint
+    - L_ring_abad_joint
+    - L_ring_pip_joint
+    - L_pinky_abad_joint
+    - L_pinky_pip_joint
+    - R_thumb_roll_joint
+    - R_thumb_abad_joint
+    - R_thumb_mcp_joint
+    - R_index_abad_joint
+    - R_index_pip_joint
+    - R_middle_pip_joint
+    - R_ring_abad_joint
+    - R_ring_pip_joint
+    - R_pinky_abad_joint
+    - R_pinky_pip_joint
+    units:
+      position: rad
+      velocity: rad/s
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
+  # Measured head positions on their own topic. joint.body_state carries head,
+  # waist and legs together and is stamped with the OLDEST of those groups, so a
+  # lagging leg group would label a fresh head measurement with an older time.
+  # The head pose places the camera, so grasp perception needs its own
+  # measurement time rather than the composite's lower bound.
+  joint.head_state:
+    capability: joint.state
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/head_joint_states
+    message_type: sensor_msgs/msg/JointState
+    joint_names:
+    - head_yaw_joint
+    - head_pitch_joint
+    units:
+      position: rad
+      velocity: rad/s
+    qos:
+      reliability: reliable
+      durability: volatile
+      history: keep_last
+      depth: 10
   joint.body_state:
     capability: joint.state
     kind: topic
@@ -747,6 +898,41 @@ interfaces:
       durability: transient_local
       history: keep_last
       depth: 5
+  # What the motion-control unit is driving the arms to, and how stiffly: the
+  # HAL's arm command, apart from the measured state. Under load an arm settles
+  # below its target by torque / stiffness (about 0.1 rad at the shoulder in an
+  # extended pose at kp 40), so an executor that takes over joint.arm_stream
+  # starts from these targets, or the arm drops at takeover; it is also how it
+  # sees the platform clamp a target to a joint limit. Stamped with the HAL's
+  # platform time.
+  joint.arm_command_state:
+    capability: joint.position_stream
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/arm/command_state
+    message_type: ibrobot_msgs/msg/JointCommandState
+    joint_names:
+    - left_shoulder_pitch_joint
+    - left_shoulder_roll_joint
+    - left_shoulder_yaw_joint
+    - left_elbow_joint
+    - left_wrist_yaw_joint
+    - left_wrist_pitch_joint
+    - left_wrist_roll_joint
+    - right_shoulder_pitch_joint
+    - right_shoulder_roll_joint
+    - right_shoulder_yaw_joint
+    - right_elbow_joint
+    - right_wrist_yaw_joint
+    - right_wrist_pitch_joint
+    - right_wrist_roll_joint
+    units:
+      position: rad
+    qos:
+      reliability: best_effort
+      durability: volatile
+      history: keep_last
+      depth: 10
   touch.hands:
     capability: perception.touch
     kind: topic

@@ -276,15 +276,19 @@ ID/digest、registry identity 和 completed step count 也必须与命令携带�
 `SKILL_CANCEL_TIMEOUT`/未知状态 fail closed。已知的 uncertain-motion error 保留原始 code 并退出 15；只有身份
 或结构证明无效时才合成为 `SKILL_CANCEL_TIMEOUT`。
 
-`robot-skill-closed-loop --resume` 在当前基线明确拒绝。当前 ROS 契约只有 `completed_step_count` 遥测，没有
-server-owned continuation admission；客户端不得切片旧步骤并用新 task ID 绕过 Gateway。确定的
+`robot-skill-closed-loop --resume` 在当前基线明确拒绝。闭环客户端拿到的 `completed_step_count` 只是遥测，
+不是续跑授权；客户端不得切片旧步骤并用新 task ID 绕过 Gateway。确定的
 `CANCELED + SKILL_CANCELLED` 终态后，用户可以提出一个独立的新 continuation 请求；成功、失败和未知状态
 都不授权自动继续。
 
 以上约束的对象是本包的闭环客户端。孵化期 Agent（`ibrobot_agent`）对「继续」的处理是已确认的语义，不属于
 被禁止的切片续跑：Agent 在自己的账本和 Gateway 账本（`GetExecution`）都确认上一条请求为确定的 `CANCELED`
 之后，把原始指令和已完整完成的步数交给规划器，只规划未完成部分，再以新的 request ID 提交一个全新 Program，
-照常经过 presentation 与 Gateway 校验；旧 plan/task 不复用，Gateway 内部不做续跑。详见
+照常经过 presentation 与 Gateway 校验，旧 plan/task 不复用。唯一的例外是**步内续做**：被打断的那一步由执行器
+留下了断点（`GetExecution.step_resumable`）时，Agent 不调用规划器，直接提交 Gateway 账本中从该步开始的规范步骤，
+并以 `ExecuteProgram.continues_from_execution_id` 引用被打断的执行。这是由 Gateway 自己准入的续做（同一
+caller/robot、该机器人最近一次执行、`CANCELED` 且有断点、第 0 步与被打断步规范化一致，否则
+`RESUME_CHECKPOINT_INVALID`），不是客户端绕过 Gateway；本包只透传这两个字段，闭环客户端的 `--resume` 仍然拒绝。详见
 [`ibrobot_agent` README](../ibrobot_agent/README.md)「继续」一节。
 
 `confirm-plan` 与 `execute-plan` 共享可选的 `--timeout-sec`：省略时两端都默认使用 Gateway 当前

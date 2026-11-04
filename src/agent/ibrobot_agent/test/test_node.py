@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -26,7 +27,7 @@ from ibrobot_agent.contracts import (
     RegistryIdentity,
     RequestKey,
 )
-from ibrobot_agent.node import IncubationAgentNode, _RosEventSink, _RosExecutionAdapter
+from ibrobot_agent.node import IncubationAgentNode, _RosEventSink, _RosExecutionAdapter, planner_prompt_builder
 
 
 class FakeCatalog:
@@ -304,9 +305,126 @@ def test_program_terminal_records_gateway_progress_and_exposes_the_ledger():
         "execution_id": "execution-1",
         "state": "CANCELED",
         "completed_step_count": 2,
+        "gateway_sequence": 0,
+        "current_skill": "",
+        "workflow_step_index": 0,
+        "execution_detail": {
+            "schema_version": 0,
+            "phase": "",
+            "phase_state": "UNKNOWN",
+            "failed_phase": "",
+            "reason_code": "",
+            "recovery_state": "UNKNOWN",
+            "retry_count": 0,
+            "suggested_action": "MANUAL_CHECK",
+        },
     }
     assert adapter.lookup_execution("request-wave")["completed_step_count"] == 2
     assert ("get_execution", "request-wave") in bridge.calls
+
+
+@pytest.mark.parametrize("version", [0, 1, 999])
+def test_long_failure_message_and_unknown_detail_never_change_a_confirmed_terminal(version):
+    class Bridge(_ProgramExecutionBridge):
+        def send_program_goal(self, **kwargs):
+            future = super().send_program_goal(**kwargs)
+            result = future.result().get_result_async().result().result
+            result.message = "底层失败信息" * 1000
+            result.error_code = "MOTION_FAILED"
+            result.execution_detail = {"schema_version": version}
+            return future
+
+        def cancel_execution(self, **kwargs):
+            raise AssertionError("display normalization must not cancel a confirmed result")
+
+    bridge = Bridge(state="FAILED", success=False)
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "failed" and result.error_code == "MOTION_FAILED"
+    assert len(result.message) == 300
+    assert result.detail["state"] == "FAILED"
+
+
+@pytest.mark.parametrize(
+    "state,status",
+    [("SUCCEEDED", "succeeded"), ("CANCELED", "cancelled"), ("FAILED", "failed"), ("UNKNOWN", "unknown")],
+)
+def test_query_convergence_keeps_terminal_and_authoritative_speech_sequence(state, status):
+    from embodied_common.execution_detail import ExecutionDetail
+    from ibrobot_agent.execution_feedback import FeedbackTracker
+
+    detail = ExecutionDetail(1, "verify", state, "", "", "NOT_NEEDED", 0, "NONE").to_dict()
+
+    class Bridge(_ProgramTransportFailureBridge):
+        def get_execution(self, **kwargs):
+            return {
+                "found": True,
+                "state": state,
+                "execution_id": "execution-1",
+                "last_event_sequence": 100,
+                "current_skill": "pick_object",
+                "execution_detail": detail,
+            }
+
+    adapter = _RosExecutionAdapter(Bridge(), timeout_policy={"rpc_timeout_sec": 0.1, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == status
+    assert result.detail["gateway_sequence"] == 100 and result.detail["execution_detail"] == detail
+    tracker = FeedbackTracker()
+    tracker.accept({"state": "RUNNING", "detail": {"execution_id": "execution-1", "gateway_sequence": 90}})
+    accepted = tracker.accept({"state": state, "sequence": 2, "detail": result.detail})
+    assert accepted and accepted[2], "terminal query must supersede the last spoken progress"
+
+
+def test_late_feedback_from_previous_request_cannot_contaminate_the_next_request():
+    from types import SimpleNamespace
+
+    class Bridge(_ProgramExecutionBridge):
+        callbacks = []
+
+        def send_program_goal(self, **kwargs):
+            def feedback(execution_id, sequence):
+                return SimpleNamespace(
+                    feedback=SimpleNamespace(
+                        execution_id=execution_id,
+                        sequence=sequence,
+                        state="ACTIVE",
+                        current_skill="pick_object",
+                        workflow_step_index=0,
+                    )
+                )
+
+            if self.callbacks:
+                self.callbacks[-1](feedback("stale", 999))
+            kwargs["feedback_callback"](feedback(f"current-{len(self.callbacks)}", 1))
+            self.callbacks.append(kwargs["feedback_callback"])
+            return super().send_program_goal(**kwargs)
+
+    bridge = Bridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    seen = []
+    adapter.set_progress_callback(seen.append)
+    for _ in range(2):
+        adapter.execute(
+            _proposal(),
+            expected_registry_identity=_proposal().catalog_identity,
+            presentation_callback=lambda _: None,
+            submission_callback=lambda *_: None,
+            stop_event=threading.Event(),
+        )
+    assert [item["execution_id"] for item in seen] == ["current-0", "current-1"]
 
 
 def test_program_transport_failure_after_submission_is_unknown_and_attempts_convergence():
@@ -745,6 +863,159 @@ def test_node_binds_runtime_identity_and_answers_read_only(tmp_path):
         node.close()
         node.destroy_node()
         rclpy.shutdown(context=context)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"direct_commands": {"点头": "nod_yes"}}', {"点头": "nod_yes"}),
+        ("{}", {}),
+        ("not json", {}),
+        ('{"direct_commands": []}', {}),
+        ('{"direct_commands": {"": "nod_yes", "点头": ""}}', {}),
+        ('{"direct_commands": {"点头": "nod_yes", "挥手": 7}}', {"点头": "nod_yes"}),
+    ],
+)
+def test_direct_commands_from_config_never_blocks_startup(raw, expected):
+    """A malformed shortcut mapping costs a model call, not the robot."""
+    from ibrobot_agent.node import _direct_commands_from_config
+
+    assert _direct_commands_from_config(raw) == expected
+
+
+class _CountingBridge:
+    """Gateway stand-in that counts how often the snapshot is actually fetched."""
+
+    def __init__(self, view):
+        self.view = view
+        self.snapshot_calls = 0
+
+    def get_status(self, **_kwargs):
+        return {}
+
+    def get_skill_snapshot(self, **_kwargs):
+        self.snapshot_calls += 1
+        return {"fetched": self.snapshot_calls}
+
+
+def _catalog_with_fake_verification(monkeypatch, view):
+    """Build the bridge catalog with snapshot verification stubbed out."""
+    from ibrobot_agent import node as node_module
+
+    bridge = _CountingBridge(view)
+    catalog = node_module._RosBridgeCatalog(bridge, rpc_timeout_sec=5.0)
+    import robot_skill_cli.catalog as catalog_module
+
+    monkeypatch.setattr(catalog_module, "capability_view_from_snapshot", lambda _snapshot, _status: copy.deepcopy(view))
+    return catalog, bridge
+
+
+def _status(generation=1, *, authorized=True, mode="idle", digest="d1"):
+    return {
+        "registry_epoch": "e1",
+        "registry_generation": generation,
+        "registry_digest": digest,
+        "control_plane_ready": True,
+        "active_control_mode": mode,
+        "motion_authorized": authorized,
+    }
+
+
+def test_catalog_is_reused_while_the_registry_identity_is_unchanged(monkeypatch):
+    """Re-fetching an unchanged snapshot costs an RPC and three digests per turn."""
+    catalog, bridge = _catalog_with_fake_verification(
+        monkeypatch, {"robot_name": "so101", "skills": [{"name": "nod_yes"}]}
+    )
+
+    for _ in range(3):
+        view = catalog.get_catalog(_status())
+
+    assert bridge.snapshot_calls == 1
+    assert view["skills"] == [{"name": "nod_yes"}]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [{"generation": 2}, {"digest": "d2"}],
+)
+def test_a_changed_registry_identity_refetches(monkeypatch, changed):
+    """A new registry must never be served from the previous one's cache."""
+    catalog, bridge = _catalog_with_fake_verification(monkeypatch, {"robot_name": "so101", "skills": []})
+
+    catalog.get_catalog(_status())
+    catalog.get_catalog(_status(**changed))
+
+    assert bridge.snapshot_calls == 2
+
+
+def test_control_plane_state_is_never_served_from_the_cache(monkeypatch):
+    """Authorization and control mode change without the registry changing."""
+    catalog, bridge = _catalog_with_fake_verification(monkeypatch, {"robot_name": "so101", "skills": []})
+
+    first = catalog.get_catalog(_status(authorized=True, mode="idle"))
+    second = catalog.get_catalog(_status(authorized=False, mode="stream"))
+
+    assert bridge.snapshot_calls == 1
+    assert first["motion_authorized"] is True
+    assert second["motion_authorized"] is False
+    assert second["active_control_mode"] == "stream"
+
+
+def test_a_caller_mutating_the_view_cannot_poison_the_cache(monkeypatch):
+    """The planner view is handed out and edited downstream; isolate the cache."""
+    catalog, _bridge = _catalog_with_fake_verification(
+        monkeypatch, {"robot_name": "so101", "skills": [{"name": "nod_yes"}]}
+    )
+
+    first = catalog.get_catalog(_status())
+    first["skills"].clear()
+    second = catalog.get_catalog(_status())
+
+    assert second["skills"] == [{"name": "nod_yes"}]
+
+
+def test_a_failed_verification_is_not_cached(monkeypatch):
+    """A rejected snapshot must not become the view every later turn reuses."""
+    import robot_skill_cli.catalog as catalog_module
+    from ibrobot_agent import node as node_module
+
+    bridge = _CountingBridge({})
+    catalog = node_module._RosBridgeCatalog(bridge, rpc_timeout_sec=5.0)
+
+    def explode(_snapshot, _status):
+        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH")
+
+    monkeypatch.setattr(catalog_module, "capability_view_from_snapshot", explode)
+    with pytest.raises(ValueError):
+        catalog.get_catalog(_status())
+
+    monkeypatch.setattr(
+        catalog_module, "capability_view_from_snapshot", lambda _s, _st: {"robot_name": "so101", "skills": []}
+    )
+    catalog.get_catalog(_status())
+
+    assert bridge.snapshot_calls == 2
+
+
+def test_the_default_planner_prompt_builds_without_a_gateway_catalog():
+    """catalog_view defaults to the planner projection, and with the Gateway
+    offline the service hands the planner ``{}``. "你是谁" must still reach the
+    model instead of failing the request on the missing catalog."""
+    request = AgentRequest(
+        schema_version=1,
+        request_id="request-offline",
+        session_id="session-1",
+        channel_id="channel-1",
+        principal_id="principal-1",
+        robot_scope="so101_single_arm",
+        text="你是谁",
+        received_at=datetime.now(timezone.utc),
+    )
+
+    messages = planner_prompt_builder(request=request, context={"messages": []}, catalog={})
+
+    assert messages[-1]["role"] == "user"
+    assert "你是谁" in json.dumps(messages, ensure_ascii=False)
 
 
 def test_gateway_catalog_names_every_x2_skill_by_its_chinese_alias():

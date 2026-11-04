@@ -5,23 +5,23 @@ match the endpoints the perception model services actually advertise. A typo
 there is otherwise a silent runtime hang with no error anywhere in the graph.
 
 Migrated from ``robot_config/test/test_motion_imitation_stream_builder.py``
-together with the builder (openspec change
-``migrate-business-launch-builders``): the stream wiring is this package's
-contribution, and the perception-model nodes it is checked against come from
-``inference_service``'s builder, so the yaml profiles are loaded by name
-instead of by source-tree-relative path.
+The end-to-end test loads the full ``aimdk_x2_magicmirror`` profile, so it needs the model
+bundles that profile references (``yolox_x_640`` / ``pear_parameter_network`` / ``zipvoice``);
+without them it skips (the root conftest's ``model_bundle`` marker), like the other suites that
+drive real robot configs.
 
-The end-to-end test loads the full ``aimdk_x2_magicmirror`` profile, so it
-needs the model bundles that profile references (``yolox_x_640`` /
-``pear_parameter_network`` / ``zipvoice``); without them it skips (the root
-conftest's ``model_bundle`` marker), like the other suites that drive real
-robot configs. Upstream carried no such guard: its source-tree-relative load
-only ever ran where the bundles were present.
+during the rebase onto the decentralised launch-builder registration: the
+tests follow ``generate_motion_imitation_stream_nodes`` into its owning
+package, and ``generate_perception_model_nodes`` now lives in
+``inference_service``. robot_config assets load through its installed share
+directory.
 """
 
 import json
+from pathlib import Path
 
 import pytest
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext
 from launch_ros.utilities import evaluate_parameters
 
@@ -29,13 +29,10 @@ from inference_service.launch_builders.perception_models import generate_percept
 from manipulation_execution.launch_builders.motion_imitation_stream import (
     generate_motion_imitation_stream_nodes,
 )
-from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import load_robot_config_dict
 
-# load_robot_config_dict takes a file path, not a name: resolve the profile
-# names through the documented precedence (installed share, then source tree).
-CONFIG = resolve_robot_config_path(config_name="aimdk_x2_magicmirror")
-BASE_CONFIG = resolve_robot_config_path(config_name="aimdk_x2")
+CONFIG = Path(get_package_share_directory("robot_config")) / "config/robots/aimdk_x2_magicmirror.yaml"
+BASE_CONFIG = Path(get_package_share_directory("robot_config")) / "config/robots/aimdk_x2.yaml"
 
 
 def parameters(node):

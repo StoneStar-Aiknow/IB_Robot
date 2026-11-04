@@ -309,6 +309,85 @@ install_graspgen_torch_abi() {
     fi
 }
 
+# mujoco_sim_pin_mode — one decision function for the MuJoCo simulation pin
+# (upgrade-mujoco-ros2-control-0-1 D5). Prints exactly one mode:
+#   install             Ubuntu full-profile venv, no benchmark request, and no
+#                       hf-libero/robosuite already installed: install
+#                       requirements/mujoco-sim.txt (mujoco==3.12.0, must equal
+#                       mujoco_vendor 0.1.1's libmujoco).
+#   skip-benchmark      INSTALL_BENCHMARK_DEPS=true: the LIBERO stack needs
+#                       mujoco<3.9 (robosuite 1.4 breaks on MuJoCo >= 3.10),
+#                       so the 3.12.0 pin must not fight it.
+#   skip-libero-present benchmark is off, but the venv already holds
+#                       hf-libero/robosuite from an earlier benchmark setup:
+#                       never downgrade or break that install; recreate the
+#                       venv to use the MuJoCo ROS simulation.
+#   none                every other profile or platform (inference, training,
+#                       openEuler): no MuJoCo pin, as before.
+# The venv package probe lives in its own function so unit tests can stub it
+# (upgrade-mujoco-ros2-control-0-1 D5/D6).
+mujoco_sim_venv_has_libero() {
+    [[ -n "${VENV_PYTHON:-}" ]] || return 1
+    "${VENV_PYTHON}" - <<'PY' >/dev/null 2>&1
+import importlib.util
+
+# hf-libero ships the top-level `libero` module; robosuite ships `robosuite`.
+raise SystemExit(0 if any(importlib.util.find_spec(name) for name in ("libero", "robosuite")) else 1)
+PY
+}
+
+mujoco_sim_pin_mode() {
+    if [[ "${SETUP_PLATFORM_ID:-unknown}" != "ubuntu-22.04" ]] || ! setup_profile_enables ubuntu_full_deps; then
+        echo "none"
+        return 0
+    fi
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        echo "skip-benchmark"
+        return 0
+    fi
+    if mujoco_sim_venv_has_libero; then
+        echo "skip-libero-present"
+        return 0
+    fi
+    echo "install"
+}
+
+# mujoco_sim_pin_constraint prints the constraint file that must govern every
+# later venv install once the pin is installed (D5 addendum), or nothing in
+# the skip modes. pip backtracks dm_control to the newest release the pin
+# allows instead of upgrading mujoco past mujoco_vendor's libmujoco.
+mujoco_sim_pin_constraint() {
+    if [[ "$(mujoco_sim_pin_mode)" == "install" ]]; then
+        printf '%s\n' "${WORKSPACE}/requirements/mujoco-sim.txt"
+    fi
+    return 0
+}
+
+# install_mujoco_sim_pin applies the decision on the Ubuntu full-profile path.
+install_mujoco_sim_pin() {
+    local pip_runner=("$@")
+    local mode
+    mode="$(mujoco_sim_pin_mode)"
+    case "${mode}" in
+        install)
+            log_info "Installing the MuJoCo simulation pin (requirements/mujoco-sim.txt)..."
+            run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/mujoco-sim.txt" --quiet
+            ;;
+        skip-benchmark)
+            log_warn "LIBERO benchmark dependencies requested: keeping the benchmark-compatible MuJoCo (<3.9)."
+            log_warn "The MuJoCo ROS simulation (sim_platform:=mujoco) is unavailable in this venv."
+            ;;
+        skip-libero-present)
+            log_warn "hf-libero/robosuite already installed in this venv: skipping the mujoco==3.12.0 pin"
+            log_warn "so the existing benchmark install stays intact. Recreate the venv"
+            log_warn "(rm -rf \${WORKSPACE}/venv and re-run ./scripts/setup.sh) to use the MuJoCo ROS simulation."
+            ;;
+        none)
+            ;;
+    esac
+    return 0
+}
+
 setup_python_venv() {
     if ! platform_supports_local_workspace_build; then
         log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
@@ -543,6 +622,23 @@ setup_python_venv() {
         ubuntu-22.04)
             if setup_profile_enables ubuntu_full_deps; then
                 run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/ubuntu-22.04.txt" --quiet
+                # The MuJoCo sim pin (mujoco-sim.txt) is decided per venv: it
+                # must match mujoco_vendor's libmujoco and is skipped next to
+                # LIBERO benchmark dependencies (D5).
+                install_mujoco_sim_pin "${pip_install[@]}"
+                # The pin must survive every later venv install (D5 addendum,
+                # Ubuntu Docker failure): constrain the rest of setup to the
+                # pin file so later full-profile steps (GraspGen ->
+                # scene-synthesizer[recommend] -> dm_control) cannot upgrade
+                # mujoco past mujoco_vendor's libmujoco — pip backtracks to
+                # the newest dm_control the pin allows instead. Skip modes add
+                # no constraint.
+                local mujoco_pin_constraint
+                mujoco_pin_constraint="$(mujoco_sim_pin_constraint)"
+                if [[ -n "${mujoco_pin_constraint}" ]]; then
+                    PIP_CONSTRAINT="${mujoco_pin_constraint}${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
+                    log_info "MuJoCo sim pin active as a constraint for all later venv installs."
+                fi
             elif setup_profile_enables onnx_tooling; then
                 # Inference profile: only the ONNX toolchain; skip mujoco (sim).
                 # AtomGit collaboration now uses the official CLI (no pip package).
@@ -631,6 +727,14 @@ EOF
         if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
             cat "${BENCHMARK_PIP_CONSTRAINTS}" >> "${ros_abi_constraints}"
         fi
+        # Explicit --constraint users (voice/perception/grasp/graspgenx) must
+        # keep the MuJoCo pin too: append the pin file the same way (D5
+        # addendum). Skip modes add nothing.
+        local mujoco_pin_constraint
+        mujoco_pin_constraint="$(mujoco_sim_pin_constraint)"
+        if [[ -n "${mujoco_pin_constraint}" && -f "${mujoco_pin_constraint}" ]]; then
+            cat "${mujoco_pin_constraint}" >> "${ros_abi_constraints}"
+        fi
     else
         log_info "Skipping the ROS 2 NumPy/OpenCV ABI pin (${SETUP_PROFILE} profile)."
         : > "${ros_abi_constraints}"
@@ -709,6 +813,8 @@ EOF
     local grasp_installed=false
     local graspgenx_wheel_root="${WORKSPACE}/third_party/wheels/graspgenx/b942909"
     local graspgenx_wheel="${graspgenx_wheel_root}/graspgenx-1.0.0+ibrobot.2-py3-none-any.whl"
+    local curobo_wheel_root="${WORKSPACE}/third_party/wheels/curobo/4ea7736"
+    local curobo_wheel="${curobo_wheel_root}/nvidia_curobo-0.8.0+ibrobot.1-py3-none-any.whl"
     if ! setup_profile_enables grasp; then
         log_info "Skipping grasp dependencies (${SETUP_PROFILE} profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
@@ -737,6 +843,34 @@ EOF
             install_graspgen_pip "${VENV_PYTHON}" -m pip install
             grasp_installed=true
         fi
+    fi
+
+    # The X2 grasp planner (cuRobo, Warp) is installed on its own predicate,
+    # not with GraspGen: it needs neither pointnet2_ops nor a CUDA toolchain at
+    # setup, so a host where that extension is skipped (aarch64, Blackwell, no
+    # nvcc) still gets the planner it runs.
+    local x2_planning_installed=false
+    if ! setup_profile_enables grasp; then
+        log_info "Skipping the X2 grasp planner (${SETUP_PROFILE} profile)."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Skipping the X2 grasp planner for Benchmark-only setup."
+    elif ! accel_supports_torch_grasp; then
+        log_warn "Skipping the X2 grasp planner on accelerator ${SETUP_ACCEL_ID}; cuRobo and Warp need CUDA."
+    else
+        log_info "Installing grasp dependencies (X2 grasp pipeline)..."
+        run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/aimdk_grasp.txt" --quiet
+        # cuRobo, the X2 grasp planner, is published only as source; PyPI's
+        # nvidia-curobo is an empty placeholder. It ships as an audited
+        # pure-Python wheel (scripts/build_curobo_wheel.sh) that compiles its
+        # CUDA kernels at run time through cuda.core NVRTC. --no-deps: the
+        # runtime dependencies it needs are pinned in requirements/aimdk_grasp.txt.
+        if ! (cd "${curobo_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "cuRobo wheel checksum verification failed."
+            return 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${curobo_wheel}" --quiet
+        x2_planning_installed=true
     fi
 
     # GraspGenX is installed on its own predicate, not with GraspGen. It ships
@@ -846,6 +980,22 @@ try:
 except Exception as exc:
     raise SystemExit(f"Missing pointnet2_ops after default grasp install: {exc}")
 print("Grasp dependencies smoke test passed")
+PY
+    fi
+    # Only assert the import when this run actually installed the X2 planner.
+    if [[ "${x2_planning_installed}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib
+
+try:
+    curobo = importlib.import_module("curobo")
+    importlib.import_module("curobo.motion_planner")
+except Exception as exc:
+    raise SystemExit(f"Missing cuRobo after the X2 grasp planner install: {exc}")
+# The audited build, never PyPI's empty nvidia-curobo placeholder.
+if curobo.__version__ != "0.8.0+ibrobot.1":
+    raise SystemExit(f"Expected the audited cuRobo 0.8.0+ibrobot.1, got {curobo.__version__}")
+print("X2 grasp planner smoke test passed")
 PY
     fi
     # Only assert the import when this run actually installed GraspGenX.

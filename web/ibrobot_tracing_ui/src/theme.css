@@ -1,0 +1,97 @@
+/* Shared light-theme roles. Charts consume the same tokens as their legends.
+   RGB channels allow translucent states to follow their semantic base color. */
+:root {
+  --oe-primary-rgb: 0, 47, 167;
+  --oe-warning-rgb: 250, 115, 5;
+  --oe-danger-rgb: 230, 0, 18;
+  --oe-success-rgb: 11, 177, 81;
+  --oe-flow-rgb: 0, 167, 179;
+  --oe-user-rgb: 61, 20, 191;
+  --oe-surface-rgb: 255, 255, 255;
+  --oe-canvas-rgb: 243, 243, 245;
+  --line-rgb: 0, 0, 0;
+  --shadow-rgb: 0, 0, 0;
+  --inverse-rgb: 255, 255, 255;
+  --chart-boundary-rgb: 0, 0, 0;
+  --chart-self-rgb: 0, 0, 0;
+  --oe-primary: rgb(var(--oe-primary-rgb));
+  --oe-hover: #345ba7;
+  --oe-active: #002793;
+  --oe-canvas: rgb(var(--oe-canvas-rgb));
+  --oe-surface: rgb(var(--oe-surface-rgb));
+  --oe-nested: #ededf0;
+  --oe-divider: rgba(var(--line-rgb), 0.1);
+  --oe-success: rgb(var(--oe-success-rgb));
+  --oe-warning: rgb(var(--oe-warning-rgb));
+  --oe-danger: rgb(var(--oe-danger-rgb));
+  --oe-flow: rgb(var(--oe-flow-rgb));
+  --oe-user: rgb(var(--oe-user-rgb));
+
+  --text: #1f2329;
+  --text-secondary: #61666d;
+  --text-tertiary: #606772;
+  --text-heading: #4d535b;
+  --text-on-accent: rgb(var(--inverse-rgb));
+  --text-info: #1e3f78;
+  --text-info-secondary: #445b7b;
+  --text-warning: #713800;
+  --text-danger: #8c220f;
+  --text-success: #176d3e;
+  --text-flow: #006b73;
+  --surface-subtle: #fafafa;
+  --surface-tinted: #f8f8fa;
+  --surface-toolbar: #f8f9fb;
+  --surface-context: #f7f9fd;
+  --surface-info: #edf3ff;
+  --surface-warning: #fffaf4;
+  --surface-danger: #fff8f7;
+  --surface-success: #f4fbf7;
+  --control-border: #747b85;
+  --focus: 0 0 0 2px var(--oe-primary);
+
+  --chart-edge: #68737d;
+  --chart-containment: #969da5;
+  --chart-overview-node: #5177ca;
+  --chart-accent-rgb: 49, 88, 184;
+  --chart-accent: rgb(var(--chart-accent-rgb));
+  --chart-band-alt: #f3f4f6;
+  --chart-bar: #829ad1;
+  --chart-bar-border: #4968ad;
+  --chart-tail: #173f9e;
+  --chart-tail-border: #00236f;
+  --chart-tail-focus: #f7a531;
+  --chart-focus: #ffcb3d;
+  --chart-flow: #008b96;
+  --chart-flow-surface: #d9f2f3;
+  --chart-gap: #9aa0a8;
+  --chart-gap-surface: #eceef1;
+  --chart-omitted: #e66a00;
+  --chart-omitted-surface: #fff4e8;
+  --chart-incomplete-surface: #d8e2f8;
+  --chart-label-surface: #243740;
+  --chart-baseline-rgb: 114, 126, 143;
+  --chart-baseline-hover-rgb: 78, 92, 111;
+  --chart-baseline-border: #596575;
+  --chart-candidate-border: #001d6c;
+  --chart-candidate-self: #101820;
+  --diff-improved: #147d64;
+  --diff-unchanged: #66778a;
+  --diff-regressed: #c53b32;
+  --diff-added: #7049ad;
+  --diff-removed: #19708a;
+  --diff-removed-surface: #d7edf2;
+
+  /* Stable component categories; keep label contrast when customizing them. */
+  --chart-component-0: #3158b8;
+  --chart-component-1: #087f8c;
+  --chart-component-2: #6746b3;
+  --chart-component-3: #b45117;
+  --chart-component-4: #18774a;
+  --chart-component-5: #9b365a;
+  --chart-component-6: #4e708f;
+  --chart-component-7: #7b6414;
+  --chart-component-8: #36509b;
+  --chart-component-9: #00706e;
+  --chart-component-10: #74407e;
+  --chart-component-11: #995027;
+}

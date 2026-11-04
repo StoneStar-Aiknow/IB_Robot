@@ -1,5 +1,6 @@
 # AI-AGENT NOTICE: Scheduled-only interface. Use only when
-# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Hardware policy inference with robot.runtime_scheduler.enable=true only.
+# Simulation and benchmark use the direct DispatchInfer interface.
 # Goal: Open a product inference session or a pipeline-local binding.
 # session_id is a caller-generated UUID4. Routing belongs exclusively to each
 # ScheduledDispatchInfer request; Open never selects a model or fallback chain.

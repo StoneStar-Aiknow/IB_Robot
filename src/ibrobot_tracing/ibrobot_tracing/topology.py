@@ -112,12 +112,17 @@ def _operation(component_id: str, trace_name: str, *, provenance: str = "declare
     )
 
 
-def bind_robot_topology(robot_config: Mapping[str, Any], *, control_mode: str | None = None) -> TraceTopology:
+def bind_robot_topology(
+    robot_config: Mapping[str, Any], *, control_mode: str | None = None, scheduler_enabled: bool = False
+) -> TraceTopology:
+    """Build declared topology using the caller's resolved scheduling decision.
+
+    The configuration owner resolves scheduling and runtime-target rules; tracing
+    only renders the selected path, defaulting to direct dispatch.
+    """
     mode = control_mode or str(robot_config.get("default_control_mode", "model_inference"))
     mode_config = dict(robot_config.get("control_modes", {}).get(mode, {}))
     inference = dict(mode_config.get("inference", {}))
-    scheduler = inference.get("scheduler", {})
-    scheduler_enabled = isinstance(scheduler, Mapping) and scheduler.get("enable") is True
     pipelines = inference.get("pipelines", {})
     pipeline_id = "policy"
     pipeline_config: Mapping[str, Any] = inference

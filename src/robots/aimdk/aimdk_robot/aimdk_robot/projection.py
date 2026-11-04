@@ -5,14 +5,18 @@ rejection rule is testable without a robot, without the AimDK SDK and without a
 DDS participant. ``vendor_gateway`` owns the vendor message types; this module
 only produces and consumes plain Python values.
 
+The rules applied at the platform's rate -- command channel payloads, holds,
+velocity limits, joint state aggregation -- are the data plane's and live in
+``aimdk_dataplane`` (C++, ``projection.hpp``) with their tests; see
+``aimdk_robot.dataplane``.
+
 Every vendor constant below is cited to the shipped SDK (``aimdk
 v0.0.0-gcdc995c``, docs ``AimDK_X2 1.1.0``).
 """
 
 from __future__ import annotations
 
-import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -77,6 +81,9 @@ VENDOR_MOTION_MODES: frozenset[str] = frozenset(
         "UPPERBODY_REMOTE_SPLIT",
     }
 )
+# The motion mode whose upper-body commands carry the hands: every command in it
+# needs a hand_pos that fits its hand_sub_mode, or the platform drops it whole.
+UPPER_BODY_HANDS_ACTION = "UPPERBODY_REMOTE_SPLIT"
 
 # Posture skills, dispatched through the same service but absent from the mode
 # table. Their registration has not been confirmed against hardware (the unit
@@ -251,140 +258,6 @@ class CommandRejected(Exception):
         return f"{self.reason}: {self.detail}" if self.detail else self.reason
 
 
-def _finite(values: Iterable[Any], label: str) -> list[float]:
-    out: list[float] = []
-    for value in values:
-        try:
-            number = float(value)
-        except (TypeError, ValueError) as exc:
-            raise CommandRejected("NON_NUMERIC_COMMAND", f"{label}: {value!r}") from exc
-        if not math.isfinite(number):
-            raise CommandRejected("NON_FINITE_COMMAND", f"{label}: {number!r}")
-        out.append(number)
-    return out
-
-
-# --- joint command projection -----------------------------------------------
-
-
-def arm_payload(values: Sequence[float], *, channel_joints: Sequence[str]) -> list[float]:
-    """Project a contract arm command onto ``UpperBodyCommandArray.arm_pos``.
-
-    ``channel_joints`` is the profile's declared order for the channel; the
-    result is always in the vendor's own index order, so a profile may declare
-    a different contract order without the bridge silently mis-indexing.
-    """
-    numbers = _finite(values, "arm command")
-    if len(numbers) != len(channel_joints):
-        raise CommandRejected(
-            "ARM_COMMAND_LENGTH",
-            f"expected {len(channel_joints)} values, got {len(numbers)}",
-        )
-    by_name = dict(zip(channel_joints, numbers, strict=True))
-    missing = [name for name in VENDOR_ARM_ORDER if name not in by_name]
-    if missing:
-        raise CommandRejected("ARM_COMMAND_JOINTS", f"missing {missing}")
-    return [by_name[name] for name in VENDOR_ARM_ORDER]
-
-
-def head_payload(
-    values: Sequence[float], *, channel_joints: Sequence[str], limits: dict[str, float] | None = None
-) -> list[float]:
-    """Project a contract head command onto ``UpperBodyCommandArray.head_pos``.
-
-    The platform states the head's travel in ``McServoStatus``' own comments
-    (yaw ±0.38, pitch ±0.35). A target outside it is refused rather than
-    clamped, for the same reason a gripper command is: clamping executes a
-    motion the caller did not ask for.
-    """
-    numbers = _finite(values, "head command")
-    if len(numbers) != len(channel_joints):
-        raise CommandRejected(
-            "HEAD_COMMAND_LENGTH",
-            f"expected {len(channel_joints)} values, got {len(numbers)}",
-        )
-    by_name = dict(zip(channel_joints, numbers, strict=True))
-    missing = [name for name in VENDOR_HEAD_ORDER if name not in by_name]
-    if missing:
-        raise CommandRejected("HEAD_COMMAND_JOINTS", f"missing {missing}")
-    payload = [by_name[name] for name in VENDOR_HEAD_ORDER]
-    bounds = limits or {}
-    for name, value in zip(VENDOR_HEAD_ORDER, payload, strict=True):
-        limit = bounds.get(name)
-        if limit is not None and abs(value) > abs(float(limit)):
-            raise CommandRejected(
-                "HEAD_COMMAND_RANGE",
-                f"{name} target {value:.3f} outside the platform's +/-{abs(float(limit)):.3f} travel",
-            )
-    return payload
-
-
-def claw_payload(values: Sequence[float], *, command_min: float = 0.0, command_max: float = 1.0) -> list[float]:
-    """Project a two-gripper aperture command onto ``hand_pos`` for sub-mode 1.
-
-    Out-of-range values are rejected rather than clamped: a clamp would execute
-    a grasp the caller did not ask for.
-    """
-    numbers = _finite(values, "gripper command")
-    if len(numbers) != 2:
-        raise CommandRejected("GRIPPER_COMMAND_LENGTH", f"expected 2 values [left, right], got {len(numbers)}")
-    for index, value in enumerate(numbers):
-        if not command_min <= value <= command_max:
-            side = "left" if index == 0 else "right"
-            raise CommandRejected(
-                "GRIPPER_COMMAND_RANGE",
-                f"{side}={value} outside [{command_min}, {command_max}]",
-            )
-    return list(numbers)
-
-
-def dexterous_joint_payload(values: Sequence[float]) -> list[float]:
-    """Project a 20-value dexterous-hand joint command (left 10 + right 10)."""
-    numbers = _finite(values, "hand joint command")
-    expected = 2 * DEXTEROUS_JOINTS_PER_HAND
-    if len(numbers) != expected:
-        raise CommandRejected("HAND_COMMAND_LENGTH", f"expected {expected} values, got {len(numbers)}")
-    return list(numbers)
-
-
-def gesture_payload(values: Sequence[float], *, gesture_ids: Sequence[int] | None = None) -> list[float]:
-    """Project ``[left_gesture, left_open, right_gesture, right_open]`` (sub-mode 3)."""
-    numbers = _finite(values, "hand gesture command")
-    if len(numbers) != 4:
-        raise CommandRejected(
-            "HAND_GESTURE_LENGTH",
-            f"expected 4 values [left_gesture, left_open, right_gesture, right_open], got {len(numbers)}",
-        )
-    for index in (0, 2):
-        gesture = numbers[index]
-        if gesture != int(gesture):
-            raise CommandRejected("HAND_GESTURE_ID", f"gesture id must be an integer, got {gesture}")
-        if gesture_ids is not None and int(gesture) not in set(gesture_ids):
-            raise CommandRejected("HAND_GESTURE_ID", f"unknown gesture id {int(gesture)}")
-    for index in (1, 3):
-        if not 0.0 <= numbers[index] <= 1.0:
-            raise CommandRejected("HAND_GESTURE_RANGE", f"openness {numbers[index]} outside [0, 1]")
-    return list(numbers)
-
-
-def hand_payload(
-    values: Sequence[float],
-    *,
-    hand_type: str,
-    command_min: float = 0.0,
-    command_max: float = 1.0,
-    gesture_ids: Sequence[int] | None = None,
-) -> tuple[int, list[float]]:
-    """Return ``(hand_sub_mode, hand_pos)`` for the configured end-effector type."""
-    if hand_type == "claw":
-        return HAND_SUB_MODE_CLAW, claw_payload(values, command_min=command_min, command_max=command_max)
-    if hand_type == "dexterous_joint":
-        return HAND_SUB_MODE_DEXTEROUS_JOINT, dexterous_joint_payload(values)
-    if hand_type == "dexterous_gesture":
-        return HAND_SUB_MODE_DEXTEROUS_GESTURE, gesture_payload(values, gesture_ids=gesture_ids)
-    raise ProjectionError(f"unsupported hand type {hand_type!r}")
-
-
 # --- locomotion -------------------------------------------------------------
 
 
@@ -409,26 +282,6 @@ class LocomotionLimits:
             max_angular_radps=float(config.get("max_angular_radps", 1.0)),
         )
 
-    def with_platform_envelope(self, envelope: SpeedEnvelope | None) -> LocomotionLimits:
-        """Tighten the maxima to the envelope the platform currently reports.
-
-        The platform narrows its own speed envelope with battery, load and
-        terrain, and publishes the result in every state message. A static
-        table is therefore either too loose (accepting what the platform will
-        refuse) or too tight (refusing what it would accept). The profile's
-        values remain the ceiling — a deployment may be more conservative than
-        the platform, never less.
-        """
-        if envelope is None or not envelope.usable:
-            return self
-        return LocomotionLimits(
-            deadband=self.deadband,
-            min_linear_mps=self.min_linear_mps,
-            min_angular_radps=self.min_angular_radps,
-            max_linear_mps=min(self.max_linear_mps, envelope.max_linear_mps),
-            max_angular_radps=min(self.max_angular_radps, envelope.max_angular_radps),
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class SpeedEnvelope:
@@ -450,37 +303,6 @@ class SpeedEnvelope:
         return self.max_linear_mps > 0.0 and self.max_angular_radps > 0.0
 
 
-def twist_to_locomotion(
-    linear_x: float, linear_y: float, angular_z: float, limits: LocomotionLimits
-) -> tuple[float, float, float]:
-    """Convert a contract Twist into the vendor locomotion triple.
-
-    Below the vendor's motion threshold a component becomes an exact zero.
-    A non-zero component below the vendor's minimum effective value is
-    rejected: raising it to the minimum would move the robot faster than asked.
-    """
-    forward, lateral, angular = _finite((linear_x, linear_y, angular_z), "twist")
-    out: list[float] = []
-    for value, minimum, maximum, label in (
-        (forward, limits.min_linear_mps, limits.max_linear_mps, "linear.x"),
-        (lateral, limits.min_linear_mps, limits.max_linear_mps, "linear.y"),
-        (angular, limits.min_angular_radps, limits.max_angular_radps, "angular.z"),
-    ):
-        magnitude = abs(value)
-        if magnitude < limits.deadband:
-            out.append(0.0)
-            continue
-        if magnitude > maximum:
-            raise CommandRejected("VELOCITY_ABOVE_MAX", f"{label}={value} exceeds {maximum}")
-        if magnitude < minimum:
-            raise CommandRejected(
-                "VELOCITY_BELOW_MIN",
-                f"{label}={value} is below the platform minimum {minimum} and would not move the robot",
-            )
-        out.append(value)
-    return out[0], out[1], out[2]
-
-
 # --- freshness --------------------------------------------------------------
 
 
@@ -490,61 +312,6 @@ def is_fresh(command_stamp_s: float, now_s: float, window_s: float) -> bool:
         # Vendor rule: stamp 0 means "use receive time".
         return True
     return abs(now_s - command_stamp_s) <= window_s
-
-
-# --- state aggregation ------------------------------------------------------
-
-
-def aggregate_joint_state(
-    group_states: dict[str, Sequence[tuple[str, float, float, float]]],
-    *,
-    order: Sequence[str],
-) -> tuple[list[str], list[float], list[float], list[float]]:
-    """Merge per-group vendor joint states into one contract JointState.
-
-    Joints named in ``order`` but absent from the vendor feed are omitted, not
-    zero-filled: a fabricated zero reads as a real measurement downstream.
-    """
-    merged: dict[str, tuple[float, float, float]] = {}
-    for entries in group_states.values():
-        for name, position, velocity, effort in entries:
-            merged[str(name)] = (float(position), float(velocity), float(effort))
-    names, positions, velocities, efforts = [], [], [], []
-    for name in order:
-        if name not in merged:
-            continue
-        position, velocity, effort = merged[name]
-        names.append(name)
-        positions.append(position)
-        velocities.append(velocity)
-        efforts.append(effort)
-    return names, positions, velocities, efforts
-
-
-def partition_fresh(received_at: dict[str, float], *, now_s: float, window_s: float) -> tuple[set[str], set[str]]:
-    """Split feedback sources into fresh and stale by their last receipt time.
-
-    A source that has never reported is stale: silence is not a measurement.
-    """
-    fresh = {source for source, stamp in received_at.items() if now_s - stamp <= window_s}
-    return fresh, set(received_at) - fresh
-
-
-def hold_target(
-    group_states: dict[str, Sequence[tuple[str, float, float, float]]], *, order: Sequence[str]
-) -> list[float] | None:
-    """Measured positions in vendor order, or None if any joint is unmeasured.
-
-    Used to fill the fixed-length vendor payload fields for joints the caller
-    did not command: the platform interprets every element of ``arm_pos`` and
-    ``head_pos`` as a target, so an uncommanded joint must be told to stay where
-    it is, never sent a fabricated zero. A partial measurement is no basis for
-    a hold target, so the answer is then None rather than a mixed vector.
-    """
-    names, positions, _velocities, _efforts = aggregate_joint_state(group_states, order=order)
-    if len(names) != len(order):
-        return None
-    return positions
 
 
 # --- modes and stop ---------------------------------------------------------
@@ -679,6 +446,11 @@ def vendor_qos(
     if resolved_depth < 1:
         raise ProjectionError(f"vendor qos {key!r}: depth must be positive, got {resolved_depth}")
     return resolved_reliability, resolved_durability, resolved_depth
+
+
+def joint_state_rate_hz(profile: dict[str, Any]) -> float:
+    """The rate the profile declares for ``/joint_states``: what the joint state views publish at."""
+    return float(((profile.get("capabilities") or {}).get("joint.state") or {}).get("rate_hz", 50.0))
 
 
 # --- interaction priorities -------------------------------------------------

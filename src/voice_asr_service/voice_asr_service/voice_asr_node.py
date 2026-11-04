@@ -173,8 +173,13 @@ class VoiceASRNode(Node):
         self.declare_parameter("vad_sensitivity", VOICE_ASR_DEFAULTS["vad_sensitivity"])
         self.declare_parameter("vad_bundle_path", VOICE_ASR_DEFAULTS["vad_bundle_path"])
         self.declare_parameter("vad_deployment", VOICE_ASR_DEFAULTS["vad_deployment"])
+        self.declare_parameter("vad_min_silence_duration", VOICE_ASR_DEFAULTS["vad_min_silence_duration"])
+        self.declare_parameter("vad_post_roll_ms", VOICE_ASR_DEFAULTS["vad_post_roll_ms"])
+        self.declare_parameter("vad_pre_roll_ms", VOICE_ASR_DEFAULTS["vad_pre_roll_ms"])
+        self.declare_parameter("vad_min_speech_duration", VOICE_ASR_DEFAULTS["vad_min_speech_duration"])
         self.declare_parameter("publish_partial", VOICE_ASR_DEFAULTS["publish_partial"])
         self.declare_parameter("output_topic", VOICE_ASR_DEFAULTS["output_topic"])
+        self.declare_parameter("transcript_topic", VOICE_ASR_DEFAULTS["transcript_topic"])
         self.declare_parameter("sample_rate", VOICE_ASR_DEFAULTS["sample_rate"])
         self.declare_parameter("chunk_size", VOICE_ASR_DEFAULTS["chunk_size"])
         self.declare_parameter("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"])
@@ -191,6 +196,7 @@ class VoiceASRNode(Node):
         self.declare_parameter("chunk_topic", VOICE_ASR_DEFAULTS["chunk_topic"])
         self.declare_parameter("external_min_samples", VOICE_ASR_DEFAULTS["external_min_samples"])
         self.declare_parameter("external_idle_timeout", VOICE_ASR_DEFAULTS["external_idle_timeout"])
+        self.declare_parameter("external_finalize_on_idle", VOICE_ASR_DEFAULTS["external_finalize_on_idle"])
 
         self._active_mode = self.get_parameter("active_mode").value
         self._language = self.get_parameter("language").value
@@ -200,8 +206,13 @@ class VoiceASRNode(Node):
         self._vad_sensitivity = self.get_parameter("vad_sensitivity").value
         self._vad_bundle_path = str(self.get_parameter("vad_bundle_path").value)
         self._vad_deployment = str(self.get_parameter("vad_deployment").value)
+        self._vad_min_silence_duration = float(self.get_parameter("vad_min_silence_duration").value)
+        self._vad_post_roll_ms = float(self.get_parameter("vad_post_roll_ms").value)
+        self._vad_pre_roll_ms = float(self.get_parameter("vad_pre_roll_ms").value)
+        self._vad_min_speech_duration = float(self.get_parameter("vad_min_speech_duration").value)
         self._publish_partial = self.get_parameter("publish_partial").value
         self._output_topic = self.get_parameter("output_topic").value
+        self._transcript_topic = str(self.get_parameter("transcript_topic").value)
         self._sample_rate = self.get_parameter("sample_rate").value
         self._chunk_size = self.get_parameter("chunk_size").value
         self._buffer_seconds = self.get_parameter("buffer_seconds").value
@@ -221,6 +232,7 @@ class VoiceASRNode(Node):
         self._external_mode = self._input_mode == "external_vad"
         self._chunk_topic = str(self.get_parameter("chunk_topic").value)
         self._external_idle_timeout = float(self.get_parameter("external_idle_timeout").value)
+        self._external_finalize_on_idle = bool(self.get_parameter("external_finalize_on_idle").value)
         if self._external_mode and self._active_mode not in ("manual", "continuous"):
             raise ValueError("external_vad supports active_mode manual or continuous")
         self._external_min_samples = int(self.get_parameter("external_min_samples").value)
@@ -255,7 +267,11 @@ class VoiceASRNode(Node):
                 f"(asr_ch={self._audio_input_channel}, vad_ch={vad_channel_desc})"
             )
 
-            vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
+            vad_config = VADConfig(
+                sample_rate=self._sample_rate,
+                frame_size=self._chunk_size,
+                **self._vad_timing_kwargs(),
+            )
             self._vad = VADModule(vad_config)
             self._vad.set_sensitivity(self._vad_sensitivity)
             self._vad_runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
@@ -324,8 +340,21 @@ class VoiceASRNode(Node):
                 f"but Voice ASR audio input uses chunk_size={self._chunk_size}"
             )
 
+    def _vad_timing_kwargs(self) -> dict[str, float]:
+        """Endpointing timings shared by the realtime and file VAD modules."""
+        return {
+            "min_silence_duration": self._vad_min_silence_duration,
+            "post_roll_ms": self._vad_post_roll_ms,
+            "pre_roll_ms": self._vad_pre_roll_ms,
+            "min_speech_duration": self._vad_min_speech_duration,
+        }
+
     def _create_vad_module(self) -> VADModule:
-        vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
+        vad_config = VADConfig(
+            sample_rate=self._sample_rate,
+            frame_size=self._chunk_size,
+            **self._vad_timing_kwargs(),
+        )
         vad = VADModule(vad_config)
         vad.set_sensitivity(self._vad_sensitivity)
         runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
@@ -357,6 +386,12 @@ class VoiceASRNode(Node):
     def _init_ros_interface(self):
         """初始化 ROS 接口"""
         self._pub_command = self.create_publisher(String, self._output_topic, 10)
+        self._pub_transcript = None
+        if self._external_mode and self._transcript_topic:
+            from ibrobot_msgs.msg import SpeechTranscript
+
+            # Only an external source names its segments; see SpeechTranscript.msg.
+            self._pub_transcript = self.create_publisher(SpeechTranscript, self._transcript_topic, 10)
         self._pub_partial = self.create_publisher(String, "/voice_partial", 10)
         self._pub_status = self.create_publisher(String, "/voice_status", 10)
         self._pub_confidence = self.create_publisher(Float32, "/voice_confidence", 10)
@@ -378,8 +413,10 @@ class VoiceASRNode(Node):
                 min_samples=self._external_min_samples,
                 max_duration=float(self._max_recording_duration),
                 idle_timeout=self._external_idle_timeout,
+                finalize_on_idle=self._external_finalize_on_idle,
                 publish_partial=self._publish_partial,
                 on_final=self._publish_command,
+                on_segment_final=self._publish_segment_transcript,
                 on_partial=self._publish_partial_result,
                 on_state=self._on_external_state_change,
             )
@@ -823,6 +860,18 @@ class VoiceASRNode(Node):
         self._pub_confidence.publish(conf_msg)
 
         self.get_logger().info(f"Command: {text}")
+
+    def _publish_segment_transcript(self, text: str, segment: tuple[str, int]) -> None:
+        """Publish the same final text tagged with the segment it came from."""
+        if self._pub_transcript is None:
+            return
+        from ibrobot_msgs.msg import SpeechTranscript
+
+        msg = SpeechTranscript()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.source_id, msg.segment_sequence = segment[0], int(segment[1])
+        msg.text = text
+        self._pub_transcript.publish(msg)
 
     def _publish_partial_result(self, text: str):
         """发布中间识别结果"""

@@ -128,6 +128,14 @@ MODEL_BUNDLE_ALLOWLIST = (
     BundleSource("fullsubnet", "fullsubnet", "fullsubnet", "tensor_model", "fullsubnet", "enhance"),
     BundleSource("silero-vad", "silero-vad", "silero-vad", "tensor_model", "silero_vad", "vad"),
     BundleSource(
+        "campplus-speaker",
+        "campplus-speaker",
+        "campplus-speaker",
+        "tensor_model",
+        "campplus",
+        "embed",
+    ),
+    BundleSource(
         "pear_parameter_network",
         "pear_parameter_network",
         "pear_parameter_network",

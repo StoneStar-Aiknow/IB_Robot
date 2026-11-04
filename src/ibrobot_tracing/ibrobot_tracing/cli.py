@@ -13,6 +13,7 @@ from typing import Any
 
 from .analysis import AnalysisRequest, AnalysisResult, AnalysisService
 from .critical_path import CriticalPathQuery, project_critical_path
+from .merging import merge_traces, write_merged_trace
 from .projection import (
     AggregateSpanProfileProjection,
     CallTreeQuery,
@@ -227,15 +228,22 @@ def _parser() -> argparse.ArgumentParser:
     ):
         command = subparsers.add_parser(name)
         command.add_argument("source", type=Path)
-        command.add_argument("--source-kind", choices=("auto", "ctf", "log"), default="auto")
+        command.add_argument("--source-kind", choices=("auto", "ctf", "log", "merged"), default="auto")
         command.add_argument("--topology", type=Path)
         command.add_argument("--request-id", required=name == "critical-path", default="")
         command.add_argument("--component", default="")
+    merge = subparsers.add_parser("merge")
+    merge.add_argument("--input", nargs=2, action="append", metavar=("TRACE", "CALIBRATION"), required=True)
+    merge.add_argument("--output", type=Path, required=True)
+    merge.add_argument("--max-events", type=int, default=1_000_000)
     subparsers.choices["requests"].add_argument("--sort", choices=sorted(REQUEST_SORT_FIELDS), default="total_ms")
     subparsers.choices["requests"].add_argument("--limit", type=int, default=20)
     subparsers.choices["events"].add_argument("--event", default="")
     subparsers.choices["events"].add_argument("--provider", default="")
     subparsers.choices["events"].add_argument("--limit", type=int, default=100)
+    subparsers.choices["events"].add_argument(
+        "--uncalibrated", action="store_true", help="Inspect events excluded from the common timeline"
+    )
     subparsers.choices["spans"].add_argument("--limit", type=int, default=100)
     subparsers.choices["flows"].add_argument("--limit", type=int, default=100)
     subparsers.choices["tracepoints"].add_argument("--kind", choices=("event", "span"), default="")
@@ -272,11 +280,32 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "merge":
+            dataset = merge_traces(
+                [(Path(source), Path(calibration)) for source, calibration in args.input], max_events=args.max_events
+            )
+            write_merged_trace(args.output, dataset)
+            print(
+                json.dumps(
+                    {
+                        "output": str(args.output),
+                        "calibrated_events": len(dataset.events),
+                        "uncalibrated_events": len(dataset.uncalibrated_events),
+                        "metadata": dataset.metadata,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
         result = _load(args)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 3
-    if not result.dataset.events and args.command not in {"critical-path", "tracepoints"}:
+    if (
+        not result.dataset.events
+        and not result.dataset.uncalibrated_events
+        and args.command not in {"critical-path", "tracepoints"}
+    ):
         print("No ib_trace events found.", file=sys.stderr)
         return 1
     if args.command == "summary":
@@ -359,6 +388,18 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout,
         )
     elif args.command == "events":
+        if args.uncalibrated:
+            events = [
+                event
+                for event in result.dataset.uncalibrated_events
+                if (not args.request_id or event.request_id == args.request_id)
+                and (not args.component or event.component_id == args.component)
+                and (not args.event or event.name == args.event)
+                and (not args.provider or event.origin.provider == args.provider)
+            ]
+            for event in events[: args.limit]:
+                _print_json_line(event.to_dict())
+            return 0
         events = _take(
             QueryService(result).events,
             EventQuery(

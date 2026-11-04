@@ -12,6 +12,7 @@ from voice_tts_service.audio_playback_node import (
     AUDIO_DATA_TYPE,
     AudioPlaybackNode,
     _audio_message_class,
+    _publisher_qos,
 )
 
 
@@ -389,3 +390,27 @@ def test_a_reply_shorter_than_the_lead_returns_once_it_has_played(monkeypatch, t
 
     assert [now for now, _written in writes] == [0.0, 0.0, 0.0]
     assert returned_at == pytest.approx(0.6)
+
+
+def test_the_bound_speaker_qos_reaches_the_publisher():
+    """The X2 runtime subscribes best_effort; RELIABLE is compatible, which is why it stayed silent."""
+    import json
+
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+    qos = _publisher_qos(
+        json.dumps({"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 10})
+    )
+
+    assert isinstance(qos, QoSProfile)
+    assert qos.reliability == ReliabilityPolicy.BEST_EFFORT
+    assert qos.depth == 10
+
+
+def test_an_undeclared_speaker_qos_keeps_the_rclpy_default():
+    assert _publisher_qos("") == 10
+
+
+def test_malformed_qos_json_is_rejected_instead_of_falling_back():
+    with pytest.raises(ValueError, match="audio_qos_json"):
+        _publisher_qos("{not json")

@@ -124,6 +124,25 @@ def test_compiler_rejects_robot_timeout_limit(tmp_path):
     assert raised.value.code == "SKILL_LIMIT_VIOLATION"
 
 
+def test_selected_implementation_description_reaches_the_planner_catalog(tmp_path):
+    _write_catalog(tmp_path)
+    manifest = tmp_path / "config/skills/open_gripper_skill/manifest.yaml"
+    with manifest.open("a", encoding="utf-8") as stream:
+        stream.write(
+            "\ndescription_variants:\n"
+            "  test_robot:\n"
+            "    summary: Open only the left hand.\n"
+            "    category: gripper\n"
+            "    when_to_use: [release an object from the left hand]\n"
+            "    motion_scope: [gripper]\n"
+            "    intensity: subtle\n"
+        )
+    snapshot = compile_skill_catalog(
+        DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context()
+    )
+    assert snapshot.capability_view["open_gripper_skill"]["summary"] == "Open only the left hand."
+
+
 def test_compiler_rejects_non_hidden_skill_directory_without_manifest(tmp_path):
     _write_catalog(tmp_path)
     (tmp_path / "config" / "skills" / "broken_skill").mkdir()

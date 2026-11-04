@@ -1,0 +1,66 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="lekiwi">
+  <compiler angle="radian" eulerseq="XYZ" meshdir="{{MESHES_DIR}}" />
+  <option gravity="0 0 -9.81" integrator="implicitfast" timestep="0.001" />
+  <asset>
+    <mesh name="lekiwi_base" file="lekiwi_base.stl" />
+    <mesh name="omni_wheel" file="omni_wheel.stl" />
+  </asset>
+  <default>
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="1" rgba="0.8 0.8 0.8 1" />
+    </default>
+    <default class="wheel_collision">
+      <geom type="sphere" size="0.051" condim="1" priority="2" group="3" friction="0 0 0" rgba="0.15 0.15 0.15 0.3" />
+    </default>
+  </default>
+  <worldbody>
+    <body name="base_link" pos="0.000000 0.000000 0.000000" quat="1.000000 0.0 0.0 0.000000">
+      <freejoint name="floating_base_joint" />
+      <inertial pos="0 0 0" mass="2.0" diaginertia="0.01 0.01 0.02" />
+      <geom class="visual" type="mesh" mesh="lekiwi_base" euler="0 0 4.712389" />
+      <geom name="chassis" type="box" size="0.13 0.13 0.03" pos="0 0 0.05" group="3" />
+      <body name="left_wheel" pos="0.0661195 0.1145530 0.01036" euler="0 1.5707963 0.5235988">
+        <joint name="wheel_7" type="hinge" axis="0 0 -1" armature="0.001" />
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001" />
+        <geom class="visual" type="mesh" mesh="omni_wheel" rgba="0.15 0.15 0.15 1" />
+        <geom name="wheel_7" class="wheel_collision" />
+      </body>
+      <body name="back_wheel" pos="-0.132239 0 0.01036" euler="0 1.5707963 3.1415927">
+        <joint name="wheel_8" type="hinge" axis="0 0 -1" armature="0.001" />
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001" />
+        <geom class="visual" type="mesh" mesh="omni_wheel" rgba="0.15 0.15 0.15 1" />
+        <geom name="wheel_8" class="wheel_collision" />
+      </body>
+      <body name="right_wheel" pos="0.0661195 -0.1145530 0.01036" euler="0 1.5707963 -0.5235988">
+        <joint name="wheel_9" type="hinge" axis="0 0 -1" armature="0.001" />
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001" />
+        <geom class="visual" type="mesh" mesh="omni_wheel" rgba="0.15 0.15 0.15 1" />
+        <geom name="wheel_9" class="wheel_collision" />
+      </body>
+      <site name="mid360_lidar_site" pos="-0.080000 0.000000 0.200000" quat="0.707107 0.000000 0.000000 0.707107" size="0.005" />
+    </body>
+  </worldbody>
+  <actuator>
+    <velocity name="wheel_7" joint="wheel_7" kv="0.6" ctrlrange="-5.5224 5.5224" />
+    <velocity name="wheel_8" joint="wheel_8" kv="0.6" ctrlrange="-5.5224 5.5224" />
+    <velocity name="wheel_9" joint="wheel_9" kv="0.6" ctrlrange="-5.5224 5.5224" />
+  </actuator>
+  <sensor>
+    <plugin name="mid360_lidar" plugin="mujoco.plugin.lidar" objtype="site" objname="mid360_lidar_site">
+      <config key="resolution" value="360 32" />
+      <config key="azimuth_range" value="-3.14159265 3.14159265" />
+      <config key="elevation_range" value="-0.122173 0.907571" />
+      <config key="min_range" value="0.1" />
+      <config key="max_range" value="40" />
+      <config key="update_rate" value="10" />
+      <config key="async" value="0" />
+    </plugin>
+    <framequat name="mid360_imu_quat" objtype="site" objname="mid360_lidar_site" />
+    <gyro name="mid360_imu_gyro" site="mid360_lidar_site" />
+    <accelerometer name="mid360_imu_accel" site="mid360_lidar_site" />
+  </sensor>
+  <extension>
+    <plugin plugin="mujoco.plugin.lidar" />
+  </extension>
+</mujoco>

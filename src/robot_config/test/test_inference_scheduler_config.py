@@ -1,6 +1,6 @@
 """Typed validation tests for the scheduler feature switch and its policy block.
 
-Covers the whole-graph scheduler control plane: the single `scheduler.enable` switch, bounded policy
+Covers the whole-graph scheduler control plane: the single `robot.runtime_scheduler.enable` switch, bounded policy
 fields, public_capacity, scheduled transport endpoints, the runtime_policy
 fingerprint, and fail-closed semantics. The false/absent path is asserted unchanged
 relative to the legacy dispatcher behavior.
@@ -22,6 +22,7 @@ from robot_config.inference_config import (
     _validate_stage_priority_range,
     scheduler_enabled_from_raw_config,
 )
+from robot_config.runtime_target import RuntimeTarget
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
@@ -289,19 +290,19 @@ def _legacy_pipeline(bundle: Path) -> dict[str, Any]:
 def test_raw_scheduler_switch_reader_does_not_parse_pipeline_artifacts() -> None:
     invalid_pipeline = {"model_path": "/missing/bundle", "profile_path": "/missing/profile"}
     robot = {
+        "runtime_scheduler": {"enable": True},
         "control_modes": {
             "model_inference": {
                 "inference": {
                     "enabled": True,
-                    "scheduler": {"enable": True},
                     "pipelines": {"policy": invalid_pipeline},
                 }
             }
-        }
+        },
     }
 
     assert scheduler_enabled_from_raw_config(robot, "model_inference") is True
-    robot["control_modes"]["model_inference"]["inference"]["scheduler"]["enable"] = False
+    robot["runtime_scheduler"]["enable"] = False
     assert scheduler_enabled_from_raw_config(robot, "model_inference") is False
     assert scheduler_enabled_from_raw_config({}, "model_inference") is False
 
@@ -321,9 +322,8 @@ def _scheduler_block() -> dict[str, Any]:
 
 def _robot_config(pipelines: dict[str, Any], *, scheduler: dict[str, Any] | None) -> dict[str, Any]:
     inference: dict[str, Any] = {"enabled": True, "pipelines": pipelines}
-    if scheduler is not None:
-        inference["scheduler"] = scheduler
     return {
+        **({"runtime_scheduler": scheduler} if scheduler is not None else {}),
         "control_modes": {
             "model_inference": {
                 "inference": inference,
@@ -338,7 +338,7 @@ def _robot_config(pipelines: dict[str, Any], *, scheduler: dict[str, Any] | None
                     },
                 },
             }
-        }
+        },
     }
 
 
@@ -1007,13 +1007,15 @@ def test_lower_priority_dispatch_contexts_must_leave_priority_zero_reserve(tmp_p
         )
 
 
-def test_scheduler_enable_true_requires_inference_enabled(tmp_path: Path) -> None:
+def test_robot_scheduler_does_not_enable_inactive_control_mode(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     profile = _profile_file(tmp_path)
     rc = _robot_config({"policy": _pipeline(bundle, profile=profile)}, scheduler=_scheduler_block())
     rc["control_modes"]["model_inference"]["inference"]["enabled"] = False
-    with pytest.raises(InferenceConfigError, match="requires"):
-        parse_inference_config(rc, "model_inference")
+    parsed = parse_inference_config(rc, "model_inference")
+    assert parsed.enabled is False
+    assert parsed.scheduler is None
+    assert parsed.pipelines["policy"].runtime_policy_json is None
 
 
 def test_fallback_chain_cannot_contain_target(tmp_path: Path) -> None:
@@ -1042,18 +1044,65 @@ def test_unknown_scheduler_field_rejected(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_only_one_scheduling_switch_exists() -> None:
-    """Scan the typed config module: `scheduler.enable` is the only switch."""
-    import re
+@pytest.mark.parametrize("field", ["with_scheduler", "scheduler_enabled"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_inference_rejects_additional_scheduling_switches(tmp_path: Path, field: str, enabled: bool) -> None:
+    """An inference-level toggle is an invalid field, regardless of its value."""
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _robot_config({"policy": _legacy_pipeline(bundle)}, scheduler=None)
+    config["control_modes"]["model_inference"]["inference"][field] = enabled
+    with pytest.raises(InferenceConfigError, match=field):
+        parse_inference_config(config, "model_inference")
 
-    from robot_config import inference_config as mod
 
-    source = Path(mod.__file__).read_text(encoding="utf-8")
-    forbidden = [r"with_scheduler", r"SCHEDULER_ENABLE_ENV"]
-    for pattern in forbidden:
-        assert not re.search(pattern, source), f"forbidden switch pattern {pattern!r} present"
-    # `enable` parsed exactly under the scheduler block.
-    assert "_parse_scheduler" in source
+@pytest.mark.parametrize("target", list(RuntimeTarget))
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("inference_enabled", [False, True])
+@pytest.mark.parametrize("decision", [None, False, True])
+def test_prepared_scheduler_decision_cannot_override_activation(tmp_path, target, enabled, inference_enabled, decision):
+    bundle = _create_bundle(tmp_path / "bundle")
+    block = _scheduler_block()
+    block["enable"] = enabled
+    robot = _robot_config({"policy": _pipeline(bundle, profile=_profile_file(tmp_path))}, scheduler=block)
+    robot["control_modes"]["model_inference"]["inference"]["enabled"] = inference_enabled
+    robot.update(runtime={"target": target.value}, benchmark={"type": "libero", "adapter": "libero"})
+    expected = enabled and inference_enabled and target is RuntimeTarget.HARDWARE
+
+    if decision is not None and decision is not expected:
+        with pytest.raises(InferenceConfigError, match="scheduler_enabled conflicts"):
+            parse_inference_config(robot, "model_inference", scheduler_enabled=decision)
+    else:
+        parsed = parse_inference_config(robot, "model_inference", scheduler_enabled=decision)
+        assert (parsed.scheduler is not None) is expected
+        assert (parsed.pipelines["policy"].runtime_policy_json is not None) is expected
+
+
+@pytest.mark.parametrize("decision", [0, 1, "false", "true", [], {}])
+def test_prepared_scheduler_decision_must_be_boolean(decision):
+    robot = {"control_modes": {"model_inference": {"inference": {"enabled": False}}}}
+    with pytest.raises(InferenceConfigError, match="scheduler_enabled must be a boolean"):
+        parse_inference_config(robot, "model_inference", scheduler_enabled=decision)
+
+
+def test_prepared_scheduler_decision_cannot_enable_absent_switch():
+    robot = {"control_modes": {"model_inference": {"inference": {"enabled": True}}}}
+    with pytest.raises(InferenceConfigError, match="scheduler_enabled conflicts"):
+        parse_inference_config(robot, "model_inference", scheduler_enabled=True)
+
+
+@pytest.mark.parametrize("declared", list(RuntimeTarget))
+@pytest.mark.parametrize("effective", list(RuntimeTarget))
+def test_prepared_scheduler_validation_uses_effective_target(tmp_path, declared, effective):
+    from copy import deepcopy
+
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot = _robot_config({"policy": _pipeline(bundle, profile=_profile_file(tmp_path))}, scheduler=_scheduler_block())
+    robot.update(runtime={"target": declared.value}, benchmark={"type": "libero", "adapter": "libero"})
+    original = deepcopy(robot)
+    expected = effective is RuntimeTarget.HARDWARE
+    parsed = parse_inference_config(robot, "model_inference", scheduler_enabled=expected, runtime_target=effective)
+    assert (parsed.scheduler is not None) is expected
+    assert robot == original
 
 
 def test_stage_instance_count_cannot_claim_unloaded_replicas(tmp_path: Path) -> None:
@@ -1104,3 +1153,42 @@ def test_sequential_rejects_ineffective_stage_priority_offset(tmp_path):
     pipeline["scheduling"] = {"stage_policy": "sequential", "stages": {"policy": {"priority_offset": 1}}}
     with pytest.raises(InferenceConfigError, match="requires independent"):
         parse_inference_config(_robot_config({"policy": pipeline}, scheduler=_scheduler_block()), "model_inference")
+
+
+@pytest.mark.parametrize("block", [{}, {"enable": False}])
+def test_robot_scheduler_missing_enable_is_disabled(tmp_path, block):
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot = _robot_config({"policy": _pipeline(bundle, profile=_profile_file(tmp_path))}, scheduler=block)
+    parsed = parse_inference_config(robot, "model_inference")
+    assert parsed.scheduler is None
+    assert parsed.pipelines["policy"].runtime_policy_json is None
+
+
+@pytest.mark.parametrize("block", [None, False, [], "enabled"])
+def test_robot_scheduler_block_must_be_mapping_even_without_inference(block):
+    robot = {"runtime_scheduler": block, "control_modes": {"teleop": {}}}
+    with pytest.raises(InferenceConfigError, match="robot.runtime_scheduler must be a mapping"):
+        parse_inference_config(robot, "teleop")
+
+
+@pytest.mark.parametrize("target", ["simulation", "benchmark"])
+def test_virtual_runtime_keeps_scheduled_tuning_dormant(tmp_path, target):
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot = _robot_config({"policy": _pipeline(bundle, profile=_profile_file(tmp_path))}, scheduler={"enable": True})
+    robot.update(runtime={"target": target}, benchmark={"type": "libero", "adapter": "libero"})
+    parsed = parse_inference_config(robot, "model_inference")
+    assert parsed.scheduler is None
+    assert parsed.pipelines["policy"].runtime_policy_json is None
+    assert scheduler_enabled_from_raw_config(robot, "model_inference") is False
+
+
+def test_robot_scheduler_is_shared_across_control_modes(tmp_path):
+    from copy import deepcopy
+
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot = _robot_config({"policy": _pipeline(bundle, profile=_profile_file(tmp_path))}, scheduler=_scheduler_block())
+    robot["control_modes"]["other_policy"] = deepcopy(robot["control_modes"]["model_inference"])
+    first = parse_inference_config(robot, "model_inference")
+    second = parse_inference_config(robot, "other_policy")
+    assert first.scheduler == second.scheduler
+    assert first.pipelines["policy"].runtime_policy_fingerprint == second.pipelines["policy"].runtime_policy_fingerprint

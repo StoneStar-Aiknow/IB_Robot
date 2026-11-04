@@ -38,7 +38,7 @@ class CapabilitiesResponse(ApiModel):
 class Source(ApiModel):
     id: str
     name: str
-    kind: Literal["ctf", "log"]
+    kind: Literal["ctf", "log", "merged"]
     version: str
     modified_at: datetime
     size_bytes: int
@@ -75,7 +75,7 @@ class Analysis(ApiModel):
     id: str
     source_id: str
     source_name: str
-    source_kind: Literal["ctf", "log"]
+    source_kind: Literal["ctf", "log", "merged"]
     source_version: str
     created_at: datetime
     event_count: int
@@ -177,6 +177,11 @@ class EventOrigin(ApiModel):
     process_id: int | None = None
     thread_id: int | None = None
     node: str = ""
+    machine_id: str = ""
+    boot_id: str = ""
+    process_instance: str = ""
+    capture_session: str = ""
+    event_sequence: int | str | None = None
 
 
 class TraceEvent(ApiModel):
@@ -190,6 +195,8 @@ class TraceEvent(ApiModel):
     sequence: int
     request_id: str
     component_id: str
+    monotonic_ns: int | str | None = None
+    time_mapping: dict[str, Any] = Field(default_factory=dict)
 
 
 class EventPage(ApiModel):
@@ -202,6 +209,8 @@ class EventPage(ApiModel):
 
 class Span(ApiModel):
     id: str
+    base_id: str = ""
+    occurrence_id: str = ""
     name: str
     trace_id: str
     span_id: str
@@ -213,6 +222,7 @@ class Span(ApiModel):
     origin: str
     fields: dict[str, Any]
     duration_ms: float | None
+    time_mapping: dict[str, Any] = Field(default_factory=dict)
 
 
 class SpanPage(ApiModel):
@@ -225,6 +235,8 @@ class SpanPage(ApiModel):
 
 class Flow(ApiModel):
     id: str
+    base_id: str = ""
+    occurrence_id: str = ""
     edge_id: str
     flow_id: str
     trace_id: str
@@ -232,6 +244,8 @@ class Flow(ApiModel):
     receive_ns: str | int | None
     status: str
     duration_ms: float | None
+    uncertainty_ns: int | str | None = None
+    provenance: dict[str, Any] = Field(default_factory=dict)
 
 
 class FlowPage(ApiModel):

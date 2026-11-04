@@ -7,9 +7,11 @@ simulated — the in-repo vendor mock that stands in for the robot's own stack.
     ros2 launch aimdk_robot runtime.launch.py profile:=<path-or-name> \
         [simulated:=true] [instance_id:=<id>] [initial_mode:=<mode>]
 
-No controller manager, no ros2_control hardware component and no sensor driver
-is launched: the vendor owns real-time control and already publishes its
-sensors. Node startup is staged because the platform documents that bulk node
+Two processes make the runtime: ``aimdk_dataplane`` (C++) takes the platform's
+joint, hand and arm command state and owns the command stream, and
+``aimdk_runtime`` keeps the control plane (see ``aimdk_robot.dataplane``). No
+controller manager, no ros2_control hardware component and no sensor driver is
+launched: the vendor owns real-time control and already publishes its sensors. Node startup is staged because the platform documents that bulk node
 launches disturb motion control (no more than ~2 nodes per second).
 """
 
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import json
 
+from aimdk_robot import dataplane
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction
 from launch.substitutions import LaunchConfiguration
@@ -48,6 +51,15 @@ def _launch_setup(context, *_args, **_kwargs):
         LaunchConfiguration("simulated").perform(context),
         source=str(profile_path),
     )
+    peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
+    if peripherals_file:
+        # runtime-deployment-peripherals D7: the X2's cameras are vendor
+        # public interfaces declared in profile.interfaces, not
+        # runtime-declared peripherals; a deployment layer for vendor
+        # interfaces is out of scope, so a non-empty fragment fails closed
+        # instead of being silently ignored. An empty value (today's
+        # behaviour for every AimDK configuration) is unchanged.
+        raise RuntimeError("aimdk_robot exposes vendor interfaces and accepts no deployment peripherals")
     simulated = use_sim
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
@@ -70,11 +82,21 @@ def _launch_setup(context, *_args, **_kwargs):
             ],
         )
 
+    # The data plane comes up one stagger ahead of the runtime, so the runtime's
+    # first control word and feedback check find it.
+    data_plane = Node(
+        package="aimdk_dataplane",
+        executable="aimdk_dataplane",
+        name="aimdk_dataplane",
+        output="screen",
+        parameters=[{"plan_json": json.dumps(dataplane.plan(profile))}],
+    )
+
     if not simulated:
         # The runtime itself bridges the vendor's processed speech stream, next
         # to the raw capture and playback paths it already owns; declaring the
         # endpoint in the profile is all a deployment has to do.
-        return [runtime_node()]
+        return [data_plane, TimerAction(period=NODE_STAGGER_S, actions=[runtime_node()])]
 
     # When simulated the platform's sensor streams have no publisher, so the
     # contract layer's synthetic publishers stand in for them on exactly the
@@ -98,12 +120,14 @@ def _launch_setup(context, *_args, **_kwargs):
         output="screen",
         parameters=[{"hand_type": str((vendor.get("hand") or {}).get("type", "claw")).split("_")[0]}],
     )
-    # The platform stand-in comes up first; the bridge follows one stagger later,
-    # then the synthetic sensor publishers, honouring the node-rate limit.
+    # The platform stand-in comes up first; the data plane, the bridge and the
+    # synthetic sensor publishers follow one stagger apart, honouring the
+    # node-rate limit.
     return [
         mock,
-        TimerAction(period=NODE_STAGGER_S, actions=[runtime]),
-        TimerAction(period=2 * NODE_STAGGER_S, actions=perception),
+        TimerAction(period=NODE_STAGGER_S, actions=[data_plane]),
+        TimerAction(period=2 * NODE_STAGGER_S, actions=[runtime]),
+        TimerAction(period=3 * NODE_STAGGER_S, actions=perception),
     ]
 
 
@@ -130,6 +154,12 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),
+            DeclareLaunchArgument(
+                "peripherals",
+                default_value="",
+                description="Rejected: aimdk_robot exposes vendor interfaces and accepts no deployment "
+                "peripherals (kept for the shared provider contract)",
+            ),
             OpaqueFunction(function=_launch_setup),
         ]
     )

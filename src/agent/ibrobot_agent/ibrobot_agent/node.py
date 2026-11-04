@@ -8,7 +8,9 @@ from an independent repository.
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
+import logging
 import os
 import threading
 import time
@@ -27,6 +29,7 @@ from std_srvs.srv import Trigger
 
 from embodied_common.agent_terminal_contract import classify_agent_terminal, stable_agent_execution_error_code
 from embodied_common.canon import sha256_text, to_canonical_json
+from embodied_common.execution_detail import execution_context, short_message
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
 from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
@@ -141,31 +144,65 @@ class _UnavailableCatalog:
 
 
 class _RosBridgeCatalog:
-    """Expose the existing Gateway read path through the core catalog port."""
+    """Expose the existing Gateway read path through the core catalog port.
+
+    The skill snapshot is fetched and re-verified on every request, which is a
+    second serial RPC carrying a six-figure JSON payload plus three digest
+    computations over it. The snapshot is fully determined by the registry
+    identity the Gateway reports, and that identity is already what
+    ``capability_view_from_snapshot`` compares to detect a stale snapshot, so
+    an unchanged identity can reuse the verified view.
+
+    What is deliberately *not* cached: the Gateway status is still read on
+    every request, and the control-plane fields are re-applied from that live
+    status, because authorization and control mode change without the registry
+    changing.
+    """
 
     def __init__(self, bridge, *, rpc_timeout_sec: float) -> None:
         self._bridge = bridge
         self._rpc_timeout_sec = rpc_timeout_sec
+        self._cached_identity: tuple[str, int, str] | None = None
+        self._cached_skills: dict | None = None
 
     def get_status(self):
         return self._bridge.get_status(task_id="", payload_hash="", timeout_sec=self._rpc_timeout_sec)
 
+    @staticmethod
+    def _identity(status) -> tuple[str, int, str]:
+        return (
+            str(status.get("registry_epoch", "")),
+            int(status.get("registry_generation", 0)),
+            str(status.get("registry_digest", "")),
+        )
+
     def get_catalog(self, status):
         from robot_skill_cli.catalog import capability_view_from_snapshot
 
-        snapshot = self._bridge.get_skill_snapshot(
-            registry_epoch=status["registry_epoch"],
-            generation=status["registry_generation"],
-            timeout_sec=status.get("rpc_timeout_sec", self._rpc_timeout_sec),
-        )
-        view = capability_view_from_snapshot(snapshot, status)
+        identity = self._identity(status)
+        snapshot = None
+        if self._cached_skills is not None and self._cached_identity == identity:
+            view = copy.deepcopy(self._cached_skills)
+        else:
+            snapshot = self._bridge.get_skill_snapshot(
+                registry_epoch=status["registry_epoch"],
+                generation=status["registry_generation"],
+                timeout_sec=status.get("rpc_timeout_sec", self._rpc_timeout_sec),
+            )
+            view = capability_view_from_snapshot(snapshot, status)
+            # Cache only after verification succeeded, and only the part the
+            # registry identity actually determines.
+            self._cached_skills = copy.deepcopy(view)
+            self._cached_identity = identity
         view["control_plane_ready"] = bool(status.get("control_plane_ready"))
         view["active_control_mode"] = str(status.get("active_control_mode", ""))
         view["motion_authorized"] = bool(status.get("motion_authorized"))
-        view["registry_epoch"] = str(status.get("registry_epoch", ""))
-        view["registry_generation"] = int(status.get("registry_generation", 0))
-        view["registry_digest"] = str(status.get("registry_digest", ""))
-        view[CATALOG_SKILL_NAMES_ZH] = _chinese_skill_names(snapshot, status)
+        view["registry_epoch"] = identity[0]
+        view["registry_generation"] = identity[1]
+        view["registry_digest"] = identity[2]
+        if snapshot is not None:
+            self._cached_zh_names = _chinese_skill_names(snapshot, status)
+        view[CATALOG_SKILL_NAMES_ZH] = getattr(self, "_cached_zh_names", {})
         return view
 
 
@@ -200,6 +237,8 @@ def _program_terminal_detail(result) -> dict:
         "execution_id": str(result.execution_id),
         "state": str(result.state),
         "completed_step_count": int(getattr(result, "completed_step_count", 0)),
+        "gateway_sequence": int(getattr(result, "last_event_sequence", 0)),
+        **execution_context(result),
     }
 
 
@@ -220,12 +259,53 @@ class _RosExecutionAdapter:
         self._active_lock = threading.Lock()
         self._active_stop_event: threading.Event | None = None
         self._active_task_id: str | None = None
+        self._progress_callback = None
+        self._progress_open = False
+        self._last_event_sequence = 0
 
-    def execute(self, proposal, *, expected_registry_identity, presentation_callback, submission_callback, stop_event):
+    def set_progress_callback(self, callback) -> None:
+        self._progress_callback = callback
+
+    def _program_feedback(self, wrapped, *, task_id: str) -> None:
+        feedback = wrapped.feedback
+        with self._active_lock:
+            if (
+                not self._progress_open
+                or task_id != self._active_task_id
+                or feedback.sequence <= self._last_event_sequence
+            ):
+                return
+            self._last_event_sequence = int(feedback.sequence)
+        callback = self._progress_callback
+        if callback is not None:
+            try:
+                callback(
+                    {
+                        "execution_id": str(feedback.execution_id),
+                        "gateway_sequence": int(feedback.sequence),
+                        "state": str(feedback.state),
+                        **execution_context(feedback),
+                    }
+                )
+            except Exception:
+                _trace.exception("execution presentation failed; execution continues")
+
+    def execute(
+        self,
+        proposal,
+        *,
+        expected_registry_identity,
+        presentation_callback,
+        submission_callback,
+        stop_event,
+        continues_from_execution_id="",
+    ):
         task_id = uuid.uuid4().hex
         with self._active_lock:
             self._active_stop_event = stop_event
             self._active_task_id = task_id
+            self._progress_open = True
+            self._last_event_sequence = 0
         try:
             return self._execute_direct(
                 proposal,
@@ -234,11 +314,13 @@ class _RosExecutionAdapter:
                 presentation_callback=presentation_callback,
                 submission_callback=submission_callback,
                 stop_event=stop_event,
+                continues_from_execution_id=continues_from_execution_id,
             )
         finally:
             with self._active_lock:
                 self._active_stop_event = None
                 self._active_task_id = None
+                self._progress_open = False
 
     def request_stop(self, request_key) -> None:
         with self._active_lock:
@@ -260,6 +342,7 @@ class _RosExecutionAdapter:
         presentation_callback,
         submission_callback,
         stop_event: threading.Event,
+        continues_from_execution_id: str = "",
     ) -> ExecutionResult:
         expected_identity = (
             expected_registry_identity.epoch,
@@ -280,6 +363,7 @@ class _RosExecutionAdapter:
                 expected_registry_digest=expected_identity[2],
                 workflow_steps=steps,
                 task_budget_sec=self._task_budget_sec,
+                continues_from_execution_id=continues_from_execution_id,
             )
             presentation = _presentation_from_mapping(
                 {
@@ -337,6 +421,8 @@ class _RosExecutionAdapter:
                         "registry_digest": expected_identity[2],
                     },
                     task_budget_sec=self._task_budget_sec,
+                    continues_from_execution_id=continues_from_execution_id,
+                    feedback_callback=lambda message: self._program_feedback(message, task_id=task_id),
                 )
                 if not self._wait_future(goal_future, self._rpc_timeout_sec, stop_event):
                     if stop_event.is_set():
@@ -375,7 +461,7 @@ class _RosExecutionAdapter:
                     execution_status,
                     presentation.task_ref,
                     str(result.error_code),
-                    str(result.message),
+                    short_message(result.message),
                     _program_terminal_detail(result),
                 )
             except Exception:
@@ -591,17 +677,24 @@ class _RosExecutionAdapter:
                     timeout_sec=self._rpc_timeout_sec,
                 )
                 state = str(execution.get("state", ""))
-                if state in {"CANCELED", "FAILED", "UNKNOWN"}:
-                    status = "cancelled" if state == "CANCELED" else ("unknown" if state == "UNKNOWN" else "failed")
+                if state in {"SUCCEEDED", "CANCELED", "FAILED", "UNKNOWN"}:
+                    status = {
+                        "SUCCEEDED": "succeeded",
+                        "CANCELED": "cancelled",
+                        "FAILED": "failed",
+                        "UNKNOWN": "unknown",
+                    }[state]
                     return ExecutionResult(
                         status,
                         presentation.task_ref,
                         str(execution.get("error_code", "")),
-                        str(execution.get("message", "")),
+                        short_message(execution.get("message", "")),
                         {
                             "submitted": True,
                             # The step list is already in the proposal; keep the terminal small.
                             **{name: value for name, value in execution.items() if name != "canonical_steps"},
+                            "gateway_sequence": execution.get("last_event_sequence", 0),
+                            **execution_context(execution),
                         },
                     )
             if result_future is not None and result_future.done():
@@ -620,7 +713,7 @@ class _RosExecutionAdapter:
                     status,
                     presentation.task_ref,
                     str(result.error_code),
-                    str(result.message),
+                    short_message(result.message),
                     _program_terminal_detail(result),
                 )
             time.sleep(0.02)
@@ -880,6 +973,7 @@ class IncubationAgentNode(Node):
                 clarification_ttl_sec=float(self.get_parameter("clarification_ttl_sec").value),
             ),
             robot_scope=str(self.get_parameter("robot_scope").value),
+            direct_commands=_direct_commands_from_config(str(self.get_parameter("planner_config_json").value)),
         )
         self._request_subscription = self.create_subscription(
             String,
@@ -1067,6 +1161,55 @@ def main(args: list[str] | None = None) -> None:
 __all__ = ["IncubationAgentNode", "main"]
 
 
+def _direct_commands_from_config(raw: str) -> dict[str, str]:
+    """Read the planner's utterance -> skill shortcuts, tolerating a bad value.
+
+    A malformed mapping must not stop the node: losing the shortcut costs a
+    model call, while refusing to start costs the robot.
+    """
+    try:
+        config = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    commands = config.get("direct_commands") if isinstance(config, dict) else None
+    if not isinstance(commands, dict):
+        return {}
+    return {
+        str(phrase): str(skill)
+        for phrase, skill in commands.items()
+        if isinstance(phrase, str) and phrase.strip() and isinstance(skill, str) and skill.strip()
+    }
+
+
+def _log_planner_call(metrics: dict) -> None:
+    """Record what one planning turn cost.
+
+    The whole user-visible planning delay is this single non-streaming call,
+    and the model's own accounting was being discarded. Without it there is no
+    way to separate a slow network from a model that is still thinking, which
+    is the first question when the robot answers late.
+    """
+    logging.getLogger("ibrobot_agent.planner").info(
+        "planner call status=%s timing_ms=%s prompt_tokens=%s completion_tokens=%s reasoning_chars=%s",
+        metrics.get("status"),
+        metrics.get("timing_ms"),
+        metrics.get("prompt_tokens"),
+        metrics.get("completion_tokens"),
+        metrics.get("reasoning_chars"),
+    )
+
+
+def planner_prompt_builder(*, request, context, catalog):
+    """Build the planner prompt from the trimmed catalog view.
+
+    Only the prompt is trimmed. Workflow validation and the read-only answers
+    keep the full catalog, which stays the authority on what the robot can do.
+    """
+    from robot_skill_cli.catalog import planner_catalog_view
+
+    return build_planner_messages(request=request, context=context, catalog=planner_catalog_view(catalog))
+
+
 def _planner_from_config(raw: str):
     try:
         config = json.loads(raw)
@@ -1098,14 +1241,37 @@ def _planner_from_config(raw: str):
     )
     from ibrobot_agent.contracts import PlannerIdentity
 
+    enable_thinking = config.get("enable_thinking", True)
+    if not isinstance(enable_thinking, bool):
+        raise ValueError("Agent planner enable_thinking must be a boolean")
+    max_tokens = config.get("max_tokens")
+    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0):
+        raise ValueError("Agent planner max_tokens must be a positive integer when set")
+    extra_body = config.get("extra_body", {})
+    if not isinstance(extra_body, dict):
+        raise ValueError("Agent planner extra_body must be a mapping")
+    catalog_view = str(config.get("catalog_view", "planner"))
+    if catalog_view not in {"planner", "full"}:
+        raise ValueError("Agent planner catalog_view must be 'planner' or 'full'")
+    stream = config.get("stream", False)
+    if not isinstance(stream, bool):
+        raise ValueError("Agent planner stream must be a boolean")
+    if stream and str(config.get("api_protocol", "chat_completions")) == "responses":
+        raise ValueError("Agent planner stream requires api_protocol chat_completions")
+
     return PlannerAdapter(
         client,
-        prompt_builder=build_planner_messages,
+        prompt_builder=build_planner_messages if catalog_view == "full" else planner_prompt_builder,
+        enable_thinking=enable_thinking,
+        max_tokens=max_tokens,
+        extra_body=extra_body,
+        observer=_log_planner_call,
+        stream=stream,
         planner_identity=PlannerIdentity(
             route="vlm",
             returned_model=config["model"],
             protocol=str(config.get("api_protocol", "chat_completions")),
-            prompt_version="agent-planner-v2",
+            prompt_version="agent-planner-v3",
             schema_version="1",
             config_digest=sha256_text(to_canonical_json(config)),
         ),

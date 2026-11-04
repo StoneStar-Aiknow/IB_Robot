@@ -109,6 +109,12 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             "max_response_audio_bytes",
         }
     }
+    if "num_steps" in config:
+        # Flow-matching steps: ~98% of synthesis time and linear in the count.
+        # There is no default here on purpose -- unset means the value the
+        # digest-verified bundle ships with (4 on the Ascend 310P bundle, 8 on
+        # the host ONNX one), and a profile opts into fewer.
+        runtime_options["num_steps"] = int(config["num_steps"])
     node_params = {
         "instance_id": str(config.get("instance_id", "voice_tts")),
         "bundle_path": bundle_path,
@@ -138,6 +144,9 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             for field, parameter in (("write_chunk_ms", "chunk_ms"), ("prebuffer_ms", "prebuffer_ms"))
             if field in audio_output
         }
+        # The publisher's QoS is the speaker's too: the runtime declares best_effort on its
+        # subscription, so publishing RELIABLE (the rclpy default) over-specifies the transport.
+        speaker_qos = audio_output.get("qos")
     else:
         audio_io = robot_config.get("audio_io", {})
         if not is_audio_io_enabled(audio_io):
@@ -146,6 +155,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
         playback_channels = int(audio_io.get("playback_channels", 1))
         speaker_pacing = {}
+        speaker_qos = None
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
     return [
         Node(
@@ -175,6 +185,9 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     "audio_topic": audio_topic,
                     "playback_sample_rate": playback_sample_rate,
                     "playback_channels": playback_channels,
+                    # Empty keeps the node's rclpy default (RELIABLE, depth 10). A launch parameter
+                    # cannot carry a mapping, so the bound profile travels as JSON.
+                    "audio_qos_json": json.dumps(speaker_qos, sort_keys=True) if speaker_qos else "",
                     "resample_to_playback_rate": bool(config.get("resample_to_playback_rate", False)),
                     # Empty keeps the node's AudioData default; robot_config checks that an
                     # explicit type matches the bound speaker.

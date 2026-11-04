@@ -26,6 +26,14 @@ const SPAN_ANALYSIS_MODES: SpanAnalysisMode[] = ["call-tree", "request", "aggreg
 const COMPARISON_METRIC = /^[A-Za-z_][A-Za-z0-9_.-]*_ms$/;
 
 export interface ProfilerRouteState {
+  sourceId?: string;
+  sourceVersion?: string;
+  requestOffset?: number;
+  requestSortBy?: string;
+  requestDescending?: boolean;
+  requestFilter?: string;
+  recordOffset?: number;
+  recordName?: string;
   activeTab: DetailTab;
   requestId: string;
   componentId: string;
@@ -39,6 +47,7 @@ export interface ProfilerRouteState {
   comparisonRelativeThreshold: number;
   comparisonAbsoluteThresholdMs: number;
   comparisonMetric: string;
+  comparisonResultId?: string;
 }
 
 function value(input: unknown): string {
@@ -61,6 +70,14 @@ export function parseProfilerRoute(query: Record<string, unknown>): ProfilerRout
   const statistic = value(query.statistic) as ComparisonStatistic;
   const comparisonMetric = value(query.comparison_metric).trim();
   return {
+    sourceId: value(query.source),
+    sourceVersion: value(query.source_version),
+    requestOffset: Math.min(10_000_000, Math.floor(nonNegativeNumber(query.request_offset, 0))),
+    requestSortBy: ["total_ms", "inference_ms", "preprocess_ms", "postprocess_ms", "queue_refill_ms"].includes(value(query.request_sort)) ? value(query.request_sort) : "total_ms",
+    requestDescending: value(query.request_order) !== "asc",
+    requestFilter: value(query.request_filter ?? (tab === "requests" ? query.q : "")).slice(0, 512),
+    recordOffset: Math.min(10_000_000, Math.floor(nonNegativeNumber(query.record_offset, 0))),
+    recordName: value(query.record_name).slice(0, 512),
     activeTab: DETAIL_TABS.includes(tab) ? tab : "summary",
     requestId: value(query.request),
     componentId: value(query.component),
@@ -74,11 +91,22 @@ export function parseProfilerRoute(query: Record<string, unknown>): ProfilerRout
     comparisonRelativeThreshold: nonNegativeNumber(query.relative_threshold, 10),
     comparisonAbsoluteThresholdMs: nonNegativeNumber(query.absolute_threshold_ms, 1),
     comparisonMetric: COMPARISON_METRIC.test(comparisonMetric) ? comparisonMetric : "",
+    comparisonResultId: value(query.comparison_result).slice(0, 128),
   };
 }
 
 export function buildProfilerQuery(state: ProfilerRouteState): Record<string, string> {
   const query: Record<string, string> = {};
+  if (state.sourceId) query.source = state.sourceId;
+  if (state.sourceVersion) query.source_version = state.sourceVersion;
+  if (state.requestOffset) query.request_offset = String(state.requestOffset);
+  if (state.requestSortBy && state.requestSortBy !== "total_ms") query.request_sort = state.requestSortBy;
+  if (state.requestDescending === false) query.request_order = "asc";
+  if (state.requestFilter) query.request_filter = state.requestFilter;
+  if (["events", "spans", "flows"].includes(state.activeTab)) {
+    if (state.recordOffset) query.record_offset = String(state.recordOffset);
+    if (state.recordName) query.record_name = state.recordName;
+  }
   if (state.activeTab !== "summary") query.tab = state.activeTab;
   if (state.requestId) query.request = state.requestId;
   if (state.componentId) query.component = state.componentId;
@@ -92,5 +120,6 @@ export function buildProfilerQuery(state: ProfilerRouteState): Record<string, st
   if (state.comparisonRelativeThreshold !== 10) query.relative_threshold = String(state.comparisonRelativeThreshold);
   if (state.comparisonAbsoluteThresholdMs !== 1) query.absolute_threshold_ms = String(state.comparisonAbsoluteThresholdMs);
   if (state.comparisonMetric) query.comparison_metric = state.comparisonMetric;
+  if (state.comparisonResultId) query.comparison_result = state.comparisonResultId;
   return query;
 }

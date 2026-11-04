@@ -1,7 +1,7 @@
 import { createPinia, setActivePinia } from "pinia";
 import { nextTick } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { tracingApi } from "../src/api/client";
+import { ApiError, tracingApi } from "../src/api/client";
 import type { AnalysisSummary, ComparisonJob, ComparisonResult, TraceSource } from "../src/api/types";
 import { useProfilerStore } from "../src/stores/profiler";
 
@@ -126,6 +126,86 @@ function prepareComparisonStore() {
 describe("comparison store", () => {
   beforeEach(() => setActivePinia(createPinia()));
   afterEach(() => vi.restoreAllMocks());
+
+  it("preserves the result and shareable ID when deletion fails", async () => {
+    vi.spyOn(tracingApi, "deleteComparison").mockRejectedValue(new Error("temporary delete failure"));
+    const store = prepareComparisonStore();
+    store.comparisonResult = result();
+    store.comparisonResultId = "comparison-1";
+    store.comparisonState = "ready";
+    await expect(store.deleteComparisonResult()).rejects.toThrow("temporary delete failure");
+    expect(store.comparisonResult).toEqual(result());
+    expect(store.comparisonResultId).toBe("comparison-1");
+    expect(store.comparisonState).toBe("ready");
+  });
+
+  it("does not clear a replacement result when an older deletion completes", async () => {
+    const pending = deferred<void>();
+    vi.spyOn(tracingApi, "deleteComparison").mockReturnValue(pending.promise);
+    const store = prepareComparisonStore();
+    store.comparisonResult = result();
+    store.comparisonResultId = "comparison-1";
+    const deletion = store.deleteComparisonResult();
+    store.clearComparison();
+    const replacement = { ...result(), id: "comparison-2" };
+    store.comparisonResult = replacement;
+    store.comparisonResultId = replacement.id;
+    store.comparisonState = "ready";
+    pending.resolve();
+    expect(await deletion).toBe(false);
+    expect(store.comparisonResult).toEqual(replacement);
+  });
+
+  it("reopens immutable evidence without executing again or replacing pending controls", async () => {
+    const fetch = vi.spyOn(tracingApi, "comparison").mockResolvedValue(result());
+    const create = vi.spyOn(tracingApi, "createComparison");
+    const store = prepareComparisonStore();
+    store.comparisonStatistic = "mean";
+    store.comparisonRelativeThreshold = 20;
+    await store.openComparisonResult("comparison-1");
+    expect(store.comparisonResultId).toBe("comparison-1");
+    expect(store.comparisonResult?.statistic).toBe("p95");
+    expect(store.comparisonStatistic).toBe("mean");
+    expect(store.comparisonRelativeThreshold).toBe(20);
+    expect(store.comparisonState).toBe("ready");
+    await store.openComparisonResult("comparison-1");
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a saved result belonging to another candidate", async () => {
+    vi.spyOn(tracingApi, "comparison").mockResolvedValue({ ...result(), candidate_analysis_id: "other-analysis" });
+    const store = prepareComparisonStore();
+    await store.openComparisonResult("comparison-1");
+    expect(store.comparisonResult).toBeNull();
+    expect(store.comparisonState).toBe("error");
+    expect(store.comparisonError).toContain("不属于当前候选分析");
+  });
+
+  it("keeps an expired result ID and controls for explicit recovery", async () => {
+    vi.spyOn(tracingApi, "comparison").mockRejectedValue(new ApiError("not found", 404));
+    const create = vi.spyOn(tracingApi, "createComparison");
+    const store = prepareComparisonStore();
+    store.comparisonRelativeThreshold = 11;
+    await store.openComparisonResult("expired");
+    expect(store.comparisonResultId).toBe("expired");
+    expect(store.comparisonRelativeThreshold).toBe(11);
+    expect(store.comparisonError).toContain("参数已保留");
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late saved result after another result is opened", async () => {
+    const pending = deferred<ComparisonResult>();
+    const fresh = { ...result(), id: "comparison-2" };
+    vi.spyOn(tracingApi, "comparison").mockReturnValueOnce(pending.promise).mockResolvedValueOnce(fresh);
+    const store = prepareComparisonStore();
+    const old = store.openComparisonResult("comparison-1");
+    await store.openComparisonResult("comparison-2");
+    pending.resolve(result());
+    await old;
+    expect(store.comparisonResult).toEqual(fresh);
+    expect(store.comparisonResultId).toBe("comparison-2");
+  });
 
   it("excludes the current analysis source from baseline choices", () => {
     const store = prepareComparisonStore();

@@ -26,6 +26,21 @@ joints: ["1", "2", "3", "4", "5", "6"]
 arm_joints: ["1", "2", "3", "4", "5"]
 gripper_joints: ["6"]
 
+# Conformance start pose (issue #194, upgrade-mujoco D9): the robot-agnostic
+# conformance suite resets the arm joints to these values before every
+# arm-moving motion test. All-zero keeps every conformance target above the
+# MuJoCo mount plane — FK margins from zero on the composed empty model:
+# stream +0.3 -> +3.9 cm, stream hold +0.2 -> +10.2 cm, trajectory +0.25 on
+# joints 1-2 -> +16.2 cm, move_to_joint +0.2 on joints 1-2 -> +17.6 cm
+# (from the profile HOME the stream targets dip -2.7 / -1.4 cm below it).
+conformance:
+  start_positions:
+    "1": 0.0
+    "2": 0.0
+    "3": 0.0
+    "4": 0.0
+    "5": 0.0
+
 # Semantic HOME is not an actuator startup command.
 home_positions:
   "1": 0.0

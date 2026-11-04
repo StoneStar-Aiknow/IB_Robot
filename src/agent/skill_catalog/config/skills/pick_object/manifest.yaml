@@ -40,5 +40,31 @@ capability:
     - target_name
   recovery_policy: ask_user
 implementations:
+  aimdk_x2_grasp: implementations/aimdk_x2_grasp.yaml
   lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
   lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
+description_variants:
+  # The X2 puts the object back where it was after holding it lifted; it has
+  # no container to transport it to.
+  aimdk_x2_grasp:
+    summary: >-
+      Detect and grasp the requested object with the selected hand, lift and hold it, then put it back.
+      The X2 selects the arm from the object's side unless its configuration forces one arm.
+      Use a short English object phrase for target_name, such as "an apple";
+      translate Chinese object names and preserve attributes such as color.
+    category: manipulation
+    when_to_use:
+    - pick up a visible object identified by a text query
+    aliases_zh:
+    - 抓取物体
+    - 拿起物体
+    aliases_en:
+    - pick object
+    - grasp object
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 40.0
+    requires_motion_params: false
