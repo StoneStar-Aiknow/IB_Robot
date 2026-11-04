@@ -57,10 +57,6 @@ _LAZY_EXPORTS = {
         "robot_config.launch_builders",
         "generate_virtual_camera_relays",
     ),
-    "generate_gazebo_nodes": (
-        "robot_config.launch_builders",
-        "generate_gazebo_nodes",
-    ),
     "validate_joint_config": (
         "robot_config.launch_builders",
         "validate_joint_config",
@@ -113,7 +109,6 @@ __all__ = [
     "generate_camera_nodes",
     "generate_tf_nodes",
     "generate_virtual_camera_relays",
-    "generate_gazebo_nodes",
     "validate_joint_config",
     # Utilities
     "resolve_ros_path",

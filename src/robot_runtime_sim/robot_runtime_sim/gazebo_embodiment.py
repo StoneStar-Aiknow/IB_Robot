@@ -15,13 +15,10 @@ from pathlib import Path
 from typing import Any
 
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import EmitEvent, IncludeLaunchDescription, RegisterEventHandler
+from launch.actions import EmitEvent, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 from robot_runtime.interface_description import platform_peripherals
 from robot_runtime.launch_support import (
@@ -51,6 +48,7 @@ from robot_runtime_sim.gazebo import (
     lidar_imu_sensor_urdf,
 )
 from robot_runtime_sim.sim_nodes import simulated_joint_current_actions
+from robot_runtime_sim.world import gazebo_world_actions
 
 #: The provider-alone minimal empty world (physics + user commands + scene
 #: broadcaster + the sensors system so runtime-owned cameras render, a light
@@ -150,8 +148,9 @@ def gazebo_embodiment_actions(
     rendered description (when this call renders it), the bridge entries and
     the static transforms for sensor frames absent from the rendered model
     (D5 inventory-first). robot_state_publisher runs on sim time; a minimal
-    empty world plus ``/clock`` bridge when no world is supplied (standalone
-    verification); ``create`` waits for the world clock, then spawns the
+    empty world plus ``/clock`` bridge through the shared launcher (D6) when
+    no world is supplied (standalone verification); ``create`` waits for the
+    world clock, then spawns the
     entity at the given pose (including yaw); controller spawners target the
     in-simulator controller manager after ``create`` exits; the facade and
     the simulated joint-current publisher complete the embodiment. The world,
@@ -193,26 +192,8 @@ def gazebo_embodiment_actions(
     if not world_name:
         # Standalone: bring a minimal empty world so the provider is verifiable
         # in isolation; the world's clock is bridged here because nobody else
-        # owns it. IBROBOT_GAZEBO_HEADLESS=1 mirrors the generic headless mode.
-        world_file = _empty_world_path()
-        headless = "-s --headless-rendering " if os.environ.get("IBROBOT_GAZEBO_HEADLESS", "0") == "1" else ""
-        gz_args = f"{headless}-r {world_file}"
-        actions.extend(
-            [
-                IncludeLaunchDescription(
-                    PythonLaunchDescriptionSource(
-                        PathJoinSubstitution([FindPackageShare("ros_gz_sim"), "launch", "gz_sim.launch.py"])
-                    ),
-                    launch_arguments={"gz_args": gz_args}.items(),
-                ),
-                Node(
-                    package="ros_gz_bridge",
-                    executable="parameter_bridge",
-                    arguments=["/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
-                    output="screen",
-                ),
-            ]
-        )
+        # owns it (the shared launcher honours IBROBOT_GAZEBO_HEADLESS).
+        actions.extend(gazebo_world_actions(_empty_world_path(), _EMPTY_WORLD_NAME))
         world_name = _EMPTY_WORLD_NAME
 
     clock_waiter = Node(
@@ -289,9 +270,11 @@ def gazebo_embodiment_actions(
     ]
     sensor_entries = camera_entries + lidar_imu_entries
     if sensor_entries:
-        actions.append(
-            bridge_config_node(sensor_entries, Path(tempfile.gettempdir()) / "ibrobot_runtime_sensor_bridge.yaml")
-        )
+        # One unique config per construction (D9): concurrent launches on
+        # different domains or worktrees must not overwrite each other's file.
+        fd, sensor_bridge_path = tempfile.mkstemp(prefix="ibrobot_runtime_sensor_bridge_", suffix=".yaml")
+        os.close(fd)
+        actions.append(bridge_config_node(sensor_entries, sensor_bridge_path))
     # The finite-point filter serves the advertised cloud endpoints of the
     # 3D lidars (D5: the bridge hands the raw gz cloud to the internal
     # topic, the filter republishes the finite points on the endpoint); the

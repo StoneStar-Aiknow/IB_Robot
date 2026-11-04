@@ -188,7 +188,7 @@ def generate_runtime_provider_actions(
         # means the provider starts its own minimal empty world (Gazebo) or
         # composes the shared ``empty`` scene (MuJoCo).
         startup = simulation_startup
-        world = str(getattr(startup, "world_name", "") or getattr(startup, "scene_name", "") or "")
+        world = str(getattr(startup, "world", "") or "")
         spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)
         include_arguments.update(
             {

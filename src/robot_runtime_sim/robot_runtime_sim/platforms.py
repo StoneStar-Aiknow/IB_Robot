@@ -58,8 +58,8 @@ GAZEBO_SPEC = SimPlatform(
     name="gazebo",
     package="robot_runtime_sim",
     embodiment="robot_runtime_sim.gazebo_embodiment:GAZEBO_EMBODIMENT",
-    world=None,
-    scene_task=None,
+    world="robot_runtime_sim.world_hooks:gazebo_start_world",
+    scene_task="robot_runtime_sim.scene_task:gazebo_scene_task_transport",
     sensor_traits=GAZEBO_SENSOR_TRAITS,
 )
 
@@ -67,8 +67,8 @@ MUJOCO_SPEC = SimPlatform(
     name="mujoco",
     package="robot_runtime_sim",
     embodiment="robot_runtime_sim.mujoco_embodiment:MUJOCO_EMBODIMENT",
-    world=None,
-    scene_task=None,
+    world="robot_runtime_sim.world_hooks:mujoco_start_world",
+    scene_task="robot_runtime_sim.scene_task:mujoco_scene_task_transport",
     sensor_traits=MUJOCO_SENSOR_TRAITS,
 )
 

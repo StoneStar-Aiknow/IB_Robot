@@ -13,6 +13,7 @@ IB_Robot/
 │   ├── task_dispatch/      # 任务调度
 │   ├── robot_teleop/       # 遥操作控制
 │   ├── robot_runtime/      # 机器人运行时契约（状态/能力/接口描述）
+│   ├── robot_runtime_sim/  # 仿真平台提供方（Gazebo/MuJoCo spec、embodiment、仿真专用节点）
 │   ├── robot_navigation/   # 导航
 │   ├── robots/so101/       # SO-101 运行时套件（sdk/hardware/description/motion/robot）
 │   ├── robots/feetech/     # Feetech 舵机 SDK

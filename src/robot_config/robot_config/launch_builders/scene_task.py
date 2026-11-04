@@ -12,13 +12,15 @@ no task, and the omission is logged.
 The node parameters come from the bound effective config: the trajectory
 endpoints and joint names are read from the bound interface description
 (``joint.trajectory_arm`` / ``joint.trajectory_gripper``), never guessed from
-controller names. On Gazebo the builder also starts the single
-``ros_gz_bridge`` the backend needs (set_pose service bridge plus the dynamic
-pose stream remapped to ``/sim/<scene>/object_poses`` — the spike T0 choice;
-the bridge is the only transport, there is no CLI fallback).
-On MuJoCo the builder adds no transport: the runtime provider configures the
-FreeJointStatePublisherPlugin for the scene's dynamic bodies and the backend
-places through ``ResetWorld`` state overrides (issue #195).
+controller names. The platform-specific transport is the selected platform's
+``SimPlatform.scene_task`` hook (sim-platform-registry D5): Gazebo's starts the
+single ``ros_gz_bridge`` the backend needs (set_pose service bridge plus the
+dynamic pose stream remapped to ``/sim/<scene>/object_poses``) and writes the
+``world_name`` parameter; MuJoCo's adds nothing (the runtime provider
+configures the FreeJointStatePublisherPlugin for the scene's dynamic bodies
+and the backend places through ``ResetWorld`` state overrides, issue #195).
+A platform with ``scene_task=None`` offers no scene tasks: the task is not
+started and an info line is logged.
 """
 
 from typing import Any
@@ -118,33 +120,23 @@ def build_scene_task(context: LaunchBuildContext) -> BuildResult:
         "gripper_joint_names": [str(j) for j in interfaces[_TRAJECTORY_GRIPPER_INTERFACE].get("joint_names", [])],
     }
 
-    actions: list[Any] = []
+    # The selected platform's scene-task transport owns everything the task
+    # node needs around itself (bridges, platform parameters). A platform
+    # with scene_task=None offers no scene tasks at all.
+    from robot_runtime.sim_platforms import SimPlatformError, get_sim_platform
 
-    if context.sim_platform == "gazebo":
-        world_name = (startup.world_name if startup is not None else "") or str(
-            robot_config.get("gazebo_world_name", "demo")
-        )
-        parameters["world_name"] = world_name
-        # One bridge carries both channels (D8): the set_pose service bridge
-        # the backend places objects through, and the dynamic pose stream the
-        # evaluation reads, remapped to the scene-namespaced topic.
-        actions.append(
-            Node(
-                package="ros_gz_bridge",
-                executable="parameter_bridge",
-                name="scene_task_object_bridge",
-                arguments=[
-                    f"/world/{world_name}/set_pose@ros_gz_interfaces/srv/SetEntityPose",
-                    f"/world/{world_name}/dynamic_pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V",
-                ],
-                remappings=[(f"/world/{world_name}/dynamic_pose/info", f"/sim/{scene}/object_poses")],
-                output="screen",
-            )
-        )
-    # On MuJoCo the task needs no extra transport: the runtime provider
-    # configures the FreeJointStatePublisherPlugin for the scene's dynamic
-    # bodies (issue #195) and the backend places through ResetWorld state
-    # overrides — both endpoints resolve the shared topic/layout themselves.
+    try:
+        spec = get_sim_platform(context.sim_platform)
+    except SimPlatformError as e:
+        logger.warning(f"scene task not started: {e}")
+        return BuildResult()
+    if not spec.scene_task:
+        logger.info(f"scene task not started: platform '{context.sim_platform}' offers no scene-task transport")
+        return BuildResult()
+    from robot_config.launch_registry.registry import resolve_builder_factory
+
+    transport = resolve_builder_factory(spec.scene_task)
+    actions: list[Any] = list(transport(scene, startup, robot_config, parameters))
 
     actions.append(
         Node(

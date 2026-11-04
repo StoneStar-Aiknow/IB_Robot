@@ -64,9 +64,8 @@ def _build_cameras_urdf_from_yaml(
     Thin re-import wrapper (openspec ``so101-gazebo-runtime-transport`` D6.1):
     the robot-agnostic builder lives in ``robot_runtime_sim.gazebo`` and is shared
     with the runtime providers; generic provider-less Gazebo callers keep the
-    same behaviour through this call site (preset defaults via
-    ``use_default_transform``, spawn-offset compensation for world-parented
-    cameras; the yaw component is 0 on this path).
+    same behaviour through this call site (spawn-offset compensation for
+    world-parented cameras; the yaw component is 0 on this path).
 
     命名约定（与 sim_peripheral_bridge.py 的 bridge 路径对齐）：
     - URDF link 名     = YAML frame_id（如 camera_top_frame）
@@ -82,8 +81,8 @@ def _build_cameras_urdf_from_yaml(
     生成逻辑完全相同，区别仅在于 parent link 的值。
     MuJoCo 使用的 <gazebo reference> 块会被忽略（不影响 MJCF 解析）。
 
-    当 use_default_transform=True 时，从 camera_presets 读取平台专属默认位姿
-    （用户保存的 override 优先）。
+    相机默认位姿来自外设自身的 ``simulation.<platform>.transform``（+ ``fovy``），
+    用户保存的 override 优先（sim-platform-registry D9：preset 表已删除）。
 
     ``parent_frame="world"`` 特殊处理：URDF 的 ``world`` link 虽然名字叫 world
     但实际是模型根，在 Gazebo 里会随机器人 spawn 位置移动。因此对此类
@@ -98,14 +97,12 @@ def _build_cameras_urdf_from_yaml(
         model_spawn_offset: 机器人模型在 Gazebo 世界坐标的 spawn 位置
             (x, y, z) —— 用于修正 ``parent_frame="world"`` 的相机位姿。
     """
-    from robot_config.launch_builders.sim_backend.camera_presets import get_preset
     from robot_runtime_sim.gazebo import camera_sensor_urdf
 
     return camera_sensor_urdf(
         peripherals,
         platform=platform,
         spawn_pose=(*model_spawn_offset, 0.0),
-        default_pose_loader=get_preset,
     )
 
 

@@ -624,27 +624,6 @@ def test_legacy_camera_urdf_keeps_the_generic_shape():
     assert f"<horizontal_fov>{2.0 * math.atan(math.tan(math.radians(47) / 2) * 640 / 480):.4f}</horizontal_fov>" in urdf
 
 
-def test_preset_loader_keeps_the_generic_use_default_transform_path():
-    periph = {
-        "type": "camera",
-        "name": "front",
-        "driver": "opencv",
-        "frame_id": "camera_front_frame",
-        "use_default_transform": True,
-        "transform": {"parent_frame": "base", "x": 9.0},
-    }
-
-    def loader(platform, name):
-        return {"parent_frame": "world", "x": 0.5, "y": 0.1, "z": 0.2, "yaw": 0.3, "fovy": 55}
-
-    transform, fovy = resolve_camera_pose(periph, "gazebo", default_pose_loader=loader)
-    assert transform["parent_frame"] == "world" and transform["x"] == 0.5
-    assert fovy == 55
-    # without the loader flag the explicit transform applies
-    plain, _ = resolve_camera_pose({**periph, "use_default_transform": False}, "gazebo")
-    assert plain["x"] == 9.0
-
-
 def test_saved_override_takes_precedence_over_the_declared_default(tmp_path, monkeypatch):
     home = tmp_path / "home"
     (home / ".ros" / "ibrobot" / "sim_camera_overrides").mkdir(parents=True)
@@ -1127,7 +1106,7 @@ def test_gazebo_embodiment_composes_the_sensor_bridge_and_tf(tmp_path):
     assert "/camera/top/image_raw" in topics
     # the raw gz streams are internal; the filters serve the endpoints
     assert "/mid360_lidar/raw" in topics and "/mid360_imu/raw" in topics
-    assert Path(_params(bridge)["config_file"]).name == "ibrobot_runtime_sensor_bridge.yaml"
+    assert Path(_params(bridge)["config_file"]).name.startswith("ibrobot_runtime_sensor_bridge_")
     # the finite filter: raw in, advertised endpoint out (D5)
     filter_node = _by_executable(nodes, "finite_cloud_filter")
     filter_params = _params(filter_node)

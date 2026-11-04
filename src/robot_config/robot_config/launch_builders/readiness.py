@@ -75,9 +75,11 @@ def controller_readiness_barrier(deferred_spawners, readiness_waiter):
 def resolve_controller_startup_timeout(robot_config: dict, use_sim: bool, sim_platform: str = "") -> float:
     """Resolve controller startup timeout from robot YAML.
 
-    The mapping may define a ``gazebo`` tier for physics transports
-    (runtime-simulation-transport D7: world boot + entity spawn + controllers
-    need more headroom than the SDK transport); it falls back to ``sim``.
+    The mapping may define per-tier timeouts (sim-platform-registry D5):
+    hardware resolves ``hardware`` → ``default``; ``sdk`` resolves ``sim`` →
+    ``default``; a physics selection ``<p>`` resolves ``<p>`` → ``sim`` →
+    ``default`` (today only ``gazebo`` is configured, so behaviour is
+    unchanged). No registry access: the platform name alone picks the tier.
     """
     configured_timeout = robot_config.get("controller_startup_timeout")
     if configured_timeout is None:
@@ -85,13 +87,16 @@ def resolve_controller_startup_timeout(robot_config: dict, use_sim: bool, sim_pl
 
     timeout_value = configured_timeout
     if isinstance(configured_timeout, dict):
-        profile_key = "sim" if use_sim else "hardware"
-        if use_sim and str(sim_platform).lower() == "gazebo":
-            timeout_value = configured_timeout.get("gazebo")
+        platform = str(sim_platform or "").strip().lower()
+        if not use_sim:
+            timeout_value = configured_timeout.get("hardware")
+        elif platform == "sdk" or not platform:
+            timeout_value = configured_timeout.get("sim")
+        else:
+            # a physics selection: its own tier first, then the shared sim tier
+            timeout_value = configured_timeout.get(platform)
             if timeout_value is None:
                 timeout_value = configured_timeout.get("sim")
-        else:
-            timeout_value = configured_timeout.get(profile_key)
         if timeout_value is None:
             timeout_value = configured_timeout.get("default")
 

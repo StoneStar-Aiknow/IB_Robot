@@ -34,13 +34,20 @@ def _provider_config(**simulation):
 # ---------------------------------------------------------------------------
 
 
-def test_shared_predicate_accepts_provider_platforms_and_names_everything_otherwise():
+def test_shared_predicate_accepts_valid_declarations_and_rejects_mock_and_malformed():
+    # sdk and every well-formed identifier are loadable declarations (D2:
+    # an unknown name only needs its plugin once it is the effective
+    # selection — checked in preparation, not at load time)
     assert provider_sim_platform_error("sdk", "so101_robot") == ""
     assert provider_sim_platform_error("gazebo", "so101_robot") == ""
     assert provider_sim_platform_error("mujoco", "so101_robot") == ""
-    for platform in ("mock", "webots"):
-        error = provider_sim_platform_error(platform, "so101_robot")
-        assert platform in error and "so101_robot" in error and "gazebo" in error
+    assert provider_sim_platform_error("webots", "so101_robot") == ""
+    # the provider-less mock backend is never interchangeable with a provider
+    error = provider_sim_platform_error("mock", "so101_robot")
+    assert "mock" in error and "so101_robot" in error
+    # malformed names are rejected at load time
+    error = provider_sim_platform_error("gazebo!", "so101_robot")
+    assert "gazebo!" in error and "so101_robot" in error
 
 
 def test_providerless_predicate_rejects_mujoco_only():
@@ -351,7 +358,7 @@ def test_rtp_distributed_launches_the_provider_on_gazebo_pick_banana(monkeypatch
 
     world = next(i for i in includes if "gz_args" in arguments(i))
     provider = next(i for i in includes if "profile" in arguments(i))
-    assert "sim_models_pick_banana.world" in arguments(world)["gz_args"]
+    assert "sim_models_pick_banana_" in arguments(world)["gz_args"]
     provider_args = arguments(provider)
     assert provider_args["use_sim"] == "true"
     assert provider_args["sim_platform"] == "gazebo"
@@ -398,7 +405,7 @@ def test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias():
 def test_gazebo_emits_platform_world_and_full_spawn_pose_only():
     startup = SimulationStartup(
         entity_action=None,
-        world_name="demo",
+        world="demo",
         spawn_pose=(0.5, 0.3, -0.03, 1.25),
     )
     arguments = _include_arguments(
@@ -436,6 +443,10 @@ def test_gazebo_readiness_timeout_uses_the_policy_with_a_gazebo_tier():
 
 # ---------------------------------------------------------------------------
 # so101-mujoco-runtime-platform D3/D7: the generic world-side hand-off
+# (MuJoCo has no sim_backend adapter since sim-platform-registry D8; the
+# world side is resolved through the platform's world hook, covered by
+# robot_runtime_sim/test/test_world_hooks.py, and the scene/spawn precedence
+# by sim_models/test/test_scene_compiler.py)
 # ---------------------------------------------------------------------------
 
 
@@ -454,39 +465,13 @@ def _mujoco_include_arguments(robot_config, *, sim_platform="mujoco", simulation
     return {text(key): text(value) for key, value in include.launch_arguments}
 
 
-def test_mujoco_adapter_through_the_real_factory_resolves_world_only():
-    from robot_config.launch_builders.sim_backend import get_sim_backend
-
-    adapter = get_sim_backend("mujoco")
-    config = {"simulation": {"scene": "pick_banana", "robot_spawn": {"x": 1.0, "y": 2.0, "z": -0.03, "yaw": 0.5}}}
-    actions, scene_name, spawn_pose = adapter.start_world_only(config)
-    assert actions == []
-    assert scene_name == "pick_banana"
-    assert spawn_pose == (1.0, 2.0, -0.03, 0.5)
-    # without robot_spawn the scene layout's spawn applies
-    actions, scene_name, spawn_pose = adapter.start_world_only({"simulation": {"scene": "pick_banana"}})
-    assert actions == []
-    assert spawn_pose == (0.0, 0.30, -0.03, 0.0)
-    # no scene: the robot model runs alone
-    actions, scene_name, spawn_pose = adapter.start_world_only({"simulation": {}})
-    assert scene_name == "" and spawn_pose == (0.0, 0.0, 0.0, 0.0)
-
-
-def test_mujoco_adapter_start_backend_raises_the_provider_error():
-    from robot_config.launch_builders.sim_backend import get_sim_backend
-
-    adapter = get_sim_backend("mujoco")
-    with pytest.raises(RuntimeError, match=r"mujoco.*runtime provider"):
-        adapter.start_backend({"simulation": {"platform": "mujoco"}})
-
-
 def test_mujoco_hand_off_passes_scene_and_spawn_by_name_only():
     from robot_config.launch_registry.registry import SimulationStartup
 
     arguments = _mujoco_include_arguments(
         _provider_config(platform="mujoco"),
         simulation_startup=SimulationStartup(
-            entity_action=None, scene_name="pick_banana", spawn_pose=(0.5, 0.3, -0.03, 1.25)
+            entity_action=None, world="pick_banana", scene_name="pick_banana", spawn_pose=(0.5, 0.3, -0.03, 1.25)
         ),
     )
     assert arguments["use_sim"] == "true"
@@ -538,26 +523,18 @@ def test_mujoco_binding_branch_hands_off_the_resolved_world(
     assert prepared.sim_platform == "mujoco"
 
     world_only_calls = []
-    import robot_config.launch_builders.sim_backend as sim_backend_module
+    import robot_runtime_sim.world_hooks as mujoco_world_hooks
 
-    original_factory = sim_backend_module.get_sim_backend
+    original_start_world = mujoco_world_hooks.mujoco_start_world
 
-    def factory_spy(platform):
-        adapter = original_factory(platform)
-        if platform == "mujoco":
-            original_start_world_only = adapter.start_world_only
+    def spy_start_world(robot_config, *, scene, spawn_pose):
+        world_only_calls.append(scene or None)
+        return original_start_world(robot_config, scene=scene, spawn_pose=spawn_pose)
 
-            def spy_world_only(robot_config):
-                world_only_calls.append(robot_config.get("simulation", {}).get("scene"))
-                return original_start_world_only(robot_config)
-
-            adapter.start_world_only = spy_world_only
-        return adapter
-
-    monkeypatch.setattr(sim_backend_module, "get_sim_backend", factory_spy)
+    monkeypatch.setattr(mujoco_world_hooks, "mujoco_start_world", spy_start_world)
 
     actions = build_prepared_launch(prepared)
-    # the world-only step ran exactly once: the pre-binding bootstrap resolved
+    # the world hook ran exactly once: the pre-binding bootstrap resolved
     # it and the consumer pass reused the pre-seeded SimulationStartup
     assert world_only_calls == [expected_scene or None]
 

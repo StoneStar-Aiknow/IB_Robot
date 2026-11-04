@@ -7,8 +7,8 @@ live in the contract layer and ``robot_config`` re-imports them — provider-les
 generic Gazebo robots keep their existing camera topics, frames and poses
 through the same call sites.
 
-The functions here never import ``robot_config``; robot-specific values (the
-generic preset table) are injected by the caller through ``default_pose_loader``.
+The functions here never import ``robot_config``; the camera default pose comes
+from the peripheral's own ``simulation.<platform>.transform`` (+ ``fovy``).
 
 Simulated lidar and IMU sensors (openspec ``lekiwi-gazebo-runtime-platform``
 D5) join the cameras here: ``lidar_sensor_sdf``/``imu_sensor_sdf`` generate
@@ -97,14 +97,12 @@ def camera_requests_depth(periph: dict) -> bool:
     )
 
 
-def load_camera_override(camera_name: str, *, fallback: dict | None = None) -> dict | None:
+def load_camera_override(camera_name: str) -> dict | None:
     """Load a user-saved Gazebo calibration override for one camera.
 
     Returns None when the override file is absent, unreadable, or still a
     placeholder stub; callers distinguish user-saved calibration from defaults.
     The file format is unchanged from the sim_models camera adjuster.
-    ``fallback`` supplies the parent_frame/fovy defaults for override files
-    that omit them (the generic path passes its preset table entry).
     """
     try:
         override_path = _override_base() / f"{camera_name}.yaml"
@@ -117,44 +115,38 @@ def load_camera_override(camera_name: str, *, fallback: dict | None = None) -> d
         pose_keys = ("x", "y", "z", "roll", "pitch", "yaw")
         if bool(data.get("_is_stub")) or all(float(pose.get(k, 0.0)) == 0.0 for k in pose_keys):
             return None
-        default = fallback or {}
         return {
-            "parent_frame": data.get("parent_frame", default.get("parent_frame", "base")),
+            "parent_frame": data.get("parent_frame", "base"),
             "x": float(pose.get("x", 0.0)),
             "y": float(pose.get("y", 0.0)),
             "z": float(pose.get("z", 0.0)),
             "roll": float(pose.get("roll", 0.0)),
             "pitch": float(pose.get("pitch", 0.0)),
             "yaw": float(pose.get("yaw", 0.0)),
-            "fovy": float(data.get("fovy_deg", default.get("fovy", 60))),
+            "fovy": float(data.get("fovy_deg", 60)),
         }
     except Exception:
         return None
 
 
-def resolve_camera_pose(periph: dict, platform: str = "gazebo", *, default_pose_loader=None) -> tuple[dict, Any]:
+def resolve_camera_pose(periph: dict, platform: str = "gazebo") -> tuple[dict, Any]:
     """Resolve a camera's effective (transform, fovy) for a simulation platform.
 
     Precedence: user override > declared default > explicit transform. The
-    declared default is either the caller's preset table (``use_default_transform``,
-    the generic provider-less mechanism) or the peripheral's own
-    ``simulation.<platform>.transform`` (+ ``fovy``), the runtime-profile
-    mechanism. Overrides apply in Gazebo convention and only on the gazebo
-    platform, exactly as before this change.
+    declared default is the peripheral's own ``simulation.<platform>.transform``
+    (+ ``fovy``), the runtime-profile mechanism. Overrides apply in Gazebo
+    convention and only on the gazebo platform, exactly as before this change.
     """
     name = periph.get("name", "camera")
     transform = dict(periph.get("transform") or {})
     fovy = periph.get("fovy", 60)
     default: dict | None = None
-    if periph.get("use_default_transform", False) and default_pose_loader is not None:
-        default = default_pose_loader(platform, name)
-    if default is None:
-        section = (periph.get("simulation") or {}).get(platform) or {}
-        declared = section.get("transform") if isinstance(section, dict) else None
-        if isinstance(declared, dict) and declared:
-            default = dict(declared)
-            if section.get("fovy") is not None:
-                default["fovy"] = section["fovy"]
+    section = (periph.get("simulation") or {}).get(platform) or {}
+    declared = section.get("transform") if isinstance(section, dict) else None
+    if isinstance(declared, dict) and declared:
+        default = dict(declared)
+        if section.get("fovy") is not None:
+            default["fovy"] = section["fovy"]
     if default is not None:
         override = load_camera_override(name) if platform == "gazebo" else None
         if override is not None:
@@ -516,7 +508,6 @@ def camera_sensor_urdf(
     *,
     platform: str = "gazebo",
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
-    default_pose_loader=None,
     frame_contract: bool = False,
 ) -> str:
     """Camera link/joint/<gazebo><sensor> XML for a peripheral list.
@@ -539,7 +530,7 @@ def camera_sensor_urdf(
             continue
         name = periph["name"]
         frame_id = periph.get("frame_id", f"camera_{name}_frame")
-        transform, cam_fovy = resolve_camera_pose(periph, platform, default_pose_loader=default_pose_loader)
+        transform, cam_fovy = resolve_camera_pose(periph, platform)
         parent = transform.get("parent_frame", "world")
         pose = {key: float(transform.get(key, 0.0)) for key in ("x", "y", "z", "roll", "pitch", "yaw")}
         # The URDF "world" link is model-local (it sits at the spawn pose in

@@ -81,6 +81,12 @@ Public API
   get_scene_layout(scene_name) -> dict
       The parsed layout.yaml of a scene (or {}).
 
+  resolve_robot_spawn(simulation, scene) -> (x, y, z, yaw)
+      The one provider-path spawn-pose rule (D7): simulation.robot_spawn
+      when it is a non-empty mapping (with or without a scene), else the
+      scene layout's robot_spawn, else the origin. Generic launch resolves
+      it once, before any world hook, so every platform shares one rule.
+
   get_scene_task(scene_name) -> dict | None
       The scene's ``task:`` declaration (executable + platforms), or None.
 """
@@ -103,6 +109,11 @@ _PLATFORM_EXT = {
     "gazebo": ".world.template",
     "mujoco": ".xml.template",
 }
+
+
+def scene_template_platforms() -> tuple[str, ...]:
+    """The simulation platforms sim_models ships scene templates for."""
+    return tuple(_PLATFORM_EXT)
 
 
 def _finite_number(value, label: str) -> float:
@@ -316,19 +327,25 @@ def get_gazebo_world_path(scene_name: str) -> Path:
 
     Reads ``{scene_name}.world.template``, replaces ``{{MESHES_DIR}}``
     with the absolute path to the installed ``meshes/`` directory, and
-    writes the result to ``/tmp/sim_models_{scene_name}.world``.
+    writes the result to a unique file under the temp directory
+    (``sim_models_<scene_name>_<unique>.world``). The content embeds the
+    installation's absolute mesh path, so one fixed name would let two
+    worktrees or domains overwrite each other's world (sim-platform-registry
+    D9); each construction owns its file.
 
     Args:
         scene_name: Scene name (e.g. ``"pick_banana"``).
 
     Returns:
-        :class:`pathlib.Path` to the generated ``.world`` file in ``/tmp/``.
+        :class:`pathlib.Path` to the generated ``.world`` file.
     """
     tmpl = get_scene_file(scene_name, "gazebo")
     meshes_dir = tmpl.parent / "meshes"
     content = tmpl.read_text().replace(_MESHES_PLACEHOLDER, str(meshes_dir))
-    out = Path(f"/tmp/sim_models_{scene_name}.world")
-    out.write_text(content)
+    fd, out_str = tempfile.mkstemp(prefix=f"sim_models_{scene_name}_", suffix=".world")
+    out = Path(out_str)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(content)
     return out
 
 
@@ -545,6 +562,42 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
     except Exception as exc:  # noqa: BLE001
         logging.warning("MuJoCo compile failed, falling back to XML: %s", exc)
         return xml_out
+
+
+def resolve_robot_spawn(simulation: dict, scene: str | None) -> tuple[float, float, float, float]:
+    """The one provider-path spawn-pose rule (sim-platform-registry D7).
+
+    Precedence, shared by every physics platform:
+
+    1. ``simulation.robot_spawn`` when it is a non-empty mapping — with or
+       without a scene. Absent, ``null`` and ``{}`` mean unspecified, and a
+       non-empty mapping defaults missing coordinates (and ``yaw``) to 0.
+    2. otherwise the scene layout's ``robot_spawn`` when a scene is set and
+       its layout loads (a scene that fails to load is never consulted: the
+       caller has already fallen back to the ``empty`` scene);
+    3. otherwise ``(0, 0, 0, 0)``.
+
+    Returns the full pose ``(x, y, z, yaw)``; generic launch resolves it once
+    before any world hook, so every platform shares one spawn rule.
+    """
+    spawn = (simulation or {}).get("robot_spawn")
+    if not isinstance(spawn, dict) or not spawn:
+        spawn = None
+    if spawn is None and scene:
+        try:
+            layout_spawn = get_scene_layout(scene).get("robot_spawn")
+        except Exception:  # noqa: BLE001 - a scene that failed to load (the caller has fallen back to empty) is never consulted for its layout
+            layout_spawn = None
+        if isinstance(layout_spawn, dict) and layout_spawn:
+            spawn = layout_spawn
+    if spawn is None:
+        return (0.0, 0.0, 0.0, 0.0)
+    return (
+        float(spawn.get("x", 0.0)),
+        float(spawn.get("y", 0.0)),
+        float(spawn.get("z", 0.0)),
+        float(spawn.get("yaw", 0.0)),
+    )
 
 
 def get_scene_layout(scene_name: str) -> dict:

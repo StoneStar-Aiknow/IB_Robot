@@ -1,11 +1,10 @@
-"""Gazebo simulation backend adapter.
+"""Gazebo simulation backend adapter (provider-less legacy path).
 
-Migrated from robot_config.launch_builders.simulation (generate_gazebo_nodes).
-Logic is unchanged from T1; this file is a pure structural reorganization.
-
-Camera bridge topic naming contains a known path mismatch — the bridge
-publishes on the raw Gazebo sensor topic, not on /camera/{name}/image_raw.
-This will be fixed in T3.
+Launches the Gazebo world (through the shared launcher in
+``robot_runtime_sim.world``), spawns the robot entity from
+``/robot_description`` and bridges ``/clock`` and the joint states. Camera
+bridges are handled by ``spawn_peripheral_bridges()``. Provider launches go
+through the registry's world hook instead (sim-platform-registry D5/D6).
 """
 
 import copy
@@ -13,22 +12,34 @@ import os
 import re
 from pathlib import Path
 
-from launch.actions import EmitEvent, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable
+from launch.actions import EmitEvent, RegisterEventHandler, SetEnvironmentVariable
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_ros_path
+from robot_runtime_sim.world import gazebo_world_actions
 
 from .base_adapter import SimBackendAdapter
 
 logger = get_colored_logger("robot_config.sim_backend.gazebo")
 
 _FIND_PATTERN = re.compile(r"\$\(find\s+(\w+)\)")
+
+
+def _required_robot_name(robot_config: dict) -> str:
+    """The configured robot name — the Gazebo model name never defaults to a
+    specific robot (D9). The loader already rejects a config without ``name``,
+    so this only fires on direct adapter use with a malformed config."""
+    name = str(robot_config.get("name") or "").strip()
+    if not name:
+        raise RuntimeError(
+            "GazeboAdapter requires the robot configuration's 'name' "
+            "(the Gazebo model name and joint-state bridge path are derived from it)"
+        )
+    return name
 
 
 def _description_packages(robot_config: dict) -> list[str]:
@@ -79,34 +90,6 @@ def _gazebo_gui_env_actions(robot_config: dict) -> list:
             "(software GL; set gazebo_gui.libgl_always_software: false if GPU view works)"
         )
     return actions
-
-
-def _gz_server_include(gz_args: str):
-    """The ros_gz_sim server launch with the given gz_args."""
-    return IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution(
-                [
-                    FindPackageShare("ros_gz_sim"),
-                    "launch",
-                    "gz_sim.launch.py",
-                ]
-            )
-        ),
-        launch_arguments={"gz_args": gz_args}.items(),
-    )
-
-
-def _headless_prefix() -> str:
-    """IBROBOT_GAZEBO_HEADLESS=1 switches to server-only headless mode (no GUI,
-    no rendering window). Used by sim_camera_adjuster when the primary
-    simulator is MuJoCo and a parallel Gazebo stack is spawned purely for
-    camera pose calibration. Default (env unset) preserves the normal Gazebo
-    UX exactly."""
-    if os.environ.get("IBROBOT_GAZEBO_HEADLESS", "0") == "1":
-        logger.info("IBROBOT_GAZEBO_HEADLESS=1 -> Gazebo server-only headless mode")
-        return "-s --headless-rendering "
-    return ""
 
 
 class GazeboAdapter(SimBackendAdapter):
@@ -166,47 +149,6 @@ class GazeboAdapter(SimBackendAdapter):
             world_path = str(get_gazebo_world_path("empty"))
             logger.info(f"sim_models scene 'empty' → {world_path}")
         return world_path, spawn
-
-    def start_world_only(self, robot_config: dict) -> tuple[list, str, tuple[float, float, float, float]]:
-        """World-only mode (runtime-simulation-transport D4): generic launch
-        owns the world for a runtime provider on the Gazebo transport.
-
-        Emits the GUI env workarounds, the scene-resolved Gazebo server and
-        the ``/clock`` bridge, and returns ``(actions, world_name,
-        spawn_pose)`` with the spawn pose (x, y, z, yaw) resolved with the
-        scene/``robot_spawn`` precedence. No ``create`` (the provider spawns
-        its own embodiment), no joint-state bridge and no camera bridges:
-        those are embodiment, owned by the provider. Scene assets resolve to
-        absolute mesh URIs inside the generated world, so no
-        description-derived resource paths are set (D7b: the provider's
-        description carries absolute ``file://`` mesh URIs itself).
-        """
-        actions: list = []
-        actions.extend(_gazebo_gui_env_actions(robot_config))
-        world_path, spawn = self._resolve_world_and_spawn(robot_config)
-
-        gazebo_world_name = robot_config.get("gazebo_world_name", "demo")
-        logger.info(f"Gazebo world name (world-only hand-off): {gazebo_world_name}")
-
-        headless_prefix = _headless_prefix()
-        gz_args = f"{headless_prefix}-r {world_path}"
-        actions.append(_gz_server_include(gz_args))
-        actions.append(
-            Node(
-                package="ros_gz_bridge",
-                executable="parameter_bridge",
-                arguments=["/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
-                output="screen",
-            )
-        )
-        spawn_pose = (
-            float(spawn.get("x", 0.0)),
-            float(spawn.get("y", 0.0)),
-            float(spawn.get("z", 0.0)),
-            float(spawn.get("yaw", 0.0)),
-        )
-        self._gazebo_world_name = gazebo_world_name
-        return actions, gazebo_world_name, spawn_pose
 
     def start_backend(self, robot_config: dict) -> tuple:
         """Launch Gazebo and core infrastructure.
@@ -271,11 +213,14 @@ class GazeboAdapter(SimBackendAdapter):
         # ---- Entity creation (spawn robot from /robot_description) ----
         # gflags names use underscores (see `ros2 run ros_gz_sim create --help`):
         #   -allow_renaming   NOT -allow-renaming (latter is not a valid flag).
+        # The model name is the configured robot name — never a robot-specific
+        # fallback (sim-platform-registry D9).
+        model_name = _required_robot_name(robot_config)
         create_args = [
             "-world",
             gazebo_world_name,
             "-name",
-            robot_config.get("name", "so101"),
+            model_name,
             "-allow_renaming=true",
             "-topic",
             "/robot_description",
@@ -293,29 +238,18 @@ class GazeboAdapter(SimBackendAdapter):
             output="screen",
         )
 
-        # ---- Clock bridge ----
-        clock_bridge = Node(
-            package="ros_gz_bridge",
-            executable="parameter_bridge",
-            arguments=["/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
-            output="screen",
-        )
-
-        # ---- Joint state bridge ----
+        # ---- Clock bridge + joint state bridge ----
+        # The clock bridge comes with the shared world launcher (D6); the
+        # joint-state bridge is this adapter's (the provider's embodiment
+        # owns its own).
         joint_state_bridge = Node(
             package="ros_gz_bridge",
             executable="parameter_bridge",
             arguments=[
-                f"/world/{gazebo_world_name}/model/{robot_config.get('name', 'so101')}"
-                f"/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model"
+                f"/world/{gazebo_world_name}/model/{model_name}/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model"
             ],
             output="screen",
         )
-
-        # ---- Gazebo server + GUI (must be listed before spawn; see below) ----
-        # The world path always exists: _resolve_world_and_spawn generates it
-        # or raises (a missing empty scene fails the launch, no bare server).
-        gz_args = f"{_headless_prefix()}-r {world_path}"
 
         clock_ready_waiter = Node(
             package="robot_runtime_sim",
@@ -332,10 +266,9 @@ class GazeboAdapter(SimBackendAdapter):
         logger.info("Gazebo spawn: waiting for /clock before creating robot entity")
         logger.info(f"ros_gz_sim create argv: {create_args}")
 
+        actions.extend(gazebo_world_actions(world_path, gazebo_world_name))
         actions.extend(
             [
-                _gz_server_include(gz_args),
-                clock_bridge,
                 joint_state_bridge,
                 clock_ready_waiter,
                 RegisterEventHandler(
@@ -352,19 +285,10 @@ class GazeboAdapter(SimBackendAdapter):
         )
 
         # Store model name for use by spawn_peripheral_bridges()
-        self._model_name = robot_config.get("name", "so101")
+        self._model_name = model_name
         self._gazebo_world_name = gazebo_world_name
 
         return actions, create_entity
-
-    def load_scene(self, scene_file_path: str) -> list:
-        """Stub: scene loading for Gazebo (T5 implementation)."""
-        logger.info("GazeboAdapter.load_scene: not implemented yet (T5)")
-        return []
-
-    def ensure_controller_manager(self, robot_config: dict) -> list:
-        """Gazebo provides controller_manager via gz_ros2_control plugin."""
-        return []
 
     def spawn_peripheral_bridges(self, peripherals: list) -> list:
         """Create ros_gz_bridge nodes for peripheral topics.
@@ -387,11 +311,12 @@ class GazeboAdapter(SimBackendAdapter):
             generate_peripheral_sim_bridges,
         )
 
-        model_name = getattr(self, "_model_name", "so101")
+        model_name = getattr(self, "_model_name", None)
+        if model_name is None:
+            raise RuntimeError(
+                "GazeboAdapter.spawn_peripheral_bridges requires start_backend() first "
+                "(the model name comes from the robot configuration's 'name')"
+            )
         world_name = getattr(self, "_gazebo_world_name", "demo")
         logger.info(f"Gazebo: spawning peripheral bridges (world: {world_name}, model: {model_name})")
         return generate_peripheral_sim_bridges(peripherals, model_name, world_name)
-
-    def update_object_pose(self, object_name: str, pose) -> None:
-        """[Reserved for v1] Runtime object pose update via Gazebo service."""
-        pass

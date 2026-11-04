@@ -26,11 +26,13 @@ from sim_models.scene_compiler import (
     compose_mujoco_model,
     composed_model_path,
     free_joint_states_topic,
+    get_gazebo_world_path,
     get_scene_layout,
     get_scene_task,
     load_mujoco_engine_plugins,
     mjcf_engine_extensions,
     randomization_placements,
+    resolve_robot_spawn,
     scene_dynamic_objects,
 )
 
@@ -321,6 +323,44 @@ def test_composed_model_path_is_keyed_by_domain(monkeypatch):
     assert composed_model_path(None).name == "robot.mjb"
 
 
+# ---------------------------------------------------------------------------
+# D9: the generated Gazebo world is unique per construction
+# ---------------------------------------------------------------------------
+
+
+def test_gazebo_world_path_is_unique_per_construction(monkeypatch, tmp_path):
+    """Two constructions of the same scene, under different domain ids, give
+    two distinct files, each carrying its own content (D9: the world embeds
+    the installation's absolute mesh path, so a fixed name let two worktrees
+    overwrite each other)."""
+    mesh_sentinel = "unique-mesh-sentinel"
+    scene_dir = tmp_path / "pick_banana"
+    scene_dir.mkdir()
+    (scene_dir / "meshes").mkdir()
+    (scene_dir / "pick_banana.world.template").write_text(
+        f'<world name="demo">{{{{MESHES_DIR}}}}/{mesh_sentinel}</world>', encoding="utf-8"
+    )
+
+    def fake_scene_file(scene_name, platform):
+        assert platform == "gazebo"
+        assert scene_name == "pick_banana"
+        return scene_dir / "pick_banana.world.template"
+
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_file", fake_scene_file)
+    monkeypatch.setenv("ROS_DOMAIN_ID", "41")
+    first = get_gazebo_world_path("pick_banana")
+    monkeypatch.setenv("ROS_DOMAIN_ID", "42")
+    second = get_gazebo_world_path("pick_banana")
+    assert first != second, "each construction must own its world file"
+    assert first.name.startswith("sim_models_pick_banana_") and first.suffix == ".world"
+    assert second.name.startswith("sim_models_pick_banana_") and second.suffix == ".world"
+    content_first = first.read_text(encoding="utf-8")
+    content_second = second.read_text(encoding="utf-8")
+    assert f"/meshes/{mesh_sentinel}</world>" in content_first
+    assert f"/meshes/{mesh_sentinel}</world>" in content_second
+    assert content_first == content_second, "same scene and installation render identical content"
+
+
 def test_compose_with_pick_banana_compiles_without_injected_keyframes(robot_mjcf, clean_domain):
     """Issue #195: placements travel through ResetWorld state overrides, not
     compiled-in keyframes — the composed model must carry no injected keys."""
@@ -376,6 +416,63 @@ def test_get_scene_task_returns_none_without_a_declaration():
     # the empty scene has no layout.yaml at all
     assert get_scene_task("empty") is None
     assert get_scene_task("does_not_exist") is None
+
+
+# ---------------------------------------------------------------------------
+# sim-platform-registry D7: the one provider-path spawn-pose rule
+# ---------------------------------------------------------------------------
+
+
+def test_robot_spawn_unspecified_without_a_scene_or_explicit_spawn():
+    # absent / null / {} all mean unspecified: the origin
+    assert resolve_robot_spawn({}, None) == (0.0, 0.0, 0.0, 0.0)
+    assert resolve_robot_spawn({"robot_spawn": None}, None) == (0.0, 0.0, 0.0, 0.0)
+    assert resolve_robot_spawn({"robot_spawn": {}}, None) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_robot_spawn_partial_coordinates_default_to_zero():
+    assert resolve_robot_spawn({"robot_spawn": {"z": -0.03}}, None) == (0.0, 0.0, -0.03, 0.0)
+    assert resolve_robot_spawn({"robot_spawn": {"yaw": 0.5}}, "pick_banana") == (0.0, 0.0, 0.0, 0.5)
+
+
+def test_robot_spawn_non_zero_yaw_is_kept():
+    spawn = resolve_robot_spawn({"robot_spawn": {"x": 1.0, "y": 2.0, "z": -0.03, "yaw": 1.25}}, None)
+    assert spawn == (1.0, 2.0, -0.03, 1.25)
+
+
+def test_robot_spawn_scene_layout_applies_when_not_configured():
+    # pick_banana's layout declares (0.0, 0.30, -0.03, no yaw)
+    assert resolve_robot_spawn({}, "pick_banana") == (0.0, 0.30, -0.03, 0.0)
+
+
+def test_robot_spawn_empty_mapping_with_a_scene_uses_the_layout():
+    # robot_spawn: {} is unspecified, not an override — the layout applies
+    assert resolve_robot_spawn({"robot_spawn": {}}, "pick_banana") == (0.0, 0.30, -0.03, 0.0)
+    assert resolve_robot_spawn({"robot_spawn": None}, "pick_banana") == (0.0, 0.30, -0.03, 0.0)
+
+
+def test_robot_spawn_explicit_without_a_scene_is_honoured():
+    # the D7 behaviour change: Gazebo without a scene now honours robot_spawn
+    assert resolve_robot_spawn({"robot_spawn": {"x": 0.25, "y": -0.1, "z": -0.03, "yaw": 0.7}}, None) == (
+        0.25,
+        -0.1,
+        -0.03,
+        0.7,
+    )
+
+
+def test_robot_spawn_explicit_overrides_the_scene_layout():
+    assert resolve_robot_spawn({"robot_spawn": {"x": 0.25}}, "pick_banana") == (0.25, 0.0, 0.0, 0.0)
+
+
+def test_robot_spawn_scene_load_failure_falls_back_to_the_origin(monkeypatch):
+    # a scene that fails to load is never consulted: the caller has already
+    # fallen back to the empty scene, whose layout has no robot_spawn
+    def _raise(scene_name):
+        raise RuntimeError(f"layout explosion: {scene_name}")
+
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", _raise)
+    assert resolve_robot_spawn({}, "no_such_scene") == (0.0, 0.0, 0.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
