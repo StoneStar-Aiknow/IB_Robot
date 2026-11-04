@@ -276,6 +276,7 @@ def _make_node(stop_ready=True, start_ready=True, home_ready=True):
     node._pose_calib_pos = None
     node._pose_calib_rot = None
     # Service clients.
+    node._start_type = Trigger
     node._so101_start_cli = _FakeClient(start_ready)
     node._so101_stop_cli = _FakeClient(stop_ready)
     node._so101_home_cli = _FakeActionClient(home_ready)

@@ -139,3 +139,67 @@ def test_keepalive_publishes_command_lease():
     backend.keepalive()
 
     assert len(published) == 1
+
+
+def test_keepalive_stamps_a_session_lease():
+    stamp = object()
+    published = []
+
+    class Lease:
+        def __init__(self):
+            self.header = SimpleNamespace(stamp=None)
+
+    backend = PlacoServoBackend.__new__(PlacoServoBackend)
+    backend._lease_type = Lease
+    backend._lease_pub = SimpleNamespace(publish=published.append)
+    backend._node = SimpleNamespace(
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: stamp))
+    )
+
+    backend.keepalive()
+
+    assert published[0].header.stamp is stamp
+
+
+def test_managed_backend_binds_the_session_endpoints_when_configured():
+    from std_msgs.msg import Empty
+    from std_srvs.srv import Trigger
+
+    from ibrobot_msgs.msg import SessionLease
+    from ibrobot_msgs.srv import StartArmSession
+
+    def build(managed, **endpoints):
+        clients, publishers = {}, {}
+        node = SimpleNamespace(
+            create_publisher=lambda kind, topic, _depth: publishers.setdefault(topic, kind),
+            create_client=lambda kind, name: clients.setdefault(name, kind) and SimpleNamespace(),
+            create_subscription=lambda *_args, **_kwargs: None,
+            get_logger=lambda: SimpleNamespace(info=print, warn=print, error=print),
+        )
+        import robot_teleop.cartesian_backend.placo_servo as module
+
+        original = module.ActionClient, module.ToolAngularAdapter
+        module.ActionClient = lambda *_args: SimpleNamespace()
+        module.ToolAngularAdapter = lambda **_kwargs: SimpleNamespace()
+        try:
+            PlacoServoBackend(
+                node,
+                None,
+                "base",
+                "gripper",
+                start_srv="/start",
+                command_lease_topic="/lease",
+                managed_teleop=managed,
+                **endpoints,
+            )
+        finally:
+            module.ActionClient, module.ToolAngularAdapter = original
+        return clients, publishers
+
+    clients, publishers = build(True, session_start_srv="/session_start", session_lease_topic="/session_lease")
+    assert clients["/session_start"] is StartArmSession and "/start" not in clients
+    assert publishers["/session_lease"] is SessionLease and "/lease" not in publishers
+    clients, publishers = build(True)
+    assert clients["/start"] is Trigger and publishers["/lease"] is Empty
+    clients, publishers = build(False, session_start_srv="/session_start", session_lease_topic="/session_lease")
+    assert clients["/start"] is Trigger and publishers["/lease"] is Empty  # Unmanaged servos do not serve them.

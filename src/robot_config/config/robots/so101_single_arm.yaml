@@ -347,6 +347,10 @@ robot:
         stop: motion.arm.stop
         home: motion.arm.home
         lease: motion.arm.lease
+        # Session endpoints: every managed device uses them. start/lease
+        # stay declared until the old pair is removed.
+        session_start: motion.arm.session_start
+        session_lease: motion.arm.session_lease
     control_params:
       cartesian_linear_speed: 0.17
       cartesian_angular_speed: 0.2

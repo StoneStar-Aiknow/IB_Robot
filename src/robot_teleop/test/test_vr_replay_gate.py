@@ -409,6 +409,27 @@ def test_connected_stream_stall_enters_hold_and_rejects_continued_commands(stack
     node.spin_for(0.6)
 
 
+def test_vr_uses_the_session_endpoints(stack):
+    node, _, _ = stack
+    interfaces = node.description["interfaces"]
+
+    def publishers(key):
+        return {info.node_name for info in node.get_publishers_info_by_topic(interfaces[key]["endpoint"])}
+
+    def clients(key):
+        endpoint = interfaces[key]["endpoint"]
+        return {
+            name
+            for name, namespace in node.get_node_names_and_namespaces()
+            if any(service == endpoint for service, _ in node.get_client_names_and_types_by_node(name, namespace))
+        }
+
+    assert "vr_teleop" in publishers("motion.arm.session_lease")
+    assert "vr_teleop" not in publishers("motion.arm.lease")
+    assert "vr_teleop" in clients("motion.arm.session_start")
+    assert "vr_teleop" not in clients("motion.arm.start")
+
+
 def test_session_start_returns_the_frozen_reference_after_a_hold(stack):
     node, _, _ = stack
     interfaces = node.description["interfaces"]

@@ -38,6 +38,11 @@ dropped when stamped at or before the session start. They share session state
 with `motion.arm.start` and `motion.arm.lease`, which stay until VR, phone, Xbox
 and leader-arm clients have all migrated.
 
+Managed devices (VR, phone, Xbox, leader arm) use the session endpoints when
+the teleoperation target names them (`target.interfaces.session_start` /
+`session_lease`, set for SO-101), and fall back to `start` and `lease` when it
+does not.
+
 A pose whose target is farther than `max_pose_step_m` (declared on
 `motion.arm.pose`) from the current reference ends the session: the servo does
 not follow or clamp it, keeps the reference, and enters HOLD. The first pose
