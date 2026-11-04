@@ -1,0 +1,33 @@
+{
+  "revision": "d8768b51cb86b6449dc3c5dd071bf90b875c63e4",
+  "results": {
+    "fifo": {
+      "calls": 60,
+      "numerical": "PASS",
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    },
+    "nice": {
+      "calls": 60,
+      "numerical": "PASS",
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    },
+    "pfp": {
+      "calls": 60,
+      "numerical": "PASS",
+      "exit_codes": [
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "total_calls": 180
+}

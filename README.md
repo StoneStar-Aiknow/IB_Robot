@@ -485,3 +485,7 @@ broken 并使校验失败，不因 CLI 不可用而被掩盖。
 - README 直接使用 SVG 架构图；修改时将 `.drawio` 和 SVG 两个文件同步提交。
 
 **维护者**：IB-Robot Team · **[项目主页](https://atomgit.com/openEuler/IB_Robot)** · **[问题反馈](https://atomgit.com/openEuler/IB_Robot/issues)**
+
+### RT-Infer
+
+[Ascend 310P RC software scheduling: deployment and multi-model validation](docs/rt_infer_deployment.md).

@@ -1,0 +1,1 @@
+{"model": "prefill", "iteration": 1, "release_ns": 126501321356955, "start_ns": 126501321356955, "finish_ns": 126501629989950, "execute_ms": 308.632995, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}

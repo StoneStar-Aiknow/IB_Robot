@@ -1,0 +1,3 @@
+{"model": "yolox", "iteration": 1, "release_ns": 126579289750269, "start_ns": 126579339555686, "finish_ns": 126579415943785, "execute_ms": 76.388099, "numerical": true, "max_abs": [0.0]}
+{"model": "yolox", "iteration": 2, "release_ns": 126580289750269, "start_ns": 126580341101781, "finish_ns": 126580421601078, "execute_ms": 80.499297, "numerical": true, "max_abs": [0.0]}
+{"model": "yolox", "iteration": 3, "release_ns": 126581289750269, "start_ns": 126581297264776, "finish_ns": 126581378927016, "execute_ms": 81.66224, "numerical": true, "max_abs": [0.0]}
