@@ -13,6 +13,7 @@ from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile
 from test_grasp_pipeline import Effector, Executor, Proposer, Source, StreamingPlanner
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity
@@ -142,7 +143,7 @@ def serve(config):
         ]
     )
     client_node = Node("grasp_pipeline_test_client")
-    client = ActionClient(client_node, PickObject, ACTION)
+    client = ActionClient(client_node, PickObject, ACTION, feedback_sub_qos_profile=QoSProfile(depth=256))
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     executor.add_node(client_node)
@@ -181,11 +182,14 @@ def test_the_node_runs_a_goal_through_the_configured_backends(ros):
         result = wait(handle.get_result_async()).result
         assert result.success and result.error_code == ""
         assert result.verification_status == PickObject.Result.VERIFICATION_SUCCESS
-        assert result.completed_phases[-4:] == ["grasp", "close", "lift", "hold_lifted"]
+        assert result.completed_phases[-5:] == ["grasp", "close", "lift", "hold_lifted", "verify"]
+        assert result.execution_detail.phase == "verify" and result.execution_detail.phase_state == "SUCCEEDED"
         assert result.candidate_index == 1 and result.attempts == 1
         assert result.actual_executor.configuration_digest == identity(config)["configuration_digest"]
         assert json.loads(result.pipeline_timings_json)["plan"] == {"planner": "streaming"}
-        phases = [message.feedback.phase for message in feedback]
+        assert feedback
+        assert result.last_feedback_sequence == len(result.execution_history)
+        phases = [detail.phase for detail in result.execution_history if detail.phase_state == "RUNNING"]
         assert phases[:3] == ["observe", "perceive", "plan"] and "approach" in phases
 
         plan_only = goal(config, now_s=now, mode=PickObject.Goal.MODE_PLAN_ONLY)

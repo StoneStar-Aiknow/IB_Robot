@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from collections.abc import Mapping
 
 import numpy as np
@@ -25,12 +26,14 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
 
 from embodied_common.dispatch_binding import (
     delegated_executor_identity,
     fill_delegated_executor_identity,
     load_delegated_model_identity,
 )
+from embodied_common.execution_detail import ExecutionDetail, fill_execution_detail, short_message
 from ibrobot_msgs.action import PickObject
 from manipulation_execution.grasp_pipeline.backends import backend_spec, load_backends
 from manipulation_execution.grasp_pipeline.outcome_message import outcome_message
@@ -62,7 +65,11 @@ def pipeline_config(grasp_execution: Mapping) -> PipelineConfig:
 
 def verification_status(outcome: PickOutcome) -> int:
     """The close's answer; NOT_RUN when no close finished."""
-    if "close" not in outcome.completed_phases:
+    if (
+        outcome.held is None
+        and "close" not in outcome.completed_phases
+        and outcome.execution_detail.reason_code != "GRASP_UNCERTAIN"
+    ):
         return PickObject.Result.VERIFICATION_NOT_RUN
     return {
         True: PickObject.Result.VERIFICATION_SUCCESS,
@@ -119,15 +126,16 @@ def pick_result(outcome: PickOutcome, identity: dict[str, str]) -> PickObject.Re
     result = PickObject.Result()
     result.success = bool(outcome.success)
     result.error_code = outcome.error_code
-    # The Agent-facing account: outcome, robot/object state, retries and why, what to do next.
+    # Only the bounded summary is prose; facts travel independently.
     result.message = outcome_message(outcome)
+    fill_execution_detail(result.execution_detail, outcome.execution_detail)
     result.attempts = int(outcome.attempts)
     result.verification_status = verification_status(outcome)
     result.verification_confidence = float(outcome.held_confidence)
     result.completed_phases = list(outcome.completed_phases)
     result.candidate_index = int(outcome.candidate_index)
     result.released_after_success = bool(outcome.released_after_success)
-    report = {**outcome.report, "retries": outcome.retries}
+    report = {**outcome.report, "retries": outcome.retries, "error_detail": outcome.message, "mode": outcome.mode}
     result.pipeline_timings_json = json.dumps(report, sort_keys=True, default=_json_value)
     fill_delegated_executor_identity(result.actual_executor, identity)
     return result
@@ -171,6 +179,7 @@ class GraspPipelineNode(Node):
             goal_callback=self._handle_goal,
             cancel_callback=lambda _goal: CancelResponse.ACCEPT,
             callback_group=ReentrantCallbackGroup(),
+            feedback_pub_qos_profile=QoSProfile(depth=256),
         )
         self.get_logger().info(f"grasp pipeline ready: action={self._action_name} backend={spec}")
 
@@ -207,13 +216,23 @@ class GraspPipelineNode(Node):
 
     def _execute(self, goal_handle):
         goal = goal_handle.request
+        goal_handle.phase_sequence = 0
+        goal_handle.phase_history = deque(maxlen=256)
         try:
             remaining = remaining_budget_s(goal, self._now_s())
             if remaining <= 0.0:
-                outcome = PickOutcome(error_code="TASK_TIMEOUT", message="task budget expired before the pick started")
+                outcome = PickOutcome(
+                    error_code="TASK_TIMEOUT",
+                    message="task budget expired before the pick started",
+                    execution_detail=ExecutionDetail(
+                        1, "dispatch", "FAILED", "dispatch", "TASK_TIMEOUT", "NOT_NEEDED", 0, "WAIT_SERVICE"
+                    ),
+                )
             else:
                 outcome = self._run(goal_handle, time.monotonic() + remaining)
             result = pick_result(outcome, self._identity)
+            result.last_feedback_sequence = goal_handle.phase_sequence
+            result.execution_history = list(goal_handle.phase_history)
             self.get_logger().info(json.dumps(terminal_record(outcome), default=_json_value))
             if not outcome.at_rest:
                 self.get_logger().error(f"arm stopped in place: {outcome.error_code}: {outcome.message}")
@@ -241,12 +260,18 @@ class GraspPipelineNode(Node):
             elif detail.get("state", "succeeded") != "succeeded":
                 message = f"{detail.get('state')}: {detail.get('reason', '')}"
             else:
-                return
-            goal_handle.publish_feedback(
-                PickObject.Feedback(
-                    phase=name, progress=progress["value"], attempt=max(0, progress["attempt"] - 1), detail=message
-                )
+                message = "succeeded"
+            feedback = PickObject.Feedback(
+                phase=name,
+                progress=progress["value"],
+                attempt=max(0, progress["attempt"] - 1),
+                detail=short_message(message),
             )
+            fill_execution_detail(feedback.execution_detail, detail.get("execution_detail"))
+            goal_handle.phase_sequence += 1
+            feedback.sequence = goal_handle.phase_sequence
+            goal_handle.phase_history.append(feedback.execution_detail)
+            goal_handle.publish_feedback(feedback)
 
         return self._pipeline.run(
             str(goal.target_query).strip(),
@@ -270,6 +295,10 @@ class GraspPipelineNode(Node):
             if backends is not None:
                 backends.close()
         finally:
+            action = getattr(self, "_action_server", None)
+            if action is not None:
+                action.destroy()
+                self._action_server = None
             super().destroy_node()
 
 

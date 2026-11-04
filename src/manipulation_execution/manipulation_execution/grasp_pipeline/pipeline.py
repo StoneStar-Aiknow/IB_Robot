@@ -19,9 +19,12 @@ from __future__ import annotations
 import enum
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+
+from embodied_common.execution_detail import ExecutionDetail
 
 from .contracts import Flag, GraspBackends, GraspFailure, GraspPlan, Observation, Proposals
+from .outcome_message import failure_action
 from .sequence import GraspSequence, PhaseCallback
 
 
@@ -78,6 +81,10 @@ class PickOutcome:
     #: "reobserve" (nothing moved), "replan" (target moved, arm retreated) or "regrasp".
     retries: list[dict] = field(default_factory=list)
     report: dict = field(default_factory=dict)
+    mode: str = "execute"
+    execution_detail: ExecutionDetail = field(
+        default_factory=lambda: ExecutionDetail(schema_version=1, recovery_state="NOT_NEEDED", suggested_action="NONE")
+    )
 
 
 class GraspPipeline:
@@ -107,7 +114,8 @@ class GraspPipeline:
         release_after_success: bool = False,
     ) -> PickOutcome:
         """``deadline`` is on this pipeline's clock; ``cancelled`` is the goal's own flag."""
-        outcome = PickOutcome()
+        outcome = PickOutcome(mode=mode.value)
+        outcome.execution_detail = replace(outcome.execution_detail, phase="validate", phase_state="RUNNING")
         if not str(query).strip():
             return self._fail(outcome, "INVALID_TARGET", "empty target query")
 
@@ -115,10 +123,35 @@ class GraspPipeline:
             return cancelled() or self._clock() >= deadline
 
         def phase(name: str, event: str, detail: dict) -> None:
+            previous = outcome.execution_detail
+            state = detail.get("state", "succeeded")
+            failed = event == "end" and state != "succeeded"
+            public_name = "verify" if name == "hold_lifted" else name
+            if previous.recovery_state == "IN_PROGRESS" and name != "recover":
+                public_name = "recover"
+            recovery = detail.get("recovery_state", previous.recovery_state)
+            reason = detail.get("reason_code", "")
+            outcome.execution_detail = replace(
+                previous,
+                phase=public_name,
+                phase_state="RUNNING"
+                if event == "start"
+                else "CANCELED"
+                if state == "cancelled"
+                else "FAILED"
+                if failed
+                else "SUCCEEDED",
+                failed_phase=previous.failed_phase or (public_name if failed else ""),
+                reason_code=previous.reason_code or reason,
+                recovery_state=recovery,
+                suggested_action=failure_action(detail.get("error_code", reason), reason, recovery)
+                if failed
+                else "NONE",
+            )
             # Steps report their state; a phase counts as completed only when it succeeded.
             if event == "end" and detail.get("state", "succeeded") == "succeeded":
                 outcome.completed_phases.append(name)
-            on_phase(name, event, detail)
+            on_phase(public_name, event, {**detail, "execution_detail": outcome.execution_detail.to_dict()})
 
         backends = self._backends
         try:
@@ -138,7 +171,13 @@ class GraspPipeline:
         planning_failures, replans, regrasps = 0, 0, 0
         try:
             while True:
+                self._check_budget(cancelled, deadline)
+                outcome.execution_detail = ExecutionDetail(
+                    schema_version=1, retry_count=outcome.attempts, recovery_state="NOT_NEEDED", suggested_action="NONE"
+                )
                 outcome.attempts += 1
+                if outcome.retries:
+                    outcome.retries[-1]["state"] = "started"
                 budget = {"deadline": deadline, "cancelled": stop}
                 steps: dict[str, float] = {}
                 try:
@@ -177,6 +216,7 @@ class GraspPipeline:
                         "SKILL_TIMEOUT",
                         f"{left:.1f} s left of the goal, an execution needs {self._config.execute_reserve_s:g} s;"
                         " the arm was not moved",
+                        reason_code="EXECUTION_BUDGET_INSUFFICIENT",
                     )
                 # Once the arm moves, only the goal's own cancel stops it in place:
                 # the deadline gates observing, planning and starting to execute,
@@ -197,6 +237,7 @@ class GraspPipeline:
                     continue
                 if (
                     result.error_code == "GRASP_VERIFICATION_FAILED"
+                    and result.reason_code in {"EMPTY_GRASP", "GRIP_LOST"}
                     and result.at_rest
                     and regrasps < self._config.max_regrasps
                     and not stop()
@@ -215,6 +256,11 @@ class GraspPipeline:
                     elif code == "MOTION_FAILED" and cancelled():
                         code = "CANCELED"
                     outcome.error_code, outcome.message = code, result.message
+                    self._fail(outcome, code, result.message, result.reason_code)
+                else:
+                    outcome.execution_detail = replace(
+                        outcome.execution_detail, failed_phase="", reason_code="", suggested_action="NONE"
+                    )
                 return outcome
         except GraspFailure as failure:
             code = failure.code
@@ -222,7 +268,7 @@ class GraspPipeline:
                 code = "CANCELED"
             elif self._clock() >= deadline:
                 code = "SKILL_TIMEOUT"
-            return self._fail(outcome, code, str(failure))
+            return self._fail(outcome, code, str(failure), failure.reason_code)
         except Exception as exc:  # noqa: BLE001 - every failure ends the goal with a code
             return self._fail(outcome, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
 
@@ -240,24 +286,45 @@ class GraspPipeline:
         sequence = GraspSequence(self._backends, home_tolerance_rad=self._config.home_tolerance_rad, on_phase=on_phase)
         if watch is not None:
             watch.arm(observation, proposals, plan)
+        outcome.at_rest = False
+        outcome.execution_detail = replace(outcome.execution_detail, recovery_state="UNKNOWN")
         try:
             result = sequence.run(plan, deadline=deadline, cancelled=stop, release_after_success=release)
         finally:
             if watch is not None:
-                outcome.report.setdefault("watch", []).append(dict(watch.disarm()))
+                try:
+                    report = dict(watch.disarm())
+                except Exception as exc:
+                    report = {"error": f"{type(exc).__name__}: {exc}"}
+                outcome.report.setdefault("watch", []).append(report)
         outcome.held, outcome.held_confidence, outcome.at_rest = result.held, result.held_confidence, result.at_rest
         outcome.released_after_success = result.released_after_success
+        outcome.execution_detail = replace(outcome.execution_detail, recovery_state=result.recovery_state)
         outcome.report.setdefault("executions", []).append({"phases": result.phases, "retreated": result.retreated})
         return result
 
     @staticmethod
     def _retry(outcome: PickOutcome, retry: str, code: str, message: str) -> None:
-        outcome.retries.append({"attempt": outcome.attempts, "retry": retry, "code": code, "message": message})
+        outcome.retries.append(
+            {"attempt": outcome.attempts, "retry": retry, "code": code, "message": message, "state": "planned"}
+        )
 
     def _step(self, name: str, phase: PhaseCallback, timings: dict, call, *args, **kwargs):
         phase(name, "start", {})
         started = self._clock()
-        value = call(*args, **kwargs)
+        try:
+            value = call(*args, **kwargs)
+        except Exception as exc:
+            phase(
+                name,
+                "end",
+                {
+                    "state": "cancelled" if getattr(exc, "code", "") == "CANCELED" else "failed",
+                    "error_code": getattr(exc, "code", "INTERNAL_ERROR"),
+                    "reason_code": getattr(exc, "reason_code", "INTERNAL_ERROR"),
+                },
+            )
+            raise
         timings[name] = self._clock() - started
         phase(name, "end", {"seconds": timings[name]})
         return value
@@ -269,6 +336,21 @@ class GraspPipeline:
             raise GraspFailure("SKILL_TIMEOUT", "goal deadline passed")
 
     @staticmethod
-    def _fail(outcome: PickOutcome, code: str, message: str) -> PickOutcome:
+    def _fail(outcome: PickOutcome, code: str, message: str, reason_code: str = "") -> PickOutcome:
         outcome.success, outcome.error_code, outcome.message = False, code, message
+        detail = outcome.execution_detail
+        reason = detail.reason_code or reason_code or code
+        outcome.execution_detail = replace(
+            detail,
+            # The task can fail after recovery succeeded. Do not rewrite the
+            # completed recovery stage as a failed motion.
+            phase_state=detail.phase_state
+            if detail.phase == "recover" and detail.recovery_state == "COMPLETED"
+            else "CANCELED"
+            if code == "CANCELED"
+            else "FAILED",
+            failed_phase=detail.failed_phase or detail.phase,
+            reason_code=reason,
+            suggested_action=failure_action(code, reason, detail.recovery_state),
+        )
         return outcome

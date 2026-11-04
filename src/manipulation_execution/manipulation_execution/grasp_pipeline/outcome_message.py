@@ -1,167 +1,81 @@
-"""The ``PickObject`` result message: what an Agent needs to decide its next step.
+"""Short grasp summaries and structured interaction advice.
 
-``error_code`` stays the machine-readable code; the message says, in order:
-the outcome, where the arm and the object are now, every retry the pipeline
-made and why, what the caller should do next, and the last failure's detail.
-An Agent passes the message on to the user and keeps it in its conversation,
-so it is plain sentences without internal names.
-
-    PICK FAILED [NO_EXECUTABLE_CANDIDATE] No safe grasp could be planned for the target.
-    State: the arm did not move; the object was not touched.
-    Retries (2): 1. reobserve after OBSERVATION_UNAVAILABLE: robot sensor data dropped out; ...
-    Next: ask the user to move the object closer to the robot or turn it, then try again.
-    Detail: RuntimeError: No candidate produced a complete three-segment plan
+Execution facts belong to ExecutionDetail. Full diagnostics and retry history
+stay in the pipeline report; neither Agent nor TTS parses this text for policy.
 """
 
 from __future__ import annotations
 
-from .pipeline import PickOutcome
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-#: What each code means, and what the caller should do next.
-FAILURES: dict[str, tuple[str, str]] = {
-    "INVALID_TARGET": (
-        "The target name is empty or not usable.",
-        "give a short object name, such as 'an apple'.",
-    ),
-    "TARGET_NOT_VISIBLE": (
-        "The target was not seen by the head camera.",
-        "check the object name, or ask the user to put the object in front of the robot, then try again.",
-    ),
-    "NO_EXECUTABLE_CANDIDATE": (
-        "No safe grasp could be planned for the target.",
-        "ask the user to move the object closer to the robot or turn it, then try again.",
-    ),
-    "REOBSERVE_REQUIRED": (
-        "The scene kept changing while the grasp was planned.",
-        "keep the object and the robot still, then try again.",
-    ),
-    "OBSERVATION_UNAVAILABLE": (
-        "The robot's camera or joint data was not available.",
-        "wait a few seconds and try again; if it repeats, the operator should check the robot's network and load.",
-    ),
-    "TARGET_MOVED": (
-        "The object moved while the arm approached it; the arm went back.",
-        "keep the object still, then try again.",
-    ),
-    "GRASP_VERIFICATION_FAILED": (
-        "The hand did not keep hold of the object.",
-        "look at the table again before retrying: the object may have moved or fallen.",
-    ),
-    "SKILL_TIMEOUT": (
-        "The pick ran out of time.",
-        "try again; if it repeats, the operator should check the robot's load.",
-    ),
-    "TASK_TIMEOUT": (
-        "The task budget ran out before the pick started.",
-        "try again with a new command.",
-    ),
-    "CANCELED": ("The pick was cancelled.", "nothing to do unless the user asks again."),
-    "RPC_FAILED": (
-        "A grasp service did not answer.",
-        "try again later; if it repeats, the operator should check the grasp services.",
-    ),
-    "RPC_TIMEOUT": (
-        "A grasp service did not answer in time.",
-        "try again later; if it repeats, the operator should check the grasp services.",
-    ),
-    "NOT_READY": ("The grasp services are still starting.", "wait about a minute and try again."),
-    "SERVICE_UNAVAILABLE": (
-        "A grasp service is not running.",
-        "the operator should check the grasp services.",
-    ),
-    "MOTION_FAILED": (
-        "The arm did not follow its motion and was stopped.",
-        "do not retry; the operator must check the robot first.",
-    ),
-    "WATCH_FAILED": (
-        "The robot could no longer see whether the target moved and stopped the arm.",
-        "do not retry; the operator must check the robot first.",
-    ),
-    "EFFECTOR_FAILED": (
-        "The hand did not finish its action and the arm was stopped.",
-        "do not retry; the operator must check the robot first.",
-    ),
-    "INTERNAL_ERROR": (
-        "The grasp software failed unexpectedly.",
-        "do not retry; report it to the operator.",
-    ),
-}
-_UNKNOWN = ("The pick failed.", "report it to the operator before retrying.")
+from embodied_common.execution_detail import short_message
 
-#: Why the pipeline retried, per retry kind and code.
-RETRY_REASONS: dict[str, str] = {
-    "OBSERVATION_UNAVAILABLE": "robot sensor data dropped out",
-    "NO_EXECUTABLE_CANDIDATE": "no safe grasp could be planned from that view",
-    "REOBSERVE_REQUIRED": "the scene or the robot changed while the grasp was planned",
-    "TARGET_MOVED": "the object moved during the approach and the arm went back",
-    "GRASP_VERIFICATION_FAILED": "the hand did not keep hold of the object",
+if TYPE_CHECKING:
+    from .pipeline import PickOutcome
+
+
+@dataclass(frozen=True)
+class FailureSpec:
+    summary: str
+    suggested_action: str
+
+
+FAILURES = {
+    "INVALID_TARGET": FailureSpec("The target name is empty or unsupported.", "WAIT_USER"),
+    "TARGET_NOT_VISIBLE": FailureSpec("The target was not detected.", "WAIT_USER"),
+    "NO_EXECUTABLE_CANDIDATE": FailureSpec("No complete grasp path was found.", "WAIT_USER"),
+    "NO_COMPLETE_PATH": FailureSpec("No complete grasp path was found.", "WAIT_USER"),
+    "OUT_OF_REACH": FailureSpec("No grasp candidate is within reach.", "WAIT_USER"),
+    "PLAN_TIMEOUT": FailureSpec("Grasp planning timed out.", "WAIT_SERVICE"),
+    "PLAN_REJECTED": FailureSpec("The planned motion was rejected.", "MANUAL_CHECK"),
+    "PLANNER_FAULT": FailureSpec("The grasp planner failed.", "MANUAL_CHECK"),
+    "REOBSERVE_REQUIRED": FailureSpec("The observation changed during planning.", "WAIT_USER"),
+    "OBSERVATION_UNAVAILABLE": FailureSpec("Camera or robot feedback is unavailable.", "WAIT_SERVICE"),
+    "TARGET_MOVED": FailureSpec("The target moved during the approach.", "WAIT_USER"),
+    "GRASP_VERIFICATION_FAILED": FailureSpec("The grasp could not be verified.", "WAIT_USER"),
+    "EMPTY_GRASP": FailureSpec("Nothing was held after closing.", "WAIT_USER"),
+    "GRIP_LOST": FailureSpec("The object slipped out of the grasp.", "WAIT_USER"),
+    "GRASP_UNCERTAIN": FailureSpec("The grip state could not be confirmed.", "MANUAL_CHECK"),
+    "SKILL_TIMEOUT": FailureSpec("The pick timed out.", "WAIT_SERVICE"),
+    "EXECUTION_BUDGET_INSUFFICIENT": FailureSpec("Too little time remains to start motion.", "WAIT_SERVICE"),
+    "TASK_TIMEOUT": FailureSpec("The task budget expired.", "WAIT_SERVICE"),
+    "CANCELED": FailureSpec("The pick was cancelled.", "NONE"),
+    "RPC_FAILED": FailureSpec("A grasp service call failed.", "WAIT_SERVICE"),
+    "RPC_TIMEOUT": FailureSpec("A grasp service call timed out.", "WAIT_SERVICE"),
+    "NOT_READY": FailureSpec("The grasp services are not ready.", "WAIT_SERVICE"),
+    "SERVICE_UNAVAILABLE": FailureSpec("A grasp service is unavailable.", "WAIT_SERVICE"),
+    "MOTION_FAILED": FailureSpec("The arm did not finish its motion.", "MANUAL_CHECK"),
+    "WATCH_FAILED": FailureSpec("Target monitoring failed.", "MANUAL_CHECK"),
+    "EFFECTOR_FAILED": FailureSpec("The end effector did not finish its action.", "MANUAL_CHECK"),
+    "INTERNAL_ERROR": FailureSpec("The grasp software failed unexpectedly.", "MANUAL_CHECK"),
 }
-_RETRY_KINDS = {
-    "reobserve": "looked again",
-    "replan": "planned again",
-    "regrasp": "grasped again",
-}
-#: Detail beyond this many characters is cut; the full text is in the pipeline report.
-DETAIL_MAX = 300
+_UNKNOWN = FailureSpec("The pick failed.", "MANUAL_CHECK")
+
+
+def failure_spec(code: str, reason_code: str = "") -> FailureSpec:
+    return FAILURES.get(reason_code) or FAILURES.get(code, _UNKNOWN)
+
+
+def failure_action(code: str, reason_code: str, recovery_state: str) -> str:
+    if recovery_state in {"UNKNOWN", "FAILED", "IN_PROGRESS"}:
+        return "MANUAL_CHECK"
+    return failure_spec(code, reason_code).suggested_action
 
 
 def outcome_message(outcome: PickOutcome) -> str:
-    lines = []
     if outcome.success:
-        lines.append(f"PICK SUCCEEDED. {_success_summary(outcome)}")
-    else:
-        what, _ = FAILURES.get(outcome.error_code, _UNKNOWN)
-        lines.append(f"PICK FAILED [{outcome.error_code or 'UNKNOWN'}] {what}")
-    lines.append(f"State: {_state(outcome)}")
-    if outcome.retries:
-        lines.append(
-            f"Retries ({len(outcome.retries)}): " + "; ".join(_retry(i, r) for i, r in enumerate(outcome.retries, 1))
-        )
-    if not outcome.success:
-        lines.append(f"Next: {FAILURES.get(outcome.error_code, _UNKNOWN)[1]}")
-        if outcome.message:
-            lines.append(f"Detail: {_cut(outcome.message)}")
-    return "\n".join(lines)
-
-
-def _success_summary(outcome: PickOutcome) -> str:
-    if outcome.released_after_success:
-        return "The object was grasped, lifted and put back where it was."
-    return "The object was grasped and lifted."
-
-
-def _executed(outcome: PickOutcome) -> bool:
-    return bool(outcome.report.get("executions"))
-
-
-def _state(outcome: PickOutcome) -> str:
-    if not outcome.at_rest:
-        held = " and may still hold the object" if outcome.held else ""
-        return f"the arm was stopped where it was{held}; it needs the operator before the next command."
-    if outcome.success:
+        if outcome.mode == "observe_only":
+            return "Observation completed."
+        if outcome.mode == "plan_only":
+            return "Grasp planning completed. Motion was not executed."
+        if outcome.held is not True:
+            return "The execution completed; the grasp is not confirmed."
+        summary = "The object was grasped, lifted and verified."
         if outcome.released_after_success:
-            return "the arm is back at home with the hand open; the object is on the table."
-        return "the hand holds the object."
-    if not _executed(outcome):
-        return "the arm did not move; the object was not touched."
-    last = (outcome.report["executions"][-1] or {}).get("phases") or []
-    lost = any(phase.get("state") == "grip_lost" for phase in last)
-    if outcome.error_code == "GRASP_VERIFICATION_FAILED":
-        if lost:
-            return "the object slipped out after the lift and may have moved or fallen; the arm is back at home, hand open."
-        return "the hand closed on nothing (the object may have been pushed); the arm is back at home, hand open."
-    if outcome.error_code == "TARGET_MOVED":
-        return "the arm went back to home; the hand is open."
-    return "the arm is back at home with the hand open; an earlier attempt touched the object (see retries)."
-
-
-def _retry(index: int, retry: dict) -> str:
-    code = retry.get("code", "")
-    kind = _RETRY_KINDS.get(retry.get("retry", ""), "tried again")
-    reason = RETRY_REASONS.get(code) or _cut(retry.get("message", ""), 120) or code
-    return f"{index}. {kind} after {code}: {reason}"
-
-
-def _cut(text: str, limit: int = DETAIL_MAX) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[: limit - 3] + "..."
+            summary += " The requested release completed."
+        return summary
+    reason = outcome.execution_detail.reason_code
+    return short_message(
+        f"PICK FAILED [{outcome.error_code or 'UNKNOWN'}] {failure_spec(outcome.error_code, reason).summary}"
+    )

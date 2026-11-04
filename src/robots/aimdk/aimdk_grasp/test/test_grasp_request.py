@@ -22,7 +22,7 @@ from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.joints import BODY_JOINTS, LEFT_ARM
 from aimdk_grasp.observation import AdmittedState, LiveState, RegisteredObservation
 from aimdk_grasp.planner import PlannerFault
-from aimdk_grasp.robot_model import arm_limits, planning_model
+from aimdk_grasp.robot_model import arm_limits, config_directory, planning_model
 from aimdk_grasp.scene_estimation import SceneEstimate
 from aimdk_grasp.trajectory import TimedTrajectory
 from aimdk_grasp.types import CameraIntrinsics, RGBDFrame
@@ -203,12 +203,30 @@ def test_a_closed_hand_is_refused_before_planning(setup, hand):
     assert raised.value.code == NO_EXECUTABLE_CANDIDATE and not service.calls
 
 
-def test_no_candidate_in_reach_is_no_executable_candidate(setup):
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_no_candidate_in_reach_is_no_executable_candidate(setup, side):
     make, admitted, _ = setup
+    service = FakeService()
+    planner = make(service)
+    planner.hand = HandMapping(planning_model(config_directory(side)), {"open": OPEN}, side=side)
+    hand_feedback = {f"{side}_hand": planner.hand.preset("open")}
+    admitted = replace(
+        admitted,
+        live=replace(
+            admitted.live,
+            feedback=replace(admitted.live.feedback, **hand_feedback),
+            observation=replace(
+                admitted.live.observation,
+                image_feedback=replace(admitted.live.observation.image_feedback, **hand_feedback),
+            ),
+        ),
+    )
     poses, confidence = candidates()
-    with pytest.raises(GraspFailure, match="within left-palm reach") as raised:
-        plan(make(), admitted, grasps=(poses[1:2], confidence[1:2]))
+    with pytest.raises(GraspFailure, match=f"within {side}-palm reach") as raised:
+        plan(planner, admitted, grasps=(poses[1:2], confidence[1:2]))
     assert raised.value.code == NO_EXECUTABLE_CANDIDATE and not raised.value.retryable
+    assert raised.value.reason_code == "OUT_OF_REACH"
+    assert not service.calls
 
 
 class FailingService(FakeService):
@@ -221,20 +239,21 @@ class FailingService(FakeService):
 
 
 @pytest.mark.parametrize(
-    "error, retryable",
+    "error, retryable, reason",
     [
-        (RuntimeError("No candidate produced a complete three-segment plan"), True),
-        (TimeoutError("Planning deadline exceeded"), True),
-        (ValueError("bad scene"), False),
-        (PlannerFault("CUDA error"), False),
+        (RuntimeError("No candidate produced a complete three-segment plan"), True, "NO_COMPLETE_PATH"),
+        (TimeoutError("Planning deadline exceeded"), True, "PLAN_TIMEOUT"),
+        (ValueError("bad scene"), False, "PLAN_REJECTED"),
+        (PlannerFault("CUDA error"), False, "PLANNER_FAULT"),
     ],
 )
-def test_only_an_exhausted_or_timed_out_search_is_retried_from_a_new_observation(setup, error, retryable):
+def test_only_an_exhausted_or_timed_out_search_is_retried_from_a_new_observation(setup, error, retryable, reason):
     """A new observation samples new candidates; a planner fault or a refused input is not a candidate problem."""
     make, admitted, _ = setup
     with pytest.raises(GraspFailure) as raised:
         plan(make(FailingService(error)), admitted)
     assert raised.value.code == NO_EXECUTABLE_CANDIDATE and raised.value.retryable is retryable
+    assert raised.value.reason_code == reason
     assert str(raised.value).startswith(f"{type(error).__name__}: {error}")
 
 

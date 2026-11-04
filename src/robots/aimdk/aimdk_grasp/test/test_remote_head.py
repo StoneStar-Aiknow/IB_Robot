@@ -155,7 +155,9 @@ class FakeHead(Node):
             time.sleep(0.01)
         goal_handle.succeed()
         if request.capture_id == "unplannable":
-            return PlanGraspCandidates.Result(success=False, error_code="NO_EXECUTABLE_CANDIDATE", message="none")
+            return PlanGraspCandidates.Result(
+                success=False, error_code="NO_EXECUTABLE_CANDIDATE", reason_code="OUT_OF_REACH", message="none"
+            )
         if request.capture_id == "flicker":
             return PlanGraspCandidates.Result(
                 success=False, error_code="REOBSERVE_REQUIRED", message="the target flickered", retryable=True
@@ -317,6 +319,7 @@ def test_a_plan_and_its_refinement_cross_and_keep_the_steps_already_run(ros):
     with pytest.raises(GraspFailure) as raised:
         planner.plan(unplannable, proposals, deadline=time.monotonic() + 5.0, cancelled=lambda: False)
     assert raised.value.code == "NO_EXECUTABLE_CANDIDATE" and not raised.value.retryable
+    assert raised.value.reason_code == "OUT_OF_REACH"
     flicker = observation.__class__(**{**vars(observation), "robot_state": RemoteCapture("flicker")})
     with pytest.raises(GraspFailure) as raised:  # the pipeline observes again, as on a single host
         planner.plan(flicker, proposals, deadline=time.monotonic() + 5.0, cancelled=lambda: False)

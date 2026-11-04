@@ -11,6 +11,7 @@ import uuid
 from typing import Any
 
 from embodied_common.agent_execution_contract import INTERACTIVE_CONFIRMATION
+from embodied_common.execution_detail import execution_context, short_message
 from embodied_common.skill_request import skill_goal_uuid, validate_request_schema_version
 from robot_skill_cli.output import EXIT_ROS_UNAVAILABLE, EXIT_TIMEOUT
 
@@ -129,6 +130,7 @@ class RosBridge:
             from rclpy.callback_groups import ReentrantCallbackGroup
             from rclpy.context import Context
             from rclpy.executors import MultiThreadedExecutor
+            from rclpy.qos import QoSProfile
 
             from embodied_common.wire_contracts import validate_public_request_wire_contracts
             from ibrobot_msgs.action import ExecuteAgentPlan, ExecuteProgram, PrimitiveCommand, SkillCommand
@@ -242,7 +244,11 @@ class RosBridge:
                 callback_group=callback_group,
             )
             self._program_client = ActionClient(
-                self._node, ExecuteProgram, self._execute_program_action, callback_group=callback_group
+                self._node,
+                ExecuteProgram,
+                self._execute_program_action,
+                callback_group=callback_group,
+                feedback_sub_qos_profile=QoSProfile(depth=256),
             )
             self._get_execution_client = self._node.create_client(
                 GetExecution, self._get_execution_service, callback_group=callback_group
@@ -862,7 +868,9 @@ class RosBridge:
             "execution_id": str(response.execution_id),
             "state": str(response.state),
             "error_code": str(response.error_code),
-            "message": str(response.message),
+            "message": short_message(response.message),
+            "last_event_sequence": int(response.last_event_sequence),
+            **execution_context(response),
             # Progress as the Gateway ledger recorded it; callers deciding a continuation need it.
             "completed_step_count": int(response.completed_step_count),
             "stop_requested": bool(response.stop_requested),

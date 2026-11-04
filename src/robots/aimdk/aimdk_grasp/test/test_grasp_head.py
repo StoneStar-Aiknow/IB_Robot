@@ -317,9 +317,10 @@ def test_a_plan_uses_the_completed_scene_and_wakes_the_imu_only_with_a_plan(head
     assert wire.plan_from_msg(result.plan).candidate_index == 0
     refined = call(node._on_refine, RefineGraspPlan, plan_id=result.plan_id, completed=0, timeout_s=1.0)
     assert refined.success and parts.planner.asked[-1][0] == "refine"
-    parts.planner.fail = GraspFailure("NO_EXECUTABLE_CANDIDATE", "none")
+    parts.planner.fail = GraspFailure("NO_EXECUTABLE_CANDIDATE", "none", reason_code="PLAN_TIMEOUT")
     result, _ = _plan(node, capture_id)
     assert (result.success, result.error_code, result.retryable) == (False, "NO_EXECUTABLE_CANDIDATE", False)
+    assert result.reason_code == "PLAN_TIMEOUT"
     parts.planner.fail = GraspFailure("REOBSERVE_REQUIRED", "the target flickered", retryable=True)
     result, _ = _plan(node, capture_id)
     assert (result.error_code, result.retryable) == ("REOBSERVE_REQUIRED", True)

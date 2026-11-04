@@ -69,6 +69,8 @@ class SequenceResult:
     released_after_success: bool = False
     completed: list[str] = field(default_factory=list)
     phases: list[dict] = field(default_factory=list)
+    reason_code: str = ""
+    recovery_state: str = "NOT_NEEDED"
 
 
 class _Stopped(Exception):
@@ -92,6 +94,7 @@ class GraspSequence:
         self._backends = backends
         self._home_tolerance = float(home_tolerance_rad)
         self._on_phase = on_phase
+        self._current_phase = ""
 
     def run(
         self, plan: GraspPlan, *, deadline: float, cancelled: Flag, release_after_success: bool = False
@@ -126,6 +129,18 @@ class GraspSequence:
                     if outcome.state is MotionState.HALTED:
                         blind(step.name)
                         result.retreated = {"step": step.name, "reason": str(state["moved"])}
+                        result.reason_code = "TARGET_MOVED"
+                        self._on_phase(
+                            step.name,
+                            "end",
+                            {
+                                "state": "failed",
+                                "error_code": "TARGET_MOVED",
+                                "reason_code": "TARGET_MOVED",
+                            },
+                        )
+                        result.recovery_state = "IN_PROGRESS"
+                        self._on_phase("recover", "start", {"recovery_state": "IN_PROGRESS"})
                         back = step.segment.walked_back(
                             self._stopped_at(step.segment, cancelled),
                             path_progress=outcome.report.get("path_progress"),
@@ -146,11 +161,22 @@ class GraspSequence:
                         if outcome.halted:
                             blind(step.name)
                             result.retreated = {"step": step.name, "reason": str(state["moved"])}
+                            result.reason_code = "TARGET_MOVED"
+                            self._on_phase(
+                                step.name,
+                                "end",
+                                {
+                                    "state": "failed",
+                                    "error_code": "TARGET_MOVED",
+                                    "reason_code": "TARGET_MOVED",
+                                },
+                            )
                             abandoned = True
                             break
                         self._expect_effect(outcome)
                         result.held, result.held_confidence = outcome.held, outcome.confidence
-                        if outcome.held is False:
+                        if outcome.held is not True:
+                            result.reason_code = "EMPTY_GRASP" if outcome.held is False else "GRASP_UNCERTAIN"
                             abandoned = True
                             break
                         state["carrying"] = True
@@ -162,6 +188,7 @@ class GraspSequence:
                         lost = self._hold_carrying(step, cancelled, result)
                         if lost:
                             result.held, result.lost = False, lost
+                            result.reason_code = "GRIP_LOST"
                             abandoned = True
                             break
                     else:
@@ -169,24 +196,60 @@ class GraspSequence:
                     done.append(step)
                 index += 1
             if not abandoned:
+                self._current_phase = "verify"
+                self._on_phase("verify", "start", {})
+                holding = getattr(self._backends.effector, "holding", None)
+                grip = holding() if holding is not None else None
+                verified = result.held is True and grip == ""
+                if not verified:
+                    result.held = False if grip else None
+                    result.reason_code = "GRIP_LOST" if grip else "GRASP_UNCERTAIN"
+                    result.lost = str(grip or "")
+                    abandoned = True
+                self._on_phase(
+                    "verify",
+                    "end",
+                    {
+                        "state": "succeeded" if verified else "failed",
+                        "error_code": "" if verified else "GRASP_VERIFICATION_FAILED",
+                        "reason_code": "" if verified else result.reason_code,
+                    },
+                )
+            if not abandoned:
                 if release_after_success:
                     self._release(plan, done, state, cancelled, result)
                     result.released_after_success = not state["carrying"]
                 result.succeeded = True
                 return result
-            self._undo(plan, done, state, cancelled, result)
+            self._recover(plan, done, state, cancelled, result)
             if result.retreated is not None:
                 result.error_code, result.message = "TARGET_MOVED", f"target moved: {result.retreated['reason']}"
             elif result.lost:
                 result.error_code, result.message = "GRASP_VERIFICATION_FAILED", f"grip lost while held: {result.lost}"
             else:
-                result.error_code, result.message = "GRASP_VERIFICATION_FAILED", "nothing held after closing"
+                result.error_code = "GRASP_VERIFICATION_FAILED"
+                result.message = (
+                    "grip state unknown" if result.reason_code == "GRASP_UNCERTAIN" else "nothing held after closing"
+                )
             return result
         except GraspFailure as failure:
+            if result.recovery_state in {"IN_PROGRESS", "FAILED"}:
+                self._stop(result, failure.code, str(failure))
+                return result
             # A refinement that cannot continue: undo from where the arm rests.
             result.error_code, result.message = failure.code, str(failure)
+            result.reason_code = failure.reason_code
+            self._on_phase(
+                self._current_phase,
+                "end",
+                {
+                    "state": "failed",
+                    "error_code": failure.code,
+                    "reason_code": failure.reason_code,
+                },
+            )
             try:
-                self._undo(plan, done, state, cancelled, result)
+                self._recover(plan, done, state, cancelled, result)
             except _Stopped as stopped:
                 self._stop(result, stopped.code, f"{failure}; then {stopped}")
             except Exception as exc:  # noqa: BLE001 - stop in place and say why
@@ -207,6 +270,12 @@ class GraspSequence:
         else:
             ok = outcome.succeeded and not outcome.halted
             state = "halted" if outcome.halted else "succeeded" if outcome.succeeded else "failed"
+            if name == "close" and ok and outcome.held is not True:
+                ok, state = False, "failed"
+                detail.update(
+                    error_code="GRASP_VERIFICATION_FAILED",
+                    reason_code="EMPTY_GRASP" if outcome.held is False else "GRASP_UNCERTAIN",
+                )
         row = {"name": name, "state": state, "reason": outcome.reason, **detail}
         row.update({k: v for k, v in dict(outcome.report).items() if k not in row})
         result.phases.append(row)
@@ -215,15 +284,18 @@ class GraspSequence:
         self._on_phase(name, "end", row)
 
     def _move(self, segment: ArmSegment, carrying: bool, halted: Flag, cancelled: Flag, result) -> MotionOutcome:
+        self._current_phase = segment.name
         self._on_phase(segment.name, "start", {"kind": segment.kind.value, "carrying": carrying})
         outcome = self._backends.executor.execute(segment, carrying=carrying, halted=halted, cancelled=cancelled)
         self._phase(result, segment.name, outcome, carrying=carrying)
         return outcome
 
-    def _hold(self, step: Hold, carrying: bool, cancelled: Flag, result) -> MotionOutcome:
+    def _hold(self, step: Hold, carrying: bool, cancelled: Flag, result, *, publish=True) -> MotionOutcome:
+        self._current_phase = step.name
         self._on_phase(step.name, "start", {"seconds": step.seconds})
         outcome = self._backends.executor.hold(step.seconds, carrying=carrying, cancelled=cancelled)
-        self._phase(result, step.name, outcome)
+        if publish:
+            self._phase(result, step.name, outcome)
         return outcome
 
     def _hold_carrying(self, step: Hold, cancelled: Flag, result) -> str:
@@ -244,10 +316,17 @@ class GraspSequence:
                 lost.append(reason)
             return bool(reason)
 
-        outcome = self._hold(step, True, stopped, result)
+        outcome = self._hold(step, True, stopped, result, publish=False)
         if lost:
-            result.phases[-1].update(state="grip_lost", reason=lost[0])
+            self._phase(
+                result,
+                step.name,
+                MotionOutcome(MotionState.FAILED, lost[0]),
+                error_code="GRASP_VERIFICATION_FAILED",
+                reason_code="GRIP_LOST",
+            )
             return lost[0]
+        self._phase(result, step.name, outcome)
         self._expect(outcome)
         return ""
 
@@ -261,6 +340,7 @@ class GraspSequence:
         sequence stops as for a failed move; a cancelled action is CANCELED,
         not a broken end effector.
         """
+        self._current_phase = action.value
         self._on_phase(action.value, "start", {})
         supervise = getattr(self._backends.executor, "supervise", None)
         check = supervise() if supervise is not None else (lambda: "")
@@ -313,6 +393,19 @@ class GraspSequence:
 
     # -- taking the plan back ----------------------------------------------------
 
+    def _recover(self, plan, done, state, cancelled, result) -> None:
+        if result.recovery_state != "IN_PROGRESS":
+            result.recovery_state = "IN_PROGRESS"
+            self._on_phase("recover", "start", {"recovery_state": "IN_PROGRESS"})
+        try:
+            self._undo(plan, done, state, cancelled, result)
+        except Exception:
+            result.recovery_state = "FAILED"
+            self._on_phase("recover", "end", {"state": "failed", "recovery_state": "FAILED"})
+            raise
+        result.recovery_state = "COMPLETED"
+        self._on_phase("recover", "end", {"state": "succeeded", "recovery_state": "COMPLETED"})
+
     def _undo(self, plan: GraspPlan, done: list[Step], state: dict, cancelled: Flag, result) -> None:
         for step in reversed(done):
             if isinstance(step, Move):
@@ -359,7 +452,20 @@ class GraspSequence:
     def _stop(self, result: SequenceResult, code: str, message: str) -> None:
         result.succeeded, result.at_rest = False, False
         result.error_code, result.message = code, message
+        result.reason_code = result.reason_code or code
+        result.recovery_state = "FAILED"
         try:
             self._backends.executor.stop(message)
         except Exception as exc:  # noqa: BLE001 - the first failure is the one to report
             result.message = f"{message}; stop failed: {type(exc).__name__}: {exc}"
+            result.recovery_state = "UNKNOWN"
+        self._on_phase(
+            self._current_phase,
+            "end",
+            {
+                "state": "cancelled" if code == "CANCELED" else "failed",
+                "error_code": code,
+                "reason_code": result.reason_code,
+                "recovery_state": result.recovery_state,
+            },
+        )

@@ -39,6 +39,7 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>embodied_common</test_depend>
   <!-- The migrated mirror-session builder tests import robot_config's
        launch preparation pipeline (design decision 4). -->
   <test_depend>robot_config</test_depend>

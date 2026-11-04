@@ -47,6 +47,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SkillRegistryEvent.msg"
   "msg/AgentPlan.msg"
   "msg/ExecutionEvent.msg"
+  "msg/ExecutionDetail.msg"
   "msg/SceneAnalysisRequest.msg"
   "msg/SceneAnalysisResult.msg"
   "msg/VisualGameEvent.msg"

@@ -224,9 +224,18 @@ class X2GraspPlanner:
             # picks, all before the arm moved, none retried). Candidates out of
             # reach, a refused plan and a planner fault are not retried.
             cause = exc.__cause__ if isinstance(exc, _SearchExhausted) else exc
-            raise GraspFailure(NO_EXECUTABLE_CANDIDATE, f"{type(cause).__name__}: {cause}", retryable=True) from exc
+            raise GraspFailure(
+                NO_EXECUTABLE_CANDIDATE,
+                f"{type(cause).__name__}: {cause}",
+                retryable=True,
+                reason_code="PLAN_TIMEOUT" if isinstance(exc, TimeoutError) else "NO_COMPLETE_PATH",
+            ) from exc
         except (RuntimeError, ValueError, PlannerFault) as exc:
-            raise GraspFailure(NO_EXECUTABLE_CANDIDATE, f"{type(exc).__name__}: {exc}") from exc
+            raise GraspFailure(
+                NO_EXECUTABLE_CANDIDATE,
+                f"{type(exc).__name__}: {exc}",
+                reason_code="PLANNER_FAULT" if isinstance(exc, PlannerFault) else "PLAN_REJECTED",
+            ) from exc
         finally:
             ready = report["request_timings_s"].get("complete_plan_ready")
             report["within_target"] = ready is not None and ready <= self.config.target_s
@@ -270,7 +279,11 @@ class X2GraspPlanner:
             )
             report["candidate_prefilter"]["kept_indices"] = kept.tolist()
             if not len(kept):
-                raise RuntimeError(f"No grasp candidate within {self.hand.side}-palm reach")
+                raise GraspFailure(
+                    NO_EXECUTABLE_CANDIDATE,
+                    f"No grasp candidate within {self.hand.side}-palm reach",
+                    reason_code="OUT_OF_REACH",
+                )
         check_deadline()
         try:
             plan, planning = measure(
@@ -290,6 +303,8 @@ class X2GraspPlanner:
             )
         except GraspFailure:
             raise  # a cancel or the goal deadline at a checkpoint (GraspFailure is a RuntimeError)
+        except (TimeoutError, PlannerFault):
+            raise
         except RuntimeError as exc:
             raise _SearchExhausted() from exc
         report.update(planning)

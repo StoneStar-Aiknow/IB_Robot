@@ -1,5 +1,9 @@
+import sqlite3
+from dataclasses import replace
+
 import pytest
 
+from embodied_common.execution_detail import ExecutionDetail
 from embodied_common.program_contracts import canonicalize_program
 from skill_library.execution_store import (
     ExecutionBusyError,
@@ -7,6 +11,88 @@ from skill_library.execution_store import (
     ExecutionQuarantinedError,
     SQLiteExecutionStore,
 )
+
+
+def test_progress_snapshots_are_durable_and_terminal_detail_is_immutable(tmp_path):
+    path = tmp_path / "executions.sqlite3"
+    store = SQLiteExecutionStore(path)
+    record, _ = store.begin(_program())
+    running = ExecutionDetail(1, "plan", "RUNNING", "", "", "NOT_NEEDED", 0, "NONE")
+    store.record_progress(
+        record.execution_id, current_skill="pick_object", workflow_step_index=0, execution_detail=running
+    )
+    failed = replace(
+        running, phase_state="FAILED", failed_phase="plan", reason_code="PLAN_TIMEOUT", suggested_action="WAIT_SERVICE"
+    )
+    terminal = store.finish(
+        record.execution_id,
+        state="FAILED",
+        completed_step_count=0,
+        error_code="NO_EXECUTABLE_CANDIDATE",
+        message="失败" * 400,
+        current_skill="pick_object",
+        workflow_step_index=0,
+        execution_detail=failed,
+    )
+    assert len(terminal.message) == 300
+    events = store.events_after(record.execution_id)
+    assert events[-2].execution_detail == running.to_dict()
+    assert events[-1].execution_detail == failed.to_dict()
+    late = store.record_progress(
+        record.execution_id, current_skill="old", workflow_step_index=0, execution_detail=running
+    )
+    assert late == terminal
+    with pytest.raises(ExecutionConflictError):
+        store.finish(
+            record.execution_id,
+            state="FAILED",
+            completed_step_count=0,
+            error_code=terminal.error_code,
+            message=terminal.message,
+            execution_detail=running,
+        )
+    store.close()
+    reopened = SQLiteExecutionStore(path)
+    assert reopened.get(execution_id=record.execution_id).execution_detail == failed.to_dict()
+    assert reopened.events_after(record.execution_id)[-2].execution_detail == running.to_dict()
+    reopened.close()
+
+
+def test_previous_child_cannot_overwrite_a_newer_step(tmp_path):
+    store = SQLiteExecutionStore(tmp_path / "executions.sqlite3")
+    record, _ = store.begin(
+        _program(workflow_steps=[{"schema_version": 1, "skill_name": name} for name in ("pick_object", "navigate")])
+    )
+    detail = ExecutionDetail(1, "travel", "RUNNING", "", "", "NOT_NEEDED", 0, "NONE")
+    current = store.record_progress(
+        record.execution_id, current_skill="navigate", workflow_step_index=1, execution_detail=detail
+    )
+    late = store.record_progress(
+        record.execution_id, current_skill="pick_object", workflow_step_index=0, execution_detail=ExecutionDetail()
+    )
+    assert late == current and store.events_after(record.execution_id)[-1].current_skill == "navigate"
+    store.finish(record.execution_id, state="SUCCEEDED", completed_step_count=2)
+    with pytest.raises(ExecutionConflictError):
+        store.finish(record.execution_id, state="UNKNOWN", completed_step_count=2)
+    assert not store.has_unresolved_unknown()
+    store.close()
+
+
+def test_migration_preserves_legacy_terminal_and_events(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    store = SQLiteExecutionStore(path)
+    record, _ = store.begin(_program())
+    store.finish(record.execution_id, state="SUCCEEDED", completed_step_count=1)
+    store.close()
+    with sqlite3.connect(path) as database:
+        for table in ("executions", "execution_events"):
+            for column in ("execution_detail_json", "current_skill", "workflow_step_index"):
+                database.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    migrated = SQLiteExecutionStore(path)
+    assert migrated.get(execution_id=record.execution_id).state == "SUCCEEDED"
+    assert migrated.get(execution_id=record.execution_id).execution_detail["schema_version"] == 0
+    assert migrated.events_after(record.execution_id)[-1].state == "SUCCEEDED"
+    migrated.close()
 
 
 def _program(**overrides):

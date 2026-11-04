@@ -74,7 +74,9 @@ class AutomaticPlanner:
             except GraspFailure as exc:
                 if exc.code not in ("NO_EXECUTABLE_CANDIDATE", "SKILL_TIMEOUT"):
                     raise
-                failures[side] = dict(code=exc.code, message=str(exc), retryable=exc.retryable)
+                failures[side] = dict(
+                    code=exc.code, reason_code=exc.reason_code, message=str(exc), retryable=exc.retryable
+                )
                 continue
             scenes.selected_side = side
             return replace(
@@ -85,10 +87,15 @@ class AutomaticPlanner:
                     "arm_selection": dict(attempted=list(failures) + [side], failures=failures),
                 },
             )
+        # A shared reason remains useful to the Agent; differing arm failures
+        # keep the generic summary rather than claiming one cause for both.
+        reasons = {item.get("reason_code") or item["code"] for item in failures.values()}
+        reason = next(iter(reasons)) if len(reasons) == 1 else "NO_EXECUTABLE_CANDIDATE"
         raise GraspFailure(
             "NO_EXECUTABLE_CANDIDATE",
             f"No selected arm could plan: {failures}",
             retryable=budget_exhausted or any(item.get("retryable", False) for item in failures.values()),
+            reason_code="PLAN_TIMEOUT" if budget_exhausted else reason,
         )
 
     def refine(self, plan, completed, **budget):

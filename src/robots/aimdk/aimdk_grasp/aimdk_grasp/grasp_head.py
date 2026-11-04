@@ -323,11 +323,13 @@ class X2GraspHeadNode(Node):
             if head.imu is not None:
                 head.imu.pause()
             result.success, result.error_code, result.message = False, failure.code, str(failure)
+            result.reason_code = failure.reason_code
             result.retryable = bool(failure.retryable)
         except Exception as exc:  # noqa: BLE001 - answer the goal; an escaping error ends the head process
             if head.imu is not None:
                 head.imu.pause()
             result.success, result.error_code = False, "INTERNAL_ERROR"
+            result.reason_code = "INTERNAL_ERROR"
             result.message = f"{type(exc).__name__}: {exc}"
         else:
             if head.imu is not None:

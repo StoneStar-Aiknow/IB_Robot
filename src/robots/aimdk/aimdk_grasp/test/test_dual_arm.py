@@ -60,7 +60,7 @@ def test_midline_returns_the_first_valid_plan_and_reserves_budget_for_the_other_
         def run(observation, proposals, *, deadline, cancelled):
             calls.append((side, deadline, proposals.scene))
             if side == "left" and first_fails:
-                raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "no IK", retryable=True)
+                raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "no IK", retryable=True, reason_code="NO_COMPLETE_PATH")
             return plan(side)
 
         return SimpleNamespace(plan=run)
@@ -73,6 +73,39 @@ def test_midline_returns_the_first_valid_plan_and_reserves_budget_for_the_other_
     assert result.report["arm_side"] == scenes.selected_side == ("right" if first_fails else "left")
     assert calls[0] == ("left", 105.5, "left scene")
     assert calls[1:] == ([("right", 110.0, "right scene")] if first_fails else [])
+    if first_fails:
+        assert result.report["arm_selection"]["failures"]["left"]["reason_code"] == "NO_COMPLETE_PATH"
+
+
+@pytest.mark.parametrize(
+    "failures, expected_reason, retryable",
+    [
+        ({"left": ("OUT_OF_REACH", False)}, "OUT_OF_REACH", False),
+        ({"right": ("OUT_OF_REACH", False)}, "OUT_OF_REACH", False),
+        ({"right": ("NO_COMPLETE_PATH", True)}, "NO_COMPLETE_PATH", True),
+        ({"left": ("PLAN_TIMEOUT", True)}, "PLAN_TIMEOUT", True),
+        ({"right": ("PLANNER_FAULT", False)}, "PLANNER_FAULT", False),
+        ({"left": ("OUT_OF_REACH", False), "right": ("OUT_OF_REACH", False)}, "OUT_OF_REACH", False),
+        ({"left": ("OUT_OF_REACH", False), "right": ("NO_COMPLETE_PATH", True)}, "NO_EXECUTABLE_CANDIDATE", True),
+    ],
+)
+def test_selected_arm_failures_preserve_specific_or_mixed_reasons(monkeypatch, failures, expected_reason, retryable):
+    monkeypatch.setattr("aimdk_grasp.dual_arm.time.monotonic", lambda: 101.0)
+
+    def attempt(observation, proposals, **budget):
+        reason, can_retry = failures[proposals.scene]
+        raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "no plan", retryable=can_retry, reason_code=reason)
+
+    planner = AutomaticPlanner({side: SimpleNamespace(plan=attempt) for side in failures})
+    observation = SimpleNamespace(robot_state=SimpleNamespace(started=100.0))
+    scenes = ArmScenes({side: side for side in failures})
+    proposals = Proposals(np.ones((1, 1), bool), np.zeros((1, 3)), np.eye(4)[None], np.ones(1), scene=scenes)
+    with pytest.raises(GraspFailure) as error:
+        planner.plan(observation, proposals, deadline=180.0, cancelled=lambda: False)
+    assert error.value.code == "NO_EXECUTABLE_CANDIDATE"
+    assert error.value.reason_code == expected_reason
+    assert error.value.retryable is retryable
+    assert scenes.selected_side is None
 
 
 def test_cancel_never_falls_back_to_the_other_arm():
@@ -96,6 +129,7 @@ def test_spent_observation_budget_requests_a_fresh_attempt(monkeypatch):
         planner.plan(observation, proposals, deadline=180.0, cancelled=lambda: False)
     assert error.value.code == "NO_EXECUTABLE_CANDIDATE"
     assert error.value.retryable
+    assert error.value.reason_code == "PLAN_TIMEOUT"
 
 
 @pytest.mark.parametrize("capture_fails", [False, True])

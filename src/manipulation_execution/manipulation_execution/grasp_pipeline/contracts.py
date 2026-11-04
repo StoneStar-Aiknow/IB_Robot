@@ -48,9 +48,10 @@ class GraspFailure(RuntimeError):
     let the pipeline observe again while attempts remain.
     """
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False):
+    def __init__(self, code: str, message: str, *, retryable: bool = False, reason_code: str = ""):
         super().__init__(message)
         self.code = code
+        self.reason_code = reason_code or code
         self.retryable = retryable
 
 

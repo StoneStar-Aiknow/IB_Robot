@@ -288,6 +288,7 @@ def test_a_streaming_arm_picks_and_holds_the_object_lifted():
         "close",
         "lift",
         "hold_lifted",
+        "verify",
     ]
     # The watch is polled only while nothing is held.
     assert watch.polls == 11 + 5 and outcome.report["watch"] == [{"polls": 16}]
@@ -439,7 +440,7 @@ def test_a_grip_that_slips_while_held_is_not_a_pick_and_is_taken_back():
     assert names(executor) == ["approach", "grasp", "lift", "hold", "retreat_lift", "retreat_grasp", "retreat_approach"]
     assert effector.log[-1] is EffectorAction.RELEASE
     hold = next(row for row in outcome.report["executions"][-1]["phases"] if row["name"] == "hold_lifted")
-    assert hold["state"] == "grip_lost" and "no longer press" in hold["reason"]
+    assert hold["state"] == "failed" and hold["reason_code"] == "GRIP_LOST" and "no longer press" in hold["reason"]
     backends, executor, effector, _, _ = streaming()  # a grip that holds changes nothing
     assert run(backends).success and names(executor) == ["approach", "grasp", "lift", "hold"]
 
@@ -451,6 +452,10 @@ def test_nothing_held_skips_the_lift_and_takes_everything_back():
     assert not outcome.success and outcome.error_code == "GRASP_VERIFICATION_FAILED" and outcome.held is False
     assert names(executor) == ["approach", "grasp", "retreat_grasp", "retreat_approach"]
     assert effector.log[-1] is EffectorAction.RELEASE and outcome.at_rest
+    detail = outcome.execution_detail
+    assert detail.phase == "recover" and detail.phase_state == "SUCCEEDED"
+    assert detail.recovery_state == "COMPLETED"
+    assert detail.failed_phase == "close" and detail.reason_code == "EMPTY_GRASP"
 
 
 def test_a_retrace_that_lands_off_home_gets_one_correction():
@@ -549,7 +554,13 @@ def test_an_observation_that_another_capture_may_fix_is_taken_again():
     outcome = run(backends)
     assert outcome.success and outcome.attempts == 2 and backends.observation.captures == 2
     assert outcome.retries == [
-        {"attempt": 1, "retry": "reobserve", "code": "OBSERVATION_UNAVAILABLE", "message": "feedback 372 ms old"}
+        {
+            "attempt": 1,
+            "retry": "reobserve",
+            "code": "OBSERVATION_UNAVAILABLE",
+            "message": "feedback 372 ms old",
+            "state": "started",
+        }
     ]
     backends, executor, *_ = streaming()
     backends.observation.failures = [GraspFailure("OBSERVATION_UNAVAILABLE", "x", retryable=True)] * 2

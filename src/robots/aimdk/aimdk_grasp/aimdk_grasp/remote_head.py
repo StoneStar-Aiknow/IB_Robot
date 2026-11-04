@@ -255,7 +255,12 @@ class RemotePlanner:
         )
         result = outcome.result
         if not result.success:
-            raise GraspFailure(result.error_code or RPC_FAILED, result.message, retryable=bool(result.retryable))
+            raise GraspFailure(
+                result.error_code or RPC_FAILED,
+                result.message,
+                retryable=bool(result.retryable),
+                reason_code=result.reason_code,
+            )
         return self._with_plan_id(wire.plan_from_msg(result.plan), result.plan_id)
 
     def refine(self, plan: GraspPlan, completed: int, *, deadline: float, cancelled: Flag) -> GraspPlan:
