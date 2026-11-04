@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import yaml
 
 from embodied_common.dispatch_binding import delegated_executor_identity
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
@@ -147,6 +148,67 @@ def test_bound_named_motion_skill_compiles_without_arguments(tmp_path):
     assert snapshot.templates["handshake"]["executor"] == "runtime_named_motion"
     assert snapshot.capability_view["handshake"]["required_control_mode"] == "named_motion"
     assert list(snapshot.capability_view["handshake"]["required_capabilities"]) == ["motion.named"]
+
+
+def test_g1_preset_catalog_exposes_only_horizontal_arms_without_recovery():
+    context = _context()
+    context = replace(context, robot=replace(context.robot, robot_name="unitree_g1_arm_presets"))
+    snapshot = compile_skill_catalog(
+        DevelopmentStagingSkillSource(Path(__file__).resolve().parents[1]),
+        profile_name="unitree_g1_arm_presets",
+        context=context,
+    )
+    assert snapshot.enabled_skill_names == ("arms_horizontal",)
+    assert snapshot.planner_visible_skill_names == ("arms_horizontal",)
+    assert snapshot.templates["arms_horizontal"]["binding"] == {"motion": "arms_horizontal"}
+    assert snapshot.templates["arms_horizontal"]["executor"] == "runtime_named_motion"
+    assert snapshot.capability_view["arms_horizontal"]["recovery_policy"] == "never_retry"
+
+
+def test_display_metadata_changes_capability_digest_not_execution_binding(tmp_path):
+    _write_catalog(tmp_path)
+    before = _compile(tmp_path)
+    assert "display_name" not in before.capability_view["handshake"]
+    assert "tags" not in before.capability_view["handshake"]
+    manifest_path = tmp_path / "config/skills/handshake/manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["capability"].update(display_name="握手", tags=["preset"])
+    manifest_path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
+
+    after = _compile(tmp_path)
+
+    assert after.capability_digest != before.capability_digest
+    assert after.templates == before.templates
+    assert after.capability_view["handshake"]["display_name"] == "握手"
+    assert list(after.capability_view["handshake"]["tags"]) == ["preset"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("display_name", None),
+        ("display_name", " "),
+        ("display_name", "a" * 121),
+        ("display_name", "wave\n"),
+        ("display_name", "wave\x7f"),
+        ("tags", "preset"),
+        ("tags", ["preset", "preset"]),
+        ("tags", [{}]),
+        ("tags", ["Preset"]),
+        ("tags", ["预置"]),
+        ("tags", ["a" * 33]),
+        ("tags", [f"tag_{i}" for i in range(9)]),
+    ],
+)
+def test_invalid_display_metadata_rejected_by_source(tmp_path, field, value):
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config/skills/handshake/manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["capability"][field] = value
+    manifest_path.write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    with pytest.raises(SkillCompileError) as raised:
+        _compile(tmp_path)
+    assert f"capability.{field}" in [item.field_path for item in raised.value.diagnostics]
 
 
 def test_named_motion_mode_is_valid_in_a_v1_robot_context():

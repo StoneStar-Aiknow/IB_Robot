@@ -255,6 +255,29 @@ def test_consumer_accepts_compiled_required_capabilities(tmp_path):
     ]
 
 
+@pytest.mark.parametrize("version", [None, 2])
+def test_derived_capability_view_preserves_optional_presentation_fields(tmp_path, version):
+    registry = json.loads(_snapshot(tmp_path).registry_preimage_json)
+    capability = registry["skills"][0]["template"]["capability"]
+    capability.update(display_name="张开夹爪", tags=["preset"])
+    if version is not None:
+        capability["schema_version"] = version
+    rebuilt = derive_capability_view_from_registry(registry)["open_gripper_skill"]
+    assert rebuilt["display_name"] == "张开夹爪"
+    assert rebuilt["tags"] == ["preset"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("display_name", ""), ("display_name", "wave\n"), ("tags", "preset"), ("tags", ["preset", "preset"])],
+)
+def test_derived_capability_view_rejects_malformed_presentation_fields(tmp_path, field, value):
+    registry = json.loads(_snapshot(tmp_path).registry_preimage_json)
+    registry["skills"][0]["template"]["capability"][field] = value
+    with pytest.raises(ValueError, match="capability fields"):
+        derive_capability_view_from_registry(registry)
+
+
 @pytest.mark.parametrize("required", [[], [""], "motion.named", [7]])
 def test_derived_capability_view_rejects_malformed_required_capabilities(tmp_path, required):
     snapshot = _snapshot(tmp_path, required_capabilities="  required_capabilities: [motion.named]\n")

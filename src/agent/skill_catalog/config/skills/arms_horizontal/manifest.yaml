@@ -1,0 +1,32 @@
+schema_version: 1
+name: arms_horizontal
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Extend both arms horizontally using the G1 preset; do not automatically recover the pose.
+  category: social_greeting
+  when_to_use:
+    - request both arms held horizontally
+  aliases_zh: [双臂平举, 两臂平举]
+  aliases_en: [arms horizontal]
+  motion_scope: [arm]
+  anchor_pose: none
+  intensity: moderate
+  # Offline scheduling estimate only, not measured physical duration.
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Extend both arms horizontally with no automatic recovery action.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities: [motion.named]
+implementations:
+  g1_preset_v1: implementations/g1_preset_v1.yaml

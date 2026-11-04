@@ -12,6 +12,16 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 - `config/skills/<name>/SKILL.md`: human/Agent documentation only; never executable configuration.
 - `config/profiles/<profile>.yaml`: enabled package, selected implementation, and planner visibility.
 
+Capabilities may include optional `display_name` (localized text, 1-120
+characters without control characters) and `tags` (up to eight unique lowercase
+identifiers, each at most 32 characters). These display fields are included in
+the capability snapshot and its digest; they never replace the stable skill
+`name` or alter execution bindings. A runtime provider may own display metadata
+and classification (`preset` is rendered as a separate badge).
+The catalog compiler and clients do not maintain vendor-specific translations.
+Older manifests without these fields remain valid. Display labels are not
+physical validation or motion-authorization claims.
+
 The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
 `lekiwi_handeye_realsense_grasp_lidar`,

@@ -113,7 +113,7 @@ admission.
 
 - 每个技能公开 `name`、`summary`、`domain`、`moves_robot`、`required_control_mode`、
   `parameters` 与 `recovery_policy`。字段从 `capability` 深拷贝，调用方修改返回值不会改写配置。
-- 共享 catalog 的 `list` 结果只使用 `name`、`summary`、`domain`、`moves_robot` 和
+- legacy/config catalog 的 `list` 结果只使用 `name`、`summary`、`domain`、`moves_robot` 和
   `required_control_mode`；`describe` 才补充 `parameters`、`recovery_policy`、完整 timeout policy
   及 digest。
 - `pose_names` 只公开名称，不公开位姿坐标。primitive sequence、目标绑定、关节/夹爪数值、
@@ -124,6 +124,12 @@ admission.
   `allow_nan=False`，且 `-0.0` 归一化为 `0.0`（由 `embodied_common.canon.to_canonical_json`
   统一实现，`robot_config`、`embodied_common`、`skill_catalog` 共用同一规范）。因此相同的
   公开能力、命名位姿名称或 timeout policy 才会得到相同 digest。
+
+生产快照还支持可选的 `display_name`（本地化显示名称）和 `tags`（分类标识）。
+`capability_presentation.presentation_errors()` 为编译器和快照验证共用格式检查；
+`skill_catalog.derive_capability_digest()` 将这些字段纳入严格字段集合与摘要；
+`skill_catalog.verify_snapshot_response()` 返回的 `VerifiedCatalogView.capability_view` 保留这些字段，
+但执行请求仍使用原始 `name`。显示名称与标签不代表动作授权或真机验证结果。
 
 `skill_request` 为 Gateway 请求提供同一套规范化规则：技能名和可选字符串会去首尾空白，
 `motion_direction` 会转为小写；`skill_name` 必须非空，`motion_distance`（给出时）必须为有限、
