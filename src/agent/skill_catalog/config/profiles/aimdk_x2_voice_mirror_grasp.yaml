@@ -1,0 +1,41 @@
+# The voice/gesture/mirror skills plus the grasp skills, for the deployment that
+# runs aimdk_x2_voice_mirror_grasp with the grasp pipeline switched on.
+#
+# This profile only compiles when grasp_execution is enabled: pick_object's
+# implementation targets the grasp_pipeline delegated executor, which the robot
+# config registers from grasp_execution. Naming it while the pipeline is off fails
+# with an unknown-executor diagnostic, which is the intended guard against
+# exposing a skill nothing can run.
+#
+# The robot config documents the four edits that turn the pipeline on together.
+schema_version: 1
+name: aimdk_x2_voice_mirror_grasp
+robot_name: aimdk_x2_voice_mirror_grasp
+enabled_skills:
+- name: wave_hand
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: handshake
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: raise_hand
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: blow_kiss
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: clap_hands
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: mirror_start
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: mirror_stop
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: self_introduction
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: pick_object
+  implementation: aimdk_x2_grasp
+  planner_visible: true
