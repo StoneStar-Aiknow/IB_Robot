@@ -76,7 +76,22 @@ def _install_stubs():
     ibrobot.srv = srv
     srv.SetRuntimeMode = types.SimpleNamespace(Request=types.SimpleNamespace)
     srv.StopRuntime = types.SimpleNamespace(Request=types.SimpleNamespace)
+    srv.StartArmSession = types.SimpleNamespace
     _mod("ibrobot_msgs.msg").RuntimeStatus = types.SimpleNamespace
+    _mod("ibrobot_msgs.msg").SessionLease = types.SimpleNamespace
+
+    def _arm_command_reference():
+        ns = types.SimpleNamespace
+        return ns(
+            header=ns(stamp=ns(sec=0, nanosec=0), frame_id=""),
+            reference=ns(position=ns(x=0.0, y=0.0, z=0.0), orientation=ns(x=0.0, y=0.0, z=0.0, w=1.0)),
+            position_error_m=0.0,
+            orientation_error_rad=0.0,
+            tracking=False,
+            reason="",
+        )
+
+    _mod("ibrobot_msgs.msg").ArmCommandReference = _arm_command_reference
 
     class _ArmReturnHome:
         class Goal:
@@ -157,6 +172,7 @@ class _FakeGoalHandle:
 def _make_node():
     node = mod.SO101PlacoServoNode.__new__(mod.SO101PlacoServoNode)
     node.managed_teleop = False
+    node._feedback_gap_pending = False
     node.arm_joint_names = ["1", "2", "3", "4", "5"]
     node.joint_lo = np.full(5, -2.0)
     node.joint_hi = np.full(5, 2.0)
@@ -221,6 +237,7 @@ def _make_node():
     node.get_logger = lambda: _FakeLogger()
     node.published = []
     node.cmd_pub = types.SimpleNamespace(publish=node.published.append)
+    node.ref_pub = None
     return node
 
 
@@ -244,6 +261,16 @@ def _managed_node():
     node._managed_mode = None
     node._frozen_reference = None
     node.reference_reset_threshold_m = 0.02
+    node.max_pose_step_m = 0.05
+    node._last_reject_reason = ""
+    node.ref_pub = None
+    node.tracking_tolerance_m = 0.06
+    node.tracking_stall_m = 0.002
+    node.tracking_lost_ticks = 15
+    node._last_solved_ee = None
+    node._solved_q = None
+    node._lost_count = 0
+    node._tracking = True
     node.input_mode = "auto"
     node.input_timeout = 0.2
     node.runtime_status_stale_s = 0.2
@@ -292,7 +319,7 @@ def _pose_message(stamp=123.0, frame="base", quaternion_w=1.0):
     return types.SimpleNamespace(
         header=header,
         pose=types.SimpleNamespace(
-            position=types.SimpleNamespace(x=0.1, y=0.0, z=0.0),
+            position=types.SimpleNamespace(x=0.01, y=0.0, z=0.0),
             orientation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=quaternion_w),
         ),
     )
@@ -580,6 +607,91 @@ def test_managed_joint_session_does_not_freeze_its_stale_cartesian_reference():
     _assert_start_uses_measured_pose(node)
 
 
+def test_managed_feedback_lost_during_hold_voids_the_reference_after_it_recovers():
+    node = _frozen_session(p_measured=(0.20, 0.0, 0.10))  # 50 mm off: under 90 mm.
+    node.reference_reset_threshold_m = 0.09
+    node._managed_stop("teleop stop requested")
+    node._managed_owner = False
+    node._now = lambda: 123.5
+    node._latest_js_received_at = 123.0  # Feedback gap longer than home_joint_state_stale_s.
+    node._on_control_tick()
+    node._now = lambda: 124.0
+    node._latest_js_received_at = 124.0  # Fresh again before the next start.
+    node._status_received_at = 124.0
+    response = _session_start(node)
+    assert response.success and response.reference_reset
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.10])
+
+
+def test_managed_feedback_gap_is_caught_when_the_recovering_sample_beats_the_tick():
+    # Gap 0.6 s against a 0.2 s budget; the recovering sample arrives before
+    # any tick sees the gap, so only the callback can catch it.
+    node = _frozen_session(p_measured=(0.20, 0.0, 0.10))  # 50 mm off: under 90 mm.
+    node.reference_reset_threshold_m = 0.09
+    node._managed_stop("teleop stop requested")
+    node._managed_owner = False
+    node._latest_js_received_at = 122.4
+    node._now = lambda: 123.0
+    node._on_joint_state(_joint_message(stamp=123.0))
+    assert node._latest_js_received_at == 123.0
+    node._now = lambda: 123.01
+    node._on_control_tick()  # Sees fresh feedback (0.01 s old).
+    response = _session_start(node)
+    assert response.success and response.reference_reset
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.10])
+
+
+def test_managed_steady_feedback_keeps_the_frozen_reference():
+    node = _frozen_session()
+    node._managed_stop("teleop stop requested")
+    node._managed_owner = False
+    for t in (123.0, 123.1, 123.2):  # 0.1 s apart, inside the 0.2 s budget.
+        node._now = lambda t=t: t
+        node._on_joint_state(_joint_message(stamp=123.0))
+        node._on_control_tick()
+    assert node._frozen_reference is not None
+
+
+def _owned_session_with_recovered_feedback_gap():
+    """Return an owned pose session whose 0.6 s feedback gap ends before any tick sees it."""
+    node = _frozen_session(p_measured=(0.20, 0.0, 0.10))  # 50 mm off: under 90 mm.
+    node.reference_reset_threshold_m = 0.09
+    node._latest_js_received_at = 122.4
+    node._now = lambda: 123.0
+    node._on_joint_state(_joint_message(stamp=123.0))
+    node._now = lambda: 123.01
+    return node
+
+
+def test_managed_session_holds_on_a_feedback_gap_that_recovered_before_the_tick():
+    node = _owned_session_with_recovered_feedback_gap()
+    node._on_control_tick()  # Sees fresh feedback (0.01 s old), input and lease fresh.
+    assert node.requests and node.requests[0].policy == "HOLD"
+    assert node._frozen_reference is None
+    node._now = lambda: 123.02
+    _assert_start_uses_measured_pose_at(node, [0.20, 0.0, 0.10])
+
+
+def test_managed_stop_before_the_tick_still_voids_a_reference_with_a_feedback_gap():
+    node = _owned_session_with_recovered_feedback_gap()
+    node._managed_stop("teleop stop requested")  # Stop service, before the tick consumes the flag.
+    assert node._frozen_reference is None
+
+
+def test_managed_session_without_any_feedback_still_expires():
+    node = _frozen_session()
+    node._latest_js_received_at = 0.0  # Never received: the tick still expires.
+    node._on_control_tick()
+    assert node.requests and node.requests[0].policy == "HOLD"
+
+
+def _assert_start_uses_measured_pose_at(node, expected):
+    node._status_received_at = node._now()
+    response = _session_start(node)
+    assert response.success and response.reference_reset
+    np.testing.assert_allclose(node._ee0_p, expected)
+
+
 def test_managed_home_voids_the_reference():
     node = _frozen_session()
     request = _activate_home(node)
@@ -595,6 +707,224 @@ def test_managed_refused_start_for_stale_feedback_voids_the_frozen_reference():
     assert not _clear_latch_and_start(node).success
     node._latest_js_received_at = 123.0
     _assert_start_uses_measured_pose(node)
+
+
+def _session_response():
+    def point(**fields):
+        return types.SimpleNamespace(**fields)
+
+    return types.SimpleNamespace(
+        success=False,
+        message="",
+        position_error_m=0.0,
+        reference_reset=False,
+        reference=point(
+            header=point(frame_id="", stamp=point(sec=0, nanosec=0)),
+            pose=point(position=point(x=0.0, y=0.0, z=0.0), orientation=point(x=0.0, y=0.0, z=0.0, w=1.0)),
+        ),
+    )
+
+
+def _session_start(node):
+    node._stop_pending = False
+    node._stop_latched = False
+    node._runtime_status = types.SimpleNamespace(active_mode="idle", lifecycle="ACTIVE", stop_latched=False)
+    node._managed_owner = False
+    request = mod._StartRequest(_session_response(), threading.Event())
+    node._start_request = request
+    node._process_start_request()
+    assert request.done.is_set()
+    return request.response
+
+
+def test_session_start_returns_the_frozen_reference_as_origin():
+    node = _frozen_session()
+    node._managed_stop("teleop stop requested")
+    resp = _session_start(node)
+    assert resp.success and resp.reference_reset is False
+    position = resp.reference.pose.position
+    np.testing.assert_allclose([position.x, position.y, position.z], [0.20, 0.0, 0.15])
+    np.testing.assert_allclose(resp.position_error_m, 0.01)
+    assert resp.reference.header.frame_id == "base"
+    q = resp.reference.pose.orientation
+    np.testing.assert_allclose(mod._quat_to_matrix(q.x, q.y, q.z, q.w), _rot_z(np.pi / 2), atol=1e-9)
+    stamp = resp.reference.header.stamp
+    np.testing.assert_allclose(stamp.sec + stamp.nanosec * 1e-9, node._managed_start_stamp, atol=1e-6)
+
+
+def test_session_start_reports_a_reset_reference():
+    node = _frozen_session(p_measured=(0.20, 0.0, 0.10))
+    node._managed_stop("teleop stop requested")
+    resp = _session_start(node)
+    assert resp.success and resp.reference_reset is True
+    assert resp.reference.pose.position.z == pytest.approx(0.10)
+    assert resp.position_error_m == pytest.approx(0.0)
+
+
+def test_first_session_start_reports_a_measured_reference():
+    node = _frozen_session()
+    node._p_ref = None
+    resp = _session_start(node)
+    assert resp.success and resp.reference_reset is True
+
+
+def test_refused_session_start_reports_nan_error():
+    node = _frozen_session()
+    node._start_request = object()  # Another mode transition is pending.
+    resp = node._on_session_start_srv(None, _session_response())
+    assert resp.success is False and np.isnan(resp.position_error_m)
+
+
+@pytest.mark.parametrize(
+    "stamp,refreshed",
+    [(123.0, True), (122.9, False), (122.5, False), (123.2, False)],
+)
+def test_session_lease_is_fenced_by_the_session_start_stamp(stamp, refreshed):
+    node = _managed_node()
+    node._last_lease_time = 100.0
+    node._on_session_lease(_joint_message(stamp))
+    assert (node._last_lease_time == 123.0) is refreshed
+
+
+def test_session_lease_cannot_refresh_without_an_owner():
+    node = _managed_node()
+    node._managed_owner = False
+    node._last_lease_time = 100.0
+    node._on_session_lease(_joint_message())
+    assert node._last_lease_time == 100.0
+
+
+def _pose_at(x, y=0.0, z=0.0, stamp=123.0):
+    message = _pose_message(stamp)
+    message.pose.position = types.SimpleNamespace(x=x, y=y, z=z)
+    return message
+
+
+def _pose_session():
+    node = _managed_node()
+    node._ee0_p = np.array([0.20, 0.0, 0.15])
+    node._p_ref = node._ee0_p.copy()
+    return node
+
+
+def test_pose_step_within_the_limit_is_followed():
+    node = _pose_session()
+    node._on_pose(_pose_at(0.03, 0.03))  # 42 mm from the reference.
+    assert node._latest_pose is not None and node._enabled
+    assert node.requests == []
+
+
+def test_first_pose_far_from_the_clutch_origin_ends_the_session_without_clamping():
+    node = _pose_session()
+    node._on_pose(_pose_at(0.06))
+    assert node._latest_pose is None  # Not followed, not clamped.
+    assert not node._enabled and not node._managed_owner
+    assert node.requests[0].policy == "HOLD"
+    assert "max_pose_step_m" in node._last_reject_reason
+    np.testing.assert_allclose(node._frozen_reference[0], [0.20, 0.0, 0.15])  # The reference stays.
+
+
+def test_pose_step_is_measured_from_the_current_reference_not_the_previous_pose():
+    node = _pose_session()
+    node._p_ref = np.array([0.24, 0.0, 0.15])  # The arm already followed earlier poses to +40 mm.
+    node._on_pose(_pose_at(0.08))  # 80 mm from the origin, 40 mm from the reference.
+    assert node._latest_pose is not None and node.requests == []
+    node._on_pose(_pose_at(-0.02))  # 60 mm back past the origin.
+    assert node.requests[0].policy == "HOLD"
+
+
+def _reference_session(commanded_z):
+    """A pose session holding reference (0.20, 0, 0.15); the QP commands height commanded_z."""
+    node, _ = _clutch_pose_tick(position_only=False)
+    node._p_ref = np.array([0.20, 0.0, 0.15])
+    node._r_ref = np.eye(3)
+    node._latest_pose = None  # Hold the reference.
+    node.published_references = []
+    node.ref_pub = types.SimpleNamespace(publish=node.published_references.append)
+    measured = np.full(5, 0.1)  # The fake QP commands zeros, so the two are told apart by value.
+    node._measured_q = measured
+
+    def ee_position(q):
+        return np.array([0.20, 0.0, 0.14] if np.allclose(q, measured) else [0.20, 0.0, node.commanded_z])
+
+    node.commanded_z = commanded_z
+    node.diffik.ee_position = ee_position
+    node.diffik.ee_rotation = lambda q: np.eye(3)
+    return node
+
+
+def test_reference_topic_reports_the_reference_and_its_measured_error():
+    node = _reference_session(commanded_z=0.15)
+    node._on_control_tick()
+    msg = node.published_references[-1]
+    p = msg.reference.position
+    assert (p.x, p.y, p.z) == pytest.approx((0.20, 0.0, 0.15))
+    assert msg.header.frame_id == "base"
+    assert msg.position_error_m == pytest.approx(0.01)  # Measured sag, not tracking.
+    assert msg.orientation_error_rad == pytest.approx(0.0)
+    assert msg.tracking and msg.reason == ""
+
+
+def _hold_command_at(node, heights):
+    """Run ticks where the fake QP commands the given end-effector heights."""
+    for z in heights:
+        node.commanded_z = z
+        node._on_control_tick()
+    return node.published_references[-1]
+
+
+def test_reference_topic_reports_lost_tracking_only_after_the_command_stalls():
+    node = _reference_session(commanded_z=0.08)  # The QP stops 70 mm short of the reference.
+    msg = _hold_command_at(node, [0.08] * 15)  # First tick has no previous command: 14 stalled ticks.
+    assert msg.tracking
+    msg = _hold_command_at(node, [0.08])
+    assert not msg.tracking and "not tracking" in msg.reason
+    assert msg.reference.position.z == pytest.approx(0.15)  # Lost tracking does not move the reference.
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.15])
+
+
+def test_reference_topic_does_not_report_lag_while_the_command_closes_the_gap():
+    node = _reference_session(commanded_z=0.0)
+    msg = _hold_command_at(node, [0.005 * i for i in range(30)])  # 150-5 mm short, moving 5 mm per tick.
+    assert msg.tracking
+
+
+def test_reference_topic_does_not_report_a_stalled_command_inside_the_tolerance():
+    node = _reference_session(commanded_z=0.10)  # 50 mm short: the soft orientation task can hold it there.
+    assert _hold_command_at(node, [0.10] * 40).tracking
+
+
+def test_reference_topic_restarts_the_lost_tracking_count_when_the_command_moves():
+    node = _reference_session(commanded_z=0.08)
+    _hold_command_at(node, [0.08] * 14)
+    msg = _hold_command_at(node, [0.085] * 15)  # One 5 mm step restarts the count.
+    assert msg.tracking
+
+
+def test_reference_topic_is_silent_during_a_joint_stream_session():
+    node = _reference_session(commanded_z=0.15)
+    node._on_control_tick()
+    assert len(node.published_references) == 1
+    node._managed_mode = "joint"  # The leader arm's first full joint intent.
+    for _ in range(20):
+        node._on_control_tick()
+    assert len(node.published_references) == 1  # The start origin is no longer tracked.
+
+
+def test_reference_topic_keeps_the_frozen_reference_and_reason_after_a_step_rejection():
+    node = _reference_session(commanded_z=0.15)
+    node._on_pose(_pose_at(0.10))
+    node._on_control_tick()
+    msg = node.published_references[-1]
+    assert "max_pose_step_m" in msg.reason
+    assert msg.reference.position.z == pytest.approx(0.15)
+
+
+def test_reference_topic_orientation_error_is_nan_when_position_only():
+    node = _reference_session(commanded_z=0.15)
+    node.position_only = True
+    node._on_control_tick()
+    assert np.isnan(node.published_references[-1].orientation_error_rad)
 
 
 def test_managed_home_requires_owner_and_fresh_lease():

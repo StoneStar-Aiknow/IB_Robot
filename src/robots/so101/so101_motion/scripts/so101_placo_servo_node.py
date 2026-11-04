@@ -60,13 +60,14 @@ from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
+from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Empty, Float64MultiArray
 from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import ArmReturnHome
-from ibrobot_msgs.msg import RuntimeStatus
-from ibrobot_msgs.srv import SetRuntimeMode, StopRuntime
+from ibrobot_msgs.msg import ArmCommandReference, RuntimeStatus, SessionLease
+from ibrobot_msgs.srv import SetRuntimeMode, StartArmSession, StopRuntime
 
 # The radian-native Placo wrapper lives next to this node (installed into the
 # same lib/<pkg> directory). Make the script dir importable so both the
@@ -238,6 +239,10 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("linear_cmd_topic", "/so101_placo_servo_node/linear_cmd_base")
         self.declare_parameter("angular_cmd_topic", "/so101_placo_servo_node/angular_cmd_base")
         self.declare_parameter("start_service", "/so101_placo_servo_node/start")
+        # Managed session endpoints; empty disables them. They share the state
+        # of start_service and command_lease_topic, which stay for old clients.
+        self.declare_parameter("session_start_service", "")
+        self.declare_parameter("session_lease_topic", "")
         self.declare_parameter("stop_service", "/so101_placo_servo_node/stop")
         self.declare_parameter("home_action", "/so101_placo_servo_node/return_home")
         self.declare_parameter("command_lease_topic", "/so101_placo_servo_node/command_lease")
@@ -283,6 +288,17 @@ class SO101PlacoServoNode(Node):
         # Managed start keeps the frozen command-side reference while it is within
         # this distance (m) of the measured end-effector position.
         self.declare_parameter("reference_reset_threshold_m", 0.09)
+        # A managed pose whose target is farther than this (m) from the current
+        # command-side reference ends the session instead of being followed.
+        self.declare_parameter("max_pose_step_m", 0.10)
+        # Managed reference feedback; empty disables it. The command is reported
+        # as not tracking once it stays farther than the tolerance (m) from the
+        # reference while moving less than the stall distance (m) per tick, for
+        # this many consecutive control ticks.
+        self.declare_parameter("reference_topic", "")
+        self.declare_parameter("tracking_tolerance_m", 0.06)
+        self.declare_parameter("tracking_stall_m", 0.002)
+        self.declare_parameter("tracking_lost_ticks", 15)
         self.declare_parameter("runtime_stream_mode", "stream")
         self.declare_parameter("runtime_idle_mode", "idle")
 
@@ -333,6 +349,8 @@ class SO101PlacoServoNode(Node):
         if self.input_mode not in ("velocity", "pose", "auto"):
             raise RuntimeError(f"input_mode must be velocity, pose or auto, got {self.input_mode!r}")
         self.start_srv_name = self.get_parameter("start_service").value
+        self.session_start_srv_name = self.get_parameter("session_start_service").value
+        self.session_lease_topic = self.get_parameter("session_lease_topic").value
         self.stop_srv_name = self.get_parameter("stop_service").value
         self.home_action_name = self.get_parameter("home_action").value
         self.command_lease_topic = self.get_parameter("command_lease_topic").value
@@ -382,6 +400,16 @@ class SO101PlacoServoNode(Node):
         self.gripper_out_topic = str(self.get_parameter("gripper_command_out_topic").value).strip()
         self.future_tolerance_s = float(self.get_parameter("future_tolerance_s").value)
         self.reference_reset_threshold_m = float(self.get_parameter("reference_reset_threshold_m").value)
+        self.max_pose_step_m = float(self.get_parameter("max_pose_step_m").value)
+        self.reference_topic = self.get_parameter("reference_topic").value
+        self.tracking_tolerance_m = float(self.get_parameter("tracking_tolerance_m").value)
+        self.tracking_stall_m = float(self.get_parameter("tracking_stall_m").value)
+        self.tracking_lost_ticks = int(self.get_parameter("tracking_lost_ticks").value)
+        self._last_solved_ee: np.ndarray | None = None
+        self._solved_q: np.ndarray | None = None
+        self._lost_count = 0
+        self._tracking = True
+        self._last_reject_reason = ""
         self.gripper_lo = np.asarray(_opt_param("gripper_limits_lower") or [], dtype=np.float64)
         self.gripper_hi = np.asarray(_opt_param("gripper_limits_upper") or [], dtype=np.float64)
         self.runtime_stream_mode = str(self.get_parameter("runtime_stream_mode").value).strip()
@@ -417,6 +445,13 @@ class SO101PlacoServoNode(Node):
                 raise RuntimeError("runtime_status_stale_s must be positive")
             if not np.isfinite(self.reference_reset_threshold_m) or self.reference_reset_threshold_m <= 0:
                 raise RuntimeError("reference_reset_threshold_m must be positive")
+            if not np.isfinite(self.max_pose_step_m) or self.max_pose_step_m <= 0:
+                raise RuntimeError("max_pose_step_m must be positive")
+            for name in ("tracking_tolerance_m", "tracking_stall_m"):
+                if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                    raise RuntimeError(f"{name} must be positive")
+            if self.tracking_lost_ticks < 1:
+                raise RuntimeError("tracking_lost_ticks must be at least 1")
             if not np.isfinite(self.future_tolerance_s) or self.future_tolerance_s < 0:
                 raise RuntimeError("future_tolerance_s must be nonnegative")
             if self.command_lease_timeout_s == 0:
@@ -498,6 +533,8 @@ class SO101PlacoServoNode(Node):
         self._active_home_request: _HomeActionRequest | None = None
         self._managed_owner = False
         self._frozen_reference: tuple[np.ndarray, np.ndarray | None] | None = None
+        # Set by _on_joint_state when a feedback gap ends during an owned session.
+        self._feedback_gap_pending = False
         self._stop_latched = False
         self._runtime_status = None
         self._managed_mode = None
@@ -560,8 +597,28 @@ class SO101PlacoServoNode(Node):
                 callback_group=self.cb_group,
             )
         self.cmd_pub = self.create_publisher(Float64MultiArray, self.cmd_out_topic, 10)
+        self.ref_pub = (
+            self.create_publisher(ArmCommandReference, self.reference_topic, 10)
+            if self.managed_teleop and self.reference_topic
+            else None
+        )
         self.create_service(Trigger, self.start_srv_name, self._on_start_srv, callback_group=self.action_group)
         self.create_service(Trigger, self.stop_srv_name, self._on_stop_srv, callback_group=self.cb_group)
+        if self.managed_teleop and self.session_start_srv_name:
+            self.create_service(
+                StartArmSession,
+                self.session_start_srv_name,
+                self._on_session_start_srv,
+                callback_group=self.action_group,
+            )
+        if self.managed_teleop and self.session_lease_topic:
+            self.create_subscription(
+                SessionLease,
+                self.session_lease_topic,
+                self._on_session_lease,
+                10,
+                callback_group=self.cb_group,
+            )
         self._runtime_mode_client = (
             self.create_client(SetRuntimeMode, self.runtime_mode_service, callback_group=self.action_group)
             if self.runtime_mode_service
@@ -629,9 +686,30 @@ class SO101PlacoServoNode(Node):
         # freshly-latched baseline with a stale relative displacement.
         if not self._accept_pose_commands:
             return
+        if self.managed_teleop and self._pose_step_rejected(msg):
+            return
         self._latest_pose = msg
         self._latest_pose_stamp = self._now()
         self._last_input_time = self._latest_pose_stamp
+
+    def _pose_step_rejected(self, msg: PoseStamped) -> bool:
+        """End the session on a target jump instead of following or clamping it.
+
+        The step is measured from the current command-side reference, so the
+        first pose after start is checked against the clutch origin and a bad
+        origin cannot pass. A jump usually means the device frame moved (e.g. a
+        Quest relocalization); every later pose would jump too, so only a fresh
+        start can re-latch both baselines. The reference stays frozen.
+        """
+        if self._p_ref is None or self._ee0_p is None:
+            return False
+        p = msg.pose.position
+        step = float(np.linalg.norm(self._ee0_p + np.array([p.x, p.y, p.z], dtype=np.float64) - self._p_ref))
+        if step <= self.max_pose_step_m:
+            return False
+        self._last_reject_reason = f"pose step {step:.4f} m exceeds max_pose_step_m {self.max_pose_step_m:.4f} m"
+        self._managed_stop(self._last_reject_reason)
+        return True
 
     def _on_joint_intent(self, msg: JointState) -> None:
         if (
@@ -744,7 +822,9 @@ class SO101PlacoServoNode(Node):
 
     def _managed_stop(self, reason: str, *, void_reference: bool = False) -> None:
         self._freeze_reference()
-        if void_reference:
+        if void_reference or self._feedback_gap_pending:
+            # A gap flagged by _on_joint_state voids it even when another stop
+            # path ends the session before the tick consumes the flag.
             self._frozen_reference = None
         if not self._stop_pending:
             now = self._now()
@@ -757,6 +837,7 @@ class SO101PlacoServoNode(Node):
             )
         self._cancel_start_request(reason)
         self._managed_owner = False
+        self._feedback_gap_pending = False
         self._preempt_home("STOP_REQUESTED", reason)
         self._home_active = False
         self._disable_motion_state()
@@ -835,9 +916,35 @@ class SO101PlacoServoNode(Node):
                 or not -_JOINT_STATE_SKEW_TOLERANCE_S <= age <= self.home_joint_state_stale_s
             ):
                 return
+        received_at = self._now()
+        had_feedback = self._latest_js_received_at > 0.0
+        if self.managed_teleop and had_feedback and self._feedback_gap_exceeded(received_at):
+            # Check the gap before this sample overwrites the receipt time: a
+            # recovering sample handled before the next control tick would
+            # otherwise hide the loss from the tick check. This callback and
+            # the tick share one mutually exclusive group, so the order holds.
+            if self._managed_owner:
+                self._feedback_gap_pending = True  # The next tick ends the session.
+            else:
+                self._void_frozen_reference("joint feedback lost during HOLD")
         self._latest_js = msg
-        self._latest_js_received_at = self._now()
+        self._latest_js_received_at = received_at
         self._joint_state_generation += 1
+
+    def _feedback_gap_exceeded(self, now: float) -> bool:
+        """Whether no valid joint feedback has been received for longer than the budget."""
+        return now - self._latest_js_received_at > self.home_joint_state_stale_s
+
+    def _void_frozen_reference(self, reason: str) -> None:
+        if self._frozen_reference is not None:
+            self._frozen_reference = None
+            self.get_logger().warning(f"{reason}; frozen reference voided")
+
+    def _on_session_lease(self, msg) -> None:
+        # Same fence as pose commands: a lease from an earlier session is
+        # stamped before this session started and cannot keep it alive.
+        if self._valid_managed_stamp(msg.header.stamp):
+            self._last_lease_time = self._now()
 
     def _on_command_lease(self, _msg: Empty) -> None:
         if self.managed_teleop and not self._managed_owner:
@@ -1049,6 +1156,10 @@ class SO101PlacoServoNode(Node):
         self._last_cmd = None
 
     # ------------------------------------------------------------------ srvs
+    def _on_session_start_srv(self, req, resp):
+        resp.position_error_m = float("nan")
+        return self._on_start_srv(req, resp)
+
     def _on_start_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
         # The motion group owns all admission state. Waiting here must leave
         # its feedback, stop and control callbacks free to run during a switch.
@@ -1236,7 +1347,7 @@ class SO101PlacoServoNode(Node):
             return None
         return self._enable_motion(resp)
 
-    def _adopt_frozen_reference(self, p_measured: np.ndarray) -> None:
+    def _adopt_frozen_reference(self, p_measured: np.ndarray) -> bool:
         """Use the frozen reference as this session's reference unless the arm has left it.
 
         Gravity sag stays inside the threshold, so it never enters the clutch
@@ -1244,20 +1355,38 @@ class SO101PlacoServoNode(Node):
         already in ``_p_ref``/``_r_ref`` is kept. The IK seed stays the measured
         joints either way, so the QP closes the gap under its step and velocity
         limits rather than jumping to an old command.
+
+        Returns True when the session reference was built from the measured pose.
         """
         frozen, self._frozen_reference = self._frozen_reference, None
         if frozen is None:
-            return
+            return True
         error = float(np.linalg.norm(frozen[0] - p_measured))
         if error > self.reference_reset_threshold_m:
             self.get_logger().warning(
                 f"frozen reference is {error:.4f} m from the measured pose "
                 f"(threshold {self.reference_reset_threshold_m:.4f} m); reset to measured"
             )
-            return
+            return True
         self._p_ref = frozen[0]
         if frozen[1] is not None:
             self._r_ref = frozen[1]
+        return False
+
+    def _fill_session_response(self, resp, p_measured: np.ndarray, reference_reset: bool) -> None:
+        """Report the clutch origin atomically with latching it, so a client never reads an old one."""
+        origin = resp.reference
+        origin.header.frame_id = self.planning_frame
+        sec = int(self._managed_start_stamp)
+        origin.header.stamp.sec = sec
+        origin.header.stamp.nanosec = int((self._managed_start_stamp - sec) * 1e9)
+        origin.pose.position.x, origin.pose.position.y, origin.pose.position.z = (float(v) for v in self._ee0_p)
+        quaternion = origin.pose.orientation
+        quaternion.x, quaternion.y, quaternion.z, quaternion.w = (
+            float(v) for v in Rotation.from_matrix(self._ee0_R).as_quat()
+        )
+        resp.position_error_m = float(np.linalg.norm(self._ee0_p - p_measured))
+        resp.reference_reset = reference_reset
 
     def _enable_motion(self, resp: Trigger.Response) -> Trigger.Response:
         if self.managed_teleop and self._now() - self._latest_js_received_at > self.home_joint_state_stale_s:
@@ -1276,8 +1405,8 @@ class SO101PlacoServoNode(Node):
             return resp
         self._p_ref = self.diffik.ee_position(q)
         self._r_ref = self.diffik.ee_rotation(q)
-        if self.managed_teleop:
-            self._adopt_frozen_reference(self._p_ref.copy())
+        p_measured = self._p_ref.copy()
+        reference_reset = self._adopt_frozen_reference(p_measured) if self.managed_teleop else True
         # Clutch baseline for pose mode: incoming relative displacements are
         # added to this EE position latched at enable, and relative rotations
         # are composed onto this EE attitude. Unmanaged sessions latch the
@@ -1294,9 +1423,14 @@ class SO101PlacoServoNode(Node):
         # (e.g. shifting seat/headset). Dropping it forces pose_stale=True until
         # a fresh command lands, so the arm holds the new baseline.
         self._latest_pose = None
+        self._last_reject_reason = ""
+        self._lost_count = 0
+        self._tracking = True
+        self._last_solved_ee = None
         now = self._now()
         if self.managed_teleop:
             self._managed_owner = True
+            self._feedback_gap_pending = False  # A HOME-ended session may leave it set.
             self._managed_mode = None
             self._joint_intent = None
             self._managed_start_stamp = self.get_clock().now().nanoseconds * 1e-9
@@ -1319,6 +1453,8 @@ class SO101PlacoServoNode(Node):
             self._latest_angular_stamp = now
         self._accept_velocity_commands = True
         self._accept_pose_commands = True
+        if hasattr(resp, "reference"):
+            self._fill_session_response(resp, p_measured, reference_reset)
         resp.success = True
         resp.message = "so101_placo_servo_node enabled"
         self.get_logger().info(resp.message)
@@ -1359,6 +1495,66 @@ class SO101PlacoServoNode(Node):
 
     # ------------------------------------------------------------------ tick
     def _on_control_tick(self) -> None:
+        self._solved_q = None
+        self._control_step()
+        self._publish_reference()
+
+    def _publish_reference(self) -> None:
+        """Publish the reference the servo tracks, or holds frozen, with its errors.
+
+        position_error_m compares the reference with the measured pose, so it
+        includes gravity sag. ``tracking`` compares it with the commanded pose:
+        the command is not tracking when it stays off the reference and has
+        stopped moving toward it. That happens when the target is outside the
+        workspace, or when the joint limits block the current arm branch and only
+        another branch reaches it (the solver never flips branches). A command
+        still closing the gap at its step limit is lag, not lost tracking.
+        """
+        if self.ref_pub is None:
+            return
+        if self._enabled and self._managed_mode == "joint":
+            # A joint stream has no Cartesian reference; the start origin is
+            # no longer tracked, so publishing it would mislead consumers.
+            return
+        if self._enabled and self._p_ref is not None:
+            p_ref, r_ref = self._p_ref, self._r_ref
+        elif self._frozen_reference is not None:
+            p_ref, r_ref = self._frozen_reference
+        else:
+            return
+        reason = self._last_reject_reason
+        if self._solved_q is not None:
+            ee = self.diffik.ee_position(self._solved_q)
+            gap = float(np.linalg.norm(ee - p_ref))
+            moved = np.inf if self._last_solved_ee is None else float(np.linalg.norm(ee - self._last_solved_ee))
+            self._last_solved_ee = ee
+            stalled = gap > self.tracking_tolerance_m and moved < self.tracking_stall_m
+            self._lost_count = self._lost_count + 1 if stalled else 0
+            self._tracking = self._lost_count < self.tracking_lost_ticks
+            if not self._tracking and not reason:
+                reason = f"not tracking: commanded pose stopped {gap:.4f} m from the reference"
+        msg = ArmCommandReference()
+        stamp = self.get_clock().now().nanoseconds
+        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(int(stamp), 1_000_000_000)
+        msg.header.frame_id = self.planning_frame
+        msg.reference.position.x, msg.reference.position.y, msg.reference.position.z = (float(v) for v in p_ref)
+        msg.position_error_m = float("nan")
+        msg.orientation_error_rad = float("nan")
+        q = self._measured_arm_joints()
+        if q is not None and np.all(np.isfinite(q)):
+            msg.position_error_m = float(np.linalg.norm(self.diffik.ee_position(q) - p_ref))
+        if r_ref is not None:
+            o = msg.reference.orientation
+            o.x, o.y, o.z, o.w = (float(v) for v in Rotation.from_matrix(r_ref).as_quat())
+            if not self.position_only and q is not None and np.all(np.isfinite(q)):
+                msg.orientation_error_rad = float(
+                    Rotation.from_matrix(r_ref @ self.diffik.ee_rotation(q).T).magnitude()
+                )
+        msg.tracking = self._tracking
+        msg.reason = reason
+        self.ref_pub.publish(msg)
+
+    def _control_step(self) -> None:
         """50 Hz: closed-loop QP step toward the command-side reference, publish.
 
         Steps:
@@ -1388,10 +1584,18 @@ class SO101PlacoServoNode(Node):
                         now - stamp > self.input_timeout
                         for stamp in (self._latest_linear_stamp, self._latest_angular_stamp)
                     )
-            feedback_expired = now - self._latest_js_received_at > self.home_joint_state_stale_s
+            feedback_expired = self._feedback_gap_pending or self._feedback_gap_exceeded(now)
             if expired or feedback_expired or now - self._status_received_at > self.runtime_status_stale_s:
-                self._managed_stop("teleop command or runtime status expired", void_reference=feedback_expired)
+                reason = "teleop command or runtime status expired"
+                if self._feedback_gap_pending:
+                    reason = "joint feedback gap exceeded the budget before it recovered"
+                self._managed_stop(reason, void_reference=feedback_expired)
                 return
+        elif self.managed_teleop:
+            # Feedback that has not come back yet; a sample that does come back
+            # checks the gap itself in _on_joint_state before updating the time.
+            if self._feedback_gap_exceeded(now):
+                self._void_frozen_reference("joint feedback lost during HOLD")
         if self._estop_active:
             self._disable_motion_state()
             return
@@ -1586,6 +1790,7 @@ class SO101PlacoServoNode(Node):
         out.data = [float(x) for x in q_des]
         self.cmd_pub.publish(out)
         self._last_cmd = q_des
+        self._solved_q = q_des
         self._solve_count += 1
         self._update_home_progress(q_measured, now)
 

@@ -855,6 +855,9 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
         base_frame, tool_frame = frames["base_link"], frames["ee_link"]
     except KeyError as exc:
         raise InterfaceDescriptionError("teleoperation requires model base_link and ee_link frames") from exc
+    step = teleop.get("max_pose_step_m")
+    if step is not None and (type(step) not in (int, float) or not math.isfinite(step) or step <= 0):
+        raise InterfaceDescriptionError("teleoperation.max_pose_step_m must be a finite positive number")
     shared = {
         "target_group": target,
         "joint_names": list(groups[target]),
@@ -870,6 +873,7 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
             "subscribe",
             units={"position": "m", "orientation": "quaternion"},
             pose_reference="clutch_relative",
+            **({} if step is None else {"max_pose_step_m": float(step)}),
             **shared,
         ),
         "motion.arm.linear": _topic(
@@ -901,6 +905,20 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
             command_stale_s=float(stale),
         ),
         "motion.arm.lease": _topic(f"{prefix}/lease", "std_msgs/msg/Empty", "runtime.stop", "subscribe", **shared),
+        "motion.arm.session_lease": _topic(
+            f"{prefix}/session_lease", "ibrobot_msgs/msg/SessionLease", "runtime.stop", "subscribe", **shared
+        ),
+        "motion.arm.reference": _topic(
+            f"{prefix}/reference", "ibrobot_msgs/msg/ArmCommandReference", "runtime.stop", "publish", **shared
+        ),
+        "motion.arm.session_start": {
+            "capability": "runtime.stop",
+            "kind": "service",
+            "direction": "serve",
+            "endpoint": f"{prefix}/session_start",
+            "message_type": "ibrobot_msgs/srv/StartArmSession",
+            **shared,
+        },
         "motion.arm.start": {
             "capability": "runtime.stop",
             "kind": "service",

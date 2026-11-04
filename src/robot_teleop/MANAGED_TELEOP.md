@@ -32,6 +32,33 @@ arm pushed by less than that during HOLD is pulled back to the old reference on
 the next start, under the QP step and velocity limits. Emergency stop, lost joint
 feedback and a joint-stream session discard the reference.
 
+`motion.arm.session_start` (`StartArmSession`) returns that origin and whether it
+was reset. `motion.arm.session_lease` (`SessionLease`) is a stamped keepalive,
+dropped when stamped at or before the session start. They share session state
+with `motion.arm.start` and `motion.arm.lease`, which stay until VR, phone, Xbox
+and leader-arm clients have all migrated.
+
+A pose whose target is farther than `max_pose_step_m` (declared on
+`motion.arm.pose`) from the current reference ends the session: the servo does
+not follow or clamp it, keeps the reference, and enters HOLD. The first pose
+after start is checked against the clutch origin, so a wrong origin is caught.
+
+`motion.arm.reference` (`ArmCommandReference`) publishes, every control tick,
+the reference the servo tracks or holds frozen, its distance to the measured pose
+(gravity sag included), the orientation error, `tracking` and the last reason.
+A joint-stream session (leader arm) has no Cartesian reference and publishes
+nothing on it. A gap in valid joint feedback longer than the feedback budget
+ends an owned session and voids the reference, during the session or in HOLD,
+also when feedback recovers before the next control tick.
+`tracking` turns false once the commanded pose has stopped short of the
+reference: farther than `tracking_tolerance_m` while moving less than
+`tracking_stall_m` per tick, for `tracking_lost_ticks` ticks (SO-101: 0.06 m,
+2 mm, 0.3 s). That covers a target outside the workspace and one the arm can
+reach only in another elbow branch past a joint limit; the solver never flips
+branches. Lag in fast motion, where the command still closes the gap, is not
+reported. Lost tracking never moves the reference or the clutch origin. Clients
+take the clutch origin from `session_start`, not from this topic.
+
 ## Admission and Recovery
 
 Startup is idle and does not follow or HOME. For leader following, explicitly

@@ -25,9 +25,12 @@ def generate_teleoperation_nodes(profile, descriptor, robot_description_dict, *,
         "linear_cmd_topic": "linear",
         "angular_cmd_topic": "angular",
         "start_service": "start",
+        "session_start_service": "session_start",
         "stop_service": "stop",
         "home_action": "home",
         "command_lease_topic": "lease",
+        "session_lease_topic": "session_lease",
+        "reference_topic": "reference",
         "joint_intent_topic": "joints",
     }.items():
         params[parameter] = interfaces[prefix + interface]["endpoint"]
@@ -60,6 +63,9 @@ def generate_teleoperation_nodes(profile, descriptor, robot_description_dict, *,
             "joint_state_topic": interfaces["joint.state"]["endpoint"],
         }
     )
+    step = interfaces[prefix + "pose"].get("max_pose_step_m")
+    if step is not None:
+        params["max_pose_step_m"] = step
     params.update(robot_description_dict)
     # The servo's managed mode compares its clock against JointState header
     # stamps: on a physics platform those are sim-stamped, so the executor

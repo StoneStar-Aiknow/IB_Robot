@@ -29,7 +29,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
-from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode
+from ibrobot_msgs.msg import ArmCommandReference
+from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StartArmSession
 from robot_runtime import contract as C
 from robot_teleop.vr_replay import RecordedPacket, load_recording, replay
 
@@ -406,6 +407,58 @@ def test_connected_stream_stall_enters_hold_and_rejects_continued_commands(stack
         assert future.result() == len(packets)
         _assert_hold(node.runtime_status(), after_injection, node.output_counts())
     node.spin_for(0.6)
+
+
+def test_session_start_returns_the_frozen_reference_after_a_hold(stack):
+    node, _, _ = stack
+    interfaces = node.description["interfaces"]
+    assert node.get_subscriptions_info_by_topic(interfaces["motion.arm.session_lease"]["endpoint"])
+    client = node.create_client(StartArmSession, interfaces["motion.arm.session_start"]["endpoint"])
+    references = []
+    subscription = node.create_subscription(
+        ArmCommandReference, interfaces["motion.arm.reference"]["endpoint"], references.append, 100
+    )
+    assert client.wait_for_service(timeout_sec=5.0)
+
+    def start():
+        node.arm_simulation()
+        future = client.call_async(StartArmSession.Request())
+        rclpy.spin_until_future_complete(node, future, timeout_sec=10.0)
+        assert future.done(), "session_start did not answer"
+        return future.result()
+
+    def wait_for_latch():
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            status = node.runtime_status()
+            if status is not None and status.stop_latched:
+                node.spin_for(0.6)  # Let the servo see the HOLD confirmation before the next start.
+                return
+            node.spin_for(0.05)
+        raise AssertionError("no HOLD after the session stopped receiving input")
+
+    wait_for_latch()  # Earlier tests may leave the servo finishing its own stop.
+    first = start()
+    assert first.success, first.message
+    node.spin_for(0.2)
+    assert len(references) >= 5, "motion.arm.reference is not published at the control rate"
+    latest = references[-1]
+    assert latest.header.frame_id == first.reference.header.frame_id
+    assert latest.tracking and latest.reason == ""
+    origin = first.reference.pose.position
+    assert (latest.reference.position.x, latest.reference.position.z) == pytest.approx((origin.x, origin.z), abs=1e-6)
+    assert first.reference.header.frame_id == node.description["interfaces"]["motion.arm.pose"]["base_frame"]
+    assert first.reference.header.stamp.sec > 0
+    wait_for_latch()  # No input: the servo expires the session into HOLD and freezes the reference.
+    second = start()
+    assert second.success, second.message
+    assert second.reference_reset is False
+    assert second.position_error_m < 0.02
+    a, b = first.reference.pose.position, second.reference.pose.position
+    assert (a.x, a.y, a.z) == pytest.approx((b.x, b.y, b.z), abs=1e-9)
+    wait_for_latch()
+    node.destroy_subscription(subscription)
+    node.destroy_client(client)
 
 
 def test_raw_position_jump_is_caught_on_pose_stream(stack):

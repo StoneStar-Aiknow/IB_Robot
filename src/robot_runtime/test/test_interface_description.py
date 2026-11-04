@@ -63,6 +63,60 @@ def test_teleoperation_pose_declares_clutch_relative_metric_frames():
     assert pose["command_stale_s"] == 0.5
 
 
+def test_teleoperation_declares_session_endpoints_next_to_the_old_ones():
+    profile = {
+        "teleoperation": {"enabled": True, "target_group": "arm", "endpoint_prefix": "/arm", "command_stale_s": 0.5}
+    }
+    model = {"joint_groups": {"arm": ["1"], "all": ["1", "6"]}, "frames": {"base_link": "base", "ee_link": "tool"}}
+    interfaces = _teleoperation_interfaces(profile, model)
+    start = interfaces["motion.arm.session_start"]
+    assert (start["kind"], start["direction"]) == ("service", "serve")
+    assert (start["endpoint"], start["message_type"]) == ("/arm/session_start", "ibrobot_msgs/srv/StartArmSession")
+    lease = interfaces["motion.arm.session_lease"]
+    assert (lease["kind"], lease["direction"]) == ("topic", "subscribe")
+    assert (lease["endpoint"], lease["message_type"]) == ("/arm/session_lease", "ibrobot_msgs/msg/SessionLease")
+    reference = interfaces["motion.arm.reference"]
+    assert (reference["kind"], reference["direction"]) == ("topic", "publish")
+    assert (reference["endpoint"], reference["message_type"]) == (
+        "/arm/reference",
+        "ibrobot_msgs/msg/ArmCommandReference",
+    )
+    assert interfaces["motion.arm.start"]["message_type"] == "std_srvs/srv/Trigger"
+    assert interfaces["motion.arm.lease"]["message_type"] == "std_msgs/msg/Empty"
+
+
+@pytest.mark.parametrize("step", [0.0, -0.01, float("nan"), float("inf"), True, "0.05"])
+def test_teleoperation_rejects_invalid_pose_step(step):
+    profile = {
+        "teleoperation": {
+            "enabled": True,
+            "target_group": "arm",
+            "endpoint_prefix": "/arm",
+            "command_stale_s": 0.5,
+            "max_pose_step_m": step,
+        }
+    }
+    model = {"joint_groups": {"arm": ["1"], "all": ["1", "6"]}, "frames": {"base_link": "base", "ee_link": "tool"}}
+    with pytest.raises(InterfaceDescriptionError, match="max_pose_step_m"):
+        _teleoperation_interfaces(profile, model)
+
+
+def test_teleoperation_declares_the_pose_step_only_on_the_pose_interface():
+    profile = {
+        "teleoperation": {
+            "enabled": True,
+            "target_group": "arm",
+            "endpoint_prefix": "/arm",
+            "command_stale_s": 0.5,
+            "max_pose_step_m": 0.05,
+        }
+    }
+    model = {"joint_groups": {"arm": ["1"], "all": ["1", "6"]}, "frames": {"base_link": "base", "ee_link": "tool"}}
+    interfaces = _teleoperation_interfaces(profile, model)
+    assert interfaces["motion.arm.pose"]["max_pose_step_m"] == 0.05
+    assert all("max_pose_step_m" not in item for key, item in interfaces.items() if key != "motion.arm.pose")
+
+
 @pytest.fixture
 def profile():
     return {

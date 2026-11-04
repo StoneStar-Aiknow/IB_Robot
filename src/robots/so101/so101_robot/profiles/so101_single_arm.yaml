@@ -141,6 +141,10 @@ teleoperation:
   # Board scheduling budget for input, lease and managed joint feedback.
   # Deployment profiles may tighten it; the public contract caps it at 1 s.
   command_stale_s: 0.5
+  # Largest accepted distance (m) between a pose target and the current
+  # reference; a larger jump ends the session. Fast VR motion stepped up to
+  # 46 mm; tracking-loss jumps were 202 mm and more (measured 2026-11-04).
+  max_pose_step_m: 0.10
   servo_config: $(find so101_motion)/config/so101_placo_servo.yaml
   # Leader hardware acquisition: the runtime launches the read-only source
   # node, never the application. Serial and calibration are deployment data,

@@ -327,6 +327,10 @@
           "enum": [
             "clutch_relative"
           ]
+        },
+        "max_pose_step_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
         }
       },
       "allOf": [
