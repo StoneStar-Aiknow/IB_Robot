@@ -103,9 +103,26 @@ def test_agent_deployment_keeps_the_grasp_executor_and_robot_identity():
     assert agent["enabled"] and agent["incubation"] and agent["execution_enabled"]
     assert agent["test_allowlist"] == ["pick_object"]
     assert agent["planner"]["mode"] == "vlm" and agent["planner"]["api_protocol"] == "chat_completions"
-    assert agent["voice_bridge"]["enabled"] is False
+    assert agent["voice_bridge"]["enabled"] is True
+    assert agent["voice_bridge"]["feedback_only"] is True
+    assert config["voice_tts"]["enabled"] is True
     for key in ("ledger_path", "conversation_path", "deployment_lock_path"):
         assert Path(agent[key]).is_absolute() and not agent[key].startswith("/tmp/")
+
+
+def test_text_feedback_configuration_without_model_artifacts():
+    from robot_config.loader import _load_robot_section, _validate_agent_voice_bridge
+
+    _, config = _load_robot_section(ROBOTS / "aimdk_x2_grasp_310p_agent.yaml")
+    bridge = config["embodied"]["agent"]["voice_bridge"]
+    assert bridge["enabled"] and bridge["feedback_only"]
+    assert not config["voice_asr"]["enabled"] and config["voice_tts"]["enabled"]
+    assert config["voice_tts"]["audio_output"]["interface"] == "audio.play"
+    assert not _validate_agent_voice_bridge(bridge)
+    assert any(
+        "feedback_only must be a boolean" in error
+        for error in _validate_agent_voice_bridge({**bridge, "feedback_only": "true"})
+    )
 
 
 def test_arm_limits_match_the_mirror_until_the_configurations_merge(merged):

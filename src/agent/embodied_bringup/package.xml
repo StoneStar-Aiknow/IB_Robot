@@ -33,6 +33,11 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <test_depend>ibrobot_agent</test_depend>
+  <test_depend>skill_library</test_depend>
+  <test_depend>embodied_common</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>std_msgs</test_depend>
   <!-- The migrated launch-builder tests import the perception-model node
        generator and the recording builder from their owning packages
        (openspec change ``migrate-business-launch-builders``, design

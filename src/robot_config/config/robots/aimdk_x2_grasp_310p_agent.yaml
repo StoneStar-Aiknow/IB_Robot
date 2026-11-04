@@ -8,7 +8,16 @@ robot:
   voice_asr:
     enabled: false
   voice_tts:
-    enabled: false
+    enabled: true
+    bundle_path: models/zipvoice
+    deployment: ascend_310p
+    resample_to_playback_rate: true
+    audio_output:
+      interface: audio.play
+      type: audio_common_msgs/msg/AudioDataStamped
+      requires:
+        capability: interaction.audio_playback
+    audio_message_type: audio_common_msgs/msg/AudioDataStamped
 
   embodied:
     entry_mode: agent
@@ -35,4 +44,6 @@ robot:
         temperature: 0.3
         catalog_view: planner
       voice_bridge:
-        enabled: false
+        enabled: true
+        feedback_only: true
+        mute_asr_during_tts: false

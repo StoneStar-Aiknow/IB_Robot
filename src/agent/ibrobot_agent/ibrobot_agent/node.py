@@ -28,6 +28,7 @@ from std_srvs.srv import Trigger
 
 from embodied_common.agent_terminal_contract import classify_agent_terminal, stable_agent_execution_error_code
 from embodied_common.canon import sha256_text, to_canonical_json
+from embodied_common.execution_detail import execution_context, short_message
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
 from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
@@ -205,6 +206,8 @@ def _program_terminal_detail(result) -> dict:
         "execution_id": str(result.execution_id),
         "state": str(result.state),
         "completed_step_count": int(getattr(result, "completed_step_count", 0)),
+        "gateway_sequence": int(getattr(result, "last_event_sequence", 0)),
+        **execution_context(result),
     }
 
 
@@ -225,6 +228,36 @@ class _RosExecutionAdapter:
         self._active_lock = threading.Lock()
         self._active_stop_event: threading.Event | None = None
         self._active_task_id: str | None = None
+        self._progress_callback = None
+        self._progress_open = False
+        self._last_event_sequence = 0
+
+    def set_progress_callback(self, callback) -> None:
+        self._progress_callback = callback
+
+    def _program_feedback(self, wrapped, *, task_id: str) -> None:
+        feedback = wrapped.feedback
+        with self._active_lock:
+            if (
+                not self._progress_open
+                or task_id != self._active_task_id
+                or feedback.sequence <= self._last_event_sequence
+            ):
+                return
+            self._last_event_sequence = int(feedback.sequence)
+        callback = self._progress_callback
+        if callback is not None:
+            try:
+                callback(
+                    {
+                        "execution_id": str(feedback.execution_id),
+                        "gateway_sequence": int(feedback.sequence),
+                        "state": str(feedback.state),
+                        **execution_context(feedback),
+                    }
+                )
+            except Exception:
+                _trace.exception("execution presentation failed; execution continues")
 
     def execute(
         self,
@@ -240,6 +273,8 @@ class _RosExecutionAdapter:
         with self._active_lock:
             self._active_stop_event = stop_event
             self._active_task_id = task_id
+            self._progress_open = True
+            self._last_event_sequence = 0
         try:
             return self._execute_direct(
                 proposal,
@@ -254,6 +289,7 @@ class _RosExecutionAdapter:
             with self._active_lock:
                 self._active_stop_event = None
                 self._active_task_id = None
+                self._progress_open = False
 
     def request_stop(self, request_key) -> None:
         with self._active_lock:
@@ -355,6 +391,7 @@ class _RosExecutionAdapter:
                     },
                     task_budget_sec=self._task_budget_sec,
                     continues_from_execution_id=continues_from_execution_id,
+                    feedback_callback=lambda message: self._program_feedback(message, task_id=task_id),
                 )
                 if not self._wait_future(goal_future, self._rpc_timeout_sec, stop_event):
                     if stop_event.is_set():
@@ -393,7 +430,7 @@ class _RosExecutionAdapter:
                     execution_status,
                     presentation.task_ref,
                     str(result.error_code),
-                    str(result.message),
+                    short_message(result.message),
                     _program_terminal_detail(result),
                 )
             except Exception:
@@ -609,17 +646,24 @@ class _RosExecutionAdapter:
                     timeout_sec=self._rpc_timeout_sec,
                 )
                 state = str(execution.get("state", ""))
-                if state in {"CANCELED", "FAILED", "UNKNOWN"}:
-                    status = "cancelled" if state == "CANCELED" else ("unknown" if state == "UNKNOWN" else "failed")
+                if state in {"SUCCEEDED", "CANCELED", "FAILED", "UNKNOWN"}:
+                    status = {
+                        "SUCCEEDED": "succeeded",
+                        "CANCELED": "cancelled",
+                        "FAILED": "failed",
+                        "UNKNOWN": "unknown",
+                    }[state]
                     return ExecutionResult(
                         status,
                         presentation.task_ref,
                         str(execution.get("error_code", "")),
-                        str(execution.get("message", "")),
+                        short_message(execution.get("message", "")),
                         {
                             "submitted": True,
                             # The step list is already in the proposal; keep the terminal small.
                             **{name: value for name, value in execution.items() if name != "canonical_steps"},
+                            "gateway_sequence": execution.get("last_event_sequence", 0),
+                            **execution_context(execution),
                         },
                     )
             if result_future is not None and result_future.done():
@@ -638,7 +682,7 @@ class _RosExecutionAdapter:
                     status,
                     presentation.task_ref,
                     str(result.error_code),
-                    str(result.message),
+                    short_message(result.message),
                     _program_terminal_detail(result),
                 )
             time.sleep(0.02)

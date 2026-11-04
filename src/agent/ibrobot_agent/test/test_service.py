@@ -587,7 +587,7 @@ def test_empty_execution_message_still_delivers_terminal_event(tmp_path):
         assert len(terminal) == 1
         assert terminal[0].state == "SUCCEEDED"
         assert service.get_request(request.to_key()).state == "SUCCEEDED"
-        assert conversation.context(request)[-1]["content"] == "Execution succeeded"
+        assert conversation.context(request)[-1]["content"] == "执行完成。"
     finally:
         service.close()
 

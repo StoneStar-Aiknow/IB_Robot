@@ -3100,6 +3100,7 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         errors.append(f"{prefix}.min_text_chars must be a positive integer")
     for field_name in (
         "speak_replies",
+        "feedback_only",
         "tts_enabled",
         "mute_asr_during_tts",
         "speaker_check_enabled",

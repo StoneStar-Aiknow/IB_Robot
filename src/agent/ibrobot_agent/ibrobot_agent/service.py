@@ -46,6 +46,7 @@ from ibrobot_agent.contracts import (
     planner_outcome_to_mapping,
     request_hash_text,
 )
+from ibrobot_agent.execution_feedback import execution_reply
 from ibrobot_agent.planner import RulePlanner, direct_command_outcome, read_only_outcome
 
 _LOGGER = logging.getLogger(__name__)
@@ -504,6 +505,9 @@ class AgentService:
                 self._finish_plan_without_execution(key, record.planning_generation, outcome.user_message)
                 return
             record = self._store.mark_preparing(key, expected_generation=record.planning_generation)
+            observe_progress = getattr(self._execution, "set_progress_callback", None)
+            if observe_progress is not None:
+                observe_progress(lambda detail: self._execution_progress(key, detail))
             with trace_stage(_trace, "agent.execution", request_id=request.request_id):
                 execution_result = self._execution.execute(
                     proposal,
@@ -519,16 +523,29 @@ class AgentService:
                 )
             if execution_result.status == "unknown":
                 current = self._store.get_request(key)
-                self._finish_unknown(key, current, execution_result.message or execution_result.error_code)
+                self._finish_unknown(
+                    key,
+                    current,
+                    execution_result.message or execution_result.error_code,
+                    detail=execution_result.detail,
+                )
             else:
                 self._store.finish(key, expected_generation=record.planning_generation, result=execution_result)
-                terminal_message = execution_result.message.strip() or f"Execution {execution_result.status}"
+                terminal_message = execution_reply(
+                    self._request_state_for_result(execution_result), execution_result.detail
+                )
                 try:
                     self._conversation.append_assistant(request, terminal_message)
                 finally:
                     # A conversation-memory failure must not hide an already
                     # persisted execution result from the waiting client.
-                    self._emit(key, "terminal", self._request_state_for_result(execution_result), terminal_message)
+                    self._emit(
+                        key,
+                        "terminal",
+                        self._request_state_for_result(execution_result),
+                        terminal_message,
+                        detail=execution_result.detail,
+                    )
         except Exception as exc:
             try:
                 record = self._store.get_request(key)
@@ -789,11 +806,18 @@ class AgentService:
         )
         self._emit(key, "failed", "FAILED", message)
 
-    def _finish_unknown(self, key: RequestKey, record: Any, message: str) -> None:
+    def _execution_progress(self, key: RequestKey, detail: Mapping) -> None:
+        current = self._store.get_request(key)
+        if current.terminal is not None:
+            return
+        message = execution_reply(str(detail.get("state", "ACTIVE")), detail)
+        self._emit(key, "execution_progress", "RUNNING", message, detail=detail)
+
+    def _finish_unknown(self, key: RequestKey, record: Any, message: str, *, detail: Mapping | None = None) -> None:
         reason = (message or "unknown execution outcome")[:300]
-        self._store.quarantine(key, expected_generation=record.planning_generation, reason=reason)
+        self._store.quarantine(key, expected_generation=record.planning_generation, reason=reason, detail=detail)
         self._quarantined = True
-        self._emit(key, "quarantined", "UNKNOWN", reason)
+        self._emit(key, "quarantined", "UNKNOWN", execution_reply("UNKNOWN", detail), detail=detail)
 
     @staticmethod
     def _request_state_for_result(result: Any) -> str:

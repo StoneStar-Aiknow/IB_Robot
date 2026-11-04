@@ -918,6 +918,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         params["wake_event_topic"] = str(wake_event["topic"])
     for field_name in (
         "speak_replies",
+        "feedback_only",
         "mute_asr_during_tts",
         "speaker_check_enabled",
         "speaker_reject_short",

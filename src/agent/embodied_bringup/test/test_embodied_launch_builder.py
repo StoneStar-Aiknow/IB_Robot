@@ -1548,6 +1548,13 @@ def test_resident_cli_bridge_executable_comes_from_the_robot_skill_cli_prefix(mo
     assert builder._resident_cli_bridge_executable() is None
 
 
+def test_voice_bridge_can_consume_text_feedback_without_voice_commands():
+    nodes = _voice_bridge_nodes(enabled=True, feedback_only=True, mute_asr_during_tts=False)
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+    assert params["feedback_only"] is True
+    assert params["mute_asr_during_tts"] is False
+
+
 def test_voice_bridge_forwards_the_addressee_gate_when_configured():
     """The gate is opt-in, so launch forwards it only when the YAML sets it."""
     nodes = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀", "灵犀"], wake_window_sec=12.0)

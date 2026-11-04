@@ -476,7 +476,9 @@ class SQLiteRequestStore(RequestStore):
             ),
         )
 
-    def quarantine(self, key: RequestKey, *, expected_generation: int, reason: str) -> RequestRecord:
+    def quarantine(
+        self, key: RequestKey, *, expected_generation: int, reason: str, detail: Mapping | None = None
+    ) -> RequestRecord:
         if not reason:
             raise RequestStoreError("REQUEST_SCHEMA_INVALID", "reason must be non-empty")
         with self._transaction():
@@ -493,7 +495,7 @@ class SQLiteRequestStore(RequestStore):
                 task_ref=_task_ref_from_json(row["task_ref_json"]),
                 error_code="ROBOT_QUARANTINED",
                 message=reason,
-                detail={"reason": reason},
+                detail={**dict(detail or {}), "reason": reason},
             )
             terminal_json = _execution_result_to_json(terminal)
             self._connection.execute(

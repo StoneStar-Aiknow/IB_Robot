@@ -253,7 +253,7 @@ def test_failed_terminal_is_spoken_without_technical_english():
     )
 
     (speak,) = _of(actions, Speak)
-    assert speak.text == "执行失败，详情见日志。"
+    assert speak.text == "执行失败，请查看执行记录或联系操作员。"
     # The technical reason stays available for the operator.
     assert any("allowlist" in log.message for log in _of(actions, Log))
 
@@ -306,8 +306,10 @@ def test_speech_thread_survives_a_tts_error_and_still_acknowledges_later_plans()
     first = Speak("准备执行：点头。", then=(PublishControl({"control_type": "presentation_rendered", "n": 1}),))
     second = Speak("准备执行：摇头。", then=(PublishControl({"control_type": "presentation_rendered", "n": 2}),))
     node._speech_queue = [first, second]
+    node._speech_closed = False
 
-    threading.Thread(target=node._speech_loop, daemon=True).start()
+    speech_thread = threading.Thread(target=node._speech_loop, daemon=True)
+    speech_thread.start()
 
     assert acknowledged.wait(timeout=5.0), "speech thread died on the first render"
     assert node._speaker.attempts == ["准备执行：点头。", "准备执行：摇头。"]
@@ -315,6 +317,11 @@ def test_speech_thread_survives_a_tts_error_and_still_acknowledges_later_plans()
     assert [json.loads(message)["n"] for message in node._control_publisher.messages] == [2]
     # ASR is resumed after the failed render too, so the microphone is not left muted.
     assert node._asr_control_publisher.messages == ["stop", "start", "stop", "start"]
+    with node._speech_wakeup:
+        node._speech_closed = True
+        node._speech_wakeup.notify_all()
+    speech_thread.join(timeout=1.0)
+    assert not speech_thread.is_alive()
 
 
 @pytest.mark.parametrize("utterance", ["帮我停一下", "别动了谢谢", "快停下来", "STOP please"])
@@ -441,7 +448,7 @@ def test_continuation_event_is_spoken_without_releasing_the_channel():
                 "reason_code": "ROBOT_QUARANTINED",
                 "message": "robot scope is quarantined",
             },
-            "执行结果未知，请人工检查机器人状态。",
+            "执行结果未知，请操作员确认机器人状态。",
         ),
     ],
 )
@@ -583,7 +590,7 @@ def test_a_refused_plan_after_its_preview_is_reported_as_a_failure():
 
     failed = core.on_event(_event("voice-0", "failed", "FAILED", "SKILL_SCHEMA_INVALID"), now=2.0)
 
-    assert [action.text for action in _of(failed, Speak)] == ["执行失败，详情见日志。"]
+    assert [action.text for action in _of(failed, Speak)] == ["执行失败，请查看执行记录或联系操作员。"]
 
 
 def _async_presentation_event(request_id):

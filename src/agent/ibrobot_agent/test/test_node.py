@@ -305,9 +305,126 @@ def test_program_terminal_records_gateway_progress_and_exposes_the_ledger():
         "execution_id": "execution-1",
         "state": "CANCELED",
         "completed_step_count": 2,
+        "gateway_sequence": 0,
+        "current_skill": "",
+        "workflow_step_index": 0,
+        "execution_detail": {
+            "schema_version": 0,
+            "phase": "",
+            "phase_state": "UNKNOWN",
+            "failed_phase": "",
+            "reason_code": "",
+            "recovery_state": "UNKNOWN",
+            "retry_count": 0,
+            "suggested_action": "MANUAL_CHECK",
+        },
     }
     assert adapter.lookup_execution("request-wave")["completed_step_count"] == 2
     assert ("get_execution", "request-wave") in bridge.calls
+
+
+@pytest.mark.parametrize("version", [0, 1, 999])
+def test_long_failure_message_and_unknown_detail_never_change_a_confirmed_terminal(version):
+    class Bridge(_ProgramExecutionBridge):
+        def send_program_goal(self, **kwargs):
+            future = super().send_program_goal(**kwargs)
+            result = future.result().get_result_async().result().result
+            result.message = "底层失败信息" * 1000
+            result.error_code = "MOTION_FAILED"
+            result.execution_detail = {"schema_version": version}
+            return future
+
+        def cancel_execution(self, **kwargs):
+            raise AssertionError("display normalization must not cancel a confirmed result")
+
+    bridge = Bridge(state="FAILED", success=False)
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "failed" and result.error_code == "MOTION_FAILED"
+    assert len(result.message) == 300
+    assert result.detail["state"] == "FAILED"
+
+
+@pytest.mark.parametrize(
+    "state,status",
+    [("SUCCEEDED", "succeeded"), ("CANCELED", "cancelled"), ("FAILED", "failed"), ("UNKNOWN", "unknown")],
+)
+def test_query_convergence_keeps_terminal_and_authoritative_speech_sequence(state, status):
+    from embodied_common.execution_detail import ExecutionDetail
+    from ibrobot_agent.execution_feedback import FeedbackTracker
+
+    detail = ExecutionDetail(1, "verify", state, "", "", "NOT_NEEDED", 0, "NONE").to_dict()
+
+    class Bridge(_ProgramTransportFailureBridge):
+        def get_execution(self, **kwargs):
+            return {
+                "found": True,
+                "state": state,
+                "execution_id": "execution-1",
+                "last_event_sequence": 100,
+                "current_skill": "pick_object",
+                "execution_detail": detail,
+            }
+
+    adapter = _RosExecutionAdapter(Bridge(), timeout_policy={"rpc_timeout_sec": 0.1, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == status
+    assert result.detail["gateway_sequence"] == 100 and result.detail["execution_detail"] == detail
+    tracker = FeedbackTracker()
+    tracker.accept({"state": "RUNNING", "detail": {"execution_id": "execution-1", "gateway_sequence": 90}})
+    accepted = tracker.accept({"state": state, "sequence": 2, "detail": result.detail})
+    assert accepted and accepted[2], "terminal query must supersede the last spoken progress"
+
+
+def test_late_feedback_from_previous_request_cannot_contaminate_the_next_request():
+    from types import SimpleNamespace
+
+    class Bridge(_ProgramExecutionBridge):
+        callbacks = []
+
+        def send_program_goal(self, **kwargs):
+            def feedback(execution_id, sequence):
+                return SimpleNamespace(
+                    feedback=SimpleNamespace(
+                        execution_id=execution_id,
+                        sequence=sequence,
+                        state="ACTIVE",
+                        current_skill="pick_object",
+                        workflow_step_index=0,
+                    )
+                )
+
+            if self.callbacks:
+                self.callbacks[-1](feedback("stale", 999))
+            kwargs["feedback_callback"](feedback(f"current-{len(self.callbacks)}", 1))
+            self.callbacks.append(kwargs["feedback_callback"])
+            return super().send_program_goal(**kwargs)
+
+    bridge = Bridge()
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    seen = []
+    adapter.set_progress_callback(seen.append)
+    for _ in range(2):
+        adapter.execute(
+            _proposal(),
+            expected_registry_identity=_proposal().catalog_identity,
+            presentation_callback=lambda _: None,
+            submission_callback=lambda *_: None,
+            stop_event=threading.Event(),
+        )
+    assert [item["execution_id"] for item in seen] == ["current-0", "current-1"]
 
 
 def test_program_transport_failure_after_submission_is_unknown_and_attempts_convergence():

@@ -1,0 +1,90 @@
+from dataclasses import replace
+
+import pytest
+
+from embodied_common.execution_detail import ExecutionDetail
+from ibrobot_agent.execution_feedback import FeedbackTracker, execution_reply
+from ibrobot_agent.voice_bridge import Speak, VoiceBridgeConfig, VoiceBridgeCore
+
+
+def event(sequence=1, state="EXECUTING", **changes):
+    detail = ExecutionDetail(1, "observe", "RUNNING", "", "", "NOT_NEEDED", 0, "NONE")
+    detail = replace(detail, **changes)
+    return {
+        "event_type": "terminal" if state in {"FAILED", "SUCCEEDED"} else "execution_progress",
+        "state": state,
+        "sequence": sequence,
+        "request_key": {"request_id": "r1", "channel_id": "text", "principal_id": "operator", "robot_scope": "robot"},
+        "detail": {
+            "execution_id": "e1",
+            "gateway_sequence": sequence,
+            "current_skill": "pick_object",
+            "workflow_step_index": 0,
+            "execution_detail": detail.to_dict(),
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "reason,action,fragment",
+    [
+        ("TARGET_NOT_VISIBLE", "WAIT_USER", "放到机器人面前"),
+        ("OUT_OF_REACH", "WAIT_USER", "放近"),
+        ("PLAN_TIMEOUT", "WAIT_SERVICE", "检查规划服务"),
+        ("EMPTY_GRASP", "WAIT_USER", "没有抓到"),
+        ("GRIP_LOST", "WAIT_USER", "滑落"),
+        ("FUTURE_CODE", "MANUAL_CHECK", "操作员"),
+    ],
+)
+def test_reason_controls_feedback_without_executing_a_retry(reason, action, fragment):
+    context = event(reason_code=reason, suggested_action=action)["detail"]
+    assert fragment in execution_reply("FAILED", context)
+    assert "操作员" in execution_reply(
+        "FAILED", {**context, "execution_detail": {**context["execution_detail"], "recovery_state": "UNKNOWN"}}
+    )
+
+
+def test_tracker_discards_duplicates_stale_and_post_terminal_events():
+    tracker = FeedbackTracker()
+    assert tracker.accept(event(2))[1] == "正在观察目标。"
+    assert tracker.accept(event(2)) is None
+    assert tracker.accept(event(1)) is None
+    assert tracker.accept(event(3)) is None  # identical phase is silent
+    assert tracker.accept(
+        event(4, "FAILED", phase_state="FAILED", reason_code="TARGET_NOT_VISIBLE", suggested_action="WAIT_USER")
+    )[2]
+    assert tracker.accept(event(5, phase="plan")) is None
+
+
+def test_text_feedback_bridge_checks_scope_and_never_submits_or_acknowledges():
+    core = VoiceBridgeCore(
+        VoiceBridgeConfig(channel_id="text", principal_id="operator", robot_scope="robot", feedback_only=True)
+    )
+    payload = event()
+    assert core.on_heard("抓取苹果", 0) == []
+    assert core.on_partial("停止", 0) == []
+    assert core.on_event({**payload, "event_type": "presentation"}, 0) == []
+    for name in ("channel_id", "principal_id", "robot_scope"):
+        assert core.on_event({**payload, "request_key": {**payload["request_key"], name: "foreign"}}, 0) == []
+    actions = core.on_event(payload, 0)
+    assert len(actions) == 1 and isinstance(actions[0], Speak) and not actions[0].then
+    assert core.on_event(payload, 0) == []
+
+
+def test_legacy_and_non_grasp_success_do_not_claim_a_grasp():
+    assert execution_reply("SUCCEEDED", {"current_skill": "pick_object"}) == "执行完成。"
+    context = event()["detail"]
+    context["current_skill"] = "navigate"
+    assert execution_reply("SUCCEEDED", context) == "执行完成。"
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        {"schema_version": 1},
+        ExecutionDetail(schema_version=1).to_dict(),
+        ExecutionDetail(1, "verify", "RUNNING", "", "", "NOT_NEEDED", 0, "NONE").to_dict(),
+    ],
+)
+def test_incomplete_display_facts_preserve_success_without_claiming_a_verified_grasp(detail):
+    assert execution_reply("SUCCEEDED", {"current_skill": "pick_object", "execution_detail": detail}) == "执行完成。"

@@ -302,7 +302,9 @@ def _say(service, request_id, text, *, session_id="s1"):
     terminal = {"SUCCEEDED", "FAILED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION", "ANSWERED", "UNKNOWN"}
     for _ in range(300):
         record = service.get_request(request.to_key())
-        if record.state in terminal:
+        if record.state in terminal and any(
+            event.request_key == request.to_key() and event.state in terminal for event in service._events.items
+        ):
             return record
         time.sleep(0.01)
     raise AssertionError(f"{request_id} did not finish: {record.state}")
