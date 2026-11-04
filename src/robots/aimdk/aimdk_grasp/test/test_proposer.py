@@ -121,6 +121,10 @@ def test_the_target_comes_with_its_candidates_and_the_scene_the_planner_preloads
         report["perception_timings_s"]
     )
     assert [call["service"] for call in report["model_rpc"]] == ["detect", "segment", "grasps"]
+    spans = {name: (start, end) for name, start, end in report["perception_timings_s"]["spans_s"]}
+    assert {"detect", "grasp", "scene"} <= set(spans)
+    assert all(0 <= start <= end for start, end in spans.values())
+    assert spans["detect"][1] <= spans["grasp"][0]  # GraspGen-X needs the target's points
 
 
 def test_a_detection_with_no_support_beneath_gives_way_to_the_next_one():

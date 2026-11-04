@@ -339,13 +339,19 @@ class X2Proposer:
         started = time.perf_counter()
         timings = {}
 
+        # Each stage's [name, start, end] from the start of perception: stages that run side by side
+        # (the scene beside GraspGen-X) are judged by which ends last, not by their sum.
+        spans = timings["spans_s"] = []
+
         def measured(name, operation):
             checkpoint()
             before = time.perf_counter()
             try:
                 result = operation()
             finally:
-                timings[name] = time.perf_counter() - before
+                after = time.perf_counter()
+                timings[name] = after - before
+                spans.append([name, round(before - started, 4), round(after - started, 4)])
             checkpoint()
             return result
 
