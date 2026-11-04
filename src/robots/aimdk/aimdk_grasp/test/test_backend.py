@@ -124,10 +124,12 @@ def test_the_gripper_is_the_one_the_deployed_bundle_generates_for(tmp_path, monk
 
 
 @pytest.mark.skipif(not (BUNDLE / "assets" / "adapter.json").is_file(), reason="GraspGen-X bundle not installed")
-def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup():
+@pytest.mark.parametrize("side", ["left", "right", "auto"])
+def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup(side):
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("warp")
     from aimdk_grasp.backend import x2_grasp_backends
+    from aimdk_grasp.dual_arm import ArmWatch, AutomaticPlanner, SelectedPart, SelectingPlanner
     from aimdk_grasp.execution_watch import X2TargetWatch
     from aimdk_grasp.grasp_request import X2GraspPlanner
     from aimdk_grasp.omnihand import OmniHandEffector
@@ -146,20 +148,27 @@ def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup()
         "model_bundle_path": os.fspath(BUNDLE),
         "model_deployment": "torch_cuda",
         "command_interfaces": list(COMMAND_INTERFACES),
-        "backend_options": {"service_timeout_s": 0.2, "registration_device": "cpu"},
+        "backend_options": {"service_timeout_s": 0.2, "registration_device": "cpu", "arm_side": side},
     }
     split = {**grasp_execution, "backend_options": {**grasp_execution["backend_options"], "head": {"namespace": "/h"}}}
     with pytest.raises(ValueError, match="single-process X2 backends run none"):
         x2_grasp_backends(node=node, grasp_execution=split, description=description)
     backends = x2_grasp_backends(node=node, grasp_execution=grasp_execution, description=description)
     try:
-        assert isinstance(backends.proposer, X2Proposer) and isinstance(backends.executor, StreamExecutor)
-        assert isinstance(backends.planner._inner, X2GraspPlanner)  # resumes the paused IMU after planning
-        assert isinstance(backends.effector, OmniHandEffector) and isinstance(backends.watch, X2TargetWatch)
+        assert isinstance(backends.proposer, X2Proposer)
+        if side == "auto":
+            assert isinstance(backends.planner._inner, SelectingPlanner)
+            assert isinstance(backends.planner._inner.planner, AutomaticPlanner)
+            assert isinstance(backends.executor, SelectedPart) and isinstance(backends.effector, SelectedPart)
+            assert isinstance(backends.watch, ArmWatch)
+        else:
+            assert isinstance(backends.executor, StreamExecutor)
+            assert isinstance(backends.planner._inner, X2GraspPlanner)  # resumes the paused IMU after planning
+            assert isinstance(backends.effector, OmniHandEffector) and isinstance(backends.watch, X2TargetWatch)
         # No camera on this graph: the warmup fails and is retried by the node.
         with pytest.raises(RuntimeError, match="warmup on 'a bottle .'.*RGB-D"):
             backends.prepare()
-        assert backends.watch.imu.paused  # nothing executes after a warmup
+        assert backends.observation._imu.paused  # nothing executes after a warmup
     finally:
         backends.close()
         node.destroy_node()

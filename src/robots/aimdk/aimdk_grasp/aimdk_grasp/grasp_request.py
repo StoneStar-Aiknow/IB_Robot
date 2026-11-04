@@ -203,7 +203,7 @@ class X2GraspPlanner:
             if time.perf_counter() >= planning_deadline:
                 raise TimeoutError("Grasp request deadline exceeded")
 
-        report: dict = {"request_config": asdict(self.config), "request_timings_s": {}}
+        report: dict = {"arm_side": self.hand.side, "request_config": asdict(self.config), "request_timings_s": {}}
 
         def measure(name, operation):
             before = time.perf_counter()

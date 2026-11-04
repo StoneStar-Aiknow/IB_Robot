@@ -16,8 +16,6 @@ from aimdk_grasp.omnihand import (
     FINGERS,
     GRIP_LOST_S,
     HAND_HZ,
-    IDLE_DUMMY,
-    RIGHT_DUMMY,
     OmniHandEffector,
     left_touch_levels,
     touch_levels,
@@ -50,6 +48,8 @@ class SimHand:
         self.feedback_received_at = self.t
         self.measured = np.array(start, dtype=float)
         self.command = self.measured.copy()
+        self.other = np.asarray(RELEASE, dtype=float) * HAND_SIGNS
+        self.full_published = []
         self.blocks: dict[int, float] = {}  # joint index -> furthest native position reachable
         self.touching: set[str] = set()  # pads pressed against the object
         self.touch_sensor = touch_sensor
@@ -79,7 +79,7 @@ class SimHand:
 
     def feedback(self):
         received_at = self.feedback_received_at - (1.0 if self.stale else 0.0)
-        return JointSample(received_at, dict(zip(self.channel_joints[: len(LEFT_HAND)], self.measured, strict=True)))
+        return JointSample(received_at, dict(zip(self.channel_joints, [*self.measured, *self.other], strict=True)))
 
     def touch(self):
         if not self.touch_sensor:
@@ -93,7 +93,9 @@ class SimHand:
         return levels
 
     def publish(self, positions):
-        assert len(positions) == 20 and tuple(positions[10:]) == RIGHT_DUMMY
+        assert len(positions) == 20
+        self.full_published.append(np.array(positions))
+        self.other = np.array(positions[10:])
         self.published.append(np.array(positions[:10]))
         self.command = np.array(positions[:10])
         if self.freeze_feedback_after_publish is not None and len(self.published) >= self.freeze_feedback_after_publish:
@@ -140,7 +142,7 @@ def test_real_hand_state_aliases_are_consumed_under_the_stream_names(mapping):
     stream.binding = binding
     stream._subscriptions = SimpleNamespace(drain=lambda: None)
     stream._lock = threading.Lock()
-    stream._views = {"joint.hand_state": (10.0, dict(zip(state_names, [*RELEASE, *RIGHT_DUMMY], strict=True)))}
+    stream._views = {"joint.hand_state": (10.0, dict(zip(state_names, [*RELEASE, *hand_right_pose()], strict=True)))}
 
     hand = SimHand(RELEASE)
     hand.channel_joints = stream_names
@@ -297,12 +299,18 @@ def test_touch_readings_older_than_a_frame_or_two_are_not_contact():
 class RightSimHand(SimHand):
     """The same simulated hand in the right slots of the 20-value stream."""
 
+    def __init__(self, start, **kwargs):
+        super().__init__(start, **kwargs)
+        self.other = np.asarray(RELEASE, dtype=float)
+
     def feedback(self):
         received_at = self.feedback_received_at - (1.0 if self.stale else 0.0)
-        return JointSample(received_at, dict(zip(self.channel_joints[len(LEFT_HAND) :], self.measured, strict=True)))
+        return JointSample(received_at, dict(zip(self.channel_joints, [*self.other, *self.measured], strict=True)))
 
     def publish(self, positions):
-        assert len(positions) == 20 and tuple(positions[:10]) == IDLE_DUMMY
+        assert len(positions) == 20
+        self.full_published.append(np.array(positions))
+        self.other = np.array(positions[:10])
         self.published.append(np.array(positions[10:]))
         self.command = np.array(positions[10:])
 
@@ -312,6 +320,77 @@ def right_mapping():
     from aimdk_grasp.robot_model import config_directory
 
     return HandMapping(planning_model(config_directory("right")), PRESETS, side="right")
+
+
+def hand_right_pose():
+    return np.asarray(RELEASE) * HAND_SIGNS
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_grasp_and_release_preserve_the_other_open_hand(mapping, right_mapping, side):
+    active, other = (mapping, right_mapping) if side == "left" else (right_mapping, mapping)
+    io = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
+    io.other = other.preset("open").copy()
+    preserved = io.other.copy()
+    effector = OmniHandEffector(io, active)
+    close, opened = active.preset("close"), active.preset("open")
+    for finger in ("thumb", "index"):
+        flex = FINGERS[finger][1]
+        io.block(finger, opened[flex] + 0.4 * (close[flex] - opened[flex]))
+    assert act(effector, EffectorAction.PRESHAPE).succeeded
+    assert act(effector, EffectorAction.CLOSE).held is True
+    io.blocks.clear()
+    io.touching.clear()
+    assert act(effector, EffectorAction.RELEASE).succeeded
+    effector.finish()
+    other_slice = slice(10, 20) if side == "left" else slice(0, 10)
+    for command in io.full_published:
+        np.testing.assert_array_equal(command[other_slice], preserved)
+    other.require_open(io.other)
+    active.require_open(io.measured)
+    assert io.released == 1
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("problem", ["missing", "nan", "moved"])
+def test_preserved_hand_feedback_failure_stops_output(mapping, right_mapping, side, problem):
+    active, other = (mapping, right_mapping) if side == "left" else (right_mapping, mapping)
+    io = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
+    io.other = other.preset("open").copy()
+    effector = OmniHandEffector(io, active)
+    if problem == "moved":
+        assert act(effector, EffectorAction.PRESHAPE).succeeded
+        io.other[0] += 0.03
+    else:
+        feedback = io.feedback
+
+        def broken_feedback():
+            sample = feedback()
+            name = io.channel_joints[10 if side == "left" else 0]
+            if problem == "missing":
+                del sample.positions[name]
+            else:
+                sample.positions[name] = float("nan")
+            return sample
+
+        io.feedback = broken_feedback
+    count = len(io.full_published)
+    outcome = act(effector, EffectorAction.CLOSE)
+    assert not outcome.succeeded and "preserved hand" in outcome.reason
+    assert len(io.full_published) == count
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_finish_discards_the_old_preserved_pose(mapping, right_mapping, side):
+    active, other = (mapping, right_mapping) if side == "left" else (right_mapping, mapping)
+    io = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
+    effector = OmniHandEffector(io, active)
+    assert act(effector, EffectorAction.PRESHAPE).succeeded
+    effector.finish()
+    io.other = other.preset("open").copy()
+    assert act(effector, EffectorAction.PRESHAPE).succeeded
+    other_slice = slice(10, 20) if side == "left" else slice(0, 10)
+    np.testing.assert_array_equal(io.full_published[-1][other_slice], io.other)
 
 
 def test_the_right_hand_opens_and_grips_in_its_own_slots(right_mapping):

@@ -3,8 +3,9 @@
 Either hand is streamed on the runtime's ``joint.hand_stream`` (20 native
 values: the left hand's ten driven joints in ``LEFT_HAND`` order, then the
 right's in ``RIGHT_HAND`` order). The grasping hand (its :class:`HandMapping`'s
-side) takes its ten slots; the other hand's are sent as the zeros the
-motion-control contract was verified with. The
+side) takes its ten slots; the other hand holds its fresh measured pose from
+the first command until the goal finishes. Missing feedback or drift of that
+preserved hand refuses further output. The
 last command is kept alive between actions, so the hand holds its target while
 the arm moves; after a goal the stream is released and the platform keeps the
 last hand target.
@@ -31,7 +32,7 @@ from manipulation_execution.grasp_pipeline.contracts import EffectorAction, Effe
 from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
 
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
-from .joints import HAND_PARTS, check_side
+from .joints import HAND_PARTS, check_side, other_side
 
 HAND_HZ = 50.0
 HAND_STEP_RAD = 0.01
@@ -78,10 +79,6 @@ FINGERS = {
     "ring": ((6, 7), 7, "ring_finger"),
     "pinky": ((8, 9), 9, "little_finger"),
 }
-# The idle hand's slots in the 20-value command: the dummy zeros the
-# motion-control contract was verified with (mc_upper_body_r13, mc_stop_r14).
-IDLE_DUMMY = (0.0,) * 10
-RIGHT_DUMMY = IDLE_DUMMY
 #: Each hand's offset in the 20-value stream and the hand state view.
 HAND_OFFSETS = {"left": 0, "right": len(HAND_PARTS)}
 
@@ -124,6 +121,7 @@ class OmniHandEffector:
     #: The last close's grip while it is held: contact fingers, frozen command, closing direction.
     _grip: dict | None = field(default=None, repr=False)
     _lost_since: float | None = field(default=None, repr=False)
+    _preserved_hand: np.ndarray | None = field(default=None, repr=False)
 
     def act(self, action: EffectorAction, *, halted: Flag, cancelled: Flag) -> EffectorOutcome:
         try:
@@ -140,6 +138,7 @@ class OmniHandEffector:
         self.io.release()
         self.command = None
         self._grip = None
+        self._preserved_hand = None
 
     def holding(self) -> str | None:
         """While an object is carried: '' while the grip holds, the reason once it is lost, None if unknown.
@@ -272,10 +271,14 @@ class OmniHandEffector:
 
     # -- pieces ---------------------------------------------------------------------
 
-    def _measured(self) -> np.ndarray:
+    def _fresh(self):
         sample = self.io.feedback()
         if not sample.healthy or not 0 <= self.io.monotonic() - sample.received_at <= self.feedback_max_age_s:
             raise _Failed("hand feedback unhealthy or stale")
+        return sample
+
+    def _measured(self) -> np.ndarray:
+        sample = self._fresh()
         side = self.mapping.side
         offset = HAND_OFFSETS[side]
         joints = self.io.channel_joints[offset : offset + len(HAND_PARTS)]
@@ -290,10 +293,27 @@ class OmniHandEffector:
         hand = self.mapping.check(hand)
         if self.io.refusal():
             raise _Failed(f"runtime does not admit output: {self.io.refusal()}")
+        sample = self._fresh()
+        if len(self.io.channel_joints) != 2 * len(HAND_PARTS):
+            raise _Failed("hand stream must describe both hands")
+        preserved_side = other_side(self.mapping.side)
+        other_offset = HAND_OFFSETS[preserved_side]
+        other_joints = self.io.channel_joints[other_offset : other_offset + len(HAND_PARTS)]
+        try:
+            other = np.asarray([sample.positions[name] for name in other_joints], dtype=float)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _Failed(f"invalid preserved hand feedback: {exc}") from None
+        if other.shape != (len(HAND_PARTS),) or not np.isfinite(other).all():
+            raise _Failed("ten finite preserved hand positions required")
+        if self._preserved_hand is None:
+            self._preserved_hand = other.copy()
+            self.report["preserved_hand"] = dict(side=preserved_side, positions=other.tolist())
+        if np.max(np.abs(other - self._preserved_hand)) > OPEN_HAND_TOLERANCE_RAD:
+            raise _Failed("preserved hand moved during grasp")
         if self.mapping.side == "left":
-            self.io.publish([*hand.tolist(), *IDLE_DUMMY])
+            self.io.publish([*hand.tolist(), *self._preserved_hand.tolist()])
         else:
-            self.io.publish([*IDLE_DUMMY, *hand.tolist()])
+            self.io.publish([*self._preserved_hand.tolist(), *hand.tolist()])
         self.command = hand.copy()
 
     def _frame(self, hand: np.ndarray, cancelled: Flag, name: str) -> None:

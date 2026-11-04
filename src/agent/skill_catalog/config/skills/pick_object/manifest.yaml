@@ -48,7 +48,8 @@ description_variants:
   # no container to transport it to.
   aimdk_x2_grasp:
     summary: >-
-      Detect and grasp the requested object with the left hand, lift and hold it, then put it back.
+      Detect and grasp the requested object with the selected hand, lift and hold it, then put it back.
+      The X2 selects the arm from the object's side unless its configuration forces one arm.
       Use a short English object phrase for target_name, such as "an apple";
       translate Chinese object names and preserve attributes such as color.
     category: manipulation

@@ -220,12 +220,15 @@ leaves less than 0.06 of the tracking limit.
 
 ## The hand
 
-`aimdk_grasp.omnihand.OmniHandEffector` is the left OmniHand as the pipeline's
-end effector, streamed on the runtime's `joint.hand_stream` (the left hand's ten
-native joints, then ten zeros for the right, the packing the motion-control
-contract was verified with). The last command is kept alive between actions, so
-the hand holds its target while the arm moves; after a goal the stream is
-released and the platform keeps it.
+`aimdk_grasp.omnihand.OmniHandEffector` drives either OmniHand through the runtime's
+`joint.hand_stream` (the left hand's ten native joints followed by the right's
+ten). Before its first output in each goal, it records the other hand's position
+from fresh feedback and preserves that pose in every command. Missing or
+non-finite feedback, or more than 0.025 rad of preserved-hand drift, refuses
+further hand commands. It never fills the other hand's slots with zeros. Prepare
+both hands in the model's open preset before a dual-arm grasp run. The last
+command is kept alive between actions, so the hand holds its target while the
+arm moves; after a goal the stream is released and the platform keeps it.
 
 Preshape and release open along a straight line, 0.01 rad per 50 Hz frame, and
 wait up to 3 s for the fingers; a hand left more than 0.1 rad short of open is
@@ -335,6 +338,25 @@ those of its launch (`cpu_isolation`), and how long the robot-side host goes
 without a watch status (`status_timeout_s`). Ending the split means selecting
 `aimdk_grasp.backend:x2_grasp_backends`, which keeps everything in one process,
 and dropping that block.
+
+## Automatic arm selection
+
+The shipped X2 grasp profiles set `grasp_execution.backend_options.arm_side`
+to `auto`. The head transforms the target's depth points into `torso_link`
+and uses their median y: positive selects the left arm, negative the right.
+Within 5 cm of the midline, it tries the nearer arm first and the other arm
+if planning fails, returning the first executable plan. Each attempt receives
+an equal share of the remaining planning budget; both attempts share the
+observation's original budget and the goal deadline.
+
+Both arm planners stay resident and share the camera, IMU and GPU lock.
+Each has its own collision scene, joint limits, gravity model and hand mapping.
+The accepted plan's `report.arm_side` routes arm commands, hand commands and
+the target watch; execution rejects trajectories whose joint names disagree
+with that side. Startup requires fresh feedback showing both hands open.
+
+Set `arm_side: left` or `arm_side: right` on both hosts to force one arm.
+Configurations that omit the option retain the left-arm default.
 
 ## Target watch states
 

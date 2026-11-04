@@ -13,9 +13,11 @@ description is the deployed GraspGen-X bundle's
 
 ``grasp_execution.backend_options`` (all optional):
 
-- ``arm_side``: ``left`` (default) or ``right``, the arm and hand every part
-  plans, watches, streams and grips with (its planning model, gravity model,
-  limits, leg obstacle and hand)
+- ``arm_side``: ``auto`` in the shipped X2 profiles, or ``left`` / ``right``
+  to force an arm. Auto uses torso y (positive left, negative right), trying
+  either arm within 5 cm of the midline. Both planners stay resident under
+  one GPU lock; execution and the watch follow the successful plan's arm.
+  An omitted option preserves the legacy left-arm behavior.
 - ``detect_service``, ``segment_service`` (empty: the detector returns its
   own masks), ``generate_grasps_service``, ``service_timeout_s``
 - ``registration_device``, ``depth_scale``, ``calibration_verified``
@@ -102,8 +104,8 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
         if not ok:
             kind = type(default).__name__ if isinstance(default, bool | str | dict) else "finite number"
             raise ValueError(f"backend_options.{name} must be a {kind}")
-    if options["arm_side"] not in ("left", "right"):
-        raise ValueError("backend_options.arm_side must be left or right")
+    if options["arm_side"] not in ("left", "right", "auto"):
+        raise ValueError("backend_options.arm_side must be left or right or auto")
     if options["watch"] not in ("stop", "log", "off"):
         raise ValueError("backend_options.watch must be stop, log or off")
     for name in ("watch_frame_timeout_s", "watch_unknown_timeout_s", "watch_image_age_s"):
@@ -214,7 +216,7 @@ def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     options = _options(grasp_execution)
     perception = _settings(PerceptionSettings, options["perception"], ("scene",), "perception")
     planning = _settings(GraspRequestConfig, options["planning"], ("revalidation",), "planning")
-    side = options["arm_side"]
+    side = "left" if options["arm_side"] == "auto" else options["arm_side"]
     # The scene is estimated for the planning arm (its reach crop and leg obstacle).
     perception = replace(perception, scene=replace(perception.scene, arm_side=side))
     directory = config_directory(side)
@@ -223,6 +225,25 @@ def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     hand = HandMapping(model, {name: dict(gripper[name]) for name in ("open", "close")}, side=side)
     return X2Robot(
         options, perception, planning, gripper, hand, ArmGravity.load(side=side), arm_limits(directory), side
+    )
+
+
+def robot_for_side(robot: X2Robot, side: str) -> X2Robot:
+    """Bind the shared gripper description and settings to one physical arm."""
+    from .arm_gravity import ArmGravity
+    from .hand import HandMapping
+    from .robot_model import arm_limits, config_directory, planning_model
+
+    directory = config_directory(side)
+    hand = HandMapping(planning_model(directory), robot.hand.presets, side=side)
+    return replace(
+        robot,
+        side=side,
+        hand=hand,
+        gravity=ArmGravity.load(side=side),
+        limits=arm_limits(directory),
+        options={**robot.options, "arm_side": side},
+        perception=replace(robot.perception, scene=replace(robot.perception.scene, arm_side=side)),
     )
 
 
@@ -241,7 +262,7 @@ class HeadParts:
     gpu: Any = field(default_factory=threading.RLock)
 
 
-def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: list, *, on_moved=None) -> HeadParts:
+def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: list, *, on_moved=None, shared=None):
     """Built on ``node``; each part's close is appended to ``closers``."""
     from .execution_watch import ChestImu, X2TargetWatch
     from .head_camera import HeadCamera
@@ -250,6 +271,14 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
     from .robot_model import config_directory
     from .robot_spheres import RobotSphereModel
 
+    if robot.options["arm_side"] == "auto":
+        from .dual_arm import AutomaticHead
+
+        robots = {side: robot_for_side(robot, side) for side in ("left", "right")}
+        left = head_parts(node, robots["left"], description, closers, on_moved=on_moved)
+        right = head_parts(node, robots["right"], description, closers, on_moved=on_moved, shared=left)
+        return AutomaticHead({"left": left, "right": right}, robots)
+
     options, planning = robot.options, robot.planning
     # One lock for every GPU user of the head: while cuRobo captures a CUDA
     # graph, an allocation or synchronization on any other thread of the
@@ -257,18 +286,23 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
     # capture registering with Warp during a planner rebuild did that and
     # took the head down (live 2026-10-22). Re-entrant: the planner's target
     # recheck captures on the planning thread.
-    gpu = threading.RLock()
-    camera = HeadCamera(
-        node,
-        description,
-        FeedbackHistory(),
-        device=options["registration_device"],
-        depth_scale=float(options["depth_scale"]),
-        calibration_verified=options["calibration_verified"],
-        revalidation=planning.revalidation,
-        gpu_lock=gpu,
+    gpu = threading.RLock() if shared is None else shared.gpu
+    camera = (
+        shared.camera
+        if shared is not None
+        else HeadCamera(
+            node,
+            description,
+            FeedbackHistory(),
+            device=options["registration_device"],
+            depth_scale=float(options["depth_scale"]),
+            calibration_verified=options["calibration_verified"],
+            revalidation=planning.revalidation,
+            gpu_lock=gpu,
+        )
     )
-    closers.append(camera.close)
+    if shared is None:
+        closers.append(camera.close)
     spheres = RobotSphereModel(robot.hand, config_directory(robot.side))
     service = GraspPlanningService(
         gripper=robot.gripper,
@@ -291,8 +325,9 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
     )
     parts = HeadParts(camera, spheres, service, planner, gpu=gpu)
     if options["watch"] != "off":
-        parts.imu = ChestImu(node, description)
-        closers.append(parts.imu.close)
+        parts.imu = ChestImu(node, description) if shared is None else shared.imu
+        if shared is None:
+            closers.append(parts.imu.close)
         parts.watch = X2TargetWatch(
             camera.capture_state,
             lambda feedback: measured_spheres(spheres, feedback),
@@ -330,6 +365,18 @@ def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: 
     return executor, OmniHandEffector(hand_io, robot.hand)
 
 
+def automatic_execution(node, robot, description, closers, planner):
+    from .dual_arm import ExecutionSelection, SelectedPart, SelectingPlanner
+
+    pairs = {side: arm_and_hand(node, robot_for_side(robot, side), description, closers) for side in ("left", "right")}
+    selection = ExecutionSelection()
+    return (
+        SelectingPlanner(planner, selection),
+        SelectedPart({side: pair[0] for side, pair in pairs.items()}, selection),
+        SelectedPart({side: pair[1] for side, pair in pairs.items()}, selection),
+    )
+
+
 def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: Mapping[str, Any]) -> GraspBackends:
     """Everything in this process (aimdk_grasp.remote_head splits it across two hosts)."""
     from rclpy.callback_groups import ReentrantCallbackGroup
@@ -352,11 +399,24 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
             timeout_s=float(options["service_timeout_s"]),
             callback_group=ReentrantCallbackGroup(),
         )
-        proposer = X2Proposer(services, head.spheres, settings=robot.perception, preload=head.service.preload)
-        executor, effector = arm_and_hand(node, robot, description, closers)
         source, planner = head.camera, head.planner
+        if options["arm_side"] == "auto":
+
+            def local_scene(observation, mask, timeout_s, cancelled):
+                if cancelled():
+                    raise GraspFailure("CANCELED", "goal cancelled during scene construction")
+                prepared = head.prepare_scene(observation)
+                scenes = head.complete_scene(prepared, mask, observation)
+                head.service.preload(observation.robot_state.live.feedback, scenes)
+                return scenes
+
+            proposer = X2Proposer(services, None, settings=robot.perception, remote_scene=local_scene)
+            planner, executor, effector = automatic_execution(node, robot, description, closers, planner)
+        else:
+            proposer = X2Proposer(services, head.spheres, settings=robot.perception, preload=head.service.preload)
+            executor, effector = arm_and_hand(node, robot, description, closers)
         if head.imu is not None:
-            source, planner = _PausingCamera(head.camera, head.imu), _ResumingPlanner(head.planner, head.imu)
+            source, planner = _PausingCamera(head.camera, head.imu), _ResumingPlanner(planner, head.imu)
     except BaseException:
         for close in reversed(closers):
             close()
@@ -368,7 +428,12 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
         deadline = time.monotonic() + WARMUP_BUDGET_S
         try:
             observation = source.capture(deadline=deadline, cancelled=lambda: False)
-            check_initial_hand(robot.hand, observation.robot_state)
+            if options["arm_side"] == "auto":
+                head.check_hands(observation.robot_state)  # both arms' hands
+                scenes = head.complete_scene(head.prepare_scene(observation), None, observation)
+                head.service.prepare(observation.robot_state.live.feedback, scenes)
+            else:
+                check_initial_hand(robot.hand, observation.robot_state)
             proposals = proposer.propose(
                 observation, options["warmup_prompt"], deadline=deadline, cancelled=lambda: False
             )

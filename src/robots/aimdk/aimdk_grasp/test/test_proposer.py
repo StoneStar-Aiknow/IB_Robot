@@ -342,3 +342,20 @@ def test_an_upside_down_camera_is_detected_upright_and_its_target_found_where_it
     assert proposals.target_mask[ON_TABLE].all() and proposals.target_mask.sum() == 64
     assert proposals.report["detection"]["box_xyxy"] == [20.0, 20.0, 28.0, 28.0]
     assert proposals.report["detection_turns"] == 2 and len(proposals.target_points) == 64
+
+
+def test_capture_scene_is_prepared_around_the_image_time_robot(monkeypatch):
+    from aimdk_grasp import proposer, scene_estimation
+
+    frame = SimpleNamespace(depth="depth", intrinsics="K", frame_id="camera", depth_scale=0.001)
+    transform = SimpleNamespace(stamp_ns=7)
+    registered = SimpleNamespace(frame=frame, transform=transform, received_at=3.5, image_feedback="image feedback")
+    observation = SimpleNamespace(robot_state=SimpleNamespace(live=SimpleNamespace(observation=registered)))
+    seen = {}
+    monkeypatch.setattr(proposer, "measured_spheres", lambda model, feedback: (model, feedback))
+    monkeypatch.setattr(scene_estimation, "prepare_scene", lambda *args, **kwargs: seen.update(args=args, **kwargs))
+    proposer.prepare_capture_scene(observation, "right model", "config")
+    assert seen["args"] == ("depth", "K", transform)
+    assert seen["robot_spheres_torso"] == ("right model", "image feedback")
+    assert (seen["stamp_ns"], seen["camera_frame"], seen["received_at"]) == (7, "camera", 3.5)
+    assert (seen["depth_scale"], seen["config"]) == (0.001, "config")

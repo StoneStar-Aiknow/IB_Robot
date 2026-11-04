@@ -52,9 +52,9 @@ from .head_interface import (
     head_endpoints,
     parse_session,
 )
-from .proposer import measured_spheres
+from .proposer import prepare_capture_scene
 from .rgbd_to_cloud import mask_depth_to_points
-from .scene_estimation import NoSupportError, complete_scene, prepare_scene
+from .scene_estimation import NoSupportError, complete_scene
 from .split import head_options
 
 #: Captures and plans kept for the requests that follow: one request uses a
@@ -161,10 +161,13 @@ class X2GraspHeadNode(Node):
                     deadline=time.monotonic() + WARMUP_BUDGET_S, cancelled=self._closing.is_set
                 )
                 admitted = observation.robot_state
-                check_initial_hand(self._robot.hand, admitted)
+                if hasattr(head, "check_hands"):
+                    head.check_hands(admitted)  # both arms' hands
+                else:
+                    check_initial_hand(self._robot.hand, admitted)
                 prepared = self._prepare_scene(observation)
                 with head.gpu:
-                    estimate = complete_scene(prepared, None, lazy_validation=False)
+                    estimate = self._complete_scene(prepared, None, observation)
                 head.service.prepare(admitted.live.feedback, estimate)
             except Exception as exc:  # noqa: BLE001 - retried until the robot and the camera are up
                 self.get_logger().warning(f"grasp head not ready: {exc}", throttle_duration_sec=5.0)
@@ -179,20 +182,15 @@ class X2GraspHeadNode(Node):
 
     def _prepare_scene(self, observation: Observation):
         """The mask-independent scene stage of one capture."""
-        registered = observation.robot_state.live.observation
-        frame, transform = registered.frame, registered.transform
+        if hasattr(self._head, "prepare_scene"):
+            return self._head.prepare_scene(observation)
         with self._head.gpu:
-            return prepare_scene(
-                frame.depth,
-                frame.intrinsics,
-                transform,
-                stamp_ns=transform.stamp_ns,
-                camera_frame=frame.frame_id,
-                received_at=registered.received_at,
-                robot_spheres_torso=measured_spheres(self._head.spheres, registered.image_feedback),
-                depth_scale=frame.depth_scale,
-                config=self._robot.perception.scene,
-            )
+            return prepare_capture_scene(observation, self._head.spheres, self._robot.perception.scene)
+
+    def _complete_scene(self, prepared, mask, observation):
+        if hasattr(self._head, "complete_scene"):
+            return self._head.complete_scene(prepared, mask, observation)
+        return complete_scene(prepared, mask, lazy_validation=mask is not None)
 
     # -- requests -----------------------------------------------------------------
 
@@ -264,7 +262,7 @@ class X2GraspHeadNode(Node):
             prepared = capture.prepared.result(timeout=max(0.0, request.timeout_s))
             started = time.perf_counter()
             with gpu_section(self._head.gpu, deadline=deadline, cancelled=self._closing.is_set):
-                estimate = complete_scene(prepared, mask, lazy_validation=True)
+                estimate = self._complete_scene(prepared, mask, capture.observation)
             settings = self._robot.perception
             points = mask_depth_to_points(
                 mask,

@@ -117,6 +117,8 @@ robot:
       - joint.arm_stream
       - joint.hand_stream
     backend_options:
+      # Pick with the arm on the target's side; left/right force one arm.
+      arm_side: auto
       detect_service: /perception/grasp/grounding_detect
       generate_grasps_service: /perception/grasp/generate_grasps
       # Halt the approach when the target moves, and replan once it is back.

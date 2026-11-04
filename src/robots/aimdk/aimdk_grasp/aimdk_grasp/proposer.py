@@ -189,6 +189,25 @@ def measured_spheres(model: RobotSphereModel, feedback) -> np.ndarray:
     return spheres[0].copy()
 
 
+def prepare_capture_scene(observation, model: RobotSphereModel, config):
+    """The mask-independent scene stage of one registered capture, with ``model``'s arm at its image-time pose."""
+    from .scene_estimation import prepare_scene
+
+    registered = observation.robot_state.live.observation
+    frame, transform = registered.frame, registered.transform
+    return prepare_scene(
+        frame.depth,
+        frame.intrinsics,
+        transform,
+        stamp_ns=transform.stamp_ns,
+        camera_frame=frame.frame_id,
+        received_at=registered.received_at,
+        robot_spheres_torso=measured_spheres(model, registered.image_feedback),
+        depth_scale=frame.depth_scale,
+        config=config,
+    )
+
+
 class X2Proposer:
     """``GraspProposer`` for the X2: GroundingDINO (+ SAM2), GraspGen-X and the collision scene."""
 
