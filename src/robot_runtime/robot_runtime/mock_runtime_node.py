@@ -186,7 +186,7 @@ class MockRuntime(Node):
         # the mock's capability surface and its description cannot disagree.
         sensor_traits = effective_sensor_traits(self._profile, peripherals_path, use_sim, sim_platform or None)
         capabilities = dict(self._profile["capabilities"])
-        capabilities.update(perception_capabilities(peripherals, traits=sensor_traits))
+        capabilities.update(perception_capabilities(peripherals, traits=sensor_traits, profile=self._profile))
         capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         description = build_description(self._profile, peripherals, use_sim=use_sim, sim_platform=sim_platform or None)

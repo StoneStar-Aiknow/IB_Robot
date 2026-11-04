@@ -47,6 +47,9 @@
   <depend>python3-numpy</depend>
   <depend>python3-yaml</depend>
   <exec_depend>ament_index_python</exec_depend>
+  <!-- The embodiment compositions build launch actions (Node, substitutions);
+       a launch-only consumer of this package's entry points needs it. -->
+  <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>xacro</exec_depend>
 
@@ -60,10 +63,15 @@
   <!-- The moved tests import sim_models directly and glob its scene
        templates; the so101/lekiwi profiles they exercise are read from the
        source tree by path, so no robot package is a test dependency (that
-       would cycle: those packages test_depend on this one). -->
+       would cycle: those packages test_depend on this one). The tests also
+       import this package's own runtime-facing modules through their real
+       import path (robot_runtime) and assert the contract messages
+       (ibrobot_msgs), so both are test dependencies. -->
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>sim_models</test_depend>
+  <test_depend>robot_runtime</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

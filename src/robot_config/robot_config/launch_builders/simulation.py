@@ -47,6 +47,16 @@ def _resolve_provider_world(context: LaunchBuildContext) -> BuildResult:
     platform — ``""`` when the configured scene failed to load, in which
     case every platform falls back to the ``empty`` scene and the layout is
     never consulted (D7).
+
+    A hook that fails its OWN scene load (Gazebo's world-file generation,
+    which the precheck cannot fully cover: the layout parses and the
+    template exists, but the generated world file read/write fails) reports
+    the final scene through ``SimWorldStartup.scene``; the scene identity
+    and the spawn pose are then re-resolved from that verdict here, because
+    this builder — not the hook — owns them. A re-resolved scene of ``""``
+    records the fallback, drops the failed scene's layout spawn and keeps
+    rule 1 (``robot_spawn``, else the origin), exactly like a precheck
+    failure.
     """
     from robot_runtime.sim_platforms import SimPlatformError, get_sim_platform
 
@@ -80,6 +90,15 @@ def _resolve_provider_world(context: LaunchBuildContext) -> BuildResult:
         startup = resolve_builder_factory(spec.world)(robot_config, scene=scene, spawn_pose=spawn_pose)
         world_actions = list(startup.actions)
         world = str(startup.world or "")
+        final_scene = getattr(startup, "scene", None)
+        if final_scene is not None and str(final_scene) != scene:
+            # The hook's own scene attempt failed and it fell back (D5): the
+            # final scene — "" for the fallback-to-empty case — is the
+            # authoritative scene identity, and the spawn pose re-resolves
+            # from it (D7: robot_spawn, else the origin; the failed scene's
+            # layout is never consulted).
+            scene = str(final_scene)
+            spawn_pose = _resolve_spawn_pose(simulation, scene)
     return BuildResult(
         actions=world_actions,
         simulation_startup=SimulationStartup(
@@ -107,6 +126,11 @@ def _scene_loads(scene: str, platform: str) -> bool:
     (``robot_spawn``), else the origin — the layout is never consulted. The
     scene's layout must load; a platform sim_models ships templates for must
     also find its template (other platforms bring their own scene assets).
+
+    This is the precheck — it proves the scene resolves. A platform whose
+    hook still fails to build its own world from a precheck-passing scene
+    (Gazebo's world-file generation) reports the fallback through
+    ``SimWorldStartup.scene`` and ``_resolve_provider_world`` re-resolves.
     """
     from sim_models.scene_compiler import get_scene_file, get_scene_layout, scene_template_platforms
 

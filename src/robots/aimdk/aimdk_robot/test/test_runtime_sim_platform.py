@@ -44,7 +44,7 @@ class _FakeEmbodiment:
         world="",
         spawn_pose=(0.0, 0.0, 0.0, 0.0),
     ):
-        self.calls.append({"world": world, "spawn_pose": spawn_pose})
+        self.calls.append({"world": world, "spawn_pose": spawn_pose, "interface_description": interface_description})
         return list(_FAKE_ACTIONS)
 
 
@@ -73,12 +73,16 @@ def fake_platform(monkeypatch):
 
 @pytest.fixture
 def physics_profile(tmp_path):
-    """A profile copy that declares the fake platform as supported."""
+    """A profile copy that declares the fake platform as supported.
+
+    The default platform stays ``sdk``: the physics selection comes from the
+    launch argument (``sim_platform:=``), exactly how a deployment selects a
+    platform the profile merely allows.
+    """
     import yaml
 
     data = yaml.safe_load(_PROFILE.read_text(encoding="utf-8"))
     data["sim_platforms"] = ["sdk", _PLATFORM]
-    data["sim_platform"] = _PLATFORM
     path = tmp_path / "x2_physics.yaml"
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
     return path
@@ -110,10 +114,19 @@ def test_a_physics_platform_returns_only_the_fake_embodiments_actions(fake_platf
     assert actions == _FAKE_ACTIONS, "no vendor mock, no data plane, nothing else"
 
 
+def test_the_embodiment_receives_a_description_carrying_the_selected_platform(fake_platform, physics_profile):
+    """The description the physics branch hands the embodiment names the platform."""
+    _render(physics_profile, _PLATFORM)
+    description = fake_platform.EMBODIMENT.calls[0]["interface_description"]
+    assert description["execution"] == "simulated"
+    assert description["sim_platform"] == _PLATFORM
+
+
 def test_the_physics_branch_hands_the_world_and_spawn_pose_to_the_embodiment(fake_platform, physics_profile):
     actions = _render(physics_profile, _PLATFORM, sim_world="x2_park", spawn=("0.4", "-1.5", "0.02", "1.57"))
     assert actions == _FAKE_ACTIONS
-    assert fake_platform.EMBODIMENT.calls == [{"world": "x2_park", "spawn_pose": (0.4, -1.5, 0.02, 1.57)}]
+    call = fake_platform.EMBODIMENT.calls[-1]
+    assert (call["world"], call["spawn_pose"]) == ("x2_park", (0.4, -1.5, 0.02, 1.57))
 
 
 def test_the_sdk_path_keeps_the_vendor_mock_and_data_plane(fake_platform):

@@ -134,7 +134,7 @@ def _launch_setup(context, *_args, **_kwargs):
     # When simulated the platform's sensor streams have no publisher, so the
     # contract layer's synthetic publishers stand in for them on exactly the
     # declared endpoints.
-    description = build_description(profile, use_sim=use_sim, sim_platform=sim_platform)
+    description = build_description(profile, use_sim=use_sim, sim_platform=sim_platform, profile_path=profile_path)
     for spec in description["interfaces"].values():
         if spec["message_type"] == "sensor_msgs/msg/Image" and spec.get("configured_profile") is None:
             spec["configured_profile"] = dict(SIMULATED_IMAGE_PROFILE)

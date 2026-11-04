@@ -113,6 +113,7 @@ def perception_capabilities(
     *,
     sim_platform: str | None = None,
     traits: SimSensorTraits | None = None,
+    profile: dict | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Perception capability specs (RuntimeStatus surface) for a peripheral list.
 
@@ -123,9 +124,12 @@ def perception_capabilities(
     surface and the advertised endpoints derive from the same projection, so
     a lidar the platform does not stand in for is neither advertised nor
     claimed. ``sim_platform`` only selects the exclusion filter (D3).
+    ``profile`` is the runtime profile the traits' rate callables resolve
+    from (the effective peripheral list is threaded through by the shared
+    :func:`peripheral_interfaces` projection).
     """
     caps: dict[str, dict[str, Any]] = {}
-    for spec in peripheral_interfaces(peripherals, sim_platform=sim_platform, traits=traits).values():
+    for spec in peripheral_interfaces(peripherals, sim_platform=sim_platform, traits=traits, profile=profile).values():
         if not spec["capability"].startswith("perception."):
             continue  # interaction.audio_* entries carry their format via audio_capabilities
         caps.setdefault(spec["capability"], {"topics": []})["topics"].append(spec["endpoint"])

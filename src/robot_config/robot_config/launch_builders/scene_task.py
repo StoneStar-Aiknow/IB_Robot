@@ -73,9 +73,15 @@ def build_scene_task(context: LaunchBuildContext) -> BuildResult:
 
     startup = context.simulation_startup
     robot_config = dict(context.robot_config or {})
-    scene = (startup.scene_name if startup is not None else "") or str(
-        (robot_config.get("simulation") or {}).get("scene", "") or ""
-    )
+    if startup is not None:
+        # The world bootstrap's scene identity is authoritative, ``""`` included:
+        # an empty ``scene_name`` is the resolved "the configured scene failed
+        # to load, the empty scene is up" state (simulation.py D7), not a
+        # missing resolution — re-reading the configured (broken) scene here
+        # would start a task against a scene that never came up.
+        scene = str(startup.scene_name or "")
+    else:
+        scene = str((robot_config.get("simulation") or {}).get("scene", "") or "")
     if not scene:
         logger.info("scene task not started: the launch has no scene")
         return BuildResult()

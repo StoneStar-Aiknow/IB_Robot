@@ -162,7 +162,7 @@ class RuntimeFacade(Node):
         # platform resolution).
         sensor_traits = effective_sensor_traits(self._profile, path, self._use_sim, self._sim_platform)
         capabilities = dict(self._profile["capabilities"])
-        capabilities.update(perception_capabilities(peripherals, traits=sensor_traits))
+        capabilities.update(perception_capabilities(peripherals, traits=sensor_traits, profile=self._profile))
         capabilities.update(audio_capabilities(peripherals))
         capabilities.setdefault("runtime.status", {})
         description = (

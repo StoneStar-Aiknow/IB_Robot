@@ -11,14 +11,14 @@ simulator: the description is rendered once with the platform's renderer (the
 public model and interface description derive from that exact render), the
 base node, FAST-LIO and the scan converter carry ``use_sim_time``, and
 ``runtime_stack_actions`` hands the embodiment the world/scene name and spawn
-pose. On Gazebo (D7) the world comes from ``gazebo_world``; on MuJoCo
-(lekiwi-mujoco-runtime-platform D7) the scene comes from ``mujoco_scene``
-(default the shared ``empty`` scene) and headless mode follows
-``IBROBOT_MUJOCO_HEADLESS``.
+pose. The world hand-off is the platform-neutral ``sim_world`` (the gz world
+name on Gazebo, the scene name on MuJoCo). On MuJoCo
+(lekiwi-mujoco-runtime-platform D7) an empty scene composes the shared
+``empty`` scene and headless mode follows ``IBROBOT_MUJOCO_HEADLESS``.
 
     ros2 launch lekiwi_robot runtime.launch.py profile:=<path-or-name> \
         [use_sim:=true] [sim_platform:=gazebo|mujoco] \
-        [gazebo_world:=<name>] [mujoco_scene:=<name>] [spawn_x/y/z/yaw:=…] \
+        [sim_world:=<name>] [spawn_x/y/z/yaw:=…] \
         [display:=true] [peripherals:=<fragment.yaml>]
 """
 

@@ -491,17 +491,25 @@ def peripheral_interfaces(
     drive every platform-specific rewrite of the surface — streams the
     platform cannot produce, forced encodings, dimensions, rates, QoS and
     the lidar drivers the platform stands in for (D4). The traits' rate
-    callables receive ``profile`` (the runtime profile the rates are
-    resolved from); the explicit ``camera_rate_hz``/``imu_rate_hz``
-    overrides keep their meaning. ``scan_source_runs`` says whether the
-    derived scan's source (FAST-LIO's registered body cloud) runs on the
-    selected platform (D5). ``sim_platform`` only selects the exclusion
-    filter (``simulation.<platform>.enabled: false``, D3: an excluded
-    peripheral is neither advertised nor claimed).
+    callables receive the effective profile — ``profile`` with
+    ``peripherals`` replaced by this projection's merged, platform-filtered
+    inventory — and a callable returning ``None`` applies no override; the
+    explicit ``camera_rate_hz``/``imu_rate_hz`` overrides keep their
+    meaning. ``scan_source_runs`` says whether the derived scan's source
+    (FAST-LIO's registered body cloud) runs on the selected platform (D5).
+    ``sim_platform`` only selects the exclusion filter
+    (``simulation.<platform>.enabled: false``, D3: an excluded peripheral
+    is neither advertised nor claimed).
     """
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
     merged = platform_peripherals(merge_peripherals(peripherals, []), sim_platform)
+    # The rate callables resolve from the effective inventory (D4): the
+    # merged peripherals this projection iterates, platform-excluded entries
+    # removed — the same list every platform consumer resolves, so a callable
+    # reading the camera fps (e.g. the MuJoCo minimum) cannot disagree with
+    # the plugin the platform runs (review round 1).
+    effective_profile = {**(profile or {}), "peripherals": merged}
     for periph in merged:
         name, kind = periph["name"], periph["type"]
         if kind in ("microphone", "speaker"):
@@ -625,8 +633,11 @@ def peripheral_interfaces(
                         encoding = forced
                 if traits is not None and traits.camera_rate is not None:
                     # the platform has one rate for all cameras (D5): every
-                    # stream advertises the effective rate
-                    fps = float(traits.resolve_camera_rate(profile if profile is not None else {}))
+                    # stream advertises the effective rate; a callable that
+                    # returns None applies no override (the per-stream fps)
+                    resolved_rate = traits.resolve_camera_rate(effective_profile)
+                    if resolved_rate is not None:
+                        fps = float(resolved_rate)
                 if camera_rate_hz is not None:
                     fps = float(camera_rate_hz)
                 suffix = "" if is_color else ("/aligned_depth_to_color" if aligned else "/depth")
@@ -751,7 +762,9 @@ def peripheral_interfaces(
                     and traits.imu_rate is not None
                     and str(driver) in traits.integrated_imu_drivers
                 ):
-                    effective_imu_rate = traits.resolve_imu_rate(profile if profile is not None else {}, [periph])
+                    # None from the callable means no override (no rate
+                    # advertised), never float(None)
+                    effective_imu_rate = traits.resolve_imu_rate(effective_profile, merged)
                 interfaces[f"lidar.{name}.imu"] = _topic(
                     periph.get("imu_topic", "/livox/imu"),
                     "sensor_msgs/msg/Imu",

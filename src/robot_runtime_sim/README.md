@@ -78,7 +78,10 @@ simulation:
   路径、平台名与引用。
 - embodiment 可以带 `sensor_traits` 属性（可选）：存在时替换平台 traits（D4），
   影响接口描述与 `RuntimeStatus` 能力面在物理选择下的传感器投影。
-- `validate_profile` 只校验字符串形式；不设置时使用平台的默认 embodiment。
+- `validate_profile` 在加载时校验引用的字符串形式（必须是 `module:attr` 且两侧都
+  非空：`:attr`、`module:`、空串与不含冒号的形式都按 `ProfileError` 拒绝并点名
+  profile，注册性与可导入性仍留到有效选择时才查）；不设置时使用平台的默认
+  embodiment。
 
 ## 运行平台测试
 

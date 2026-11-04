@@ -41,7 +41,7 @@ import yaml
 
 from robot_runtime.capabilities import validate_capability_set
 from robot_runtime.contract import IDLE_MODE, STOP_POLICIES
-from robot_runtime.sim_platforms import is_valid_sim_platform_name
+from robot_runtime.sim_platforms import SimPlatformError, is_valid_sim_platform_name, validate_embodiment_reference
 
 
 def resolve_sensor_pose(periph: dict, platform: str = "gazebo") -> dict:
@@ -212,6 +212,15 @@ def validate_profile(data: dict[str, Any], source: str | Path = "<profile>") -> 
                     )
 
     _validate_sim_selection(data, source)
+
+    # sim-platform-registry D3: a declared embodiment override is checked at
+    # load time for its string form only ('module:attr', never ':attr',
+    # 'module:' or empty) — syntax, not registration, so a hardware-only
+    # host still loads a profile that declares one.
+    try:
+        validate_embodiment_reference(data, source)
+    except SimPlatformError as exc:
+        raise ProfileError(str(exc)) from exc
 
     ros2_control = data.get("ros2_control") or {}
     for key, default in (

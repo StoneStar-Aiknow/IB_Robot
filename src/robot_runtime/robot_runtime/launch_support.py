@@ -29,7 +29,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
 
 from robot_runtime.contract import IDLE_MODE
-from robot_runtime.interface_description import build_description, platform_peripherals
+from robot_runtime.interface_description import build_description, effective_sensor_traits, platform_peripherals
 from robot_runtime.path_subst import resolve_path
 from robot_runtime.peripherals import (
     audio_nodes,
@@ -609,9 +609,13 @@ def peripheral_stack_actions(
     sensors and bridges (embodiment, D6), so only the host audio devices
     remain here — plus the derived scan converter, which runs on simulation
     time when its source (FAST-LIO's registered body cloud) runs on the
-    platform (D5). Audio devices are host devices, so their ALSA owners run
-    in EVERY execution (the legacy robot_config audio_io entry also launched
-    them under simulation).
+    platform (D5). A lidar the effective traits exclude from the platform's
+    simulated surface starts no derived node either (D4: the description, the
+    capability surface and the composed nodes project the same inventory —
+    a scan converter for a lidar nothing feeds would be a dead node).
+    Audio devices are host devices, so their ALSA owners run in EVERY
+    execution (the legacy robot_config audio_io entry also launched them
+    under simulation).
     """
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
@@ -619,6 +623,16 @@ def peripheral_stack_actions(
         # D3: excluded peripherals are not launched on the platform (the
         # audio owners and the scan converter resolve the filtered inventory)
         peripherals = platform_peripherals(peripherals, sim_platform)
+        # D4: the same effective-traits lidar projection the description
+        # applies — only a lidar the platform stands in for contributes a
+        # derived node.
+        traits = effective_sensor_traits(profile, None, simulated, sim_platform)
+        if traits is not None and traits.lidar_sim_drivers is not None:
+            peripherals = [
+                periph
+                for periph in peripherals
+                if periph.get("type") != "lidar" or str(periph.get("driver", "")) in traits.lidar_sim_drivers
+            ]
         fast_lio = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
         scan_converters = (
             [

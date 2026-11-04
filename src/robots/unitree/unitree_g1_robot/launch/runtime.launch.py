@@ -250,8 +250,13 @@ def _launch_setup(context, *_args, **_kwargs):
     if instance_id:
         profile["runtime"]["instance_id"] = instance_id
     # D6: the description is projected from the profile alone — the URDF is
-    # never passed, so no public model is published.
-    description = build_description(profile, peripherals=peripherals, use_sim=simulated)
+    # never passed, so no public model is published. ``sim_platform`` selects
+    # the execution identity (and the effective sensor traits) of the
+    # description, so the physics branch's embodiment receives one carrying
+    # the platform the launch resolved.
+    description = build_description(
+        profile, peripherals=peripherals, use_sim=simulated, sim_platform=_sim_platform, profile_path=profile_path
+    )
 
     # E1: the vendor tier's domain/NIC binding is a node parameter, never a
     # CYCLONEDDS_URI side effect — the SDK builds its own CycloneDDS domain

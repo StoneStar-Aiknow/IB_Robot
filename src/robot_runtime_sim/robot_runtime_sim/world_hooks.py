@@ -10,12 +10,17 @@ exists:
   the ``gz_sim.launch.py`` include plus the ``/clock`` bridge — the same
   actions the provider hand-off has always started) and returns the gz world
   instance name the provider creates its entity in. A scene that fails to
-  load falls back to the ``empty`` scene with a warning; the spawn pose is
-  resolved by the caller either way.
+  load falls back to the ``empty`` scene with a warning; the hook reports
+  the final scene through ``SimWorldStartup.scene`` (``""`` after a
+  fallback) so the world owner re-resolves the scene identity and the spawn
+  pose (D7: ``robot_spawn`` else the origin — the failed scene's layout is
+  never consulted).
 - MuJoCo starts nothing: one process is both simulator and controller
   manager, and the provider's embodiment starts it with the composed
   robot+scene model. The hook returns ``world=scene`` so the provider and
-  the scene task share the scene identity.
+  the scene task share the scene identity, and ``scene=None`` (the scene
+  it was asked for is the world identity; no fallback can happen here —
+  the embodiment's composition owns the scene).
 """
 
 from __future__ import annotations
@@ -63,6 +68,12 @@ def gazebo_start_world(robot_config: dict, *, scene: str, spawn_pose) -> SimWorl
     identifier the provider receives as ``sim_world`` and creates its entity
     in. No ``create`` and no joint-state or camera bridges: the embodiment is
     the provider's.
+
+    The final scene is reported back through ``startup.scene`` (the
+    requested scene when it came up, ``""`` after the fallback): the world
+    owner, not this hook, owns the scene identity and the spawn pose, so
+    it — not this hook — re-resolves them when the requested scene failed
+    here.
     """
     from sim_models.scene_compiler import get_gazebo_world_path
 
@@ -89,7 +100,10 @@ def gazebo_start_world(robot_config: dict, *, scene: str, spawn_pose) -> SimWorl
     logger.info(f"Gazebo world name (generic world hook): {gazebo_world_name}")
 
     actions.extend(gazebo_world_actions(world_path, gazebo_world_name))
-    return SimWorldStartup(actions=actions, world=gazebo_world_name)
+    # ``scene_name`` now holds the FINAL scene (unchanged when the requested
+    # one came up, "" after a fallback): report it so simulation.py re-resolves
+    # scene_name + spawn against the world that is actually up.
+    return SimWorldStartup(actions=actions, world=gazebo_world_name, scene=scene_name)
 
 
 def mujoco_start_world(robot_config: dict, *, scene: str, spawn_pose) -> SimWorldStartup:

@@ -280,6 +280,110 @@ def test_validate_embodiment_reference_checks_the_string_form_only():
         validate_embodiment_reference(_profile(simulation={PLATFORM: {"embodiment": "no-colon"}}))
 
 
+@pytest.mark.parametrize("reference", [":attr", "module:", "", "   "])
+def test_validate_embodiment_reference_rejects_one_sided_references(reference):
+    # both sides of the colon must be non-empty; an empty value is not a
+    # declaration of "no override" (that is the key's absence)
+    with pytest.raises(SimPlatformError, match="must be a 'module:attr' reference"):
+        validate_embodiment_reference(_profile(simulation={PLATFORM: {"embodiment": reference}}))
+
+
+def test_load_profile_validates_the_declared_embodiment_reference(tmp_path):
+    # fix 6: validate_profile calls the load-time check — a malformed
+    # override fails naming the profile, a valid-but-uninstalled reference
+    # (syntax only, no registry access) loads
+    from robot_runtime.profile import ProfileError, load_profile
+
+    profile = _profile()
+    path = tmp_path / "p.yaml"
+    import yaml
+
+    path.write_text(yaml.safe_dump(profile), encoding="utf-8")
+    loaded = load_profile(path)
+    assert loaded["runtime"]["name"] == "test_robot"
+
+    valid = {**profile, "simulation": {PLATFORM: {"embodiment": "not_installed_anywhere:Thing"}}}
+    path.write_text(yaml.safe_dump(valid), encoding="utf-8")
+    assert load_profile(path)["simulation"][PLATFORM]["embodiment"] == "not_installed_anywhere:Thing"
+
+    for reference in (":attr", "module:", ""):
+        broken = {**profile, "simulation": {PLATFORM: {"embodiment": reference}}}
+        path.write_text(yaml.safe_dump(broken), encoding="utf-8")
+        with pytest.raises(
+            ProfileError, match=rf"simulation\.{PLATFORM}\.embodiment must be a 'module:attr' reference"
+        ):
+            load_profile(path)
+
+
+# ---------------------------------------------------------------------------
+# D1: discovery is cached per process (the cache-write regression, fix 5)
+# ---------------------------------------------------------------------------
+
+
+def test_two_lookups_discover_once(monkeypatch):
+    import robot_runtime.sim_platforms as sim_platforms
+
+    calls = []
+
+    def _counting_discover(*, group=None):
+        calls.append(group)
+        return [_entry_point(PLATFORM, SPEC_REF)]
+
+    clear_sim_platform_cache()
+    monkeypatch.setattr(sim_platforms, "_discover_entry_points", _counting_discover)
+    monkeypatch.setitem(sys.modules, "testsim_platform", type(sys)("testsim_platform"))
+    sys.modules["testsim_platform"].SPEC = SimPlatform(name=PLATFORM, package="testsim_pkg", embodiment=EMBODIMENT_REF)
+    first = discover_sim_platforms()
+    second = discover_sim_platforms()
+    assert calls == [SIM_PLATFORM_ENTRY_POINT_GROUP], "the second lookup must hit the cache, not importlib.metadata"
+    assert first == second and list(first) == [PLATFORM]
+    clear_sim_platform_cache()
+
+
+def test_clear_sim_platform_cache_rediscovers(monkeypatch):
+    import robot_runtime.sim_platforms as sim_platforms
+
+    calls = []
+
+    def _counting_discover(*, group=None):
+        calls.append(group)
+        return [_entry_point(PLATFORM, SPEC_REF)]
+
+    clear_sim_platform_cache()
+    monkeypatch.setattr(sim_platforms, "_discover_entry_points", _counting_discover)
+    module = type(sys)("testsim_platform")
+    module.SPEC = SimPlatform(name=PLATFORM, package="testsim_pkg", embodiment=EMBODIMENT_REF)
+    monkeypatch.setitem(sys.modules, "testsim_platform", module)
+    assert list(discover_sim_platforms()) == [PLATFORM]
+    clear_sim_platform_cache()
+    assert list(discover_sim_platforms()) == [PLATFORM]
+    assert calls == [SIM_PLATFORM_ENTRY_POINT_GROUP] * 2, "clearing the cache makes the next lookup rediscover"
+    clear_sim_platform_cache()
+
+
+def test_injected_entry_points_do_not_touch_the_cache(monkeypatch):
+    import robot_runtime.sim_platforms as sim_platforms
+
+    clear_sim_platform_cache()
+    assert sim_platforms._DISCOVERED_PLATFORMS is None
+    injected = discover_sim_platforms(entry_points=[])
+    assert injected == {}
+    assert sim_platforms._DISCOVERED_PLATFORMS is None, "an injected lookup must bypass the cache, not write it"
+    # and a later real lookup still discovers (the empty injection seeded nothing)
+    monkeypatch.setattr(
+        sim_platforms,
+        "_discover_entry_points",
+        lambda *, group=None: [_entry_point(PLATFORM, SPEC_REF)],
+    )
+    module = type(sys)("testsim_platform")
+    module.SPEC = SimPlatform(name=PLATFORM, package="testsim_pkg", embodiment=EMBODIMENT_REF)
+    monkeypatch.setitem(sys.modules, "testsim_platform", module)
+    try:
+        assert list(discover_sim_platforms()) == [PLATFORM]
+    finally:
+        clear_sim_platform_cache()
+
+
 # ---------------------------------------------------------------------------
 # D4: traits — default, platform, and the embodiment override
 # ---------------------------------------------------------------------------
@@ -339,16 +443,18 @@ def test_platform_traits_rewrite_the_surface(spec_module, fake_platform):
     assert "camera.front.points" not in description["interfaces"], "drop_pointcloud removes the points stream"
 
 
-def test_an_embodiment_traits_override_changes_description_and_capabilities_identically(fake_platform, monkeypatch):
-    # D4: an override that stands in for an extra lidar driver changes the
-    # description and the RuntimeStatus perception capabilities identically
-    import robot_runtime.interface_description as interface_description
-
-    override = SimSensorTraits(lidar_sim_drivers=("other_driver",))
-    profile = _sensor_profile()
-    monkeypatch.setattr(interface_description, "effective_sensor_traits", lambda *args: None)
-    plain = build_description(profile, use_sim=True, sim_platform=PLATFORM)
-    monkeypatch.setattr(interface_description, "effective_sensor_traits", lambda *args: override)
+def test_an_embodiment_traits_override_changes_description_and_capabilities_identically(fake_platform):
+    """D4, code review 2 fix 3: a REAL embodiment override carrying ``sensor_traits``
+    (referenced from ``simulation.<platform>.embodiment``, resolver untouched)
+    changes the description and the RuntimeStatus perception capabilities
+    identically — one effective-traits resolution, both consumers."""
+    override = FakeEmbodiment(sensor_traits=SimSensorTraits(lidar_sim_drivers=("other_driver",)))
+    module = sys.modules["testsim_platform"]
+    module.OVERRIDE = override
+    profile = _sensor_profile(simulation={PLATFORM: {"embodiment": "testsim_platform:OVERRIDE"}})
+    # the platform's default traits (the registered spec's) stand in for every
+    # declared lidar; the override stands in for none of them
+    plain = build_description(_sensor_profile(), use_sim=True, sim_platform=PLATFORM)
     overridden = build_description(profile, use_sim=True, sim_platform=PLATFORM)
 
     # the description keeps the MID-360 under the platform's default traits and
@@ -358,10 +464,95 @@ def test_an_embodiment_traits_override_changes_description_and_capabilities_iden
 
     # the RuntimeStatus capabilities derive from the same traits: the surface
     # and the advertised endpoints cannot drift apart
-    plain_caps = perception_capabilities(profile["peripherals"], traits=None)
-    overridden_caps = perception_capabilities(profile["peripherals"], traits=override)
+    plain_caps = perception_capabilities(_sensor_profile()["peripherals"], traits=None)
+    overridden_caps = perception_capabilities(profile["peripherals"], traits=override.sensor_traits)
     assert plain_caps["perception.lidar"]["topics"] == ["/livox/lidar", "/livox/imu"]
     assert "perception.lidar" not in overridden_caps
+
+
+@pytest.mark.parametrize(
+    ("default_traits", "override_traits", "platform_advertises_lidar"),
+    [
+        # direction 1: the override ADDS a simulated lidar driver — the
+        # platform's default traits stand in for none, the override for the
+        # MID-360
+        (
+            SimSensorTraits(lidar_sim_drivers=()),
+            SimSensorTraits(lidar_sim_drivers=("livox_mid360",)),
+            False,
+        ),
+        # direction 2: the override EXCLUDES a lidar — the platform's default
+        # traits stand in for the MID-360, the override for none
+        (
+            SimSensorTraits(lidar_sim_drivers=("livox_mid360",)),
+            SimSensorTraits(lidar_sim_drivers=("other_driver",)),
+            True,
+        ),
+    ],
+    ids=["override-adds-a-simulated-lidar", "override-excludes-a-lidar"],
+)
+def test_a_traits_lidar_override_changes_description_capabilities_and_node_list_together(
+    fake_platform, default_traits, override_traits, platform_advertises_lidar
+):
+    """Code review 2, fix 3: the embodiment traits override is a real override
+    object referenced from ``simulation.<platform>.embodiment`` — never a
+    replaced resolver — and its lidar projection applies to the description,
+    the capability surface and the composed node list together, in BOTH
+    directions."""
+    from robot_runtime.launch_support import peripheral_stack_actions
+
+    # the registered platform spec carries the default traits; the profile
+    # overrides the platform's default EMBODIMENT with one carrying the traits
+    sys.modules["testsim_platform"].SPEC = SimPlatform(
+        name=PLATFORM,
+        package="testsim_pkg",
+        embodiment=EMBODIMENT_REF,
+        sensor_traits=default_traits,
+    )
+    override = FakeEmbodiment(sensor_traits=override_traits)
+    sys.modules["testsim_platform"].OVERRIDE = override
+    plain_profile = _sensor_profile()
+    override_profile = _sensor_profile(simulation={PLATFORM: {"embodiment": "testsim_platform:OVERRIDE"}})
+
+    # a scan converter on the LIDAR + FAST-LIO enabled: the derived node is
+    # the thing the traits projection must gate
+    for profile in (plain_profile, override_profile):
+        lidar = next(periph for periph in profile["peripherals"] if periph["type"] == "lidar")
+        lidar["scan_converter"] = {"enabled": True, "scan_topic": "/scan"}
+        profile["fast_lio"] = {"enabled": True, "params_file": "/tmp/f.yaml", "sim_params_file": "/tmp/s.yaml"}
+
+    plain_description = build_description(plain_profile, use_sim=True, sim_platform=PLATFORM)
+    override_description = build_description(override_profile, use_sim=True, sim_platform=PLATFORM)
+    plain_caps = perception_capabilities(plain_profile["peripherals"], traits=default_traits)
+    override_caps = perception_capabilities(override_profile["peripherals"], traits=override_traits)
+    plain_nodes = peripheral_stack_actions(plain_profile, peripherals_file="", simulated=True, sim_platform=PLATFORM)
+    override_nodes = peripheral_stack_actions(
+        override_profile, peripherals_file="", simulated=True, sim_platform=PLATFORM
+    )
+
+    def scan_converters(nodes):
+        return [n for n in nodes if getattr(n, "_Node__node_executable", None) == "pointcloud_to_laserscan_node"]
+
+    if platform_advertises_lidar:
+        # the platform's defaults advertise and stand in for the MID-360
+        assert "lidar.mid360.points" in plain_description["interfaces"]
+        assert "perception.lidar" in plain_caps
+        assert scan_converters(plain_nodes), "the simulated lidar contributes its derived scan converter"
+    else:
+        assert "lidar.mid360.points" not in plain_description["interfaces"]
+        assert "perception.lidar" not in plain_caps
+        assert not scan_converters(plain_nodes), "a lidar no platform stands in for starts no derived node"
+
+    # the override flips the projection the other way — description,
+    # capability surface AND node list change together
+    if platform_advertises_lidar:
+        assert not any(key.startswith("lidar.mid360.") for key in override_description["interfaces"])
+        assert "perception.lidar" not in override_caps
+        assert not scan_converters(override_nodes), "an excluded lidar starts no derived node"
+    else:
+        assert "lidar.mid360.points" in override_description["interfaces"]
+        assert "perception.lidar" in override_caps
+        assert scan_converters(override_nodes), "the override's simulated lidar contributes its derived scan converter"
 
 
 # ---------------------------------------------------------------------------

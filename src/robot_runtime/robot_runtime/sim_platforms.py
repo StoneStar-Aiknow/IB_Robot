@@ -169,11 +169,21 @@ class SimWorldStartup:
 
     ``world`` is the platform hand-off identifier the provider receives as
     ``sim_world`` (the gz world instance name on Gazebo, the scene name on
-    MuJoCo).
+    MuJoCo). ``scene`` is the hook's verdict on the final scene it started:
+    ``None`` means "no verdict — keep the scene resolution you passed me"
+    (a hook that starts no world, or whose world identity IS the scene, as
+    on MuJoCo), a string is the scene actually running — identical to the
+    requested one when it came up, ``""`` after a fallback to the empty
+    world. The world owner re-resolves the scene identity and the spawn
+    pose (D7) from a differing verdict: this is the only way a hook can
+    report "the configured scene failed to load; the empty world is up
+    instead" back to the owner, whose ``SimulationStartup`` must not record
+    a scene that never came up.
     """
 
     actions: list = field(default_factory=list)
     world: str = ""
+    scene: str | None = None
 
 
 @runtime_checkable
@@ -332,14 +342,15 @@ def discover_sim_platforms(*, entry_points=None) -> dict[str, SimPlatform]:
     bypasses and does not pollute the cache).
     """
     global _DISCOVERED_PLATFORMS
-    if entry_points is None and _DISCOVERED_PLATFORMS is not None:
+    injected = entry_points is not None
+    if not injected and _DISCOVERED_PLATFORMS is not None:
         return dict(_DISCOVERED_PLATFORMS)
-    if entry_points is None:
+    if not injected:
         entry_points = _discover_entry_points(group=SIM_PLATFORM_ENTRY_POINT_GROUP)
     platforms: dict[str, SimPlatform] = {}
     for name, _value, spec in _entry_point_platforms(entry_points):
         platforms[name] = spec
-    if entry_points is None:
+    if not injected:
         _DISCOVERED_PLATFORMS = dict(platforms)
     return platforms
 
@@ -413,6 +424,9 @@ def validate_embodiment_reference(profile: dict, source: Any = "<profile>") -> N
     Registration and importability are checked when the platform is
     selected, so a hardware-only host still loads a profile that declares
     ``simulation.<platform>.embodiment`` for a platform it has not installed.
+    The reference must be a ``module:attr`` string with both sides
+    non-empty — ``":attr"``, ``"module:"``, a reference without a colon and
+    an empty value all fail naming the key and the profile.
     """
     simulation = profile.get("simulation")
     if not isinstance(simulation, dict):
@@ -423,7 +437,14 @@ def validate_embodiment_reference(profile: dict, source: Any = "<profile>") -> N
         override = section.get("embodiment")
         if override is None:
             continue
-        if not isinstance(override, str) or not override.strip() or ":" not in override:
+        module_name, separator, attribute = str(override).partition(":")
+        if (
+            not isinstance(override, str)
+            or not override.strip()
+            or not separator
+            or not module_name.strip()
+            or not attribute.partition("[")[0].strip()
+        ):
             raise SimPlatformError(
                 f"runtime profile simulation.{key}.embodiment must be a 'module:attr' reference, "
                 f"got {override!r}: {source}"

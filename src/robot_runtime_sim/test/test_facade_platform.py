@@ -367,3 +367,81 @@ def test_excluded_peripherals_stay_advertised_on_the_sdk_execution(tmp_path):
     assert "interaction.audio_playback" in capabilities
     camera_topics = capabilities["perception.camera"]["topics"]
     assert "/camera/front/image_raw" in camera_topics and "/camera/wrist/image_raw" in camera_topics
+
+
+# ---------------------------------------------------------------------------
+# Code review 1, fix 3: the traits' rate callables receive the profile through
+# the REAL facade and mock_runtime capability paths — a callable that reads
+# profile["simulation"][platform] resolves, and one returning None applies no
+# override instead of crashing on float(None)
+# ---------------------------------------------------------------------------
+
+_CAMERA_PERIPHERALS = [
+    {
+        "type": "camera",
+        "name": "front",
+        "driver": "opencv",
+        "width": 16,
+        "height": 12,
+        "fps": 30,
+        "pixel_format": "mjpeg2rgb",
+        "frame_id": "front_optical",
+    }
+]
+
+
+def _camera_profile(sim_platform="mujoco"):
+    return {
+        **PLATFORM_PROFILE,
+        "sim_platforms": ["sdk", "mujoco"],
+        "sim_platform": sim_platform,
+        "peripherals": _CAMERA_PERIPHERALS,
+        "simulation": {"mujoco": {"camera_publish_rate": 6.25}},
+    }
+
+
+def test_the_facade_passes_the_profile_to_the_traits_rate_callable(tmp_path, monkeypatch):
+    """Through the facade: the callable sees the profile the facade holds, so
+    the RuntimeStatus camera surface is built from the platform's own rate."""
+    import sys
+    import types
+
+    import robot_runtime.facade_node as facade_module
+    from robot_runtime.sim_platforms import SimSensorTraits
+
+    seen = {}
+
+    def _reading_rate(profile):
+        seen.update(profile)
+        return 6.25  # what simulation.mujoco.camera_publish_rate declares
+
+    module = types.ModuleType("facade_rate_probe")
+    module.reading_rate = _reading_rate
+    monkeypatch.setitem(sys.modules, "facade_rate_probe", module)
+    traits = SimSensorTraits(camera_rate="facade_rate_probe:reading_rate")
+    monkeypatch.setattr(facade_module, "effective_sensor_traits", lambda *args: traits)
+
+    capabilities = _facade_capabilities(_camera_profile(), tmp_path)
+    assert capabilities["perception.camera"]["topics"] == ["/camera/front/image_raw", "/camera/front/camera_info"]
+    assert seen.get("simulation") == {"mujoco": {"camera_publish_rate": 6.25}}, (
+        "the facade threaded its profile into the callable"
+    )
+
+
+def test_the_facade_survives_a_traits_rate_callable_returning_none(tmp_path, monkeypatch):
+    """A None rate applies no override: the capability surface is built from
+    the per-stream fps instead of failing on float(None)."""
+    import sys
+    import types
+
+    import robot_runtime.facade_node as facade_module
+    from robot_runtime.sim_platforms import SimSensorTraits
+
+    module = types.ModuleType("facade_none_probe")
+    module.none_rate = lambda profile: None
+    monkeypatch.setitem(sys.modules, "facade_none_probe", module)
+    traits = SimSensorTraits(camera_rate="facade_none_probe:none_rate")
+    monkeypatch.setattr(facade_module, "effective_sensor_traits", lambda *args: traits)
+
+    capabilities = _facade_capabilities(_camera_profile(), tmp_path)
+    assert capabilities["perception.camera"]["topics"] == ["/camera/front/image_raw", "/camera/front/camera_info"]

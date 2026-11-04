@@ -335,6 +335,143 @@ def test_mujoco_imu_rate_fails_closed_on_a_missing_update_rate(tmp_path):
         build_description(profile, use_sim=True, sim_platform="mujoco")
 
 
+# ---------------------------------------------------------------------------
+# Code review 1, fix 1: the traits camera-rate callable receives the EFFECTIVE
+# peripheral list (merged with the deployment fragment, platform-excluded
+# entries removed), exactly as the pre-change _mujoco_camera_rate did
+# ---------------------------------------------------------------------------
+
+
+def _camera_rate_profile():
+    return {
+        "runtime": {"name": "rate_probe", "version": "0.0.1"},
+        "capabilities": {},
+        "joints": ["1"],
+        "peripherals": [
+            {
+                "type": "camera",
+                "name": "fast",
+                "driver": "opencv",
+                "width": 16,
+                "height": 12,
+                "fps": 30,
+                "pixel_format": "mjpeg2rgb",
+                "frame_id": "fast_optical",
+            },
+            {
+                "type": "camera",
+                "name": "slow",
+                "driver": "opencv",
+                "width": 16,
+                "height": 12,
+                "fps": 5,
+                "pixel_format": "mjpeg2rgb",
+                "frame_id": "slow_optical",
+                "simulation": {"mujoco": {"enabled": False}},
+            },
+        ],
+    }
+
+
+def test_mujoco_camera_rate_advertises_the_effective_not_the_raw_minimum():
+    """The single camera rate is the minimum of the EFFECTIVE cameras: the
+    plugin (robot_runtime_sim.mujoco.camera_plugin_parameters) resolves it
+    from the merged, platform-filtered list, so the description must too —
+    an excluded slow camera must not drag the advertised rate down."""
+    from robot_runtime_sim.mujoco import camera_plugin_parameters
+
+    profile = _camera_rate_profile()
+    # what the plugin would run: the excluded slow camera is filtered out
+    from robot_runtime.interface_description import platform_peripherals
+
+    effective = platform_peripherals(profile["peripherals"], "mujoco")
+    plugin_rate = camera_plugin_parameters(profile, effective)["mujoco_plugins"]["ibrobot_cameras"][
+        "camera_publish_rate"
+    ]
+
+    description = build_description(profile, use_sim=True, sim_platform="mujoco")
+    # the slow camera is neither advertised...
+    assert not any(key.startswith("camera.slow.") for key in description["interfaces"])
+    # ...nor claimed as a rate source: every advertised stream carries the
+    # effective minimum (30, from the surviving camera), not min(30, 5)
+    for key in ("camera.fast.color",):
+        assert description["interfaces"][key]["configured_profile"]["fps"] == plugin_rate
+    assert plugin_rate == 30.0, "the excluded slow camera must not set the rate"
+
+
+def test_mujoco_camera_rate_honours_a_deployment_fragment_override():
+    """A fragment overriding a camera fps changes the effective rate the
+    description advertises — the callable sees the merged inventory."""
+    profile = _camera_rate_profile()
+    # the fragment overrides the fast camera's fps to 12.5; the slow camera
+    # stays excluded on the platform, so the effective minimum is 12.5
+    merged = [{**profile["peripherals"][0], "fps": 12.5}, profile["peripherals"][1]]
+    description = build_description(profile, peripherals=merged, use_sim=True, sim_platform="mujoco")
+    assert not any(key.startswith("camera.slow.") for key in description["interfaces"])
+    assert description["interfaces"]["camera.fast.color"]["configured_profile"]["fps"] == 12.5
+
+
+def test_a_traits_camera_rate_callable_returning_none_applies_no_override():
+    """Fix 3 companion: a camera-rate callable may return None (no override);
+    the per-stream fps then stands instead of float(None) failing the build."""
+    from robot_runtime.sim_platforms import SimSensorTraits
+
+    profile = _camera_rate_profile()
+    profile["peripherals"] = [profile["peripherals"][0]]  # keep one enabled camera
+    traits = SimSensorTraits(camera_rate="robot_runtime_sim.test_none_rate:none_rate")
+    import sys as _sys
+    import types as _types
+
+    module = _types.ModuleType("robot_runtime_sim.test_none_rate")
+    module.none_rate = lambda profile: None
+    _sys.modules["robot_runtime_sim.test_none_rate"] = module
+    try:
+        from robot_runtime.interface_description import peripheral_interfaces
+
+        interfaces = peripheral_interfaces(
+            profile["peripherals"], sim_platform="mujoco", traits=traits, profile=profile
+        )
+        assert interfaces["camera.fast.color"]["configured_profile"]["fps"] == 30, "the per-stream fps stands"
+    finally:
+        del _sys.modules["robot_runtime_sim.test_none_rate"]
+
+
+# ---------------------------------------------------------------------------
+# Code review 1, fix 3: perception_capabilities threads the effective profile
+# so the traits' rate callables read the profile they resolve from
+# ---------------------------------------------------------------------------
+
+
+def test_perception_capabilities_pass_the_profile_to_the_traits_callables():
+    """Through the real projection path: a camera-rate callable that reads
+    profile["simulation"][platform] must see the profile the facade passes,
+    not {} — the capability surface cannot crash or silently mis-resolve."""
+    from robot_runtime.peripherals import perception_capabilities
+    from robot_runtime.sim_platforms import SimSensorTraits
+
+    seen = {}
+
+    def _reading_rate(profile):
+        seen.update(profile)
+        return None  # and a None return must not crash float(None)
+
+    import sys as _sys
+    import types as _types
+
+    module = _types.ModuleType("robot_runtime_sim.test_profile_rate")
+    module.reading_rate = _reading_rate
+    _sys.modules["robot_runtime_sim.test_profile_rate"] = module
+    try:
+        traits = SimSensorTraits(camera_rate="robot_runtime_sim.test_profile_rate:reading_rate")
+        profile = _camera_rate_profile()
+        profile["simulation"] = {"mujoco": {"camera_publish_rate": 7.5}}
+        caps = perception_capabilities(profile["peripherals"], sim_platform="mujoco", traits=traits, profile=profile)
+        assert caps["perception.camera"]["topics"] == ["/camera/fast/image_raw", "/camera/fast/camera_info"]
+        assert seen.get("simulation") == {"mujoco": {"camera_publish_rate": 7.5}}, "the callable saw the profile"
+    finally:
+        del _sys.modules["robot_runtime_sim.test_profile_rate"]
+
+
 def test_platform_peripherals_filters_the_excluded_physics_platforms():
     from robot_runtime.interface_description import platform_peripherals
 

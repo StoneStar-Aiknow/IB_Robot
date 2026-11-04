@@ -31,6 +31,9 @@ def test_gazebo_hook_starts_the_scene_world_and_clock_bridge():
         {"name": "test_robot", "gazebo_world_name": "demo"}, scene="pick_banana", spawn_pose=(0.0, 0.3, -0.03, 0.0)
     )
     assert startup.world == "demo"
+    # the requested scene came up: the hook reports it as the final scene
+    # (no re-resolution: the caller's resolution already matches)
+    assert startup.scene == "pick_banana"
     includes = [a for a in startup.actions if isinstance(a, IncludeLaunchDescription)]
     assert len(includes) == 1
     assert "sim_models_pick_banana_" in _gz_args(includes[0])
@@ -47,6 +50,8 @@ def test_gazebo_hook_without_a_scene_uses_the_empty_world():
     from robot_runtime_sim.world_hooks import gazebo_start_world
 
     startup = gazebo_start_world({"name": "t"}, scene="", spawn_pose=(0.0, 0.0, 0.0, 0.0))
+    # no scene was configured at all: not a failure verdict, just "empty is up"
+    assert startup.scene == ""
     include = next(a for a in startup.actions if isinstance(a, IncludeLaunchDescription))
     assert "sim_models_empty_" in _gz_args(include)
 
@@ -63,6 +68,40 @@ def test_gazebo_hook_scene_load_failure_falls_back_with_a_warning(caplog):
     assert "falling back to the empty scene world" in caplog.text
     include = next(a for a in startup.actions if isinstance(a, IncludeLaunchDescription))
     assert "sim_models_empty_" in _gz_args(include)
+    # the fallback verdict travels back to the world owner: "" names the
+    # empty world as the final scene, not the scene that failed
+    assert startup.scene == ""
+
+
+def test_gazebo_hook_world_file_generation_failure_reports_the_fallback(monkeypatch, caplog):
+    """A scene the precheck accepts (layout parses, template exists) but whose
+    world-file generation fails: the hook still starts the empty world and
+    reports ``scene=""`` so the world owner re-resolves (code review 2, fix 1)."""
+    import logging
+
+    from launch.actions import IncludeLaunchDescription
+
+    import sim_models.scene_compiler as scene_compiler
+    from robot_runtime_sim import world_hooks
+
+    real_get_gazebo_world_path = scene_compiler.get_gazebo_world_path
+
+    def _generation_fails_for_pick_banana(scene_name):
+        if scene_name == "pick_banana":
+            raise OSError(f"cannot write the world file for scene '{scene_name}'")
+        return real_get_gazebo_world_path(scene_name)
+
+    # a scene the precheck accepts (layout parses, the gazebo template
+    # exists) but whose world-file generation fails
+    monkeypatch.setattr(scene_compiler, "get_gazebo_world_path", _generation_fails_for_pick_banana)
+    with caplog.at_level(logging.WARNING, logger="robot_runtime_sim.world_hooks"):
+        startup = world_hooks.gazebo_start_world({"name": "t"}, scene="pick_banana", spawn_pose=(0.0, 0.3, -0.03, 0.0))
+    assert "falling back to the empty scene world" in caplog.text
+    # the fallback world still starts (the empty scene must generate)
+    include = next(a for a in startup.actions if isinstance(a, IncludeLaunchDescription))
+    assert "sim_models_empty_" in _gz_args(include)
+    assert startup.world == "demo"
+    assert startup.scene == "", "the final scene must report the fallback, not the failed scene"
 
 
 def test_mujoco_hook_starts_nothing_and_returns_the_scene():
@@ -71,8 +110,11 @@ def test_mujoco_hook_starts_nothing_and_returns_the_scene():
     startup = mujoco_start_world({"name": "t"}, scene="pick_banana", spawn_pose=(0.0, 0.3, -0.03, 0.0))
     assert startup.actions == []
     assert startup.world == "pick_banana"
+    # the scene IS the world identity on MuJoCo: no fallback, no verdict to report
+    assert startup.scene is None
     empty = mujoco_start_world({"name": "t"}, scene="", spawn_pose=(0.0, 0.0, 0.0, 0.0))
     assert empty.world == ""
+    assert empty.scene is None
 
 
 # ---------------------------------------------------------------------------
