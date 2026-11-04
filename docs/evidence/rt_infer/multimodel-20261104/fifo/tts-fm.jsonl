@@ -1,0 +1,3 @@
+{"model": "fm", "iteration": 1, "release_ns": 126500940903673, "start_ns": 126500940903673, "finish_ns": 126501755484794, "execute_ms": 814.581121, "numerical": true, "max_abs": [0.0]}
+{"model": "fm", "iteration": 2, "release_ns": 126501759369637, "start_ns": 126501759369637, "finish_ns": 126502387716904, "execute_ms": 628.347267, "numerical": true, "max_abs": [0.0]}
+{"model": "fm", "iteration": 3, "release_ns": 126502392273466, "start_ns": 126502392273466, "finish_ns": 126503031653623, "execute_ms": 639.380157, "numerical": true, "max_abs": [0.0]}
