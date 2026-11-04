@@ -1,0 +1,39 @@
+# Offline Gateway integration for the preset action 15 surface.
+#
+# Physical execution is not blocked outright: it needs the runtime profile's
+# vendor.operator_validation block (confirmed + robot-facing NIC + expected FSM)
+# and the node's preset_operator_confirmed flag, so only an operator-supervised
+# session can dispatch. Offline runs use the vendor mock on loopback.
+robot:
+  name: unitree_g1_arm_presets
+  type: g1_29dof_arm_presets
+  robot_type: unitree_g1
+  simulation: {platform: sdk}
+  runtime:
+    provider: unitree_g1_robot
+    profile: g1_29dof_arm_presets
+    require_model: false
+  capabilities:
+    requires: [joint.state, motion.named]
+  default_control_mode: named_motion
+  skill_required_control_mode: named_motion
+  control_modes:
+    named_motion:
+      description: Runtime preset arm gesture
+      runtime_mode: idle
+      inference: {enabled: false}
+      executor: {enabled: false}
+  voice_asr: {enabled: false}
+  voice_tts: {enabled: false}
+  semantic_mapping: {enabled: false}
+  embodied:
+    enabled: true
+    arm_surface: false
+    skill_catalog_profile: unitree_g1_arm_presets
+    skill_catalog_source_mode: development
+    runtime_named_motion:
+      enabled: true
+      interface: motion.named
+      kind: action
+      type: ibrobot_msgs/action/ExecuteNamedMotion
+      requires: {capability: motion.named}

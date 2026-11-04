@@ -5,12 +5,13 @@
 # runtime profile (unitree_g1_robot/profiles/g1_29dof_dex3.yaml). This file
 # selects that runtime and states what the application requires of it.
 #
-# Deployment note: the G1 vendor DDS tier speaks CycloneDDS, so the whole
-# deployment — the runtime and every application node that calls its services
-# — must run rmw_cyclonedds_cpp; export RMW_IMPLEMENTATION before launching
-# (the runtime launch verifies this in real transport and fails closed).
-# The launch argument network_interface:=<nic> additionally binds CycloneDDS
-# to the NIC the robot is wired to (see
+# Deployment note: the G1 vendor DDS tier runs inside the official SDK, which
+# binds its own CycloneDDS participants to the domain and NIC the runtime takes
+# as node parameters (vendor_domain_id / vendor_network_interface) — the launch
+# always passes them and both nodes refuse an inconsistent pair. The launch
+# argument network_interface:=<nic> names the robot-facing NIC for real
+# transport and additionally binds the deployment's own ROS participants to it
+# through CYCLONEDDS_URI; it does not configure the vendor tier (see
 # src/robots/unitree/unitree_g1_robot/README.md). The MID-360 and D435
 # instance values (IPs, serials) arrive via the launch argument's peripherals
 # fragment, never hand-edited per unit here.
@@ -95,11 +96,10 @@ robot:
         control_frequency: 50.0
 
   # The G1 runtime serves no audio contract: the vendor voice service plays
-  # named streams (StartPlay/StopPlay), and no PCM capture or playback topic
-  # is verified on the unit (gate 6.1). The shared ALSA nodes would publish
-  # and subscribe against endpoints nothing serves, so they stay off.
-  audio_io:
-    enabled: false
+  # Audio devices are runtime-owned: the G1 runtime's voice RPC is the only
+  # speech surface (the vendor TTS call behind /speech/speak), and no PCM
+  # capture or playback endpoint is verified on the unit (gate 6.1), so no
+  # audio_io section is declared here and the shared ALSA nodes stay off.
 
   # The vendor voice RPC carries an ASR api id, but no ASR surface is bridged
   # or verified; enabling the ASR stack needs a runtime-provided capture
