@@ -601,7 +601,19 @@ def robot_context_schema_version(robot_config: dict[str, Any]) -> int:
 
 
 def robot_supported_control_modes(robot_config: dict[str, Any]) -> tuple[str, ...]:
-    """Return control modes that a hybrid runtime may select per skill."""
+    """Return control modes that a hybrid runtime may select per skill.
+
+    ``skill_supported_control_modes`` states the modes explicitly for a
+    deployment whose runtime can switch per skill but whose context is not a
+    hybrid navigation stage (the X2 compute pack has no navigation service, so
+    ``nav_stage: hybrid`` is not available there). Without an override the
+    schema-3 ``motion_mode`` pair is the only source.
+    """
+    override = robot_config.get("skill_supported_control_modes")
+    if isinstance(override, list):
+        modes = tuple(dict.fromkeys(str(mode).strip() for mode in override if isinstance(mode, str) and mode.strip()))
+        if modes:
+            return modes
     if robot_context_schema_version(robot_config) != 3:
         return ()
     motion_mode = robot_config.get("motion_mode", {})
@@ -683,8 +695,9 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
         "execution_endpoints": robot_execution_endpoints(robot_config),
     }
-    if context_schema_version >= 3:
-        preimage["supported_control_modes"] = list(robot_supported_control_modes(robot_config))
+    supported_control_modes = robot_supported_control_modes(robot_config)
+    if context_schema_version >= 3 or supported_control_modes:
+        preimage["supported_control_modes"] = list(supported_control_modes)
     return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
 
@@ -1665,6 +1678,18 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
             control_modes = robot_config.get("control_modes")
             if not isinstance(control_modes, dict) or required_control_mode not in control_modes:
                 errors.append("skill_required_control_mode must be a control_modes member")
+
+    override_modes = robot_config.get("skill_supported_control_modes")
+    if override_modes is not None:
+        control_modes = robot_config.get("control_modes")
+        if not isinstance(override_modes, list) or not override_modes:
+            errors.append("skill_supported_control_modes must be a non-empty list of control_modes members")
+        elif not isinstance(control_modes, dict):
+            errors.append("skill_supported_control_modes requires a control_modes mapping")
+        else:
+            for mode in override_modes:
+                if not isinstance(mode, str) or mode.strip() not in control_modes:
+                    errors.append(f"skill_supported_control_modes entry {mode!r} is not a control_modes member")
 
     if isinstance(embodied, dict):
         status_service = embodied.get("skill_gateway_status_service")
