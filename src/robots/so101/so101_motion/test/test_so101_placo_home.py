@@ -423,6 +423,71 @@ def test_managed_explicit_start_latches_fresh_reference_after_clear():
     assert node.published == []  # activation is not HOME
 
 
+def _rot_z(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
+def _rot_x(angle):
+    c, s = np.cos(angle), np.sin(angle)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
+def _clutch_pose_tick(position_only):
+    """Run one managed pose tick from a rotated clutch origin; return the solver targets."""
+    node = _managed_node()
+    node.position_only = position_only
+    node.output_lowpass_alpha = 0.0
+    node._recovery_count = 0
+    node._ee0_p = np.array([0.20, 0.0, 0.15])
+    node._ee0_R = _rot_z(np.pi / 2)
+    node._p_ref = node._ee0_p.copy()
+    node._r_ref = node._ee0_R.copy()
+    calls = []
+
+    def solve_to_position(seed, p, dt):
+        calls.append(("position", p.copy(), None))
+        return np.zeros(5)
+
+    def solve_to_pose(seed, p, r, dt):
+        calls.append(("pose", p.copy(), r.copy()))
+        return np.zeros(5)
+
+    node.diffik = types.SimpleNamespace(
+        solve_to_position=solve_to_position,
+        solve_to_pose=solve_to_pose,
+    )
+    message = _pose_message()
+    message.pose.position = types.SimpleNamespace(x=0.03, y=-0.01, z=0.02)
+    half = np.sin(np.pi / 4)
+    message.pose.orientation = types.SimpleNamespace(x=half, y=0.0, z=0.0, w=np.cos(np.pi / 4))
+    node._on_pose(message)
+    node._on_control_tick()
+    return node, calls
+
+
+def test_managed_clutch_pose_adds_base_frame_delta_and_left_multiplies_rotation():
+    node, calls = _clutch_pose_tick(position_only=False)
+    assert len(calls) == 1 and calls[0][0] == "pose"
+    _, target_p, target_r = calls[0]
+    # p_ref = ee0_p + delta_p_base: the message is a displacement, not a target.
+    np.testing.assert_allclose(target_p, [0.23, -0.01, 0.17], atol=1e-12)
+    # r_ref = rel_R @ ee0_R: a base-frame increment; ee0_R @ rel_R would read it in the tool frame.
+    expected = _rot_x(np.pi / 2) @ _rot_z(np.pi / 2)
+    np.testing.assert_allclose(target_r, expected, atol=1e-12)
+    assert not np.allclose(target_r, _rot_z(np.pi / 2) @ _rot_x(np.pi / 2), atol=1e-6)
+    # The clutch origin is not moved by the command.
+    np.testing.assert_allclose(node._ee0_p, [0.20, 0.0, 0.15])
+    assert len(node.published) == 1
+
+
+def test_managed_clutch_pose_position_only_ignores_orientation_delta():
+    node, calls = _clutch_pose_tick(position_only=True)
+    assert len(calls) == 1 and calls[0][0] == "position"
+    np.testing.assert_allclose(calls[0][1], [0.23, -0.01, 0.17], atol=1e-12)
+    np.testing.assert_allclose(node._r_ref, _rot_z(np.pi / 2))
+
+
 def test_managed_home_requires_owner_and_fresh_lease():
     node = _managed_node()
     goal = types.SimpleNamespace(target_name="home")

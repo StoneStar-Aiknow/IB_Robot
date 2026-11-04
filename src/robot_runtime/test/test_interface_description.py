@@ -48,6 +48,21 @@ def test_teleoperation_deadline_projects_hardware_profile_budget(stale):
     assert all(interface["command_stale_s"] == stale for interface in interfaces.values())
 
 
+def test_teleoperation_pose_declares_clutch_relative_metric_frames():
+    """The managed pose spec relies on these fields to tell senders how to read a PoseStamped."""
+    profile = {
+        "teleoperation": {"enabled": True, "target_group": "arm", "endpoint_prefix": "/arm", "command_stale_s": 0.5}
+    }
+    model = {"joint_groups": {"arm": ["1"], "all": ["1", "6"]}, "frames": {"base_link": "base", "ee_link": "tool"}}
+    pose = _teleoperation_interfaces(profile, model)["motion.arm.pose"]
+    assert pose["endpoint"] == "/arm/pose"
+    assert pose["message_type"] == "geometry_msgs/msg/PoseStamped"
+    assert pose["pose_reference"] == "clutch_relative"
+    assert pose["units"] == {"position": "m", "orientation": "quaternion"}
+    assert (pose["base_frame"], pose["tool_frame"]) == ("base", "tool")
+    assert pose["command_stale_s"] == 0.5
+
+
 @pytest.fixture
 def profile():
     return {
