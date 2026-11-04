@@ -572,3 +572,112 @@ mirror_session:
 `max_gap 1.016 s`，runtime 本身正常。修法见 `aimdk_x2_handover_2026-10-23_zh.md` 第 6.2 节（`STATUS_MAX_AGE_S` 2.0 → 4.0）。
 
 **接手入口**：日常操作手册见 [`aimdk_x2_handover_2026-10-23_zh.md`](aimdk_x2_handover_2026-10-23_zh.md)（启动全链路 / 停止 / 验证 / 已知问题 / 板端补丁清单）。
+
+---
+
+## 18. 2026-11-04：换板、追平与运维加固
+
+本节记录一次完整的“板子掉了 → 换板 → 追平主线”的过程，以及期间确认的几条容易误判的事实。
+
+### 18.1 拓扑与地址
+
+| 设备 | 地址 | 说明 |
+|---|---|---|
+| 310P 板（当前在用） | `10.42.0.178` / `10.0.1.15` / `10.0.200.148`（同一 eth0 三个网段） | openEuler Embedded，无 RTC |
+| Windows（planner 主机） | `10.42.0.100`（实验室网口） | 旧的 `10.42.0.177`、`192.168.3.100` 都已不存在 |
+| 运控 PC | `10.0.1.40` | 不开 SSH |
+| Jetson（感知） | `10.0.1.41` | 不开 SSH |
+| 交互 PC（agent） | `10.0.1.42` | 不开 SSH |
+
+机器人机内三台都不开 SSH，访问它们必须拿板子当跳板。**不要再让板子连 WiFi**：2026-11-04 一天之内 WiFi 地址（`192.168.3.10`）掉了三次，有线全天零中断。
+
+### 18.2 掉线排查：三个容易误判的点
+
+1. **“load average 14” 不是 CPU 过载**。`top` 里 CPU 98.5% idle，负载来自 14 个厂商 D 状态线程
+   （`bbox_main`、`bbox_up_0`/`bbox_down_0`、`ts_proxy`、`lpm_proxy`、`hsm_proxy`、`dms_poll_task`、
+   `hi_venc_*`/`hi_vpc_*`/`hi_vdec_*`/`hi_jpegd_*`）。它们长期不可中断，恒定贡献 load ≈ 14。
+   **别再用 load 判断这块板是否过载**，要看 `%Cpu(s)` 的 idle 与 `ps` 的 pcpu。
+2. **掉线是整机级复位，不是网络问题**。判据：`10.0.1.15` 与 `10.42.0.178` 同时消失。
+   若只有一个网段消失，才怀疑网线/交换机/网段配置。
+3. **该镜像的 journal 不可用**。`journalctl` 读 journald 自己写的文件会报
+   `uses an unsupported feature, ignoring file`，即使建了 `/var/log/journal` 也读不出内容。
+   所以排查掉线**不能依赖 journal**。
+
+已落地的可用证据链（都开机自启）：
+
+| 机制 | 位置 | 说明 |
+|---|---|---|
+| `rsyslog` | `/var/log/messages` | journald `ForwardToSyslog=yes`，文本可读，logrotate 每日轮转 |
+| `x2-kmsg-tail.service` | `/var/log/kmsg-tail.log` | 每 15 s 追加 `dmesg -T`，保留最后 4000 行；断电/看门狗复位前的最后几分钟都在这里 |
+
+下次掉线后的两条命令：
+
+```bash
+tail -200 /var/log/kmsg-tail.log     # 内核：panic / watchdog / 供电 / 网口
+tail -200 /var/log/messages          # 服务层最后动作
+```
+
+**镜像自带 bug（已修）**：`/etc/logrotate.d/rsyslog` 与 `/etc/logrotate.d/logrotate.rsyslog`
+重复声明 `/var/log/messages`，logrotate 报 `duplicate log entry` 后跳过整个文件 →
+`messages` 永不轮转，会一直涨到写满闪存。已把后者改名为 `.disabled`，`logrotate.service` 现在 `status=0`。
+
+### 18.3 planner 地址参数化（`d3114171`）
+
+planner 主机地址会随“板子插在哪个网”变化（一天内变过三次：`10.42.0.177` → `192.168.3.100` → `10.42.0.100`），
+把它写死在 profile 里意味着每次换网都要改文件 + 重编。现在改为启动时传参：
+
+```bash
+# embodied_pipeline.launch.py 新增参数
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=aimdk_x2_voice_mirror_all \
+  planner_base_url:=http://10.42.0.100:18094/v1
+```
+
+- 覆盖逻辑在 `embodied_bringup/launch_builders/embodied.py` 的 `apply_planner_base_url()`：
+  **空值保持 profile 原值**；没有 `agent.planner` 的部署完全不碰。
+- 现场启动脚本 `/root/workspace/lyx/run_x2_all.sh` 里有
+  `PLANNER_BASE_URL=${PLANNER_BASE_URL:-http://10.42.0.100:18094/v1}`，换机器只改这一行。
+- 验证：`ros2 param get /ibrobot_agent_node planner_config_json` 里应出现该地址。
+- **不要用环境变量直接写 URL**：仓库的 `$(env VAR)` 替换只作用于路径类字段，且变量未设置时直接
+  `ValueError` 让配置加载失败。
+
+### 18.4 板端补丁归属（追平后的现状）
+
+| 文件 | 状态 | 处置 |
+|---|---|---|
+| `robot_config/robot_config/loader.py` | **已上游**（`a9af2c07`，含 8 个单测） | 板端不再有本地改动 |
+| `aimdk_robot/named_motion.py` + `runtime_node.py` | 仍留板端（T6 `task_id=0` 适配） | 待与 XiaoqiangWu 协调，材料：`/root/workspace/lyx/aimdk_robot_t6_taskid_workaround.{md,patch}` |
+| `libs/lerobot` 指针 | 留板端 | 环境适配，按仓库规则不得普通提交 |
+| 两个 profile 的 `base_url` | 留板端 | 站点值；主栈走 launch 参数 |
+| `assets/audio/self_introduction.wav`、`demo_relaxed.yaml`、`aimdk_x2_voice_raw.yaml` | 未跟踪 | 板端资源与实验 profile |
+
+### 18.5 追平操作与四个坑
+
+```bash
+cd /root/workspace/lyx/IB_Robot_hz
+git stash push -u -m "board-local before fast-forward"
+git -c http.proxy=http://10.42.0.100:7897 fetch origin
+git merge --ff-only origin/1028_agi_lyx
+git apply /root/workspace/lyx/aimdk_robot_t6_taskid_workaround.patch
+# 重放 profile 的 planner 默认值 + 站点地址，恢复未跟踪资源
+./scripts/build.sh -- --packages-ignore feetech_sdk so101_sdk
+```
+
+1. **`git config http.proxy` 会盖掉环境变量**。板子上它长期指向旧 IP（`10.42.0.177:7897`），
+   `git fetch` 因此一直失败，报错却像是“网络不通”。要么改掉配置，要么用 `git -c http.proxy=...`。
+2. **`install/share` 是拷贝，不是硬链**。改 `src/` 里的 `.yaml` 必须重编对应包才生效
+   （`colcon build --packages-select robot_config`）；只有 Python 入口是符号链接。
+3. **`colcon test` 需要 `--merge-install`**：这块板的 `install/` 是 merged layout，
+   不带该参数会报 `The install directory 'install' was created with the layout 'merged'`。
+4. **`colcon test` 会因缺 `install/share/sim_models/package.sh` 失败**：
+   先 `colcon build --merge-install --packages-select sim_models`，否则测试在收集阶段就失败，
+   看起来像“被测包的测试挂了”。
+
+### 18.6 本次结束时的状态
+
+- 板端 `HEAD = a9af2c07`，与主线一致；本地剩余改动仅 18.4 表中那几项。
+- 全量构建 54 个包、0 失败（跳过 `feetech_sdk`/`so101_sdk`，SO-101 与 X2 无关且需要联网 clone）。
+- 重启后验收：runtime `ACTIVE`、“挥挥手” `SUCCEEDED`、ASR `streaming + beam_search + hotwords`、
+  109 个节点、0 traceback、`planner_config_json` 指向 `10.42.0.100`。
+- 备份：`/root/workspace/lyx/backup-20261104/`（`pre-rebase.diff`、`untracked.tgz`、`status.txt`、`HEAD.txt`）
+  以及 `git stash@{0}`。
