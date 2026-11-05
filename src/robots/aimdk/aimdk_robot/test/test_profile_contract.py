@@ -378,3 +378,36 @@ def test_both_x2_profiles_ask_for_the_same_playback_pacing():
     ]
     assert pacing[0] == pacing[1]
     assert None not in pacing[0].values()
+
+
+def test_the_dexterous_profile_serves_trajectories_on_the_replay_it_already_has():
+    """joint.trajectory is the recordings' replay fed by the caller: same mode, URDF travel."""
+    import xml.etree.ElementTree as ET
+
+    path = PROFILE_PATH.with_name("x2_ultra_omnihand.yaml")
+    omni = load_profile(path)
+    assert "joint.trajectory" in omni["capabilities"]
+    assert omni["capabilities"]["joint.trajectory"]["joint_count"] == len(VENDOR_ARM_ORDER)
+    assert omni["trajectory_actions"] == ["/arm_trajectory_controller/follow_joint_trajectory"]
+    trajectory_modes = {
+        name for name, mode in omni["modes"].items() if name != "initial" and mode.get("allows_trajectory")
+    }
+    assert trajectory_modes == set(omni["vendor"]["named_motion"]["trajectory_modes"])
+    urdf = Path(__file__).resolve().parents[2] / "aimdk_description" / "urdf" / "x2_ultra.urdf"
+    travel = {
+        j.get("name"): [float(j.find("limit").get("lower")), float(j.find("limit").get("upper"))]
+        for j in ET.parse(urdf).getroot().findall("joint")
+        if j.find("limit") is not None and j.find("limit").get("lower") is not None
+    }
+    limits = omni["vendor"]["arm"]["limits"]
+    assert set(limits) == set(VENDOR_ARM_ORDER)
+    assert {name: list(map(float, value)) for name, value in limits.items()} == {n: travel[n] for n in limits}
+    validate_description(build_description(omni, use_sim=True))
+
+
+def test_the_simulated_arm_model_is_the_commit_the_description_pins():
+    import yaml
+    from aimdk_robot.mock_physics import PINNED_COMMIT
+
+    manifest = Path(__file__).resolve().parents[2] / "aimdk_description" / "manifest.yaml"
+    assert yaml.safe_load(manifest.read_text())["upstream"]["commit"] == PINNED_COMMIT

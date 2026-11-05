@@ -10,6 +10,12 @@ Three mechanisms sit behind ``/motion/execute_named``:
 Which one runs follows the runtime mode: a trajectory mode replays, every other
 admitted mode uses the vendor mechanisms.
 
+The same replay serves ``joint.trajectory``: a ``FollowJointTrajectory`` goal
+the caller computed (a composed pose, a primitive) is validated against the
+profile's arm limits and speed ceiling and replayed exactly like a recording,
+with the same admission, ease-in, cancel-and-hold and follow check. Named
+motions and trajectory goals share one executor: one arm motion at a time.
+
 All are "run this named thing"; the caller does not need to know which
 mechanism a given name uses. Names come from the profile, so an unknown name is
 rejected instead of being mapped onto a neighbouring motion.
@@ -40,6 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from aimdk_robot import projection
@@ -162,6 +169,28 @@ class NamedMotionServer:
             cancel_callback=self._on_cancel,
             callback_group=node.action_callback_group,
         )
+        # joint.trajectory: caller-computed arm trajectories on the same replay.
+        self._max_speed = max_speed
+        arm = vendor.get("arm") or {}
+        self._arm_limits = {str(k): (float(v[0]), float(v[1])) for k, v in (arm.get("limits") or {}).items()}
+        self._trajectory_server = None
+        endpoints = [str(e) for e in (node.profile.get("trajectory_actions") or [])]
+        if endpoints:
+            missing = sorted(set(projection.VENDOR_ARM_ORDER) - set(self._arm_limits))
+            if missing or not self._trajectory_modes:
+                raise ValueError(
+                    "trajectory_actions needs vendor.arm.limits for every arm joint and a trajectory mode; "
+                    f"missing limits {missing}"
+                )
+            self._trajectory_server = ActionServer(
+                node,
+                FollowJointTrajectory,
+                endpoints[0],
+                execute_callback=self._execute_trajectory,
+                goal_callback=self._accept_trajectory,
+                cancel_callback=self._on_cancel,
+                callback_group=node.action_callback_group,
+            )
 
     # --- goal handling ------------------------------------------------------
 
@@ -238,6 +267,103 @@ class NamedMotionServer:
         finally:
             with self._lock:
                 self._executing -= 1
+
+    # --- joint.trajectory ---------------------------------------------------
+
+    def _accept_trajectory(self, goal) -> GoalResponse:
+        """Refuse a goal that names no arm joint, an unknown one, or no point."""
+        names = list(goal.trajectory.joint_names)
+        if not names or not set(names) <= set(projection.VENDOR_ARM_ORDER) or len(set(names)) != len(names):
+            return GoalResponse.REJECT
+        if not goal.trajectory.points:
+            return GoalResponse.REJECT
+        with self._lock:
+            if self._executing:
+                return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def _execute_trajectory(self, goal_handle):
+        result = FollowJointTrajectory.Result()
+        with self._lock:
+            busy = self._executing > 0
+            if not busy:
+                self._executing += 1
+        if busy:
+            return self._fail_trajectory(goal_handle, result, "another arm motion is executing")
+        try:
+            return self._execute_trajectory_admitted(goal_handle, result)
+        finally:
+            with self._lock:
+                self._executing -= 1
+
+    def _execute_trajectory_admitted(self, goal_handle, result):
+        failure = self._admission_failure()
+        if failure is not None:
+            return self._fail_trajectory(goal_handle, result, failure[1])
+        mode = str(self._node.current_mode())
+        if mode not in self._trajectory_modes:
+            return self._fail_trajectory(
+                goal_handle, result, f"mode {mode!r} does not replay trajectories; use {self._trajectory_modes}"
+            )
+        start = self._node.measured_arm_positions()
+        if start is None:
+            return self._fail_trajectory(goal_handle, result, "no fresh arm measurement to start the motion from")
+        goal = goal_handle.request.trajectory
+        times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in goal.points]
+        try:
+            plan = traj.planned_trajectory(
+                "trajectory",
+                start,
+                list(goal.joint_names),
+                times,
+                [list(p.positions) for p in goal.points],
+                limits=self._arm_limits,
+                max_speed_radps=self._max_speed,
+                rate_hz=self._rate_hz,
+            )
+        except traj.TrajectoryError as exc:
+            return self._fail_trajectory(goal_handle, result, str(exc))
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+        epoch = self._node.runtime_state.stop_epoch
+
+        def on_progress(_progress: float, point: list[float]) -> None:
+            feedback = FollowJointTrajectory.Feedback()
+            feedback.joint_names = list(projection.VENDOR_ARM_ORDER)
+            feedback.desired.positions = [float(v) for v in point]
+            goal_handle.publish_feedback(feedback)
+
+        try:
+            ok, _code, message = self._run_trajectory(
+                "trajectory", mode, "", "", goal_handle, generation, epoch, recorded=plan, on_progress=on_progress
+            )
+        except _Superseded as superseded:
+            return self._fail_trajectory(goal_handle, result, superseded.message)
+        except _Cancelled as cancelled:
+            goal_handle.canceled()
+            result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+            result.error_string = cancelled.message
+            return result
+        finally:
+            with self._lock:
+                if self._running == ("trajectory", generation):
+                    self._running = None
+        if not ok:
+            result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
+            result.error_string = message
+            goal_handle.abort()
+            return result
+        goal_handle.succeed()
+        result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
+        result.error_string = message
+        return result
+
+    def _fail_trajectory(self, goal_handle, result, message: str):
+        goal_handle.abort()
+        result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+        result.error_string = message
+        return result
 
     def _execute_admitted(self, goal_handle):
         request = goal_handle.request
@@ -401,9 +527,7 @@ class NamedMotionServer:
         self._take_over(name, generation)
         return self._await_preset(name, task_id, goal_handle, generation, epoch)
 
-    def _await_preset_without_task(
-        self, name: str, goal_handle, generation: int, epoch: int
-    ) -> tuple[bool, int, str]:
+    def _await_preset_without_task(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
         """Hold the goal while the platform plays a motion it answered without a task.
 
         T6 firmware accepts the preset motion and plays it but returns task_id 0,
@@ -444,8 +568,7 @@ class NamedMotionServer:
         return (
             False,
             ExecuteNamedMotion.Result.TIMEOUT,
-            f"preset motion {name} (no platform task) not reported complete within "
-            f"{self._preset_timeout_s:.0f}s",
+            f"preset motion {name} (no platform task) not reported complete within {self._preset_timeout_s:.0f}s",
         )
 
     def _await_preset(self, name: str, task_id: int, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
@@ -530,20 +653,43 @@ class NamedMotionServer:
         return checkpoint.offset_s, f"; resumed from {checkpoint.offset_s:.1f}s"
 
     def _run_trajectory(
-        self, name: str, mode: str, target: str, resume_token: str, goal_handle, generation: int, epoch: int
+        self,
+        name: str,
+        mode: str,
+        target: str,
+        resume_token: str,
+        goal_handle,
+        generation: int,
+        epoch: int,
+        *,
+        recorded: traj.ArmTrajectory | None = None,
+        on_progress=None,
     ) -> tuple[bool, int, str]:
-        """Replay a recorded trajectory on the arm channel, easing in from the measured pose."""
-        recorded = self._trajectories.get(name)
+        """Replay a trajectory on the arm channel, easing in from the measured pose.
+
+        ``recorded`` defaults to the profile's recording for ``name``; a
+        ``joint.trajectory`` goal passes its own validated plan instead.
+        """
+        planned = recorded is not None
+        recorded = recorded or self._trajectories.get(name)
         if recorded is None:
             return (
                 False,
                 ExecuteNamedMotion.Result.MODE_NOT_ALLOWED,
                 f"mode {mode!r} replays only recorded motions {sorted(self._trajectories)}; {name!r} has none",
             )
+        if on_progress is None:
+            named_feedback = ExecuteNamedMotion.Feedback()
+            named_feedback.state = "running"
+
+            def on_progress(progress: float, _point: list[float]) -> None:
+                named_feedback.progress = progress
+                goal_handle.publish_feedback(named_feedback)
+
         # A recording drives exactly the side it was recorded on (the loader
         # refuses one that does not say which), so a request for any other side
         # is refused rather than answered with that side's motion.
-        if target and target != recorded.target:
+        if not planned and target and target != recorded.target:
             raise CommandRejected("INVALID_TARGET", f"{name!r} was recorded for {recorded.target!r}, not {target!r}")
         # Arm targets only move the robot in the mode's own platform action;
         # anywhere else they would be accepted and silently dropped.
@@ -582,8 +728,6 @@ class NamedMotionServer:
                 ExecuteNamedMotion.Result.BUSY,
                 f"another source is streaming on the arm channel; {name} does not preempt it",
             )
-        feedback = ExecuteNamedMotion.Feedback()
-        feedback.state = "running"
         commanded_peak = [0.0] * len(start)
         measured_peak = [0.0] * len(start)
         # (t, target) sent within the last hold lag, oldest first.
@@ -623,8 +767,7 @@ class NamedMotionServer:
                 if t >= total:
                     break
                 if tick % int(self._rate_hz) == 0:
-                    feedback.progress = min(reached / recorded.duration, 1.0)
-                    goal_handle.publish_feedback(feedback)
+                    on_progress(min(reached / recorded.duration, 1.0), point)
                 tick += 1
                 time.sleep(max(0.0, started + tick * period - time.monotonic()))
         finally:

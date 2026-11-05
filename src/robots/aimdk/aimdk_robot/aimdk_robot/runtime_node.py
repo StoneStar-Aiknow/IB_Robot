@@ -786,7 +786,7 @@ class AimdkRuntimeNode(Node):
             self.create_service(
                 StartRelocalization, RELOCALIZE_SERVICE, self._on_relocalize, callback_group=self._service_cb
             )
-        if self._state.has_capability("motion.named") or self._state.has_capability("motion.posture"):
+        if any(self._state.has_capability(c) for c in ("motion.named", "motion.posture", "joint.trajectory")):
             from aimdk_robot.named_motion import NamedMotionServer  # noqa: PLC0415
 
             self._named_motion = NamedMotionServer(self)

@@ -22,7 +22,7 @@ import json
 from aimdk_robot import dataplane
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
@@ -118,7 +118,12 @@ def _launch_setup(context, *_args, **_kwargs):
         executable="aimdk_vendor_mock",
         name="aimdk_vendor_mock",
         output="screen",
-        parameters=[{"hand_type": str((vendor.get("hand") or {}).get("type", "claw")).split("_")[0]}],
+        parameters=[
+            {
+                "hand_type": str((vendor.get("hand") or {}).get("type", "claw")).split("_")[0],
+                "physics_mjcf": LaunchConfiguration("physics_mjcf", default="").perform(context).strip(),
+            }
+        ],
     )
     # The platform stand-in comes up first; the data plane, the bridge and the
     # synthetic sensor publishers follow one stagger apart, honouring the
@@ -154,6 +159,14 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),
+            DeclareLaunchArgument(
+                "physics_mjcf",
+                # Robot-config launches (robot.launch.py) pass no provider-specific argument;
+                # the environment selects the physics for them.
+                default_value=EnvironmentVariable("AIMDK_MOCK_PHYSICS_MJCF", default_value=""),
+                description="Simulated only: official X2 MuJoCo scene (see aimdk_fetch_x2_mjcf) to simulate the "
+                "arms with; empty: the mock follows commands at once",
+            ),
             DeclareLaunchArgument(
                 "peripherals",
                 default_value="",
