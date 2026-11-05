@@ -1712,7 +1712,7 @@ completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）�
 | `agent.voice_bridge.addressee_trigger` | `wake_phrase`（默认）或 `vendor_session`。前者要求话语以 `wake_phrases` 开头；后者用于**先吃掉自身唤醒词再放行语音**的平台（X2 实测如此），此时唤醒词到不了文本层，**只有唤醒事件能开会话**（必须配 `wake_event`），会话首句是唤醒事件指明那一段的转写；静默 `session_gap_sec` 后会话结束，下一句没有新唤醒就被拒绝。`vendor_session` 下配 `wake_phrases` 会被拒绝 |
 | `agent.voice_bridge.session_gap_sec` | 有限正数，默认 15 秒。仅 `vendor_session` 下生效：会话内转写间隔超过它即结束会话，之后需要新的唤醒事件。必须大于最长话语加 ASR 定稿延迟（间隔在最终转写之间测量）；偏小会让用户停顿后的追问也要重说唤醒词 |
 | `agent.voice_bridge.wake_phrases` | 非空字符串列表，省略该键表示**接受每一句话**（现有部署的行为）。配置后，一句话必须以其中之一**开头**才算是对机器人说的；命中后唤醒词会被**从文本中剥离**再送给 planner。空列表会被拒绝（那是一道没人能打开的门）。停止词**不受此门控**，安全优先 |
-| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；窗口**只被真正被处理的话续期**，被忽略的话不会把它撑开。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
+| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；实际处理的指令、窗口内声纹比对通过的语音均会续期，缺失或不可比的声纹不为被忽略的语音续期。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
 | `agent.voice_bridge.speaker_check_enabled` | 布尔，默认 false。开启后窗口内的话要与**会话首句**（说唤醒词那句，或 `vendor_session` 下唤醒事件指明的那一句）的声纹匹配才转发。要求门控已开启（配 `wake_phrases` 或 `addressee_trigger: vendor_session`，锚点来自会话首句），且要求 `voice_asr.speaker_embedding.enabled: true`（否则没人发布可比对的声纹，门看起来在过滤实际全放行）——两条都 fail closed |
 | `agent.voice_bridge.speaker_min_similarity` | `(0, 1]`，默认 0.60。余弦相似度下限。默认值是 X2 真机测试用的值（2026-10-24，campplus，≥2 s 片段）：旁人与锚点 0.28–0.56，用户本人在锚点累积后 0.67–0.84。离线语料的数字不能作依据——其分组标签并非同一个人。**仍须用真人录音现场标定**（方法见 `ibrobot_agent/README.md`）：取决于模型、麦克风、房间与说话人相似度 |
 | `agent.voice_bridge.speaker_max_age_sec` | 有限正数，默认 2.5 秒。声纹按语音段与转写配对；某段的声纹超过这个时长仍没有等到它的转写（ASR 丢弃了该段）即丢弃，只限制内存，不决定谁判定谁 |
@@ -2324,7 +2324,7 @@ robot:
         speaker_check_enabled: true
 ```
 
-开启后使用 ASR 文本前缀开启 25 秒滑动窗口，不依赖厂商 `audio.wake_event`。
+开启后使用 ASR 文本前缀开启 60 秒滑动窗口，不依赖厂商 `audio.wake_event`。
 欧/鸥是同音字，偶是近音字；只匹配句首，不以句中提及触发。
 仅开启时需额外 provision `models/campplus-speaker`（默认 `torch_cpu`）。
 保持原有厂商持续采音设置；本配置不修改厂商唤醒服务，也不切换麦克风。

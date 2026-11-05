@@ -737,7 +737,10 @@ class VoiceBridgeCore:
         execution_id, text, terminal = accepted
         if self._silent(str(payload.get("request_id", ""))):
             return [Log(f"request {payload.get('request_id')} speech suppressed: its output is speech itself")]
-        return [Speak(text, execution_id=execution_id, terminal=terminal)]
+        detail = payload.get("detail") or {}
+        if payload.get("state") == "SUCCEEDED" and detail.get("save_prompt"):
+            text += str(detail["save_prompt"])
+        return [Speak(text, execution_id=execution_id, terminal=terminal, kind="terminal" if terminal else "reply")]
 
     def _on_reply_preview(self, payload: dict[str, Any], request_id: str) -> list[Action]:
         """Say the reply the planner is still producing, once per request.

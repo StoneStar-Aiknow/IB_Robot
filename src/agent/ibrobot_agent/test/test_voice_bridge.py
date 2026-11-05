@@ -147,12 +147,14 @@ def test_deployed_chinese_tts_never_receives_internal_english(text):
     assert not re.search("[A-Za-z_]", spoken)
 
 
-def test_save_question_is_spoken_only_after_success():
+@pytest.mark.parametrize("structured", [False, True])
+def test_save_question_is_spoken_only_after_success(structured):
     core = _core()
     core.on_transcript("双手交叉放在胸前", now=0.0)
-    actions = core.on_event(
-        _event("voice-0", "terminal", "SUCCEEDED", detail={"save_prompt": "刚才这个动作到位吗？可以保存吗？"}), now=1.0
-    )
+    detail = {"save_prompt": "刚才这个动作到位吗？可以保存吗？"}
+    if structured:
+        detail.update(execution_id="pose-execution", gateway_sequence=1)
+    actions = core.on_event(_event("voice-0", "terminal", "SUCCEEDED", detail=detail), now=1.0)
     assert [a.text for a in _of(actions, Speak)] == ["执行完成。刚才这个动作到位吗？可以保存吗？"]
 
 
@@ -449,8 +451,8 @@ def test_partial_transcript_stops_once_before_the_utterance_ends():
     core = _core()
     core.on_transcript("挥挥手", now=0.0)
 
-    first = core.on_partial("帮我停", now=1.0)
-    grown = core.on_partial("帮我停一下", now=1.2)
+    first = core.on_partial("停", now=1.0)
+    grown = core.on_partial("停下", now=1.2)
     unrelated = core.on_partial("今天天气", now=1.3)
 
     assert [action.payload for action in _of(first, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
@@ -468,7 +470,7 @@ def test_final_of_a_partial_stop_does_not_become_a_command_after_the_request_end
     # "帮我停一下" was sent to the Agent as a new request and "继续" was then dropped as busy.
     core = _core()
     core.on_transcript("挥手然后点头再摇头", now=0.0)
-    core.on_partial("帮我停", now=1.0)
+    core.on_partial("停", now=1.0)
     core.on_event(_event("voice-0", "terminal", "CANCELLED", "skill cancelled"), now=1.1)
 
     final = core.on_transcript("帮我停一下", now=1.8)
@@ -1003,6 +1005,32 @@ MODEL = "campplus@test"
 ALICE = Voiceprint((1.0, 0.0, 0.0), MODEL)
 BOB = Voiceprint((0.0, 1.0, 0.0), MODEL)
 SPEAKER = {**WAKE, "speaker_check_enabled": True, "speaker_min_similarity": 0.5, "speaker_max_age_sec": 2.5}
+
+
+def test_verified_speech_renews_the_window_even_while_the_robot_is_busy():
+    core = _core(**SPEAKER)
+    core.on_measurement("speaker", ALICE, now=1.0, segment=_seg(1))
+    core.on_transcript("灵犀灵犀挥个手", now=1.0, segment=_seg(1))
+    for index, moment in enumerate((10.0, 20.0, 30.0), start=2):
+        core.on_measurement("speaker", ALICE, now=moment, segment=_seg(index))
+        actions = core.on_transcript("继续聊一会儿", now=moment, segment=_seg(index))
+        assert not _of(actions, PublishRequest)
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=31.0)
+    core.on_measurement("speaker", ALICE, now=40.0, segment=_seg(5))
+    actions = core.on_transcript("举个手", now=40.0, segment=_seg(5))
+    assert [action.payload["text"] for action in _of(actions, PublishRequest)] == ["举个手"]
+
+
+@pytest.mark.parametrize("voice", [BOB, None, Voiceprint(ALICE.vector, "other-model")])
+def test_unverified_speech_does_not_renew_the_window_while_busy(voice):
+    core = _core(**SPEAKER)
+    core.on_measurement("speaker", ALICE, now=1.0, segment=_seg(1))
+    core.on_transcript("灵犀灵犀挥个手", now=1.0, segment=_seg(1))
+    core.on_measurement("speaker", voice, now=10.0, segment=_seg(2))
+    core.on_transcript("继续聊一会儿", now=10.0, segment=_seg(2))
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=11.0)
+    core.on_measurement("speaker", ALICE, now=14.0, segment=_seg(3))
+    assert not _of(core.on_transcript("举个手", now=14.0, segment=_seg(3)), PublishRequest)
 
 
 def test_enabling_the_check_makes_the_node_subscribe_to_the_voiceprints():

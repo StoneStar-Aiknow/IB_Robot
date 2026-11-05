@@ -25,7 +25,8 @@
   原始指令含相对要求时，即使 Agent 返回固定标准表达也不复用固定缓存。
   此修改扩展了 ROS 服务响应，部署需同时重建 `ibrobot_msgs`、`ibrobot_agent` 和 `pose_composer`。
 - Mock 验收入口：`colcon test --merge-install --packages-select ibrobot_agent pose_composer`。
-  `test_voice_memory_mock.py` 使用真实 Agent、Composer、求解器和 SQLite，替代模型、动作执行和播报接口。
+  `test_agent_memory_mock.py` 用真实 Agent、Composer、SQLite 验证保存确认及召回免模型调用；
+  语音路由、确认分支和失败分支分别由 `test_voice_bridge.py`、`test_pose_preview.py` 专项覆盖。
 
 `ibrobot_agent` 是 IB-Robot 自然语言 Agent 的孵化运行时包。它把用户的自然语言请求转成
 严格校验的 canonical Program，并把全部机器人执行委托给既有 Capability Gateway 链路
@@ -129,6 +130,8 @@ execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为�
   其他未对账 UNKNOWN 仍阻止新任务。只在下一次启动时重新计算隔离状态。
 - 执行结果 `message` 为最多 300 字符的摘要；超长时截断，原文保存于 `detail.raw_message`，
   并设置 `detail.message_truncated=true`。诊断长度不改变已收到的执行终态或触发额外取消。
+- `free_pose`、`return_to_task_pose` 收到 `TASK_POSE_NOT_REACHED` 时，回复“动作执行结束，未校验通过。”。
+  该回复表示结束位置未通过校验；执行终态仍为 `FAILED`，错误码及校验阶段保留在执行记录中。
 - 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
   供人工通过 Gateway 核实；确定未提交的中断请求转为 FAILED 或 CANCELLED_BEFORE_EXECUTION。
   不重放旧请求，不以 Gateway 空闲推断成功；已有终态和其他 robot scope 的记录保持原样。
@@ -225,7 +228,8 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
   保持常开，因此房间里的每一句话都会到达桥接，无论是否对机器人说的。配置 `wake_phrases` 后，一句话必须以
   其中之一**开头**才被转发；命中后唤醒词从文本中剥离（ASR 会丢掉逗号，「灵犀灵犀，挥个手」实际到达的是
   「灵犀灵犀挥个手」，planner 不应看到前缀）。命中即开 `wake_window_sec` 窗口，窗口内的后续话无需再点名，
-  但**只有被真正处理的话才续期窗口**——否则旁边的持续交谈会把它一直撑开，门控退化为常开。
+  被真正处理的话会续期窗口；当前窗口内通过声纹比对的话也会续期，即使机器人忙或文本太短而未提交指令。
+  续期至本句转写到达时间加 `wake_window_sec`；声纹缺失、不可比或被拒绝的闲聊不续期，过期后仍需重新唤醒。
   句中提及不算点名（「昨天我跟灵犀说过这个事」被忽略），这是用前缀匹配而非包含匹配的原因。
   **停止词不受此门控**：安全优先于寻址。ASR 把专名读成同音词是常态（X-ASR 实测「灵犀」→「林夕」/「林溪」），
   用现成的 `text_corrections` 吸收即可，门控在纠正之后判定。
@@ -416,6 +420,7 @@ typed Program 路径不产生 `presentation_rendered`。
 需要时按 robot_config README 的覆盖配置启用 `wake_phrase` + `小欧小欧` 及同音/近音前缀。
 不依赖厂商播放应答推导的唤醒事件。沿用现场持续采音方式，不修改厂商服务。
 文本前缀被剥离后提交 Agent；首句声纹建锚，可信后续语音累积更新，再次点名重设。
-仅真正处理的指令延长 25 秒窗口，拒绝的旁人话语不续期。需下载 CAMPPlus bundle，
+唤醒窗口为 60 秒；真正处理的指令、窗口内声纹比对通过的后续语音均将截止时间刷新至本句转写到达后的 60 秒。
+拒绝的旁人话语不续期。需下载 CAMPPlus bundle，
 首次请将“小欧小欧”与 3～6 秒完整指令连说，避免短唤醒残留成为无效锚点。
 这是 ASR 文本触发，不是专用 KWS；短首句无锚点和缺失测量的 fail-open 边界保持不变。

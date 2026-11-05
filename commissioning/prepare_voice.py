@@ -119,10 +119,13 @@ for name, enabled in [
     config["voice_asr"].update(
         {
             "input_mode": "external_vad",
-            "hotwords_file": "$(find robot_config)/config/hotwords/x2_commands.txt",
+            # X-ASR uses prefixed subword tokens; the character hotword list is incompatible.
+            "hotwords_file": "",
             "audio_input": {"interface": "audio.speech", "type": "ibrobot_msgs/msg/SpeechAudioChunk"},
         }
     )
+    # Text wake and speaker checks are opt-in for this commissioning deployment.
+    config["voice_asr"]["speaker_embedding"] = {"enabled": True}
     config["voice_tts"] = copy.deepcopy(reference["voice_tts"])
     embodied = config["embodied"]
     embodied.update(
@@ -150,6 +153,24 @@ for name, enabled in [
     )
     agent["test_allowlist"] = site_skills
     agent["voice_bridge"]["silent_skills"] = ["self_introduction"]
+    agent["voice_bridge"].update(
+        {
+            "addressee_trigger": "wake_phrase",
+            "wake_window_sec": 60.0,
+            "wake_phrases": [
+                "小欧小欧",
+                "小欧小鸥",
+                "小欧小偶",
+                "小鸥小欧",
+                "小鸥小鸥",
+                "小鸥小偶",
+                "小偶小欧",
+                "小偶小鸥",
+                "小偶小偶",
+            ],
+            "speaker_check_enabled": True,
+        }
+    )
     agent["voice_bridge"]["confirm_mode"] = "voice_confirm"
     if name.startswith("hz_site_mirror_"):
         # Opt-in mirror profiles retain all seven existing skills. Only the

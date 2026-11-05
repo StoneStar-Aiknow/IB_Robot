@@ -138,7 +138,7 @@ robot:
         # No wake_phrases key: accept speech without a wake prefix by default.
         # To opt in, enable both speaker flags and add:
         # wake_phrases: [小欧小欧, 小欧小鸥, 小欧小偶, 小鸥小欧, 小鸥小鸥, 小鸥小偶, 小偶小欧, 小偶小鸥, 小偶小偶]
-        wake_window_sec: 25.0
+        wake_window_sec: 60.0
         speaker_check_enabled: false
         speaker_min_similarity: 0.60
         speaker_merge_margin: 0.10

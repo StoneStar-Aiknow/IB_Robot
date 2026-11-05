@@ -390,13 +390,14 @@ class AddresseeGate:
     def note_handled(self, heard_at: float) -> None:
         """An addressed utterance, heard at ``heard_at``, is being acted on: keep the ``wake_phrase`` window open.
 
-        Extended only by an utterance that is actually being handled, so a
-        window cannot be held open by speech the robot ignored. The
+        Called for an utterance being handled or a follow-up with a matching
+        voiceprint, even when the bridge is busy. Unverified ignored speech
+        cannot keep the window open. The
         vendor_session trigger has no such timer: its window is the session,
         tracked by ``open_if_new_session``.
         """
         if self.wake_phrases:
-            self.wake_until = heard_at + self.wake_window_sec
+            self.wake_until = max(self.wake_until, heard_at + self.wake_window_sec)
 
     def _wakes(self, segment: Segment, heard_at: float) -> bool:
         """Whether the pending wake event opened ``segment``'s utterance.
@@ -450,7 +451,7 @@ class AddresseeGate:
             return None
         return self.measurements.get(check.name, {}).pop(segment, None)
 
-    def _rejecting_check(self, segment: Segment | None) -> str:
+    def _rejecting_check(self, segment: Segment | None, *, heard_at: float | None = None) -> str:
         """Describe the first check that says this utterance is someone else's; empty if none does.
 
         When none does, the utterance is the anchored source by every enabled
@@ -459,6 +460,7 @@ class AddresseeGate:
         """
         rejections = []
         judged: list[tuple[AnchorCheck, Any]] = []
+        speaker_verified = False
         for check in self.checks:
             anchor = self.anchors.get(check.name)
             measurement = self._take(check, segment)
@@ -472,9 +474,16 @@ class AddresseeGate:
             agrees, detail = check.verdict(anchor, measurement.value)
             if not agrees:
                 rejections.append(f"{check.name}: {detail}")
+            elif isinstance(check, SpeakerCheck) and _similarity(anchor, measurement.value) is not None:
+                speaker_verified = True
             judged.append((check, measurement.value))
         if rejections:
             return rejections[0]
+        # A matching speaker keeps our attention even when the bridge is busy
+        # or the utterance is too short to submit. Missing/incomparable evidence
+        # may still fail open, but must not renew the wake window.
+        if speaker_verified and heard_at is not None:
+            self.note_handled(heard_at)
         for check, value in judged:
             merge = getattr(check, "merge", None)
             if merge is not None:
@@ -530,6 +539,6 @@ class AddresseeGate:
             self.wake_until = heard_at + self.wake_window_sec
             return GateVerdict(True, raw[cut:].lstrip(spare), normalized[len(phrase) :].lstrip(spare))
         if heard_at < self.wake_until:
-            rejected = self._rejecting_check(segment)
+            rejected = self._rejecting_check(segment, heard_at=heard_at)
             return GateVerdict(not rejected, raw, normalized, reason=rejected)
         return GateVerdict(False, raw, normalized, reason="no wake phrase")
