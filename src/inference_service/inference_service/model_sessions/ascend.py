@@ -86,6 +86,12 @@ class AscendOmModelSession(ModelSession):
         self._models: dict[str, AclModel] = {}
         self._linked_inputs: frozenset[tuple[str, str]] = frozenset()
         self._diagnostic_capture = diagnostic_capture
+        # RT-Infer periodic admission (optional, PEAR-under-soft-scheduler only):
+        # opened lazily on first execute; only the owner arms the mapping.
+        # See inference_service.rt_infer_periodic.
+        self._periodic_admission = None
+        self._rt_infer_warmups: dict[str, int] = {}
+        self._rt_infer_ready = False
 
     @property
     def runtime_version(self) -> str:
@@ -228,8 +234,20 @@ class AscendOmModelSession(ModelSession):
             models[role].prepare_datasets(input_overrides=input_overrides)
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        import time
+
+        received_ns = time.monotonic_ns()
         context.check("backend")
         deployment = self._loaded_deployment()
+        admission = self._periodic_admission_for(deployment)
+        if admission is not None:
+            admission.arm()
+            # Publish the request's real admission/release instant before the
+            # device work starts.  The adapter never sleeps or changes the
+            # request deadline/cancellation contract.
+            context.check("periodic_publish")
+            admission.publish_release(request.metadata, received_ns=received_ns)
+        context.check("backend")
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
         for role_index, role in enumerate(deployment.execution):
@@ -237,6 +255,34 @@ class AscendOmModelSession(ModelSession):
                 if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     public_outputs[semantic] = output
         return public_outputs
+
+    def _periodic_admission_for(self, deployment: CompiledDeployment):
+        """The RT-Infer periodic admission for this deployment, or None.
+
+        The hook attaches only when BOTH hold: the launch named a periodic
+        mapping (only the wrapped PEAR client gets that environment) AND the
+        loaded model is the PEAR parameter network. Any other session — or
+        any native launch — resolves to None and takes no locking overhead.
+        """
+        if self._periodic_admission is not None:
+            return self._periodic_admission
+        import os
+
+        if not os.environ.get("RT_INFER_PERIODIC_PATH"):
+            return None
+        model_type = self._require_context().validated_manifest.manifest.model.model_type
+        if model_type != "pear_parameter_network":
+            raise BackendInferenceError(
+                f"RT-Infer periodic admission was configured for this process but the loaded model "
+                f"is {model_type!r}, not the PEAR parameter network; refusing to publish periodic "
+                "releases for a model the profile was never validated on",
+                code="periodic_model_mismatch",
+            )
+        from inference_service.rt_infer_periodic import PeriodicAdmission
+
+        admission = PeriodicAdmission.from_launch_environment()
+        self._periodic_admission = admission
+        return admission
 
     def _loaded_deployment(self) -> CompiledDeployment:
         deployment = self._require_context().deployment
@@ -294,6 +340,15 @@ class AscendOmModelSession(ModelSession):
             values[binding.semantic] = output
             outputs[binding.semantic] = output
         self._capture_role_outputs(role, outputs)
+        import os
+
+        if not self._rt_infer_ready and os.environ.get("RTINFER_LAUNCH_TOKEN"):
+            self._rt_infer_warmups[role] = self._rt_infer_warmups.get(role, 0) + 1
+            if all(self._rt_infer_warmups.get(name, 0) >= 3 for name in self._loaded_deployment().execution):
+                from inference_service.rt_infer_client import mark_runtime_ready
+
+                mark_runtime_ready()
+                self._rt_infer_ready = True
         if self._diagnostic_capture is not None and not isolated:
             linked_outputs = {
                 link.semantic
@@ -533,6 +588,12 @@ class AscendOmModelSession(ModelSession):
         self._lease = None
         self._priority_streams = None
         self._linked_inputs = frozenset()
+        admission, self._periodic_admission = self._periodic_admission, None
+        if admission is not None:
+            try:
+                admission.close()
+            except Exception as exc:
+                errors.append(exc)
         if errors:
             raise BackendLifecycleError(
                 f"Ascend model session close failed: {'; '.join(str(error) for error in errors)}",

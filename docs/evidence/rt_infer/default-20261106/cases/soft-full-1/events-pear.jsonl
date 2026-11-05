@@ -1,0 +1,3 @@
+{"stage": "handle_close_begin", "pid": 3094, "monotonic_ns": 1369569340679, "model": "pear"}
+{"stage": "handle_close_end", "pid": 3094, "monotonic_ns": 1369844508831, "model": "pear"}
+{"stage": "worker_finished", "pid": 3094, "monotonic_ns": 1369850052503}

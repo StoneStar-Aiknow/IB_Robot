@@ -177,7 +177,6 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         DEFAULT_MAX_EVIDENCE_AGE_SEC,
         DEFAULT_MAX_SESSION_SEC,
         DEFAULT_MIN_GAP_SEC,
-        NODE_NAME,
     )
     from visual_interaction.session.endpoints import CAMERA_COMPRESSED
 
@@ -318,15 +317,62 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         if key in chatter:
             parameters[f"chatter_{key}"] = float(chatter[key])
 
-    return [
-        Node(
+    return [_visual_interaction_node(robot_config, vl_implementation=implementation, parameters=parameters)]
+
+
+def _visual_interaction_node(robot_config: Mapping[str, object], *, vl_implementation: str, parameters: dict) -> Node:
+    """The session node, attached to RT-Infer when the robot enables it.
+
+    The InternVL chain (vision + prefill + decode) runs inside this node
+    process through the board deployment's ais_bench sessions
+    (``visual_interaction.session.internvl_vision``), so under RT-Infer the
+    whole node becomes the vendor's ``vl``-role client -- one priority for the
+    whole chain, matching how the candidate10 validation measured it. The
+    ``fake`` implementation touches no NPU and never wraps.
+    """
+    from embodied_common.visual_interaction_contract import NODE_NAME
+
+    if vl_implementation != "internvl":
+        return Node(
             package="visual_interaction",
             executable="visual_interaction_node",
             name=NODE_NAME,
             parameters=[parameters],
             output="screen",
         )
-    ]
+    from robot_config.rt_infer_config import RtInferConfigError, parse_rt_infer_config
+
+    try:
+        rt_infer = parse_rt_infer_config(robot_config)
+    except RtInferConfigError as exc:
+        raise ValueError(f"rt_infer configuration is invalid: {exc}") from exc
+    if not rt_infer.enable:
+        return Node(
+            package="visual_interaction",
+            executable="visual_interaction_node",
+            name=NODE_NAME,
+            parameters=[parameters],
+            output="screen",
+        )
+    from inference_service.launch_builders.perception_models import write_rt_infer_snapshot
+
+    return Node(
+        package="inference_service",
+        executable="rt_infer_client",
+        sigterm_timeout=str(rt_infer.stop_timeout_sec + 1),
+        name=NODE_NAME,
+        output="screen",
+        parameters=[parameters],
+        arguments=[
+            "--role",
+            "vl",
+            "--rt-infer-config",
+            str(write_rt_infer_snapshot(dict(robot_config))),
+            "--node-main",
+            "visual_interaction.visual_interaction_node:main",
+            "--",
+        ],
+    )
 
 
 __all__ = ["generate_visual_interaction_nodes"]
@@ -342,4 +388,7 @@ VISUAL_INTERACTION_BUILDER = BuilderSpec(
     id="visual_interaction",
     factory=f"{__name__}:build_visual_interaction",
     timing="runtime_ready",
+    # Topological edge to the device owner (binding only when rt_infer is
+    # enabled; dropped otherwise).
+    after=("rt_infer_scheduler",),
 )

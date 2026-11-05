@@ -1,0 +1,166 @@
+[
+  {
+    "case": "native-full",
+    "offered": 1530,
+    "completed": 1265,
+    "dropped": 265,
+    "late_completed": 285,
+    "deadline_misses": 550,
+    "deadline_miss_pct": 35.947712418300654,
+    "p50_ms": 24.265523,
+    "p95_ms": 156.386381,
+    "completed_p99_ms": 277.455918,
+    "all_release_p99_ms": null,
+    "max_ms": 326.56755,
+    "background": {
+      "tts": {
+        "offered": 11,
+        "completed_inside_window": 11,
+        "max_completion_silence_s": 7.520259511
+      },
+      "vl": {
+        "offered": 34,
+        "completed_inside_window": 34,
+        "max_completion_silence_s": 3.458875211
+      }
+    }
+  },
+  {
+    "case": "native-pose",
+    "offered": 450,
+    "completed": 450,
+    "dropped": 0,
+    "late_completed": 0,
+    "deadline_misses": 0,
+    "deadline_miss_pct": 0.0,
+    "p50_ms": 23.939651,
+    "p95_ms": 24.007662,
+    "completed_p99_ms": 24.050816,
+    "all_release_p99_ms": 24.050816,
+    "max_ms": 27.028193,
+    "background": {}
+  },
+  {
+    "case": "public-r1/alone-periodic",
+    "offered": 450,
+    "completed": 450,
+    "dropped": 0,
+    "late_completed": 0,
+    "deadline_misses": 0,
+    "deadline_miss_pct": 0.0,
+    "p50_ms": 33.13477,
+    "p95_ms": 33.23688,
+    "completed_p99_ms": 34.218709,
+    "all_release_p99_ms": 34.218709,
+    "max_ms": 44.578947,
+    "background": {}
+  },
+  {
+    "case": "public-r1/full-periodic",
+    "offered": 1530,
+    "completed": 1529,
+    "dropped": 1,
+    "late_completed": 1,
+    "deadline_misses": 2,
+    "deadline_miss_pct": 0.13071895424836602,
+    "p50_ms": 34.673719,
+    "p95_ms": 43.417344,
+    "completed_p99_ms": 45.092724,
+    "all_release_p99_ms": 45.133767,
+    "max_ms": 120.392964,
+    "background": {
+      "tts": {
+        "offered": 11,
+        "completed_inside_window": 11,
+        "max_completion_silence_s": 15.408133788
+      },
+      "vl": {
+        "offered": 34,
+        "completed_inside_window": 16,
+        "max_completion_silence_s": 6.552756593
+      }
+    }
+  },
+  {
+    "case": "public-r2/alone-periodic",
+    "offered": 450,
+    "completed": 450,
+    "dropped": 0,
+    "late_completed": 0,
+    "deadline_misses": 0,
+    "deadline_miss_pct": 0.0,
+    "p50_ms": 33.167725,
+    "p95_ms": 33.28445,
+    "completed_p99_ms": 33.766177,
+    "all_release_p99_ms": 33.766177,
+    "max_ms": 36.8054,
+    "background": {}
+  },
+  {
+    "case": "public-r2/full-periodic",
+    "offered": 1530,
+    "completed": 1530,
+    "dropped": 0,
+    "late_completed": 4,
+    "deadline_misses": 4,
+    "deadline_miss_pct": 0.26143790849673204,
+    "p50_ms": 41.023612,
+    "p95_ms": 41.825819,
+    "completed_p99_ms": 44.5651,
+    "all_release_p99_ms": 44.5651,
+    "max_ms": 73.305072,
+    "background": {
+      "tts": {
+        "offered": 11,
+        "completed_inside_window": 1,
+        "max_completion_silence_s": 82.607890593
+      },
+      "vl": {
+        "offered": 34,
+        "completed_inside_window": 19,
+        "max_completion_silence_s": 5.610992218
+      }
+    }
+  },
+  {
+    "case": "public-r3/alone-periodic",
+    "offered": 450,
+    "completed": 450,
+    "dropped": 0,
+    "late_completed": 0,
+    "deadline_misses": 0,
+    "deadline_miss_pct": 0.0,
+    "p50_ms": 33.429834,
+    "p95_ms": 33.571037,
+    "completed_p99_ms": 34.460545,
+    "all_release_p99_ms": 34.460545,
+    "max_ms": 42.565372,
+    "background": {}
+  },
+  {
+    "case": "public-r3/full-periodic",
+    "offered": 1530,
+    "completed": 1530,
+    "dropped": 0,
+    "late_completed": 6,
+    "deadline_misses": 6,
+    "deadline_miss_pct": 0.39215686274509803,
+    "p50_ms": 41.230534,
+    "p95_ms": 42.154438,
+    "completed_p99_ms": 45.368277,
+    "all_release_p99_ms": 45.368277,
+    "max_ms": 84.554082,
+    "background": {
+      "tts": {
+        "offered": 11,
+        "completed_inside_window": 1,
+        "max_completion_silence_s": 82.623748067
+      },
+      "vl": {
+        "offered": 34,
+        "completed_inside_window": 19,
+        "max_completion_silence_s": 4.78935253
+      }
+    }
+  }
+]

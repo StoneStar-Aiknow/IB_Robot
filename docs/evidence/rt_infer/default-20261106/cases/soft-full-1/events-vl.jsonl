@@ -1,0 +1,7 @@
+{"stage": "handle_close_begin", "pid": 3086, "monotonic_ns": 1369830236487, "model": "decode"}
+{"stage": "handle_close_end", "pid": 3086, "monotonic_ns": 1370026206695, "model": "decode"}
+{"stage": "handle_close_begin", "pid": 3086, "monotonic_ns": 1370028986826, "model": "prefill"}
+{"stage": "handle_close_end", "pid": 3086, "monotonic_ns": 1370277973935, "model": "prefill"}
+{"stage": "handle_close_begin", "pid": 3086, "monotonic_ns": 1370278717347, "model": "vision"}
+{"stage": "handle_close_end", "pid": 3086, "monotonic_ns": 1370377938857, "model": "vision"}
+{"stage": "worker_finished", "pid": 3086, "monotonic_ns": 1370394428493}

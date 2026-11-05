@@ -1,0 +1,13 @@
+{
+  "pid": 2173,
+  "affinity": [
+    11
+  ],
+  "persistent_io": "1",
+  "safe_args_batch": "1",
+  "stream_priority": "3",
+  "runtime_libraries": [
+    "/opt/rt-infer/pr581-oee-2026.11.05/lib/libruntime.so",
+    "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so"
+  ]
+}

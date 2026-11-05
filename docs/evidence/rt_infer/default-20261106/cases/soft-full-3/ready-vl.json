@@ -1,0 +1,36 @@
+{
+  "pid": 3733,
+  "start_ticks": "153472",
+  "boot_id": "8f445c1a-fa03-4c80-b0c5-fc065ac186c4",
+  "affinity": [
+    11
+  ],
+  "runtime_libraries": [
+    "/opt/rt-infer/2026.11.06/lib/libruntime.so",
+    "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so"
+  ],
+  "token": "launch-3662-1528235449082",
+  "priority": "3",
+  "buffers": {
+    "vision": {},
+    "prefill": {},
+    "decode": {}
+  },
+  "input_sha256": {
+    "vision": [
+      "26395a6faaab51e9d1cdd2069ac28cc25bf92a1067834dcb9b362fa997bf1840",
+      "e67cb4b120fe2d39d5073a7669df2563ee3b9ba969d3134c20d2b64091797849",
+      "eb8f5a6be6990cc2b7055d38628a2bf88de4c873934d3a04899230d9e9d02509"
+    ],
+    "prefill": [
+      "244b7070ee5747de09bc044a3fea9c87a8fe17730897130aa4955e42a996354e",
+      "1c3543e670a1f83dc78662b77dc8af96de49c042252db6b1a8025e0d9510229c",
+      "107a92dd61af8ebc9c6236b7ee678e5b834cb4dffc5bd54c2b7b1d4f9b1caf00"
+    ],
+    "decode": [
+      "7acb7f923b10c1c85960368ec48514b43f89f01ce8b15e07550f5630c4d1791a",
+      "695a8c0dcde68c76de861792d21a44c677952e9772cf368c3e2e8ae04bd842c0",
+      "fe1117f74be55e0d7fbb6d53e1de1dc900b083c75031cbc40fe476c5f1643da2"
+    ]
+  }
+}

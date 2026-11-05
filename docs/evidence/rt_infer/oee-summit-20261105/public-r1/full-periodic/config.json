@@ -1,0 +1,32 @@
+{
+  "periodic_path": "/data/pr581-oee-summit-perf-20261105-r2/public-r1/full-periodic-control.bin",
+  "high_budget_ns": 38000000,
+  "persistent_io": "1",
+  "safe_args_batch": "1",
+  "mode": "pfp",
+  "scene": "full",
+  "hz": 18,
+  "duration": 90,
+  "trim": 5,
+  "priorities": {
+    "pose": 0,
+    "yolo": 3,
+    "tts": 3,
+    "vl": 3
+  },
+  "cpu": {
+    "pose": 13,
+    "yolo": 10,
+    "tts": 12,
+    "vl": 11,
+    "scheduler": 15
+  },
+  "prefetch": "on",
+  "deadline_ms": 55.55555555555556,
+  "drop_policy": "latest frame; all offered releases counted",
+  "output_policy": "host arrays in every path",
+  "correctness": "3 warmups, first/every100 completed calls and final output; native references",
+  "measurement_script_sha256": "1cee5efb94f00c1692c4fafe6f44f0606ac59f2a9449a9e0a7553a4ce81e7083",
+  "scheduler_pid": 2164,
+  "boot_id": "49cab1ff-f85e-40b7-9c58-3c9646ed475e"
+}

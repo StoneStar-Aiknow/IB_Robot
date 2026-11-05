@@ -80,6 +80,72 @@ def _ascend_node_environment(bundle_path: str, deployment: str) -> dict[str, str
     return ascend_node_environment(resolve_cann_root(next(iter(abis), None)))
 
 
+def _deployment_is_ascend(bundle_path: str, deployment: str) -> bool:
+    """Whether this TTS deployment runs on the Ascend ACL backend."""
+    from inference_manifest import load_inference_manifest
+
+    validated = load_inference_manifest(bundle_path, deployment)
+    profiles = dict(validated.deployment.role_runtime_profiles or {})
+    if not profiles and validated.deployment.runtime_profile is not None:
+        profiles = {"": validated.deployment.runtime_profile}
+    return any(profile.backend == "ascend" for profile in profiles.values())
+
+
+def _voice_tts_model_node(
+    robot_config: dict[str, Any], node_name: str, node_params: dict[str, Any], environment: dict[str, str]
+) -> Node:
+    """The ZipVoice model host, attached to RT-Infer when the robot enables it.
+
+    RT-Infer schedules whole processes at one priority each; the TTS chain
+    (text encoder + flow matching) runs inside this one model-service node,
+    so the node becomes the vendor's ``tts``-role client. Only Ascend
+    deployments are wrapped -- the CPU ONNX ZipVoice stays native, and a
+    robot without the rt_infer block keeps the plain node. Review #7: an
+    Ascend deployment on an rt_infer launch is never silently native.
+    """
+    from robot_config.rt_infer_config import RtInferConfigError, parse_rt_infer_config
+
+    try:
+        rt_infer = parse_rt_infer_config(robot_config)
+    except RtInferConfigError as exc:
+        raise ValueError(f"rt_infer configuration is invalid: {exc}") from exc
+    is_ascend = rt_infer.enable and _deployment_is_ascend(node_params["bundle_path"], node_params["deployment"])
+    if rt_infer.enable and is_ascend:
+        from inference_service.launch_builders.perception_models import write_rt_infer_snapshot
+
+        return Node(
+            package="inference_service",
+            executable="rt_infer_client",
+            sigterm_timeout=str(rt_infer.stop_timeout_sec + 1),
+            name=node_name,
+            output="screen",
+            parameters=[node_params],
+            arguments=[
+                "--role",
+                "tts",
+                "--rt-infer-config",
+                str(write_rt_infer_snapshot(robot_config)),
+                "--node-main",
+                "inference_service.model_service_node:main",
+                "--",
+            ],
+            additional_env=environment or None,
+        )
+    if rt_infer.enable and not is_ascend:
+        logger.warning(
+            "voice_tts deployment is not Ascend; the TTS host runs native alongside the RT-Infer "
+            "scheduler (no NPU contention, CPU-only path)"
+        )
+    return Node(
+        package="inference_service",
+        executable="model_service_node",
+        name=node_name,
+        output="screen",
+        parameters=[node_params],
+        additional_env=environment or None,
+    )
+
+
 def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
     """Generate the ZipVoice model host and local audio playback service."""
 
@@ -157,15 +223,11 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         speaker_pacing = {}
         speaker_qos = None
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
+    tts_node = _voice_tts_model_node(
+        robot_config, node_name, node_params, _ascend_node_environment(bundle_path, deployment)
+    )
     return [
-        Node(
-            package="inference_service",
-            executable="model_service_node",
-            name=node_name,
-            output="screen",
-            parameters=[node_params],
-            additional_env=_ascend_node_environment(bundle_path, deployment),
-        ),
+        tts_node,
         Node(
             package="voice_tts_service",
             executable="audio_playback_node",
@@ -234,4 +296,7 @@ def build_voice_tts(context: LaunchBuildContext) -> BuildResult:
 VOICE_TTS_BUILDER = BuilderSpec(
     id="voice_tts",
     factory=f"{__name__}:build_voice_tts",
+    # Topological edge to the device owner (binding only when rt_infer is
+    # enabled; dropped otherwise).
+    after=("rt_infer_scheduler",),
 )

@@ -1,0 +1,285 @@
+Starting >>> robot_config
+[0.563s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.1.1, pluggy-1.7.0 -- /tmp/IB_Robot-pr581-oee-summit/venv/bin/python3
+cachedir: /tmp/rtinfer-default-finish/build/robot_config/.pytest_cache
+rootdir: /tmp/IB_Robot-pr581-oee-summit
+configfile: pyproject.toml
+plugins: ament-pep257-0.12.15, ament-copyright-0.12.15, launch-pytest-1.0.14, ament-lint-0.12.15, ament-xmllint-0.12.15, ament-flake8-0.12.15, cov-7.1.0, colcon-core-0.21.3, hydra-core-1.3.8, platformdirs-4.12.4, repeat-0.9.4, rerunfailures-16.7, anyio-4.15.1
+collecting ... collected 1942 items / 1859 deselected / 83 selected
+
+test/test_rt_infer_bundle.py::test_resolver_finds_the_source_tree_bundle PASSED [  1%]
+test/test_rt_infer_bundle.py::test_resolver_falls_back_to_the_installed_share PASSED [  2%]
+test/test_rt_infer_bundle.py::test_resolver_refuses_incomplete_bundles PASSED [  3%]
+test/test_rt_infer_bundle.py::test_bootstrap_script_comes_from_the_bundle_itself PASSED [  4%]
+test/test_rt_infer_bundle.py::test_bootstrap_refuses_a_bundle_without_scripts PASSED [  6%]
+test/test_rt_infer_bundle.py::test_expected_toolkit_home_uses_manifest_versioned_runtime PASSED [  7%]
+test/test_rt_infer_config.py::test_absent_block_means_disabled PASSED    [  8%]
+test/test_rt_infer_config.py::test_disabled_block_still_validates_fields PASSED [  9%]
+test/test_rt_infer_config.py::test_enable_requires_bundle_version PASSED [ 10%]
+test/test_rt_infer_config.py::test_prefix_is_canonical_and_derived PASSED [ 12%]
+test/test_rt_infer_config.py::test_parse_is_pure_on_any_host PASSED      [ 13%]
+test/test_rt_infer_config.py::test_partial_role_override_keeps_every_role PASSED [ 14%]
+test/test_rt_infer_config.py::test_role_defaults_match_candidate10_profile PASSED [ 15%]
+test/test_rt_infer_config.py::test_unknown_role_rejected PASSED          [ 16%]
+test/test_rt_infer_config.py::test_role_cpu_rejects_scheduler_alias PASSED [ 18%]
+test/test_rt_infer_config.py::test_priority_out_of_scale_rejected PASSED [ 19%]
+test/test_rt_infer_config.py::test_periodic_block_validation PASSED      [ 20%]
+test/test_rt_infer_config.py::test_periodic_defaults_are_candidate10_values PASSED [ 21%]
+test/test_rt_infer_config.py::test_timeouts_reject_non_positive_and_non_finite[nan] PASSED [ 22%]
+test/test_rt_infer_config.py::test_timeouts_reject_non_positive_and_non_finite[inf] PASSED [ 24%]
+test/test_rt_infer_config.py::test_timeouts_reject_non_positive_and_non_finite[-1] PASSED [ 25%]
+test/test_rt_infer_config.py::test_timeouts_reject_non_positive_and_non_finite[0] PASSED [ 26%]
+test/test_rt_infer_config.py::test_timeouts_reject_non_positive_and_non_finite[5] PASSED [ 27%]
+test/test_rt_infer_config.py::test_timeouts_reject_non_positive_and_non_finite[True] PASSED [ 28%]
+test/test_rt_infer_config.py::test_nan_is_not_smuggled_through_int_fields PASSED [ 30%]
+test/test_rt_infer_lifecycle.py::test_two_processes_cannot_claim_even_with_corrupt_lock_header PASSED [ 31%]
+test/test_rt_infer_lifecycle.py::test_async_shutdown_keeps_launch_dispatching_and_waits_for_real_client PASSED [ 32%]
+test/test_rt_infer_lifecycle.py::test_empty_prefix_install_uses_bundle_bootstrap_and_prepares_parent PASSED [ 33%]
+test/test_rt_infer_lifecycle.py::test_manifest_backend_not_deployment_name_controls_policy_refusal PASSED [ 34%]
+test/test_rt_infer_lifecycle.py::test_no_pear_profile_does_not_create_periodic_reservation PASSED [ 36%]
+test/test_rt_infer_lifecycle.py::test_start_failure_returns_nonzero_without_starting_dependent_node PASSED [ 37%]
+test/test_rt_infer_lifecycle.py::test_no_ascend_models_never_start_owner PASSED [ 38%]
+test/test_rt_infer_lifecycle.py::test_unexpected_supervisor_exit_fails_the_real_launch[pass] PASSED [ 39%]
+test/test_rt_infer_lifecycle.py::test_unexpected_supervisor_exit_fails_the_real_launch[import os,signal; os.kill(os.getpid(),signal.SIGINT)] PASSED [ 40%]
+test/test_rt_infer_lifecycle.py::test_unexpected_supervisor_exit_fails_the_real_launch[import os,signal; os.kill(os.getpid(),signal.SIGTERM)] PASSED [ 42%]
+test/test_rt_infer_lifecycle.py::test_vendor_stop_waits_for_own_wrapper_bookkeeping PASSED [ 43%]
+test/test_rt_infer_lifecycle.py::test_stop_exit_zero_with_recovery_state_is_not_success PASSED [ 44%]
+test/test_rt_infer_scheduler_builder.py::test_disabled_config_produces_no_actions PASSED [ 45%]
+test/test_rt_infer_scheduler_builder.py::test_simulated_target_never_touches_the_device PASSED [ 46%]
+test/test_rt_infer_scheduler_builder.py::test_non_hardware_target_refuses_at_enable_time PASSED [ 48%]
+test/test_rt_infer_scheduler_builder.py::test_start_failure_aborts_launch_without_native_fallback PASSED [ 49%]
+test/test_rt_infer_scheduler_builder.py::test_non_ascend_host_aborts_before_any_cli_call PASSED [ 50%]
+test/test_rt_infer_scheduler_builder.py::test_ready_requires_a_live_scheduler_identity PASSED [ 51%]
+test/test_rt_infer_scheduler_builder.py::test_successful_start_installs_creates_mapping_then_starts PASSED [ 53%]
+test/test_rt_infer_scheduler_builder.py::test_start_carries_candidate10_profile PASSED [ 54%]
+test/test_rt_infer_scheduler_builder.py::test_foreign_scheduler_is_refused_before_owner_claim PASSED [ 55%]
+test/test_rt_infer_scheduler_builder.py::test_unproven_start_never_stops_state_and_releases_launch_lock[racing_vendor] PASSED [ 56%]
+test/test_rt_infer_scheduler_builder.py::test_unproven_start_never_stops_state_and_releases_launch_lock[foreign_after_nonzero] PASSED [ 57%]
+test/test_rt_infer_scheduler_builder.py::test_unproven_start_never_stops_state_and_releases_launch_lock[unknown_after_timeout] PASSED [ 59%]
+test/test_rt_infer_scheduler_builder.py::test_shutdown_callback_is_nonblocking_and_supervisor_drains_clients PASSED [ 60%]
+test/test_rt_infer_scheduler_builder.py::test_supervisor_never_signals_foreign_client PASSED [ 61%]
+test/test_rt_infer_scheduler_builder.py::test_teardown_timeout_retains_state_and_does_not_report_success PASSED [ 62%]
+test/test_rt_infer_scheduler_builder.py::test_supervisor_rejects_missing_corrupt_and_swapped_state PASSED [ 63%]
+test/test_rt_infer_scheduler_builder.py::test_builder_registered_in_builtin_table PASSED [ 65%]
+test/test_rt_infer_scheduler_builder.py::test_second_owner_is_refused_conservatively PASSED [ 66%]
+test/test_rt_infer_scheduler_builder.py::test_dead_lock_holder_is_reclaimed PASSED [ 67%]
+test/test_rt_infer_scheduler_builder.py::test_unmapped_ascend_service_refuses_before_any_device_work PASSED [ 68%]
+test/test_rt_infer_state_security.py::test_rt_infer_state_scan_accepts_real_process_atomic_publish[state.tmp] PASSED [ 69%]
+test/test_rt_infer_state_security.py::test_rt_infer_state_scan_accepts_real_process_atomic_publish[periodic-session.tmp] PASSED [ 71%]
+test/test_rt_infer_state_security.py::test_rt_infer_state_scan_accepts_real_process_atomic_publish[client-101.tmp] PASSED [ 72%]
+test/test_rt_infer_state_security.py::test_rt_infer_missing_state_json_is_not_a_transient_exception PASSED [ 73%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_unknown_state_entries[unrecognized.tmp] PASSED [ 74%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_unknown_state_entries[client-0.tmp] PASSED [ 75%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_unknown_state_entries[state.tmp.extra] PASSED [ 77%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_unknown_state_entries[unknown] PASSED [ 78%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_state_and_lock_symlinks[state.json] PASSED [ 79%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_state_and_lock_symlinks[state.tmp] PASSED [ 80%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_state_and_lock_symlinks[lock] PASSED [ 81%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_state_and_lock_symlinks[client-12.token] PASSED [ 83%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_world_writable_state[state.json] PASSED [ 84%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_world_writable_state[state.tmp] PASSED [ 85%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_world_writable_state[lock] PASSED [ 86%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_foreign_file_owner PASSED [ 87%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_nonregular_and_multilink_state[directory] PASSED [ 89%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_nonregular_and_multilink_state[fifo] PASSED [ 90%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_nonregular_and_multilink_state[hardlink] PASSED [ 91%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_state_directory_symlinks[root] PASSED [ 92%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_state_directory_symlinks[ancestor] PASSED [ 93%]
+test/test_rt_infer_state_security.py::test_rt_infer_rejects_world_writable_state_directory PASSED [ 95%]
+test/test_rt_infer_state_security.py::test_rt_infer_detects_lock_inode_replacement PASSED [ 96%]
+test/test_rt_infer_state_security.py::test_rt_infer_detects_state_directory_replacement PASSED [ 97%]
+test/test_rt_infer_state_security.py::test_rt_infer_second_process_cannot_acquire_live_state_lock PASSED [ 98%]
+test/test_rt_infer_state_security.py::test_rt_infer_default_control_revision_verifies_reused_binaries PASSED [100%]
+
+- generated xml file: /tmp/rtinfer-default-finish/build/robot_config/pytest.xml -
+===================== 83 passed, 1859 deselected in 4.91s ======================
+Finished <<< robot_config [6.11s]
+Starting >>> inference_service
+[6.672s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- torch_models
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+- action_dispatch
+- dataset_tools
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/torch_models
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+- /tmp/IB_Robot-pr581-oee-summit/install/action_dispatch
+- /tmp/IB_Robot-pr581-oee-summit/install/dataset_tools
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest torch_models embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description action_dispatch dataset_tools
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.1.1, pluggy-1.7.0 -- /tmp/IB_Robot-pr581-oee-summit/venv/bin/python3
+cachedir: /tmp/rtinfer-default-finish/build/inference_service/.pytest_cache
+rootdir: /tmp/IB_Robot-pr581-oee-summit/src/inference_service
+configfile: pytest.ini
+testpaths: test
+plugins: ament-pep257-0.12.15, ament-copyright-0.12.15, launch-pytest-1.0.14, ament-lint-0.12.15, ament-xmllint-0.12.15, ament-flake8-0.12.15, cov-7.1.0, colcon-core-0.21.3, hydra-core-1.3.8, platformdirs-4.12.4, repeat-0.9.4, rerunfailures-16.7, anyio-4.15.1
+collecting ... collected 974 items / 943 deselected / 31 selected
+
+test/test_rt_infer_client.py::test_child_actually_calls_the_node_main_and_passes_arguments PASSED [  3%]
+test/test_rt_infer_client.py::test_child_propagates_the_node_exit_code PASSED [  6%]
+test/test_rt_infer_client.py::test_child_preserves_real_ros_parameters_and_remapping PASSED [  9%]
+test/test_rt_infer_client.py::test_child_reports_unresolvable_module_cleanly PASSED [ 12%]
+test/test_rt_infer_client.py::test_child_rejects_malformed_entry PASSED  [ 16%]
+test/test_rt_infer_client.py::test_argv_uses_role_priority_and_cpu PASSED [ 19%]
+test/test_rt_infer_client.py::test_argv_pins_manifest_toolkit_home PASSED [ 22%]
+test/test_rt_infer_client.py::test_control_tool_and_prefix_are_canonical PASSED [ 25%]
+test/test_rt_infer_client.py::test_pear_role_carries_periodic_environment PASSED [ 29%]
+test/test_rt_infer_client.py::test_background_roles_do_not_get_pear_periodic_env PASSED [ 32%]
+test/test_rt_infer_client.py::test_list_args_prints_argv_without_executing PASSED [ 35%]
+test/test_rt_infer_client.py::test_unknown_role_rejected PASSED          [ 38%]
+test/test_rt_infer_client.py::test_corrupt_snapshot_raises_client_error PASSED [ 41%]
+test/test_rt_infer_client.py::test_wrapper_argv_spawns_importable_child_not_pasted_source PASSED [ 45%]
+test/test_rt_infer_client.py::test_real_wrapper_waits_through_parent_and_late_child_sigint PASSED [ 48%]
+test/test_rt_infer_periodic.py::test_explicit_release_metadata_is_published_unchanged PASSED [ 51%]
+test/test_rt_infer_periodic.py::test_missing_release_metadata_uses_current_monotonic_time_without_sleep PASSED [ 54%]
+test/test_rt_infer_periodic.py::test_future_owner_epoch_skips_cold_start_without_client_rearm PASSED [ 58%]
+test/test_rt_infer_periodic.py::test_client_close_does_not_disarm_and_next_client_can_publish PASSED [ 61%]
+test/test_rt_infer_periodic.py::test_sparse_and_future_off_grid_releases_are_not_rewritten PASSED [ 64%]
+test/test_rt_infer_periodic.py::test_decreasing_or_invalid_release_is_rejected PASSED [ 67%]
+test/test_rt_infer_periodic.py::test_session_identity_mismatch_fails_before_open PASSED [ 70%]
+test/test_rt_infer_periodic.py::test_missing_or_corrupt_live_state_fails_closed PASSED [ 74%]
+test/test_rt_infer_periodic.py::test_no_environment_means_native_inert PASSED [ 77%]
+test/test_rt_infer_periodic.py::test_missing_prefix_is_a_hard_error PASSED [ 80%]
+test/test_rt_infer_periodic.py::test_model_session_checks_deadline_or_cancellation_before_publish PASSED [ 83%]
+test/test_rt_infer_periodic.py::test_model_session_forwards_release_metadata_without_rewriting PASSED [ 87%]
+test/test_rt_infer_periodic.py::test_close_real_session_then_publish_from_replacement PASSED [ 90%]
+test/test_rt_infer_periodic.py::test_cancel_during_mapping_open_prevents_publication PASSED [ 93%]
+test/test_rt_infer_periodic.py::test_mapping_close_failure_still_releases_model_and_lease PASSED [ 96%]
+test/test_rt_infer_periodic.py::test_owner_waits_for_bound_readiness_then_arms_once_and_drains[unarmed] PASSED [100%]
+
+- generated xml file: /tmp/rtinfer-default-finish/build/inference_service/pytest.xml -
+====================== 31 passed, 943 deselected in 5.91s ======================
+Finished <<< inference_service [7.20s]
+Starting >>> visual_interaction
+[13.871s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- torch_models
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+- action_dispatch
+- dataset_tools
+- skill_catalog
+- model_utils
+- perception_service
+- manipulation_execution
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/torch_models
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+- /tmp/IB_Robot-pr581-oee-summit/install/action_dispatch
+- /tmp/IB_Robot-pr581-oee-summit/install/dataset_tools
+- /tmp/IB_Robot-pr581-oee-summit/install/skill_catalog
+- /tmp/IB_Robot-pr581-oee-summit/install/model_utils
+- /tmp/IB_Robot-pr581-oee-summit/install/perception_service
+- /tmp/IB_Robot-pr581-oee-summit/install/manipulation_execution
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest torch_models embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description action_dispatch dataset_tools skill_catalog model_utils perception_service manipulation_execution
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.1.1, pluggy-1.7.0 -- /tmp/IB_Robot-pr581-oee-summit/venv/bin/python3
+cachedir: /tmp/rtinfer-default-finish/build/visual_interaction/.pytest_cache
+rootdir: /tmp/IB_Robot-pr581-oee-summit
+configfile: pyproject.toml
+plugins: ament-pep257-0.12.15, ament-copyright-0.12.15, launch-pytest-1.0.14, ament-lint-0.12.15, ament-xmllint-0.12.15, ament-flake8-0.12.15, cov-7.1.0, colcon-core-0.21.3, hydra-core-1.3.8, platformdirs-4.12.4, repeat-0.9.4, rerunfailures-16.7, anyio-4.15.1
+collecting ... collected 629 items / 628 deselected / 1 selected
+
+test/test_rt_infer_launch_plan.py::test_rt_infer_plan_orders_models_after_owner_and_drops_disabled_edge PASSED [100%]
+
+- generated xml file: /tmp/rtinfer-default-finish/build/visual_interaction/pytest.xml -
+====================== 1 passed, 628 deselected in 0.68s =======================
+Finished <<< visual_interaction [1.46s]
+
+Summary: 3 packages finished [15.2s]

@@ -72,6 +72,10 @@ BUILTIN_BUILDERS: tuple[str, ...] = (
     "robot_config.launch_builders.readiness:CONTROLLER_STARTUP_BUILDER",
     # ---- Business ----
     "robot_config.launch_builders.perception:PERCEPTION_BUILDER",
+    # RT-Infer device-scheduler owner: starts the Ascend 310P software
+    # scheduler (when robot.rt_infer.enable is true) before any model-service
+    # process attaches, and stops it through the vendor CLI on shutdown.
+    "robot_config.launch_builders.rt_infer_scheduler:RT_INFER_SCHEDULER_BUILDER",
     "robot_config.launch_builders.benchmark:BENCHMARK_BUILDER",
     # perception_models moved to inference_service, semantic_mapping moved
     # to the semantic_mapping package; both register through the

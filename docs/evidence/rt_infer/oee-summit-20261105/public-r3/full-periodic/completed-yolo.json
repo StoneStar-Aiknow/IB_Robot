@@ -1,0 +1,11 @@
+{
+  "pid": 2964,
+  "numerical": true,
+  "models": {
+    "yolox": {
+      "calls": 90,
+      "drops": 0,
+      "checks": 5
+    }
+  }
+}

@@ -1,0 +1,76 @@
+{
+  "board_time": "2026-11-06T18:11:28.384161+08:00",
+  "boot_id": "41744d9c-7845-470f-9d30-4297a5294a95",
+  "status": "native_recovered",
+  "official_runtime_sha256": "94029220e9849e4c479c34f7ebf7441c0b80631dfd9301667c28af7f20979e37",
+  "doctor": {
+    "version": "2026.11.06-candidate10-controlfix",
+    "prefix": "/opt/rt-infer/2026.11.06",
+    "state": {
+      "status": "not-started-this-boot"
+    },
+    "module_loaded": false,
+    "ipc": null,
+    "device_users": [],
+    "management_device_users": [
+      1580,
+      1585,
+      1587,
+      1608,
+      1609,
+      1632
+    ],
+    "compatibility": "passed"
+  },
+  "numeric_results": {
+    "pear": {
+      "boot_id": "41744d9c-7845-470f-9d30-4297a5294a95",
+      "models": {
+        "pear": {
+          "numeric_pass": true,
+          "calls": 10,
+          "p50_ms": 23.157291,
+          "max_ms": 23.40875
+        }
+      },
+      "runtime_libraries": [
+        "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so"
+      ]
+    },
+    "tts": {
+      "boot_id": "41744d9c-7845-470f-9d30-4297a5294a95",
+      "models": {
+        "te": {
+          "numeric_pass": true,
+          "calls": 10,
+          "p50_ms": 21.191041,
+          "max_ms": 24.957213
+        },
+        "fm": {
+          "numeric_pass": true,
+          "calls": 10,
+          "p50_ms": 427.098594,
+          "max_ms": 427.982188
+        }
+      },
+      "runtime_libraries": [
+        "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so"
+      ]
+    },
+    "vl": {
+      "boot_id": "41744d9c-7845-470f-9d30-4297a5294a95",
+      "models": {
+        "vision": {
+          "numeric_pass": true,
+          "calls": 10,
+          "p50_ms": 304.906407,
+          "max_ms": 305.238933
+        }
+      },
+      "runtime_libraries": [
+        "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so"
+      ]
+    }
+  },
+  "ptp": "not modified; lock status not asserted"
+}

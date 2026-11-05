@@ -1,0 +1,196 @@
+════════════════════════════════════════════════════════════════════
+Building with mixin(s): dev
+════════════════════════════════════════════════════════════════════
+colcon.colcon_mixin.mixin WARNING Mixin 'debug' from file '/tmp/IB_Robot-pr581-oee-summit/.colcon/mixin/build.mixin.yaml' is overwriting another mixin with the same name
+colcon.colcon_mixin.mixin WARNING Mixin 'release' from file '/tmp/IB_Robot-pr581-oee-summit/.colcon/mixin/build.mixin.yaml' is overwriting another mixin with the same name
+colcon.colcon_mixin.mixin WARNING Mixin 'rel-with-deb-info' from file '/tmp/IB_Robot-pr581-oee-summit/.colcon/mixin/build.mixin.yaml' is overwriting another mixin with the same name
+[0.655s] colcon.colcon_core.package_selection WARNING Some selected packages are already built in one or more underlay workspaces:
+	'inference_service' is in: /tmp/IB_Robot-pr581-oee-summit/install/inference_service, /tmp/rtinfer-default-finish/install
+	'robot_config' is in: /tmp/IB_Robot-pr581-oee-summit/install/robot_config, /tmp/rtinfer-default-finish/install
+If a package in a merged underlay workspace is overridden and it installs headers, then all packages in the overlay must sort their include directories by workspace order. Failure to do so may result in build failures or undefined behavior at run time.
+If the overridden package is used by another package in any underlay, then the overriding package in the overlay must be API and ABI compatible or undefined behavior at run time may occur.
+
+If you understand the risks and want to override a package anyways, add the following to the command line:
+	--allow-overriding inference_service robot_config
+
+This may be promoted to an error in a future release of colcon-override-check.
+Starting >>> robot_config
+[0.665s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description
+Finished <<< robot_config [2.45s]
+Starting >>> inference_service
+[3.109s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- torch_models
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+- action_dispatch
+- dataset_tools
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/torch_models
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+- /tmp/IB_Robot-pr581-oee-summit/install/action_dispatch
+- /tmp/IB_Robot-pr581-oee-summit/install/dataset_tools
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest torch_models embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description action_dispatch dataset_tools
+Finished <<< inference_service [2.58s]
+Starting >>> voice_tts_service
+[5.696s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- torch_models
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+- action_dispatch
+- dataset_tools
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/torch_models
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+- /tmp/IB_Robot-pr581-oee-summit/install/action_dispatch
+- /tmp/IB_Robot-pr581-oee-summit/install/dataset_tools
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest torch_models embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description action_dispatch dataset_tools
+Finished <<< voice_tts_service [1.91s]
+Starting >>> visual_interaction
+[7.604s] colcon.colcon_core.shell WARNING The following packages are in the workspace but haven't been built:
+- aero_hand_hardware
+- feetech_sdk
+- ibrobot_msgs
+- ibrobot_tracing
+- inference_manifest
+- torch_models
+- embodied_common
+- sim_models
+- so101_sdk
+- tensormsg
+- lekiwi_hardware
+- observation_transport
+- robot_runtime
+- so101_hardware
+- benchmark_runtime
+- so101_description
+- lekiwi_description
+- action_dispatch
+- dataset_tools
+- skill_catalog
+- model_utils
+- perception_service
+- manipulation_execution
+They are being used from the following locations instead:
+- /tmp/IB_Robot-pr581-oee-summit/install/aero_hand_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/feetech_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_msgs
+- /tmp/IB_Robot-pr581-oee-summit/install/ibrobot_tracing
+- /tmp/IB_Robot-pr581-oee-summit/install/inference_manifest
+- /tmp/IB_Robot-pr581-oee-summit/install/torch_models
+- /tmp/IB_Robot-pr581-oee-summit/install/embodied_common
+- /tmp/IB_Robot-pr581-oee-summit/install/sim_models
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_sdk
+- /tmp/IB_Robot-pr581-oee-summit/install/tensormsg
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/observation_transport
+- /tmp/IB_Robot-pr581-oee-summit/install/robot_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_hardware
+- /tmp/IB_Robot-pr581-oee-summit/install/benchmark_runtime
+- /tmp/IB_Robot-pr581-oee-summit/install/so101_description
+- /tmp/IB_Robot-pr581-oee-summit/install/lekiwi_description
+- /tmp/IB_Robot-pr581-oee-summit/install/action_dispatch
+- /tmp/IB_Robot-pr581-oee-summit/install/dataset_tools
+- /tmp/IB_Robot-pr581-oee-summit/install/skill_catalog
+- /tmp/IB_Robot-pr581-oee-summit/install/model_utils
+- /tmp/IB_Robot-pr581-oee-summit/install/perception_service
+- /tmp/IB_Robot-pr581-oee-summit/install/manipulation_execution
+To suppress this warning ignore these packages in the workspace:
+--packages-ignore aero_hand_hardware feetech_sdk ibrobot_msgs ibrobot_tracing inference_manifest torch_models embodied_common sim_models so101_sdk tensormsg lekiwi_hardware observation_transport robot_runtime so101_hardware benchmark_runtime so101_description lekiwi_description action_dispatch dataset_tools skill_catalog model_utils perception_service manipulation_execution
+Finished <<< visual_interaction [1.83s]
+
+Build complete. Source with: source install/setup.sh

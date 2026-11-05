@@ -1,0 +1,27 @@
+{
+  "activated_ns": 1274026286205,
+  "boot_id": "8f445c1a-fa03-4c80-b0c5-fc065ac186c4",
+  "budget_ns": 38000000,
+  "control_path": "/run/ibrobot-rtinfer/periodic-control.bin",
+  "created_ns": 1239693017716,
+  "epoch_ns": 1274081813715,
+  "expected_roles": [
+    "pear",
+    "tts",
+    "vl",
+    "yolox"
+  ],
+  "launch_token": "launch-3021-1235348941723",
+  "owner": {
+    "pid": 3021,
+    "start_ticks": "123018"
+  },
+  "period_ns": 55555556,
+  "phase": "active",
+  "prefix": "/opt/rt-infer/2026.11.06",
+  "scheduler": {
+    "executable": "/opt/rt-infer/2026.11.06/bin/aicore_scheduler",
+    "pid": 3066,
+    "start_ticks": "124055"
+  }
+}
