@@ -929,6 +929,96 @@ TEST(SO101HardwareAdapter, ProtectionTimeoutRemainsConfigurable)
     std::chrono::milliseconds(2500));
 }
 
+namespace
+{
+// Activate on the simulated bus, then return the servo tuning registers each
+// motor received: {kp (21), acc (41), goal speed word (46-47)}.
+std::vector<std::array<unsigned, 3>> activated_servo_tuning(
+  const std::unordered_map<std::string, std::string> & extra)
+{
+  TempCalibFile calib;
+  auto params = extra;
+  params["simulated"] = "true";
+  params["calib_file"] = calib.path();
+  so101_hardware::SO101SystemHardware hw;
+  rclcpp_lifecycle::State unused;
+  rclcpp::init(0, nullptr);
+  std::vector<std::array<unsigned, 3>> out;
+  if (hw.on_init(make_arm_info(params)) == hardware_interface::CallbackReturn::SUCCESS &&
+    hw.on_configure(unused) == hardware_interface::CallbackReturn::SUCCESS &&
+    hw.on_activate(unused) == hardware_interface::CallbackReturn::SUCCESS)
+  {
+    // One commanded write after activation: the profile rides on every
+    // position command, not only on the activation hold.
+    for (auto & command : hw.export_command_interfaces()) {
+      command.set_value(0.1);
+    }
+    EXPECT_EQ(
+      hw.write(rclcpp::Time(0), rclcpp::Duration::from_seconds(0.01)),
+      hardware_interface::return_type::OK);
+    auto & sim = so101_hardware::SO101HardwareTestAccess::bus(hw).sim();
+    for (std::uint8_t id = 1; id <= 6; ++id) {
+      const unsigned speed = static_cast<unsigned>(sim.register_byte(id, 46)) |
+        (static_cast<unsigned>(sim.register_byte(id, 47)) << 8);
+      out.push_back({sim.register_byte(id, 21), sim.register_byte(id, 41), speed});
+    }
+    EXPECT_EQ(hw.on_shutdown(unused), hardware_interface::CallbackReturn::SUCCESS);
+  }
+  rclcpp::shutdown();
+  return out;
+}
+}  // namespace
+
+TEST(SO101HardwareAdapter, ServoTuningDefaultsAreUnchangedWhenUnset)
+{
+  const auto tuning = activated_servo_tuning({});
+  ASSERT_EQ(tuning.size(), 6U);
+  for (const auto & motor : tuning) {
+    EXPECT_EQ(motor[0], 16U);    // kp
+    EXPECT_EQ(motor[1], 50U);    // profile_acc
+    EXPECT_EQ(motor[2], 2400U);  // profile_speed
+  }
+  // Explicit empty values (xacro default) behave like absent ones.
+  const auto explicit_empty = activated_servo_tuning(
+    {{"profile_speed", ""}, {"profile_acc", "''"}, {"position_kp", ""}});
+  EXPECT_EQ(explicit_empty, tuning);
+}
+
+TEST(SO101HardwareAdapter, ServoTuningReachesEveryMotor)
+{
+  // LeRobot-like profile: no speed cap, acc 254, higher kp.
+  const auto tuning = activated_servo_tuning(
+    {{"profile_speed", "0"}, {"profile_acc", "254"}, {"position_kp", "24"}});
+  ASSERT_EQ(tuning.size(), 6U);
+  for (const auto & motor : tuning) {
+    EXPECT_EQ(motor[0], 24U);
+    EXPECT_EQ(motor[1], 254U);
+    EXPECT_EQ(motor[2], 0U);
+  }
+  // Fields are independent: only acc set keeps the other defaults.
+  for (const auto & motor : activated_servo_tuning({{"profile_acc", "0"}})) {
+    EXPECT_EQ(motor[0], 16U);
+    EXPECT_EQ(motor[1], 0U);
+    EXPECT_EQ(motor[2], 2400U);
+  }
+}
+
+TEST(SO101HardwareAdapter, InvalidServoTuningFailsClosed)
+{
+  const std::vector<std::pair<std::string, std::string>> invalid = {
+    {"profile_speed", "-1"}, {"profile_speed", "32768"}, {"profile_speed", "2400rpm"},
+    {"profile_speed", "1e3"}, {"profile_speed", " 100"}, {"profile_speed", "999999"},
+    {"profile_acc", "255"}, {"profile_acc", "-5"}, {"profile_acc", "50.0"},
+    {"position_kp", "0"}, {"position_kp", "255"}, {"position_kp", "abc"},
+  };
+  for (const auto & [key, value] : invalid) {
+    so101_hardware::SO101SystemHardware hw;
+    EXPECT_EQ(
+      hw.on_init(make_arm_info({{key, value}})),
+      hardware_interface::CallbackReturn::ERROR) << key << "=" << value;
+  }
+}
+
 TEST(SO101HardwareAdapter, InvalidProtectionConfigurationFailsClosed)
 {
   for (const auto * value : {"0", "-1", "nan", "inf", "10garbage", "1e100", "1e-100"}) {

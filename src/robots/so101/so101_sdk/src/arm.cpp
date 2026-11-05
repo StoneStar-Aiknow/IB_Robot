@@ -40,12 +40,26 @@ feetech::BusOptions make_bus_options(
     motor.homing_offset = joint_calib.homing_offset;
     motor.range_min = joint_calib.range_min;
     motor.range_max = joint_calib.range_max;
+    apply_servo_tuning(config, motor);
     options.motors.push_back(motor);
   }
   return options;
 }
 
 }  // namespace
+
+void apply_servo_tuning(const ArmConfig & config, feetech::MotorConfig & motor)
+{
+  if (config.profile_speed) {
+    motor.profile_speed = *config.profile_speed;
+  }
+  if (config.profile_acc) {
+    motor.profile_acc = *config.profile_acc;
+  }
+  if (config.position_kp) {
+    motor.kp = *config.position_kp;
+  }
+}
 
 Arm::Arm(ArmConfig config) : config_(std::move(config))
 {

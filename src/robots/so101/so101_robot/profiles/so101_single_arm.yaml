@@ -58,6 +58,14 @@ description:
 hardware:
   port: /dev/ttyACM0
   calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+  # Servo motion tuning (so101_hardware README): the LeRobot SO-101 values.
+  # Replaying the same teleop joint commands on a real arm cut the command ->
+  # measured latency from about 210 ms (driver defaults 50 / 2400 / 16) to
+  # about 167 ms with unchanged tracking error. Remove to get the defaults.
+  xacro_args:
+    profile_acc: "254"
+    profile_speed: "0"
+    position_kp: "16"
 
 ros2_control:
   controllers_config: $(find so101_hardware)/config/so101_controllers.yaml

@@ -10,6 +10,12 @@
     <!-- Escalation bound (issue #138): how long a motor protection may stay
          active before the component reports ERROR (default 1 s). -->
     <xacro:arg name="protection_timeout" default=""/>
+    <!-- Servo motion tuning (so101_hardware README). Empty keeps the driver
+         defaults: profile_speed 2400 (0 = no limit), profile_acc 50
+         (0 = no limit), position_kp 16. -->
+    <xacro:arg name="profile_speed" default=""/>
+    <xacro:arg name="profile_acc" default=""/>
+    <xacro:arg name="position_kp" default=""/>
     <!-- simulated: run the SO101 hardware plugin on the SDK simulated transport
          (no serial port, no physics) so the production controller stack runs
          headless for runtime conformance. Independent of use_sim (Gazebo/MuJoCo). -->
@@ -59,6 +65,16 @@
                 <param name="calib_file">$(arg calib_file)</param>
                 <param name="reset_positions">$(arg reset_positions)</param>
                 <param name="protection_timeout">$(arg protection_timeout)</param>
+                <!-- Emitted only when set, so the default render is unchanged. -->
+                <xacro:if value="${'$(arg profile_speed)' != ''}">
+                    <param name="profile_speed">$(arg profile_speed)</param>
+                </xacro:if>
+                <xacro:if value="${'$(arg profile_acc)' != ''}">
+                    <param name="profile_acc">$(arg profile_acc)</param>
+                </xacro:if>
+                <xacro:if value="${'$(arg position_kp)' != ''}">
+                    <param name="position_kp">$(arg position_kp)</param>
+                </xacro:if>
                 <param name="simulated">$(arg simulated)</param>
             </hardware>
         </xacro:unless>

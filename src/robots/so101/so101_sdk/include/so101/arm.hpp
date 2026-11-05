@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -46,7 +47,19 @@ struct ArmConfig
   std::map<std::string, int> motor_ids;
   /// Construct against the simulated transport (for tests).
   bool simulated = false;
+  /// Servo motion tuning applied to every motor. Unset keeps the
+  /// feetech::MotorConfig defaults (profile_speed 2400, profile_acc 50, kp 16).
+  /// profile_speed: step/s sent with every position command, 0 = no limit.
+  std::optional<std::uint16_t> profile_speed;
+  /// profile_acc: acceleration register (100 step/s^2 units), 0 = no limit.
+  std::optional<std::uint8_t> profile_acc;
+  /// position_kp: position loop P gain written at configure time.
+  std::optional<std::uint8_t> position_kp;
 };
+
+/// Copy the configured servo tuning onto one motor; unset fields keep the
+/// motor's existing (default) values.
+void apply_servo_tuning(const ArmConfig & config, feetech::MotorConfig & motor);
 
 /// One joint's SI reading.
 struct JointReading

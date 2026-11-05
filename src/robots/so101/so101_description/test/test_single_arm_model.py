@@ -102,6 +102,29 @@ def test_ros2_control_xacro_renders_for_every_platform():
     assert "camera_publish_rate" not in hardware_params
 
 
+def test_servo_tuning_args_reach_the_hardware_plugin_only_when_set():
+    """Unset tuning args leave the driver defaults (no param); set ones pass through verbatim."""
+
+    def hardware_params(mappings):
+        robot = _render(mappings)
+        return {node.get("name"): node.text or "" for node in robot.find(".//ros2_control/hardware").findall("param")}
+
+    tuning = ("profile_speed", "profile_acc", "position_kp")
+    unset = hardware_params({"use_sim": "false"})
+    assert not any(name in unset for name in tuning)
+
+    params = hardware_params({"use_sim": "false", "profile_speed": "0", "profile_acc": "254", "position_kp": "24"})
+    assert (params["profile_speed"], params["profile_acc"], params["position_kp"]) == ("0", "254", "24")
+
+    only_acc = hardware_params({"use_sim": "false", "profile_acc": "100"})
+    assert only_acc["profile_acc"] == "100"
+    assert "profile_speed" not in only_acc and "position_kp" not in only_acc
+
+    # simulation plugins never receive the servo tuning
+    sim = hardware_params({"use_sim": "true", "profile_acc": "254"})
+    assert "profile_acc" not in sim
+
+
 def _render_text(mappings):
     package = Path(__file__).resolve().parents[1]
     document = xacro.process_file(str(package / "urdf/lerobot/so101/so101.urdf.xacro"), mappings=mappings)

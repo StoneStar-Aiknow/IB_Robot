@@ -235,6 +235,10 @@ bool SimSmsSts::write_register(
     } else {
       m->goal_ticks = goal;
     }
+    // Keep the raw frame inspectable (acc / goal / speed registers).
+    for (int i = 0; i < len; ++i) {
+      m->regs[static_cast<std::uint8_t>(addr + i)] = data[i];
+    }
   } else {
     for (int i = 0; i < len; ++i) {
       m->regs[static_cast<std::uint8_t>(addr + i)] = data[i];
