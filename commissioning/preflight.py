@@ -11,6 +11,8 @@ import inference_service
 import manipulation_execution
 import robot_config
 import robot_runtime
+from manipulation_execution.launch_builders.mirror_session import generate_mirror_session_nodes
+from manipulation_execution.launch_builders.motion_imitation_stream import generate_motion_imitation_stream_nodes
 from robot_config.interface_binding import bind_robot_interfaces
 from robot_config.loader import load_robot_config_dict, validate_robot_config_dict
 from robot_runtime.interface_description import build_description
@@ -25,7 +27,15 @@ for module in (aimdk_grasp, aimdk_robot, inference_service, manipulation_executi
     print(f"IMPORT {module.__name__} {path}", flush=True)
 profile = load_profile(str(root / "src/robots/aimdk/aimdk_robot/profiles/x2_ultra_omnihand.yaml"))
 results = []
-for name in ("hz_voice_apple_dryrun", "hz_voice_apple_live", "hz_voice_apple_smoke", "hz_site_dryrun", "hz_site_live"):
+for name in (
+    "hz_voice_apple_dryrun",
+    "hz_voice_apple_live",
+    "hz_voice_apple_smoke",
+    "hz_site_dryrun",
+    "hz_site_live",
+    "hz_site_mirror_preview",
+    "hz_site_mirror_live",
+):
     path = root / "commissioning/robots" / f"{name}.yaml"
     config = load_robot_config_dict(path, defer_interface_binding=True)
     config = bind_robot_interfaces(config, build_description(profile, use_sim=name.endswith("smoke")))
@@ -33,9 +43,22 @@ for name in ("hz_voice_apple_dryrun", "hz_voice_apple_live", "hz_voice_apple_smo
     if errors:
         raise RuntimeError(f"invalid {name}: {errors}")
     if name.startswith("hz_site_"):
+        mirror_enabled = name.startswith("hz_site_mirror_")
         for section in ("mirror_session", "motion_imitation_stream", "visual_interaction"):
-            if config.get(section, {}).get("enabled"):
-                raise RuntimeError(f"unexpected active {section}")
+            expected_enabled = mirror_enabled and section != "visual_interaction"
+            if bool(config.get(section, {}).get("enabled")) != expected_enabled:
+                raise RuntimeError(f"unexpected {section} enablement")
+        if mirror_enabled:
+            expected_live = name == "hz_site_mirror_live"
+            if (
+                config["mirror_session"]["publish_enabled"] != expected_live
+                or config["embodied"]["agent"]["execution_enabled"] != expected_live
+            ):
+                raise RuntimeError("mirror execution and publication must match the selected preview/live profile")
+            if config["control_modes"]["model_inference"]["runtime_mode"] != "policy_stream":
+                raise RuntimeError("mirror must share policy_stream")
+            generate_mirror_session_nodes(config)
+            generate_motion_imitation_stream_nodes(config)
         if config["embodied"]["agent"]["voice_bridge"]["confirm_mode"] != "voice_confirm":
             raise RuntimeError("site profile must require voice confirmation")
         if config["voice_asr"]["input_mode"] != "external_vad":
@@ -58,6 +81,8 @@ for name in ("hz_voice_apple_dryrun", "hz_voice_apple_live", "hz_voice_apple_smo
         if name.startswith("hz_site_")
         else ["pick_object"]
     )
+    if name.startswith("hz_site_mirror_"):
+        expected = sorted([*expected, "mirror_start", "mirror_stop"])
     if skills != expected:
         raise RuntimeError(f"unexpected skill catalog: {skills}")
     if name.startswith("hz_site_") and "pick_object" not in catalog.planner_visible_skill_names:

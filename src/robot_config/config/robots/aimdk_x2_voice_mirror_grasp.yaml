@@ -1,22 +1,12 @@
-# AgiBot X2: the voice + gesture + mirror deployment, with the grasp pipeline
-# declared and switched off.
+# AgiBot X2: the voice + gesture + mirror deployment with grasp enabled.
 #
-# Layered on aimdk_x2_voice_mirror_all so the voice agent, the five preset
-# gestures and the mirror behave exactly as they do there. What this profile
-# adds is the third control mode the grasp skills require, the three perception
-# services the grasp pipeline consumes, and the delegated executor that drives
-# the Orin's grasp head.
+# Layered on aimdk_x2_voice_mirror_all for the voice agent, gestures, and mirror.
+# This profile maps gestures, grasp, and mirror to the shared policy_stream and
+# enables the perception services and delegated executor required by grasp.
 #
-# Everything grasp-related is declared `enabled: false` on purpose:
-#   - the three model bundles are not present on a machine that has never run
-#     the grasp deployment, and the loader validates each bundle's manifest,
-#     digest and deployment, so a placeholder cannot stand in for a real one;
-#   - the grasp head runs on the Orin (10.0.1.41), which is not part of this
-#     stack;
-#   - a pick needs the platform in URS, the left arm at HOME and the left hand
-#     open, none of which the voice/mirror flow guarantees.
-# Declaring them now keeps the wiring reviewable, and turning the feature on is
-# the edit list at the bottom of this file.
+# This profile requires the three grasp model bundles on the 310P and the grasp
+# head on the Orin. Keep the models, Orin head, and robot preparation available
+# whenever this configuration is launched.
 robot:
   base_config: aimdk_x2_voice_mirror_all.yaml
   name: aimdk_x2_voice_mirror_grasp
@@ -30,10 +20,17 @@ robot:
     - moveit_planning
 
   control_modes:
+    # Gestures, grasp, and mirror share the vendor's upper-body stream so
+    # sequential skills do not switch between incompatible vendor modes.
+    named_motion:
+      runtime_mode: policy_stream
+      inference:
+        enabled: false
+      executor:
+        enabled: false
     # Copied from aimdk_x2_grasp.yaml. The grasp pipeline streams the left arm
-    # and hand itself, so the executor stays off; policy_stream is the same
-    # vendor mode (UPPERBODY_REMOTE_SPLIT) the mirror uses, which is why the two
-    # features cannot stream at once.
+    # and hand through its delegated executor, so the control-mode executor stays
+    # off. Grasp and mirror both use policy_stream and must not run concurrently.
     moveit_planning:
       description: "Grasp pipeline streams the left arm and hand"
       description_cn: "抓取流水线流式控制左臂和左手"
@@ -50,10 +47,10 @@ robot:
       __append__:
         # GroundingDINO returns boxes for a text prompt; SAM2 turns each box into
         # a mask; GraspGen-X proposes grasps on the masked cloud. All three are
-        # required by the pipeline and none of them by the voice/mirror flow.
+        # required by the always-enabled grasp pipeline.
         - id: grasp_grounding
-          enabled: false
-          required: false
+          enabled: true
+          required: true
           bundle_path: models/grounding_dino_swint_seq8_1280x720
           deployment: ascend_310p
           adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
@@ -63,8 +60,8 @@ robot:
           runtime_options:
             device_id: 0
         - id: grasp_segmentation
-          enabled: false
-          required: false
+          enabled: true
+          required: true
           bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
           deployment: ascend_310p
           adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
@@ -74,8 +71,8 @@ robot:
           runtime_options:
             device_id: 0
         - id: grasp_generation
-          enabled: false
-          required: false
+          enabled: true
+          required: true
           bundle_path: models/graspgenx_omnihand_left_x2
           # torch_npu, unlike the two above: the compiled 400-grasp diffusion
           # loop runs on the NPU and its gripper description is what the planner
@@ -87,7 +84,7 @@ robot:
           node_name: grasp_generate_grasps
 
   grasp_execution:
-    enabled: false
+    enabled: true
     action_name: /manipulation/execute_pick
     # Only compressed captures, masks, candidates, plans and the watch's status
     # cross to the Orin; the vendor forbids subscribing raw camera streams
@@ -112,13 +109,10 @@ robot:
       watch_frame_timeout_s: 1.0
 
   embodied:
-    # Stays aimdk_x2_all while grasping is off: pick_object needs the delegated
-    # executor that grasp_execution registers, so a catalog naming it now would
-    # fail to compile. Switch both together (see below).
-    skill_catalog_profile: aimdk_x2_all
+    # The profile exposes pick_object together with the delegated executor
+    # registered by grasp_execution above.
+    skill_catalog_profile: aimdk_x2_voice_mirror_grasp
     agent:
-      # pick_object is NOT here yet for the same reason: an allowlist entry the
-      # compiled catalog does not contain is rejected at startup.
       test_allowlist:
         - wave_hand
         - handshake
@@ -128,24 +122,27 @@ robot:
         - mirror_start
         - mirror_stop
         - self_introduction
+        - pick_object
+    runtime_play_audio:
+      clips:
+        self_intro: "$(env WORKSPACE)/commissioning/audio/self_introduction.wav"
 
-# Enabling the grasp pipeline (all four together, in this order):
-#
-#   1. Bundles on this host: models/grounding_dino_swint_seq8_1280x720,
-#      models/sam2.1_hiera_tiny_prompt_ascend, models/graspgenx_omnihand_left_x2
-#      (scripts/download_models.py covers the first two; the third is packaged
-#      with perception_service.package_graspgenx_torch_bundle and must be the
-#      same bundle the Orin uses).
-#   2. The three perception_services above: enabled: true, required: true.
-#   3. grasp_execution.enabled: true.
-#   4. embodied.skill_catalog_profile: aimdk_x2_voice_mirror_grasp and add
-#      pick_object to embodied.agent.test_allowlist.
-#
-# Before the first request: platform in URS, left arm at HOME (shoulder pitch
-# 0.4 rad, elbow -1.2 rad, everything else 0), left hand open. A half-closed
+  # The Agent owns spoken interaction and starts/stops mirror rounds, avoiding
+  # duplicate speech or physical operator events during the same session.
+  mirror_session:
+    voice:
+      enabled: false
+    operator:
+      enabled: false
+      send_enabled: false
+
+# Runtime prerequisites for pick_object: the model bundles configured above
+# must be installed on the 310P, and the matching grasp head must run on the
+# Orin. Before each request, put the platform in URS, the left arm at HOME
+# (shoulder pitch 0.4 rad, elbow -1.2 rad, everything else 0), left hand open.
+# A half-closed
 # left hand rebuilds the cuRobo planner on the Orin (~50 s) and the request
 # times out.
 #
-# While a pick runs the mirror cannot: both need policy_stream. The mode switch
-# enforces that, so a mirror round started during a pick is refused rather than
-# two producers fighting over the same joints.
+# Stop the mirror session before a pick. Both skills use policy_stream, so
+# mode switching alone does not arbitrate concurrent arm commands.

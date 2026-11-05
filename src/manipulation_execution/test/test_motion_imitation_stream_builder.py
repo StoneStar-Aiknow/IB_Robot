@@ -29,7 +29,7 @@ from inference_service.launch_builders.perception_models import generate_percept
 from manipulation_execution.launch_builders.motion_imitation_stream import (
     generate_motion_imitation_stream_nodes,
 )
-from robot_config.loader import load_robot_config_dict
+from robot_config.loader import load_robot_config_dict, resolve_robot_config_path
 
 CONFIG = Path(get_package_share_directory("robot_config")) / "config/robots/aimdk_x2_magicmirror.yaml"
 BASE_CONFIG = Path(get_package_share_directory("robot_config")) / "config/robots/aimdk_x2.yaml"

@@ -68,11 +68,22 @@ source_profile = yaml.safe_load(
 source_profile.update({"name": "hz_site_no_mirror", "robot_name": "aimdk_x2_grasp"})
 source_profile["enabled_skills"] = [item for item in source_profile["enabled_skills"] if item["name"] in site_skills]
 (catalog / "profiles/hz_site_no_mirror.yaml").write_text(yaml.safe_dump(source_profile, sort_keys=False))
+mirror_skills = [*site_skills, "mirror_start", "mirror_stop"]
+mirror_profile = yaml.safe_load(
+    (root / "src/agent/skill_catalog/config/profiles/aimdk_x2_voice_mirror_grasp.yaml").read_text()
+)
+mirror_profile.update({"name": "hz_site_mirror", "robot_name": "aimdk_x2_grasp"})
+(catalog / "profiles/hz_site_mirror.yaml").write_text(yaml.safe_dump(mirror_profile, sort_keys=False))
 voice_reference = yaml.safe_load((robots / "aimdk_x2_voice_mirror_all.yaml").read_text())["robot"]
 reference = yaml.safe_load((robots / "aimdk_x2_grasp_310p_agent.yaml").read_text())["robot"]
 grasp = yaml.safe_load((robots / "aimdk_x2_grasp.yaml").read_text())["robot"]
 models = yaml.safe_load((robots / "aimdk_x2_grasp_310p.yaml").read_text())["robot"]["perception_services"]
-for name, enabled in [("hz_site_dryrun", False), ("hz_site_live", True)]:
+for name, enabled in [
+    ("hz_site_dryrun", False),
+    ("hz_site_live", True),
+    ("hz_site_mirror_preview", False),
+    ("hz_site_mirror_live", True),
+]:
     config = copy.deepcopy(base)
     config.update(
         {
@@ -140,6 +151,21 @@ for name, enabled in [("hz_site_dryrun", False), ("hz_site_live", True)]:
     agent["test_allowlist"] = site_skills
     agent["voice_bridge"]["silent_skills"] = ["self_introduction"]
     agent["voice_bridge"]["confirm_mode"] = "voice_confirm"
+    if name.startswith("hz_site_mirror_"):
+        # Opt-in mirror profiles retain all seven existing skills. Only the
+        # explicitly selected live profile publishes physical arm commands.
+        config["default_control_mode"] = "model_inference"
+        config["skill_required_control_mode"] = "model_inference"
+        config["skill_supported_control_modes"].append("model_inference")
+        config["motion_imitation_stream"] = {"enabled": True}
+        config["mirror_session"].update({"enabled": True, "control_mode": "model_inference"})
+        config["mirror_session"]["publish_enabled"] = enabled
+        mirror_models = yaml.safe_load((robots / "aimdk_x2_magicmirror.yaml").read_text())["robot"][
+            "perception_services"
+        ]["services"]
+        config["perception_services"]["services"] = copy.deepcopy(mirror_models) + copy.deepcopy(models["services"])
+        embodied["skill_catalog_profile"] = "hz_site_mirror"
+        agent["test_allowlist"] = mirror_skills
     site_state = stage / "site_state" / name
     site_state.mkdir(parents=True, exist_ok=True)
     embodied["execution_store_path"] = str(site_state / "executions.sqlite3")
@@ -162,6 +188,8 @@ print(
                 "hz_grasp_head",
                 "hz_site_dryrun",
                 "hz_site_live",
+                "hz_site_mirror_preview",
+                "hz_site_mirror_live",
             ],
             "models": "reused",
             "site_skill_allowlist": site_skills,

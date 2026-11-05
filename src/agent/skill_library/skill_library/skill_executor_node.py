@@ -1038,6 +1038,23 @@ class SkillExecutorNode(Node):
             if self._mirror_session_enabled
             else None
         )
+        self._mirror_session_state_lock = RLock()
+        self._mirror_session_state = None
+        self._mirror_session_start_latched = False
+        self._mirror_session_seen_holding = False
+        self._mirror_session_state_sub = (
+            self.create_subscription(
+                String,
+                MIRROR_SESSION.STATE_TOPIC,
+                self._on_mirror_session_state,
+                QoSProfile(
+                    depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+                ),
+                callback_group=callback_group,
+            )
+            if self._mirror_session_enabled
+            else None
+        )
         self._play_audio_client = (
             self.create_client(PlayAudioFile, self._play_audio_service, callback_group=callback_group)
             if self._play_audio_enabled
@@ -2354,7 +2371,7 @@ class SkillExecutorNode(Node):
         effective_timeout_sec: float | None = None,
         left_idle: bool = False,
     ):
-        """Start or stop the mirror session; the Gateway does not track it past the reply.
+        """Start or stop the persistent mirror session.
 
         The session answers start once it holds the runtime mode, and stop once
         it has observed the runtime back in idle. ``left_idle`` says admission
@@ -2387,6 +2404,12 @@ class SkillExecutorNode(Node):
                 give_back=True,
             )
 
+        if start and getattr(self, "_mirror_session_enabled", False):
+            # Latch before dispatch: the service reply can beat the state-topic
+            # callback, and a timeout does not prove that takeover never happened.
+            with self._mirror_session_state_lock:
+                self._mirror_session_start_latched = True
+                self._mirror_session_seen_holding = False
         future = client.call_async(SetBool.Request(data=MIRROR_SESSION_COMMANDS[command]))
         if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
             return self._fail_mirror_session(
@@ -2416,7 +2439,48 @@ class SkillExecutorNode(Node):
                 message or f"{skill_name} failed",
                 give_back=start and left_idle,
             )
+        if not start and getattr(self, "_mirror_session_enabled", False) and self._runtime_idle_for_admission():
+            with self._mirror_session_state_lock:
+                self._mirror_session_start_latched = False
         return self._succeed_mirror_session(result, goal_handle, skill_name, response.message)
+
+    def _on_mirror_session_state(self, message: String) -> None:
+        try:
+            state = json.loads(message.data)
+            if (
+                not isinstance(state, dict)
+                or state.get("state") not in MIRROR_SESSION.STATES
+                or type(state.get("holding")) is not bool
+                or type(state.get("releasing")) is not bool
+                or isinstance(state.get("stamp"), bool)
+                or not math.isfinite(float(state["stamp"]))
+            ):
+                raise ValueError("invalid mirror session state")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            state = None
+        with self._mirror_session_state_lock:
+            self._mirror_session_state = state
+            if state is not None and state["holding"] and self._mirror_session_start_latched:
+                self._mirror_session_seen_holding = True
+
+    def _mirror_session_allows_skill(self, skill_name: str) -> tuple[bool, str]:
+        """Mode equality alone cannot arbitrate a session that outlives its start action."""
+        if not getattr(self, "_mirror_session_enabled", False):
+            return True, ""
+        if self._active_mirror_session_command(skill_name):
+            return True, ""
+        with self._mirror_session_state_lock:
+            state = self._mirror_session_state
+            now = self.get_clock().now().nanoseconds / 1e9
+            if state is None or not 0 <= now - float(state["stamp"]) <= MIRROR_SESSION.STATE_STALE_SEC:
+                return False, "mirror session state is unknown or stale; stop mirror before other skills"
+            if state["state"] != MIRROR_SESSION.STATE_WAIT or state["holding"] or state["releasing"]:
+                return False, "mirror session owns the arms; execute mirror_stop before other skills"
+            if self._mirror_session_start_latched:
+                if not self._mirror_session_seen_holding or not self._runtime_idle_for_admission():
+                    return False, "mirror takeover or release is unconfirmed; execute mirror_stop first"
+                self._mirror_session_start_latched = False
+        return True, ""
 
     def _publish_asr_control(self, command: str) -> None:
         """Mute (stop) or restore (start) the ASR while a recorded clip plays."""
@@ -2471,20 +2535,14 @@ class SkillExecutorNode(Node):
         self._publish_asr_control("stop")
         try:
             future = client.call_async(PlayAudioFile.Request(file_path=path))
-            if not self._wait_for_future(
-                future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested
-            ):
+            if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
                 if goal_handle.is_cancel_requested:
                     return self._cancel_skill(result, goal_handle, [], skill_name)
-                return self._abort_skill(
-                    result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out"
-                )
+                return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out")
             try:
                 response = future.result()
             except Exception as exc:
-                return self._abort_skill(
-                    result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}"
-                )
+                return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}")
             if response is None or not response.success:
                 code = str(getattr(response, "error_code", "") or "PLAY_AUDIO_FAILED")
                 message = str(getattr(response, "message", "") or f"{skill_name} failed")
@@ -3754,6 +3812,9 @@ class SkillExecutorNode(Node):
 
     def _ensure_skill_control_mode(self, skill_name: str, goal_handle) -> tuple[bool, str]:
         """Verify ownership before dispatch, using only the explicitly selected path."""
+        mirror_ready, mirror_reason = self._mirror_session_allows_skill(skill_name)
+        if not mirror_ready:
+            return False, mirror_reason
         if getattr(self, "_runtime_enabled", False):
             with self._motion_mode_switch_lock:
                 if goal_handle is not None and goal_handle.is_cancel_requested:
@@ -6694,7 +6755,11 @@ class SkillExecutorNode(Node):
         # what takes the runtime out of idle, so a failed start knows the mode
         # is the Gateway's to give back.
         mirror_command = self._active_mirror_session_command(goal.skill_name)
-        if mirror_command == "stop" and self._runtime_idle_for_admission():
+        if (
+            mirror_command == "stop"
+            and not getattr(self, "_mirror_session_start_latched", False)
+            and self._runtime_idle_for_admission()
+        ):
             return self._succeed_mirror_session(
                 result, goal_handle, goal.skill_name, "runtime already idle", called=False
             )
