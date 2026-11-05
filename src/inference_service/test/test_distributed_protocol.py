@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from inference_manifest import load_inference_manifest
 from inference_service.backends import BackendCancellationError
@@ -35,9 +36,10 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
 )
-from inference_service.distributed.service import align_inputs_to_selection
+from inference_service.distributed.service import align_inputs_to_selection, normalize_action_dtype
 from inference_service.distributed.types import PROTOCOL_VERSION, structured_error_from_exception
 from inference_service.pipeline import PipelineState
+from tensormsg import TensorMsgConverter
 from test.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
 
@@ -1136,3 +1138,77 @@ def test_distributed_session_guard_fails_fast_when_session_is_down():
     host._config = SimpleNamespace(execution_mode="monolithic")
     host._require_edge_session = lambda: (_ for _ in ()).throw(AssertionError("session must not be touched"))
     PipelinePolicyNode._ensure_distributed_session_ready(host)
+
+
+def test_normalize_action_dtype_widens_fp16_to_float32():
+    action = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16)
+
+    normalized = normalize_action_dtype(action)
+
+    assert normalized.dtype == torch.float32
+    torch.testing.assert_close(normalized, action.to(torch.float32))
+
+
+def test_normalize_action_dtype_widens_bfloat16_and_keeps_float32_identity():
+    bfloat16_action = torch.tensor([0.5, -1.5], dtype=torch.bfloat16)
+    float32_action = torch.tensor([0.5, -1.5], dtype=torch.float32)
+
+    assert normalize_action_dtype(bfloat16_action).dtype == torch.float32
+    assert normalize_action_dtype(float32_action) is float32_action
+
+
+def test_normalize_action_dtype_passthrough_none_and_plain_objects():
+    assert normalize_action_dtype(None) is None
+    payload = [1, 2, 3]
+    assert normalize_action_dtype(payload) is payload
+
+
+def test_fp16_action_chunk_serializes_after_normalization():
+    # Regression coverage for issue #235: the cloud result encode used to fail
+    # with "Unsupported dtype torch.float16" for RKNN action chunks because
+    # the distributed result skipped the fp32 normalization that the
+    # monolithic path applies before TensorMsgConverter.to_variant.
+    action = torch.arange(600, dtype=torch.float16).reshape(100, 6)
+
+    message = TensorMsgConverter.to_variant({"action": normalize_action_dtype(action)})
+
+    decoded = TensorMsgConverter.from_variant(message)
+    assert decoded["action"].dtype == torch.float32
+    torch.testing.assert_close(decoded["action"], action.to(torch.float32))
+
+
+def test_cloud_handle_round_trips_fp16_action_as_float32(tmp_path):
+    # Handle-level regression for issue #235: the dtype normalization must be
+    # proven on the DistributedCloudService.handle call site itself, so a
+    # reverted call site cannot pass while the helper-only test still does.
+    identity = _identity(tmp_path / "bundle")
+    expected = torch.arange(12, dtype=torch.float16).reshape(2, 6)
+
+    class Runtime:
+        capabilities = SimpleNamespace(resettable=True, stateful=True, supports_cancellation=False)
+
+        def infer(self, _request_id, _inputs, *, prompt=None, deadline=None):
+            return SimpleNamespace(action=expected.clone(), actual_chunk_size=2, backend_latency_ms=1.0)
+
+        @staticmethod
+        def health():
+            return SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+
+    service = DistributedCloudService(identity, Runtime())
+    edge = EdgeSession(identity)
+    edge.start()
+    edge.observe_cloud(service.observe_edge(edge.local_status()))
+    request = edge.prepare_request(
+        Operation.INFER,
+        "fp16-handle-request",
+        inputs={},
+        deadline=datetime.now(timezone.utc) + timedelta(seconds=5),
+    )
+
+    result = service.handle(request)
+
+    assert result.success
+    assert result.action.dtype == torch.float32
+    decoded = result_from_message(result_to_message(result))
+    assert decoded.action.dtype == torch.float32
+    torch.testing.assert_close(decoded.action, expected.to(torch.float32))
