@@ -51,6 +51,12 @@ def main():
     status = json.loads(subprocess.check_output(ctl + ["status"], text=True))
     if status.get("device_users") or status.get("status") == "running":
         raise RuntimeError("Device or scheduler is busy; coordinate an idle test window")
+    # Check the same worker imports before taking ownership of the device.
+    subprocess.run(
+        [sys.executable, "-c", "from baseline import OM, InferSession, np"],
+        cwd=Path(__file__).resolve().parent,
+        check=True,
+    )
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     environment = {
