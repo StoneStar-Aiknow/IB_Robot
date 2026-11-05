@@ -8,9 +8,9 @@ from typing import Any
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
-from skill_catalog.source import resolve_development_source_root
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
+from embodied_common import pose_composer_contract as POSE_COMPOSER
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
@@ -28,6 +28,7 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
 from robot_config.voice_contract import SPEAKER_EMBEDDING_OUTPUT_TOPIC, VOICE_TRANSCRIPT_TOPIC
 from robot_runtime import contract as RUNTIME
+from skill_catalog.source import resolve_development_source_root
 
 logger = get_colored_logger("embodied_bringup")
 
@@ -404,6 +405,10 @@ def generate_embodied_nodes(
             runtime_play_audio_clips_json=json.dumps(clips),
             asr_control_topic=str(play_audio.get("asr_control_topic", "/voice_control")),
         )
+    pose_composer = robot_config.get("pose_composer", {})
+    if isinstance(pose_composer, dict) and pose_composer.get("enabled") is True:
+        # Arm poses composed from a description; pose_composer's own builder launches the node.
+        common_params.update(pose_composer_enabled=True, pose_composer_action=POSE_COMPOSER.EXECUTE_ACTION)
     if arm_surface:
         common_params.update(
             move_configuration_service=public_endpoint(
@@ -660,6 +665,10 @@ def generate_embodied_nodes(
                             "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
                         ),
                         "gateway_caller_token": agent_config.get("caller_token", ""),
+                        # Compose arm poses while the plan is prepared, so the presented pose is the one run.
+                        "pose_compose_service": POSE_COMPOSER.COMPOSE_SERVICE
+                        if common_params.get("pose_composer_enabled")
+                        else "",
                     }
                 ],
             )

@@ -39,6 +39,7 @@ from ibrobot_agent.contracts import (
     PlannerIdentity,
     PlannerOutcome,
     PlanProposal,
+    PosePreviewPort,
     PresentationPort,
     RegistryIdentity,
     RequestKey,
@@ -175,6 +176,8 @@ class AgentService:
         max_planning_workers: int = 1,
         robot_scope: str = "so101_single_arm",
         direct_commands: Mapping[str, str] | None = None,
+        pose_preview: PosePreviewPort | None = None,
+        pose_skills: frozenset[str] = frozenset({"free_pose"}),
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -191,6 +194,11 @@ class AgentService:
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
+        # Arm poses described in words are composed before the plan is presented,
+        # so the user confirms the pose that will run, and an unreachable or
+        # unsafe one is answered without preparing anything.
+        self._pose_preview = pose_preview
+        self._pose_skills = frozenset(pose_skills)
         # A shortcut is not the model's decision, so a proposal it produced
         # must not be recorded under the model's identity.
         self._direct_identity = PlannerIdentity(
@@ -501,6 +509,11 @@ class AgentService:
             self._validate_workflow(outcome, catalog)
             outcome = self._bind_step_schema_versions(outcome, catalog)
             outcome = self._bind_summary_to_catalog_names(outcome, catalog)
+            if not self._preview_pose(key, record.planning_generation, request, outcome):
+                return
+            if cancel_token.is_set():
+                self._finish_cancel_before_execution(key, record.planning_generation)
+                return
             identity = RegistryIdentity(
                 epoch=str(status["registry_epoch"]),
                 generation=int(status["registry_generation"]),
@@ -585,6 +598,44 @@ class AgentService:
                 self._active.pop(key, None)
             with self._queue_condition:
                 self._queued_or_active.discard(key)
+
+    def _preview_pose(self, key: RequestKey, generation: int, request: AgentRequest, outcome: PlannerOutcome) -> bool:
+        """Compose the plan's leading pose step now; False when the request was answered instead.
+
+        Only a pose that is the first step can be composed from the arm pose
+        measured now; a later one depends on the steps before it and is composed
+        when it runs (the executor says so in its result).
+        """
+        if self._pose_preview is None or not outcome.steps or outcome.steps[0].skill_name not in self._pose_skills:
+            return True
+        text = str(outcome.steps[0].target_name or "").strip()
+        with trace_stage(_trace, "agent.pose_preview", request_id=request.request_id):
+            composed = dict(self._pose_preview.compose(text))
+        detail = {
+            "text": text,
+            "kind": str(composed.get("kind", "")),
+            "composition_id": str(composed.get("composition_id", "")),
+            "description": _json_or_text(composed.get("description_json", "")),
+            "duration_sec": round(float(composed.get("duration_sec", 0.0) or 0.0), 2),
+            "approximate": bool(composed.get("approximate", False)),
+            "error_code": str(composed.get("error_code", "")),
+        }
+        spoken = str(composed.get("user_message", "")).strip()
+        if not composed.get("success"):
+            message = f"这个姿势现在做不了：{composed.get('message') or composed.get('error_code')}"
+            self._conversation.append_assistant(request, message)
+            self._finish_answered(
+                key, generation, message, error_code=str(composed.get("error_code") or "POSE_FAILED"),
+                event_type="pose_refused",
+            )  # fmt: skip
+            return False
+        if detail["kind"] in ("rejected", "no_motion"):
+            message = spoken or "这个姿势我不做。"
+            self._conversation.append_assistant(request, message)
+            self._finish_answered(key, generation, message, event_type="pose_refused")
+            return False
+        self._emit(key, "pose_preview", "PLANNING", spoken or text, detail=detail)
+        return True
 
     def _resolve_continuation(self, request: AgentRequest) -> ContinuationDecision:
         """Read both ledgers for "继续"; any read failure refuses instead of guessing."""
@@ -925,6 +976,13 @@ class AgentService:
                 # The ledger is authoritative; a broken transport must not reopen
                 # the request through the outer failure handler.
                 _LOGGER.exception("Could not publish Agent event for %s", key.request_id)
+
+
+def _json_or_text(value: Any) -> Any:
+    try:
+        return json.loads(value) if isinstance(value, str) and value else value
+    except ValueError:
+        return value
 
 
 def _ledger_replay_outcome(steps) -> PlannerOutcome:

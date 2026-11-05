@@ -1,0 +1,59 @@
+schema_version: 1
+name: free_pose
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Hold the arms in a pose the user describes in their own words, such as both arms straight forward, both hands over the head, a bent-arm pose, hands on hips or a hand on the head.
+  category: body_pose
+  when_to_use:
+  - the user asks for an arm pose or posture by describing it (straight, raised, bent, spread, on the hips, on the head, at the chin)
+  - the user adjusts the current arm pose (higher, lower, the other arm too, put one arm down)
+  - the user asks to put the arms down or back
+  do_not_use:
+  - condition: wave hello or goodbye
+    instead_use: wave_hand
+  - condition: shake hands
+    instead_use: handshake
+  - condition: applaud or clap
+    instead_use: clap_hands
+  - condition: blow a kiss
+    instead_use: blow_kiss
+  aliases_zh:
+  - 摆个姿势
+  - 手伸直
+  - 双手举起来
+  - 手放下
+  - 弯曲手臂
+  - 叉腰
+  aliases_en:
+  - strike a pose
+  - arms straight
+  - arms up
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  # Typical in simulation: 3-8 s of motion after composition.
+  duration_sec_estimate: 8.0
+  requires_motion_params: true
+capability:
+  schema_version: 1
+  summary: Move both arms to the pose target_name describes. Put the user's own words for the pose in target_name, unchanged and complete (for example 「双手向前伸直」), including relative wording such as 「再抬高一点」.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      target_name:
+        type: string
+        freeform: true
+    required:
+    - target_name
+  # The composer reports unreachable poses instead of retrying with another one.
+  recovery_policy: never_retry
+  required_capabilities:
+  - joint.trajectory
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

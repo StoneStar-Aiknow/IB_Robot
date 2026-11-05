@@ -620,3 +620,48 @@ def test_validate_release_skill_requires_place_name():
     )
     assert allowed
     assert reason == ""
+
+
+def _pose_composer_templates():
+    return {
+        "free_pose": {
+            "executor": "pose_composer",
+            "required_args": ["target_name"],
+            "capability": {"schema_version": 1},
+        }
+    }
+
+
+def _pose_request(**overrides):
+    request = {
+        "skill_name": "free_pose",
+        "target_name": "双手向前伸直",
+        "place_name": "",
+        "motion_direction": "",
+        "motion_distance": 0.0,
+        "named_poses": {},
+        "named_targets": {},
+        "skill_templates": _pose_composer_templates(),
+        "schema_version": 1,
+    }
+    request.update(overrides)
+    return validate_skill_request(**request)
+
+
+def test_validate_pose_composer_accepts_a_description():
+    assert _pose_request() == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "rejected"),
+    [
+        ({"target_name": "  "}, "target_name is required"),
+        ({"target_name": "举" * 201}, "target_name is longer than 200 characters"),
+        ({"direction": "forward", "distance": 0.5}, "direction, distance not accepted by free_pose"),
+        ({"x": 1.0}, "x not accepted by free_pose"),
+        ({"arm_side": "left"}, "arm_side is not accepted by free_pose"),
+        ({"motion_direction": "up"}, "motion parameters are not accepted by free_pose"),
+    ],
+)
+def test_validate_pose_composer_rejects_anything_but_a_description(overrides, rejected):
+    assert _pose_request(**overrides) == (False, rejected)

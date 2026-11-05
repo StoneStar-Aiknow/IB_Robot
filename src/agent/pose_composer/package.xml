@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>pose_composer</name>
+  <version>0.1.0</version>
+  <description>Natural-language arm poses for the AgiBot X2: language model description, solver, safety checks and a collision-free path sent to the runtime's joint.trajectory interface</description>
+  <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>builtin_interfaces</depend>
+  <depend>ibrobot_msgs</depend>
+  <depend>embodied_common</depend>
+  <exec_depend>aimdk_robot</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+  <exec_depend>robot_config</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

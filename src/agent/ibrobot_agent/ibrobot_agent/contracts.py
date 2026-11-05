@@ -648,6 +648,17 @@ class CatalogPort(Protocol):
     def get_catalog(self, status: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
+class PosePreviewPort(Protocol):
+    """Compose an arm pose while the plan is prepared (pose_composer's ComposeArmPose).
+
+    Returns ``success``, ``error_code``, ``message``, ``kind`` (pose, sequence,
+    rejected, no_motion), ``user_message``, ``composition_id``,
+    ``description_json``, ``duration_sec`` and ``approximate``.
+    """
+
+    def compose(self, text: str) -> Mapping[str, Any]: ...
+
+
 class EventSink(Protocol):
     def publish(self, event: AgentEvent) -> None: ...
 

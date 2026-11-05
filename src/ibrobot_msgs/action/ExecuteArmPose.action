@@ -1,0 +1,22 @@
+# Move the arms to a pose composed from a description (pose_composer).
+#
+# The composition ComposeArmPose prepared for the same text is used if it is
+# still fresh, otherwise the text is composed again first and the result says
+# so. The path is planned from the measured pose and executed through the
+# runtime's joint.trajectory interface; a cancel holds the arms where they are.
+
+string text
+# Optional: the composition to execute; "" uses the latest one for text.
+string composition_id
+---
+bool success
+# "" on success; the ComposeArmPose codes, POSE_RUNTIME_UNAVAILABLE,
+# POSE_RUNTIME_REJECTED or POSE_CANCELLED otherwise.
+string error_code
+string message
+# true when the composition prepared for the plan was the one executed.
+bool used_prepared
+---
+# "composing", "planning", "moving"
+string state
+float32 progress

@@ -40,6 +40,9 @@ RUNTIME_NAMED_MOTION_EXECUTOR = "runtime_named_motion"
 MIRROR_SESSION_EXECUTOR = "mirror_session"
 # Delegated executor that plays a recorded clip the deployment profile resolves.
 RUNTIME_PLAY_AUDIO_EXECUTOR = "runtime_play_audio"
+# Delegated executor that composes an arm pose from the user's words; its only
+# argument is target_name, the description (see validate_implementation).
+POSE_COMPOSER_EXECUTOR = "pose_composer"
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
@@ -554,6 +557,16 @@ def validate_implementation(
                 capability_parameters,
                 diagnostics,
                 source_relative_path=source_relative_path,
+            )
+        elif executor_name == POSE_COMPOSER_EXECUTOR and (
+            required_args != ["target_name"] or set(capability_parameters) != {"target_name"}
+        ):
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                "pose_composer skills take exactly target_name (the pose in the user's words)",
+                source_relative_path=source_relative_path,
+                field_path="required_args",
             )
         elif (
             not isinstance(required_args, list)

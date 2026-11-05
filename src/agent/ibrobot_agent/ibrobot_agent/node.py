@@ -143,6 +143,53 @@ class _UnavailableCatalog:
         raise RuntimeError("Agent catalog adapter is not configured")
 
 
+class _RosPosePreview:
+    """ComposeArmPose client on a private node and executor, called from the planning worker."""
+
+    def __init__(self, service: str, *, timeout_sec: float) -> None:
+        from rclpy.executors import SingleThreadedExecutor
+
+        from ibrobot_msgs.srv import ComposeArmPose
+
+        self._request_type = ComposeArmPose.Request
+        self._timeout_sec = timeout_sec
+        self._node = rclpy.create_node("ibrobot_agent_pose_preview")
+        self._client = self._node.create_client(ComposeArmPose, service)
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(target=self._spin, name="agent-pose-preview", daemon=True)
+        self._thread.start()
+
+    def _spin(self) -> None:
+        # Shutdown of the shared context ends the spin; that is not an error.
+        with contextlib.suppress(Exception):
+            self._executor.spin()
+
+    def compose(self, text: str):
+        if not self._client.wait_for_service(timeout_sec=5.0):
+            return {"success": False, "error_code": "POSE_COMPOSER_UNAVAILABLE", "message": "pose composer unavailable"}
+        request = self._request_type()
+        request.text = text
+        future = self._client.call_async(request)
+        deadline = time.monotonic() + self._timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not future.done() or future.result() is None:
+            return {"success": False, "error_code": "POSE_COMPOSER_TIMEOUT", "message": "pose composer did not answer"}
+        response = future.result()
+        return {
+            name: getattr(response, name)
+            for name in (
+                "success", "error_code", "message", "kind", "user_message",
+                "composition_id", "description_json", "duration_sec", "approximate",
+            )
+        }  # fmt: skip
+
+    def close(self) -> None:
+        self._executor.shutdown(timeout_sec=1.0)
+        self._node.destroy_node()
+
+
 class _RosBridgeCatalog:
     """Expose the existing Gateway read path through the core catalog port.
 
@@ -870,6 +917,9 @@ class IncubationAgentNode(Node):
         self.declare_parameter("gateway_caller_scope", "agent_incubation:local_operator")
         self.declare_parameter("gateway_caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR")
         self.declare_parameter("gateway_caller_token", "")
+        # ibrobot_msgs/srv/ComposeArmPose; empty: arm poses are composed only when they run.
+        self.declare_parameter("pose_compose_service", "")
+        self.declare_parameter("pose_compose_timeout_sec", 90.0)
         ledger_path = str(self.get_parameter("ledger_path").value).strip()
         if not ledger_path:
             ledger_path = str(Path.home() / ".ros" / "ibrobot_agent" / "requests.sqlite3")
@@ -958,6 +1008,12 @@ class IncubationAgentNode(Node):
         ):
             raise ValueError("allowed_skills_json must be a JSON array of non-empty strings")
         allowed_skills = set(decoded_allowlist)
+        pose_service = str(self.get_parameter("pose_compose_service").value).strip()
+        self._pose_preview = (
+            _RosPosePreview(pose_service, timeout_sec=float(self.get_parameter("pose_compose_timeout_sec").value))
+            if pose_service
+            else None
+        )
         self._service = AgentService(
             planner=active_planner,
             catalog=catalog,
@@ -974,6 +1030,7 @@ class IncubationAgentNode(Node):
             ),
             robot_scope=str(self.get_parameter("robot_scope").value),
             direct_commands=_direct_commands_from_config(str(self.get_parameter("planner_config_json").value)),
+            pose_preview=self._pose_preview,
         )
         self._request_subscription = self.create_subscription(
             String,
@@ -1138,6 +1195,8 @@ class IncubationAgentNode(Node):
             finally:
                 if self._bridge is not None:
                     self._bridge.close()
+                if getattr(self, "_pose_preview", None) is not None:
+                    self._pose_preview.close()
         finally:
             self._deployment_lock.close()
 

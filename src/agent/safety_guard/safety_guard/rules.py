@@ -207,6 +207,24 @@ def validate_skill_request(
             ]
             if supplied:
                 return False, f"{', '.join(supplied)} not accepted by {skill_name}"
+        if executor_name == "pose_composer":
+            # The pose is described by target_name alone, in the user's words.
+            if len(str(target_name).strip()) > 200:
+                return False, "target_name is longer than 200 characters"
+            supplied = [
+                name
+                for name, value in (
+                    ("direction", str(direction).strip()),
+                    ("distance", distance),
+                    ("degree", degree),
+                    ("x", x),
+                    ("y", y),
+                    ("yaw", yaw),
+                )
+                if value not in ("", 0.0, None)
+            ]
+            if supplied:
+                return False, f"{', '.join(supplied)} not accepted by {skill_name}"
         if executor_name == "mirror_session":
             # The catalog binds the session command; the skill accepts no argument.
             supplied = [

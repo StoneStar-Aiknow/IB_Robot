@@ -1643,3 +1643,14 @@ def test_voice_bridge_refuses_an_unbound_wake_event():
             addressee_trigger="vendor_session",
             wake_event={"interface": "audio.wake_event", "type": "ibrobot_msgs/msg/SpeechWakeEvent"},
         )
+
+
+def test_pose_composer_gives_the_gateway_its_action_only_when_enabled(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+    assert "pose_composer_enabled" not in _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    config["pose_composer"] = {"enabled": True}
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    assert params["pose_composer_enabled"] is True
+    assert _decode_launch_string(params["pose_composer_action"]) == "/pose_composer/execute"

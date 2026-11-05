@@ -29,9 +29,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -39,6 +36,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
+from embodied_common import pose_composer_contract as POSE_COMPOSER
 from embodied_common.caller_auth import is_caller_authorized
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.dispatch_binding import (
@@ -66,6 +64,7 @@ from embodied_common.workflow_contracts import (
     validate_workflow_steps,
 )
 from ibrobot_msgs.action import (
+    ExecuteArmPose,
     ExecuteNamedMotion,
     ExecuteNavigation,
     ExecuteProgram,
@@ -105,6 +104,9 @@ from ibrobot_msgs.srv import (
 from robot_config.contract_utils import qos_profile_from_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_runtime import contract as RUNTIME
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
 from skill_library.execution_store import (
     ExecutionBusyError,
@@ -619,6 +621,9 @@ class SkillExecutorNode(Node):
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
+        # Arm poses composed from a description (ibrobot_msgs/action/ExecuteArmPose).
+        self.declare_parameter("pose_composer_action", "", descriptor=startup_descriptor)
+        self.declare_parameter("pose_composer_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -751,6 +756,12 @@ class SkillExecutorNode(Node):
         )
         if self._runtime_named_motion_enabled and not self._runtime_named_motion_action:
             raise ValueError("runtime_named_motion_action must be set when runtime_named_motion_enabled is true")
+        self._pose_composer_enabled = self.get_parameter("pose_composer_enabled").value is True
+        self._pose_composer_action = (
+            self.get_parameter("pose_composer_action").get_parameter_value().string_value.strip()
+        )
+        if self._pose_composer_enabled and not self._pose_composer_action:
+            raise ValueError("pose_composer_action must be set when pose_composer_enabled is true")
         if self._runtime_named_motion_enabled and not self._runtime_enabled:
             # Admission (mode, capabilities, stop latch) comes from the runtime status.
             raise ValueError("runtime_named_motion requires runtime admission (runtime_enabled)")
@@ -1031,6 +1042,11 @@ class SkillExecutorNode(Node):
         self._runtime_named_motion_client = (
             ActionClient(self, ExecuteNamedMotion, self._runtime_named_motion_action, callback_group=callback_group)
             if self._runtime_named_motion_enabled
+            else None
+        )
+        self._pose_composer_client = (
+            ActionClient(self, ExecuteArmPose, self._pose_composer_action, callback_group=callback_group)
+            if self._pose_composer_enabled
             else None
         )
         self._mirror_session_client = (
@@ -1919,6 +1935,17 @@ class SkillExecutorNode(Node):
                 "runtime_named_motion configuration mismatch: "
                 f"runtime enabled={named_runtime_enabled}, catalog enabled={named_catalog_enabled}"
             )
+        pose_runtime_enabled = bool(getattr(self, "_pose_composer_enabled", False))
+        pose_catalog_enabled = any(
+            str(template.get("executor", "")).strip() == POSE_COMPOSER.EXECUTOR
+            for template in (getattr(snapshot, "templates", None) or {}).values()
+            if isinstance(template, Mapping)
+        )
+        if pose_runtime_enabled != pose_catalog_enabled:
+            raise ValueError(
+                "pose_composer configuration mismatch: "
+                f"runtime enabled={pose_runtime_enabled}, catalog enabled={pose_catalog_enabled}"
+            )
         sound_runtime_enabled = bool(getattr(self, "_sound_following_enabled", False))
         sound_catalog_enabled = "sound_following" in snapshot.enabled_skill_names
         if sound_runtime_enabled != sound_catalog_enabled:
@@ -1996,11 +2023,27 @@ class SkillExecutorNode(Node):
             configured_executors.add(MIRROR_SESSION_EXECUTOR)
         if getattr(self, "_play_audio_enabled", False):
             configured_executors.add(RUNTIME_PLAY_AUDIO_EXECUTOR)
+        if getattr(self, "_pose_composer_enabled", False):
+            configured_executors.add(POSE_COMPOSER.EXECUTOR)
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
             configured_executors.add("semantic_map_query")
         for name in sorted(configured_executors):
+            if name == POSE_COMPOSER.EXECUTOR:
+                endpoint_name = getattr(self, "_pose_composer_action", "")
+                if not getattr(self, "_pose_composer_enabled", False) or not endpoint_name:
+                    continue
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_action",
+                        configuration={},
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
             if name == named_motion.EXECUTOR_NAME:
                 endpoint_name = getattr(self, "_runtime_named_motion_action", "")
                 if not getattr(self, "_runtime_named_motion_enabled", False) or not endpoint_name:
@@ -2282,6 +2325,130 @@ class SkillExecutorNode(Node):
         result.success = True
         result.error_code = ""
         result.message = message or f"named motion {motion} completed"
+        result.executed_primitives = executed
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
+
+    def _execute_pose_composer_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+    ) -> SkillCommand.Result:
+        """Move the arms to the pose ``target_name`` describes, through the pose composer.
+
+        The composer executes the composition it prepared for the same text
+        while the plan was prepared (or composes again and says so), plans the
+        path from the measured pose and hands it to the runtime's
+        joint.trajectory action, which checks it once more. A cancel is
+        forwarded; the runtime holds the arms where they are.
+        """
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        client = getattr(self, "_pose_composer_client", None)
+        text = str(goal.target_name or "").strip()
+        if client is None:
+            return self._abort_skill(
+                result, goal_handle, [], "POSE_COMPOSER_UNAVAILABLE", "pose composer is not enabled for this deployment"
+            )
+        if not text:
+            return self._abort_skill(result, goal_handle, [], "POSE_EMPTY_TEXT", "target_name must describe the pose")
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 60.0))
+        if not client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "POSE_COMPOSER_UNAVAILABLE",
+                f"pose composer action unavailable: {self._pose_composer_action}",
+            )
+        executed = [f"{POSE_COMPOSER.EXECUTOR}:{goal.skill_name}"]
+        pose_goal = ExecuteArmPose.Goal()
+        pose_goal.text = text
+
+        def feedback_cb(feedback_msg) -> None:
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = (
+                f"{POSE_COMPOSER.EXECUTOR}:{feedback_msg.feedback.state}:{feedback_msg.feedback.progress:.2f}"
+            )
+            goal_handle.publish_feedback(feedback)
+
+        admission = self._active_skill_admission
+        nonce = uuid.uuid4().hex
+        cleanup_key = self._register_delegated_dispatch(nonce, admission, goal.dispatch_binding)
+        terminal = False
+        late_cleanup = _LateCleanupConfirmation()
+        late_cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, cleanup_key))
+        send_future = result_future = cancel_future = None
+        try:
+            send_future = client.send_goal_async(pose_goal, feedback_callback=feedback_cb)
+            if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+                late_cleanup.watch_goal_future(send_future, lambda handle: handle.cancel_goal_async())
+                return self._abort_skill(
+                    result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "pose goal response timed out: arm motion state is unknown",
+                )  # fmt: skip
+            pose_handle = send_future.result()
+            if pose_handle is None or not pose_handle.accepted:
+                terminal = True
+                return self._abort_skill(result, goal_handle, [], "POSE_REJECTED", "pose composer refused the goal")
+            result_future = pose_handle.get_result_async()
+            deadline = time.monotonic() + timeout_sec
+            while rclpy.ok() and not result_future.done():
+                if goal_handle.is_cancel_requested and cancel_future is None:
+                    cancel_future = pose_handle.cancel_goal_async()
+                    self._audit_cancel_propagated()
+                if time.monotonic() >= deadline:
+                    if cancel_future is None:
+                        cancel_future = pose_handle.cancel_goal_async()
+                    late_cleanup.watch_result_future(result_future)
+                    return self._abort_skill(
+                        result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        "pose still running at the skill deadline; cancel sent, admission held until it ends",
+                    )  # fmt: skip
+                time.sleep(_WAIT_POLL_SEC)
+            if not result_future.done():
+                late_cleanup.watch_result_future(result_future)
+                return self._abort_skill(
+                    result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "pose execution state is unknown"
+                )
+            terminal = True
+            wrapped = result_future.result()
+        except Exception:
+            self.get_logger().error(f"pose composer execution failed:\n{traceback.format_exc()}")
+            if result_future is not None:
+                late_cleanup.watch_result_future(result_future)
+            elif send_future is not None:
+                late_cleanup.watch_goal_future(send_future, lambda handle: handle.cancel_goal_async())
+            else:
+                terminal = True
+            return self._abort_skill(
+                result, goal_handle, executed if send_future is not None else [],
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT if send_future is not None else "POSE_FAILED",
+                "pose execution state is unknown",
+            )  # fmt: skip
+        finally:
+            if terminal:
+                late_cleanup.confirm()
+        pose_result = getattr(wrapped, "result", None) if wrapped is not None else None
+        if pose_result is None:
+            return self._abort_skill(result, goal_handle, executed, "POSE_FAILED", "pose composer returned no result")
+        message = str(pose_result.message).strip()
+        if pose_result.error_code == "POSE_CANCELLED":
+            self._cancel_skill(result, goal_handle, executed, goal.skill_name)
+            result.message = message or result.message
+            return result
+        if not pose_result.success:
+            return self._abort_skill(
+                result, goal_handle, executed, str(pose_result.error_code) or "POSE_FAILED", message or "pose failed"
+            )
+        result.success = True
+        result.error_code = ""
+        result.message = message or "pose reached"
         result.executed_primitives = executed
         self._set_result_catalog_identity(result)
         result.diagnostics = []
@@ -6800,6 +6967,12 @@ class SkillExecutorNode(Node):
             )
         if str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME:
             return self._execute_runtime_named_motion_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == POSE_COMPOSER.EXECUTOR:
+            return self._execute_pose_composer_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
