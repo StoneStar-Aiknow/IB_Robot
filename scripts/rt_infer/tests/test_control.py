@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-SPEC = importlib.util.spec_from_file_location("rt_infer_control", Path(__file__).parents[3] / "third_party/vendor/rt-infer/2026.11.04/scripts/base_control.py")
+SPEC = importlib.util.spec_from_file_location("rt_infer_control", Path(__file__).parents[3] / f"third_party/vendor/rt-infer/{os.environ.get('RTINFER_TEST_VERSION', '2026.11.04')}/scripts/base_control.py")
 ctl = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(ctl)
 

@@ -1,0 +1,70 @@
+{
+  "exit_codes": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "reports": {
+    "pose": {
+      "pid": 94833,
+      "numerical": true,
+      "models": {
+        "pear": {
+          "calls": 1620,
+          "drops": 0,
+          "checks": 21
+        }
+      }
+    },
+    "yolo": {
+      "pid": 94836,
+      "numerical": true,
+      "models": {
+        "yolox": {
+          "calls": 90,
+          "drops": 0,
+          "checks": 5
+        }
+      }
+    },
+    "tts": {
+      "pid": 94853,
+      "numerical": true,
+      "models": {
+        "te": {
+          "calls": 2,
+          "drops": 0,
+          "checks": 5
+        },
+        "fm": {
+          "calls": 6,
+          "drops": 0,
+          "checks": 5
+        }
+      }
+    },
+    "vl": {
+      "pid": 94835,
+      "numerical": true,
+      "models": {
+        "vision": {
+          "calls": 20,
+          "drops": 0,
+          "checks": 5
+        },
+        "prefill": {
+          "calls": 20,
+          "drops": 0,
+          "checks": 5
+        },
+        "decode": {
+          "calls": 300,
+          "drops": 0,
+          "checks": 7
+        }
+      }
+    }
+  },
+  "status": "PASS"
+}

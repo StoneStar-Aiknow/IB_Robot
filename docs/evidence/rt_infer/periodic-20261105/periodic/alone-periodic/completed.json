@@ -1,0 +1,19 @@
+{
+  "exit_codes": [
+    0
+  ],
+  "reports": {
+    "pose": {
+      "pid": 91070,
+      "numerical": true,
+      "models": {
+        "pear": {
+          "calls": 540,
+          "drops": 0,
+          "checks": 10
+        }
+      }
+    }
+  },
+  "status": "PASS"
+}
