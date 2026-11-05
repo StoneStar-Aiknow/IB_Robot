@@ -756,6 +756,13 @@ class ModelRuntimeHandle:
                 # Some sessions discover reset support only after loading the model.
                 session_capabilities = getattr(self._assembly.session, "capabilities", None)
                 self._resettable = self._resettable or bool(getattr(session_capabilities, "resettable", False))
+                # Use the executor's public semantics: a policy assembler can
+                # expose stateless chunk execution over a stateful Session.
+                executor_capabilities = getattr(self._executor, "capabilities", None)
+                self._stateful = self._stateful or bool(
+                    self._capability_value(executor_capabilities, "stateful", False)
+                )
+                self._validate_configuration()
                 self._admission_open = True
                 self._transition_locked(LifecycleState.READY)
                 self._condition.notify_all()
@@ -1324,6 +1331,12 @@ class ModelRuntimeHandle:
                 self._last_outcome = result.evidence
             return result
         except ExecutionFailure as failure:
+            if tracker.snapshot().state is OutcomeState.COMPLETED:
+                # A direct executor may return device work before completion.
+                # Reuse its discard fence before recording delivery failures.
+                complete_failure = getattr(self._executor, "complete_failure", None)
+                if callable(complete_failure):
+                    complete_failure(failure)
             self._execution_failure(failure, context, started=started)
             raise
         except (DeadlineExceeded, CancellationRequested) as exc:
@@ -1462,17 +1475,21 @@ class ModelRuntimeHandle:
             return
         failure._runtime_failure_owner = self._owner_token
         self._failure_count += 1
+        diagnostic = failure
+        failure_diagnostic = getattr(self._execution_policy, "failure_diagnostic", None)
+        if callable(failure_diagnostic):
+            diagnostic = failure_diagnostic(failure)
         # Delivered failures acquire caller frames and may retain large results.
         # All entry points keep only immutable diagnostic values here.
         self._last_failure = self._failure_factory.create(
-            failure.code,
-            failure.message,
-            evidence=failure.evidence,
-            recovery=failure.recovery,
-            recoverable=failure.recoverable,
-            details=failure.details,
+            diagnostic.code,
+            diagnostic.message,
+            evidence=diagnostic.evidence,
+            recovery=diagnostic.recovery,
+            recoverable=diagnostic.recoverable,
+            details=diagnostic.details,
         )
-        self._last_outcome = failure.evidence
+        self._last_outcome = diagnostic.evidence
         if (
             failure.recovery.action is not RecoveryAction.NONE
             and failure.recovery.scope is not RecoveryScope.STREAM

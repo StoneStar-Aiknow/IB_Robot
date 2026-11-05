@@ -63,6 +63,10 @@ class TorchModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(self._torch)
 
+    @property
+    def runtime_device_index(self) -> int | None:
+        return getattr(self._device, "index", None)
+
     def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         profile = context.backend_profile
         if (

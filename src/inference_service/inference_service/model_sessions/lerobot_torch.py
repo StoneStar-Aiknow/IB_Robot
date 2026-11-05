@@ -51,6 +51,7 @@ class LeRobotTorchModelSession(ModelSession):
         device_name: str,
         *,
         priority_scheduling: bool = False,
+        managed_execution: bool = False,
     ) -> None:
         super().__init__(
             "model-session:lerobot-torch",
@@ -58,7 +59,7 @@ class LeRobotTorchModelSession(ModelSession):
                 thread_safe=False,
                 max_in_flight_per_instance=1,
                 supports_multiple_instances=True,
-                hardware_resource_id=f"torch:{device_name}" if priority_scheduling else None,
+                hardware_resource_id=f"torch:{device_name}" if managed_execution or priority_scheduling else None,
                 resource_domain=f"torch:{device_name}",
                 max_in_flight_per_resource_domain=1,
                 admission_evidence=BackendAdmissionEvidence(
@@ -93,6 +94,10 @@ class LeRobotTorchModelSession(ModelSession):
     @property
     def runtime_version(self) -> str:
         return self._runtime_version(self._torch)
+
+    @property
+    def runtime_device_index(self) -> int | None:
+        return getattr(self._device, "index", None)
 
     def preprocess(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         with torch_execution_scope(

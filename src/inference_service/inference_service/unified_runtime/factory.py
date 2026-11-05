@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from types import MappingProxyType
 
 from .adapters import ResultAdapter
 from .assembly import OwnedComponent, RuntimeAssembly, RuntimeProviders
 from .contracts import ModelRequest, OutcomeEvidence
-from .errors import execution_evidence, merge_execution_evidence
+from .errors import ExecutionFailure, execution_evidence, merge_execution_evidence
 from .handle import ModelRuntimeHandle
+from .lifecycle import check_startup, lifecycle_budget
 from .loading import LoadRollback
 from .registry import (
     CompositeRuntimeDescriptor,
@@ -31,7 +33,52 @@ from .registry import (
     SessionBuilderKey,
 )
 
+
+class SessionRoleExecutor:
+    """Expose manifest role execution through the ordinary handle API."""
+
+    def __init__(self, session, roles):
+        self.session = session
+        self.roles = frozenset(roles)
+
+    @property
+    def capabilities(self):
+        return self.session.capabilities
+
+    def execute(self, request, context):
+        role = request.metadata.get("role")
+        if not isinstance(role, str) or role not in self.roles:
+            raise ExecutionFailure(
+                code="invalid_role",
+                message="role execution requires a manifest role",
+                evidence=OutcomeEvidence.not_started("role_validation"),
+            )
+        return self.session.execute_role(role, request.inputs, request, context)
+
+
+class SessionRoleStream(SessionRoleExecutor):
+    """One runtime-exclusive stream owns a session's recurrent state."""
+
+    def open_stream(self, context):
+        self.session.reset(context)
+        return None
+
+    def step(self, stream, request, context):
+        return self.execute(request, context)
+
+    def reset_stream(self, stream, context):
+        self.session.reset(context)
+
+    def reset_host_stream(self, stream, context):
+        # Runtime reset owns the Session reset through owned_components.
+        return None
+
+    def close_stream(self, stream, context):
+        return None
+
+
 _MISSING = object()
+_FAILED_LOAD_CLEANUP_TIMEOUT_SECONDS = 1.0
 _VALID_CONTRACTS = frozenset(
     {
         "request-direct",
@@ -867,8 +914,8 @@ def _assembly_from_result(
 def _validate_assembly_contract(assembly: RuntimeAssembly, contract: object, *, role: str | None = None) -> None:
     expected = _contract_name(contract)
     actual = _get(assembly, "execution_contract", default=None)
+    label = f" for role {role!r}" if role is not None else ""
     if actual is None or _contract_name(actual) != expected:
-        label = f" for role {role!r}" if role is not None else ""
         raise RuntimeFactoryError(
             f"RuntimeAssembly contract{label} does not match {expected!r}",
             code="descriptor_assembly_contract_mismatch",
@@ -1131,6 +1178,147 @@ def _invoke_composite_assembler(
 
 class ModelRuntimeFactory:
     """Construct a ``ModelRuntimeHandle`` from typed runtime data."""
+
+    @staticmethod
+    def load_session(validated, *, registry_set, providers, timeout=None, **assembly_options) -> ModelRuntimeHandle:
+        """Return a loaded Handle owning the registered Session's lifecycle.
+
+        Session assembly and failed-load retention share the existing providers.
+        ``timeout`` budgets assembly/loading, not total failed-call latency.
+        On failure, cleanup gets a separate cooperative one-second budget,
+        still capped by any enclosing lifecycle deadline. Providers retain the
+        Handle if cleanup remains pending; native calls are not preempted.
+        """
+        handle = None
+        try:
+            with lifecycle_budget(timeout) if timeout is not None else nullcontext():
+                check_startup()
+                handle = ModelRuntimeFactory.create_session(
+                    validated, registry_set=registry_set, providers=providers, **assembly_options
+                )
+                handle.load()
+        except BaseException:
+            if handle is not None:
+                # Finish ordinary rollback, including the instance lease, now.
+                # A pending native owner still belongs to process shutdown.
+                with suppress(BaseException), lifecycle_budget(_FAILED_LOAD_CLEANUP_TIMEOUT_SECONDS):
+                    handle.close()
+                if not handle.closed:
+                    providers.retain_cleanup(handle)
+            raise
+        return handle
+
+    @staticmethod
+    def create_session(
+        validated,
+        *,
+        registry_set,
+        providers,
+        runtime_options=None,
+        execution_contract=None,
+        role_execution=False,
+        role=None,
+        runtime_id=None,
+        allowed_deployments=None,
+        builder_options=None,
+        override=None,
+        backend_registry=None,
+    ) -> ModelRuntimeHandle:
+        """Return an unloaded Handle owning the assembled Session's lifecycle.
+
+        Loading and policy binding remain explicit. This does not enable Global
+        scheduling automatically.
+        """
+        from inference_service.backends.types import RuntimeContext
+
+        if registry_set is None or not isinstance(providers, RuntimeProviders):
+            raise RuntimeFactoryError("explicit registries and RuntimeProviders are required")
+        profile = getattr(validated, "runtime_profile", None)
+        if profile is None:
+            raise RuntimeFactoryError(
+                "composite deployments require ModelRuntimeFactory.create and a composite descriptor",
+                code="composite_session_unsupported",
+            )
+        context = RuntimeContext(
+            validated_manifest=validated, runtime_options=runtime_options or {}, runtime_profile=profile, role=role
+        )
+        contract = validated.deployment.execution_contract
+        if execution_contract is not None and _contract_name(execution_contract) != _contract_name(contract):
+            raise RuntimeFactoryError(
+                "session execution contract must match the validated deployment", code="execution_contract_mismatch"
+            )
+        if role_execution and getattr(validated.deployment, "device_links", ()):
+            # One public role call cannot own a producer/consumer transaction.
+            # Shared device buffers otherwise carry data across requests.
+            raise RuntimeFactoryError(
+                "public role execution does not support deployment device links",
+                code="role_device_links_unsupported",
+            )
+        if contract.execution_structure == "iterative" and contract.orchestration_visibility == "executor":
+            raise RuntimeFactoryError(
+                "executor-orchestrated iteration requires ModelRuntimeFactory.create and an iterative assembler",
+                code="executor_orchestration_required",
+            )
+        execution_roles = getattr(validated.deployment, "execution", ())
+        if role_execution and not execution_roles:
+            raise RuntimeFactoryError(
+                "public role execution requires non-empty deployment execution roles", code="role_execution_missing"
+            )
+        backend_registry = backend_registry if backend_registry is not None else registry_set.backend_registry
+        backend_registry.validate(context, allowed_deployments=allowed_deployments)
+        session = registry_set.session_builder_registry.create(
+            context,
+            allowed_deployments=allowed_deployments,
+            backend_registry=backend_registry,
+            providers=providers,
+            options=context.runtime_options,
+            builder_options=builder_options,
+            override=override,
+        )
+        try:
+            if role_execution and not callable(getattr(session, "execute_role", None)):
+                raise RuntimeFactoryError("session does not provide role execution", code="role_execution_unsupported")
+            streaming = role_execution and bool(session.capabilities.stateful)
+            if streaming and contract.state_bank_mode != "runtime_exclusive":
+                raise RuntimeFactoryError("role streams require a runtime_exclusive state bank")
+            executor_type = SessionRoleStream if streaming else SessionRoleExecutor
+            executor = executor_type(session, execution_roles) if role_execution else session
+            assembly = RuntimeAssembly(
+                runtime_executor=executor,
+                streaming_runtime=executor if streaming else None,
+                session=session,
+                execution_contract=contract,
+                stateful=bool(session.capabilities.stateful),
+                resettable=bool(session.capabilities.resettable),
+                runtime_id=runtime_id,
+                load_context=context,
+                providers=providers,
+                owned_components=(OwnedComponent(session, "model-session", load_context=context),),
+            )
+            # Both factory entry points use the same metadata/ownership and
+            # contract validation before transferring an assembly to a Handle.
+            bindings, artifacts = _artifact_data(validated, validated.deployment)
+            _finalize_assembly(
+                assembly,
+                (assembly,),
+                providers=providers,
+                sessions=(session,),
+                spec=context,
+                snapshot=validated,
+                identity=validated.manifest.model,
+                contract=contract,
+                bindings=bindings,
+                artifact_handles=artifacts,
+            )
+            _validate_final_assembly(assembly, contract, composite=False)
+            return ModelRuntimeHandle(assembly)
+        except BaseException as error:
+            rollback = LoadRollback()
+            rollback.defer(session.close)
+            if rollback.rollback():
+                providers.retain_cleanup(rollback)
+                error.cleanup_owner = rollback
+            raise
 
     @staticmethod
     def create(

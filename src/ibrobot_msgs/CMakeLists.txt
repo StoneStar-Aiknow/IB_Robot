@@ -19,6 +19,7 @@ find_package(sensor_msgs REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/RuntimeControlV1.srv"
   "msg/Variant.msg"
   "msg/VariantsList.msg"
   "msg/InferenceError.msg"

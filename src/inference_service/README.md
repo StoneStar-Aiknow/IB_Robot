@@ -1212,3 +1212,219 @@ RKNN/HMM 原生释放抛出无完成证据的异常时，保留所有权并报�
 字符串流 ID 的关闭幂等历史仅保留最近 128 条；淘汰后返回 `stream_not_found`。
 持有原始 `StreamHandle` 对象时，已关闭对象的幂等性不受历史淘汰影响。
 该限制也适用于 SpeechDirection 的字符串流 ID。
+
+## 固定目标公共运行时调度
+
+公共基础现提供 native/session factory、宿主执行控制器、共享设备 FIFO/EDF 队列、
+v2 workload profile 和 `global_runtime_scheduler_node`。目标集合在启动时固定。
+现有 policy 调度器、旧 profile 和 direct 调用继续保留。
+
+### 配置与执行边界
+
+当前入口只覆盖 PR-06 至 PR-10。机器人配置编译尚未接入。
+调用方手工提供相同的 `RuntimeExecutionTarget` 和资源描述。
+现有业务 launch 不会自动创建新 Host 或 Global。
+
+| Global 节点参数 | 默认值与约束 |
+| --- | --- |
+| `runtime_targets_json` | `[]`。固定 Target 对象数组。每个 Host endpoint 必须唯一。 |
+| `runtime_resources_json` | `{}`。按 `hardware_resource_id` 索引的资源对象。 |
+| `runtime_scheduler_endpoint` | `/inference/runtime/v1`。禁止与 Host endpoint 重合。 |
+| `priority_zero_policy` | `fifo`。也支持 `edf`。旧名 `global_policy` 会触发错误。 |
+| `status_stale_timeout_ns` | `2000000000`。单位 ns，必须大于两个心跳间隔，即 200 ms。 |
+| `control_rpc_timeout_ns` | `5000000000`。控制服务回复的等待期限，单位 ns，必须为正的 64 位整数。独立于状态新鲜度。 |
+| `profile_min_samples` | `10000`。ROS 入口强制不小于 10000。 |
+| `profile_max_age_days` | `30`。必须为正整数。 |
+
+Target 的必填字段：`target_id`、`endpoint`、`hardware_resource_id`、
+`physical_device`、`deployment_fingerprint`、`composition_fingerprint`、
+`lifecycle_group`、`configuration_generation`、`interface`、`model_type`、`operation`。
+`deployment_fingerprint` 必须来自已加载 deployment。
+`composition_fingerprint` 必须表示实际业务组合。
+当前 Adapter 只核对加载身份和设备，调用方负责组合描述的准确性。
+
+每个 Target 默认允许 1 个执行、8 个待处理请求和 4096 条记录。
+输入与结果的保留配额各为 64 MiB。
+默认请求期限为 5000 ms，重试窗口为 30000 ms。
+字段定义与校验见 `scheduler/runtime_protocol.py`。
+
+资源对象必须包含 `physical_device`。默认 `mode` 为 `serial`。
+`ascend_concurrent` 要求 `verified_concurrency=true` 和后端并发证据。
+预测准入要求串行 FIFO、`managed_coverage=true` 和硬件指纹。
+同一资源的全部 Target 必须启用预测准入。
+资源与 Target 的模式、预测开关、硬件指纹和安全余量必须一致。
+
+Host 和 Global 必须运行在同一台机器。
+请求使用 Linux boot clock 和单调期限，不使用 ROS 仿真时钟。
+Host 通过 `SchedulerRuntimeAdapter(node, target, handle)` 绑定公共 Handle。
+Session 必须在 `runtime_context_defaults(priority_scheduling=False, managed_execution=True)` 中加载。
+
+绑定后，业务继续调用 Handle 的 `execute`、`reset` 和 `close`。
+当前受管入口只支持请求执行，不支持 managed stream。
+直接调用的单流 Session 仍使用既有 stream 契约。
+
+`create_session(role_execution=True)` 拒绝带 `device_links` 的 deployment。
+deployment 必须声明非空执行 role，Session 必须提供 `execute_role()`。
+Factory 在加载前拒绝不支持的组合，并回滚已构造的 Session。
+独立 role 调用不能证明 producer 与 consumer 属于同一请求。
+需要设备直连的完整执行器继续通过已有组装入口创建。
+
+`create_session()` 和 `load_session()` 不提供 executor 层迭代编排。
+`iterative` 且 `orchestration_visibility=executor` 的 deployment 必须使用已有迭代 assembler。
+两个入口在构造 Session 前调用 `BackendRegistry.validate()`。
+校验使用所选 backend registry 和 `allowed_deployments`。
+
+领域 Torch 回调默认在工作线程内使用 `torch.no_grad()`。
+确需局部梯度计算的回调须自行启用梯度，并返回已分离的结果。
+领域 Torch 回调只支持 `request_boundary` 取消。
+声明 `checkpoint` 或 `stage` 的 deployment 会在资源构造时被拒绝。
+
+回调返回结果时，必须交出结果存储的修改权。
+SDK 和回调禁止在后续请求或 Close 中修改已返回的存储。
+如果 SDK 复用输出缓冲，回调必须先创建独立结果。
+NumPy 使用 `copy()`，Torch 使用 `detach().clone()`。
+视图或单独 `detach()` 不会复制存储。
+设备复制在回调内完成，复用现有执行上下文的完成屏障。
+
+`create_session()` 返回未加载的 Handle。
+进程内 Controller 支持先绑定策略再加载。
+ROS Adapter 要求先加载，再绑定。
+加载前绑定 ROS Adapter 会返回 `RUNTIME_LOAD_REQUIRED`。
+CUDA/NPU 的实际设备索引在加载时确定。
+
+`load_session()` 返回已加载的 Handle。两者都通过 Handle 管理生命周期。
+
+### 控制、结果与关闭
+
+Global 支持 `describe`、`register`、`measurements`、`submit`、`query`、`cancel`。
+Host 支持 `execute`、`query`、`cancel`、`ack`。
+控制服务只传递身份和执行证据，业务输入与结果留在 Host。
+`<runtime_scheduler_endpoint>/ready` 是 `std_srvs/Trigger` readiness 服务。
+
+Host 冻结输入后生成请求摘要。结果配额按受支持的保留存储核算。
+
+每次输入准备使用独立的子取消令牌。
+调用方取消父令牌时，子令牌同步取消。
+调度取消和 Host 关闭只取消子令牌。
+输入准备失败或操作进入终态后，Host 解除父令牌的取消回调。
+
+Host 明确证明 Execute 未开始时，错误回复携带 `not_started=true`。
+Global 保留 `NOT_STARTED`，通过 Cancel/ACK 释放 Host 快照。
+回复丢失或缺少未开始证据时，Global 仍将操作记为 `UNKNOWN`。
+重复 Execute 返回已有执行证据，不因 Host 正在关闭而改成未开始。
+
+排队的 reset、drain、close 为共享资源保留派发权。
+Global 等待已有执行结束，暂停同资源的新 execute 派发。
+这个屏障也约束优先级更高的 execute，不中断已有执行。
+其他资源继续派发。维护请求取消或过期后，Global 解除保留。
+
+输入 Mapping 的键、身份选择器和请求 ID 只接受内建 `str`。
+输入和结果拒绝结构化 NumPy dtype，以及含对象引用或 metadata 的 dtype。
+检查包括嵌套字段、子数组 dtype，以及结果保留的底层数组。
+输入和结果暂不支持量化 Torch Tensor。
+
+Host 在入账前检查控制描述的编码和字节上限。
+检查覆盖最长请求封装、256 字符错误及 64 位时间戳的终态回执。
+无法编码或超出控制预算的 priority 不占用记录容量。
+
+带 autograd 图或 `.grad` 载荷的 Torch 结果会触发 `RESULT_RETAINS_AUTOGRAD`。
+结果树支持普通 `dict`、只读 mapping、`list`、`tuple`、标量、NumPy 数组和 Torch Tensor。
+运行时自身的 `ModelResult`、完成证据、延迟和恢复值按字段重建。
+领域 dataclass、容器子类和其他不透明对象须先转为普通值结构。
+可证明分配范围的 NumPy/Torch 存储按完整分配计费，共享分配只计一次。
+
+计费证明存储大小，不证明 SDK 已交出修改权。
+普通自有存储直接保留，生产者必须遵守交付后不再修改的约束。
+Controller 不支持借用可变输出，也不隐式复制全部结果。
+
+外部 CPU 数组和不可调整大小的 CPU Tensor 转为独立快照后计费。
+这包括 ORT 的 CPU 输出、Torch 的 NumPy 导出和冻结输入的返回视图。
+设备 Tensor 的外部存储仍不受支持，不在结果检查中发起设备复制。
+结果规范化和计费在控制锁外完成，期间仍保留执行所有权。
+终态提交在锁内复核总配额，并释放已无执行用途的请求上下文。
+配额不代表进程 RSS 或模型缓存的上限。
+
+业务调用方放弃等待，不会释放尚未确认完成的执行所有权。
+只有 `NOT_STARTED` 证明执行未开始。`UNKNOWN` 保持隔离和资源占用。
+领域 Torch SDK 关闭失败后，只有明确 `NOT_STARTED` 才允许重试 SDK 关闭。
+释放结果未知时，资源继续保留，必须重启进程。
+SDK 关闭成功后的设备 drain 失败，不会重复调用 SDK 关闭。
+
+已完成且已 ACK 的历史退出调度与回执循环。
+Global 仍保留历史供查询和幂等重放。
+回收必须同时满足重试窗口与业务期限到期。
+
+当前 Global 通过 Query 获取终态，首次查询可能等待 250 ms。
+当前版本不保证短 deadline 或高频连续派发。
+每个 Host 必须使用独立 `lifecycle_group`。
+
+多个 Host 必须逐个关闭，并等待 Global 确认前一个 Host 退出。
+组合层通过 Global 的 `shutdown_pending()` 核对退出状态。
+本地 Close 返回或本地 ACK 标记都不能单独证明 Global 已确认。
+在确认前，必须保留 Host 传输和 executor。
+确认后停止 Host executor，再销毁传输和节点。
+
+并发 Close、共享生命周期组、ACK 丢响应恢复和动态退役尚未交付。
+清理未知时必须保留所有者，不能重新绑定同一 Handle 来绕过隔离。
+非法 `boot_id` 会在绑定前被拒绝，同一 Handle 仍支持修正参数后重试。
+ROS 实体全部创建成功后才绑定 Handle。
+endpoint 校验或实体创建失败时，原 Handle 仍可重试。
+Global 开始关闭后，readiness 和后续心跳返回不可用。
+已经接收的工作继续排空，Close 控制仍可提交。
+
+### 持续采样与 profile 生成
+
+Global 仅保留最近 1024 条测量。实验结束后一次性导出不足以建立生产 profile。
+`runtime_profile_collect` 持续读取带 epoch 的游标，并按 Target 保存 JSONL。
+采集器从启动时的最新序号开始，只保存之后的测量。
+采集器创建输出文件前，逐页检查固定目录。
+目标缺失、配置不符或检查期间 epoch 变化时，采集器立即失败退出。
+
+发生游标丢样、epoch 变化或身份不符时，采集器失败退出。
+失败会保留已有文件前缀供诊断，不能将失败运行视为完整采样。
+重新采样须使用新的输出文件。
+
+前置条件：资源为串行模式，资源所有者声明 `managed_coverage=true`。
+Target 必须填写真实硬件指纹和运行时版本。
+采样时先关闭预测准入，并完成模型预热。
+每个 workload bucket 至少需要 10000 个成功样本。
+样本必须覆盖代表性内容和高开销内容。
+
+1. 保存 Host 与 Global 使用的 Target 为 `target.json`。
+2. 启动采集器。
+
+```bash
+source .shrc_local && ros2 run inference_service runtime_profile_collect \
+  --target target.json --endpoint /inference/runtime/v1 \
+  --output models/_work/my_model/profiling/warm-samples.jsonl --count 10000
+```
+
+3. 在输出文件创建后，从另一终端提交工作负载。
+4. 在采集器成功退出后，生成 profile。
+
+```bash
+source .shrc_local && ros2 run inference_service runtime_profile \
+  --target target.json --samples models/_work/my_model/profiling/warm-samples.jsonl \
+  --output models/_work/my_model/profiling/runtime.json --min-samples 10000 --margin 1.2
+```
+
+`--count` 是目标总样本数，不是每个 bucket 的样本数。
+多 bucket 采样须增加总数，确保每个 bucket 达到门槛。
+生成命令会拒绝样本不足的 bucket。
+生成器使用每个 bucket 的最大观测占用时间乘以余量。
+占用时间包含派发到终态确认的时间，不是单独的 kernel 耗时。
+经验上界不构成最坏执行时间证明。
+
+生成器每次最多处理 1,000,000 条样本。
+operation ID 沿用控制协议的标识符语法，最长 127 个字符。
+这两项限制约束去重集合，与 JSONL 的逐行读取独立。
+按生产门槛计算，每次最多生成 100 个样本充足的 bucket。
+超过限制时，生成器拒绝运行并保留已有 profile。
+
+5. 将生成路径写入 Target 的 `profile_path`。
+6. 为资源和全部参与 Target 启用预测准入。
+7. 重新启动 Global 与 Host，并核对 readiness。
+
+v2 profile 的身份必须匹配 deployment、组合、资源、设备、模式、
+执行类型、硬件指纹、运行时版本和观测输入声明。
+旧 policy profile 不能复用。转换和采样产物只放在 `models/_work/`。

@@ -110,6 +110,11 @@ class ModelSession(ABC):
     def runtime_version(self) -> str:
         return ""
 
+    @property
+    def runtime_device_index(self) -> int | None:
+        """Frozen Torch placement for shared-resource identity, when applicable."""
+        return None
+
     @staticmethod
     def _runtime_version(runtime: object | None) -> str:
         if runtime is None:

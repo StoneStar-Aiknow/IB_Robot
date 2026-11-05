@@ -959,3 +959,153 @@ String stream IDs have idempotent Close receipts for the most recent 128 closure
 Direct stateless synchronous errors retain known completion unless native evidence says otherwise. LeRobot CUDA/NPU
 execution pins the resolved device at load; resource domains remain conservative device-family groups such as
 `torch:npu`, not per-device identifiers.
+
+## Fixed-target common runtime scheduling
+
+The foundation provides native/session factories, host execution control, shared
+FIFO/EDF device queues, v2 workload profiles and `global_runtime_scheduler_node`.
+Membership is fixed at startup. Existing policy scheduling, profiles and direct
+callers remain available.
+
+### Configuration and execution boundary
+
+This entry covers PR-06 through PR-10. Robot configuration compilation is not integrated.
+The composition owner supplies identical `RuntimeExecutionTarget` and resource descriptors to Host and Global.
+Existing business launches do not automatically create these components.
+
+| Global node parameter | Default and constraint |
+| --- | --- |
+| `runtime_targets_json` | `[]`; an array of fixed targets with unique Host endpoints. |
+| `runtime_resources_json` | `{}`; resource objects keyed by `hardware_resource_id`. |
+| `runtime_scheduler_endpoint` | `/inference/runtime/v1`; must differ from every Host endpoint. |
+| `priority_zero_policy` | `fifo` or `edf`; the old `global_policy` name is rejected. |
+| `status_stale_timeout_ns` | `2000000000` ns; must exceed two heartbeat intervals (200 ms). |
+| `profile_min_samples` | `10000`; the ROS production minimum is 10000. |
+| `profile_max_age_days` | `30`; a positive integer. |
+
+Required Target fields are `target_id`, `endpoint`, `hardware_resource_id`, `physical_device`,
+`deployment_fingerprint`, `composition_fingerprint`, `lifecycle_group`, `configuration_generation`,
+`interface`, `model_type` and `operation`. Use the loaded deployment fingerprint and the actual composition
+identity. The Adapter checks loaded deployment/device identity; the caller remains responsible for the
+composition descriptor. Defaults per Target are 1 in-flight execution, 8 pending requests, 4096 records,
+64 MiB each of retained inputs/results, a 5000 ms request timeout and a 30000 ms retry window.
+See `scheduler/runtime_protocol.py` for field definitions and validation.
+
+Each resource requires `physical_device`; `mode` defaults to `serial`. `ascend_concurrent` requires
+`verified_concurrency=true` and backend concurrency evidence. Prediction requires serial FIFO,
+`managed_coverage=true`, a hardware fingerprint, and predictive profiles for every Target sharing the resource.
+Resource and Target mode, prediction flag, hardware fingerprint and safety margin must agree.
+
+Host and Global must run on the same machine: operation identity uses the Linux boot clock and monotonic
+expiry, not ROS simulation time. Bind with `SchedulerRuntimeAdapter(node, target, handle)` after loading
+Sessions inside `runtime_context_defaults(priority_scheduling=False, managed_execution=True)`. Business callers then use the existing
+Handle `execute`, `reset` and `close` APIs. Managed streams are not supported in this phase; direct single-stream
+Sessions retain their existing stream contract.
+`create_session()` returns an unloaded Handle. An in-process Controller may bind it before loading;
+the ROS Adapter rejects a validated, unloaded Handle with `RUNTIME_LOAD_REQUIRED` before binding.
+CUDA/NPU device indices are resolved during loading.
+
+`create_session(role_execution=True)` rejects deployments with `device_links`: separate role calls cannot
+establish one producer/consumer request transaction. Complete executors that use device links continue through
+the existing assembly entry. Role execution requires non-empty deployment roles and a callable Session
+`execute_role()` method. The Factory rejects unsupported combinations before loading and rolls back
+any constructed Session. Domain Torch callbacks run under `torch.no_grad()` in the executing thread.
+Algorithms requiring local differentiation must explicitly enable it and return detached results.
+Callbacks transfer output storage: neither the SDK nor the callback may mutate returned storage on later
+requests or Close. An SDK that reuses output buffers requires the callback to return an independent NumPy
+`copy()` or Torch `detach().clone()`; a view or `detach()` alone does not copy storage. Perform device copies
+inside the callback so the existing execution scope also owns their completion barrier.
+`create_session()` and `load_session()` do not orchestrate executor-owned iteration: deployments declaring
+`iterative` with `orchestration_visibility=executor` must use an existing iterative assembler.
+Both entries call `BackendRegistry.validate()` with the selected registry and `allowed_deployments`
+before constructing a Session.
+
+### Control, results and shutdown
+
+Global supports `describe`, `register`, `measurements`, `submit`, `query` and `cancel`.
+Host supports `execute`, `query`, `cancel` and `ack`. Only identity and execution evidence cross the control
+service; business data and results remain in the Host. `<runtime_scheduler_endpoint>/ready` is a
+`std_srvs/Trigger` readiness service.
+
+The Host freezes inputs before calculating request identity. Result capacity charges supported retained
+storage. Torch results owning an autograd graph or `.grad` payload fail with `RESULT_RETAINS_AUTOGRAD`.
+External NumPy CPU buffers and non-resizable CPU Tensor storage are copied into independent results and charged.
+Non-resizable device Tensor storage remains unsupported; result retention does not copy device data.
+Opaque objects, structured NumPy dtypes, dtypes with object references or metadata (including nested
+field/subarray dtypes and retained array bases), and quantized Torch inputs/results are rejected.
+Input mapping keys, identity selectors and request IDs must be plain `str` values.
+The Host validates control encoding and its byte budget before retaining an operation record;
+this covers the longest request envelope and receipts with a 256-character error and 64-bit timestamps.
+Unencodable or oversized priority values do not consume record capacity.
+Ordinary owned NumPy/Torch storage is retained without copying and shared allocations are charged once.
+Accounting proves allocation size, not exclusive mutation rights: producers must stop mutating returned
+storage. Borrowed mutable outputs are unsupported; the Controller does not implicitly copy every result.
+Limits do not bound process RSS or model caches. Abandoning a business waiter never releases unproven execution
+ownership: only `NOT_STARTED` proves
+that execution did not begin; `UNKNOWN` remains quarantined and holds resources.
+
+Completed, acknowledged history leaves the dispatch/report loop while remaining available for query and
+idempotent replay. Global collects it only after both the retry window and business deadline expire.
+
+Global currently discovers completion through Query, whose first reconciliation may wait 250 ms.
+Short deadlines and high-frequency continuous dispatch are not guaranteed. Give each Host a distinct
+`lifecycle_group`. Close Hosts sequentially and wait for Global to confirm each retirement through its owner's
+`shutdown_pending()` view. Neither local Close return nor the Host's ACK flag proves Global confirmation.
+Keep Host transport and executors alive until confirmation; then stop the Host executor before destroying
+transport and nodes.
+
+Concurrent Close, shared lifecycle groups, lost-ACK recovery and dynamic retirement await later PRs.
+Retain owners when cleanup is unknown; rebinding cannot bypass quarantine. An invalid `boot_id` is rejected
+before binding, so the same Handle can retry with corrected parameters.
+Native Torch SDK Close errors permit another SDK Close only with explicit `NOT_STARTED` evidence.
+An unknown release outcome retains the owner and requires process restart; a successful SDK Close is not
+repeated if the subsequent device drain fails.
+
+### Continuous sampling and profile generation
+
+Global retains only the latest 1024 measurements, so an export after the experiment cannot produce a
+production profile. `runtime_profile_collect` continuously follows an epoch-bound cursor and writes JSONL
+for one Target. It starts at the latest sequence at collector startup and records only subsequent samples.
+Before creating the output file, the collector checks the paginated fixed catalogue for an identical Target.
+An absent or mismatched Target, or an epoch change during that check, fails immediately.
+Overrun, epoch change or identity mismatch stops collection with an error. The existing prefix remains for
+diagnosis; it is not a complete collection. Retry into a new output file.
+
+Prerequisites: a serial resource with owner-attested `managed_coverage=true`, accurate hardware fingerprint
+and runtime version, prediction disabled during sampling, and a warmed-up model. Collect at least 10000
+successful samples per workload bucket using representative and expensive contents.
+
+1. Save the Target descriptor used by Host and Global as `target.json`.
+2. Start collection:
+
+```bash
+source .shrc_local && ros2 run inference_service runtime_profile_collect \
+  --target target.json --endpoint /inference/runtime/v1 \
+  --output models/_work/my_model/profiling/warm-samples.jsonl --count 10000
+```
+
+3. After the output file appears, submit the workload from another terminal.
+4. After successful collector exit, generate the profile:
+
+```bash
+source .shrc_local && ros2 run inference_service runtime_profile \
+  --target target.json --samples models/_work/my_model/profiling/warm-samples.jsonl \
+  --output models/_work/my_model/profiling/runtime.json --min-samples 10000 --margin 1.2
+```
+
+`--count` is the total for the Target, not for each bucket. Increase it for multiple buckets until every
+bucket meets the threshold; the writer rejects undersampled buckets. Estimates use each bucket's maximum
+observed occupancy multiplied by the margin. Occupancy includes dispatch through terminal confirmation,
+not kernel time alone. An empirical bound is not a worst-case execution-time proof.
+The writer accepts at most 1,000,000 samples per profile and operation identifiers of at most 127 characters
+using the control protocol's identifier syntax. These limits bound deduplication state even when the JSONL
+reader streams a larger file. At the production minimum, at most 100 fully sampled buckets fit in one run.
+Exceeding a limit rejects the run before replacing an existing profile.
+
+5. Set the Target's `profile_path` to the generated file.
+6. Enable predictive admission on the resource and all participating Targets.
+7. Restart Global and Hosts and verify readiness.
+
+A v2 profile must match deployment, composition, resource, device, mode, execution kind, hardware fingerprint,
+runtime version and declared observation inputs. Legacy policy profiles cannot be reused. Keep conversion
+and sampling artifacts under `models/_work/`.

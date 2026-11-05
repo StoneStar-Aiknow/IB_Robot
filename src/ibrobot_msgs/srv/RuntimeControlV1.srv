@@ -1,0 +1,5 @@
+# Control metadata only. Model inputs and results remain in the runtime host.
+# Protocol v1 uses a bounded, strictly validated JSON object for each verb.
+string<=32768 payload
+---
+string<=32768 payload

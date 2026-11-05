@@ -23,6 +23,9 @@ class RuntimeExecutionPolicy(Protocol):
     orchestration as a second device operation. Its signature is
     ``submit_frame(request: ModelRequest, context: ExecutionContext) -> Future``;
     the Future delivers the executor's frame result or execution failure.
+    ``failure_diagnostic(failure)`` optionally limits the Handle's retained
+    diagnostic snapshot to control metadata when the policy owns payloads. It must not raise,
+    mutate the delivered failure, or change completion/recovery decisions.
     """
 
     @property

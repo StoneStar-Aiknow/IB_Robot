@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -210,3 +211,51 @@ def test_runtime_bank_link_resolves_through_state_bank_name() -> None:
     link = _state_link(role="__runtime__", state_bank="model.bank")
     pairs = StatefulAscendOmModelSession._state_indices_for_role(bindings, link, "model")
     assert pairs == ((1, 1),)
+
+
+def test_load_rejects_priority_streams_for_stateful_dataset_banks(tmp_path: Path) -> None:
+    deployment = _deployment()
+    context = replace(_context(tmp_path, deployment), priority_scheduling=True)
+    with pytest.raises(BackendLoadError) as exc:
+        StatefulAscendOmModelSession(priority_scheduling=True, runtime_manager=object()).load(context)
+    assert exc.value.code == "hardware_priority_unavailable"
+    assert "priority streams" in str(exc.value)
+
+
+def test_managed_serial_stateful_session_loads_without_priority_streams(tmp_path, monkeypatch):
+    from inference_service.backends import runtime_context_defaults
+    from inference_service.model_sessions import ascend
+
+    with runtime_context_defaults(priority_scheduling=False, managed_execution=True):
+        context = _context(tmp_path, _deployment())
+        session = StatefulAscendOmModelSession(runtime_manager=SimpleNamespace(acquire=lambda _: lease))
+    lease = SimpleNamespace(close=lambda: None)
+    options = []
+    banks = []
+
+    def model_factory(*args, **kwargs):
+        options.append(kwargs)
+        return SimpleNamespace(
+            input_descriptors=[SimpleNamespace(size=1024)] * 3,
+            output_descriptors=[SimpleNamespace(size=1024)] * 3,
+            load_descriptor=lambda: None,
+            allocate_device_buffer=lambda size: object(),
+            zero_device_buffer=lambda buffer: None,
+            prepare_dataset_banks=lambda *args, **kwargs: banks.append(args),
+            close=lambda: None,
+        )
+
+    def forbidden_streams(_lease):
+        pytest.fail("serial resource must not allocate priority streams")
+
+    monkeypatch.setattr(ascend.AclPriorityStreamPool, "create", forbidden_streams)
+    session._model_factory = model_factory
+    try:
+        session.load(context)
+        assert session.health().ready
+        assert context.managed_execution and not context.priority_scheduling
+        assert options == [{}] and len(banks) == 1
+        assert session.capabilities.resource_domain == "ascend:0"
+        assert session.capabilities.priority_mapping is None
+    finally:
+        session.close()

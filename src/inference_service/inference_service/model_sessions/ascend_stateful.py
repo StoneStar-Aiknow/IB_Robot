@@ -47,6 +47,11 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment):
             raise BackendLoadError("stateful Ascend sessions require a compiled deployment")
+        if self._priority_scheduling:
+            raise BackendLoadError(
+                "stateful Ascend dataset-bank sessions do not support priority streams",
+                code="hardware_priority_unavailable",
+            )
         typed_links = deployment.execution_contract.state_links
         if not typed_links:
             raise BackendLoadError(
