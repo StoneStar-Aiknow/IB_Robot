@@ -2304,3 +2304,30 @@ Apache-2.0
 文本、语言、优先级、动作名和目标侧由每次 `runtime-demo speak` / `runtime-demo motion`
 请求传入，不在机器人 YAML 中固化。业务包只依赖中立 `ibrobot_msgs`，不依赖 robot_config、
 robot_runtime 或厂商 SDK。详细命令见 [交互示范指南](../../docs/aimdk_interaction_demo.md)。
+
+## X2 镜子/抓取：可选小欧文本唤醒与声纹
+
+`aimdk_x2_voice_mirror_grasp` 默认省略 `wake_phrases`（不要求唤醒词）、`speaker_check_enabled: false`、
+`speaker_embedding.enabled: false`，直接处理语音，不加载声纹模型，不区分说话人。
+需要开启时，在派生 YAML 中显式覆盖（`base_config` 须指向同目录的基础 YAML）：
+
+```yaml
+robot:
+  base_config: aimdk_x2_voice_mirror_grasp.yaml
+  voice_asr:
+    speaker_embedding:
+      enabled: true
+  embodied:
+    agent:
+      voice_bridge:
+        wake_phrases: [小欧小欧, 小欧小鸥, 小欧小偶, 小鸥小欧, 小鸥小鸥, 小鸥小偶, 小偶小欧, 小偶小鸥, 小偶小偶]
+        speaker_check_enabled: true
+```
+
+开启后使用 ASR 文本前缀开启 25 秒滑动窗口，不依赖厂商 `audio.wake_event`。
+欧/鸥是同音字，偶是近音字；只匹配句首，不以句中提及触发。
+仅开启时需额外 provision `models/campplus-speaker`（默认 `torch_cpu`）。
+保持原有厂商持续采音设置；本配置不修改厂商唤醒服务，也不切换麦克风。
+首次建议说“小欧小欧，现在请你帮我做一个挥手动作”，让同一语音段包含足够长的人声。
+后续本人指令通过声纹校验后续期；旁人被拒绝的指令不续期；再次点名重设声纹锚点。
+停止词始终旁路。首句无有效声纹则无锚点，声纹消息缺失仍超时放行，不能作为身份认证。

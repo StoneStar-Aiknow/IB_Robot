@@ -108,11 +108,35 @@ robot:
       # grasp segment, so the timeout is well above the median gap.
       watch_frame_timeout_s: 1.0
 
+  # Optional local text wake and speaker check; both stay off by default.
+  # Enabling them requires continuous vendor audio and the CAMPPlus bundle.
+  voice_asr:
+    external_finalize_on_idle: true
+    speaker_embedding:
+      enabled: false
+      bundle_path: models/campplus-speaker
+      deployment: torch_cpu
+      min_speech_seconds: 1.0
+      max_speech_seconds: 6.0
+      idle_timeout_sec: 1.2
+
   embodied:
     # The profile exposes pick_object together with the delegated executor
     # registered by grasp_execution above.
     skill_catalog_profile: aimdk_x2_voice_mirror_grasp
     agent:
+      voice_bridge:
+        addressee_trigger: wake_phrase
+        # No wake_phrases key: accept speech without a wake prefix by default.
+        # To opt in, enable both speaker flags and add:
+        # wake_phrases: [小欧小欧, 小欧小鸥, 小欧小偶, 小鸥小欧, 小鸥小鸥, 小鸥小偶, 小偶小欧, 小偶小鸥, 小偶小偶]
+        wake_window_sec: 25.0
+        speaker_check_enabled: false
+        speaker_min_similarity: 0.60
+        speaker_merge_margin: 0.10
+        speaker_max_age_sec: 6.0
+        speaker_reject_short: true
+        measurement_grace_sec: 1.5
       test_allowlist:
         - wave_hand
         - handshake
