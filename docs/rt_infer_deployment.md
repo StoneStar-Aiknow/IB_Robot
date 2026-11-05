@@ -4,6 +4,8 @@ RT-Infer 为 Ascend 310P1 RC 提供软件控制的 AI Core 任务调度，可在
 
 本集成是可选入口，不修改 IB-Robot 的默认推理后端、全局依赖或系统 CANN。核心实现仅以二进制交付。
 
+最新交付为 [2026.11.05 candidate10 周期调度版本](rt_infer_periodic.md)，包含参数与缓冲区复用、全核独占及周期准入配置。下文保留 2026.11.04 的功能验证流程，两版数据不能混用。
+
 ## 环境与安装
 
 已验证环境：aarch64、Ascend 310P1 RC、openEuler Embedded BUILD_ID 20251020093351、内核 5.10.0-openeuler、CANN 8.1.RC1。其他环境需要独立适配，不应强制加载驱动。
