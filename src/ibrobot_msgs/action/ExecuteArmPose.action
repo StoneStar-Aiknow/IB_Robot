@@ -4,19 +4,30 @@
 # still fresh, otherwise the text is composed again first and the result says
 # so. The path is planned from the measured pose and executed through the
 # runtime's joint.trajectory interface; a cancel holds the arms where they are.
+# Named task poses may explicitly request hand opening after arm arrival;
+# ordinary free-text poses never acquire that side effect.
 
 string text
 # Optional: the composition to execute; "" uses the latest one for text.
 string composition_id
+# Deterministic configured target; mutually exclusive with text/composition_id.
+string named_pose
+string task_poses_digest
+# Optional smaller budget for named poses; zero uses the configured budget.
+float64 timeout_sec
+# The Gateway task that owns this execution. A named pose that also opens hands
+# is refused unless the Gateway reports exactly this task as the active one.
+string gateway_task_id
 ---
 bool success
-# "" on success; the ComposeArmPose codes, POSE_RUNTIME_UNAVAILABLE,
-# POSE_RUNTIME_REJECTED or POSE_CANCELLED otherwise.
+# "" on success; ComposeArmPose, TASK_POSE_* or HAND_* errors,
+# POSE_RUNTIME_UNAVAILABLE, POSE_RUNTIME_REJECTED or POSE_CANCELLED otherwise.
 string error_code
 string message
 # true when the composition prepared for the plan was the one executed.
 bool used_prepared
 ---
-# "composing", "planning", "moving"
+# "composing", "planning", "moving"; for a named pose also "preflight", "arm_settling",
+# "takeover", "opening_left", "opening_right" and "confirming".
 string state
 float32 progress

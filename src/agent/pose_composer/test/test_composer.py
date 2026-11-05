@@ -74,6 +74,7 @@ def test_an_empty_or_overlong_description_never_reaches_the_model():
 
 def test_a_reached_pose_is_context_for_the_next_instruction():
     composer, calls = _composer(FORWARD)
-    composer.remember("双手向前伸直", dict(load().rest))
+    prepared = composer.compose("双手向前伸直", dict(load().rest))
+    composer.succeeded(prepared)
     composer.compose("再抬高一点", dict(load().rest))
     assert "双手向前伸直" in calls[-1][1]["content"]

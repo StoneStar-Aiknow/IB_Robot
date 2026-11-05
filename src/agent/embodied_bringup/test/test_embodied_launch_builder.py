@@ -1636,6 +1636,20 @@ def test_voice_bridge_reads_the_segment_tagged_transcripts_when_the_gate_pairs_b
     assert "transcript_topic" not in plain_params
 
 
+def test_external_audio_echo_filter_uses_segment_identity_even_without_speaker_gate():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        voice_asr_extra={
+            "input_mode": "external_vad",
+            "audio_input": {"topic": "/x2/speech_chunk"},
+            "transcript_topic": "/x2/transcript",
+        },
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+    assert _decode_launch_string(params["speech_chunk_topic"]) == "/x2/speech_chunk"
+    assert _decode_launch_string(params["transcript_topic"]) == "/x2/transcript"
+
+
 def test_voice_bridge_refuses_an_unbound_wake_event():
     with pytest.raises(ValueError, match="wake_event must be bound to a runtime description"):
         _voice_bridge_nodes(
@@ -1654,3 +1668,22 @@ def test_pose_composer_gives_the_gateway_its_action_only_when_enabled(public_des
 
     assert params["pose_composer_enabled"] is True
     assert _decode_launch_string(params["pose_composer_action"]) == "/pose_composer/execute"
+    assert json.loads(_decode_launch_string(params["pose_catalog_json"])) == {}
+
+
+@pytest.mark.parametrize("memory", [False, True])
+@pytest.mark.parametrize("lookup", [None, False, True])
+def test_agent_pose_lookup_and_writable_feedback_are_independent(memory, lookup):
+    from embodied_bringup.launch_builders.embodied import _pose_memory_agent_params
+
+    config = {"pose_composer": {"enabled": True, "memory": {"enabled": memory}}}
+    if lookup is not None:
+        config["pose_composer"]["lookup"] = {"enabled": lookup}
+    params = _pose_memory_agent_params(config, {"pose_composer_enabled": True})
+    assert params["pose_lookup_service"] == ("/pose_composer/lookup" if lookup is not False else "")
+    assert params["pose_feedback_service"] == ("/pose_composer/feedback" if memory else "")
+    assert "pose_feedback_phrases_json" not in params
+    assert _pose_memory_agent_params(config, {"pose_composer_enabled": False}) == {
+        "pose_lookup_service": "",
+        "pose_feedback_service": "",
+    }

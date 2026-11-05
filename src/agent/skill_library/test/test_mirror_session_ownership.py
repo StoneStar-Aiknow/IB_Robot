@@ -33,7 +33,7 @@ def observe(node, *, state="WAIT", holding=False, releasing=False, stamp=100.0):
     )
 
 
-@pytest.mark.parametrize("skill", ["wave_hand", "pick_object", "__primitive__:moveit_planning"])
+@pytest.mark.parametrize("skill", ["wave_hand", "pick_object", "return_to_task_pose", "__primitive__:moveit_planning"])
 @pytest.mark.parametrize("state", ["STANDBY", "MIRRORING"])
 def test_session_blocks_other_producers_even_when_runtime_mode_is_shared(node, skill, state):
     observe(node, state=state, holding=True)
@@ -73,13 +73,14 @@ def test_old_wait_after_start_reply_cannot_release_the_start_latch(node):
     assert not node._ensure_skill_control_mode("pick_object", None)[0]
 
 
-def test_observed_session_release_requires_idle_before_allowing_grasp(node):
+@pytest.mark.parametrize("skill", ["pick_object", "return_to_task_pose"])
+def test_observed_session_release_requires_idle_before_allowing_grasp(node, skill):
     node._mirror_session_start_latched = True
     observe(node, state="STANDBY", holding=True)
     observe(node)
-    assert not node._ensure_skill_control_mode("pick_object", None)[0]
+    assert not node._ensure_skill_control_mode(skill, None)[0]
     node._runtime_idle_for_admission = lambda: True
-    assert node._ensure_skill_control_mode("pick_object", None) == (True, "")
+    assert node._ensure_skill_control_mode(skill, None) == (True, "")
 
 
 def test_deployment_without_mirror_keeps_existing_behavior(node):

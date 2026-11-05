@@ -19,13 +19,15 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 
 from embodied_common.control_phrases import STOP_PHRASES
@@ -47,7 +49,14 @@ _ACTIVE_ASR_STATES = {"listening", "recognizing"}
 #: A refusal can contain a confirm word ("不执行" has 执行, "我不确定" has 确定); it must never
 #: acknowledge a plan. "没" is left out on purpose: "没问题" is consent.
 _NEGATION_MARKERS = ("不", "别")
-_PHRASE_FIELDS = ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "wake_phrases", "silent_skills")
+_PHRASE_FIELDS = (
+    "stop_phrases",
+    "bypass_phrases",
+    "confirm_phrases",
+    "cancel_phrases",
+    "wake_phrases",
+    "silent_skills",
+)
 
 
 @dataclass(frozen=True)
@@ -240,6 +249,9 @@ class Speak:
     then: tuple[Any, ...] = ()
     execution_id: str = ""
     terminal: bool = False
+    request_id: str = ""
+    kind: str = "reply"
+    expires_at: float = float("inf")
 
 
 @dataclass(frozen=True)
@@ -318,6 +330,9 @@ class _BridgeState:
     # Stopped by this channel but not yet terminal: the Agent may not have seen
     # the stop when it publishes the preview, so the channel drops it itself.
     stopped_request_id: str = ""
+    task_label: str = "当前任务"
+    last_busy_at: float = float("-inf")
+    receipt_spoken: bool = False
 
 
 def _normalize(text: str) -> str:
@@ -351,6 +366,39 @@ class VoiceBridgeCore:
         )
         #: Transcripts held for their measurement, in arrival order (``on_heard``).
         self._held: list[_HeldTranscript] = []
+        self._recent_speech: deque[tuple[str, float]] = deque(maxlen=16)
+        self._speech_windows: deque[list[float]] = deque(maxlen=16)
+        self._echo_segments: OrderedDict[Segment, None] = OrderedDict()
+
+    def note_speech(self, text: str, now: float, *, finished: bool = False) -> None:
+        self._recent_speech.append((_normalize(text), now))
+        if finished:
+            if self._speech_windows:
+                self._speech_windows[-1][1] = now + 1.0
+        else:
+            self._speech_windows.append([now, float("inf")])
+
+    def note_audio(self, segment: Segment, captured_at: float) -> None:
+        if any(start <= captured_at <= end for start, end in self._speech_windows):
+            self._echo_segments[segment] = None
+            while len(self._echo_segments) > 128:
+                self._echo_segments.popitem(last=False)
+
+    def is_recent_echo(self, text: str, now: float) -> bool:
+        if self.is_stop_text(text):
+            return False
+        value = _normalize(text)
+        return len(value) >= 6 and any(
+            now - stamp <= 20.0 and SequenceMatcher(None, value, spoken).ratio() >= 0.78
+            for spoken, stamp in self._recent_speech
+        )
+
+    def speech_is_current(self, action: Speak, now: float) -> bool:
+        return action.kind not in ("busy", "receipt") or (
+            action.request_id == self.active_request_id
+            and self._state.stopped_request_id != action.request_id
+            and now < action.expires_at
+        )
 
     @property
     def active_request_id(self) -> str:
@@ -426,6 +474,8 @@ class VoiceBridgeCore:
         if self.config.feedback_only:
             return []
         heard_at = now if heard_at is None else heard_at
+        if not self.is_stop_text(text) and (segment in self._echo_segments or self.is_recent_echo(text, now)):
+            return [Log(f"ignored recent playback echo: {text!r}")]
         stopped_by_partial, self._state.utterance_stopped = self._state.utterance_stopped, False
         heard = str(text).strip()
         raw = self.config.correct(heard)
@@ -571,7 +621,18 @@ class VoiceBridgeCore:
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
             return [Log(f"ignored bypass utterance {raw!r}")]
         if state.active_request_id:
-            return [Log(f"busy with {state.active_request_id}; dropped {raw!r}"), *self._say(self.config.busy_message)]
+            actions = [Log(f"busy with {state.active_request_id}; dropped {raw!r}")]
+            if now - state.last_busy_at >= 10.0 and state.stopped_request_id != state.active_request_id:
+                state.last_busy_at = now
+                actions.append(
+                    Speak(
+                        f"正在做{state.task_label}，请稍等。",
+                        request_id=state.active_request_id,
+                        kind="busy",
+                        expires_at=now + 5.0,
+                    )
+                )
+            return actions
         if len(normalized) < self.config.min_text_chars:
             return [Log(f"ignored short utterance {raw!r}")]
         self._gate.note_handled(heard_at)
@@ -590,6 +651,9 @@ class VoiceBridgeCore:
             payload["reply_to_request_id"] = state.clarification_request_id
             state.clarification_request_id = ""
         state.active_request_id = request_id
+        state.task_label = _spoken_label(raw)
+        state.last_busy_at = float("-inf")
+        state.receipt_spoken = False
         state.active_since = now
         state.last_activity = now
         state.known_request_ids.add(request_id)
@@ -608,8 +672,13 @@ class VoiceBridgeCore:
                 return []
             message = str(payload.get("message", "")).strip()
             reason = payload.get("reason_code", "")
-            spoken = self.config.busy_message if reason == "BUSY" else _spoken_reply(payload.get("state"), message)
-            return [Log(f"request {request_id} not admitted: {reason} {message}"), *self._say(spoken)]
+            actions = [Log(f"request {request_id} not admitted: {reason} {message}")]
+            if reason != "BUSY":
+                actions.extend(self._say(_spoken_reply(payload.get("state"), message)))
+            return actions
+        if payload.get("accepted") is True and request_id == self.active_request_id and not self._state.receipt_spoken:
+            self._state.receipt_spoken = True
+            return [Speak("收到，正在准备。", request_id=request_id, kind="receipt", expires_at=now + 3.0)]
         return []
 
     def on_event(self, payload: dict[str, Any], now: float) -> list[Action]:
@@ -631,7 +700,12 @@ class VoiceBridgeCore:
         if event_type == "continuation":
             # The Agent resolved "继续" against its ledgers; tell the user what resumes.
             message = str(payload.get("user_message", "")).strip()
-            return [Log(f"request {request_id} continuation: {message}"), *self._say(message)]
+            detail = payload.get("detail") or {}
+            continuation = detail.get("continuation") or {}
+            target = (continuation.get("interrupted_step") or {}).get("target_name")
+            if target:
+                self._state.task_label = _spoken_label(target)
+            return [Log(f"request {request_id} continuation: {message}"), *self._say("从当前位置继续准备。")]
         if event_type == "reply_preview":
             return self._on_reply_preview(payload, request_id)
         if state not in TERMINAL_REQUEST_STATES:
@@ -646,10 +720,13 @@ class VoiceBridgeCore:
         if isinstance(payload.get("detail"), dict) and payload["detail"].get("execution_id"):
             return self._execution_speech(payload)
         spoken = "" if silent else _spoken_reply(state, message)
+        detail = payload.get("detail") or {}
+        if state == "SUCCEEDED" and isinstance(detail, dict) and detail.get("save_prompt"):
+            spoken = "执行完成。" + str(detail["save_prompt"])
         log = Log(f"request {request_id} {event_type} {state}: {message}")
         if previewed and spoken == previewed:
             return [log, Log(f"request {request_id} reply was already said as its preview")]
-        return [log, *self._say(spoken)]
+        return [log, *self._say(spoken, kind="terminal")]
 
     def _execution_speech(self, payload: dict[str, Any]) -> list[Action]:
         if payload.get("event_type") not in {"execution_progress", "terminal", "quarantined", "failed", "cancelled"}:
@@ -741,6 +818,7 @@ class VoiceBridgeCore:
         if not isinstance(presentation, dict) or presentation_digest(presentation) != detail.get("presentation_digest"):
             return [Log(f"presentation digest mismatch for {request_id}; not acknowledging")]
         summary = _presentation_summary(presentation, payload.get("user_message", ""))
+        self._state.task_label = _spoken_label(summary)
         plan_log = Log("exact plan " + json.dumps(presentation, ensure_ascii=False, sort_keys=True))
         if self._is_silent_presentation(presentation):
             # The clip is the reply: announcing the plan and then saying "执行完成。" would talk over it.
@@ -823,10 +901,10 @@ class VoiceBridgeCore:
             self._state.pending = None
         return True
 
-    def _say(self, text: str) -> list[Action]:
+    def _say(self, text: str, *, kind: str = "reply") -> list[Action]:
         if not text or not self.config.speak_replies:
             return []
-        return [Speak(text)]
+        return [Speak(text, kind=kind)]
 
 
 def _spoken_reply(state: Any, message: str) -> str:
@@ -834,11 +912,28 @@ def _spoken_reply(state: Any, message: str) -> str:
     return execution_reply(str(state), fallback=message)
 
 
+def _spoken_label(text: str) -> str:
+    value = re.sub(r"[A-Za-z_][A-Za-z_0-9-]*", "", str(text).replace("V字", "胜利手势"))
+    value = value.strip(" ：:，,。()（）")
+    return value[:18] if re.search(r"[\u4e00-\u9fff]", value) else "当前动作"
+
+
+def _tts_text(text: str) -> str:
+    """The deployed Chinese frontend rejects English words and internal IDs."""
+    text = str(text).replace("free_pose", "自由姿态").replace("(remembered)", "").replace("V字", "胜利手势")
+    text = re.sub(r"[A-Za-z_][A-Za-z_0-9-]*", "", text).strip()
+    return text if re.search(r"[\u4e00-\u9fff]", text) else "正在处理。"
+
+
 def _presentation_summary(presentation: dict[str, Any], fallback: Any) -> str:
+    steps = presentation.get("steps") or []
+    targets = [str(step.get("target_name", "")) for step in steps if isinstance(step, dict)]
+    if any(re.search(r"[\u4e00-\u9fff]", target) for target in targets):
+        return _spoken_label("、".join(targets))
     summary = presentation.get("summary")
     if isinstance(summary, str) and summary.strip():
-        return summary.strip()
-    return str(fallback or "").strip() or "当前计划"
+        return _spoken_label(summary)
+    return _spoken_label(fallback)
 
 
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:
@@ -866,6 +961,7 @@ def node_parameter_defaults() -> dict[str, Any]:
     """ROS parameter defaults: transport names plus every ``VoiceBridgeConfig`` default, declared once."""
     defaults: dict[str, Any] = {
         "input_topic": "/voice_command",
+        "speech_chunk_topic": "",
         # voice_asr_node publishes/listens on these fixed names; an empty partial_topic disables
         # the realtime (partial-transcript) stop.
         "partial_topic": "/voice_partial",
@@ -1044,9 +1140,20 @@ def _build_node_class():
             self._request_publisher = self.create_publisher(String, str(values["request_topic"]), 10)
             self._control_publisher = self.create_publisher(String, str(values["control_topic"]), 10)
             self._asr_control_publisher = self.create_publisher(String, str(values["asr_control_topic"]), 10)
+            self._active_audio_segments: dict[str, int] = {}
+            if values["speech_chunk_topic"]:
+                from ibrobot_msgs.msg import SpeechAudioChunk
+
+                self.create_subscription(
+                    SpeechAudioChunk,
+                    str(values["speech_chunk_topic"]),
+                    self._on_audio_chunk,
+                    50,
+                    callback_group=inbound,
+                )
             if self._core.config.feedback_only:
                 transcript_topic = "feedback only"
-            elif self._core.config.pairs_by_segment:
+            elif self._core.config.pairs_by_segment or values["transcript_topic"]:
                 from ibrobot_msgs.msg import SpeechTranscript
 
                 if not values["transcript_topic"]:
@@ -1122,6 +1229,22 @@ def _build_node_class():
 
         def _on_segment_transcript(self, message: Any) -> None:
             self._hear(str(message.text), (str(message.source_id), int(message.segment_sequence)))
+
+        def _on_audio_chunk(self, message: Any) -> None:
+            source = str(message.source_id)
+            if message.state == message.STATE_BEGIN:
+                self._active_audio_segments[source] = int(message.sequence)
+                if len(self._active_audio_segments) > 16:
+                    del self._active_audio_segments[next(iter(self._active_audio_segments))]
+            sequence = self._active_audio_segments.get(source)
+            if sequence is not None:
+                stamp = message.header.stamp
+                age = self.get_clock().now().nanoseconds / 1e9 - (stamp.sec + stamp.nanosec / 1e9)
+                captured_at = time.monotonic() - max(0.0, age) if stamp.sec else time.monotonic()
+                with self._core_lock:
+                    self._core.note_audio((source, sequence), captured_at)
+            if message.state == message.STATE_END:
+                self._active_audio_segments.pop(source, None)
 
         def _hear(self, text: str, segment: Segment | None) -> None:
             if self._core.config.feedback_only:
@@ -1205,6 +1328,19 @@ def _build_node_class():
                                     for queued in self._speech_queue
                                     if queued.execution_id != action.execution_id or queued.terminal
                                 ]
+                            if action.kind == "terminal":
+                                # Clear outdated announcements, but never drop a legacy
+                                # presentation receipt that carries dependent control.
+                                self._speech_queue = [queued for queued in self._speech_queue if queued.then]
+                                self._speech_queue.insert(0, action)
+                                self._speech_wakeup.notify()
+                                continue
+                            if action.kind in ("busy", "receipt"):
+                                self._speech_queue = [
+                                    queued for queued in self._speech_queue if queued.kind not in ("busy", "receipt")
+                                ]
+                            else:
+                                self._speech_queue = [queued for queued in self._speech_queue if queued.kind != "busy"]
                             self._speech_queue.append(action)
                             self._speech_wakeup.notify()
 
@@ -1236,8 +1372,12 @@ def _build_node_class():
             return super().destroy_node()
 
         def _render_speech(self, action: Speak) -> None:
+            text = _tts_text(action.text)
             with self._core_lock:
+                if not self._core.speech_is_current(action, time.monotonic()):
+                    return
                 interruptible = self._core.interruptible
+                self._core.note_speech(text, time.monotonic())
             # Muting ASR would also drop the stop keyword, so it is only done while nothing can move.
             # A reply that itself contains a stop word would stop the request it talks about, so it
             # still mutes (and says so).
@@ -1252,8 +1392,8 @@ def _build_node_class():
             elif filter_echo:
                 self._echo_until = float("inf")
             try:
-                self.get_logger().info(f"[say] {action.text}")
-                spoken = self._speaker.speak(action.text)
+                self.get_logger().info(f"[say] {text}")
+                spoken = self._speaker.speak(text)
             finally:
                 settled = time.monotonic() + self._resume_settle_sec
                 if muted:
@@ -1261,6 +1401,8 @@ def _build_node_class():
                     self._deaf_until = settled
                 elif filter_echo:
                     self._echo_until = settled
+                with self._core_lock:
+                    self._core.note_speech(text, time.monotonic(), finished=True)
             if spoken:
                 self._execute(action.then)
             elif action.then:

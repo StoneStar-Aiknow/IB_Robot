@@ -142,7 +142,7 @@ class FakeExecution:
         from ibrobot_agent.contracts import ExecutionResult, Presentation, TaskRef
 
         self.calls += 1
-        task_ref = TaskRef("task-1", "plan-1", "plan-digest", "epoch", 1, "digest", 1)
+        task_ref = TaskRef("task-1", "plan-1", "plan-digest", "epoch", 1, "digest", len(proposal.outcome.steps))
         presentation_callback(
             Presentation(
                 task_ref=task_ref,
@@ -824,6 +824,31 @@ def _wait_state(service, key, states, timeout=2.0):
     return service.get_request(key)
 
 
+def test_long_failure_is_persisted_and_does_not_quarantine_robot(tmp_path):
+    message = "finger drift exceeded; preparation=" + "x" * 2208
+
+    class LongFailure(FakeExecution):
+        def execute(self, *args, **kwargs):
+            return replace(super().execute(*args, **kwargs), message=message)
+
+    events = Events()
+    execution = LongFailure(status="failed", execution_mode=ASYNC_PRESENTATION_MODE)
+    service, _ = _async_service(tmp_path, events, execution=execution)
+    request = _request(text="请挥手")
+    try:
+        assert service.send_message(request).accepted
+        record = _wait_state(service, request.to_key(), {"FAILED", "UNKNOWN"})
+        assert record.state == "FAILED"
+        assert record.terminal.detail["raw_message"] == message
+        assert len(record.terminal.message) == 300
+        assert not service._store.is_robot_quarantined(request.robot_scope)
+        _wait_for_event(events, "terminal")
+        assert not any(event.state == "UNKNOWN" for event in events.items)
+        assert execution.stop_calls == 0
+    finally:
+        service.close()
+
+
 @pytest.mark.parametrize("broken_transport", [False, True])
 def test_async_program_executes_without_receipt_or_working_display(tmp_path, broken_transport):
     events = FailingEvents() if broken_transport else Events()
@@ -1010,9 +1035,9 @@ class NamedCatalog(FakeCatalog):
 
 
 class CatalogRecordingPlanner(FakePlanner):
-    def plan(self, request, context, catalog, cancel_token):
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
         self.catalog = catalog
-        return super().plan(request, context, catalog, cancel_token)
+        return super().plan(request, context, catalog, cancel_token, on_preview=on_preview)
 
 
 def test_plan_is_presented_with_the_chinese_catalog_names_of_its_steps(tmp_path):
@@ -1042,7 +1067,8 @@ def test_plan_is_presented_with_the_chinese_catalog_names_of_its_steps(tmp_path)
     try:
         request = _request(text="挥手然后握手")
         assert service.send_message(request).accepted
-        assert _wait_state(service, request.to_key(), {"SUCCEEDED"}).state == "SUCCEEDED"
+        terminal = _wait_state(service, request.to_key(), {"SUCCEEDED"})
+        assert terminal.state == "SUCCEEDED", terminal
         presentation = next(event for event in events.items if event.event_type == "presentation")
         assert presentation.detail["presentation"]["summary"] == "挥手、握手"
         # The names only word replies: what the planner is given is unchanged.
@@ -1062,6 +1088,23 @@ def test_plan_summary_is_kept_when_a_step_has_no_chinese_catalog_name():
 
     for catalog in ({CATALOG_SKILL_NAMES_ZH: {"wave_hand": "挥手"}}, {}):
         assert AgentService._bind_summary_to_catalog_names(outcome, catalog).summary == "wave_hand、nav_turn"
+
+
+@pytest.mark.parametrize("target", ["双手举过头顶", "arms_up"])
+def test_pose_summary_cannot_name_the_opposite_first_seed_alias(target):
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="举起双手再回准备位。",
+        summary="举起双手、回准备位",
+        steps=(
+            CanonicalWorkflowStep(1, "free_pose", target_name=target),
+            CanonicalWorkflowStep(1, "return_to_task_pose", target_name="grasp_ready"),
+        ),
+    )
+    catalog = {CATALOG_SKILL_NAMES_ZH: {"free_pose": "双臂放下", "return_to_task_pose": "回准备位"}}
+    bound = AgentService._bind_summary_to_catalog_names(outcome, catalog)
+    assert bound.summary == ("双手举过头顶、回准备位" if target != "arms_up" else outcome.summary)
+    assert bound.steps == outcome.steps
 
 
 def test_skill_list_names_skills_the_way_plans_do(tmp_path):
@@ -1107,3 +1150,43 @@ def test_a_repaired_planner_reply_is_answered_and_its_repairs_audited(tmp_path, 
         assert any("repaired" in entry.getMessage() for entry in caplog.records if entry.levelname == "WARNING")
     finally:
         service.close()
+
+
+def test_catalog_target_alias_is_bound_before_execution():
+    from embodied_common.workflow_contracts import CanonicalWorkflowStep
+
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="好的",
+        summary="回位",
+        steps=(CanonicalWorkflowStep(1, "return_to_task_pose", target_name="抓取初始位置"),),
+    )
+    skill = {
+        "name": "return_to_task_pose",
+        "parameters": {"properties": {"target_name": {"enum": ["grasp_ready"]}}},
+        "target_options": [{"target_name": "grasp_ready", "aliases": ["抓取初始位置"]}],
+    }
+    result = AgentService._bind_catalog_targets(outcome, {"skills": [skill]})
+    assert result.steps[0].target_name == "grasp_ready"
+    assert outcome.steps[0].target_name == "抓取初始位置"
+    skill["target_options"] = []
+    with pytest.raises(RuntimeError, match="invalid or ambiguous"):
+        AgentService._bind_catalog_targets(outcome, {"skills": [skill]})
+
+
+def test_catalog_target_rejects_ambiguous_alias():
+    from embodied_common.workflow_contracts import CanonicalWorkflowStep
+
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="好的",
+        summary="姿态",
+        steps=(CanonicalWorkflowStep(1, "free_pose", target_name="举手"),),
+    )
+    skill = {
+        "name": "free_pose",
+        "parameters": {"properties": {"target_name": {"enum": ["left_up", "right_up"]}}},
+        "target_options": [{"target_name": name, "aliases": ["举手"]} for name in ("left_up", "right_up")],
+    }
+    with pytest.raises(RuntimeError, match="invalid or ambiguous"):
+        AgentService._bind_catalog_targets(outcome, {"skills": [skill]})

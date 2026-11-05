@@ -392,7 +392,8 @@ def test_the_dexterous_profile_serves_trajectories_on_the_replay_it_already_has(
     trajectory_modes = {
         name for name, mode in omni["modes"].items() if name != "initial" and mode.get("allows_trajectory")
     }
-    assert trajectory_modes == set(omni["vendor"]["named_motion"]["trajectory_modes"])
+    assert set(omni["vendor"]["named_motion"]["trajectory_modes"]) <= trajectory_modes
+    assert trajectory_modes == {"stream", "policy_stream"}
     urdf = Path(__file__).resolve().parents[2] / "aimdk_description" / "urdf" / "x2_ultra.urdf"
     travel = {
         j.get("name"): [float(j.find("limit").get("lower")), float(j.find("limit").get("upper"))]

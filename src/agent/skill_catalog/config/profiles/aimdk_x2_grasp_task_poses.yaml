@@ -1,0 +1,10 @@
+schema_version: 1
+name: aimdk_x2_grasp_task_poses
+robot_name: aimdk_x2_grasp
+enabled_skills:
+- name: pick_object
+  implementation: aimdk_x2_grasp_task_poses
+  planner_visible: true
+- name: return_to_task_pose
+  implementation: x2_runtime_v1
+  planner_visible: true

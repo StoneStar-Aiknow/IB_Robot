@@ -82,6 +82,7 @@ def _node(*, enabled=True, status=None, required=("joint.trajectory", "gripper.1
         "_runtime_mode_for",
         "_request_runtime_mode",
         "_ensure_skill_control_mode",
+        "_mirror_session_allows_skill",
         "_control_mode_for_runtime",
     ):
         setattr(node, name, getattr(SkillExecutorNode, name).__get__(node))

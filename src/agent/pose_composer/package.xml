@@ -8,6 +8,7 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>rcl_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>control_msgs</depend>
@@ -16,6 +17,8 @@
   <depend>ibrobot_msgs</depend>
   <depend>embodied_common</depend>
   <exec_depend>aimdk_robot</exec_depend>
+  <!-- hands: opening an OmniHand reuses its mapping, collision model and runtime hand stream -->
+  <exec_depend>aimdk_grasp</exec_depend>
   <exec_depend>robot_runtime</exec_depend>
   <exec_depend>robot_config</exec_depend>
   <exec_depend>launch_ros</exec_depend>
@@ -24,6 +27,11 @@
   <exec_depend>python3-scipy</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
+  <test_depend>ibrobot_agent</test_depend>
+  <test_depend>skill_library</test_depend>
+  <test_depend>aimdk_grasp</test_depend>
+  <test_depend>aimdk_robot</test_depend>
+  <test_depend>robot_runtime</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -72,3 +72,13 @@ robot:
       model: DeepSeek-V4.1-Flash-1017
       timeout_sec: 60.0
       temperature: 0.3
+    # Poses the robot has done, shared by every conversation and kept across
+    # restarts. Two successful similar poses allow a save question; only explicit
+    # consent interpreted by the Agent confirms saving. New tasks never confirm
+    # a candidate. A confirmed pose is recalled without a generation model call. The seeds
+    # are pinned reference poses, re-solved against the current joint travel.
+    memory:
+      enabled: true
+      max_poses: 500
+      candidate_ttl_days: 7
+      seeds: true

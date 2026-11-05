@@ -274,6 +274,12 @@ def test_format_value_scalars_use_str() -> None:
     assert perceive_cli._format_value(0.1 + 0.2) == str(0.1 + 0.2)
 
 
+def test_extract_field_ignores_timestamped_fastdds_logs_around_message():
+    diagnostic = "2026-10-31 13:00:00.123 [Warning] [123] [RTPS_READER] Removing reader in topic: rt/joint_states\n"
+    stdout = diagnostic + "name: ['left', 'right']\nposition: [0.12, -0.31]\n---\n" + diagnostic
+    assert perceive_cli._extract_field(stdout, "position") == [0.12, -0.31]
+
+
 def test_format_value_compound_types_use_json() -> None:
     assert perceive_cli._format_value([0.12, -0.31]) == "[0.12, -0.31]"
     assert perceive_cli._format_value({"k": 1}) == '{"k": 1}'

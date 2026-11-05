@@ -324,12 +324,14 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
 
     pose_composer = robot_config.get("pose_composer", {})
     if isinstance(pose_composer, dict) and pose_composer.get("enabled") is True:
+        from robot_runtime.task_poses import task_pose_identity
+
         descriptor = DelegatedExecutorDescriptor(
             **delegated_executor_identity(
                 name="pose_composer",
                 endpoint_name=POSE_COMPOSER_ACTION,
                 endpoint_kind="ros_action",
-                configuration={},
+                configuration=task_pose_identity(robot_config.get("task_poses"), pose_composer),
             )
         )
         delegated[descriptor.name] = descriptor
@@ -373,6 +375,8 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         execution_endpoints=robot_execution_endpoints(robot_config),
         supported_control_modes=robot_supported_control_modes(robot_config),
     )
+    from robot_runtime.task_poses import pose_catalog
+
     primitive_contract = primitive_contract_for_version(robot_context.context_schema_version)
     return compile_skill_catalog(
         source,
@@ -382,6 +386,7 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
             primitive_contracts=primitive_contract.descriptors,
             primitive_contract_digest=primitive_contract.digest,
             delegated_executors=delegated,
+            pose_catalog=pose_catalog(robot_config.get("task_poses"), pose_composer),
         ),
     )
 
@@ -497,6 +502,7 @@ _PLANNER_SKILL_FIELDS = (
     "moves_robot",
     "required_control_mode",
     "parameters",
+    "target_options",
     "schema_version",
 )
 

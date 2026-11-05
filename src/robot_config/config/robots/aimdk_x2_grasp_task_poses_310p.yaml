@@ -1,0 +1,11 @@
+# Opt-in task-pose wiring; example targets are NOT hardware approved.
+robot:
+  base_config: aimdk_x2_grasp_310p.yaml
+  task_poses:
+    file: ../task_poses/x2_example.yaml
+  pose_composer:
+    enabled: true
+    memory:
+      enabled: false
+  embodied:
+    skill_catalog_profile: aimdk_x2_grasp_task_poses

@@ -278,6 +278,37 @@ def test_program_result_preserves_gateway_terminal_state(state, expected_status)
     assert result.status == expected_status
 
 
+def test_long_program_result_does_not_trigger_cancel_or_lose_terminal():
+    message = "finger drift exceeded; preparation=" + "x" * 2208
+
+    class Bridge(_ProgramExecutionBridge):
+        def send_program_goal(self, **kwargs):
+            future = super().send_program_goal(**kwargs)
+            result = future.result().get_result_async().result().result
+            result.message = message
+            result.error_code = "HAND_PRESERVED_MOVED"
+            result.completed_step_count = 3
+            return future
+
+        def cancel_execution(self, **kwargs):
+            pytest.fail("a received terminal must not request cancellation because of diagnostic length")
+
+    bridge = Bridge(state="FAILED", success=False)
+    adapter = _RosExecutionAdapter(bridge, timeout_policy={"rpc_timeout_sec": 1.0, "task_budget_sec": 30.0})
+    result = adapter.execute(
+        _proposal(),
+        expected_registry_identity=_proposal().catalog_identity,
+        presentation_callback=lambda _: None,
+        submission_callback=lambda *_: None,
+        stop_event=threading.Event(),
+    )
+    assert result.status == "failed"
+    assert result.detail["raw_message"] == message
+    assert result.detail["completed_step_count"] == 3
+    assert result.error_code == "HAND_PRESERVED_MOVED"
+    assert bridge.calls == ["program_submit"]
+
+
 def test_program_terminal_records_gateway_progress_and_exposes_the_ledger():
     class _ProgressBridge(_ProgramExecutionBridge):
         def send_program_goal(self, **kwargs):

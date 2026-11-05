@@ -363,6 +363,10 @@ def test_unreadable_gateway_ledger_refuses_without_motion(tmp_path):
         assert record.state == "ANSWERED"
         assert record.terminal.error_code == CONTINUE_REFUSED
         assert len(gateway.programs) == 1
+        # Terminal state is persisted before its event is published by the worker.
+        deadline = time.monotonic() + 1.0
+        while not _events_of(events, "r2", "continuation_refused") and time.monotonic() < deadline:
+            time.sleep(0.005)
         assert _events_of(events, "r2", "continuation_refused")
     finally:
         service.close()

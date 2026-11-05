@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -151,6 +152,15 @@ class SkillCatalogCompiler:
             manifest = discovered_manifests.get(skill_name)
             if manifest is None:
                 continue
+            manifest = copy.deepcopy(manifest)
+            options = context.pose_catalog.get(skill_name)
+            if options is not None:
+                if not options:
+                    raise ValueError(f"{skill_name} requires at least one configured pose")
+                manifest["capability"]["parameters"]["properties"]["target_name"] = {
+                    "type": "string",
+                    "enum": [item["target_name"] for item in options],
+                }
             manifests[skill_name] = manifest
             manifest_relative_path = _relative_path(package.manifest_path, release.root)
             manifest_diagnostics = [item for item in diagnostics if item.source_relative_path == manifest_relative_path]
@@ -288,6 +298,12 @@ class SkillCatalogCompiler:
                 "parameters": capability["parameters"],
                 "recovery_policy": capability["recovery_policy"],
             }
+            if options is not None:
+                capability_view[skill_name]["summary"] = (
+                    "Execute a configured pose by its canonical target_name ID from target_options; "
+                    "descriptions and aliases are for selection only, never execution arguments."
+                )
+                capability_view[skill_name]["target_options"] = options
             if "required_capabilities" in capability:
                 capability_view[skill_name]["required_capabilities"] = list(capability["required_capabilities"])
             if manifest["schema_version"] == 2:

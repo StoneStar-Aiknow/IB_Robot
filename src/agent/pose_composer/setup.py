@@ -9,6 +9,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/seeds", ["seeds/x2_poses.yaml"]),
     ],
     # mujoco is a venv dependency of the workspace (requirements); the model is the
     # vendor's, fetched by aimdk_robot's aimdk_fetch_x2_mjcf, never vendored.
@@ -22,6 +23,9 @@ setup(
     entry_points={
         "console_scripts": [
             "pose_composer_node = pose_composer.node:main",
+            "pose_memory = pose_composer.memory_cli:main",
+            "pose_compile_library = pose_composer.compile_library:main",
+            "pose_compile_validation = pose_composer.compile_validation:main",
         ],
         "ibrobot.launch_builders": [
             "pose_composer = pose_composer.launch_builder:POSE_COMPOSER_BUILDER",

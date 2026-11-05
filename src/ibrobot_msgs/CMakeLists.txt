@@ -145,6 +145,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetSemanticObjects.srv"
   "srv/ResolveSemanticTarget.srv"
   "srv/ComposeArmPose.srv"
+  "srv/LookupArmPose.srv"
+  "srv/ArmPoseFeedback.srv"
   "srv/SynthesizeSpeech.srv"
   "srv/PlayAudioFile.srv"
   "srv/StartTracking.srv"

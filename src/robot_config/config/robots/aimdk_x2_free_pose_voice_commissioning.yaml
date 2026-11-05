@@ -1,0 +1,40 @@
+# Small-motion real-X2 commissioning. Replies use a separately provisioned
+# workstation TTS/playback relay; synthesis and playback must both succeed
+# before the voice bridge acknowledges a motion presentation.
+robot:
+  name: aimdk_x2_skills
+  base_config: aimdk_x2_free_pose.yaml
+  embodied:
+    skill_catalog_profile: aimdk_x2_free_pose_commissioning
+    execution_store_path: /tmp/ibrobot-x2-commissioning/executions.sqlite3
+    agent:
+      channel_id: voice_asr
+      test_allowlist: [free_pose]
+      ledger_path: /tmp/ibrobot-x2-commissioning/requests.sqlite3
+      conversation_path: /tmp/ibrobot-x2-commissioning/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-x2-commissioning/agent.lock
+      voice_bridge:
+        enabled: true
+        confirm_mode: auto
+        tts_enabled: true
+        tts_timeout_sec: 60.0
+        mute_asr_during_tts: true
+        # No wake_phrases: accept ASR commands without an application prefix.
+  voice_asr:
+    enabled: true
+    input_mode: external_vad
+    active_mode: continuous
+    external_finalize_on_idle: true
+    audio_input:
+      interface: audio.speech
+      type: ibrobot_msgs/msg/SpeechAudioChunk
+    output_topic: /voice_command
+  voice_tts:
+    enabled: false
+    service_name: /commissioning/tts/synthesize
+    playback_service_name: /commissioning/tts/play
+  pose_composer:
+    max_joint_delta_rad: 0.06
+    max_hand_displacement_m: 0.025
+    memory:
+      enabled: false

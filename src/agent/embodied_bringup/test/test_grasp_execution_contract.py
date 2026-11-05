@@ -4,6 +4,7 @@ import json
 import time
 
 import pytest
+import rclpy
 from std_msgs.msg import String
 
 from embodied_common.execution_detail import ExecutionDetail
@@ -11,8 +12,19 @@ from embodied_common.execution_detail import ExecutionDetail
 from .grasp_contract_rig import ContractRig, wait_until
 
 
+@pytest.fixture(scope="module")
+def ros_context():
+    # Keep one DDS participant for this process's cases, as the live pipeline
+    # does. Each rig still creates and destroys its own nodes and executor.
+    rclpy.init()
+    try:
+        yield
+    finally:
+        rclpy.shutdown()
+
+
 @pytest.fixture
-def rig(request, tmp_path):
+def rig(request, tmp_path, ros_context):
     options = getattr(request, "param", {})
     instance = ContractRig(tmp_path, **options)
     try:

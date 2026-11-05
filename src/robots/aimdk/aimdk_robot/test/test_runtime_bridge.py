@@ -2848,6 +2848,12 @@ def test_a_partial_trajectory_goal_moves_its_joints_and_holds_the_rest(tmp_path)
         assert handle.accepted
         result = _trajectory_result(harness, handle)
         assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, result.result.error_string
+        # Action results and vendor commands arrive on separate DDS channels.
+        # Wait for wire delivery instead of assuming their callback order.
+        harness.wait_for(
+            lambda: harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(-1.0, abs=1e-6),
+            "the final trajectory target on the vendor wire",
+        )
         sent = list(harness.mock.last_upper_body.arm_pos)
         assert sent[_RIGHT_PITCH] == pytest.approx(-1.0, abs=1e-6)
         assert sent[projection.VENDOR_ARM_ORDER.index("right_elbow_joint")] == pytest.approx(-0.5, abs=1e-6)
@@ -2964,5 +2970,27 @@ def test_with_simulated_arms_a_trajectory_is_tracked_with_lag_and_sag(tmp_path):
         time.sleep(1.0)
         sag = received[-1] - (-1.57)
         assert 0.0 < sag < 0.25  # held short of the target against gravity, not dropped
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_task_pose_trajectory_in_policy_stream_preserves_mode_and_can_stop(tmp_path, cancel):
+    from action_msgs.msg import GoalStatus
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        assert harness.set_mode("policy_stream").success
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.3], 1.5)
+        assert handle.accepted
+        if cancel:
+            stopped = handle.cancel_goal_async()
+            harness.wait_for(stopped.done, "planned-trajectory cancel response")
+            assert stopped.result().goals_canceling
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
+        assert result.status == (GoalStatus.STATUS_CANCELED if cancel else GoalStatus.STATUS_SUCCEEDED)
+        assert harness.status().active_mode == "policy_stream"
     finally:
         harness.shutdown()

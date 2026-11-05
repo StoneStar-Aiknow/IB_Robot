@@ -19,6 +19,14 @@ robot:
     - model_inference
     - moveit_planning
 
+  # Mock reference only: hardware approval remains false in the example file.
+  task_poses:
+    file: ../task_poses/x2_example.yaml
+  pose_composer:
+    enabled: true
+    memory:
+      enabled: false
+
   control_modes:
     # Gestures, grasp, and mirror share the vendor's upper-body stream so
     # sequential skills do not switch between incompatible vendor modes.
@@ -147,6 +155,8 @@ robot:
         - mirror_stop
         - self_introduction
         - pick_object
+        - free_pose
+        - return_to_task_pose
     runtime_play_audio:
       clips:
         self_intro: "$(env WORKSPACE)/commissioning/audio/self_introduction.wav"

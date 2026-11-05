@@ -6,6 +6,7 @@ created. The root conftest reserves a localhost DDS domain before importing it.
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import threading
@@ -224,7 +225,9 @@ class ContractRig:
         if not tts_block:
             self.speech_gate.set()
         self.nodes = []
-        rclpy.init()
+        self._owns_context = not rclpy.ok()
+        if self._owns_context:
+            rclpy.init()
         self.executor = MultiThreadedExecutor(num_threads=10)
         self.thread = None
         self.server = None
@@ -442,13 +445,19 @@ class ContractRig:
     def close(self):
         self.speech_gate.set()
         if self.thread:
-            self.executor.shutdown(timeout_sec=5.0)
+            assert self.executor.shutdown(timeout_sec=5.0), "contract callbacks did not stop"
             self.thread.join(timeout=5.0)
+            assert not self.thread.is_alive(), "contract executor did not exit"
         for node in reversed(self.nodes):
             if isinstance(node, IncubationAgentNode):
                 node.close()
             node.destroy_node()
-        if rclpy.ok():
+        # Humble's executor can retain its last wait-set generator after spin
+        # exits. Release it while the context still exists, before another rig
+        # registers clients and services with the same public names.
+        self.executor = None
+        gc.collect()
+        if self._owns_context and rclpy.ok():
             rclpy.shutdown()
         if self.server:
             self.server.shutdown()

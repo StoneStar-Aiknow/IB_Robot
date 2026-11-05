@@ -131,6 +131,13 @@ class NamedMotionServer:
         # on the arm channel instead of being handed to the platform. Files are
         # resolved relative to the profile and validated at startup.
         self._trajectory_modes = [str(mode) for mode in config.get("trajectory_modes", [])]
+        # Caller-planned trajectories use the public mode capability. Keep
+        # recorded gesture replay modes independent of policy-stream preparation.
+        self._planned_trajectory_modes = [
+            str(name)
+            for name, mode in (node.profile.get("modes") or {}).items()
+            if isinstance(mode, dict) and mode.get("allows_trajectory") is True
+        ]
         self._blend_speed = float(config.get("trajectory_blend_speed_radps", 0.5))
         self._blend_min_s = float(config.get("trajectory_blend_min_s", 0.5))
         # A replay only succeeds if the measured arm followed it: the platform
@@ -177,7 +184,7 @@ class NamedMotionServer:
         endpoints = [str(e) for e in (node.profile.get("trajectory_actions") or [])]
         if endpoints:
             missing = sorted(set(projection.VENDOR_ARM_ORDER) - set(self._arm_limits))
-            if missing or not self._trajectory_modes:
+            if missing or not self._planned_trajectory_modes:
                 raise ValueError(
                     "trajectory_actions needs vendor.arm.limits for every arm joint and a trajectory mode; "
                     f"missing limits {missing}"
@@ -188,7 +195,9 @@ class NamedMotionServer:
                 endpoints[0],
                 execute_callback=self._execute_trajectory,
                 goal_callback=self._accept_trajectory,
-                cancel_callback=self._on_cancel,
+                # Caller-planned arm paths can always cancel between ticks.
+                # Keep the stricter preset/posture cancel policy separate.
+                cancel_callback=lambda _goal: CancelResponse.ACCEPT,
                 callback_group=node.action_callback_group,
             )
 
@@ -221,7 +230,7 @@ class NamedMotionServer:
         )
         return CancelResponse.REJECT
 
-    def _admission_failure(self) -> tuple[int, str] | None:
+    def _admission_failure(self, *, planned: bool = False) -> tuple[int, str] | None:
         """Why a named motion may not be dispatched right now, or None."""
         state = self._node.runtime_state
         if state.stop_latched:
@@ -235,6 +244,13 @@ class NamedMotionServer:
                 "runtime does not hold platform command arbitration",
             )
         mode = str(self._node.current_mode())
+        if planned:
+            if mode in self._planned_trajectory_modes:
+                return None
+            return (
+                ExecuteNamedMotion.Result.MODE_NOT_ALLOWED,
+                f"mode {mode!r} does not replay trajectories; use {self._planned_trajectory_modes}",
+            )
         if mode not in self._allowed_modes and mode not in self._trajectory_modes:
             return (
                 ExecuteNamedMotion.Result.MODE_NOT_ALLOWED,
@@ -297,13 +313,13 @@ class NamedMotionServer:
                 self._executing -= 1
 
     def _execute_trajectory_admitted(self, goal_handle, result):
-        failure = self._admission_failure()
+        failure = self._admission_failure(planned=True)
         if failure is not None:
             return self._fail_trajectory(goal_handle, result, failure[1])
         mode = str(self._node.current_mode())
-        if mode not in self._trajectory_modes:
+        if mode not in self._planned_trajectory_modes:
             return self._fail_trajectory(
-                goal_handle, result, f"mode {mode!r} does not replay trajectories; use {self._trajectory_modes}"
+                goal_handle, result, f"mode {mode!r} does not replay trajectories; use {self._planned_trajectory_modes}"
             )
         start = self._node.measured_arm_positions()
         if start is None:

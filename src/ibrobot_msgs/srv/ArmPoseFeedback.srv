@@ -1,0 +1,17 @@
+# What the user thought of the last pose executed in a conversation (pose_composer memory).
+#
+# offer/status: offer or inspect a save confirmation after two successful poses.
+# good: accept that pending question within 60 seconds. next_task cancels the
+# pending question without saving. bad rejects the pose for these phrases.
+
+string VERDICT_GOOD=good
+string VERDICT_BAD=bad
+string VERDICT_NEXT_TASK=next_task
+
+string session_id
+string verdict
+---
+bool success
+# The pose the verdict applied to; "" when the conversation has no pending pose.
+string pose_id
+string message

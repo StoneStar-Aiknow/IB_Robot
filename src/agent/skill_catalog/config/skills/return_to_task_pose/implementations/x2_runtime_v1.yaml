@@ -1,0 +1,7 @@
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: pose_composer
+required_args: [target_name]
+# Arms, then any hands the pose declares; the pose's own timeout_sec still bounds the run.
+timeout_sec: 90.0

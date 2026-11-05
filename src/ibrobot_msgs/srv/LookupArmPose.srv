@@ -1,0 +1,16 @@
+# Is there a confirmed remembered pose for these words? (pose_composer memory)
+#
+# Answered from the pose memory alone, without a language model, so the Agent
+# can skip planning for a pose the robot has already done and the user has
+# accepted. Only confirmed (active or pinned) poses whose fingerprint matches
+# the current model, prompt and joint travel are hits.
+
+string text
+---
+bool hit
+string pose_id
+# active | pinned
+string state
+string user_message
+# Confirmed poses and exact lookup phrases for semantic planning on a miss.
+string catalog_json

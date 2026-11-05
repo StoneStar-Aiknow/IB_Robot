@@ -1,5 +1,32 @@
 # ibrobot_agent 架构契约
 
+## 语音反馈与动作保存验收
+
+- 请求接受后异步播报“收到，正在准备”；任务执行不等待该播报。
+- 忙碌提示简短描述当前任务，间隔至少 10 秒，排队超过 5 秒或任务已结束时丢弃。
+- 外部分段音频按采集时间及段标识关联播放窗口；普通文本入口用近期播报文本相似度兜底。
+  停止词始终走快速通道。此过滤不是声学回声消除，真实环境仍需验证。
+- TTS 播报使用中文目标名称，技术摘要保留在日志，英文标识不传给中文前端。
+- 两次相近绝对姿态成功完成后询问“刚才这个动作到位吗？可以保存吗？”。
+  当前会话在 60 秒内明确同意才确认保存；否定、换话题、超时不保存。
+  未确认候选不参与动作缓存命中；近似姿态单独说明，种子库保持可用。
+- 保存意图由现有 Agent 在同一次规划调用中判断，无单独分类器或确认短语白名单。
+  `pending_pose_save` 提供会话内待确认动作 ID 和询问内容，规划结果使用 `pose_feedback`
+  （accept/decline/clarify/new_task/offer）表达决定，不要求模型回传动作 ID。
+  程序重新核验待确认动作；Composer 继续检查有效期和实际到达的目标。
+  含糊回复、缺少决定或模型失败保留确认、不延长有效期。拒绝保存只取消确认，不封禁动作。
+  保存和新动作可在同一个 workflow 结果中表达；新动作仍走原有 Gateway 校验。
+  移除了 `pose_feedback_phrases_json` 和 `pose_composer.memory.feedback` 旧配置。
+- 原文未命中时，LookupArmPose 的 `catalog_json` 返回当前可复用动作的标准表达、别名、
+  活动手臂和姿态描述，作为本次 Agent 上下文 `remembered_poses`。
+  Agent 可修正明确的识别错误并选择完整符合约束的标准表达；Composer 再次查库，
+  命中后跳过姿态生成模型，但仍做当前姿态与路径校验。
+  不符合左右手、高度、幅度等要求时保留完整描述生成；含义不确定时询问用户。
+  原始指令含相对要求时，即使 Agent 返回固定标准表达也不复用固定缓存。
+  此修改扩展了 ROS 服务响应，部署需同时重建 `ibrobot_msgs`、`ibrobot_agent` 和 `pose_composer`。
+- Mock 验收入口：`colcon test --merge-install --packages-select ibrobot_agent pose_composer`。
+  `test_voice_memory_mock.py` 使用真实 Agent、Composer、求解器和 SQLite，替代模型、动作执行和播报接口。
+
 `ibrobot_agent` 是 IB-Robot 自然语言 Agent 的孵化运行时包。它把用户的自然语言请求转成
 严格校验的 canonical Program，并把全部机器人执行委托给既有 Capability Gateway 链路
 （Agent ExecutionPort → `ExecuteProgram` → ExecutionStore → Safety Guard → Skill Executor）。
@@ -94,6 +121,14 @@ execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为�
   （字段、动作、原值）写入 ledger 的 `planner_outcome` 事件 `planner_repairs` 并记 warning 日志，不进入
   digest。workflow 回复从不修正；字段与类型矛盾（如澄清带 `steps`、对话带 `summary`）仍然拒绝。
 - 终态未知（UNKNOWN）进入 robot-scope quarantine，需人工介入。
+- 因适配器错误留下的 UNKNOWN 可在停机后使用 `ibrobot_agent_reconcile` 对账。
+  工具必须独占 Agent 部署锁和 Gateway 账本写锁，以只读方式读取 Gateway；请求 ID、机器人、
+  caller scope、Program 摘要、registry 身份及完成步数必须与保存的 TaskRef 一致，且机器人没有
+  未完成或 UNKNOWN 的 Gateway 执行。只接受确定终态，不以“网关空闲”代替证据。
+  原请求及 UNKNOWN 终态保持不变，独立保存操作者、证据和 Gateway 结果；同一旧请求不会重放，
+  其他未对账 UNKNOWN 仍阻止新任务。只在下一次启动时重新计算隔离状态。
+- 执行结果 `message` 为最多 300 字符的摘要；超长时截断，原文保存于 `detail.raw_message`，
+  并设置 `detail.message_truncated=true`。诊断长度不改变已收到的执行终态或触发额外取消。
 - 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
   供人工通过 Gateway 核实；确定未提交的中断请求转为 FAILED 或 CANCELLED_BEFORE_EXECUTION。
   不重放旧请求，不以 Gateway 空闲推断成功；已有终态和其他 robot scope 的记录保持原样。

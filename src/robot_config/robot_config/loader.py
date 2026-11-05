@@ -753,6 +753,14 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
     supported_control_modes = robot_supported_control_modes(robot_config)
     if context_schema_version >= 3 or supported_control_modes:
         preimage["supported_control_modes"] = list(supported_control_modes)
+    if robot_config.get("task_poses"):
+        preimage["task_poses"] = robot_config["task_poses"]
+    fixed_digest = (robot_config.get("pose_composer") or {}).get("fixed_library_sha256")
+    if fixed_digest:
+        preimage["fixed_library_sha256"] = fixed_digest
+    from robot_runtime.path_validation import path_validation_identity
+
+    preimage.update(path_validation_identity(robot_config.get("pose_composer")))
     return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
 
@@ -2057,6 +2065,15 @@ def load_robot_config_dict(
         resolve_robot_config_path(config_path=config_path)
     )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    from robot_config.task_poses import resolve_task_pose_file
+
+    resolve_task_pose_file(robot_config, resolved_config_path)
+    from robot_config.fixed_poses import resolve_fixed_poses
+
+    resolve_fixed_poses(robot_config, resolved_config_path)
+    from robot_config.path_validation import resolve_path_validation
+
+    resolve_path_validation(robot_config, resolved_config_path)
     runtime_section = robot_config.get("runtime") or {}
     if isinstance(runtime_section, dict) and "_disabled_peripherals" in runtime_section:
         # runtime-deployment-peripherals D2: the private key is framework

@@ -38,5 +38,12 @@ enabled_skills:
   implementation: x2_runtime_v1
   planner_visible: true
 - name: pick_object
-  implementation: aimdk_x2_grasp
+  # Reuse the preparation-aware 150 s implementation, not its robot profile.
+  implementation: aimdk_x2_grasp_task_poses
+  planner_visible: true
+- name: free_pose
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: return_to_task_pose
+  implementation: x2_runtime_v1
   planner_visible: true

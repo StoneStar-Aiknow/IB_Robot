@@ -291,8 +291,10 @@ class SkillCompileContext:
     primitive_contracts: Mapping[str, PrimitiveDescriptor]
     primitive_contract_digest: str
     delegated_executors: Mapping[str, DelegatedExecutorDescriptor]
+    pose_catalog: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "pose_catalog", deep_freeze(self.pose_catalog))
         object.__setattr__(self, "primitive_contracts", deep_freeze(self.primitive_contracts))
         object.__setattr__(self, "delegated_executors", deep_freeze(self.delegated_executors))
 

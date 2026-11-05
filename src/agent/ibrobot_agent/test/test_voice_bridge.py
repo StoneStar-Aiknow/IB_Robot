@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 from ibrobot_agent.addressee import Voiceprint
+from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE
 from ibrobot_agent.presentation import presentation_digest
 from ibrobot_agent.voice_bridge import (
     Log,
@@ -53,14 +54,106 @@ def test_transcript_becomes_agent_request_and_stop_phrase_bypasses_planner():
     assert [action.payload for action in _of(stop, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
 
 
-def test_busy_channel_drops_new_utterance_and_tells_user():
+def test_busy_channel_drops_new_utterance_and_briefly_names_current_task():
     core = _core()
     core.on_transcript("挥手", now=0.0)
 
     actions = core.on_transcript("点头", now=1.0)
 
     assert _of(actions, PublishRequest) == []
-    assert [action.text for action in _of(actions, Speak)] == [VoiceBridgeConfig.busy_message]
+    assert [a.text for a in _of(actions, Speak)] == ["正在做挥手，请稍等。"]
+    assert core.active_request_id == "voice-0"
+
+
+def test_busy_speech_is_rate_limited_and_expires_without_controlling_execution():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    first = core.on_transcript("你好", now=1.0)
+    assert [a.text for a in _of(first, Speak)] == ["正在做双手交叉放在胸前，请稍等。"]
+    assert not _of(first, PublishControl) and not _of(first, PublishRequest)
+    assert not _of(core.on_transcript("你好", now=2.0), Speak)
+    assert not core.speech_is_current(_of(first, Speak)[0], now=7.0)
+    later = core.on_transcript("你好", now=12.0)
+    assert len(_of(later, Speak)) == 1
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=13.0)
+    assert not core.speech_is_current(_of(later, Speak)[0], now=13.1)
+
+
+def test_acceptance_gets_one_async_receipt_and_never_waits_for_playback():
+    core = _core()
+    core.on_transcript("双手侧平举", now=0.0)
+    response = {"request_id": "voice-0", "accepted": True, "state": "RECEIVED"}
+    actions = core.on_response(response, now=0.01)
+    assert [a.text for a in _of(actions, Speak)] == ["收到，正在准备。"]
+    assert not _of(actions, Speak)[0].then
+    assert not core.on_response(response, now=0.02)
+    stop = core.on_partial("停", now=0.03)
+    assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
+
+
+def test_delayed_playback_text_and_captured_audio_cannot_trigger_busy_loop():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    core.note_speech("上次任务还没有完成任何步骤，现在重新执行。", now=1.0)
+    core.note_audio(("mic", 10), captured_at=1.2)
+    core.note_speech("上次任务还没有完成任何步骤，现在重新执行。", now=5.0, finished=True)
+    # ASR final arrives after the old playback+1s window, with a misrecognized first word.
+    actions = core.on_transcript("这个任务还没有完成任何步骤现在重新执行", now=6.24)
+    assert not _of(actions, Speak) and not _of(actions, PublishRequest)
+    actions = core.on_transcript("识别完全错误的内容", now=25.0, segment=("mic", 10))
+    assert not _of(actions, Speak) and not _of(actions, PublishRequest)
+    stop = core.on_transcript("停", now=25.1, segment=("mic", 10))
+    assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
+
+
+def test_internal_english_summary_is_not_sent_to_chinese_tts():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    presentation = {
+        "summary": "continue_cross_arms_on_chest",
+        "steps": [{"skill_name": "free_pose", "target_name": "双手交叉放在胸前"}],
+        "execution_mode": ASYNC_PRESENTATION_MODE,
+    }
+    event = _event(
+        "voice-0",
+        "presentation",
+        "MAY_EXECUTE",
+        detail={
+            "presentation": presentation,
+            "presentation_digest": presentation_digest(presentation),
+            "async_display": True,
+        },
+    )
+    actions = core.on_event(event, now=1.0)
+    assert [a.text for a in _of(actions, Speak)] == ["正在执行：双手交叉放在胸前。"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "正在执行：free_pose: 双手交叉放在胸前。",
+        "正在执行：continue_cross_arms_on_chest。",
+        "正在执行：free_pose: 双手侧平举 (remembered)。",
+        "做一个V字动作。",
+    ],
+)
+def test_deployed_chinese_tts_never_receives_internal_english(text):
+    import re
+
+    from ibrobot_agent.voice_bridge import _tts_text
+
+    spoken = _tts_text(text)
+    assert re.search(r"[\u4e00-\u9fff]", spoken)
+    assert not re.search("[A-Za-z_]", spoken)
+
+
+def test_save_question_is_spoken_only_after_success():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    actions = core.on_event(
+        _event("voice-0", "terminal", "SUCCEEDED", detail={"save_prompt": "刚才这个动作到位吗？可以保存吗？"}), now=1.0
+    )
+    assert [a.text for a in _of(actions, Speak)] == ["执行完成。刚才这个动作到位吗？可以保存吗？"]
 
 
 def test_auto_mode_executes_without_second_confirmation_once_plan_is_rendered():
@@ -92,7 +185,7 @@ def test_async_presentation_is_announced_without_a_receipt_or_a_confirmation_pro
 
     assert _of(actions, PublishControl) == []
     (speak,) = _of(actions, Speak)
-    assert speak.text == "正在执行：nod_yes。" and speak.then == ()
+    assert speak.text == "正在执行：当前动作。" and speak.then == ()
     assert not core.awaiting_confirmation
     assert any("cannot gate" in log.message for log in _of(actions, Log)) == (confirm_mode == "voice_confirm")
     # The robot is moving: a stop word still reaches the request.
@@ -430,7 +523,7 @@ def test_continuation_event_is_spoken_without_releasing_the_channel():
         _event("voice-0", "continuation", "PLANNING", "上次任务已完整完成 1/3 步，现在继续剩余部分"), now=1.0
     )
 
-    assert [action.text for action in _of(actions, Speak)] == ["上次任务已完整完成 1/3 步，现在继续剩余部分"]
+    assert [action.text for action in _of(actions, Speak)] == ["从当前位置继续准备。"]
     assert core.active_request_id == "voice-0"
 
 
@@ -439,7 +532,7 @@ def test_continuation_event_is_spoken_without_releasing_the_channel():
     [
         (
             {"accepted": False, "state": "BUSY", "reason_code": "BUSY", "message": "robot scope has an active request"},
-            VoiceBridgeConfig.busy_message,
+            None,
         ),
         (
             {
@@ -458,7 +551,7 @@ def test_rejected_admission_is_spoken_in_chinese(response, spoken):
 
     actions = core.on_response({"request_id": "voice-0", **response}, now=1.0)
 
-    assert [action.text for action in _of(actions, Speak)] == [spoken]
+    assert [action.text for action in _of(actions, Speak)] == ([] if spoken is None else [spoken])
 
 
 @pytest.mark.parametrize(
@@ -541,6 +634,22 @@ def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
         {"operation": "stop", "request_id": "voice-0"}
     ]
     assert node._request_publisher.messages == []  # the echo was not routed as a command
+
+
+def test_terminal_feedback_discards_queued_busy_speech_without_delaying_stop_control():
+    import threading
+
+    core = _core()
+    core.on_transcript("双手侧平举", now=0.0)
+    node = _speaking_node(core, [])
+    node._speech_queue = []
+    node._speech_wakeup = threading.Condition()
+    node._execute([Speak("正在做双手侧平举，请稍等。", kind="busy"), Speak("收到，正在准备。", kind="receipt")])
+    # _execute queues TTS, it never invokes the blocking speaker in the input callback.
+    node._execute(core.on_partial("停", now=1.0))
+    assert node._control_publisher.messages
+    node._execute(core.on_event(_event("voice-0", "terminal", "CANCELLED"), now=2.0))
+    assert [action.text for action in node._speech_queue] == ["已停止。"]
 
 
 def test_reply_with_a_stop_word_still_mutes_asr():
@@ -626,7 +735,7 @@ def test_a_previewed_plan_on_the_receipt_path_is_still_rendered_before_its_recei
 
     assert _of(actions, PublishControl) == []
     (speak,) = _of(actions, Speak)
-    assert speak.text == "准备执行：nod_yes。"
+    assert speak.text == "准备执行：当前动作。"
     (ack,) = speak.then
     assert ack.payload["operation"] == "presentation_rendered"
 

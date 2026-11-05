@@ -9,6 +9,7 @@ description:
   - the user asks for an arm pose or posture by describing it (straight, raised, bent, spread, on the hips, on the head, at the chin)
   - the user adjusts the current arm pose (higher, lower, the other arm too, put one arm down)
   - the user asks to put the arms down or back
+  - the user requests the arms_down seed, which returns both arms to the configured grasp_ready task pose
   do_not_use:
   - condition: wave hello or goodbye
     instead_use: wave_hand
@@ -22,6 +23,7 @@ description:
   - 摆个姿势
   - 手伸直
   - 双手举起来
+  - 双臂放下
   - 手放下
   - 弯曲手臂
   - 叉腰

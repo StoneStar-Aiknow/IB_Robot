@@ -101,6 +101,7 @@ modes:
   policy_stream:
     controllers: []
     allows_stream: true
+    allows_trajectory: true
     transitions:
     - idle
     - stream

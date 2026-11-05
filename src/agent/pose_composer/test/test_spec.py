@@ -69,3 +69,19 @@ def test_the_prompt_carries_the_current_pose_and_history():
     messages = spec.build_messages("再高一点", dict(load().rest), [("双手向前伸直", dict(load().rest))])
     assert "当前姿态" in messages[1]["content"] and "双手向前伸直" in messages[1]["content"]
     assert "hand_to" in messages[0]["content"]
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_relative_pose_preserves_the_wrist_while_absolute_pose_keeps_neutral_default(relative):
+    start = dict(load().rest, left_wrist_roll_joint=0.2)
+    pose = kin.fk(start)
+    out = _compose(
+        {
+            "kind": "pose",
+            "depends_on_current": relative,
+            "left": {"upper": pose.upper("left").tolist(), "fore": pose.fore("left").tolist()},
+            "right": {"keep": True},
+        },
+        start,
+    )
+    assert out.frames[0]["left_wrist_roll_joint"] == pytest.approx(0.2 if relative else 0.0)

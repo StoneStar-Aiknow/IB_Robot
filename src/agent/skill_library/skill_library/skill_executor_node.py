@@ -450,7 +450,7 @@ class _LateCleanupConfirmation:
             except Exception:
                 return
             result = getattr(wrapped_result, "result", wrapped_result)
-            if getattr(result, "error_code", "") != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
+            if getattr(result, "error_code", "") not in {PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "POSE_STOP_UNKNOWN"}:
                 self.confirm()
 
         result_future.add_done_callback(confirm_terminal)
@@ -624,6 +624,9 @@ class SkillExecutorNode(Node):
         # Arm poses composed from a description (ibrobot_msgs/action/ExecuteArmPose).
         self.declare_parameter("pose_composer_action", "", descriptor=startup_descriptor)
         self.declare_parameter("pose_composer_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("task_poses_json", "{}", descriptor=startup_descriptor)
+        self.declare_parameter("pose_validation_identity_json", "{}", descriptor=startup_descriptor)
+        self.declare_parameter("pose_catalog_json", "{}", descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -691,6 +694,12 @@ class SkillExecutorNode(Node):
             self.get_parameter("validate_primitive_service").get_parameter_value().string_value
         )
         self._named_poses = load_json_mapping(self.get_parameter("named_poses_json").get_parameter_value().string_value)
+        from robot_runtime.task_poses import normalize_task_poses
+
+        task_poses = json.loads(self.get_parameter("task_poses_json").value)
+        self._task_poses = normalize_task_poses(task_poses) if task_poses else {}
+        self._pose_validation_identity = json.loads(self.get_parameter("pose_validation_identity_json").value)
+        self._pose_catalog = json.loads(self.get_parameter("pose_catalog_json").value)
         self._named_targets = load_json_mapping(
             self.get_parameter("named_targets_json").get_parameter_value().string_value
         )
@@ -1357,8 +1366,15 @@ class SkillExecutorNode(Node):
             goal_handle._program_step_checkpoint = None
             self._execution_store.mark_committing(record.execution_id)
             program_owner = ExecutionOwner.workflow(program.root_task_id)
+            admission_started = time.monotonic()
             workflow_error, lease_token = self._gateway_policy.admit_workflow(
                 program_owner, self._runtime_snapshot(), timeout_sec=program.task_budget_sec
+            )
+            self._audit(
+                "gateway_admission",
+                task_id=program.root_task_id,
+                duration_sec=time.monotonic() - admission_started,
+                error_code=workflow_error or "",
             )
             program_admission = _ProgramAdmission(
                 SimpleNamespace(
@@ -1905,6 +1921,7 @@ class SkillExecutorNode(Node):
             primitive_contracts=getattr(self, "_primitive_descriptors", PRIMITIVE_CONTRACT_V1.descriptors),
             primitive_contract_digest=getattr(self, "_primitive_contract_digest", PRIMITIVE_CONTRACT_V1.digest),
             delegated_executors=self._delegated_executor_descriptors(),
+            pose_catalog=getattr(self, "_pose_catalog", {}),
         )
         snapshot = SkillCatalogCompiler().compile(
             source,
@@ -1946,6 +1963,15 @@ class SkillExecutorNode(Node):
                 "pose_composer configuration mismatch: "
                 f"runtime enabled={pose_runtime_enabled}, catalog enabled={pose_catalog_enabled}"
             )
+        if getattr(self, "_task_poses", {}):
+            from robot_runtime.task_poses import RETURN_TASK_POSE
+
+            templates = snapshot.templates
+            if (templates.get(RETURN_TASK_POSE) or {}).get("executor") != POSE_COMPOSER.EXECUTOR:
+                raise ValueError("task_poses requires return_to_task_pose in the skill catalog")
+            for skill in self._task_poses["skill_entry_poses"]:
+                if (templates.get(skill) or {}).get("executor") != "grasp_pipeline":
+                    raise ValueError("task-pose preparation requires a configured grasp_pipeline skill")
         sound_runtime_enabled = bool(getattr(self, "_sound_following_enabled", False))
         sound_catalog_enabled = "sound_following" in snapshot.enabled_skill_names
         if sound_runtime_enabled != sound_catalog_enabled:
@@ -2034,12 +2060,17 @@ class SkillExecutorNode(Node):
                 endpoint_name = getattr(self, "_pose_composer_action", "")
                 if not getattr(self, "_pose_composer_enabled", False) or not endpoint_name:
                     continue
+                from robot_runtime.task_poses import task_pose_identity
+
                 descriptor = DelegatedExecutorDescriptor(
                     **delegated_executor_identity(
                         name=name,
                         endpoint_name=endpoint_name,
                         endpoint_kind="ros_action",
-                        configuration={},
+                        configuration={
+                            **task_pose_identity(getattr(self, "_task_poses", {})),
+                            **getattr(self, "_pose_validation_identity", {}),
+                        },
                     )
                 )
                 descriptors[descriptor.name] = descriptor
@@ -2337,6 +2368,7 @@ class SkillExecutorNode(Node):
         template: dict,
         *,
         effective_timeout_sec: float | None = None,
+        named_pose: str = "",
     ) -> SkillCommand.Result:
         """Move the arms to the pose ``target_name`` describes, through the pose composer.
 
@@ -2349,7 +2381,7 @@ class SkillExecutorNode(Node):
         goal = goal_handle.request
         result = SkillCommand.Result()
         client = getattr(self, "_pose_composer_client", None)
-        text = str(goal.target_name or "").strip()
+        text = named_pose or str(goal.target_name or "").strip()
         if client is None:
             return self._abort_skill(
                 result, goal_handle, [], "POSE_COMPOSER_UNAVAILABLE", "pose composer is not enabled for this deployment"
@@ -2365,9 +2397,19 @@ class SkillExecutorNode(Node):
                 "POSE_COMPOSER_UNAVAILABLE",
                 f"pose composer action unavailable: {self._pose_composer_action}",
             )
-        executed = [f"{POSE_COMPOSER.EXECUTOR}:{goal.skill_name}"]
+        executed = [f"task_pose:{named_pose}" if named_pose else f"{POSE_COMPOSER.EXECUTOR}:{goal.skill_name}"]
         pose_goal = ExecuteArmPose.Goal()
-        pose_goal.text = text
+        pose_goal.timeout_sec = timeout_sec
+        # A deployment with articulated-hand checks also binds free-pose arm
+        # trajectories to the Gateway owner while checking preserved fingers.
+        lease = getattr(self, "_gateway_lease", None)
+        owner = lease.owner if lease is not None else None
+        pose_goal.gateway_task_id = owner.root_task_id if owner is not None else str(goal.dispatch_binding.root_task_id)
+        if named_pose:
+            pose_goal.named_pose = named_pose
+            pose_goal.task_poses_digest = getattr(self, "_task_poses", {}).get("digest", "")
+        else:
+            pose_goal.text = text
 
         def feedback_cb(feedback_msg) -> None:
             feedback = SkillCommand.Feedback()
@@ -2416,8 +2458,15 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(
                     result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "pose execution state is unknown"
                 )
-            terminal = True
             wrapped = result_future.result()
+            pose_outcome = getattr(wrapped, "result", None) if wrapped is not None else None
+            if pose_outcome is None or pose_outcome.error_code == "POSE_STOP_UNKNOWN":
+                return self._abort_skill(
+                    result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "POSE_STOP_UNKNOWN: physical stop unconfirmed; Gateway admission retained; "
+                    + (str(pose_outcome.message) if pose_outcome is not None else "no pose result"),
+                )  # fmt: skip
+            terminal = True
         except Exception:
             self.get_logger().error(f"pose composer execution failed:\n{traceback.format_exc()}")
             if result_future is not None:
@@ -2453,6 +2502,71 @@ class SkillExecutorNode(Node):
         self._set_result_catalog_identity(result)
         result.diagnostics = []
         goal_handle.succeed()
+        return result
+
+    def _execute_prepared_pick_skill(self, goal_handle, template, *, effective_timeout_sec=None):
+        """A declared preparation phase within the admitted pick, never nested admission.
+
+        The pose snapshot is part of the catalog identity. The grasp action is
+        dispatched only after the pose server verifies fresh, stable feedback;
+        its perception/planning therefore starts after preparation completes.
+        """
+        from robot_runtime.task_poses import RETURN_TASK_POSE
+
+        config = getattr(self, "_task_poses", {})
+        name = config.get("skill_entry_poses", {}).get(goal_handle.request.skill_name)
+        if not name:
+            return self._execute_pick_skill(goal_handle, template, effective_timeout_sec=effective_timeout_sec)
+        if goal_handle.is_cancel_requested:
+            result = SkillCommand.Result()
+            self._cancel_skill(result, goal_handle, [], goal_handle.request.skill_name)
+            return result
+        budget = float(effective_timeout_sec or goal_handle.request.timeout_sec or template.get("timeout_sec", 120.0))
+        started = time.monotonic()
+        ready, reason = self._ensure_skill_capabilities(RETURN_TASK_POSE)
+        if not ready:
+            return self._abort_skill(SkillCommand.Result(), goal_handle, [], "CAPABILITY_MISSING", reason)
+        child = _DeferredTerminalGoalHandle(goal_handle)
+        feedback = SkillCommand.Feedback()
+        feedback.state, feedback.detail = "preparing", f"task_pose:{name}"
+        goal_handle.publish_feedback(feedback)
+        prepared = self._execute_pose_composer_skill(
+            child,
+            template,
+            effective_timeout_sec=min(budget, config["poses"][name]["timeout_sec"]),
+            named_pose=name,
+        )
+        if not prepared.success:
+            child.commit()
+            return prepared
+        if getattr(self, "_runtime_enabled", False):
+            status, reason = self._runtime_status_for_admission()
+            required = self._required_control_mode_for_skill(goal_handle.request.skill_name)
+            expected = self._runtime_mode_for(required or self._skill_required_control_mode)
+            if status is None or status.active_mode != expected:
+                return self._abort_skill(
+                    SkillCommand.Result(),
+                    goal_handle,
+                    list(prepared.executed_primitives),
+                    "CONTROL_MODE_MISMATCH",
+                    reason or "runtime mode changed during task preparation",
+                )
+        remaining = budget - (time.monotonic() - started)
+        if goal_handle.is_cancel_requested:
+            result = SkillCommand.Result()
+            self._cancel_skill(result, goal_handle, list(prepared.executed_primitives), goal_handle.request.skill_name)
+            return result
+        if remaining <= 0:
+            return self._abort_skill(
+                SkillCommand.Result(),
+                goal_handle,
+                list(prepared.executed_primitives),
+                "TASK_POSE_TIMEOUT",
+                "preparation exhausted the pick budget",
+            )
+        result = self._execute_pick_skill(goal_handle, template, effective_timeout_sec=remaining)
+        result.executed_primitives = [f"task_pose:{name}", *result.executed_primitives]
+        result.message = f"{result.message}; {prepared.message}".lstrip("; ")
         return result
 
     def _note_named_motion_cancel(self, motion: str, cancel_future) -> None:
@@ -4100,6 +4214,14 @@ class SkillExecutorNode(Node):
         result.success = False
         result.error_code = error_code
         result.message = short_message(message)
+        if (
+            getattr(goal_handle.request, "skill_name", "") in {"free_pose", "return_to_task_pose"}
+            and error_code == "TASK_POSE_NOT_REACHED"
+        ):
+            fill_execution_detail(
+                result.execution_detail,
+                ExecutionDetail(1, "verify", "FAILED", "verify", error_code, "NOT_NEEDED", 0, "MANUAL_CHECK"),
+            )
         if getattr(goal_handle.request, "skill_name", "") == "pick_object":
             detail = ExecutionDetail.from_value(result.execution_detail)
             if error_code in {"PICK_SERVER_UNAVAILABLE", "PICK_GOAL_REJECTED"}:
@@ -6481,7 +6603,9 @@ class SkillExecutorNode(Node):
             except ValueError:
                 result = SkillCommand.Result()
                 return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", "task budget is invalid")
+            admission_started = time.monotonic()
             admission = self._gateway_policy.admit(request, self._runtime_snapshot(), owner)
+            admission_sec = time.monotonic() - admission_started
             prepared = admission.prepared_request
             audit_context = {
                 "task_id": prepared.identity.task_id if prepared is not None else _binding_task_id(goal),
@@ -6501,6 +6625,9 @@ class SkillExecutorNode(Node):
                 )
                 self._active_runtime_generation_retained = self._active_runtime_bundle is not None
         self._audit("requested", **audit_context)
+        self._audit(
+            "gateway_admission", duration_sec=admission_sec, error_code=admission.error_code or "", **audit_context
+        )
         if not admission.admitted:
             self._audit("precondition_rejected", error_code=admission.error_code, **audit_context)
             result = SkillCommand.Result()
@@ -6588,7 +6715,11 @@ class SkillExecutorNode(Node):
             if cleanup_unknown:
                 result.success = False
                 result.error_code = SKILL_CANCEL_TIMEOUT
-                result.message = "cancel cleanup timed out"
+                result.message = (
+                    "cancel cleanup timed out; " + result.message
+                    if "POSE_STOP_UNKNOWN" in result.message
+                    else "cancel cleanup timed out"
+                )
                 self._audit(
                     "terminal",
                     error_code=result.error_code,
@@ -6870,7 +7001,11 @@ class SkillExecutorNode(Node):
         if cleanup_unknown:
             result.success = False
             result.error_code = SKILL_CANCEL_TIMEOUT
-            result.message = "cancel cleanup timed out"
+            result.message = (
+                "cancel cleanup timed out; " + result.message
+                if "POSE_STOP_UNKNOWN" in result.message
+                else "cancel cleanup timed out"
+            )
             deferred_goal_handle.force_abort()
             self._retain_admission_cleanup(
                 admission,
@@ -6948,7 +7083,7 @@ class SkillExecutorNode(Node):
         )
         template = active_templates.get(goal.skill_name, {})
         if str(template.get("executor", "")).strip() == "grasp_pipeline":
-            return self._execute_pick_skill(
+            return self._execute_prepared_pick_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
@@ -6972,10 +7107,13 @@ class SkillExecutorNode(Node):
                 effective_timeout_sec=effective_timeout_sec,
             )
         if str(template.get("executor", "")).strip() == POSE_COMPOSER.EXECUTOR:
+            from robot_runtime.task_poses import RETURN_TASK_POSE
+
             return self._execute_pose_composer_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
+                named_pose=goal.target_name if goal.skill_name == RETURN_TASK_POSE else "",
             )
         if str(template.get("executor", "")).strip() == "sound_following":
             return self._execute_sound_following_skill(

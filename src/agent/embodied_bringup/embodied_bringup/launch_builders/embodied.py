@@ -125,6 +125,19 @@ def apply_planner_base_url(robot_config: dict[str, Any], planner_base_url: str) 
     planner["base_url"] = url
 
 
+def _pose_memory_agent_params(robot_config: dict, common_params: dict) -> dict:
+    composer = robot_config.get("pose_composer") or {}
+    if not common_params.get("pose_composer_enabled"):
+        return {"pose_lookup_service": "", "pose_feedback_service": ""}
+    memory = composer.get("memory") or {}
+    return {
+        "pose_lookup_service": POSE_COMPOSER.LOOKUP_SERVICE if POSE_COMPOSER.lookup_enabled(composer) else "",
+        "pose_feedback_service": POSE_COMPOSER.FEEDBACK_SERVICE
+        if isinstance(memory, dict) and memory.get("enabled") is True
+        else "",
+    }
+
+
 def generate_embodied_nodes(
     robot_config: dict[str, Any],
     active_control_mode: str,
@@ -408,7 +421,16 @@ def generate_embodied_nodes(
     pose_composer = robot_config.get("pose_composer", {})
     if isinstance(pose_composer, dict) and pose_composer.get("enabled") is True:
         # Arm poses composed from a description; pose_composer's own builder launches the node.
-        common_params.update(pose_composer_enabled=True, pose_composer_action=POSE_COMPOSER.EXECUTE_ACTION)
+        from robot_runtime.path_validation import path_validation_identity
+        from robot_runtime.task_poses import pose_catalog
+
+        common_params.update(
+            pose_catalog_json=json.dumps(pose_catalog(robot_config.get("task_poses"), pose_composer), sort_keys=True),
+            pose_composer_enabled=True,
+            pose_composer_action=POSE_COMPOSER.EXECUTE_ACTION,
+            task_poses_json=json.dumps(robot_config.get("task_poses") or {}, sort_keys=True),
+            pose_validation_identity_json=json.dumps(path_validation_identity(pose_composer), sort_keys=True),
+        )
     if arm_surface:
         common_params.update(
             move_configuration_service=public_endpoint(
@@ -669,6 +691,8 @@ def generate_embodied_nodes(
                         "pose_compose_service": POSE_COMPOSER.COMPOSE_SERVICE
                         if common_params.get("pose_composer_enabled")
                         else "",
+                        # Recall confirmed poses and supply pending save context to the planner.
+                        **_pose_memory_agent_params(robot_config, common_params),
                     }
                 ],
             )
@@ -948,7 +972,11 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     pairs_by_segment = (
         voice_bridge.get("speaker_check_enabled") is True or voice_bridge.get("addressee_trigger") == "vendor_session"
     )
-    if pairs_by_segment:
+    audio_input = voice_asr.get("audio_input") or {}
+    chunk_topic = str(audio_input.get("topic", ""))
+    if voice_asr.get("input_mode") == "external_vad" and chunk_topic:
+        params["speech_chunk_topic"] = chunk_topic
+    if pairs_by_segment or params.get("speech_chunk_topic"):
         # The gate pairs each transcript with its segment's voiceprint and wake
         # event, so the bridge reads the segment-tagged copy the ASR publishes;
         # one source of truth, as for input_topic.

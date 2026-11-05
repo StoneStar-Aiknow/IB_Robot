@@ -41,3 +41,9 @@ def test_the_catalog_compiles_with_the_pose_composer_executor(config):
     assert "free_pose" in snapshot.planner_visible_skill_names
     assert snapshot.templates["free_pose"]["executor"] == "pose_composer"
     assert "pose_composer" in snapshot.delegated_executors
+
+
+def test_the_pose_memory_is_on_with_seeds_without_a_verdict_phrase_table(config):
+    memory = config["pose_composer"]["memory"]
+    assert memory["enabled"] is True and memory["seeds"] is True
+    assert "feedback" not in memory

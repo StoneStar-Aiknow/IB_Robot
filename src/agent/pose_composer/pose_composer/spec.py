@@ -17,32 +17,41 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
 
-import numpy as np
+from aimdk_robot.pose_backend.composition import (
+    LANDMARKS,
+    Composition,
+    SpecError,
+    compose,
+    describe,
+    moved_arms,
+    plan,
+    recall,
+    resolve,
+    signature_of,
+    targets_of,
+)
 
-from pose_composer import kin, planner, safety, solver
-from pose_composer.model import ARM_JOINTS, SIDES
+__all__ = [
+    "LANDMARKS",
+    "Composition",
+    "SpecError",
+    "compose",
+    "describe",
+    "moved_arms",
+    "plan",
+    "recall",
+    "resolve",
+    "signature_of",
+    "targets_of",
+    "build_messages",
+    "parse",
+    "memorable",
+]
 
 KINDS = ("pose", "sequence", "rejected", "no_motion")
-LANDMARKS = {
-    "head_top": ("头顶", (0.0, 0.0, 0.08)),
-    "forehead": ("额头", (0.08, 0.0, 0.0)),
-    "mouth": ("嘴", (0.08, 0.0, 0.0)),
-    "chin": ("下巴", (0.07, 0.0, -0.03)),
-    "left_ear": ("左耳", (0.0, 0.08, 0.0)),
-    "right_ear": ("右耳", (0.0, -0.08, 0.0)),
-    "back_of_head": ("后脑勺", (-0.08, 0.0, 0.0)),
-    "chest": ("胸口", (0.07, 0.0, 0.0)),
-    "front_of_chest": ("胸前正前方约 20 厘米处", (0.20, -0.02, 0.0)),
-    "belly": ("肚子", (0.08, 0.0, 0.0)),
-    "waist_left": ("左腰侧（叉腰的位置）", (0.0, 0.07, 0.0)),
-    "waist_right": ("右腰侧（叉腰的位置）", (0.0, -0.07, 0.0)),
-    "left_shoulder": ("左肩", (0.0, 0.0, 0.07)),
-    "right_shoulder": ("右肩", (0.0, 0.0, 0.07)),
-}
-ELBOW_HINTS = {"out": (0, 1, 0), "down": (0, 0, -1), "forward": (1, 0, 0), "up": (0, 0, 1), "back": (-1, 0, 0)}
-PROMPT_VERSION = "pose-hybrid-v3"
+
+PROMPT_VERSION = "pose-hybrid-v5"
 
 SYSTEM_PROMPT = (
     "你是人形机器人 X2 的上肢姿态规划器。用户用自然语言让机器人摆手臂姿势，你只控制左右两条手臂"
@@ -54,6 +63,8 @@ SYSTEM_PROMPT = (
     "每个回答都带 user_message：动作开始前播报给用户听的一句中文口语，不超过 30 个字，"
     "说要做什么（如「好的，双手向前伸直」），不要说已经做完。\n"
     "没被要求动的手臂保持当前姿态（keep=true）。相对指令（「再高一点」「左手也这样」）以当前姿态和对话历史为准。\n"
+    '姿势如果取决于当前姿态或之前的对话（相对指令、「回到刚才」「另一只手也这样」），加 "depends_on_current": true；'
+    "只是让另一只手保持不动（keep）不算。\n"
     "坐标系：以机器人自身为准，x 指向机器人正前方，y 指向机器人的左边，z 竖直向上。"
     "机器人的左手在 +y 一侧，右手在 −y 一侧。\n"
     "每条手臂二选一描述：\n"
@@ -70,34 +81,6 @@ SYSTEM_PROMPT = (
     'sequence 时：{"kind":"sequence","frames":[{"left":{...},"right":{...},"hold_s":1.0},...],"user_message":"..."}；'
     'rejected / no_motion 时：{"kind":"rejected","reason":"...","user_message":"..."}。\n'
 )
-
-
-class SpecError(ValueError):
-    """A pose description that must not be executed."""
-
-
-@dataclass
-class Composition:
-    kind: str
-    frames: list[dict[str, float]] = field(default_factory=list)
-    holds: list[float] = field(default_factory=list)
-    user_message: str = ""
-    reason: str = ""
-    approx: bool = False
-    residual: dict = field(default_factory=dict)
-
-
-def describe(q: dict[str, float]) -> dict:
-    """The current pose in the vocabulary of the prompt."""
-    pose = kin.fk(q)
-    return {
-        side: {
-            "upper": np.round(pose.upper(side), 2).tolist(),
-            "fore": np.round(pose.fore(side), 2).tolist(),
-            "elbow_bend_deg": round(pose.flex_deg(side)),
-        }
-        for side in SIDES
-    }
 
 
 def build_messages(text: str, current_q: dict[str, float], history: list[tuple[str, dict]] | None = None) -> list[dict]:
@@ -124,73 +107,14 @@ def parse(reply: str) -> dict:
     return data
 
 
-def _mirror(v, side):
-    v = np.asarray(v, float)
-    return v if side == "left" else v * np.array([1, -1, 1])
+def memorable(data: dict, composition: Composition, text: str, *, allow_approximate: bool = False) -> bool:
+    """Whether a composed pose may be remembered and recalled for the same words later."""
+    from pose_composer.memory import is_relative
 
-
-def _vector(value, name: str) -> np.ndarray:
-    v = np.asarray(value, float)
-    if v.shape != (3,) or not np.all(np.isfinite(v)) or np.linalg.norm(v) < 1e-6:
-        raise SpecError(f"{name} must be a non-zero 3-vector")
-    return v
-
-
-def compose(data: dict, start_q: dict[str, float]) -> Composition:
-    """Joint targets for a parsed description, each projected into the safe set."""
-    out = Composition(
-        str(data["kind"]), user_message=str(data.get("user_message", "")), reason=str(data.get("reason", ""))
+    return (
+        composition.kind == "pose"
+        and (allow_approximate or not composition.approx)
+        and not data.get("depends_on_current", False)
+        and not is_relative(text)
+        and bool(moved_arms(data))
     )
-    if out.kind in ("rejected", "no_motion"):
-        return out
-    specs = list(data["frames"]) if out.kind == "sequence" else [data]
-    if not specs or len(specs) > 4:
-        raise SpecError("a sequence needs 1 to 4 frames")
-    points = kin.fk({}).points
-    shoulders = solver.shoulder_points()
-    prev = dict(start_q)
-    for k, spec in enumerate(specs):
-        q = dict(prev)
-        for side in SIDES:
-            arm = spec.get(side) or {"keep": True}
-            if not isinstance(arm, dict) or arm.get("keep", False):
-                continue
-            if "hand_to" in arm:
-                name = str(arm["hand_to"])
-                if name not in LANDMARKS:
-                    raise SpecError(f"unknown body point {name!r}")
-                offset = np.asarray(LANDMARKS[name][1], float)
-                anchor = points["chest" if name == "front_of_chest" else name]
-                if name == "front_of_chest":
-                    offset = _mirror(offset, side)
-                extra = _vector(arm["offset_cm"], "offset_cm") / 100.0 if arm.get("offset_cm") else np.zeros(3)
-                if np.linalg.norm(extra) > 0.3:
-                    raise SpecError("offset_cm is limited to 30 cm")
-                hint = arm.get("elbow")
-                hint_vec = _mirror(ELBOW_HINTS[hint], side) if hint in ELBOW_HINTS else None
-                sol = solver.solve_hand(side, anchor + offset + extra - shoulders[side], hint_vec, q)
-                out.residual[f"{k}.{side}"] = {n: round(v, 3) for n, v in sol.residual_m.items()}
-            elif "upper" in arm and "fore" in arm:
-                sol = solver.solve_dirs(side, _vector(arm["upper"], "upper"), _vector(arm["fore"], "fore"), q)
-                out.residual[f"{k}.{side}"] = {n: round(v, 1) for n, v in sol.residual_deg.items()}
-            else:
-                raise SpecError(f"{side}: give upper+fore, hand_to, or keep")
-            q.update(sol.q)
-            out.approx |= sol.approx
-        q, _ = solver.project_safe(q)
-        if not safety.check_pose(q).ok:
-            raise SpecError(f"frame {k} has no safe pose near the description")
-        out.frames.append({n: float(q[n]) for n in ARM_JOINTS})
-        out.holds.append(min(max(float(spec.get("hold_s", 1.0)), 0.0), 5.0))
-        prev = q
-    if out.approx:
-        # Say so rather than let the robot claim a pose it could not reach.
-        out.user_message = (
-            out.user_message + " " if out.user_message else ""
-        ) + "（有的位置够不到，我做到了最接近的姿势）"
-    return out
-
-
-def plan(composition: Composition, start_q: dict[str, float]) -> planner.Plan:
-    full = [dict(start_q, **f) for f in composition.frames]
-    return planner.plan_safe(dict(start_q), full, composition.holds)

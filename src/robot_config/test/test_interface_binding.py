@@ -24,6 +24,39 @@ def description_api():
     return importlib.import_module("robot_runtime.interface_description")
 
 
+def test_pose_executor_binds_without_enabling_grasp(descriptor, description_api):
+    descriptor["interfaces"]["joint.trajectory_arm"] = {
+        "capability": "joint.trajectory",
+        "kind": "action",
+        "direction": "serve",
+        "endpoint": "/custom/arms",
+        "message_type": "control_msgs/action/FollowJointTrajectory",
+    }
+    descriptor["digest"] = description_api.description_digest(descriptor)
+    config = {
+        "grasp_execution": {"enabled": False},
+        "pose_composer": {
+            "enabled": True,
+            "interfaces": {
+                "trajectory": {
+                    "interface": "joint.trajectory_arm",
+                    "kind": "action",
+                    "type": "control_msgs/action/FollowJointTrajectory",
+                }
+            },
+        },
+    }
+    assert required_interface_ids(config) == ["joint.trajectory_arm"]
+    assert resolve_robot_interfaces(config, defer=True)["_interfaces_deferred"]
+    bound = bind_robot_interfaces(config, descriptor)
+    assert bound["pose_composer"]["interfaces"]["trajectory"]["endpoint"] == "/custom/arms"
+    config["pose_composer"]["interfaces"]["trajectory"]["type"] = "bad/type"
+    with pytest.raises(InterfaceBindingError, match="type_mismatch"):
+        bind_robot_interfaces(config, descriptor)
+    config["pose_composer"]["enabled"] = False
+    assert required_interface_ids(config) == []
+
+
 @pytest.fixture
 def descriptor(description_api):
     qos = {"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 5}

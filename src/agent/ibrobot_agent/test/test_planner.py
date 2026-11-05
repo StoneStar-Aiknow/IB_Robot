@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime, timezone
 
 import pytest
 
-from ibrobot_agent.contracts import AgentRequest, PlannerIdentity
+from ibrobot_agent.contracts import AgentRequest, PlannerIdentity, PlannerRepair
 from ibrobot_agent.planner import (
     PlannerAdapter,
     PlannerParseError,
@@ -204,6 +205,57 @@ def test_planner_adapter_builds_prompt_with_conversation_and_catalog():
     assert "上一轮" in client.messages[0]["content"] or "上一轮" in client.messages[1]["content"]
 
 
+def test_confirmed_pose_directory_reaches_model_with_constraint_rules():
+    poses = [
+        {
+            "pose_id": "thinking",
+            "target_name": "做一个思考的姿势",
+            "arms": ["right"],
+            "description": {"left": {"keep": True}, "right": {"hand_to": "chin"}},
+        }
+    ]
+    messages = build_planner_messages(
+        request=_request("思考的姿色"), context={"remembered_poses": poses}, catalog={"skills": []}
+    )
+    payload = json.loads(messages[1]["content"])
+    assert payload["conversation"]["remembered_poses"] == poses
+    assert payload["request"]["text"] == "思考的姿色"
+    assert "Never discard extra constraints" in messages[0]["content"]
+    assert "needs_clarification instead of guessing" in messages[0]["content"]
+
+
+@pytest.mark.parametrize("decision", ["accept", "decline", "clarify", "new_task", "offer"])
+def test_save_decision_round_trips_in_the_existing_planner_contract(decision):
+    payload = {"kind": "conversation", "user_message": "回复", "pose_feedback": decision}
+    outcome = parse_planner_outcome(json.dumps(payload))
+    assert outcome.to_dict() == payload
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"pose_feedback": "yes", "pose_id": "p1"},
+        {"pose_feedback": "accept", "pose_id": "p1"},
+        {"pose_id": "p1"},
+        {"pose_feedback": "offer", "pose_id": "p1"},
+    ],
+)
+def test_invalid_save_decisions_are_rejected(fields):
+    with pytest.raises(PlannerParseError):
+        parse_planner_outcome(json.dumps({"kind": "conversation", "user_message": "回复", **fields}))
+
+
+def test_save_question_is_context_for_the_same_model_call():
+    pending = {"pose_id": "p1", "message": "刚才动作到位吗？可以保存吗？"}
+    messages = build_planner_messages(
+        request=_request("动作到位，可以保存"), context={"pending_pose_save": pending}, catalog={"skills": []}
+    )
+    assert json.loads(messages[1]["content"])["conversation"]["pending_pose_save"] == pending
+    assert "SAME planning call" in messages[0]["content"]
+    assert "For pose_feedback=clarify, use kind=conversation" in messages[0]["content"]
+    assert "missing_fields must be a non-empty array" in messages[0]["content"]
+
+
 def test_planner_adapter_supports_ordinary_knowledge_answer():
     planner, _ = _planner_adapter(
         {
@@ -369,8 +421,10 @@ def test_rejection_with_an_invented_reason_code_is_still_refused_locally():
         }
     )
 
-    with pytest.raises(PlannerParseError, match="reason_code is invalid"):
-        planner.plan(_request("点个头"), {}, {}, threading.Event())
+    outcome = planner.plan(_request("点个头"), {}, {}, threading.Event())
+    assert outcome.kind == "rejected" and outcome.steps == ()
+    assert outcome.reason_code == "UNSUPPORTED_TASK"
+    assert outcome.repairs == (PlannerRepair("reason_code", "defaulted", "motion_not_authorized"),)
 
 
 @pytest.mark.parametrize("reason_code", sorted({"UNSUPPORTED_TASK", "OUT_OF_SCOPE", "SAFETY_RESTRICTED"}))
@@ -743,18 +797,6 @@ def test_a_clarification_without_missing_fields_is_still_asked():
         (["SAFETY_RESTRICTED"], "UNSUPPORTED_TASK", "defaulted"),
     ],
 )
-
-
-@pytest.mark.parametrize(
-    ("reason_code", "expected", "action"),
-    [
-        (" SAFETY_RESTRICTED ", "SAFETY_RESTRICTED", "normalized"),
-        ("out_of_scope", "OUT_OF_SCOPE", "normalized"),
-        ("NOT_A_REASON", "UNSUPPORTED_TASK", "defaulted"),
-        (None, "UNSUPPORTED_TASK", "defaulted"),
-        (["SAFETY_RESTRICTED"], "UNSUPPORTED_TASK", "defaulted"),
-    ],
-)
 def test_a_refusal_keeps_a_reason_the_contract_knows_and_records_the_original(reason_code, expected, action):
     outcome = _parse({"kind": "rejected", "user_message": "这个我做不到。", "reason_code": reason_code})
 
@@ -787,64 +829,12 @@ def test_a_refusal_keeps_a_reason_the_contract_knows_and_records_the_original(re
         {"kind": "read_only", "user_message": "我来查。", "query_kind": "list_skills", "skill_name": ""},
     ],
 )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {
-            "kind": "needs_clarification",
-            "user_message": "哪只手？",
-            "missing_fields": ["hand"],
-            "reason_code": "",
-            "skill_name": "",
-            "query_kind": None,
-            "steps": [],
-            "summary": "",
-        },
-        {
-            "kind": "rejected",
-            "user_message": "做不到。",
-            "reason_code": "OUT_OF_SCOPE",
-            "skill_name": "",
-            "missing_fields": [],
-        },
-        {"kind": "conversation", "user_message": "你好。", "reason_code": "", "skill_name": None, "summary": ""},
-        {"kind": "read_only", "user_message": "我来查。", "query_kind": "list_skills", "skill_name": ""},
-    ],
-)
 def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
     # Models fill the fields they do not use with empty values; dropping those loses nothing.
     outcome = _parse(payload)
 
     assert outcome.kind == payload["kind"]
     assert outcome.repairs == ()
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        # A question that also carries steps or a reason: the model's intent is ambiguous.
-        {
-            "kind": "needs_clarification",
-            "user_message": "哪只手？",
-            "missing_fields": ["hand"],
-            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
-        },
-        {"kind": "needs_clarification", "user_message": "哪只手？", "missing_fields": ["hand"], "reason_code": "X"},
-        {"kind": "rejected", "user_message": "做不到。", "reason_code": "OUT_OF_SCOPE", "summary": "wave_hand"},
-        # Workflow replies are never repaired.
-        {
-            "kind": "workflow",
-            "user_message": "准备执行。",
-            "summary": "挥手",
-            "reason_code": "",
-            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
-        },
-        # A read-only reply without its query has no unambiguous repair.
-        {"kind": "read_only", "user_message": "我来查。"},
-    ],
-)
 
 
 @pytest.mark.parametrize(
