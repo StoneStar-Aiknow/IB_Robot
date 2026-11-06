@@ -22,6 +22,9 @@ being ignored. Times are seconds.
                        the vendor ``priority``, and the ``"on"``/``"off"``
                        colours (``mode`` and ``rgb``)
 ``session_silent_s``   no session state message for longer: no session
+``max_session_s``      a session on (STANDBY or MIRRORING) this long is
+                       stopped like a long cover; counted from the first
+                       state that is not WAIT, cleared only by WAIT. 0: off
 
 ``"on"`` and ``"off"`` must be quoted in YAML, which otherwise reads them as
 booleans.
@@ -88,6 +91,7 @@ class OperatorConfig:
     touch: TouchConfig = field(default_factory=TouchConfig)
     led: LedConfig = field(default_factory=LedConfig)
     session_silent_s: float = 3.0
+    max_session_s: float = 0.0
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any] | None) -> OperatorConfig:
