@@ -24,7 +24,7 @@ per-person state is reset before the next frame. ``~/play``
 
 **Hands (optional).** With ``hand_frame_topic`` set it also follows the
 dexterous hands: ``HandFrame`` observations go through ``x2.hand_follow``
-(hand_core, loaded from ``hand_extern_dir``) and 20 hand radians are published every tick on
+(the packaged hand_core, or ``hand_extern_dir``'s) and 20 hand radians are published every tick on
 ``hand_preview_topic``, playing or not; the session decides when to use them.
 Empty (the default) creates neither the subscription nor the publisher.
 
@@ -116,7 +116,7 @@ class MotionImitationRetargetNode(Node):
         self.declare_parameter("hand_thumb_fold_tip_in", 0.25)
         self.declare_parameter("hand_thumb_fold_tip_out", 0.60)
         self.declare_parameter("hand_robot_json", "")
-        self.declare_parameter("hand_extern_dir", "/root/x2-dexhand-run/extern")
+        self.declare_parameter("hand_extern_dir", "")
 
         self._pear_topic = _validated_topic(self.get_parameter("pear_frame_topic").value, "pear_frame_topic")
         preview_topic = _validated_topic(self.get_parameter("preview_topic").value, "preview_topic")

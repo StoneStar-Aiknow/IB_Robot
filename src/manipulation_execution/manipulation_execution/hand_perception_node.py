@@ -19,8 +19,8 @@ Per frame:
      keypoints back to source pixels, split into the person's left / right hand,
      curls from the world keypoints, normalised by the calibration file.
 
-The hand pipeline and keypoint helper modules are not part of this package;
-they are loaded from ``extern_dir`` at start (see npu_hands.load_extern).
+The hand pipeline and keypoint helper modules ship with this package; a
+non-empty ``extern_dir`` loads them from there instead (see npu_hands.load_extern).
 """
 
 from __future__ import annotations
@@ -62,11 +62,11 @@ PARAMS = {
     "camera_topic": "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed",
     "pear_frame_topic": "/motion_imitation_stream/pear_frame",
     "frame_topic": "/hri/hand/frame",
-    "model_dir": "/root/x2-dexhand-run/models",
+    "model_dir": npu_hands.DEFAULT_MODEL_DIR,
     "extern_dir": npu_hands.DEFAULT_EXTERN_DIR,
     "device": 0,
     "rule_labels": False,
-    "calib_path": "",  # empty: extern_dir/data/dexhand_calib_mediapipe.json
+    "calib_path": "",  # empty: dexhand_calib_mediapipe.json, in the package or extern_dir/data
     "max_bbox_age_s": 0.5,
     "min_detector_score": 0.5,
     "reset_gap_s": 1.0,
@@ -124,17 +124,17 @@ class HandPerceptionNode(Node):
     def __init__(self):
         super().__init__("hand_perception")
         p = {k: self.declare_parameter(k, v).value for k, v in PARAMS.items()}
-        p["calib_path"] = p["calib_path"] or str(Path(p["extern_dir"]) / npu_hands.CALIB_MEDIAPIPE_JSON)
+        p["calib_path"] = p["calib_path"] or str(npu_hands.extern_path(p["extern_dir"], npu_hands.CALIB_MEDIAPIPE_JSON))
         self.p = p
         self.keypoints = npu_hands.load_extern(p["extern_dir"], npu_hands.KEYPOINTS_PY)
         calib = json.loads(Path(p["calib_path"]).read_text())
         fingers = self.keypoints.CURL_FINGERS
         # per side: (5,2) [open, fist] in CURL_FINGERS order
         self.calib = {s: np.array([calib["endpoints"][s][f] for f in fingers], dtype=np.float64) for s in SIDES}
-        for d, names in ((p["model_dir"], npu_hands.MODEL_FILES), (p["extern_dir"], npu_hands.EXTERN_FILES)):
-            for n in names:
-                f = Path(d) / n
-                self.get_logger().info(f"{f} sha256 {npu_hands.file_sha256(f) if f.is_file() else 'MISSING'}")
+        files = [*npu_hands.model_paths(p["model_dir"]).values()]
+        files += [npu_hands.extern_path(p["extern_dir"], n) for n in npu_hands.EXTERN_FILES]
+        for f in files:
+            self.get_logger().info(f"{f} sha256 {npu_hands.file_sha256(f) if f.is_file() else 'MISSING'}")
         self.get_logger().info(f"calib {p['calib_path']} sha256 {npu_hands.file_sha256(p['calib_path'])}")
 
         self._slot = None

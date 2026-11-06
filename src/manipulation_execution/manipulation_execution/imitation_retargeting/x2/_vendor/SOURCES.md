@@ -38,3 +38,31 @@ Patches:
 
 Not copied: the rest of `smplx2robot` (cli, export, delivery, safety, preview,
 compare, verify), which the streaming path does not import.
+
+## Dexterous hand (video2x2_runtime 570c53c)
+
+Copied byte for byte from video2x2_runtime commit 570c53c; only `hand_core.py`
+is PATCHED, and each edit carries an "IB-Robot patch" comment. Before this
+copy the same files were loaded at run time from `/root/x2-dexhand-run/extern`;
+a non-empty `extern_dir` still loads them from a directory
+(`hand_perception/npu_hands.load_extern`).
+
+| here | upstream | sha256 of the upstream file | sha256 here |
+| --- | --- | --- | --- |
+| `hand_core.py` (PATCHED) | `ros2_ws/src/hri_pear_stream/hri_pear_stream/hand_core.py` | `44b213dd1c4bdb64da23dfe6ab722e08e573eee049cad2655af7051bafbfc0c6` | `897c53a639a151179efed6e9948f49aeb053a734de0c4e5f8c8fd7db14d2960c` |
+| `hand_keypoints.py` | `ros2_ws/src/hri_pear_stream/hri_pear_stream/hand_keypoints.py` | `ca407f8a5b3e0808e0c06c0c3a4f3be99f566b78f0e16266ab841fba5959f5a1` | same |
+| `data/dexhand_calib.json` | `ros2_ws/src/hri_pear_stream/hri_pear_stream/data/dexhand_calib.json` | `9a1f6d22ec1d41f67c5b5e223d1a17c0e2340de15d2a25fb06d493d7fa2655ec` | same |
+| `data/dexhand_calib_mediapipe.json` | `ros2_ws/src/hri_pear_stream/hri_pear_stream/data/dexhand_calib_mediapipe.json` | `7efaebe19ee20adbf37852b9f4f84e547c1940e0b9dbb435b986f8b15f84c4f4` | same |
+| `data/dexhand_robot.json` | `ros2_ws/src/hri_pear_stream/hri_pear_stream/data/dexhand_robot.json` | `73ee9eb70415da23c38393e3a12f73c02d7b6098dbe6a6eb34c566c9b4ff7507` | same |
+| `mp_hand_pipeline.py` | `tools/mediapipe_npu/mp_hand_pipeline.py` | `317228b526832f2d9423109e50aa34e0f46e15888bdb02daf463fade0a622414` | same |
+
+Patches (`hand_core.py`):
+
+* `HandStream(gesture_labels=...)`: the labels the gesture layer accepts come
+  from the caller; the default is upstream's `GESTURE_LABELS`.
+* `_gesture_layer`: a gesture already active on the first `emit` starts from
+  the tracked value instead of failing on `g.q is None`.
+
+Not copied: `data/dexhand_calib_wilor.json` (WiLoR, not used) and
+`thumb_safety.py` (imported by `hand_core` only when `thumb_3d` is set, which
+this package never does).

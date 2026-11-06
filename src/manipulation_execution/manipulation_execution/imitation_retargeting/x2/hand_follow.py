@@ -2,8 +2,8 @@
 
 The arm path is untouched. This holds its own ``hand_core.HandStream``
 (video2x2_runtime 570c53c, where ``FollowMeStream`` holds it). ``hand_core.py``
-and its ``data/*.json`` are not in this repository: they are loaded at run time
-from ``extern_dir`` (``hand_perception.npu_hands.load_extern``).
+and its ``data/*.json`` are in ``_vendor/``; a non-empty ``extern_dir`` loads them
+from there instead (``hand_perception.npu_hands.load_extern``).
 It runs on the same output clock idea as the arm: ``t_out = now - offset``,
 ``offset`` = median age of the camera frames + ``latency_s``. The ages are the
 PEAR frames' when they arrive (the arm's clock), else the hand frames' own.
