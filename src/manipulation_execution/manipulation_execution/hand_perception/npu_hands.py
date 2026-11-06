@@ -1,11 +1,12 @@
 """Hand keypoints and gesture labels on the 310P NPU. **No ROS in here.**
 
-Nothing third-party lives in this package. The hand pipeline module
-(``mp_hand_pipeline.py``) and the keypoint helpers (``hand_keypoints.py``) are
-loaded at run time from ``extern_dir``, next to the model files, the same way
-the ``.om`` models and ``ais_bench`` are. ``load_extern`` is the only door.
+The hand pipeline module (``mp_hand_pipeline.py``) and the keypoint helpers
+(``hand_keypoints.py``) ship with this package, in ``x2/_vendor/``. A
+non-empty ``extern_dir`` loads them from that directory instead (a field
+override). ``load_extern`` is the only door. The ``.om`` models are not in git:
+``model_dir`` holds them (see ``model_paths``).
 
-    hands = NpuHands(model_dir, extern_dir)
+    hands = NpuHands(model_dir)
     hands.reset()                               # drop the tracked hands
     out = hands.infer(bgr_crop, person_box_in_crop)
     # -> list[dict]: lm (21,2) crop pixels, wlm (21,3) metres,
@@ -29,6 +30,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -44,27 +46,53 @@ PIPELINE_PY = "mp_hand_pipeline.py"
 KEYPOINTS_PY = "hand_keypoints.py"
 HAND_CORE_PY = "hand_core.py"  # loaded by x2.hand_follow
 CALIB_MEDIAPIPE_JSON = "data/dexhand_calib_mediapipe.json"
-DEFAULT_EXTERN_DIR = "/root/x2-dexhand-run/extern"
+DEFAULT_EXTERN_DIR = ""  # empty: the copies in this package
+DEFAULT_MODEL_DIR = "models/hand_mediapipe_310p"
+BUNDLE_ARTIFACTS = "artifacts/ascend_310p"
 EXTERN_FILES = (PIPELINE_PY, KEYPOINTS_PY)
+_VENDOR_DIR = Path(__file__).parent.parent / "imitation_retargeting" / "x2" / "_vendor"
+_BUNDLED = {
+    name: _VENDOR_DIR / name for name in (PIPELINE_PY, KEYPOINTS_PY, HAND_CORE_PY, CALIB_MEDIAPIPE_JSON)
+}
 
 
 def file_sha256(path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def extern_path(extern_dir, filename: str) -> Path:
+    """``extern_dir/filename``; empty ``extern_dir``: the copy in this package."""
+    return Path(extern_dir) / filename if extern_dir else _BUNDLED[filename]
+
+
 def load_extern(extern_dir, filename: str):
-    """Import ``extern_dir/filename`` as a private module (not on sys.path)."""
-    path = Path(extern_dir) / filename
+    """Import the hand module (``extern_path``) as a private module (not on sys.path)."""
+    path = extern_path(extern_dir, filename)
     if not path.is_file():
-        raise FileNotFoundError(f"{path} missing (hand modules are deployed beside the models, not in git)")
+        raise FileNotFoundError(f"{path} missing (extern_dir={str(extern_dir)!r})")
     name = f"_hand_extern_{path.stem}"
-    if name in sys.modules:
-        return sys.modules[name]
+    loaded = sys.modules.get(name)
+    if loaded is not None and Path(loaded.__file__) == path:
+        return loaded
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def model_paths(model_dir) -> dict[str, Path]:
+    """Model file name -> path. A relative ``model_dir`` is under ``$WORKSPACE``, as ``bundle_path`` is
+    (``perception_runtime_config``); its files are in the bundle's artifact directory, or directly in it."""
+    d = Path(model_dir).expanduser()
+    if not d.is_absolute():
+        workspace = os.environ.get("WORKSPACE")
+        if not workspace:
+            raise ValueError(f"model_dir {model_dir!r} is relative but WORKSPACE is unset")
+        d = Path(workspace) / d
+    if (d / BUNDLE_ARTIFACTS).is_dir():
+        d = d / BUNDLE_ARTIFACTS
+    return {name: d / name for name in MODEL_FILES}
 
 
 def relabel(label: str, score: float, rule: str) -> tuple[str, float]:
@@ -88,11 +116,10 @@ def as_right_hand(lm: np.ndarray, handed: float) -> np.ndarray:
 
 
 class NpuHands:
-    def __init__(self, model_dir, extern_dir, device: int = 0, rule_labels: bool = False):
+    def __init__(self, model_dir, extern_dir=DEFAULT_EXTERN_DIR, device: int = 0, rule_labels: bool = False):
         from ais_bench.infer.interface import InferSession
 
-        d = Path(model_dir)
-        self.paths = {name: d / name for name in MODEL_FILES}
+        self.paths = model_paths(model_dir)
         missing = [str(p) for p in self.paths.values() if not p.is_file()]
         if missing:
             raise FileNotFoundError(f"model files missing: {missing}")

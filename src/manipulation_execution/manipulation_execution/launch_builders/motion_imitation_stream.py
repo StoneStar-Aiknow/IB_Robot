@@ -495,8 +495,8 @@ def mock_hand_endpoints(robot_config: Mapping) -> dict | None:
 
 
 def _extern_dir(hands: Mapping) -> str:
-    """Where the video2x2 hand files (not in this repository) are deployed."""
-    return str(hands.get("extern_dir", "") or "/root/x2-dexhand-run/extern")
+    """Override directory for the video2x2 hand files; empty: the copies in this package."""
+    return str(hands.get("extern_dir", "") or "")
 
 
 def _thumb_follow_parameters(hands: Mapping) -> dict:

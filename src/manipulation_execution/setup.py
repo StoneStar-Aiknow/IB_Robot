@@ -10,7 +10,7 @@ setup(
     packages=find_packages(exclude=["test"]),
     package_data={
         "manipulation_execution.imitation_retargeting.x2": ["model/*.xml"],
-        "manipulation_execution.imitation_retargeting.x2._vendor": ["data/*.npz"],
+        "manipulation_execution.imitation_retargeting.x2._vendor": ["data/*.npz", "data/*.json"],
         "manipulation_execution.imitation_retargeting.x2._vendor.smplx2robot": ["data/*.json"],
     },
     data_files=[
