@@ -64,6 +64,7 @@ PARAMS = {
     "frame_topic": "/hri/hand/frame",
     "model_dir": npu_hands.DEFAULT_MODEL_DIR,
     "extern_dir": npu_hands.DEFAULT_EXTERN_DIR,
+    "backend": npu_hands.DEFAULT_BACKEND,  # ais_bench, or inference_service (needs a bundle), see npu_hands
     "device": 0,
     "rule_labels": False,
     "calib_path": "",  # empty: dexhand_calib_mediapipe.json, in the package or extern_dir/data
@@ -193,7 +194,8 @@ class HandPerceptionNode(Node):
     def _run(self):
         try:
             self.backend = npu_hands.NpuHands(
-                self.p["model_dir"], self.p["extern_dir"], int(self.p["device"]), bool(self.p["rule_labels"])
+                self.p["model_dir"], self.p["extern_dir"], int(self.p["device"]), bool(self.p["rule_labels"]),
+                self.p["backend"],
             )
         except Exception as e:  # noqa: BLE001
             self._init_error = f"{type(e).__name__}: {e}"
