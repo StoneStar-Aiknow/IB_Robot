@@ -181,6 +181,7 @@ for name, enabled in [
         config["motion_imitation_stream"] = {"enabled": True}
         config["mirror_session"].update({"enabled": True, "control_mode": "model_inference"})
         config["mirror_session"]["publish_enabled"] = enabled
+        config["mirror_session"]["operator"] = {"enabled": True, "send_enabled": enabled}
         mirror_models = yaml.safe_load((robots / "aimdk_x2_magicmirror.yaml").read_text())["robot"][
             "perception_services"
         ]["services"]

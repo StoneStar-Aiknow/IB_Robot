@@ -9,8 +9,9 @@
 # cover_judge: given to the cover judge class as is (DemoCoverJudge, manipulation_execution.mirror_operator.judge).
 #              Covered when the percentile-th percentile of the reduced gray image is at most
 #              max_value (0..255): no more than 5 % of the pixels brighter than 45.
-# operator:    read by the operator node; empty = its defaults.
+# operator:    read by the operator node; unset keys = its defaults. max_session_s: a round
+#              (STANDBY or MIRRORING) is stopped like a long cover after this long; 0 = off.
 session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0}
 timing:      {start_confirm_s: 1.5, cancel_confirm_s: 2.0}
 cover_judge: {percentile: 95, max_value: 45}
-operator:    {}
+operator:    {max_session_s: 60.0}

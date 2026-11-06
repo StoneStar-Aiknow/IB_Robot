@@ -161,14 +161,12 @@ robot:
       clips:
         self_intro: "$(env WORKSPACE)/commissioning/audio/self_introduction.wav"
 
-  # The Agent owns spoken interaction and starts/stops mirror rounds, avoiding
-  # duplicate speech or physical operator events during the same session.
+  # The Agent owns spoken interaction, so the mirror's own phrases stay off. The
+  # physical triggers (double cover, long cover, head touch, the session timeout)
+  # are the operator's, inherited from aimdk_x2_voice_mirror_all.yaml.
   mirror_session:
     voice:
       enabled: false
-    operator:
-      enabled: false
-      send_enabled: false
 
 # Runtime prerequisites for pick_object: the model bundles configured above
 # must be installed on the 310P, and the matching grasp head must run on the
