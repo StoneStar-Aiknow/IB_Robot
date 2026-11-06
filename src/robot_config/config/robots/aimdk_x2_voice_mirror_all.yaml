@@ -132,6 +132,9 @@ robot:
             camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
             # Relative to $WORKSPACE, like the perception services' bundle_path.
             model_dir: models/hand_mediapipe_310p
+            # In-process inference_service; the node's default stays ais_bench
+            # for the older flat model directories.
+            backend: inference_service
 
   # The mirror drives the upper body itself. The demo rules are the relaxed
   # copy: a reply's TTS synthesis shares this board's single NPU with the
