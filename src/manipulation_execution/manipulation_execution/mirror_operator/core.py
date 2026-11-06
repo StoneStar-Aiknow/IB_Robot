@@ -10,6 +10,7 @@ double cover        session state WAIT              ``mirror_start`` (Gateway)
 long cover          session STANDBY or MIRRORING    ``set_session(false)``
 head touch held     any session state               ``operator_touch``
 (``tick``)          on/off stable ``stable_s``      the light
+(``tick``)          on for ``max_session_s``        ``set_session(false)``
 ==================  ==============================  ==========================
 
 * The session state is the ``state`` of the newest message on the session
@@ -24,6 +25,13 @@ head touch held     any session state               ``operator_touch``
 * ``send_enabled`` False: every call is recorded as not sent, nothing is sent.
 * ``operator_touch`` answering ``success=False`` ("nothing to do") is a normal
   answer, recorded as ``declined``.
+* The session timeout (``max_session_s`` > 0) starts at the first state
+  message that is not WAIT and is cleared only by a WAIT message: STANDBY and
+  MIRRORING back and forth, a head touch, or the state topic going silent do
+  not clear it. Due, the stop is sent like a long cover's, only while the
+  session channel is free and the session is not silent. A stop that fails or
+  is declined is sent again at most every ``TIMEOUT_RETRY_S`` until WAIT comes;
+  an answered stop, or one not sent because ``send_enabled`` is False, is not.
 """
 
 from __future__ import annotations
@@ -48,6 +56,7 @@ from manipulation_execution.mirror_session.core import SessionState
 GATEWAY_TIMEOUT_S = RESULT_WAIT_SEC
 STOP_TIMEOUT_S = DEFAULT_STOP_TIMEOUT_SEC + STOP_TIMEOUT_MARGIN_SEC
 TOUCH_TIMEOUT_S = 2.0
+TIMEOUT_RETRY_S = 1.0
 FRAME_HZ_WINDOW_S = 1.0
 SESSION_ON = (SessionState.STANDBY.value, SessionState.MIRRORING.value)
 _STATES = tuple(state.value for state in SessionState)
@@ -151,6 +160,12 @@ class Operator:
         self._last_led: dict | None = None
         self._led_token = 0
         self.dropped = {"gateway": 0, "session": 0}
+        # the session timeout: start, stops sent this round, when the next may go, the last stop's record
+        self._timeout_started_at: float | None = None
+        self._timeout_attempts = 0
+        self._timeout_next_at = 0.0
+        self._timeout_done = False
+        self._timeout_record: dict | None = None
 
     # ------------------------------------------------------------------
     # inputs
@@ -207,14 +222,20 @@ class Operator:
                 self._log("warning", error)
                 return
             self._state, self._state_at, self._state_error = state, now, ""
+            if state == SessionState.WAIT.value:
+                self._timeout_started_at = None
+                self._timeout_attempts, self._timeout_next_at, self._timeout_done = 0, 0.0, False
+            elif self._timeout_started_at is None:
+                self._timeout_started_at = now
 
     def tick(self) -> None:
-        """Call timeouts and the light; the node calls it about 10 times a second."""
+        """Call timeouts, the session timeout and the light; the node calls it about 10 times a second."""
         with self._lock:
             now = self._clock()
             for channel, flight in self._flights.items():
                 if flight is not None and now - flight.started_at > flight.timeout_s:
                     self._finish(channel, flight.token, "timeout", f"no answer within {flight.timeout_s:g} s", now)
+            self._session_timeout(now)
             color = self._led.update(self._session_state(now) in SESSION_ON, now)
             if color is not None:
                 self._set_led(color, now)
@@ -238,6 +259,30 @@ class Operator:
             action = f"ignored: session {state or 'none'}"
         self._gesture = {"name": gesture, "action": action, "at": now}
         self._log("info", f"{gesture}: {action}")
+
+    def _session_timeout(self, now: float) -> None:
+        limit = self._config.max_session_s
+        started = self._timeout_started_at
+        if limit <= 0 or started is None or self._timeout_done or now - started < limit:
+            return
+        record = self._timeout_record
+        if self._timeout_attempts and record is not None:
+            if record["result"] == "":
+                return  # the stop is in flight
+            if record["result"] == "ok":
+                self._timeout_done = True
+                return
+        if now < self._timeout_next_at or self._flights["session"] is not None:
+            return
+        if self._session_state(now) not in SESSION_ON:
+            return  # silent: no session to stop until a state message comes again
+        self._timeout_attempts += 1
+        self._timeout_next_at = now + TIMEOUT_RETRY_S
+        action = self._send("session", "stop", now)
+        self._timeout_record = self._last_session_call
+        if not self._send_enabled:
+            self._timeout_done = True
+        self._log("info", f"session timeout ({limit:g} s, attempt {self._timeout_attempts}): {action}")
 
     def _send(self, channel: str, call: str, now: float) -> str:
         record = {"call": call, "result": "", "message": "", "sent_at": now, "answered_at": None}
@@ -334,6 +379,7 @@ class Operator:
                 self._frame_times.popleft()
             frame = self._frame
             state = self._session_state(now)
+            started = self._timeout_started_at
             return {
                 "send_enabled": self._send_enabled,
                 "frame_hz": len(self._frame_times) / FRAME_HZ_WINDOW_S,
@@ -361,6 +407,15 @@ class Operator:
                 },
                 "last_gateway": _age(self._last_gateway, now),
                 "last_session_call": _age(self._last_session_call, now),
+                "session_timeout": {
+                    "enabled": self._config.max_session_s > 0,
+                    "max_session_s": self._config.max_session_s,
+                    "elapsed_s": None if started is None else round(now - started, 3),
+                    "fired": self._timeout_attempts > 0,
+                    "attempts": self._timeout_attempts,
+                    "done": self._timeout_done,
+                    "last": _age(self._timeout_record, now),
+                },
                 "led": {
                     "available": not self._led_unavailable,
                     "reason": self._led_unavailable,

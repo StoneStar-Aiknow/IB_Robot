@@ -131,7 +131,7 @@ def test_voice_mirror_grasp_resolves_task_poses_without_losing_deployment_featur
     assert config["voice_asr"]["enabled"] is True
     assert config["mirror_session"]["enabled"] is True
     assert config["mirror_session"]["voice"]["enabled"] is False
-    assert config["mirror_session"]["operator"]["enabled"] is False
+    assert config["mirror_session"]["operator"]["enabled"] is True
     assert config["grasp_execution"]["enabled"] is True
     assert set(config["skill_supported_control_modes"]) == {"named_motion", "model_inference", "moveit_planning"}
     assert all(

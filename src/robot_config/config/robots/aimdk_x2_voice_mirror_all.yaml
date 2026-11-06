@@ -93,6 +93,46 @@ robot:
       requires:
         capability: motion.named
 
+  # Back to the half-resolution stream for PEAR and the hands:
+  # aimdk_x2_voice_mirror.yaml switched to full resolution because the firmware
+  # of that time published the full-resolution stream only; the robots now
+  # publish rgb_image_half (check the topic list before a run).
+  motion_imitation_stream:
+    frame_source:
+      topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+    mock_playback:
+      # The dexterous hands follow the person's hands while mirroring: the hand
+      # perception node (MediaPipe hand landmarks + gestures on the NPU) reads the
+      # same camera, the retarget node turns its frames into 20 hand radians, and
+      # mirror_session overlays them on every command it sends (neutral when not
+      # mirroring or when hand feedback is lost).
+      hands:
+        enabled: true
+        frame_topic: /hri/hand/frame
+        # The gestures with a preset on both hands in dexhand_robot.json.
+        gesture_labels: [Victory, Thumb_Up, Pointing_Up]
+        # Score a label must hold (0.15 s) to enter its preset; hand_core's default is 0.7.
+        # The person's left hand scores ~0.65 on a held Victory (10-24 run 162444), so 0.7
+        # left the robot's right hand following; 0.6 entered on 0.97 of those frames.
+        gesture_theta_in: 0.6
+        # Thumb follow: the tracked thumb otherwise follows the four-finger mean only, so a
+        # "six" (three fingers curled, thumb out) folded the robot thumb halfway. thumb_tuck
+        # (thumb tip to index/middle PIP/DIP over palm length, world keypoints) on 10-24 run
+        # 164923: six 0.71-0.87, fists 0.23-0.45. <= d_tuck: no change; >= d_out: thumb open.
+        thumb_follow: {d_tuck: 0.45, d_out: 0.60}
+        # Tracked thumb by its tip's distance to the fingers (zll 10-24), not the four-finger
+        # curl: thumb tip to each fingertip / pinky MCP over palm length picks a stop on
+        # open -> ok -> (middle) -> Victory thumb -> fist thumb ("four"), closer = deeper.
+        # 10-24 run 175919: touching 0.06-0.25, open palm >= 0.60, six >= 0.80; four, thumb to
+        # pinky MCP 0.13-0.44 (run 171354 up to 0.60). <= *_in: the stop; >= *_out: open.
+        # Fist / gestures stay hand_core's; collision order in thumb_fold.py.
+        thumb_fold: {pk_in: 0.55, pk_out: 0.85, tip_in: 0.25, tip_out: 0.60}
+        perception:
+          parameters:
+            camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+            # Relative to $WORKSPACE, like the perception services' bundle_path.
+            model_dir: models/hand_mediapipe_310p
+
   # The mirror drives the upper body itself. The demo rules are the relaxed
   # copy: a reply's TTS synthesis shares this board's single NPU with the
   # detector, and the default 1.0 s freshness rule would end the round mid-gesture.
@@ -116,8 +156,8 @@ robot:
   # The base entry turns the visual interaction ("看图说话") on. This deployment
   # does not run it: the base names the fake backend, whose scripted replies
   # would ride the mirror voice's utterance queue the moment a half-resolution
-  # stream appears, and this firmware publishes full-resolution only. A round
-  # would also share the single NPU with the detector and ZipVoice. Take the
+  # stream appears, and the robots now publish one. A round would also share
+  # the single NPU with the detector, the hands and ZipVoice. Take the
   # internvl settings from aimdk_x2_magicmirror_board.yaml when it is wanted.
   visual_interaction:
     enabled: false
