@@ -120,6 +120,17 @@ def test_due_sends_stop_once(started_as):
     assert any("session timeout" in message for _, message in logs)
 
 
+@pytest.mark.parametrize("first", ["STANDBY", "MIRRORING"])
+def test_first_state_on_without_wait_counts(first):
+    # the operator (re)started mid-round: the first message it sees is not WAIT
+    operator, clock, calls, _ = make()
+    state(operator, clock, first)
+    run(operator, clock, LIMIT - 1.0, keep=first)
+    assert calls.stops == []
+    run(operator, clock, 1.0, keep=first)
+    assert len(calls.stops) == 1
+
+
 def test_standby_mirroring_back_and_forth_does_not_clear():
     operator, clock, calls, _ = make()
     state(operator, clock, "WAIT")
