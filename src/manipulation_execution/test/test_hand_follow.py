@@ -12,17 +12,17 @@ FOLD = (0.55, 0.85, 0.25, 0.60)
 
 
 def _follow(**kwargs):
-    kwargs = {"latency_s": 0.1, "lookahead_s": 0.05, "mirror": True, "out_hz": 50.0, **kwargs}
+    kwargs = {"latency_s": 0.1, "lookahead_s": 0.25, "mirror": True, "out_hz": 50.0, **kwargs}
     return HandFollow(**kwargs)
 
 
 def _world_hand(thumb_tip=(0.2, 0.0, 0.0)):
-    """21 keypoints: palm 0.1 long along y, fingertips spread at y = 0.2, thumb tip where asked."""
+    """21 keypoints: palm 0.1 long along y, fingertips 0.8 palm apart at y = 0.2 (past tip_out), thumb tip where asked."""
     a = np.zeros((21, 3))
     a[9] = (0.0, 0.1, 0.0)
     a[17] = (-0.05, 0.1, 0.0)
     for k, tip in enumerate((8, 12, 16, 20)):
-        a[tip] = (-0.03 * k, 0.2, 0.0)
+        a[tip] = (-0.08 * k, 0.2, 0.0)
     a[4] = thumb_tip
     return a.ravel()
 
@@ -33,7 +33,7 @@ def _run(hf, obs, seconds=2.0, hz=30.0):
     for k in range(int(seconds * hz)):
         t = 100.0 + k / hz
         hf.on_hand(t, t, obs, obs)
-        q = hf.tick(t + 0.11)
+        q = hf.tick(t)  # t_out = t - latency_s: inside the frames, not past the newest
     return q
 
 
@@ -81,7 +81,7 @@ def test_thumb_dists_are_over_palm_length():
     d = thumb_fold.thumb_dists(_world_hand(thumb_tip=(0.0, 0.2, 0.0)))
     assert d.shape == (5,)
     assert d[0] == pytest.approx(0.0)
-    assert d[1] == pytest.approx(0.3)
+    assert d[1] == pytest.approx(0.8)
 
 
 def test_thumb_fold_needs_ordered_thresholds():
