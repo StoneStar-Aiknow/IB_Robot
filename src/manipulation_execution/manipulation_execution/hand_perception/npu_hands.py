@@ -6,10 +6,11 @@ non-empty ``extern_dir`` loads them from that directory instead (a field
 override). ``load_extern`` is the only door. The ``.om`` models are not in git:
 ``model_dir`` holds them (see ``model_paths``).
 
-Two backends run them. ``inference_service`` (the default) is that package's ACL
-session in this process, roles ``det`` / ``lm`` / ``embedder`` of the bundle's
-manifest; it needs a bundle. ``ais_bench`` is the code from before, the way back,
-and takes a bundle or a flat directory.
+Two backends run them. ``ais_bench`` (the default) is the code from before and
+takes a bundle or a flat directory, so configurations that do not name a backend
+run as they did. ``inference_service`` is that package's ACL session in this
+process, roles ``det`` / ``lm`` / ``embedder`` of the bundle's manifest; it needs
+a bundle.
 
     hands = NpuHands(model_dir)
     hands.reset()                               # drop the tracked hands
@@ -42,7 +43,7 @@ from pathlib import Path
 import numpy as np
 
 BACKENDS = ("inference_service", "ais_bench")
-DEFAULT_BACKEND = BACKENDS[0]
+DEFAULT_BACKEND = "ais_bench"  # configurations without ``backend`` (the flat model_dir ones) keep working
 DEPLOYMENT = "ascend_310p"
 LABELS = ("None", "Closed_Fist", "Open_Palm", "Pointing_Up", "Thumb_Down", "Thumb_Up", "Victory", "ILoveYou")
 DET_OM = "hd_npu.om"

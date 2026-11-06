@@ -129,6 +129,13 @@ def test_missing_model_files_are_named(fake_ais_bench, model_dir):
         npu_hands.NpuHands(model_dir, backend="ais_bench")
 
 
+def test_no_backend_given_is_ais_bench(fake_ais_bench, model_dir):
+    hands = npu_hands.NpuHands(model_dir)
+    assert npu_hands.DEFAULT_BACKEND == "ais_bench"
+    assert hands.backend_name == "ais_bench"
+    assert isinstance(hands.npu, npu_hands.AisBenchBackend)
+
+
 def test_unknown_backend_is_refused(model_dir):
     with pytest.raises(ValueError, match="onnx"):
         npu_hands.NpuHands(model_dir, backend="onnx")

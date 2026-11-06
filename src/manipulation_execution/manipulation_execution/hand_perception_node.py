@@ -64,7 +64,7 @@ PARAMS = {
     "frame_topic": "/hri/hand/frame",
     "model_dir": npu_hands.DEFAULT_MODEL_DIR,
     "extern_dir": npu_hands.DEFAULT_EXTERN_DIR,
-    "backend": npu_hands.DEFAULT_BACKEND,  # or ais_bench, see npu_hands
+    "backend": npu_hands.DEFAULT_BACKEND,  # ais_bench, or inference_service (needs a bundle), see npu_hands
     "device": 0,
     "rule_labels": False,
     "calib_path": "",  # empty: dexhand_calib_mediapipe.json, in the package or extern_dir/data
