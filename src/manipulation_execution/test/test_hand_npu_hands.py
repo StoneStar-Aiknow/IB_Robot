@@ -1,4 +1,6 @@
-"""The hand perception code without ROS or an NPU: label helpers, the classifier head, where modules load from."""
+"""The hand perception code without ROS or an NPU: label helpers, the classifier head, where modules load from.
+
+The inference_service backend needs ACL, so it is compared with ais_bench on the board, not here."""
 
 import json
 import sys
@@ -91,7 +93,7 @@ def test_relabel(label, score, rule, expected):
 
 
 def test_classify_is_the_head_over_the_embedding(fake_ais_bench, model_dir):
-    hands = npu_hands.NpuHands(model_dir)
+    hands = npu_hands.NpuHands(model_dir, backend="ais_bench")
     head = np.load(model_dir / npu_hands.HEAD)
     emb = _FakeSession.embedding.astype(np.float64)
     logits = np.maximum(emb * head["bn_mul"] + head["bn_add"], 0.0) @ head["W"] + head["b"]
@@ -101,7 +103,7 @@ def test_classify_is_the_head_over_the_embedding(fake_ais_bench, model_dir):
 
     assert label == npu_hands.LABELS[int(np.argmax(expected))]
     assert score == pytest.approx(float(expected.max()))
-    hand, handed, world = hands.emb.fed[-1]
+    hand, handed, world = hands.npu.emb.fed[-1]
     assert hand.shape == (1, 21, 3) and hand.dtype == np.float32
     assert handed.shape == (1, 1) and world.shape == (1, 21, 3)
 
@@ -109,22 +111,27 @@ def test_classify_is_the_head_over_the_embedding(fake_ais_bench, model_dir):
 def test_head_with_the_wrong_shape_is_refused(fake_ais_bench, model_dir):
     np.savez(model_dir / npu_hands.HEAD, bn_mul=np.ones(128), bn_add=np.ones(128), W=np.ones((128, 7)), b=np.ones(7))
     with pytest.raises(ValueError, match="expected"):
-        npu_hands.NpuHands(model_dir)
+        npu_hands.NpuHands(model_dir, backend="ais_bench")
 
 
 def test_no_hand_detected_is_an_empty_list(fake_ais_bench, model_dir):
-    hands = npu_hands.NpuHands(model_dir)
+    hands = npu_hands.NpuHands(model_dir, backend="ais_bench")
     img = np.zeros((240, 320, 3), np.uint8)
     assert hands.infer(img, (10.0, 10.0, 200.0, 230.0)) == []
     hands.reset()
     hands.close()
-    assert hands.emb.freed
+    assert hands.npu.emb.freed
 
 
 def test_missing_model_files_are_named(fake_ais_bench, model_dir):
     (model_dir / npu_hands.LM_OM).unlink()
     with pytest.raises(FileNotFoundError, match=npu_hands.LM_OM):
-        npu_hands.NpuHands(model_dir)
+        npu_hands.NpuHands(model_dir, backend="ais_bench")
+
+
+def test_unknown_backend_is_refused(model_dir):
+    with pytest.raises(ValueError, match="onnx"):
+        npu_hands.NpuHands(model_dir, backend="onnx")
 
 
 def test_model_paths_flat_directory_and_bundle(tmp_path):

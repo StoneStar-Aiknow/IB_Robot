@@ -6,6 +6,11 @@ non-empty ``extern_dir`` loads them from that directory instead (a field
 override). ``load_extern`` is the only door. The ``.om`` models are not in git:
 ``model_dir`` holds them (see ``model_paths``).
 
+Two backends run them. ``inference_service`` (the default) is that package's ACL
+session in this process, roles ``det`` / ``lm`` / ``embedder`` of the bundle's
+manifest; it needs a bundle. ``ais_bench`` is the code from before, the way back,
+and takes a bundle or a flat directory.
+
     hands = NpuHands(model_dir)
     hands.reset()                               # drop the tracked hands
     out = hands.infer(bgr_crop, person_box_in_crop)
@@ -36,6 +41,9 @@ from pathlib import Path
 
 import numpy as np
 
+BACKENDS = ("inference_service", "ais_bench")
+DEFAULT_BACKEND = BACKENDS[0]
+DEPLOYMENT = "ascend_310p"
 LABELS = ("None", "Closed_Fist", "Open_Palm", "Pointing_Up", "Thumb_Down", "Thumb_Up", "Victory", "ILoveYou")
 DET_OM = "hd_npu.om"
 LM_OM = "hand_landmarks_detector.om"
@@ -81,15 +89,20 @@ def load_extern(extern_dir, filename: str):
     return mod
 
 
-def model_paths(model_dir) -> dict[str, Path]:
-    """Model file name -> path. A relative ``model_dir`` is under ``$WORKSPACE``, as ``bundle_path`` is
-    (``perception_runtime_config``); its files are in the bundle's artifact directory, or directly in it."""
+def resolve_model_dir(model_dir) -> Path:
+    """A relative ``model_dir`` is under ``$WORKSPACE``, as ``bundle_path`` is (``perception_runtime_config``)."""
     d = Path(model_dir).expanduser()
-    if not d.is_absolute():
-        workspace = os.environ.get("WORKSPACE")
-        if not workspace:
-            raise ValueError(f"model_dir {model_dir!r} is relative but WORKSPACE is unset")
-        d = Path(workspace) / d
+    if d.is_absolute():
+        return d
+    workspace = os.environ.get("WORKSPACE")
+    if not workspace:
+        raise ValueError(f"model_dir {model_dir!r} is relative but WORKSPACE is unset")
+    return Path(workspace) / d
+
+
+def model_paths(model_dir) -> dict[str, Path]:
+    """Model file name -> path: in the bundle's artifact directory, or directly in ``model_dir``."""
+    d = resolve_model_dir(model_dir)
     if (d / BUNDLE_ARTIFACTS).is_dir():
         d = d / BUNDLE_ARTIFACTS
     return {name: d / name for name in MODEL_FILES}
@@ -115,22 +128,84 @@ def as_right_hand(lm: np.ndarray, handed: float) -> np.ndarray:
     return out
 
 
-class NpuHands:
-    def __init__(self, model_dir, extern_dir=DEFAULT_EXTERN_DIR, device: int = 0, rule_labels: bool = False):
+class ServiceBackend:
+    """``HandPipeline``'s backend (``infer("det" | "lm", x)``) and the embedder, on inference_service's ACL session."""
+
+    def __init__(self, model_dir, device: int):
+        from inference_manifest import load_inference_manifest
+        from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
+        from inference_service.backends.types import RuntimeContext
+        from inference_service.model_sessions.ascend import AscendOmModelSession
+        from inference_service.unified_runtime import ExecutionContext, ModelRequest
+
+        validated = load_inference_manifest(resolve_model_dir(model_dir), DEPLOYMENT)
+        self._session = AscendOmModelSession(device, runtime_manager=AclRuntimeManager())
+        self._session.load(RuntimeContext(validated_manifest=validated, runtime_profile=validated.runtime_profile))
+        self._request, self._context = ModelRequest(), ExecutionContext("hand_perception")
+        self._bindings = validated.deployment.bindings
+
+    def _run(self, role: str, inputs: dict) -> list[np.ndarray]:
+        out = self._session.execute_role(role, inputs, self._request, self._context)
+        return [np.asarray(out[b.semantic]) for b in self._bindings[role].outputs]
+
+    def infer(self, name: str, x: np.ndarray):
+        return tuple(self._run(name, {self._bindings[name].inputs[0].semantic: np.ascontiguousarray(x)}))
+
+    def embed(self, feed: dict[str, np.ndarray]) -> np.ndarray:
+        inputs = {b.semantic: feed[b.semantic.rpartition(".")[2]] for b in self._bindings["embedder"].inputs}
+        return self._run("embedder", inputs)[0]
+
+    def close(self) -> None:
+        self._session.close()
+
+
+class AisBenchBackend:
+    """The pipeline's own ``AclBackend`` and an ``InferSession`` for the embedder."""
+
+    def __init__(self, pipeline, paths: dict[str, Path], device: int):
         from ais_bench.infer.interface import InferSession
 
+        self._pipeline_backend = pipeline.AclBackend(str(paths[DET_OM]), str(paths[LM_OM]), device)
+        self.emb = InferSession(device, str(paths[EMB_OM]))
+        self._emb_names = [i.name for i in self.emb.get_inputs()]
+        if sorted(self._emb_names) != ["hand", "handedness", "world_hand"]:
+            raise ValueError(f"{EMB_OM} inputs are {self._emb_names}, expected hand / handedness / world_hand")
+
+    def infer(self, name: str, x: np.ndarray):
+        return self._pipeline_backend.infer(name, x)
+
+    def embed(self, feed: dict[str, np.ndarray]) -> np.ndarray:
+        return self.emb.infer([feed[n] for n in self._emb_names])[0]
+
+    def close(self) -> None:
+        for s in [*self._pipeline_backend.s.values(), self.emb]:
+            with contextlib.suppress(Exception):
+                s.free_resource()
+
+
+class NpuHands:
+    def __init__(
+        self,
+        model_dir,
+        extern_dir=DEFAULT_EXTERN_DIR,
+        device: int = 0,
+        rule_labels: bool = False,
+        backend: str = DEFAULT_BACKEND,
+    ):
+        if backend not in BACKENDS:
+            raise ValueError(f"backend {backend!r} is not one of {BACKENDS}")
         self.paths = model_paths(model_dir)
         missing = [str(p) for p in self.paths.values() if not p.is_file()]
         if missing:
             raise FileNotFoundError(f"model files missing: {missing}")
         pipeline = load_extern(extern_dir, PIPELINE_PY)
         self.rule_labels = bool(rule_labels)
-        backend = pipeline.AclBackend(str(self.paths[DET_OM]), str(self.paths[LM_OM]), device)
-        self.pipe = pipeline.HandPipeline(backend, track=True)
-        self.emb = InferSession(device, str(self.paths[EMB_OM]))
-        self._emb_names = [i.name for i in self.emb.get_inputs()]
-        if sorted(self._emb_names) != ["hand", "handedness", "world_hand"]:
-            raise ValueError(f"{EMB_OM} inputs are {self._emb_names}, expected hand / handedness / world_hand")
+        self.backend_name = backend
+        if backend == "inference_service":
+            self.npu = ServiceBackend(model_dir, device)
+        else:
+            self.npu = AisBenchBackend(pipeline, self.paths, device)
+        self.pipe = pipeline.HandPipeline(self.npu, track=True)
         w = np.load(self.paths[HEAD])
         self._scale, self._shift = w["bn_mul"].astype(np.float64), w["bn_add"].astype(np.float64)
         self._dense, self._bias = w["W"].astype(np.float64), w["b"].astype(np.float64)
@@ -140,14 +215,14 @@ class NpuHands:
 
     @property
     def description(self) -> str:
-        return f"NPU hand pipeline + {EMB_OM} + numpy head, rule_labels={self.rule_labels}"
+        return f"NPU hand pipeline + {EMB_OM} + numpy head ({self.backend_name}), rule_labels={self.rule_labels}"
 
     def reset(self) -> None:
         self.pipe.reset()
 
     def _classify(self, lm_px: np.ndarray) -> tuple[str, float]:
         feed = {"hand": np.ascontiguousarray(lm_px[None], dtype=np.float32), **self._zeros}
-        emb = np.asarray(self.emb.infer([feed[n] for n in self._emb_names])[0], dtype=np.float64).reshape(-1)
+        emb = np.asarray(self.npu.embed(feed), dtype=np.float64).reshape(-1)
         logits = np.maximum(emb * self._scale + self._shift, 0.0) @ self._dense + self._bias
         p = np.exp(logits - logits.max())
         p /= p.sum()
@@ -182,8 +257,4 @@ class NpuHands:
         return out
 
     def close(self) -> None:
-        for s in [*getattr(self.pipe.be, "s", {}).values(), self.emb]:
-            free = getattr(s, "free_resource", None)
-            if free is not None:
-                with contextlib.suppress(Exception):
-                    free()
+        self.npu.close()
