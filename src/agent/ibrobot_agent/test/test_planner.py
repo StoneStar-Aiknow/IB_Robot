@@ -743,18 +743,6 @@ def test_a_clarification_without_missing_fields_is_still_asked():
         (["SAFETY_RESTRICTED"], "UNSUPPORTED_TASK", "defaulted"),
     ],
 )
-
-
-@pytest.mark.parametrize(
-    ("reason_code", "expected", "action"),
-    [
-        (" SAFETY_RESTRICTED ", "SAFETY_RESTRICTED", "normalized"),
-        ("out_of_scope", "OUT_OF_SCOPE", "normalized"),
-        ("NOT_A_REASON", "UNSUPPORTED_TASK", "defaulted"),
-        (None, "UNSUPPORTED_TASK", "defaulted"),
-        (["SAFETY_RESTRICTED"], "UNSUPPORTED_TASK", "defaulted"),
-    ],
-)
 def test_a_refusal_keeps_a_reason_the_contract_knows_and_records_the_original(reason_code, expected, action):
     outcome = _parse({"kind": "rejected", "user_message": "这个我做不到。", "reason_code": reason_code})
 
@@ -787,64 +775,12 @@ def test_a_refusal_keeps_a_reason_the_contract_knows_and_records_the_original(re
         {"kind": "read_only", "user_message": "我来查。", "query_kind": "list_skills", "skill_name": ""},
     ],
 )
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {
-            "kind": "needs_clarification",
-            "user_message": "哪只手？",
-            "missing_fields": ["hand"],
-            "reason_code": "",
-            "skill_name": "",
-            "query_kind": None,
-            "steps": [],
-            "summary": "",
-        },
-        {
-            "kind": "rejected",
-            "user_message": "做不到。",
-            "reason_code": "OUT_OF_SCOPE",
-            "skill_name": "",
-            "missing_fields": [],
-        },
-        {"kind": "conversation", "user_message": "你好。", "reason_code": "", "skill_name": None, "summary": ""},
-        {"kind": "read_only", "user_message": "我来查。", "query_kind": "list_skills", "skill_name": ""},
-    ],
-)
 def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
     # Models fill the fields they do not use with empty values; dropping those loses nothing.
     outcome = _parse(payload)
 
     assert outcome.kind == payload["kind"]
     assert outcome.repairs == ()
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        # A question that also carries steps or a reason: the model's intent is ambiguous.
-        {
-            "kind": "needs_clarification",
-            "user_message": "哪只手？",
-            "missing_fields": ["hand"],
-            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
-        },
-        {"kind": "needs_clarification", "user_message": "哪只手？", "missing_fields": ["hand"], "reason_code": "X"},
-        {"kind": "rejected", "user_message": "做不到。", "reason_code": "OUT_OF_SCOPE", "summary": "wave_hand"},
-        # Workflow replies are never repaired.
-        {
-            "kind": "workflow",
-            "user_message": "准备执行。",
-            "summary": "挥手",
-            "reason_code": "",
-            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
-        },
-        # A read-only reply without its query has no unambiguous repair.
-        {"kind": "read_only", "user_message": "我来查。"},
-    ],
-)
 
 
 @pytest.mark.parametrize(
