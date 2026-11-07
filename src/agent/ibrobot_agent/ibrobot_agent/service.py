@@ -464,7 +464,7 @@ class AgentService:
                     outcome = self._planner.plan(
                         planned_request,
                         planner_context,
-                        catalog,
+                        _planner_catalog(catalog),
                         cancel_token,
                         on_preview=lambda text: self._emit_reply_preview(key, text, cancel_token),
                     )
