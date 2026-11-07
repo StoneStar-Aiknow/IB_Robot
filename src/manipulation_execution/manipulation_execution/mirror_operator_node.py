@@ -32,12 +32,14 @@ Interfaces:
 * subscribes ``touch.head`` with the type named in the runtime description
   and the QoS given there; with ``touch.head`` missing or its type not
   loadable, the touch is off and ``~/status`` says why;
-* subscribes ``/mirror_session/state`` (reliable + transient_local, depth 1);
-  silence is measured by this node's receive time;
-* calls the Gateway (double cover in WAIT: ``mirror_start``), the session's
-  ``~/set_session`` with false (long cover in STANDBY/MIRRORING) and its
-  ``~/operator_touch`` (head touch); a touch the session answers with
-  ``success=False`` ("nothing to do") is a normal answer;
+* subscribes ``/mirror_session/state`` (reliable + transient_local, depth 10,
+  so a WAIT between two other states is not lost); silence is measured by this
+  node's receive time;
+* calls the Gateway (double cover in WAIT: ``mirror_start``; long cover in
+  STANDBY/MIRRORING and the session timeout: ``mirror_stop``), the session's
+  ``~/operator_touch`` (head touch) and, only when the Gateway gave no answer
+  to ``mirror_stop``, its ``~/set_session`` with false; a touch the session
+  answers with ``success=False`` ("nothing to do") is a normal answer;
 * sets the light (``operator.led``, type loaded by name); with the type not
   loadable, the light is off and ``~/status`` says why;
 * ``~/status`` (``std_msgs/String``, JSON snapshot, every
@@ -78,7 +80,7 @@ from manipulation_execution.mirror_operator import vendor
 from manipulation_execution.mirror_operator.config import LedColor, OperatorConfig
 from manipulation_execution.mirror_operator.core import Done, LedDone, Operator, TouchEndpoint, resolve_touch_endpoint
 from manipulation_execution.mirror_operator.frames import FrameThrottle, gray_from_compressed, gray_from_image
-from manipulation_execution.mirror_operator.gateway import GatewayError, MirrorStartRequest
+from manipulation_execution.mirror_operator.gateway import MIRROR_START, MIRROR_STOP, GatewayError, MirrorSkillRequest
 from manipulation_execution.mirror_operator.judge import CoverJudge, build_cover_judge
 from manipulation_execution.mirror_session.business import load_business_config
 
@@ -195,7 +197,13 @@ class RosOperatorCalls:
         self._led_type = led_type
 
     def mirror_start(self, done: Done) -> None:
-        request = MirrorStartRequest()
+        self._execute(MIRROR_START, done)
+
+    def mirror_stop(self, done: Done) -> None:
+        self._execute(MIRROR_STOP, done)
+
+    def _execute(self, skill_name: str, done: Done) -> None:
+        request = MirrorSkillRequest(skill_name)
 
         def on_status(response) -> None:
             request.accept_status(response)
@@ -209,16 +217,16 @@ class RosOperatorCalls:
                 return
             goal = request.fill_goal(SkillCommand.Goal())
             future = self._skill.send_goal_async(goal, goal_uuid=UUID(uuid=request.goal_uuid))
-            self._then(future, on_goal, done, "mirror_start goal")
+            self._then(future, on_goal, done, f"{skill_name} goal")
 
         def on_goal(handle) -> None:
             if not handle.accepted:
-                raise GatewayError("SKILL_GOAL_REJECTED", "the Gateway did not accept the mirror_start goal")
-            self._then(handle.get_result_async(), on_result, done, "mirror_start result")
+                raise GatewayError("SKILL_GOAL_REJECTED", f"the Gateway did not accept the {skill_name} goal")
+            self._then(handle.get_result_async(), on_result, done, f"{skill_name} result")
 
         def on_result(answer) -> None:
             if answer.result is None:
-                done(None, "mirror_start result: no answer")
+                done(None, f"{skill_name} result: no answer")
                 return
             done(True, request.accept_result(answer.result))
 
@@ -333,7 +341,7 @@ class MirrorOperatorNode(Node):
             String,
             STATE_TOPIC,
             self._on_state,
-            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL),
             callback_group=inputs_group,
         )
         self._status_publisher = self.create_publisher(String, "~/status", 10)

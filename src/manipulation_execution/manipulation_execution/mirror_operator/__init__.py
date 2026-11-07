@@ -10,8 +10,8 @@ Modules:
              framework half).
 ``touch``    a head touch held long enough.
 ``led``      when the light strip follows the session.
-``gateway``  the ``mirror_start`` request to the Gateway: status, validate,
-             goal.
+``gateway``  the ``mirror_start`` and ``mirror_stop`` requests to the Gateway:
+             status, validate, goal.
 ``vendor``   the only place that names the vendor: its touch and light types,
              loaded by name.
 ``core``     ``Operator``: the above put together, sending through injected

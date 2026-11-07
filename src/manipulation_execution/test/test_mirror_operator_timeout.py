@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from manipulation_execution.mirror_operator.config import OperatorConfig
-from manipulation_execution.mirror_operator.core import STOP_TIMEOUT_S, TIMEOUT_RETRY_S, Operator
+from manipulation_execution.mirror_operator.core import GATEWAY_TIMEOUT_S, STOP_TIMEOUT_S, TIMEOUT_RETRY_S, Operator
 from manipulation_execution.mirror_operator.judge import CoverJudge
 
 LIMIT = 60.0
@@ -23,14 +23,18 @@ class Calls:
     """Records every call; the test answers the held ``done`` callbacks itself."""
 
     def __init__(self):
-        self.stops = []
+        self.stops = []  # mirror_stop through the Gateway
+        self.direct = []  # set_session(false), only when the Gateway gave no answer
         self.touches = []
 
     def mirror_start(self, done):
         raise AssertionError("no mirror_start expected")
 
-    def stop_session(self, done):
+    def mirror_stop(self, done):
         self.stops.append(done)
+
+    def stop_session(self, done):
+        self.direct.append(done)
 
     def operator_touch(self, done):
         self.touches.append(done)
@@ -177,39 +181,53 @@ def test_silent_when_due_waits_for_the_session():
     assert len(calls.stops) == 1
 
 
-def test_busy_channel_delays_the_stop_without_drops():
+def test_busy_gateway_channel_delays_the_stop_without_drops():
     operator, clock, calls, logs = make()
     state(operator, clock, "WAIT")
     state(operator, clock, "STANDBY")
     run(operator, clock, LIMIT - 1.0, keep="STANDBY")
-    hold_touch(operator, clock)  # the touch call holds the session channel
-    assert len(calls.touches) == 1
-    run(operator, clock, 0.5, every=0.1, keep="STANDBY")  # due, channel still busy
-    assert calls.stops == []
-    assert operator.dropped["session"] == 0
+    assert operator._send("gateway", "mirror_stop", clock.now) == "sent mirror_stop"  # a long cover's stop
+    run(operator, clock, 1.5, every=0.1, keep="STANDBY")  # due, channel still busy
+    assert len(calls.stops) == 1
+    assert timeout(operator)["attempts"] == 0
+    assert operator.dropped["gateway"] == 0
     assert not any("dropped" in message for _, message in logs)
-    calls.touches[0](True, "ok")
+    calls.stops[0](False, "SKILL_BUSY: another root execution is active")
     operator.tick()
+    assert len(calls.stops) == 2
+    assert timeout(operator)["attempts"] == 1
+
+
+def test_touch_in_flight_does_not_delay_the_stop():
+    # a touch holds the session channel; the stop goes on the Gateway channel
+    operator, clock, calls, _ = make()
+    state(operator, clock, "WAIT")
+    state(operator, clock, "STANDBY")
+    run(operator, clock, LIMIT - 1.0, keep="STANDBY")
+    hold_touch(operator, clock)
+    assert len(calls.touches) == 1
+    run(operator, clock, 0.5, every=0.1, keep="STANDBY")
     assert len(calls.stops) == 1
 
 
-@pytest.mark.parametrize("answer", [(False, "declined"), (None, "error")])
-def test_failed_stop_is_retried_at_most_every_retry_s(answer):
+def test_refused_stop_is_retried_every_retry_s():
     operator, clock, calls, _ = make()
+    answer = (False, "SKILL_BUSY: another root execution is active")
     state(operator, clock, "WAIT")
     state(operator, clock, "STANDBY")
     run(operator, clock, LIMIT, keep="STANDBY")
     assert len(calls.stops) == 1
-    calls.stop_session = lambda done: (calls.stops.append(done), done(*answer))  # answered at once from now on
+    calls.mirror_stop = lambda done: (calls.stops.append(done), done(*answer))  # answered at once from now on
     calls.stops[0](*answer)
     run(operator, clock, TIMEOUT_RETRY_S * 0.5, every=0.1, keep="STANDBY")
     assert len(calls.stops) == 1
     run(operator, clock, 10.0, every=0.1, keep="STANDBY")
-    # 100 ticks, about one stop per TIMEOUT_RETRY_S
-    assert 9 <= len(calls.stops) - 1 <= 11
+    # 10 s: about one stop per TIMEOUT_RETRY_S
+    assert 4 <= len(calls.stops) - 1 <= 6
     assert timeout(operator)["attempts"] == len(calls.stops)
-    assert timeout(operator)["last"]["result"] == ("declined" if answer[0] is False else "error")
-    calls.stop_session = lambda done: (calls.stops.append(done), done(True, "stopped"))
+    assert timeout(operator)["last"]["result"] == "failed"
+    assert calls.direct == []  # a refusal is obeyed
+    calls.mirror_stop = lambda done: (calls.stops.append(done), done(True, "stopped"))
     run(operator, clock, TIMEOUT_RETRY_S * 1.5, every=0.1, keep="STANDBY")
     sent = len(calls.stops)
     run(operator, clock, 10.0, every=0.1, keep="STANDBY")  # answered: no more
@@ -217,13 +235,16 @@ def test_failed_stop_is_retried_at_most_every_retry_s(answer):
     assert timeout(operator)["done"] is True
 
 
-def test_unanswered_stop_times_out_then_retries():
+def test_unanswered_stop_goes_direct_then_retries_through_the_gateway():
     operator, clock, calls, _ = make()
     state(operator, clock, "WAIT")
     state(operator, clock, "STANDBY")
     run(operator, clock, LIMIT, keep="STANDBY")
     assert len(calls.stops) == 1
-    run(operator, clock, STOP_TIMEOUT_S + 1.0, every=0.1, keep="STANDBY")  # no answer within STOP_TIMEOUT_S
+    run(operator, clock, GATEWAY_TIMEOUT_S + 0.5, every=0.1, keep="STANDBY")  # no answer from the Gateway
+    assert len(calls.direct) == 1
+    assert timeout(operator)["last"]["call"] == "stop"
+    run(operator, clock, STOP_TIMEOUT_S + 0.5, every=0.1, keep="STANDBY")  # no answer from the session either
     assert len(calls.stops) == 2
     assert timeout(operator)["attempts"] == 2
 

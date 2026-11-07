@@ -1,16 +1,18 @@
-"""The Gateway call behind a double cover: ``mirror_start``. No ROS calls.
+"""The Gateway calls behind the cover gestures and the session timeout. No ROS calls.
 
-The node makes the calls; this fills the requests and checks the answers,
-written after ``robot_skill_cli`` (status, payload, validate) and
+A double cover sends ``mirror_start``; a long cover and the session timeout
+send ``mirror_stop``, the same skill the agent sends. The node makes the calls;
+this fills the requests and checks the answers, written after
+``robot_skill_cli`` (status, payload, validate) and
 ``embodied_agent.sound_orientation_node`` (goal), without importing either:
 
-1. ``GetSkillGatewayStatus``: ``mirror_start`` must be a ready capability;
-   remember the registry identity (epoch, generation, digest) and build the
-   canonical payload (schema 1, ``timeout_sec`` 5.0).
+1. ``GetSkillGatewayStatus``: the skill must be a ready capability; remember
+   the registry identity (epoch, generation, digest) and build the canonical
+   payload (schema 1, ``timeout_sec`` 5.0).
 2. ``ValidateSkill`` with that payload and identity: it must be allowed, and
    the registry identity it validated against must be the one from step 1
    (an empty one does not match), else nothing is sent.
-3. ``SkillCommand`` goal ``mirror_start``, goal id ``skill_goal_uuid(task_id)``;
+3. ``SkillCommand`` goal for the skill, goal id ``skill_goal_uuid(task_id)``;
    the result must be a success.
 
 ``task_budget`` is left empty: the Gateway fills it for a root goal.
@@ -26,10 +28,13 @@ from embodied_common.dispatch_binding import new_binding
 from embodied_common.mirror_session_contract import OPERATOR_NODE_NAME
 from embodied_common.skill_request import canonical_skill_payload, skill_goal_uuid, skill_payload_hash
 
-SKILL_NAME = "mirror_start"
+MIRROR_START = "mirror_start"
+MIRROR_STOP = "mirror_stop"
 SCHEMA_VERSION = 1
+# Both skills' catalog timeout; the Gateway refuses to start unless mirror_stop's
+# covers the session's stop_timeout_sec.
 TIMEOUT_SEC = 5.0
-# From the double cover to the goal result: status, validate and the goal itself.
+# From the gesture to the goal result: status, validate and the goal itself.
 RESULT_WAIT_SEC = 8.0
 REGISTRY_MISMATCH = "SKILL_REGISTRY_VERSION_MISMATCH"
 
@@ -40,10 +45,11 @@ class GatewayError(RuntimeError):
         super().__init__(f"{code}: {message}" if message else code)
 
 
-class MirrorStartRequest:
-    """One ``mirror_start`` attempt; a new double cover makes a new one."""
+class MirrorSkillRequest:
+    """One ``mirror_start`` or ``mirror_stop`` attempt; every send makes a new one."""
 
-    def __init__(self, task_id: str = ""):
+    def __init__(self, skill_name: str, task_id: str = ""):
+        self.skill_name = skill_name
         self.task_id = task_id or f"{OPERATOR_NODE_NAME}-{uuid.uuid4()}"
         self.identity: tuple[str, int, str] | None = None
         self.payload: dict[str, Any] | None = None
@@ -60,11 +66,11 @@ class MirrorStartRequest:
         return request
 
     def accept_status(self, response: Any) -> None:
-        capability = next((item for item in response.capabilities if item.name == SKILL_NAME), None)
+        capability = next((item for item in response.capabilities if item.name == self.skill_name), None)
         if capability is None or not capability.ready:
             reason = str(capability.reason) if capability is not None and capability.reason else ""
             code = reason.partition(":")[0].strip() or "CAPABILITY_NOT_READY"
-            raise GatewayError(code, reason or f"{SKILL_NAME} is not a ready capability")
+            raise GatewayError(code, reason or f"{self.skill_name} is not a ready capability")
         identity = (
             str(response.registry_epoch),
             int(response.registry_generation),
@@ -73,7 +79,7 @@ class MirrorStartRequest:
         if not identity[0] or not identity[2]:
             raise GatewayError(REGISTRY_MISMATCH, "Gateway status has no registry identity")
         payload = canonical_skill_payload(
-            SKILL_NAME,
+            self.skill_name,
             schema_version=SCHEMA_VERSION,
             motion_distance=0.0,  # as robot_skill_cli: the request field is 0.0, so the hash is of 0.0
             timeout_sec=TIMEOUT_SEC,
