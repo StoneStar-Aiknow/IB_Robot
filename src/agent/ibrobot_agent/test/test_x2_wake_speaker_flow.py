@@ -149,18 +149,18 @@ def test_x2_short_opener_leaves_followups_unchecked_until_next_wake():
 def _text_core():
     config = _core().config
     return VoiceBridgeCore(
-        replace(config, addressee_trigger="wake_phrase", wake_phrases=("小欧小欧",), wake_window_sec=25.0)
+        replace(config, addressee_trigger="wake_phrase", wake_phrases=("欧拉欧拉",), wake_window_sec=25.0)
     )
 
 
 @pytest.mark.parametrize("opener_first", [True, False])
 @pytest.mark.parametrize("followup_first", [True, False])
-def test_xiaoou_text_wake_speaker_flow_without_vendor_event(opener_first, followup_first):
+def test_oula_text_wake_speaker_flow_without_vendor_event(opener_first, followup_first):
     core = _text_core()
     assert not _requests(core.on_heard("请挥个手", now=90.0, segment=_segment(1)))
     if opener_first:
         core.on_measurement("speaker", OWNER, now=100.0, segment=_segment(2))
-    opened = core.on_heard("小欧小欧，现在请你挥个手", now=100.1, segment=_segment(2))
+    opened = core.on_heard("欧拉欧拉，现在请你挥个手", now=100.1, segment=_segment(2))
     assert [r.payload["text"] for r in _requests(opened)] == ["现在请你挥个手"]
     if not opener_first:
         core.on_measurement("speaker", OWNER, now=100.2, segment=_segment(2))
@@ -180,7 +180,7 @@ def test_xiaoou_text_wake_speaker_flow_without_vendor_event(opener_first, follow
     core.on_measurement("speaker", OWNER, now=140.0, segment=_segment(5))
     _finish(core, core.on_heard("请挥个手", now=140.1, segment=_segment(5)), 140.2)
     core.on_measurement("speaker", OTHER, now=142.0, segment=_segment(6))
-    takeover = core.on_heard("小欧小欧，请举起手", now=142.1, segment=_segment(6))
+    takeover = core.on_heard("欧拉欧拉，请举起手", now=142.1, segment=_segment(6))
     assert [r.payload["text"] for r in _requests(takeover)] == ["请举起手"]
     _finish(core, takeover, 142.2)
     core.on_measurement("speaker", OWNER, now=144.0, segment=_segment(7))
@@ -189,23 +189,42 @@ def test_xiaoou_text_wake_speaker_flow_without_vendor_event(opener_first, follow
     assert not _requests(core.on_heard("请挥手", now=170.1, segment=_segment(8)))
 
 
-def test_xiaoou_stop_cancels_followup_waiting_for_voiceprint():
+def test_oula_stop_cancels_followup_waiting_for_voiceprint():
     core = _text_core()
     core.on_measurement("speaker", OWNER, now=100.0, segment=_segment(1))
-    _finish(core, core.on_heard("小欧小欧，请挥手", now=100.1, segment=_segment(1)), 100.2)
+    _finish(core, core.on_heard("欧拉欧拉，请挥手", now=100.1, segment=_segment(1)), 100.2)
     assert not _requests(core.on_heard("请举手", now=104.0, segment=_segment(2)))
     core.on_heard("停止", now=104.1, segment=_segment(3))
     assert not _requests(core.on_measurement("speaker", OWNER, now=104.2, segment=_segment(2)))
     assert not _requests(core.tick(now=106.0))
 
 
-@pytest.mark.parametrize("phrase", [f"小{a}小{b}" for a in "欧鸥偶" for b in "欧鸥偶"])
-def test_xiaoou_variants_are_prefix_only_and_stripped(phrase):
-    config = replace(_text_core().config, wake_phrases=tuple(f"小{a}小{b}" for a in "欧鸥偶" for b in "欧鸥偶"))
+OULA_FORMS = ("欧拉", "欧啦", "鸥拉", "偶拉")
+OULA_PREFIXES = tuple(a + b for a in OULA_FORMS for b in OULA_FORMS)
+
+
+@pytest.mark.parametrize("phrase", OULA_PREFIXES)
+def test_oula_variants_are_prefix_only_and_stripped(phrase):
+    config = replace(_text_core().config, wake_phrases=OULA_PREFIXES)
     core = VoiceBridgeCore(config)
     assert not _requests(core.on_heard(f"我刚才说了{phrase}请挥手", now=90.0, segment=_segment(1)))
     core.on_measurement("speaker", OWNER, now=100.0, segment=_segment(2))
     actions = core.on_heard(f"{phrase}，请挥手", now=100.1, segment=_segment(2))
+    assert [r.payload["text"] for r in _requests(actions)] == ["请挥手"]
+
+
+@pytest.mark.parametrize("text", ["欧拉，请挥手", "欧啦，请挥手", "好啦好啦，请挥手", "小欧小欧，请挥手"])
+def test_oula_wake_does_not_accept_short_unrelated_or_replaced_prefixes(text):
+    core = VoiceBridgeCore(replace(_text_core().config, wake_phrases=OULA_PREFIXES))
+    assert not _requests(core.on_heard(text, now=100.0, segment=_segment(1)))
+    assert not _requests(core.tick(now=102.0))
+
+
+@pytest.mark.parametrize("text", ["欧拉 欧啦，请挥手", "欧拉欧啦！请挥手", "，欧拉欧啦，请挥手"])
+def test_oula_wake_accepts_spacing_and_phrase_boundary_punctuation(text):
+    core = VoiceBridgeCore(replace(_text_core().config, wake_phrases=OULA_PREFIXES))
+    core.on_measurement("speaker", OWNER, now=100.0, segment=_segment(1))
+    actions = core.on_heard(text, now=100.1, segment=_segment(1))
     assert [r.payload["text"] for r in _requests(actions)] == ["请挥手"]
 
 

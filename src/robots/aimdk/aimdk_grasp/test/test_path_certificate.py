@@ -80,6 +80,8 @@ def test_match_needs_live_assumptions_route_and_entry_separate_from_arrival(empt
     altered = copy.deepcopy(plan)
     altered.traj.positions[len(altered.traj.positions) // 2, 1] += 0.001
     assert match(observed, altered)[0] is None
+    for side in ("left", "right"):
+        assert match(replace(observed, **{f"{side}_hand": None}))[0] is None
     observed.left_hand[0] += 0.006
     assert match(observed)[0] is None
 

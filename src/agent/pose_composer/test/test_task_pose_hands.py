@@ -118,17 +118,19 @@ def test_partial_completion_survives_failure_without_rollback(fault, code):
     assert "confirming" not in events and "total_sec" in runner.report
 
 
-def test_arm_only_pose_never_constructs_hand_backend():
-    arm = MockArm()
+@pytest.mark.parametrize("away", [False, True])
+def test_arm_only_pose_never_constructs_hand_backend(away):
+    arm = MockArm(away=away)
 
     def forbidden():
         pytest.fail("hand backend was requested for an arm-only pose")
 
     config = snapshot()
     runner = TaskPoseRunner(config, simulation=True, clock=lambda: arm.now, pause=arm.sleep)
-    assert runner.execute(
+    skipped = runner.execute(
         "grasp_ready", config["digest"], read_state=arm.read, move=arm.move, cancelled=lambda: False, hands=forbidden
     )
+    assert skipped is (not away) and len(arm.moves) == int(away)
 
 
 def test_unloaded_approval_is_required_separately_from_arm_approval():

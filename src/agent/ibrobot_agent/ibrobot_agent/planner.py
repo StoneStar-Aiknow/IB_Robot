@@ -184,8 +184,10 @@ def _repair_untrusted_reply(payload: Mapping[str, Any]) -> tuple[dict[str, Any],
     The model is untrusted input while ``PlannerOutcome`` stays strict, so a question or refusal
     that merely left a field empty or out used to surface as a FAILED terminal: the user heard
     that execution failed where nothing could have run. Workflow replies are never repaired, and
-    a reply whose fields contradict its kind (a question carrying steps, a chat reply carrying a
-    summary) still fails closed, since its intent is ambiguous.
+    a reply that claims a meaning its kind cannot hold (a chat reply carrying a summary, a question
+    carrying a reason) still fails closed, since its intent is ambiguous. A question that carries
+    a workflow is the one contradiction repaired rather than refused: nothing can run from it, so
+    keeping the question and dropping the workflow loses nothing the robot was allowed to do.
     """
     data = dict(payload)
     kind = data.get("kind")
@@ -200,6 +202,13 @@ def _repair_untrusted_reply(payload: Mapping[str, Any]) -> tuple[dict[str, Any],
     if kind == "needs_clarification" and not data.get("missing_fields"):
         repairs.append(PlannerRepair("missing_fields", "defaulted", payload.get("missing_fields")))
         data["missing_fields"] = [_CLARIFICATION_FIELD_FALLBACK]
+    if kind == "needs_clarification":
+        # A question that also carries a workflow contradicts itself, but nothing can run from
+        # it: keeping the question and dropping the workflow is the only reading that loses
+        # nothing the robot was allowed to do, so it is repaired instead of failed.
+        for name in ("steps", "summary"):
+            if data.get(name) not in (None, "", [], {}):
+                repairs.append(PlannerRepair(name, "defaulted", data.pop(name)))
     if kind == "rejected":
         original = data.get("reason_code")
         # Only text can name a reason; anything else (null, a list) is no reason at all.

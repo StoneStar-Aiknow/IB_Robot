@@ -20,7 +20,7 @@ from sensor_msgs.msg import JointState
 from ibrobot_msgs.msg import RuntimeStatus
 from robot_config.contract_utils import qos_profile_from_dict
 
-from .feedback import VIEWS, FeedbackHistory
+from .feedback import FeedbackHistory
 
 STATUS_INTERFACE = "runtime.status"
 
@@ -36,7 +36,7 @@ def _bound(interfaces: Mapping[str, Any], name: str, message_type: str) -> Mappi
 def subscribe_feedback(subscriptions, description: Mapping[str, Any], history: FeedbackHistory) -> None:
     """Subscribe the views and the runtime status on ``subscriptions`` (an ``OnDemandSubscriptions``)."""
     interfaces = description.get("interfaces") or {}
-    for view in VIEWS:
+    for view in history.views:
         interface = _bound(interfaces, view, "sensor_msgs/msg/JointState")
 
         def on_state(message: JointState, _received: float | None, view: str = view) -> None:

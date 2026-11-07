@@ -1,0 +1,937 @@
+{
+  "schema_version": 1,
+  "test_date": "2026-11-07",
+  "report_timezone": "Asia/Shanghai",
+  "created_at": "2026-11-06T18:54:39.896353+00:00",
+  "canonical_yaml": "src/robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml",
+  "inheritance_child_to_parent": [
+    "aimdk_x2_voice_mirror_grasp.yaml",
+    "aimdk_x2_voice_mirror_all.yaml",
+    "aimdk_x2_voice_mirror.yaml",
+    "aimdk_x2_magicmirror.yaml",
+    "aimdk_x2_skills.yaml",
+    "aimdk_x2.yaml"
+  ],
+  "final_yaml_sha256": "6f15561c726878ae5f135fee54831a64af58e5cec82636d61f469a2369022cab",
+  "online_yaml_sha256": "2808ae6c6d5bb65c0cba1df9a5d091345b377253993f2bf300f482f4cbe5e2b2",
+  "installed_hands": [
+    "right"
+  ],
+  "arm_side": "right",
+  "deployment_validation": [
+    {
+      "role": "310p",
+      "canonical_yaml": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml",
+      "yaml_sha256": "6f15561c726878ae5f135fee54831a64af58e5cec82636d61f469a2369022cab",
+      "installed_hands": [
+        "right"
+      ],
+      "task_pose_digest": "7e76950cf6a23cd03b867fb14ecd2e5b98339dfa21375e3efd1a9c4d52ac327d",
+      "fixed_library_digest": "e5c4bc31b7e1b02ccd437751b6f7078fd7cb80f034544fb40d3a0b6ee3fdc50d",
+      "fixed_pose_count": 12,
+      "head_namespace": "/x2_grasp_head",
+      "source_imports": {
+        "robot_runtime.hand_mounts": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_runtime/robot_runtime/hand_mounts.py",
+        "robot_config.task_poses": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_config/robot_config/task_poses.py",
+        "robot_config.fixed_poses": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_config/robot_config/fixed_poses.py",
+        "aimdk_grasp.joints": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/src/robots/aimdk/aimdk_grasp/aimdk_grasp/joints.py"
+      },
+      "path_validation": {
+        "hand": "off",
+        "body": "off"
+      },
+      "local_model_validation": true,
+      "hardware_approved": true,
+      "commands_sent": false
+    },
+    {
+      "role": "orin",
+      "canonical_yaml": "/home/agi/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml",
+      "yaml_sha256": "6f15561c726878ae5f135fee54831a64af58e5cec82636d61f469a2369022cab",
+      "installed_hands": [
+        "right"
+      ],
+      "task_pose_digest": "7e76950cf6a23cd03b867fb14ecd2e5b98339dfa21375e3efd1a9c4d52ac327d",
+      "fixed_library_digest": "e5c4bc31b7e1b02ccd437751b6f7078fd7cb80f034544fb40d3a0b6ee3fdc50d",
+      "fixed_pose_count": 12,
+      "head_namespace": "/x2_grasp_head",
+      "source_imports": {
+        "robot_runtime.hand_mounts": "/home/agi/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_runtime/robot_runtime/hand_mounts.py",
+        "robot_config.task_poses": "/home/agi/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_config/robot_config/task_poses.py",
+        "robot_config.fixed_poses": "/home/agi/IB_Robot_selfintro_ready_20261106_17d353a56/src/robot_config/robot_config/fixed_poses.py",
+        "aimdk_grasp.joints": "/home/agi/IB_Robot_selfintro_ready_20261106_17d353a56/src/robots/aimdk/aimdk_grasp/aimdk_grasp/joints.py"
+      },
+      "path_validation": {
+        "hand": "off",
+        "body": "off"
+      },
+      "local_model_validation": false,
+      "hardware_approved": true,
+      "commands_sent": false
+    }
+  ],
+  "configuration_comparison": {
+    "old_task_digest": "7e76950cf6a23cd03b867fb14ecd2e5b98339dfa21375e3efd1a9c4d52ac327d",
+    "new_task_digest": "7e76950cf6a23cd03b867fb14ecd2e5b98339dfa21375e3efd1a9c4d52ac327d",
+    "task_snapshots_equal": true,
+    "arm_targets_equal": true,
+    "old_hands": {
+      "right": "open"
+    },
+    "new_hands": {
+      "right": "open"
+    },
+    "old_hardware_approved": true,
+    "new_hardware_approved": true,
+    "old_unloaded_approved": true,
+    "new_unloaded_approved": true,
+    "old_arm_limits_equal_new": true,
+    "old_installed_hands": [
+      "right"
+    ],
+    "new_installed_hands": [
+      "right"
+    ],
+    "old_library": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/commissioning/fixed_poses.json",
+    "new_library": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/commissioning/fixed_poses.json",
+    "library_sha256": "c3de912a5265161a6b626a5a29914e5ce5e1b131b90885c4dd5d22cb664dd7a6",
+    "old_path_validation": {
+      "hand": "off",
+      "body": "off"
+    },
+    "new_path_validation": {
+      "hand": "online",
+      "body": "online"
+    }
+  },
+  "cases": [
+    {
+      "case_id": "T01",
+      "entrypoint": "robot-skill run-workflow",
+      "text": null,
+      "request_id": "codex-wave-test-20261107-001",
+      "policy": {
+        "hand": "online",
+        "body": "online"
+      },
+      "state": "SUCCEEDED",
+      "error_code": "",
+      "message": "replayed wave in policy_stream (6.3s)",
+      "request_to_terminal_sec": null,
+      "skill_terminal_event": {
+        "event": "terminal",
+        "skill": "wave_hand",
+        "duration_sec": 6.502494696000213,
+        "task_id": "b4fbc3b1-0574-5756-a13e-23cb5358df74/skill/0001",
+        "payload_hash": "fcf6b64b83bc6e9395d22518ad91b86d09edd4be092ee972e85bcaeabd30b62c"
+      },
+      "requested_log_epoch": 1793988149.488165,
+      "terminal_log_epoch": 1793988156.0469413,
+      "workflow_events": [
+        {
+          "command": "run-workflow",
+          "data": {
+            "execution_mode": "immediate_after_presentation",
+            "plan_digest": "6fb855c8a735c99842beaea85bfe6ded4d12c1ad6f4b0318baf7bb600408ff6a",
+            "plan_id": "83c44ca5-34aa-4dde-b3a9-69b2c2d1d6d6",
+            "plan_kind": 1,
+            "proposed_task_budget_sec": 180,
+            "registry_identity": {
+              "registry_digest": "5d85fe053a75b3d6b94714091ae3bedfea1fd37580d4c5a9ca2850b21ed86bf7",
+              "registry_epoch": "af07e9c6-e5fb-45fb-9466-37efb9231d68",
+              "registry_generation": 1
+            },
+            "state": "prepared",
+            "steps": [
+              {
+                "container_name": "",
+                "motion_direction": "",
+                "motion_distance": 0,
+                "place_name": "",
+                "schema_version": 1,
+                "skill_name": "wave_hand",
+                "target_name": "",
+                "timeout_sec": 0
+              }
+            ],
+            "task_id": "634093d0064441be8ceb2c0a498c1eff"
+          },
+          "event": "workflow_presentation",
+          "schema_version": 1,
+          "task_id": "634093d0064441be8ceb2c0a498c1eff"
+        },
+        {
+          "command": "run-workflow",
+          "data": {
+            "error_code": "",
+            "message": "replayed wave in policy_stream (6.3s)",
+            "result": {
+              "execution_id": "f76888af-45d2-4dd3-aa62-ba37d9a817f0",
+              "state": "SUCCEEDED",
+              "success": true
+            },
+            "state": "succeeded",
+            "task_id": "634093d0064441be8ceb2c0a498c1eff"
+          },
+          "event": "workflow_terminal",
+          "schema_version": 1,
+          "task_id": "634093d0064441be8ceb2c0a498c1eff"
+        }
+      ]
+    },
+    {
+      "case_id": "T02",
+      "entrypoint": "Agent text",
+      "text": "请挥手一次",
+      "request_id": "cli-33e2a127c456",
+      "session_id": "codex-text-actions-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0.0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "wave_hand",
+          "target_name": "",
+          "timeout_sec": 0.0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "4251f1f8faa44992f6b37576d847a335bffe19b0e6b3aba55b0d1db48f5ae8c8",
+        "plan_id": "34abcd0d97a7484c85b864d6043a810f",
+        "registry_digest": "5d85fe053a75b3d6b94714091ae3bedfea1fd37580d4c5a9ca2850b21ed86bf7",
+        "registry_epoch": "af07e9c6-e5fb-45fb-9466-37efb9231d68",
+        "registry_generation": 1,
+        "task_id": "34abcd0d97a7484c85b864d6043a810f"
+      },
+      "policy": {
+        "hand": "online",
+        "body": "online"
+      },
+      "created_at": "2026-11-06T18:10:28.564454+00:00",
+      "terminal_at": "2026-11-06T18:10:36.977565+00:00",
+      "state": "SUCCEEDED",
+      "error_code": "",
+      "message": "replayed wave in policy_stream (5.0s)",
+      "execution_id": "6a45060b-dc6f-4d33-bbc2-3b5ea4450a76",
+      "request_to_terminal_sec": 8.413111,
+      "skill_terminal_event": {
+        "duration_sec": 5.2514406079972105,
+        "event": "terminal",
+        "payload_hash": "4251f1f8faa44992f6b37576d847a335bffe19b0e6b3aba55b0d1db48f5ae8c8",
+        "skill": "wave_hand",
+        "step_count": 1,
+        "task_id": "1561cb96-9e6b-56d5-9515-a8d5396b03aa/skill/0001"
+      },
+      "pose_preparation": null
+    },
+    {
+      "case_id": "T03",
+      "entrypoint": "Agent text",
+      "text": "请做一次飞吻动作",
+      "request_id": "cli-a8225608ba7f",
+      "session_id": "codex-text-actions-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0.0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "blow_kiss",
+          "target_name": "",
+          "timeout_sec": 0.0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "b6d1f28b624d3a32ce62455d2daad5077959569f52696302efb265c0a404d1df",
+        "plan_id": "f38842237a4d451ab7c92fcbccddb604",
+        "registry_digest": "5d85fe053a75b3d6b94714091ae3bedfea1fd37580d4c5a9ca2850b21ed86bf7",
+        "registry_epoch": "af07e9c6-e5fb-45fb-9466-37efb9231d68",
+        "registry_generation": 1,
+        "task_id": "f38842237a4d451ab7c92fcbccddb604"
+      },
+      "policy": {
+        "hand": "online",
+        "body": "online"
+      },
+      "created_at": "2026-11-06T18:11:38.031610+00:00",
+      "terminal_at": "2026-11-06T18:11:45.509952+00:00",
+      "state": "SUCCEEDED",
+      "error_code": "",
+      "message": "replayed blow_kiss in policy_stream (5.2s)",
+      "execution_id": "303c059d-d816-4160-8812-fbf8e5a904ca",
+      "request_to_terminal_sec": 7.478342,
+      "skill_terminal_event": {
+        "duration_sec": 5.405710455001099,
+        "event": "terminal",
+        "payload_hash": "b6d1f28b624d3a32ce62455d2daad5077959569f52696302efb265c0a404d1df",
+        "skill": "blow_kiss",
+        "step_count": 1,
+        "task_id": "1f4c8396-2a75-536d-82ca-45f1838cd5f4/skill/0001"
+      },
+      "pose_preparation": null
+    },
+    {
+      "case_id": "T04",
+      "entrypoint": "Agent text",
+      "text": "回到抓取准备位",
+      "request_id": "cli-70a4af1eedd9",
+      "session_id": "codex-text-actions-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0.0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "return_to_task_pose",
+          "target_name": "grasp_ready",
+          "timeout_sec": 0.0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "aa0cb58ab3322b341d4482b725d0e99cd545b1e35b0aea561e4ed6d1599039de",
+        "plan_id": "2f99581b24b04737824cc89e85d15e19",
+        "registry_digest": "5d85fe053a75b3d6b94714091ae3bedfea1fd37580d4c5a9ca2850b21ed86bf7",
+        "registry_epoch": "af07e9c6-e5fb-45fb-9466-37efb9231d68",
+        "registry_generation": 1,
+        "task_id": "2f99581b24b04737824cc89e85d15e19"
+      },
+      "policy": {
+        "hand": "online",
+        "body": "online"
+      },
+      "created_at": "2026-11-06T18:12:48.450341+00:00",
+      "terminal_at": "2026-11-06T18:12:53.037596+00:00",
+      "state": "FAILED",
+      "error_code": "HAND_SWEEP_COLLISION",
+      "message": "insufficient hand clearance: right_wrist_yaw_link/R_thumb_abad, clearance=0.005993 m, required=0.010181 m; start_tolerance_rad=0.000000; preparation=1.661s; opened_hands=none; path_validation=hand:online,body:online",
+      "execution_id": "3cb3333c-39fc-44f8-86a4-d7bf2f0576f0",
+      "request_to_terminal_sec": 4.587255,
+      "skill_terminal_event": {
+        "duration_sec": 1.8103008090001822,
+        "error_code": "HAND_SWEEP_COLLISION",
+        "event": "terminal",
+        "payload_hash": "aa0cb58ab3322b341d4482b725d0e99cd545b1e35b0aea561e4ed6d1599039de",
+        "skill": "return_to_task_pose",
+        "step_count": 1,
+        "task_id": "0dbb41fc-beb1-5ead-9e4e-34235ebeffa3/skill/0001"
+      },
+      "pose_preparation": {
+        "completed_hands": [],
+        "phase_sec": {
+          "hand_preflight_after_takeover": 0.6164064440017683,
+          "moving": 0.3215143240013276,
+          "planning": 0.006097189001593506,
+          "preflight": 0.7112117780015978,
+          "takeover": 0.003995148003014037
+        },
+        "skipped_hands": [],
+        "stages": {
+          "arm_settling": {
+            "reason": "stage not reached",
+            "sec": 0.0,
+            "status": "skipped"
+          },
+          "confirming": {
+            "reason": "stage not reached",
+            "sec": 0.0,
+            "status": "skipped"
+          },
+          "hand_preflight_after_takeover": {
+            "reason": "",
+            "sec": 0.6164064440017683,
+            "status": "executed"
+          },
+          "moving": {
+            "reason": "",
+            "sec": 0.3215143240013276,
+            "status": "executed"
+          },
+          "opening_left": {
+            "reason": "hand action not requested",
+            "sec": 0.0,
+            "status": "skipped"
+          },
+          "opening_right": {
+            "reason": "stage not reached",
+            "sec": 0.0,
+            "status": "skipped"
+          },
+          "planning": {
+            "reason": "",
+            "sec": 0.006097189001593506,
+            "status": "executed"
+          },
+          "preflight": {
+            "reason": "",
+            "sec": 0.7112117780015978,
+            "status": "executed"
+          },
+          "takeover": {
+            "reason": "",
+            "sec": 0.003995148003014037,
+            "status": "executed"
+          }
+        },
+        "total_sec": 1.660849338000844
+      }
+    },
+    {
+      "case_id": "T05",
+      "entrypoint": "Agent text",
+      "text": "回到抓取的初始位置",
+      "request_id": "cli-b454880c1a6b",
+      "session_id": "codex-ready-retry-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "return_to_task_pose",
+          "target_name": "grasp_ready",
+          "timeout_sec": 0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "fe498862cab72ececafd4f09f9facbddd5dc9c2508348104a69024bd428478b4",
+        "plan_id": "2e0b274823db484da8d75b77488be002",
+        "registry_digest": "5d85fe053a75b3d6b94714091ae3bedfea1fd37580d4c5a9ca2850b21ed86bf7",
+        "registry_epoch": "af07e9c6-e5fb-45fb-9466-37efb9231d68",
+        "registry_generation": 1,
+        "task_id": "2e0b274823db484da8d75b77488be002"
+      },
+      "policy": {
+        "hand": "online",
+        "body": "online"
+      },
+      "created_at": "2026-11-06T18:22:47.902502+00:00",
+      "terminal_at": "2026-11-06T18:22:54.332985+00:00",
+      "state": "FAILED",
+      "error_code": "HAND_SWEEP_COLLISION",
+      "message": "insufficient hand clearance: right_wrist_yaw_link/R_thumb_abad, clearance=0.005995 m, required=0.010181 m; start_tolerance_rad=0.000000; preparation=1.522s; opened_hands=none; path_validation=hand:online,body:online",
+      "execution_id": "8554b54c-01c3-4a80-8931-8a424761e7e6",
+      "request_to_terminal_sec": 6.430483,
+      "skill_terminal_event": {
+        "duration_sec": 1.6614417160017183,
+        "error_code": "HAND_SWEEP_COLLISION",
+        "event": "terminal",
+        "payload_hash": "fe498862cab72ececafd4f09f9facbddd5dc9c2508348104a69024bd428478b4",
+        "skill": "return_to_task_pose",
+        "step_count": 1,
+        "task_id": "81b11290-7661-5981-920a-da86cc5573ce/skill/0001"
+      },
+      "pose_preparation": {
+        "completed_hands": [],
+        "phase_sec": {
+          "hand_preflight_after_takeover": 0.592732449000323,
+          "moving": 0.2967789640024421,
+          "planning": 0.009585080999386264,
+          "preflight": 0.6154088179973769,
+          "takeover": 0.006046676000551088
+        },
+        "skipped_hands": [],
+        "stages": {
+          "arm_settling": {
+            "reason": "stage not reached",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "confirming": {
+            "reason": "stage not reached",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "hand_preflight_after_takeover": {
+            "reason": "",
+            "sec": 0.592732449000323,
+            "status": "executed"
+          },
+          "moving": {
+            "reason": "",
+            "sec": 0.2967789640024421,
+            "status": "executed"
+          },
+          "opening_left": {
+            "reason": "hand action not requested",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "opening_right": {
+            "reason": "stage not reached",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "planning": {
+            "reason": "",
+            "sec": 0.009585080999386264,
+            "status": "executed"
+          },
+          "preflight": {
+            "reason": "",
+            "sec": 0.6154088179973769,
+            "status": "executed"
+          },
+          "takeover": {
+            "reason": "",
+            "sec": 0.006046676000551088,
+            "status": "executed"
+          }
+        },
+        "total_sec": 1.52188670599935
+      }
+    },
+    {
+      "case_id": "T06",
+      "entrypoint": "Agent text",
+      "text": "回到抓取的初始位置",
+      "request_id": "cli-5ddec46956af",
+      "session_id": "codex-ready-path-off-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "return_to_task_pose",
+          "target_name": "grasp_ready",
+          "timeout_sec": 0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "b059d6eb663f8f3ff09dd458650d1e1718382e907772ed717e744e30193a070d",
+        "plan_id": "d47ddd3c4dc34f5d891e0293369be45e",
+        "registry_digest": "743864d45af39743b350492bb657c56a1c90c2c3bc9dca1bea1bedf2eacd266d",
+        "registry_epoch": "07424880-e802-405f-b688-b59647cdd049",
+        "registry_generation": 1,
+        "task_id": "d47ddd3c4dc34f5d891e0293369be45e"
+      },
+      "policy": {
+        "hand": "off",
+        "body": "off"
+      },
+      "created_at": "2026-11-06T18:33:47.088986+00:00",
+      "terminal_at": "2026-11-06T18:33:55.387272+00:00",
+      "state": "FAILED",
+      "error_code": "TASK_POSE_NOT_REACHED",
+      "message": "trajectory finished but arrival not confirmed: right_shoulder_roll_joint error=0.111417 rad exceeds 0.100000 rad; preparation=4.357s; opened_hands=none; path_validation=hand:off,body:off",
+      "execution_id": "4122cb7b-9e7e-4fa3-8e30-32d94d7cbba4",
+      "request_to_terminal_sec": 8.298286,
+      "skill_terminal_event": {
+        "duration_sec": 4.546783353998762,
+        "error_code": "TASK_POSE_NOT_REACHED",
+        "event": "terminal",
+        "payload_hash": "b059d6eb663f8f3ff09dd458650d1e1718382e907772ed717e744e30193a070d",
+        "skill": "return_to_task_pose",
+        "step_count": 1,
+        "task_id": "192e92bb-03f8-5022-ad97-210bdc8beece/skill/0001"
+      },
+      "pose_preparation": {
+        "arrival_check": {
+          "max_error_rad": 0.11141652450561523,
+          "policy": "single_sample",
+          "stable_window_verified": false,
+          "tolerance_rad": 0.1,
+          "worst_joint": "right_shoulder_roll_joint"
+        },
+        "completed_hands": [],
+        "phase_sec": {
+          "arm_settling": 0.0005682520022673998,
+          "hand_preflight_after_takeover": 0.6594656859997485,
+          "moving": 2.9028591659989615,
+          "planning": 0.006337245002214331,
+          "preflight": 0.7809533539984841,
+          "takeover": 0.0056570769993413705
+        },
+        "skipped_hands": [],
+        "stages": {
+          "arm_settling": {
+            "reason": "",
+            "sec": 0.0005682520022673998,
+            "status": "failed"
+          },
+          "confirming": {
+            "reason": "stage not reached",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "hand_preflight_after_takeover": {
+            "reason": "",
+            "sec": 0.6594656859997485,
+            "status": "executed"
+          },
+          "moving": {
+            "reason": "",
+            "sec": 2.9028591659989615,
+            "status": "executed"
+          },
+          "opening_left": {
+            "reason": "hand action not requested",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "opening_right": {
+            "reason": "stage not reached",
+            "sec": 0,
+            "status": "skipped"
+          },
+          "planning": {
+            "reason": "",
+            "sec": 0.006337245002214331,
+            "status": "executed"
+          },
+          "preflight": {
+            "reason": "",
+            "sec": 0.7809533539984841,
+            "status": "executed"
+          },
+          "takeover": {
+            "reason": "",
+            "sec": 0.0056570769993413705,
+            "status": "executed"
+          }
+        },
+        "total_sec": 4.357317224999861
+      }
+    },
+    {
+      "case_id": "T07",
+      "entrypoint": "Agent text",
+      "text": "开始照镜子",
+      "request_id": "cli-fd3d78b841e4",
+      "session_id": "codex-mirror-text-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "mirror_start",
+          "target_name": "",
+          "timeout_sec": 0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "bb121c8c785f1be3dfe97e37e3f283f54ba00c280a38699b8ded6bf45fda46b0",
+        "plan_id": "5fa4b57f405e4459943911bab0b3181d",
+        "registry_digest": "743864d45af39743b350492bb657c56a1c90c2c3bc9dca1bea1bedf2eacd266d",
+        "registry_epoch": "07424880-e802-405f-b688-b59647cdd049",
+        "registry_generation": 1,
+        "task_id": "5fa4b57f405e4459943911bab0b3181d"
+      },
+      "policy": {
+        "hand": "off",
+        "body": "off"
+      },
+      "created_at": "2026-11-06T18:44:01.669451+00:00",
+      "terminal_at": "2026-11-06T18:44:03.641974+00:00",
+      "state": "SUCCEEDED",
+      "error_code": "",
+      "message": "mirror_start: took over policy_stream [state=STANDBY]",
+      "execution_id": "e5de5c7b-a511-4bec-b003-1a151ef6a8ed",
+      "request_to_terminal_sec": 1.972523,
+      "skill_terminal_event": {
+        "duration_sec": 0.05982045000200742,
+        "event": "terminal",
+        "payload_hash": "bb121c8c785f1be3dfe97e37e3f283f54ba00c280a38699b8ded6bf45fda46b0",
+        "skill": "mirror_start",
+        "step_count": 1,
+        "task_id": "6c542729-f82a-5d8a-acdb-7f1a67e5b61f/skill/0001"
+      },
+      "pose_preparation": null
+    },
+    {
+      "case_id": "T08",
+      "entrypoint": "Agent text",
+      "text": "结束照镜子",
+      "request_id": "cli-edcfe307b4ad",
+      "session_id": "codex-mirror-text-20261107",
+      "workflow_steps": [
+        {
+          "container_name": "",
+          "motion_direction": "",
+          "motion_distance": 0,
+          "place_name": "",
+          "schema_version": 1,
+          "skill_name": "mirror_stop",
+          "target_name": "",
+          "timeout_sec": 0
+        }
+      ],
+      "planner_identity": {
+        "config_digest": "c3980800d8f2d7edee06fdaed8901396ec93435be0aca6342477e32469ac6e94",
+        "prompt_version": "agent-planner-v4",
+        "protocol": "chat_completions",
+        "returned_model": "DeepSeek-V4.1-Flash-1017",
+        "route": "vlm",
+        "schema_version": "1"
+      },
+      "task_ref": {
+        "expected_step_count": 1,
+        "plan_digest": "7cd18ee7ea16075be5c52bc96365ae89ffffd3ce6f7ad42e0deda2a723763abb",
+        "plan_id": "aa9cc7896c674e3d9c8e66d600166054",
+        "registry_digest": "743864d45af39743b350492bb657c56a1c90c2c3bc9dca1bea1bedf2eacd266d",
+        "registry_epoch": "07424880-e802-405f-b688-b59647cdd049",
+        "registry_generation": 1,
+        "task_id": "aa9cc7896c674e3d9c8e66d600166054"
+      },
+      "policy": {
+        "hand": "off",
+        "body": "off"
+      },
+      "created_at": "2026-11-06T18:44:16.323216+00:00",
+      "terminal_at": "2026-11-06T18:44:21.844166+00:00",
+      "state": "SUCCEEDED",
+      "error_code": "",
+      "message": "mirror_stop: runtime returned to idle [0.93 s stop(HOLD) accepted: stopped: command admission closed and an explicit safe command published; the platform holds its current motion mode (no registered hold action); 0.98 s accepted: stop latch cleared] [state=WAIT]",
+      "execution_id": "ff5e9eae-1c1e-4b08-ba4f-a4709ff14142",
+      "request_to_terminal_sec": 5.52095,
+      "skill_terminal_event": {
+        "duration_sec": 3.0764171649971104,
+        "event": "terminal",
+        "payload_hash": "7cd18ee7ea16075be5c52bc96365ae89ffffd3ce6f7ad42e0deda2a723763abb",
+        "skill": "mirror_stop",
+        "step_count": 1,
+        "task_id": "8151e47d-1325-5ae6-b157-4fa728017b3e/skill/0001"
+      },
+      "pose_preparation": null
+    }
+  ],
+  "summary": {
+    "requests": 8,
+    "agent_text_requests": 7,
+    "gateway_direct_requests": 1,
+    "succeeded": 5,
+    "failed": 3,
+    "automatic_motion_retries": 0,
+    "physical_grasp_executed": false,
+    "dual_hand_hardware_tested": false,
+    "visual_following_quality_verified": false
+  },
+  "mirror_execution_log": [
+    "[skill_executor_node-17] [INFO] [1793990643.519309257] [skill_executor_node]: {\"duration_sec\":0.0034211240017612,\"event\":\"gateway_admission\",\"task_id\":\"6c542729-f82a-5d8a-acdb-7f1a67e5b61f\"}",
+    "[skill_executor_node-17] [INFO] [1793990643.539013532] [skill_executor_node]: {\"event\":\"requested\",\"payload_hash\":\"bb121c8c785f1be3dfe97e37e3f283f54ba00c280a38699b8ded6bf45fda46b0\",\"skill\":\"mirror_start\",\"task_id\":\"6c542729-f82a-5d8a-acdb-7f1a67e5b61f/skill/0001\"}",
+    "[mirror_session_node-4] [INFO] [1793990643.595374630] [mirror_session]: set_session start: success=True took over policy_stream [state=STANDBY]",
+    "[skill_executor_node-17] [INFO] [1793990643.609376233] [skill_executor_node]: {\"duration_sec\":0.05982045000200742,\"event\":\"terminal\",\"payload_hash\":\"bb121c8c785f1be3dfe97e37e3f283f54ba00c280a38699b8ded6bf45fda46b0\",\"skill\":\"mirror_start\",\"step_count\":1,\"task_id\":\"6c542729-f82a-5d8a-acdb-7f1a67e5b61f/skill/0001\"}",
+    "[mirror_session_node-4] [INFO] [1793990643.611991580] [mirror_session]: WAIT/none -> STANDBY/approach (mirror_start); cancel_reason='' short_rounds=0",
+    "[mirror_session_node-4] [INFO] [1793990644.411356689] [mirror_session]: STANDBY/approach -> STANDBY/ready (approach_done); cancel_reason='' short_rounds=0",
+    "[mirror_session_node-4] [INFO] [1793990649.476313651] [mirror_session]: STANDBY/ready -> MIRRORING/running (criteria); cancel_reason='' short_rounds=0",
+    "[skill_executor_node-17] [INFO] [1793990658.506115994] [skill_executor_node]: {\"duration_sec\":0.0077095660017221235,\"event\":\"gateway_admission\",\"task_id\":\"8151e47d-1325-5ae6-b157-4fa728017b3e\"}",
+    "[skill_executor_node-17] [INFO] [1793990658.653918786] [skill_executor_node]: {\"event\":\"requested\",\"payload_hash\":\"7cd18ee7ea16075be5c52bc96365ae89ffffd3ce6f7ad42e0deda2a723763abb\",\"skill\":\"mirror_stop\",\"task_id\":\"8151e47d-1325-5ae6-b157-4fa728017b3e/skill/0001\"}",
+    "[mirror_session_node-4] [INFO] [1793990658.709139916] [mirror_session]: MIRRORING/running -> MIRRORING/wrap_up (mirror_stop); cancel_reason='' short_rounds=1",
+    "[mirror_session_node-4] [INFO] [1793990660.696874585] [mirror_session]: MIRRORING/wrap_up -> WAIT/none (mirror_stop); cancel_reason='' short_rounds=0",
+    "[mirror_session_node-4] [INFO] [1793990661.718862328] [mirror_session]: set_session stop: success=True runtime returned to idle [0.93 s stop(HOLD) accepted: stopped: command admission closed and an explicit safe command published; the platform holds its current motion mode (no registered hold action); 0.98 s accepted: stop latch cleared] [state=WAIT]; last command before the release was 0.00 deg from the reset pose",
+    "[skill_executor_node-17] [INFO] [1793990661.739523310] [skill_executor_node]: {\"duration_sec\":3.0764171649971104,\"event\":\"terminal\",\"payload_hash\":\"7cd18ee7ea16075be5c52bc96365ae89ffffd3ce6f7ad42e0deda2a723763abb\",\"skill\":\"mirror_stop\",\"step_count\":1,\"task_id\":\"8151e47d-1325-5ae6-b157-4fa728017b3e/skill/0001\"}"
+  ],
+  "after_last_motion_test": {
+    "pipeline_pid": 145636,
+    "pipeline_running": true,
+    "pipeline_log": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/commissioning/logs/pipeline_unified_yaml_20261107_023130.log",
+    "started_epoch": 1793989890.32,
+    "consumer_snapshot": "/tmp/ibrobot_interfaces__eyk0aq1/robot.yaml",
+    "installed_hands": [
+      "right"
+    ],
+    "task_pose_digest": "7e76950cf6a23cd03b867fb14ecd2e5b98339dfa21375e3efd1a9c4d52ac327d",
+    "live_path_validation": {
+      "hand": "off",
+      "body": "off"
+    },
+    "gateway": {
+      "control_plane_ready": true,
+      "motion_authorized": true,
+      "busy": false,
+      "control_plane_error_code": ""
+    },
+    "agent_ready": true,
+    "agent_message": "Gateway adapter is ready",
+    "composer_hands": [
+      "right"
+    ],
+    "self_intro_clip": "/root/lwh/IB_Robot_selfintro_ready_20261106_17d353a56/commissioning/audio/self_introduction.wav",
+    "self_intro_clip_exists": true,
+    "startup_alerts": [],
+    "checked_epoch": 1793990704.2013118
+  },
+  "shutdown": {
+    "310p": {
+      "pgid": 145636,
+      "remaining_active_pids": [],
+      "stopped": true
+    },
+    "orin": {
+      "pgid": 392883,
+      "remaining_active_pids": [],
+      "stopped": true
+    },
+    "scope": "owned embodied pipeline and grasp head; independent camera driver left running"
+  },
+  "software_verification": [
+    {
+      "package": "robot_config",
+      "entrypoint": "colcon test",
+      "tests": 73,
+      "passed": 73,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "timestamps": [
+        "2026-11-07T02:49:47.802480+08:00"
+      ],
+      "result_file": "build/robot_config/pytest.xml",
+      "result_sha256": "dcaced8213df442cf16bc23d01040b586ac085b29e890974428404df25d8e326",
+      "test_modules": [
+        "robot_config.src.robot_config.test.test_embodied_launch_builder",
+        "robot_config.src.robot_config.test.test_fixed_pose_path",
+        "robot_config.src.robot_config.test.test_launch_builder_registry.TestExecutePlan",
+        "robot_config.src.robot_config.test.test_observation_transport_config",
+        "robot_config.src.robot_config.test.test_task_pose_file"
+      ]
+    },
+    {
+      "package": "pose_composer",
+      "entrypoint": "colcon test",
+      "tests": 24,
+      "passed": 24,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "timestamps": [
+        "2026-11-07T02:50:10.851433+08:00"
+      ],
+      "result_file": "build/pose_composer/pytest.xml",
+      "result_sha256": "3a8153e7150d3a7fe4933a598aad2d424e862cd441dac567e7aab479c18273aa",
+      "test_modules": [
+        "pose_composer.src.agent.pose_composer.test.test_configuration_compile",
+        "pose_composer.src.agent.pose_composer.test.test_task_poses"
+      ]
+    },
+    {
+      "package": "aimdk_grasp",
+      "entrypoint": "colcon test",
+      "tests": 148,
+      "passed": 146,
+      "skipped": 2,
+      "failures": 0,
+      "errors": 0,
+      "timestamps": [
+        "2026-11-07T02:49:56.529299+08:00"
+      ],
+      "result_file": "build/aimdk_grasp/pytest.xml",
+      "result_sha256": "92c0952831ca8c725ef80a65acf402e9d16bc5af98f642769eb928b0928f6cf2",
+      "test_modules": [
+        "aimdk_grasp",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_feedback",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_hand_restore",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_hand_restore_geometry",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_hand_restore_ros",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_head_camera",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_mirror_side",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_observation",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_omnihand",
+        "aimdk_grasp.src.robots.aimdk.aimdk_grasp.test.test_split"
+      ]
+    },
+    {
+      "package": "embodied_bringup",
+      "entrypoint": "colcon test",
+      "tests": 79,
+      "passed": 73,
+      "skipped": 6,
+      "failures": 0,
+      "errors": 0,
+      "timestamps": [
+        "2026-11-07T02:50:53.014208+08:00"
+      ],
+      "result_file": "build/embodied_bringup/pytest.xml",
+      "result_sha256": "c625a6a9aa47fab7f20049bb5945ad0d5601abd2cb464c2ae326b9112efbc20a",
+      "test_modules": [
+        "embodied_bringup.src.agent.embodied_bringup.test.test_embodied_launch_builder"
+      ]
+    },
+    {
+      "package": "skill_catalog",
+      "entrypoint": "colcon test",
+      "tests": 5,
+      "passed": 5,
+      "skipped": 0,
+      "failures": 0,
+      "errors": 0,
+      "timestamps": [
+        "2026-11-07T02:49:54.702635+08:00"
+      ],
+      "result_file": "build/skill_catalog/pytest.xml",
+      "result_sha256": "d234c856b2aa0e8793ef307f5855358aa42283d5ac2df5413dd5efdb64296c20",
+      "test_modules": [
+        "skill_catalog.src.agent.skill_catalog.test.test_task_pose_catalog"
+      ]
+    }
+  ],
+  "software_selection": {
+    "packages_except_embodied_bringup": "test_task_pose_file or test_fixed_pose_path or test_configuration_compile or test_compile_library or test_task_poses or test_fixed_library or test_split or test_mirror_side or test_feedback or test_hand_restore or test_omnihand or test_observation or test_embodied_launch_builder or test_task_pose_catalog",
+    "embodied_bringup": "test/test_embodied_launch_builder.py",
+    "timeout_exit_124": false,
+    "environment_note": "Unselected source packages with absent install metadata were ignored; existing dependency overlays were retained."
+  },
+  "asset_policy": "No vendor geometry, model files, audio, or authentication material included"
+}

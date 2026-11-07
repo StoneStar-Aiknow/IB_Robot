@@ -1,0 +1,37 @@
+{
+  "status": "complete-native-restored",
+  "completed": [
+    "native-pose",
+    "native-full",
+    "public-r1",
+    "public-r2",
+    "public-r3"
+  ],
+  "boot_id": "49cab1ff-f85e-40b7-9c58-3c9646ed475e",
+  "started": 1793887590.8625224,
+  "current": null,
+  "finished": 1793888480.126366,
+  "recovery": {
+    "boot_id": "03b4a7c7-490f-4c06-a12f-9c04cac8c537",
+    "models": {
+      "pear": {
+        "iterations": 10,
+        "all_valid": true
+      },
+      "te": {
+        "iterations": 10,
+        "all_valid": true
+      },
+      "fm": {
+        "iterations": 10,
+        "all_valid": true
+      },
+      "vision": {
+        "iterations": 10,
+        "all_valid": true
+      }
+    },
+    "official_runtime_sha256": "94029220e9849e4c479c34f7ebf7441c0b80631dfd9301667c28af7f20979e37",
+    "no_module_ipc_compute_clients": true
+  }
+}

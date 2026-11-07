@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
+from typing import Any
 
 import rclpy
 from builtin_interfaces.msg import Duration as DurationMsg
@@ -567,6 +568,54 @@ def _load_json_list(raw_value: str) -> list[str]:
 # (skill -> primitive -> task_executor -> controller), each with an accept and
 # a result wait, so a 50 ms poll added ~0.3 s before the arm started moving.
 _WAIT_POLL_SEC = 0.005
+
+
+def _play_audio_failure(future, skill_name: str) -> tuple[str, str] | None:
+    """``(error_code, message)`` for a finished playback call that failed, else None."""
+    try:
+        response = future.result()
+    except Exception as exc:
+        return "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}"
+    if response is None or not response.success:
+        code = str(getattr(response, "error_code", "") or "PLAY_AUDIO_FAILED")
+        return code, str(getattr(response, "message", "") or f"{skill_name} failed")
+    return None
+
+
+class _CompositeBranchGoal:
+    """A skill goal handle for one branch of a composite skill.
+
+    The branch's executor reads the request, publishes feedback and sees a
+    cancel request (the root's, or one the composite raises through
+    ``stop_requested``) as usual, but its terminal call is kept here, so the
+    composite ends the root goal exactly once. It carries no resume token and
+    records no motion checkpoint: a composite step restarts as a whole.
+    """
+
+    def __init__(self, goal_handle, *, stop_requested: Callable[[], bool]) -> None:
+        self._goal_handle = goal_handle
+        self._stop_requested = stop_requested
+        self.terminal = ""
+
+    @property
+    def request(self):
+        return self._goal_handle.request
+
+    @property
+    def is_cancel_requested(self) -> bool:
+        return bool(self._goal_handle.is_cancel_requested) or bool(self._stop_requested())
+
+    def publish_feedback(self, feedback) -> None:
+        self._goal_handle.publish_feedback(feedback)
+
+    def succeed(self) -> None:
+        self.terminal = "succeeded"
+
+    def abort(self) -> None:
+        self.terminal = "aborted"
+
+    def canceled(self) -> None:
+        self.terminal = "canceled"
 
 
 class SkillExecutorNode(Node):
@@ -1942,8 +1991,14 @@ class SkillExecutorNode(Node):
                 f"runtime enabled={runtime_enabled}, catalog enabled={catalog_enabled}"
             )
         named_runtime_enabled = bool(getattr(self, "_runtime_named_motion_enabled", False))
+        # A clip bound with a motion runs that motion through the same executor.
         named_catalog_enabled = any(
             str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME
+            or (
+                str(template.get("executor", "")).strip() == RUNTIME_PLAY_AUDIO_EXECUTOR
+                and isinstance(template.get("binding"), Mapping)
+                and "motion" in template["binding"]
+            )
             for template in (getattr(snapshot, "templates", None) or {}).values()
             if isinstance(template, Mapping)
         )
@@ -2186,48 +2241,51 @@ class SkillExecutorNode(Node):
         """
         goal = goal_handle.request
         result = SkillCommand.Result()
+        motion = named_motion.bound_motion_name(template)
+        client, error_code, reason = self._prepare_runtime_named_motion(goal.skill_name, motion)
+        if client is None:
+            return self._abort_skill(result, goal_handle, [], error_code, reason)
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+        return self._run_runtime_named_motion(goal_handle, client, motion, timeout_sec)
+
+    def _prepare_runtime_named_motion(self, skill_name: str, motion: str) -> tuple[Any, str, str]:
+        """Check, before anything is dispatched, that the runtime can run ``motion`` now.
+
+        Returns ``(client, "", "")``, or ``(None, error_code, reason)``.
+        """
         client = getattr(self, "_runtime_named_motion_client", None)
         if client is None:
-            return self._abort_skill(
-                result,
-                goal_handle,
-                [],
+            return (
+                None,
                 named_motion.RUNTIME_UNAVAILABLE,
                 "runtime named motion executor is not enabled for this deployment",
             )
-        motion = named_motion.bound_motion_name(template)
         if not motion:
-            return self._abort_skill(
-                result, goal_handle, [], named_motion.INVALID_BINDING, "skill template binds no motion"
-            )
+            return None, named_motion.INVALID_BINDING, "skill template binds no motion"
         status, reason = self._runtime_status_for_admission()
         if status is None:
-            return self._abort_skill(result, goal_handle, [], named_motion.PLATFORM_NOT_READY, reason)
+            return None, named_motion.PLATFORM_NOT_READY, reason
         names, error_code, reason = named_motion.advertised_motion_names(
-            status.capabilities_json, self._required_capabilities_for_skill(goal.skill_name)
+            status.capabilities_json, self._required_capabilities_for_skill(skill_name)
         )
         if names is None:
-            return self._abort_skill(result, goal_handle, [], error_code, reason)
+            return None, error_code, reason
         if motion not in names:
             # Checked here because the runtime rejects an unknown name at goal
             # acceptance, which carries no reason.
-            return self._abort_skill(
-                result,
-                goal_handle,
-                [],
-                named_motion.UNKNOWN,
-                f"runtime does not advertise named motion {motion!r}",
-            )
-        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+            return None, named_motion.UNKNOWN, f"runtime does not advertise named motion {motion!r}"
         if not client.wait_for_server(timeout_sec=self._rpc_timeout):
-            return self._abort_skill(
-                result,
-                goal_handle,
-                [],
+            return (
+                None,
                 named_motion.RUNTIME_UNAVAILABLE,
                 f"named motion action unavailable: {self._runtime_named_motion_action}",
             )
+        return client, "", ""
 
+    def _run_runtime_named_motion(self, goal_handle, client, motion: str, timeout_sec: float) -> SkillCommand.Result:
+        """Dispatch a prepared named motion and end ``goal_handle`` with its outcome."""
+        goal = goal_handle.request
+        result = SkillCommand.Result()
         executed = [f"{named_motion.EXECUTOR_NAME}:{motion}"]
         motion_goal = ExecuteNamedMotion.Goal()
         motion_goal.name = motion
@@ -2773,12 +2831,22 @@ class SkillExecutorNode(Node):
         publisher.publish(message)
 
     def _execute_play_audio_skill(self, goal_handle, template, *, effective_timeout_sec: float | None = None):
-        """Play the clip the catalog binds for this skill, muting the ASR while it runs."""
+        """Play the clip the catalog binds for this skill, muting the ASR while it runs.
+
+        A binding that also names a runtime motion plays the clip and runs the
+        motion together (the self-introduction waves while it speaks). Every
+        check for both happens before anything is dispatched; the playback
+        request goes out first and the motion straight after it, without
+        waiting for either to be accepted, so the robot does not keep the user
+        waiting. A playback request that cannot be sent sends no motion.
+        """
         result = SkillCommand.Result()
         skill_name = str(goal_handle.request.skill_name)
         binding = template.get("binding") if isinstance(template, Mapping) else None
         clip = str((binding or {}).get("clip", "")).strip() if isinstance(binding, Mapping) else ""
         path = str(self._play_audio_clips.get(clip, "")).strip() if clip else ""
+        binds_motion = isinstance(binding, Mapping) and "motion" in binding
+        motion = named_motion.bound_motion_name(template) if binds_motion else ""
         if not clip or not path:
             return self._abort_skill(
                 result,
@@ -2813,27 +2881,99 @@ class SkillExecutorNode(Node):
                 "PLAY_AUDIO_SERVICE_UNAVAILABLE",
                 f"playback service unavailable: {self._play_audio_service}",
             )
+        motion_client = None
+        if binds_motion:
+            motion_client, error_code, reason = self._prepare_runtime_named_motion(skill_name, motion)
+            if motion_client is None:
+                return self._abort_skill(result, goal_handle, [], error_code, reason)
+        executed = [f"runtime_play_audio:{clip}"]
+        deadline = time.monotonic() + timeout_sec
         self._publish_asr_control("stop")
         try:
-            future = client.call_async(PlayAudioFile.Request(file_path=path))
+            try:
+                future = client.call_async(PlayAudioFile.Request(file_path=path))
+            except Exception as exc:
+                # Nothing was sent, so no motion is sent either.
+                return self._abort_skill(
+                    result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} playback request failed: {exc}"
+                )
+            if motion_client is not None:
+                return self._finish_play_audio_with_motion(
+                    goal_handle, future, motion_client, motion, deadline, executed
+                )
             if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
                 if goal_handle.is_cancel_requested:
                     return self._cancel_skill(result, goal_handle, [], skill_name)
                 return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out")
-            try:
-                response = future.result()
-            except Exception as exc:
-                return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}")
-            if response is None or not response.success:
-                code = str(getattr(response, "error_code", "") or "PLAY_AUDIO_FAILED")
-                message = str(getattr(response, "message", "") or f"{skill_name} failed")
-                return self._abort_skill(result, goal_handle, [], code, message)
+            failure = _play_audio_failure(future, skill_name)
+            if failure is not None:
+                return self._abort_skill(result, goal_handle, [], *failure)
         finally:
             self._publish_asr_control("start")
+        return self._succeed_play_audio(result, goal_handle, executed, f"{skill_name}: played {clip}")
+
+    def _finish_play_audio_with_motion(self, goal_handle, future, client, motion: str, deadline: float, executed):
+        """Run the bound motion while the clip plays, then end the skill once for both.
+
+        The motion runs through the named-motion executor against a proxy that
+        keeps its terminal call, so only this method ends ``goal_handle``. A
+        playback failure while the motion runs cancels the motion and waits for
+        its terminal state; a motion whose state is unknown is reported as
+        such. The playback service has no cancel: a skill cancel or timeout
+        stops waiting for it, and the clip may keep playing.
+        """
+        result = SkillCommand.Result()
+        skill_name = str(goal_handle.request.skill_name)
+
+        def playback_failed() -> bool:
+            return future.done() and _play_audio_failure(future, skill_name) is not None
+
+        branch = _CompositeBranchGoal(goal_handle, stop_requested=playback_failed)
+        motion_result = self._run_runtime_named_motion(branch, client, motion, max(0.0, deadline - time.monotonic()))
+        executed = [*executed, *motion_result.executed_primitives]
+        audio_failure = _play_audio_failure(future, skill_name) if future.done() else None
+        if branch.terminal not in {"succeeded", "canceled"}:
+            message = motion_result.message
+            if audio_failure is not None:
+                message = f"{message}; playback also failed: {audio_failure[1]}"
+            return self._abort_skill(result, goal_handle, executed, motion_result.error_code, message)
+        if audio_failure is not None:
+            return self._abort_skill(result, goal_handle, executed, *audio_failure)
+        if goal_handle.is_cancel_requested:
+            return self._cancel_play_audio(result, goal_handle, executed, skill_name)
+        if branch.terminal != "succeeded":
+            return self._abort_skill(
+                result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} ended without a result"
+            )
+        if not self._wait_for_future(
+            future,
+            max(0.0, deadline - time.monotonic()),
+            cancel_requested=lambda: goal_handle.is_cancel_requested,
+        ):
+            if goal_handle.is_cancel_requested:
+                return self._cancel_play_audio(result, goal_handle, executed, skill_name)
+            return self._abort_skill(
+                result, goal_handle, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out after {motion} ended"
+            )
+        failure = _play_audio_failure(future, skill_name)
+        if failure is not None:
+            return self._abort_skill(result, goal_handle, executed, *failure)
+        clip = executed[0].partition(":")[2]
+        return self._succeed_play_audio(
+            result, goal_handle, executed, f"{skill_name}: played {clip} and {motion_result.message}"
+        )
+
+    def _cancel_play_audio(self, result, goal_handle, executed, skill_name: str):
+        self._cancel_skill(result, goal_handle, executed, skill_name)
+        # The playback service cannot be cancelled: say so instead of implying silence.
+        result.message = f"{result.message}; the motion has ended, the recorded clip may still be playing"
+        return result
+
+    def _succeed_play_audio(self, result, goal_handle, executed, message: str):
         result.success = True
         result.error_code = ""
-        result.message = f"{skill_name}: played {clip}"
-        result.executed_primitives = [f"runtime_play_audio:{clip}"]
+        result.message = short_message(message)
+        result.executed_primitives = executed
         self._set_result_catalog_identity(result)
         result.diagnostics = []
         goal_handle.succeed()

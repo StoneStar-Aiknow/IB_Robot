@@ -106,7 +106,8 @@ def test_graspgen_transform_rejects_nonrigid_inputs():
         palm_goal_from_camera_grasp(np.diag([2, 1, 1, 1]), np.eye(4), np.eye(4))
 
 
-def test_the_right_arm_plans_on_its_own_model_with_the_left_arm_and_head_locked():
+@pytest.mark.parametrize("left_hand_present", [True, False])
+def test_the_right_arm_plans_on_its_own_model_with_the_left_arm_and_head_locked(left_hand_present):
     from aimdk_grasp.planner import screen_robot_config
     from aimdk_grasp.robot_model import config_directory
 
@@ -114,7 +115,9 @@ def test_the_right_arm_plans_on_its_own_model_with_the_left_arm_and_head_locked(
     right_hand = HandMapping(right_model, PRESETS, side="right")
     positions = dict.fromkeys(RIGHT_ARM + HEAD, 0.0)
     positions.update(zip(LEFT_ARM, np.linspace(-0.3, 0.3, 7), strict=True))
-    feedback = Feedback(0.0, positions, np.zeros(10), right_hand=right_hand.preset("open"))
+    feedback = Feedback(
+        0.0, positions, np.zeros(10) if left_hand_present else None, right_hand=right_hand.preset("open")
+    )
     kin = robot_config(feedback, side="right")["robot_cfg"]["kinematics"]
     assert kin["cspace"]["default_joint_position"] == [0.0] * 7
     for name, value in zip(LEFT_ARM, np.linspace(-0.3, 0.3, 7), strict=True):

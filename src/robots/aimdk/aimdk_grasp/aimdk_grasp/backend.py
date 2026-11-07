@@ -18,6 +18,10 @@ description is the deployed GraspGen-X bundle's
   either arm within 5 cm of the midline. Both planners stay resident under
   one GPU lock; execution and the watch follow the successful plan's arm.
   An omitted option preserves the legacy left-arm behavior.
+- ``installed_hands``: the OmniHands mounted, ``[left, right]`` by default. A
+  robot with one hand removed declares the other alone and forces
+  ``arm_side`` to it (auto needs both); the absent hand is then not read, its
+  stream slots carry ``joints.ABSENT_HAND_COMMAND``, and it is no obstacle.
 - ``detect_service``, ``segment_service`` (empty: the detector returns its
   own masks), ``generate_grasps_service``, ``service_timeout_s``
 - ``registration_device``, ``depth_scale``, ``calibration_verified``
@@ -51,11 +55,14 @@ from manipulation_execution.grasp_pipeline.perception import PerceptionServices
 from .execution_watch import MAX_TIMEOUT_S, WatchTimeouts, finite_seconds
 from .feedback import FeedbackHistory
 from .grasp_request import GraspRequestConfig, X2GraspPlanner, check_initial_hand
+from .joints import installed_hands as parse_installed_hands
+from .joints import other_side
 from .proposer import PerceptionSettings, X2Proposer, measured_spheres
 from .split import head_options
 
 DEFAULTS = {
     "arm_side": "left",
+    "installed_hands": ["left", "right"],
     "detect_service": "/perception/grasp/grounding_detect",
     "segment_service": "",
     "generate_grasps_service": "/perception/grasp/generate_grasps",
@@ -97,6 +104,8 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
     options = {**DEFAULTS, **given}
     for name, default in DEFAULTS.items():
         value = options[name]
+        if isinstance(default, list):
+            continue  # checked by its own parser below
         if isinstance(default, bool | str | dict):
             ok = isinstance(value, type(default))
         else:
@@ -106,6 +115,20 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"backend_options.{name} must be a {kind}")
     if options["arm_side"] not in ("left", "right", "auto"):
         raise ValueError("backend_options.arm_side must be left or right or auto")
+    hands = installed_hands(options)
+    options["installed_hands"] = list(hands)
+    if not hands:
+        raise ValueError(
+            "grasp execution requires at least one installed hand; disable grasp_execution when none are mounted"
+        )
+    if options["arm_side"] == "auto" and len(hands) != 2:
+        raise ValueError(
+            f"backend_options.arm_side auto needs both hands; with only {list(hands)} installed, set arm_side to it"
+        )
+    if options["arm_side"] != "auto" and options["arm_side"] not in hands:
+        raise ValueError(
+            f"backend_options.arm_side {options['arm_side']!r} names a hand that is not installed ({list(hands)})"
+        )
     if options["watch"] not in ("stop", "log", "off"):
         raise ValueError("backend_options.watch must be stop, log or off")
     for name in ("watch_frame_timeout_s", "watch_unknown_timeout_s", "watch_image_age_s"):
@@ -113,6 +136,16 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"backend_options.{name} must be a finite number of seconds in (0, {MAX_TIMEOUT_S:g}]")
     head_options(options)
     return options
+
+
+def installed_hands(options: Mapping[str, Any]) -> tuple[str, ...]:
+    """``installed_hands`` of ``backend_options`` checked; both hands when it is omitted."""
+    return parse_installed_hands(options.get("installed_hands", DEFAULTS["installed_hands"]))
+
+
+def grasp_installed_hands(grasp_execution: Mapping[str, Any]) -> tuple[str, ...]:
+    """The hands a ``grasp_execution`` configuration declares mounted."""
+    return installed_hands(grasp_execution.get("backend_options") or {})
 
 
 def watch_timeouts(options: Mapping[str, Any]) -> WatchTimeouts:
@@ -293,7 +326,7 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
         else HeadCamera(
             node,
             description,
-            FeedbackHistory(),
+            FeedbackHistory(required_hands=installed_hands(options)),
             device=options["registration_device"],
             depth_scale=float(options["depth_scale"]),
             calibration_verified=options["calibration_verified"],
@@ -362,7 +395,9 @@ def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: 
     hand_io = RosHandIO(node, description, robot.side)
     closers.append(hand_io.close)
     executor = x2_arm_executor(arm, gravity=robot.gravity, limits=robot.limits, side=robot.side)
-    return executor, OmniHandEffector(hand_io, robot.hand)
+    # The other hand is held where it is measured; one that is not installed is not read at all.
+    absent_other = other_side(robot.side) not in installed_hands(robot.options)
+    return executor, OmniHandEffector(hand_io, robot.hand, absent_other=absent_other)
 
 
 def automatic_execution(node, robot, description, closers, planner):

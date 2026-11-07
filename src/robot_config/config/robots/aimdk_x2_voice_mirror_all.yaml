@@ -78,7 +78,167 @@ robot:
         # would talk over the self-introduction.
         silent_skills:
           - self_introduction
-    # The self-introduction plays a recorded clip; the catalog binds the name.
+        # L3 semantic gate: decide whether an utterance is addressed to the robot at
+        # all, before the planner sees it. enforce drops the vetoed ones; the JSONL log
+        # stays the queue of sentences worth labelling for the next model.
+        semantic_gate_mode: enforce
+        # Trained on the 639-sentence field corpus (see tools/addressee and
+        # docs/aimdk_x2_addressee_semantic_gate_design_zh.md). Copy the artefact to
+        # this path on the board; a missing file only disables the gate (fail_open).
+        semantic_gate_model_path: /root/workspace/lyx/addressee/addressee_zh_v1.json
+        semantic_gate_threshold: 0.10
+        semantic_gate_model_only_threshold: 0.90
+        semantic_gate_log_path: /var/log/ibrobot/semantic_gate.jsonl
+        semantic_gate_fail_open: true
+        # A catalog alias beats the model: "帮我抓取橘子" is rare in the corpus but
+        # unmistakably addressed to the robot. Generated from the skill catalog by
+        # tools/addressee/emit_lexicon.py -- regenerate it when a skill is renamed.
+        semantic_gate_lexicon:
+          - 撒娇
+          - 卖萌
+          - 装可爱
+          - 可爱一下
+          - 求关注
+          - 飞吻
+          - 飞个吻
+          - 庆祝
+          - 庆祝一下
+          - 欢呼
+          - 太棒了
+          - 鼓掌
+          - 拍手
+          - 拍拍手
+          - 关闭夹爪
+          - 合拢夹爪
+          - 夹爪关闭
+          - 夹爪合拢
+          - 夹紧
+          - 闭爪
+          - 跳舞
+          - 跳个舞
+          - 舞动
+          - 举手致意
+          - 正式打招呼
+          - 举手打招呼
+          - 握手
+          - 握个手
+          - 开心转圈
+          - 高兴转圈
+          - 快乐转圈
+          - 直立转圈
+          - 开心地转圈
+          - 模仿动作
+          - 模仿人类动作
+          - 跟我做动作
+          - 观察桌面
+          - 观察场景
+          - 看看桌面
+          - 扫描桌面
+          - 观察点
+          - 观察位置
+          - 照镜子
+          - 开始照镜子
+          - 学我动作
+          - 模仿我
+          - 停止照镜子
+          - 结束照镜子
+          - 不玩照镜子了
+          - 往前一点
+          - 往上一点
+          - 夹爪往左
+          - 移动一点
+          - 点头
+          - 点头表示同意
+          - 打开夹爪
+          - 张开夹爪
+          - 展开夹爪
+          - 夹爪打开
+          - 夹爪张开
+          - 开爪
+          - 抓取物体
+          - 拿起物体
+          - 放进容器
+          - 放到盒子里
+          - 投入料框
+          - 举手
+          - 举起手
+          - 回原位
+          - 回安全位
+          - 回安全位置
+          - 原位
+          - 原点
+          - 回到home
+          - 返回home
+          - 零点
+          - 零位
+          - 回零点
+          - 到零点
+          - 查物品位置
+          - 查停靠位
+          - 找物品
+          - 逆时针旋转
+          - 逆时针转
+          - 顺时针旋转
+          - 顺时针转
+          - 自我介绍
+          - 介绍一下你自己
+          - 介绍下你自己
+          - 做个自我介绍
+          - 你是谁
+          - 摇头
+          - 不同意
+          - 摇头表示否定
+          - 开启声源跟随
+          - 开始声源跟随
+          - 声源跟随
+          - 停止声源跟随
+          - 关闭声源跟随
+          - 挥手
+          - 挥挥手
+          - 打招呼
+          - 招手
+          - 再见
+          - 嗨
+        # Requests to talk are addressed to whatever can answer them. Without this list
+        # the gate read "讲个故事" as chatter, because the corpus that trained the model
+        # holds commands and meetings but almost no small talk.
+        semantic_gate_dialogue_requests:
+          - 讲个故事
+          - 讲一个故事
+          - 讲个笑话
+          - 讲一个笑话
+          - 说个笑话
+          - 讲个段子
+          - 唱首歌
+          - 唱一首歌
+          - 背首诗
+          - 聊聊天
+          - 陪我聊聊
+          - 说点什么
+          # Questions about what the robot just did. The corpus has no such phrasing, so
+          # the model scores them at zero even though only this robot can answer them.
+          - 你做了什么
+          - 你刚刚做了什么
+          - 你刚才做了什么
+          - 你做了哪些
+          - 你都做了哪些
+          - 做了哪些动作
+          - 干了什么
+          - 执行了什么
+          - 还做了什么
+        # Corrupted wake words the model was trained to recognise as opening an
+        # utterance; a hit accepts it even when the rest scores low.
+        semantic_gate_wake_prefixes:
+          - 灵犀灵犀
+          - 灵犀
+          - 灵溪
+          - 林星
+          - 林静熙
+          - 年轻人
+          - 小欧
+          - 零七零七
+    # The self-introduction plays a recorded clip and waves while it plays; the
+    # catalog binds the clip name and the runtime motion (runtime_named_motion below).
     runtime_play_audio:
       enabled: true
       service: /voice_tts/play

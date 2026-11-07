@@ -170,22 +170,25 @@ def test_fixed_raise_return_and_both_hands_without_generation(
     monkeypatch.setattr(node_module.time, "monotonic", lambda: state.now)
     monkeypatch.setattr(node_module.time, "sleep", ports.wait)
     server._composer = FixedComposer(fixed_backend.library)
-    config = normalize_task_poses(
-        {
-            "schema_version": 1,
-            "robot_type": "x2_ultra_omnihand",
-            "joint_names": list(LEFT_ARM + RIGHT_ARM),
-            "poses": {
-                "grasp_ready": {
-                    "joint_positions": dict(state.q),
-                    "hardware_approved": True,
-                    "unloaded_operation_approved": True,
-                    "timeout_sec": 180.0,
-                    "hands": {"left": "open", "right": "open"},
-                }
-            },
-        }
-    )
+    config = copy.deepcopy(fixed_backend.task_poses) or {
+        "schema_version": 1,
+        "robot_type": "x2_ultra_omnihand",
+        "joint_names": list(LEFT_ARM + RIGHT_ARM),
+        "poses": {
+            name: {
+                "joint_positions": dict(state.q),
+                "hardware_approved": True,
+                "unloaded_operation_approved": True,
+                "timeout_sec": 180.0,
+                "hands": {"left": "open", "right": "open"},
+            }
+            for name in ("arms_rest", "grasp_ready")
+        },
+    }
+    config.pop("digest", None)
+    for pose in config["poses"].values():
+        pose.update(hardware_approved=True, unloaded_operation_approved=True, timeout_sec=180.0)
+    config = normalize_task_poses(config)
     server._task_pose_runner = TaskPoseRunner(config, clock=lambda: state.now, pause=ports.wait, backend=fixed_backend)
 
     class Trajectory:
@@ -203,7 +206,7 @@ def test_fixed_raise_return_and_both_hands_without_generation(
     if pose_name not in fixed_backend.library["poses"] or (
         return_kind == "seed" and "arms_down" not in fixed_backend.library["poses"]
     ):
-        pytest.skip("set IBROBOT_FIXED_LIBRARY to the HOME-bound expanded candidate library")
+        pytest.skip("set IBROBOT_FIXED_LIBRARY to the rest-bound expanded candidate library")
     up = ExecuteArmPose.Goal(text=pose_name, gateway_task_id="mock_task", timeout_sec=180.0)
     first = Goal(up, state)
     result = server._on_execute(first)
@@ -211,10 +214,11 @@ def test_fixed_raise_return_and_both_hands_without_generation(
     assert first.terminal == "succeeded"
     assert state.q == pytest.approx(fixed_backend.library["poses"][pose_name]["target"])
     for side in ("left", "right"):
-        if fixed_backend.library["poses"][pose_name]["description"].get(side, {}).get("task_pose"):
+        anchor = fixed_backend.library["poses"][pose_name]["description"].get(side, {}).get("task_pose")
+        if anchor:
             for joint in state.q:
                 if joint.startswith(side + "_"):
-                    assert state.q[joint] == config["poses"]["grasp_ready"]["joint_positions"][joint]
+                    assert state.q[joint] == config["poses"][anchor]["joint_positions"][joint]
     events.append("raised")
     request = ExecuteArmPose.Goal(
         named_pose="grasp_ready", task_poses_digest=config["digest"], gateway_task_id="mock_task", timeout_sec=180.0
@@ -224,7 +228,8 @@ def test_fixed_raise_return_and_both_hands_without_generation(
     second = Goal(request, state)
     result = server._on_execute(second)
     assert result.success, result.message
-    assert state.q == pytest.approx(config["poses"]["grasp_ready"]["joint_positions"])
+    target_name = "arms_rest" if return_kind == "seed" else "grasp_ready"
+    assert state.q == pytest.approx(config["poses"][target_name]["joint_positions"])
     assert server._task_pose_runner.report["completed_hands"] == ["left", "right"]
     assert server._task_pose_runner.report["skipped_hands"] == []
     for side, plan in plans.items():

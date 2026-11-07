@@ -26,7 +26,15 @@ GATEWAY_REQUEST_PERIOD_S = 0.2
 class RuntimeRestorePorts:
     """Call :meth:`close` before ``node`` is destroyed."""
 
-    def __init__(self, node, description: Mapping, *, gateway_service: str, callback_group=None):
+    def __init__(
+        self,
+        node,
+        description: Mapping,
+        *,
+        gateway_service: str,
+        callback_group=None,
+        installed_hands=("left", "right"),
+    ):
         from ibrobot_msgs.msg import JointCommandState, RuntimeStatus
         from ibrobot_msgs.srv import GetSkillGatewayStatus
         from robot_config.contract_utils import qos_profile_from_dict
@@ -39,7 +47,7 @@ class RuntimeRestorePorts:
         # Execution consumes only latest(), never image-time history. Keeping
         # 120 samples per view makes a post-sweep drain decode stale backlog
         # before the freshness gate; let DDS discard superseded samples.
-        self.history = FeedbackHistory(history=1)
+        self.history = FeedbackHistory(history=1, required_hands=installed_hands)
         self._subscriptions = OnDemandSubscriptions(node.context, f"{node.get_name()}_hand_restore")
         subscribe_feedback(self._subscriptions, description, self.history)
         self._status = None

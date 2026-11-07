@@ -19,6 +19,36 @@ robot:
   base_config: aimdk_x2_magicmirror.yaml
   name: aimdk_x2_magicmirror_board
 
+  # RT-Infer software AI-core scheduling for the 310P, default-on for the
+  # summit live entries. The launch starts the device scheduler through the
+  # vendor priorityctl before any Ascend model process and wraps each of the
+  # four model roles (PEAR/YOLOX model services, the ZipVoice TTS host, the
+  # InternVL visual-interaction host) as one priorityctl client per process;
+  # no benchmark or manual priorityctl call is needed. Priorities/CPU pins
+  # and the PEAR periodic admission (18 Hz / 38 ms budget) are the summit
+  # evaluation profile (docs/rt_infer_periodic.md); the numbers live here in
+  # one place rather than scattered in launch code.
+  #
+  # Diagnostics/native escape hatch: set rt_infer.enable: false here. After a
+  # boot that started the soft scheduler, restoring native hardware scheduling
+  # additionally requires a reboot (vendor rule; a clean stop is not enough).
+  #
+  # The launch installs this branch's vendor bundle
+  # third_party/vendor/rt-infer/<bundle_version> to the canonical prefix
+  # /opt/rt-infer/<bundle_version> through the vendor's own guarded,
+  # idempotent install command, so a normal setup/build/launch prepares the
+  # environment; no manual CLI step exists.
+  rt_infer:
+    enable: true
+    bundle_version: "2026.11.06"
+    scheduler_cpu: 15
+    pear_periodic:
+      period_hz: 18
+      budget_ns: 38000000
+
+  motion_imitation_stream:
+    max_pear_hz: 18.0
+
   visual_interaction:
     vl:
       implementation: internvl

@@ -1,0 +1,49 @@
+{
+  "boot_id": "8f445c1a-fa03-4c80-b0c5-fc065ac186c4",
+  "prefix": "/opt/rt-infer/2026.11.06",
+  "version": "2026.11.06-candidate10-controlfix",
+  "status": "running",
+  "module_owned": true,
+  "module_sha256": "0ff837d764754475a2cb723d7eab75e129dd400fafd3bd85a7210fb45b3fdf6d",
+  "strategy": "pfp",
+  "prefetch": "on",
+  "cpu": 15,
+  "pfp_exclusive": "on",
+  "local_pool": "on",
+  "pfp_batch_select": "on",
+  "pfp_min_cache": "on",
+  "pfp_hi_priority": 0,
+  "native_recovery": "reboot-required",
+  "clients": [
+    {
+      "pid": 3725,
+      "start_ticks": "153469"
+    },
+    {
+      "pid": 3728,
+      "start_ticks": "153470"
+    },
+    {
+      "pid": 3733,
+      "start_ticks": "153472"
+    },
+    {
+      "pid": 3734,
+      "start_ticks": "153472"
+    }
+  ],
+  "scheduler": {
+    "pid": 3703,
+    "start_ticks": "153287",
+    "executable": "/opt/rt-infer/2026.11.06/bin/aicore_scheduler"
+  },
+  "shmid": "3",
+  "ipc_identity": {
+    "key": "1478101256",
+    "shmid": "3",
+    "cpid": "3703",
+    "ctime": "1793959434",
+    "uid": "0",
+    "size": "13139968"
+  }
+}

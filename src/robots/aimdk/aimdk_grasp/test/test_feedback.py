@@ -85,6 +85,35 @@ def test_every_view_is_required():
         history.latest()
 
 
+@pytest.mark.parametrize("sides", [("left",), ("right",), ("left", "right"), ()])
+def test_only_explicitly_installed_hands_are_required(sides):
+    history = FeedbackHistory(required_hands=sides)
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    names = tuple(name for side in sides for name in (LEFT_HAND if side == "left" else RIGHT_HAND))
+    if sides:
+        history.record("joint.hand_state", 10 * MS, names, [0.1] * len(names))
+    history.set_healthy(True, time.monotonic())
+    for feedback in (history.latest(), history.at(10 * MS)):
+        assert feedback.healthy and len(feedback.vector(ARMS)) == 14
+        for side in ("left", "right"):
+            if side in sides:
+                np.testing.assert_allclose(feedback.hand(side), [0.1] * 10)
+            else:
+                with pytest.raises(ValueError, match=f"lacks {side} hand"):
+                    feedback.hand(side)
+
+
+@pytest.mark.parametrize("names", [(), RIGHT_HAND[:-1], LEFT_HAND + RIGHT_HAND])
+def test_missing_partial_or_unexpected_hand_feedback_cannot_change_the_mounting_configuration(names):
+    history = FeedbackHistory(required_hands=("right",))
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, names, [0.0] * len(names))
+    with pytest.raises(ValueError, match="hand"):
+        history.latest()
+
+
 def test_missing_joints_and_desynchronized_views_are_refused():
     history = FeedbackHistory()
     history.record("joint.state", 10 * MS, LEFT_ARM, [0.0] * 7)

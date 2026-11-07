@@ -1,0 +1,351 @@
+[
+  {
+    "case": "native-full-1",
+    "mode": "native",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1354,
+        "drops": 266,
+        "window_finished": 1354,
+        "window_released_and_finished": 1354,
+        "p50_ms": 24.095481,
+        "completed_p99_ms": 229.822142,
+        "all_release_p99_ms": null,
+        "late_55_56ms": 291,
+        "longest_silence_s": 0.386063803
+      },
+      "yolox": {
+        "offered": 90,
+        "completed": 90,
+        "drops": 0,
+        "window_finished": 90,
+        "window_released_and_finished": 90,
+        "p50_ms": 59.400607,
+        "completed_p99_ms": 109.022309,
+        "all_release_p99_ms": 109.022309,
+        "late_55_56ms": null,
+        "longest_silence_s": 1.049511433
+      },
+      "tts": {
+        "offered": 12,
+        "completed": 12,
+        "drops": 0,
+        "window_finished": 12,
+        "window_released_and_finished": 12,
+        "p50_ms": 1884.25907,
+        "completed_p99_ms": 1895.964225,
+        "all_release_p99_ms": 1895.964225,
+        "late_55_56ms": null,
+        "longest_silence_s": 7.511131672
+      },
+      "vl": {
+        "offered": 36,
+        "completed": 36,
+        "drops": 0,
+        "window_finished": 36,
+        "window_released_and_finished": 36,
+        "p50_ms": 1087.8398,
+        "completed_p99_ms": 2020.761764,
+        "all_release_p99_ms": 2020.761764,
+        "late_55_56ms": null,
+        "longest_silence_s": 3.433244847
+      }
+    }
+  },
+  {
+    "case": "native-full-2",
+    "mode": "native",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1348,
+        "drops": 272,
+        "window_finished": 1348,
+        "window_released_and_finished": 1348,
+        "p50_ms": 24.081783,
+        "completed_p99_ms": 229.562314,
+        "all_release_p99_ms": null,
+        "late_55_56ms": 287,
+        "longest_silence_s": 0.386059896
+      },
+      "yolox": {
+        "offered": 90,
+        "completed": 90,
+        "drops": 0,
+        "window_finished": 90,
+        "window_released_and_finished": 90,
+        "p50_ms": 60.102771,
+        "completed_p99_ms": 108.624016,
+        "all_release_p99_ms": 108.624016,
+        "late_55_56ms": null,
+        "longest_silence_s": 1.050471824
+      },
+      "tts": {
+        "offered": 12,
+        "completed": 12,
+        "drops": 0,
+        "window_finished": 12,
+        "window_released_and_finished": 12,
+        "p50_ms": 1880.600427,
+        "completed_p99_ms": 1902.421211,
+        "all_release_p99_ms": 1902.421211,
+        "late_55_56ms": null,
+        "longest_silence_s": 7.531636646
+      },
+      "vl": {
+        "offered": 36,
+        "completed": 36,
+        "drops": 0,
+        "window_finished": 36,
+        "window_released_and_finished": 36,
+        "p50_ms": 1092.651936,
+        "completed_p99_ms": 2026.201154,
+        "all_release_p99_ms": 2026.201154,
+        "late_55_56ms": null,
+        "longest_silence_s": 3.438138336
+      }
+    }
+  },
+  {
+    "case": "native-full-3",
+    "mode": "native",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1356,
+        "drops": 264,
+        "window_finished": 1356,
+        "window_released_and_finished": 1356,
+        "p50_ms": 24.038507,
+        "completed_p99_ms": 229.684605,
+        "all_release_p99_ms": null,
+        "late_55_56ms": 297,
+        "longest_silence_s": 0.384726589
+      },
+      "yolox": {
+        "offered": 90,
+        "completed": 90,
+        "drops": 0,
+        "window_finished": 90,
+        "window_released_and_finished": 90,
+        "p50_ms": 59.521001,
+        "completed_p99_ms": 108.81788,
+        "all_release_p99_ms": 108.81788,
+        "late_55_56ms": null,
+        "longest_silence_s": 1.050673178
+      },
+      "tts": {
+        "offered": 12,
+        "completed": 12,
+        "drops": 0,
+        "window_finished": 12,
+        "window_released_and_finished": 12,
+        "p50_ms": 1883.582128,
+        "completed_p99_ms": 1902.226717,
+        "all_release_p99_ms": 1902.226717,
+        "late_55_56ms": null,
+        "longest_silence_s": 7.518644589
+      },
+      "vl": {
+        "offered": 36,
+        "completed": 36,
+        "drops": 0,
+        "window_finished": 36,
+        "window_released_and_finished": 36,
+        "p50_ms": 1087.323318,
+        "completed_p99_ms": 2020.513555,
+        "all_release_p99_ms": 2020.513555,
+        "late_55_56ms": null,
+        "longest_silence_s": 3.433663597
+      }
+    }
+  },
+  {
+    "case": "native-pose",
+    "mode": "native",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1620,
+        "drops": 0,
+        "window_finished": 1620,
+        "window_released_and_finished": 1620,
+        "p50_ms": 23.642401,
+        "completed_p99_ms": 23.824965,
+        "all_release_p99_ms": 23.824965,
+        "late_55_56ms": 0,
+        "longest_silence_s": 0.062590052
+      }
+    }
+  },
+  {
+    "case": "soft-full-1",
+    "mode": "soft",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1620,
+        "drops": 0,
+        "window_finished": 1620,
+        "window_released_and_finished": 1620,
+        "p50_ms": 43.892216,
+        "completed_p99_ms": 45.390071,
+        "all_release_p99_ms": 45.390071,
+        "late_55_56ms": 3,
+        "longest_silence_s": 0.087749063
+      },
+      "yolox": {
+        "offered": 90,
+        "completed": 90,
+        "drops": 0,
+        "window_finished": 90,
+        "window_released_and_finished": 90,
+        "p50_ms": 113.398503,
+        "completed_p99_ms": 497.401868,
+        "all_release_p99_ms": 497.401868,
+        "late_55_56ms": null,
+        "longest_silence_s": 1.384278985
+      },
+      "tts": {
+        "offered": 12,
+        "completed": 0,
+        "drops": 12,
+        "window_finished": 1,
+        "window_released_and_finished": 0,
+        "p50_ms": null,
+        "completed_p99_ms": null,
+        "all_release_p99_ms": null,
+        "late_55_56ms": null,
+        "longest_silence_s": 88.237230294
+      },
+      "vl": {
+        "offered": 36,
+        "completed": 17,
+        "drops": 19,
+        "window_finished": 18,
+        "window_released_and_finished": 17,
+        "p50_ms": 6720.369915,
+        "completed_p99_ms": 7214.399892,
+        "all_release_p99_ms": null,
+        "late_55_56ms": null,
+        "longest_silence_s": 5.340445837
+      }
+    }
+  },
+  {
+    "case": "soft-full-2",
+    "mode": "soft",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1620,
+        "drops": 0,
+        "window_finished": 1620,
+        "window_released_and_finished": 1620,
+        "p50_ms": 43.876995,
+        "completed_p99_ms": 46.167134,
+        "all_release_p99_ms": 46.167134,
+        "late_55_56ms": 2,
+        "longest_silence_s": 0.085197031
+      },
+      "yolox": {
+        "offered": 90,
+        "completed": 90,
+        "drops": 0,
+        "window_finished": 90,
+        "window_released_and_finished": 90,
+        "p50_ms": 165.266935,
+        "completed_p99_ms": 501.98246,
+        "all_release_p99_ms": 501.98246,
+        "late_55_56ms": null,
+        "longest_silence_s": 1.379310417
+      },
+      "tts": {
+        "offered": 12,
+        "completed": 3,
+        "drops": 9,
+        "window_finished": 4,
+        "window_released_and_finished": 3,
+        "p50_ms": 6165.559217,
+        "completed_p99_ms": 6872.591104,
+        "all_release_p99_ms": null,
+        "late_55_56ms": null,
+        "longest_silence_s": 65.627408896
+      },
+      "vl": {
+        "offered": 36,
+        "completed": 16,
+        "drops": 20,
+        "window_finished": 17,
+        "window_released_and_finished": 16,
+        "p50_ms": 6721.225745,
+        "completed_p99_ms": 8763.319529,
+        "all_release_p99_ms": null,
+        "late_55_56ms": null,
+        "longest_silence_s": 6.889105187
+      }
+    }
+  },
+  {
+    "case": "soft-full-3",
+    "mode": "soft",
+    "round": "round-1",
+    "roles": {
+      "pear": {
+        "offered": 1620,
+        "completed": 1620,
+        "drops": 0,
+        "window_finished": 1620,
+        "window_released_and_finished": 1620,
+        "p50_ms": 38.493545,
+        "completed_p99_ms": 46.941414,
+        "all_release_p99_ms": 46.941414,
+        "late_55_56ms": 2,
+        "longest_silence_s": 0.104189063
+      },
+      "yolox": {
+        "offered": 90,
+        "completed": 90,
+        "drops": 0,
+        "window_finished": 90,
+        "window_released_and_finished": 90,
+        "p50_ms": 168.221034,
+        "completed_p99_ms": 499.306093,
+        "all_release_p99_ms": 499.306093,
+        "late_55_56ms": null,
+        "longest_silence_s": 1.333703986
+      },
+      "tts": {
+        "offered": 12,
+        "completed": 8,
+        "drops": 4,
+        "window_finished": 9,
+        "window_released_and_finished": 8,
+        "p50_ms": 6776.510845,
+        "completed_p99_ms": 6945.004653,
+        "all_release_p99_ms": null,
+        "late_55_56ms": null,
+        "longest_silence_s": 28.057931273
+      },
+      "vl": {
+        "offered": 36,
+        "completed": 14,
+        "drops": 22,
+        "window_finished": 15,
+        "window_released_and_finished": 14,
+        "p50_ms": 7430.542721,
+        "completed_p99_ms": 9485.779002,
+        "all_release_p99_ms": null,
+        "late_55_56ms": null,
+        "longest_silence_s": 7.112003963
+      }
+    }
+  }
+]

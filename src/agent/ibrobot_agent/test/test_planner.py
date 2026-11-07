@@ -10,6 +10,7 @@ from ibrobot_agent.contracts import AgentRequest, PlannerIdentity, PlannerRepair
 from ibrobot_agent.planner import (
     PlannerAdapter,
     PlannerParseError,
+    PlannerRepair,
     RulePlanner,
     build_planner_messages,
     parse_planner_outcome,
@@ -411,8 +412,12 @@ def test_prompt_names_every_legal_reason_code():
         assert value in system, f"prompt does not mention reason_code {value}"
 
 
-def test_rejection_with_an_invented_reason_code_is_still_refused_locally():
-    """The prompt is guidance; the contract stays the authority."""
+def test_an_invented_reason_code_is_repaired_to_a_documented_one():
+    """The prompt is guidance; the contract stays the authority.
+
+    An invented code cannot reach the Gateway, so the refusal is kept and its code is
+    defaulted, with the repair recorded instead of the turn being lost.
+    """
     planner, _ = _planner_adapter(
         {
             "status": "ok",
@@ -422,6 +427,7 @@ def test_rejection_with_an_invented_reason_code_is_still_refused_locally():
     )
 
     outcome = planner.plan(_request("点个头"), {}, {}, threading.Event())
+
     assert outcome.kind == "rejected" and outcome.steps == ()
     assert outcome.reason_code == "UNSUPPORTED_TASK"
     assert outcome.repairs == (PlannerRepair("reason_code", "defaulted", "motion_not_authorized"),)
@@ -840,13 +846,10 @@ def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
 @pytest.mark.parametrize(
     "payload",
     [
-        # A question that also carries steps or a reason: the model's intent is ambiguous.
-        {
-            "kind": "needs_clarification",
-            "user_message": "哪只手？",
-            "missing_fields": ["hand"],
-            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
-        },
+        # A question that also carries a reason: the model's intent is ambiguous.
+        # A question carrying steps is *not* listed here: the planner strips an
+        # unrunnable workflow and keeps the question (see
+        # test_a_question_that_also_carries_a_workflow_keeps_the_question).
         {"kind": "needs_clarification", "user_message": "哪只手？", "missing_fields": ["hand"], "reason_code": "X"},
         {"kind": "rejected", "user_message": "做不到。", "reason_code": "OUT_OF_SCOPE", "summary": "wave_hand"},
         # Workflow replies are never repaired.
@@ -864,6 +867,28 @@ def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
 def test_a_reply_whose_fields_contradict_its_kind_still_fails_closed(payload):
     with pytest.raises(PlannerParseError):
         _parse(payload)
+
+
+def test_a_question_that_also_carries_a_workflow_keeps_the_question():
+    # Nothing can run from a clarification, so the workflow it also carries is dropped and
+    # audited instead of failing the whole turn: the user hears the question, not "failed".
+    outcome = _parse(
+        {
+            "kind": "needs_clarification",
+            "user_message": "你是想让我举手吗？",
+            "missing_fields": ["hand"],
+            "steps": [{"schema_version": 1, "skill_name": "raise_hand"}],
+            "summary": "举手",
+        }
+    )
+
+    assert outcome.kind == "needs_clarification"
+    assert outcome.steps == ()
+    assert outcome.summary == ""
+    assert outcome.repairs == (
+        PlannerRepair("steps", "defaulted", [{"schema_version": 1, "skill_name": "raise_hand"}]),
+        PlannerRepair("summary", "defaulted", "举手"),
+    )
 
 
 def test_repairs_stay_out_of_what_the_robot_is_asked_to_do():

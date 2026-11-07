@@ -1,0 +1,14 @@
+{
+  "vision": {
+    "calls": 18,
+    "checks": 5
+  },
+  "prefill": {
+    "calls": 18,
+    "checks": 5
+  },
+  "decode": {
+    "calls": 260,
+    "checks": 7
+  }
+}

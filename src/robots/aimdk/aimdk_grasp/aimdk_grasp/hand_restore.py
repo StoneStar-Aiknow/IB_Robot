@@ -32,10 +32,13 @@ import numpy as np
 
 from .feedback import Feedback
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping, hand_links
-from .joints import BODY_JOINTS, LEFT_ARM, RIGHT_ARM, arm_joints, other_side
+from .joints import ABSENT_HAND_COMMAND, BODY_JOINTS, LEFT_ARM, RIGHT_ARM, arm_joints, other_side
+from .joints import installed_hands as parse_installed_hands
 from .omnihand import HAND_HZ, HAND_STEP_RAD
 
 SIDES = ("left", "right")
+#: Why ``build_hand_plans`` has no plan for a hand the configuration declares absent.
+NOT_INSTALLED = "not installed (backend_options.installed_hands)"
 #: Newest feedback sample may be at most this old (s); a hand moves 0.01 rad per 20 ms frame.
 FEEDBACK_MAX_AGE_S = 0.1
 RUNTIME_STATUS_MAX_AGE_S = 2.0
@@ -291,11 +294,15 @@ def build_hand_plans(grasp_execution: Mapping) -> tuple[dict[str, HandPlan], dic
     and a native/alias mapping. Each physical side uses its own planning model,
     independently of the arm selected for a subsequent grasp.
     """
-    from .backend import x2_robot
+    from .backend import grasp_installed_hands, x2_robot
 
+    installed = grasp_installed_hands(grasp_execution)
     plans: dict[str, HandPlan] = {}
     missing = {}
     for side in SIDES:
+        if side not in installed:
+            missing[side] = NOT_INSTALLED
+            continue
         robot = x2_robot(
             {**grasp_execution, "backend_options": {**(grasp_execution.get("backend_options") or {}), "arm_side": side}}
         )
@@ -303,15 +310,15 @@ def build_hand_plans(grasp_execution: Mapping) -> tuple[dict[str, HandPlan], dic
             plans[side] = HandPlan(side, robot.hand, robot.hand.preset("open"), HandSweepCheck(robot.hand))
         except RestoreError as exc:
             missing[side] = str(exc)
-    if set(plans) == set(SIDES):
+    if plans and set(plans) == set(installed):
         from .hand_restore_geometry import DualHandCollision
 
         geometry = DualHandCollision({side: plan.sweep for side, plan in plans.items()})
         for side, plan in plans.items():
             plan.sweep = geometry.sweep(side)
     else:
-        # Even a one-hand request needs the opposite articulated hand as an obstacle.
-        missing.update({side: "both physical hand models are required for combined collision checks" for side in plans})
+        # Even a one-hand request needs every other installed articulated hand as an obstacle.
+        missing.update({side: "every installed hand model is required for combined collision checks" for side in plans})
         plans.clear()
     return plans, missing
 
@@ -331,7 +338,16 @@ class HandRestorer:
     # The deployed arm planner has rigid dummy hands, not a verified finger envelope.
     # Only a backend with that coverage (or a Mock) may enable combined arm motion.
     arm_motion_covered: bool = False
+    installed_hands: tuple[str, ...] = SIDES
     _baseline: dict | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        self.installed_hands = parse_installed_hands(self.installed_hands)
+
+    @property
+    def installed(self) -> tuple[str, ...]:
+        """Explicit mounting configuration; missing feedback never changes it."""
+        return self.installed_hands
 
     # -- shared guards --
 
@@ -408,7 +424,7 @@ class HandRestorer:
 
     def require_capabilities(self, sides: Sequence[str]) -> None:
         for side in sides:
-            if side not in self.plans:
+            if side not in self.installed or side not in self.plans:
                 raise CapabilityMissing(f"cannot open the {side} hand: {self.missing.get(side, 'no model')}")
 
     def arm_planning_gap(self, obs: Observation) -> str:
@@ -421,13 +437,13 @@ class HandRestorer:
         and both hands open; recognizing a preset alone does not prove coverage.
         """
         if self.geometry is not None:
-            for side in SIDES:
+            for side in self.installed:
                 self._hand(obs, side)
             return ""
         reasons = []
         if not self.arm_motion_covered:
             reasons.append("rigid dummy hands do not establish collision coverage for articulated fingers")
-        for side in SIDES:
+        for side in self.installed:
             plan = self.plans.get(side)
             if plan is None:
                 reasons.append(f"{side} hand shape cannot be verified ({self.missing.get(side, 'no model')})")
@@ -440,8 +456,9 @@ class HandRestorer:
     @property
     def geometry(self):
         """The shared real geometry checker, absent for older/synthetic backends."""
-        checks = [getattr(plan.sweep, "geometry", None) for plan in self.plans.values()]
-        return checks[0] if len(checks) == 2 and checks[0] is not None and checks[0] is checks[1] else None
+        checks = [getattr(self.plans[side].sweep, "geometry", None) for side in self.installed if side in self.plans]
+        complete = bool(checks) and len(checks) == len(self.installed) and checks[0] is not None
+        return checks[0] if complete and all(check is checks[0] for check in checks) else None
 
     def arm_baseline(self, ctx):
         obs = self._observe(ctx)
@@ -486,7 +503,7 @@ class HandRestorer:
         from .joints import HEAD
 
         obs = self._observe(ctx)
-        for side in SIDES:
+        for side in self.installed:
             current, baseline = self._hand(obs, side), self._hand(initial, side)
             index = int(np.argmax(np.abs(current - baseline)))
             delta = float(abs(current[index] - baseline[index]))
@@ -546,7 +563,7 @@ class HandRestorer:
             right_arm = [arm_target[name] for name in RIGHT_ARM]
         except KeyError as exc:
             raise RestoreError("HAND_SWEEP_OUT_OF_LIMITS", f"arm target lacks {exc}") from None
-        if "right" in sides and "left" not in sides:
+        if "right" in sides and "left" not in sides and "left" in self.installed:
             self._require_left_open(obs)
         seconds = OBSERVE_S + (SETTLE_S if gains_class(obs.command) != "ready" else 0.0)
         projected = obs.feedback
@@ -556,7 +573,7 @@ class HandRestorer:
             self._check_hand_sweep(ctx, plan, projected, frames, obs, left_arm=left_arm, right_arm=right_arm)
             projected = replace(projected, **{f"{side}_hand": plan.open_pose})
             seconds += len(frames) / HAND_HZ + SETTLE_S
-        for side in SIDES:
+        for side in self.installed:
             self._hand(obs, side)
         self._wait_output_ready(ctx)
         return seconds
@@ -578,7 +595,7 @@ class HandRestorer:
         Returns whether a takeover was needed.
         """
         obs = self._observe(ctx)
-        self._baseline = {side: self._hand(obs, side) for side in SIDES}
+        self._baseline = {side: self._hand(obs, side) for side in self.installed}
         kind = gains_class(obs.command)
         if kind == "ready":
             return False
@@ -586,7 +603,7 @@ class HandRestorer:
             raise RestoreError("HAND_ARM_GAINS_UNVERIFIED", "arm gains changed to an unverified setting")
         ctx.progress("takeover", 0.0)
         hold = dict(self._baseline)
-        self._drive(ctx, "takeover", obs, [hold], hold, moving=tuple(SIDES))
+        self._drive(ctx, "takeover", obs, [hold], hold, moving=self.installed)
         return True
 
     def _require_left_open(self, obs: Observation) -> None:
@@ -603,12 +620,12 @@ class HandRestorer:
         plan = self.plans[side]
         obs = self._observe(ctx)
         start = self._hand(obs, side)
-        held = {s: self._hand(obs, s) for s in SIDES}
+        held = {s: self._hand(obs, s) for s in self.installed}
         # In particular, do not accept a new preserved pose after the other hand drifted.
-        for other in SIDES:
+        for other in self.installed:
             if other != side and np.max(np.abs(held[other] - self._baseline[other])) > PATH_SHAPE_HOLD_RAD:
                 raise RestoreError("HAND_PRESERVED_MOVED", f"{other} hand moved between preparation stages")
-        if side == "right":
+        if side == "right" and "left" in self.installed:
             self._require_left_open(obs)
         frames = sweep_frames(start, plan.open_pose, self.step_rad)
         self._check_hand_sweep(ctx, plan, obs.feedback, frames, obs)
@@ -638,7 +655,7 @@ class HandRestorer:
         until = self.ports.monotonic() + duration
         while True:
             obs = self._observe(ctx)
-            for side in SIDES:
+            for side in self.installed:
                 pose = self._hand(obs, side)
                 if side in sides:
                     if float(np.max(np.abs(pose - self.plans[side].open_pose))) > OPEN_HAND_TOLERANCE_RAD:
@@ -672,8 +689,8 @@ class HandRestorer:
         ports = self.ports
         body = first.feedback.vector(BODY_JOINTS)
         board = first.command
-        held = {side: self._hand(first, side) for side in SIDES}
-        previous = {side: held[side].copy() for side in SIDES}
+        held = {side: self._hand(first, side) for side in self.installed}
+        previous = {side: held[side].copy() for side in self.installed}
         began = ports.monotonic()
         settled_at = None
         last_tick = None
@@ -694,8 +711,8 @@ class HandRestorer:
                     float(np.max(np.abs(np.asarray(command.position) - np.asarray(board.position)))) > COMMAND_DRIFT_RAD
                 ):
                     raise RestoreError("HAND_COMMAND_CHANGED", "another controller changed an arm target")
-                actual = {side: self._hand(obs, side) for side in SIDES}
-                for side in SIDES:
+                actual = {side: self._hand(obs, side) for side in self.installed}
+                for side in self.installed:
                     if side in moving:
                         if float(np.max(np.abs(actual[side] - previous[side]))) > TRACKING_RAD:
                             raise RestoreError("HAND_NOT_TRACKING", f"{side} hand is not tracking the previous command")
@@ -705,7 +722,7 @@ class HandRestorer:
                 if refusal:
                     raise RestoreError("HAND_OUTPUT_REFUSED", f"runtime refuses hand output: {refusal}")
                 ports.publish(self._command(frame, "left"), self._command(frame, "right"))
-                previous = {side: np.asarray(frame[side], float) for side in SIDES}
+                previous = {side: np.asarray(frame[side], float) for side in self.installed}
                 last_tick = tick
                 error = max(float(np.max(np.abs(actual[side] - final[side]))) for side in moving)
                 reached = index >= len(sequence)
@@ -726,6 +743,8 @@ class HandRestorer:
             ports.release()
 
     def _command(self, frame: Mapping[str, np.ndarray], side: str) -> np.ndarray:
+        if side not in self.installed:
+            return np.array(ABSENT_HAND_COMMAND)
         plan = self.plans.get(side)
         values = np.asarray(frame[side], float)
         if plan is not None:

@@ -1,0 +1,3 @@
+{"stage": "handle_close_begin", "pid": 2324, "monotonic_ns": 952090310126, "model": "yolox"}
+{"stage": "handle_close_end", "pid": 2324, "monotonic_ns": 952145847757, "model": "yolox"}
+{"stage": "worker_finished", "pid": 2324, "monotonic_ns": 952147217366}

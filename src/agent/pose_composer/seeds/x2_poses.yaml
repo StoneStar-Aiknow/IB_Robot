@@ -7,15 +7,15 @@
 # target outside the travel. The poses are the reference answers checked in
 # simulation (evidence phase1/02_reference_answers.png). Bump version to make
 # robots reload the file.
-version: 2
+version: 3
 poses:
   - id: arms_down
-    user_message: 好的，双臂放下并回到 HOME 准备位
-    phrases: [双臂放下, 放下双臂, 双手放下, 放下双手, 双臂回到准备位]
+    user_message: 好的，双臂放下并回到休息位
+    phrases: [双臂放下, 放下双臂, 双手放下, 放下双手, 双臂休息位]
     description:
       kind: pose
-      left: {task_pose: grasp_ready}
-      right: {task_pose: grasp_ready}
+      left: {task_pose: arms_rest}
+      right: {task_pose: arms_rest}
   - id: arms_forward
     user_message: 好的，双手向前伸直
     phrases: [双手向前伸直, 双手向前平举, 两只手向前伸直, 双手往前伸]
@@ -66,39 +66,39 @@ poses:
       left: {hand_to: waist_left, elbow: out}
       right: {hand_to: waist_right, elbow: out}
   - id: right_hand_on_head
-    user_message: 好的，右手靠近头顶，左臂回到 HOME 准备位
+    user_message: 好的，右手靠近头顶，左臂回到休息位
     phrases: [右手摸头顶, 右手摸头, 摸头]
     description:
       kind: pose
-      left: {task_pose: grasp_ready}
+      left: {task_pose: arms_rest}
       # The articulated open hand needs clearance beyond the wrist landmark.
       # Body frame offset (cm): x forward, y left, z up. No head contact.
       right: {hand_to: head_top, elbow: out, offset_cm: [0, -5, 5]}
   - id: salute
-    user_message: 好的，右手敬礼，左臂回到 HOME 准备位
+    user_message: 好的，右手敬礼，左臂回到休息位
     phrases: [敬礼, 敬个礼]
     description:
       kind: pose
-      left: {task_pose: grasp_ready}
+      left: {task_pose: arms_rest}
       right: {hand_to: forehead, elbow: out, offset_cm: [7, -3, 0]}
   - id: thinking
-    user_message: 好的，右手在下巴外侧做思考姿势，左臂回到 HOME 准备位
+    user_message: 好的，右手在下巴外侧做思考姿势，左臂回到休息位
     phrases: [做一个思考的姿势, 思考, 托下巴]
     description:
       kind: pose
-      left: {task_pose: grasp_ready}
+      left: {task_pose: arms_rest}
       right: {hand_to: chin, elbow: down, offset_cm: [8, -3, 0]}
   - id: right_forward
-    user_message: 好的，右手向前伸直，左臂回到 HOME 准备位
+    user_message: 好的，右手向前伸直，左臂回到休息位
     phrases: [右手向前伸直, 右手往前伸]
     description:
       kind: pose
-      left: {task_pose: grasp_ready}
+      left: {task_pose: arms_rest}
       right: {upper: [1, 0, 0], fore: [1, 0, 0]}
   - id: left_forward
-    user_message: 好的，左手向前伸直，右臂回到 HOME 准备位
+    user_message: 好的，左手向前伸直，右臂回到休息位
     phrases: [左手向前伸直, 左手往前伸]
     description:
       kind: pose
       left: {upper: [1, 0, 0], fore: [1, 0, 0]}
-      right: {task_pose: grasp_ready}
+      right: {task_pose: arms_rest}

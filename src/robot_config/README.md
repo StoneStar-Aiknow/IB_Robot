@@ -2305,29 +2305,70 @@ Apache-2.0
 请求传入，不在机器人 YAML 中固化。业务包只依赖中立 `ibrobot_msgs`，不依赖 robot_config、
 robot_runtime 或厂商 SDK。详细命令见 [交互示范指南](../../docs/aimdk_interaction_demo.md)。
 
-## X2 镜子/抓取：可选小欧文本唤醒与声纹
+## X2 镜子/抓取：可选欧拉文本唤醒与声纹
 
-`aimdk_x2_voice_mirror_grasp` 默认省略 `wake_phrases`（不要求唤醒词）、`speaker_check_enabled: false`、
-`speaker_embedding.enabled: false`，直接处理语音，不加载声纹模型，不区分说话人。
-需要开启时，在派生 YAML 中显式覆盖（`base_config` 须指向同目录的基础 YAML）：
+The shared entry for one or two hands is
+[`config/robots/aimdk_x2_voice_mirror_grasp.yaml`](config/robots/aimdk_x2_voice_mirror_grasp.yaml).
+Both the 310P pipeline and the Orin grasp-head launch select
+`robot_config:=aimdk_x2_voice_mirror_grasp`. Mounting is declared once in
+`grasp_execution.backend_options.installed_hands` and `arm_side`.
+`task_poses.hands: installed` resolves the prepared hands from that declaration
+without changing arm targets or granting hardware approval.
+See the [configuration and launch guide](../../docs/x2_voice_mirror_grasp_config_zh.md)
+for right-only, left-only and dual-hand settings and fixed-artifact preparation.
+
+`aimdk_x2_voice_mirror_grasp` 默认启用“欧拉欧拉”文本唤醒。
+`speaker_check_enabled: false`、`speaker_embedding.enabled: false` 保持声纹校验关闭。
+系统不加载声纹模型，不区分说话人。
+总 YAML 使用以下列表，删除 `wake_phrases` 键可恢复直接接收普通语音：
 
 ```yaml
 robot:
-  base_config: aimdk_x2_voice_mirror_grasp.yaml
-  voice_asr:
-    speaker_embedding:
-      enabled: true
   embodied:
     agent:
       voice_bridge:
-        wake_phrases: [小欧小欧, 小欧小鸥, 小欧小偶, 小鸥小欧, 小鸥小鸥, 小鸥小偶, 小偶小欧, 小偶小鸥, 小偶小偶]
-        speaker_check_enabled: true
+        wake_phrases:
+          - 欧拉欧拉
+          - 欧拉欧啦
+          - 欧拉鸥拉
+          - 欧拉偶拉
+          - 欧啦欧拉
+          - 欧啦欧啦
+          - 欧啦鸥拉
+          - 欧啦偶拉
+          - 鸥拉欧拉
+          - 鸥拉欧啦
+          - 鸥拉鸥拉
+          - 鸥拉偶拉
+          - 偶拉欧拉
+          - 偶拉欧啦
+          - 偶拉鸥拉
+          - 偶拉偶拉
 ```
 
-开启后使用 ASR 文本前缀开启 60 秒滑动窗口，不依赖厂商 `audio.wake_event`。
-欧/鸥是同音字，偶是近音字；只匹配句首，不以句中提及触发。
-仅开启时需额外 provision `models/campplus-speaker`（默认 `torch_cpu`）。
-保持原有厂商持续采音设置；本配置不修改厂商唤醒服务，也不切换麦克风。
-首次建议说“小欧小欧，现在请你帮我做一个挥手动作”，让同一语音段包含足够长的人声。
-后续本人指令通过声纹校验后续期；旁人被拒绝的指令不续期；再次点名重设声纹锚点。
-停止词始终旁路。首句无有效声纹则无锚点，声纹消息缺失仍超时放行，不能作为身份认证。
+启用后，ASR 文本前缀触发 60 秒滑动窗口。
+文本唤醒不依赖厂商 `audio.wake_event`。
+标准唤醒词为“欧拉欧拉”。
+列表包含“欧拉、欧啦、鸥拉、偶拉”两两组合的 16 个前缀。
+“欧/鸥”与“拉/啦”覆盖同音转写，“偶”覆盖近音转写。
+规则只匹配句首，并在转交 Agent 前剥离前缀。
+
+重复词之间的空格不影响匹配。
+唤醒词与指令之间支持逗号或感叹号。
+单次“欧拉”和“好啦好啦”不在前缀列表中。
+仅启用文本唤醒不需要声纹模型。
+
+总配置沿用厂商处理后的 `external_vad` 和 `audio.speech` 输入。
+启用声纹校验前，确认厂商语音流持续输出音频。
+声纹校验需要同时启用 `speaker_embedding.enabled` 和 `speaker_check_enabled`。
+声纹校验还需部署 `models/campplus-speaker`（默认 `torch_cpu`）。
+本配置不修改厂商唤醒服务或麦克风设备。
+
+使用声纹校验时，首次建议说“欧拉欧拉，现在请你帮我做一个挥手动作”。
+这让同一语音段包含足够长的人声。
+启用声纹校验后，通过校验的本人指令续期。
+旁人未通过校验的指令不续期，再次点名重设声纹锚点。
+停止词始终旁路。
+
+声纹校验仍保留原有边界：首句无有效声纹则无锚点。
+声纹消息缺失仍超时放行，不能作为身份认证。

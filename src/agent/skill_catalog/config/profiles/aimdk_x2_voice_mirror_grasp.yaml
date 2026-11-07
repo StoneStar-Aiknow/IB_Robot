@@ -9,6 +9,8 @@
 #
 # The matching robot config enables this pipeline and requires its model bundles
 # and delegated grasp head to be available at launch.
+# Single-hand and dual-hand deployments share this catalog. The mounting and
+# preparation policy belongs to robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml.
 schema_version: 1
 name: aimdk_x2_voice_mirror_grasp
 robot_name: aimdk_x2_voice_mirror_grasp

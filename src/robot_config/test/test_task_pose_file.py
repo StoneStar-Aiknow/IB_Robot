@@ -13,6 +13,64 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "config/task_poses/x2_example.yaml"
 
 
+@pytest.mark.parametrize(
+    "robot_file",
+    ["aimdk_x2_grasp_task_poses_310p.yaml", "aimdk_x2_voice_mirror_grasp.yaml"],
+)
+def test_grasp_ready_uses_table_side_pose(robot_file):
+    from robot_config.loader import _load_robot_section
+    from robot_config.task_poses import resolve_task_pose_file
+
+    expected = {
+        "left_shoulder_pitch_joint": -0.0486,
+        "left_shoulder_roll_joint": 0.4486,
+        "left_shoulder_yaw_joint": 0.3506,
+        "left_elbow_joint": -1.45,
+        "left_wrist_yaw_joint": 0.0038,
+        "left_wrist_pitch_joint": 0.0678,
+        "left_wrist_roll_joint": -0.0002,
+        "right_shoulder_pitch_joint": -0.0554,
+        "right_shoulder_roll_joint": -0.4486,
+        "right_shoulder_yaw_joint": -0.3478,
+        "right_elbow_joint": -1.45,
+        "right_wrist_yaw_joint": -0.0029,
+        "right_wrist_pitch_joint": 0.0678,
+        "right_wrist_roll_joint": 0.0001,
+    }
+    path, config = _load_robot_section(ROOT / "config/robots" / robot_file)
+    resolve_task_pose_file(config, path)
+    task_poses = config["task_poses"]
+    pose = task_poses["poses"]["grasp_ready"]
+    assert set(task_poses["joint_names"]) == set(expected)
+    assert pose["joint_positions"] == pytest.approx(expected, abs=1e-9)
+    assert task_poses["skill_entry_poses"] == {"pick_object": "grasp_ready"}
+    expected_hands = {"right": "open"} if "voice_mirror" in robot_file else {"left": "open", "right": "open"}
+    assert pose["hands"] == expected_hands
+    assert pose["hardware_approved"] is False
+    assert pose["unloaded_operation_approved"] is False
+    assert "HOME" not in pose["aliases"]
+    assert "双臂放下" not in pose["aliases"]
+    rest = task_poses["poses"]["arms_rest"]
+    assert rest["joint_positions"] != pose["joint_positions"]
+    assert "双手放下" in rest["aliases"]
+    assert rest["hands"] == expected_hands
+    assert rest["hardware_approved"] is False
+    assert rest["unloaded_operation_approved"] is False
+
+    # Both entry points must stay within the grasp runtime's declared MC limits.
+    _, grasp_config = _load_robot_section(ROOT / "config/robots/aimdk_x2_grasp.yaml")
+    for target in (pose, rest):
+        for name, position in target["joint_positions"].items():
+            lower, upper = grasp_config["arm_limits"][name]
+            assert lower <= position <= upper, name
+
+    # Accepted tracking error must not take a resting shoulder across its MC limit.
+    for name in ("left_shoulder_roll_joint", "right_shoulder_roll_joint"):
+        lower, upper = grasp_config["arm_limits"][name]
+        position = rest["joint_positions"][name]
+        assert min(position - lower, upper - position) > rest["position_tolerance_rad"]
+
+
 def test_task_pose_file_changes_execution_identity_and_stays_frozen(tmp_path):
     source = yaml.safe_load(EXAMPLE.read_text())
     file = tmp_path / "poses.yaml"
@@ -46,6 +104,15 @@ def test_canonical_loader_reads_file_before_validation(tmp_path):
     config.write_text("robot:\n  name: test_x2\n  type: x2_ultra_omnihand\n  task_poses: {file: absent.yaml}\n")
     with pytest.raises(FileNotFoundError):
         load_robot_config_dict(config)
+
+
+@pytest.mark.parametrize("block", [{}, {"hands": "installed"}])
+def test_task_pose_declaration_requires_a_file_before_loading(block, tmp_path):
+    from robot_config.task_poses import resolve_task_pose_file
+
+    config = {"task_poses": block}
+    with pytest.raises(ValueError, match="non-empty file path"):
+        resolve_task_pose_file(config, tmp_path / "robot.yaml")
 
 
 def test_materialized_task_poses_reload_without_source_and_reject_tampering(tmp_path):
@@ -111,7 +178,10 @@ def test_voice_mirror_grasp_resolves_task_poses_without_losing_deployment_featur
     pose = config["task_poses"]["poses"]["grasp_ready"]
     assert pose["hardware_approved"] is False
     assert pose["unloaded_operation_approved"] is False
-    assert pose["hands"] == {"left": "open", "right": "open"}
+    assert pose["hands"] == {"right": "open"}
+    assert config["grasp_execution"]["backend_options"]["installed_hands"] == ["right"]
+    assert config["grasp_execution"]["backend_options"]["arm_side"] == "right"
+    assert config["pose_composer"]["mode"] == "fixed"
     assert config["pose_composer"]["enabled"] is True
     assert config["pose_composer"]["memory"]["enabled"] is False
     assert config["embodied"]["skill_catalog_profile"] == "aimdk_x2_voice_mirror_grasp"
@@ -133,6 +203,8 @@ def test_voice_mirror_grasp_resolves_task_poses_without_losing_deployment_featur
     assert config["mirror_session"]["voice"]["enabled"] is False
     assert config["mirror_session"]["operator"]["enabled"] is True
     assert config["grasp_execution"]["enabled"] is True
+    _, grasp = _load_robot_section(ROOT / "config/robots/aimdk_x2_grasp.yaml")
+    assert config["arm_limits"] == grasp["arm_limits"]
     assert set(config["skill_supported_control_modes"]) == {"named_motion", "model_inference", "moveit_planning"}
     assert all(
         config["control_modes"][mode]["runtime_mode"] == "policy_stream" for mode in ("named_motion", "moveit_planning")
@@ -191,3 +263,84 @@ def test_unloaded_approval_is_a_boolean(approval):
     data["poses"]["grasp_ready"]["unloaded_operation_approved"] = approval
     with pytest.raises(ValueError, match="boolean"):
         normalize_task_poses(data)
+
+
+@pytest.mark.parametrize("sides,arm_side", [(["right"], "right"), (["left"], "left"), (["left", "right"], "auto")])
+def test_one_voice_mirror_grasp_config_selects_mounted_hands_without_changing_targets(sides, arm_side):
+    from robot_config.loader import _load_robot_section
+    from robot_config.task_poses import resolve_task_pose_file
+
+    path, config = _load_robot_section(ROOT / "config/robots/aimdk_x2_voice_mirror_grasp.yaml")
+    config["grasp_execution"]["backend_options"].update(installed_hands=sides, arm_side=arm_side)
+    source = normalize_task_poses(yaml.safe_load(EXAMPLE.read_text()))
+    resolve_task_pose_file(config, path)
+    selected = config["task_poses"]
+    for name, pose in selected["poses"].items():
+        assert pose["hands"] == dict.fromkeys(sides, "open")
+        assert pose["joint_positions"] == source["poses"][name]["joint_positions"]
+        assert pose["hardware_approved"] is False
+        assert pose["unloaded_operation_approved"] is False
+    if len(sides) == 2:
+        assert selected == source
+    else:
+        assert selected["digest"] != source["digest"]
+    frozen = copy.deepcopy(config)
+    resolve_task_pose_file(config, path)
+    assert config == frozen
+    assert normalize_task_poses(yaml.safe_load(EXAMPLE.read_text())) == source
+
+
+@pytest.mark.parametrize("mounts", [None, [], "right", ["left", "left"], ["unknown"], [False]])
+def test_installed_hand_preparation_refuses_missing_or_invalid_mounting(mounts):
+    from robot_config.task_poses import resolve_task_pose_file
+
+    config = {
+        "type": "x2_ultra_omnihand",
+        "pose_composer": {"enabled": True},
+        "task_poses": {"file": str(EXAMPLE), "hands": "installed"},
+        "grasp_execution": {"backend_options": {"installed_hands": mounts}},
+    }
+    if mounts is None:
+        config["grasp_execution"]["backend_options"].clear()
+    with pytest.raises(ValueError, match="installed_hands|installed hand"):
+        resolve_task_pose_file(config, ROOT / "unused.yaml")
+
+
+def test_hand_selection_validates_removed_side_actions_and_preserves_arm_only_poses(tmp_path):
+    from robot_config.task_poses import resolve_task_pose_file
+
+    source = yaml.safe_load(EXAMPLE.read_text())
+    source["poses"]["grasp_ready"]["hands"]["left"] = "close"
+    file = tmp_path / "poses.yaml"
+    config = {
+        "type": "x2_ultra_omnihand",
+        "pose_composer": {"enabled": True},
+        "task_poses": {"file": str(file), "hands": "installed"},
+        "grasp_execution": {"backend_options": {"installed_hands": ["right"]}},
+    }
+    file.write_text(yaml.safe_dump(source))
+    with pytest.raises(ValueError, match="hands"):
+        resolve_task_pose_file(config, tmp_path / "robot.yaml")
+    source["poses"]["grasp_ready"].pop("hands")
+    source["poses"]["grasp_ready"].pop("unloaded_operation_approved")
+    file.write_text(yaml.safe_dump(source))
+    resolve_task_pose_file(config, tmp_path / "robot.yaml")
+    assert "hands" not in config["task_poses"]["poses"]["grasp_ready"]
+    assert config["task_poses"]["poses"]["arms_rest"]["hands"] == {"right": "open"}
+
+
+def test_installed_hand_policy_refuses_a_pose_that_never_declared_the_mounted_hand(tmp_path):
+    from robot_config.task_poses import resolve_task_pose_file
+
+    source = yaml.safe_load(EXAMPLE.read_text())
+    source["poses"]["grasp_ready"]["hands"] = {"left": "open"}
+    path = tmp_path / "poses.yaml"
+    path.write_text(yaml.safe_dump(source))
+    config = {
+        "type": "x2_ultra_omnihand",
+        "pose_composer": {"enabled": True},
+        "task_poses": {"file": str(path), "hands": "installed"},
+        "grasp_execution": {"backend_options": {"installed_hands": ["right"]}},
+    }
+    with pytest.raises(ValueError, match="actions for every installed hand"):
+        resolve_task_pose_file(config, tmp_path / "robot.yaml")

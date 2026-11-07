@@ -53,6 +53,56 @@ HAL leaves `meas_stamp` zero), so joint states and images are compared within on
 clock domain, as in the standalone pipeline; the nearest sample is at most 10 ms
 from the image.
 
+### Removed hands
+
+Declare the mounted hands explicitly in `grasp_execution.backend_options` on
+both the pipeline host and the grasp-head host. For a robot with only the right
+OmniHand mounted:
+
+```yaml
+grasp_execution:
+  backend_options:
+    installed_hands: [right]
+    arm_side: right
+```
+
+The default is `[left, right]`. A single mounted hand requires its own explicit
+`arm_side`; `auto` requires both hands. Task poses that open hands must request
+only mounted sides, for example `hands: {right: open}`. The restore collision
+checker keeps both arms and the body, and uses only the installed hand's finger
+model. Certificates generated for two hands fall back to online checking.
+
+Feedback must contain every joint of each declared hand. Missing or partial
+feedback fails preparation; feedback from a hand declared absent also refuses
+grasp output. A runtime `none` report is never used to infer physical removal.
+The fixed 20-value stream keeps ten zero placeholders for an absent hand; these
+are output slots, never invented measurements or a substitute for feedback.
+
+When neither hand is mounted, disable `grasp_execution.enabled` and omit `hands`
+from task poses. Arm-only task poses and gestures do not construct the hand
+restorer or wait for hand feedback. The mounting parser accepts
+`installed_hands: []`, and `FeedbackHistory(required_hands=())` subscribes only
+to body/head feedback and runtime health. Enabling grasp execution with no
+installed hands is an explicit configuration error.
+
+The runtime's transport-health checks still apply. If the vendor publishes no
+hand-state messages at all, the handless deployment's runtime profile must also
+set `vendor.feedback.required_groups: [arm]`. Keep the arm/head fault checks and
+the normal `[arm, hand]` freshness requirement whenever a hand is mounted. An
+empty hand-joint view and a failed runtime transport are separate conditions.
+
+Changing these settings requires matching configuration on both hosts and a
+restart of the affected nodes. Mock checks do not establish hardware approval
+for a new right-hand grasp deployment.
+
+The combined voice/mirror/grasp entry is the existing robot configuration
+`aimdk_x2_voice_mirror_grasp.yaml` on **both** hosts. It declares
+`task_poses.hands: installed`, so the canonical loader selects open-hand requests
+from the same `installed_hands` declaration. The task-pose source retains both
+arms and its hardware approvals; no per-mounting pose file or catalog is needed.
+Its fixed artifact must be compiled again after mounting or pose settings change.
+See the [shared configuration and launch guide](../../../../docs/x2_voice_mirror_grasp_config_zh.md).
+
 ## Planning model
 
 `aimdk_grasp.planning_model.build_planning_model()` generates the planning URDF

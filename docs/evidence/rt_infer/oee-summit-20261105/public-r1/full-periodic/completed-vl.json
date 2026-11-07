@@ -1,0 +1,21 @@
+{
+  "pid": 2173,
+  "numerical": true,
+  "models": {
+    "vision": {
+      "calls": 17,
+      "drops": 0,
+      "checks": 5
+    },
+    "prefill": {
+      "calls": 17,
+      "drops": 0,
+      "checks": 5
+    },
+    "decode": {
+      "calls": 255,
+      "drops": 0,
+      "checks": 7
+    }
+  }
+}
