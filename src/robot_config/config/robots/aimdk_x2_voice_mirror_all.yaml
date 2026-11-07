@@ -79,9 +79,9 @@ robot:
         silent_skills:
           - self_introduction
         # L3 semantic gate: decide whether an utterance is addressed to the robot at
-        # all, before the planner sees it. shadow logs the verdict and keeps routing;
-        # the log is the queue of sentences worth labelling for the next model.
-        semantic_gate_mode: shadow
+        # all, before the planner sees it. enforce drops the vetoed ones; the JSONL log
+        # stays the queue of sentences worth labelling for the next model.
+        semantic_gate_mode: enforce
         # Trained on the 639-sentence field corpus (see tools/addressee and
         # docs/aimdk_x2_addressee_semantic_gate_design_zh.md). Copy the artefact to
         # this path on the board; a missing file only disables the gate (fail_open).

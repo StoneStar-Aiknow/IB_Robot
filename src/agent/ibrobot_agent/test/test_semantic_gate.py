@@ -39,6 +39,12 @@ def _toy_gate(tmp_path: Path, **kwargs) -> SemanticGate:
     return gate
 
 
+def _quiet_gate(**kwargs) -> SemanticGate:
+    """Only "挥" logits up; everything else, including two-character fragments, sits near 0."""
+    payload = _payload(_weigh("挥", 6.0), bias=-4.0)
+    return SemanticGate(payload, threshold=kwargs.pop("threshold", 0.10), **kwargs)
+
+
 # --- format ------------------------------------------------------------------------------
 
 
@@ -76,6 +82,33 @@ def test_low_score_without_a_skill_word_is_rejected(tmp_path):
     assert decision.rejected
     assert not decision.lexicon_hit
     assert decision.reason.startswith("score")
+
+
+def test_a_skill_word_only_counts_in_a_command_sized_sentence():
+    # 2026-11-07 field session: "这不是没开始吗智商没开始吗" carries 开始 and 镜子 and
+    # scored 0.000, yet the catalog word alone let it through to the planner.
+    gate = _quiet_gate(lexicon=("开始", "镜子"))
+    decision = gate.judge("这不是没开始吗智商没开始吗")
+    assert decision.lexicon_hit
+    assert decision.rejected
+    # The same word in a command still passes without the model's help.
+    assert not gate.judge("开始照镜子").rejected
+
+
+def test_naming_someone_else_in_the_room_is_not_addressed_to_the_robot():
+    # "周哥举手的动作" was said to a colleague and scored 1.000 on the skill word.
+    gate = _quiet_gate(lexicon=("举手",))
+    decision = gate.judge("周哥举手的动作")
+    assert decision.rejected
+    assert decision.address_term == "哥"
+    assert "someone else" in decision.reason
+
+
+def test_a_bare_fragment_needs_a_session_the_addressee_gate_opened():
+    # "怎么" scored 0.999: two characters carry no grammar, so the score is mostly the bias.
+    gate = _quiet_gate()
+    assert gate.judge("挥").rejected
+    assert not gate.judge("挥", session_open=True).rejected
 
 
 def test_skill_word_wins_over_the_model(tmp_path):

@@ -27,7 +27,14 @@
    打分、判定、shadow 日志）、`voice_bridge.py` 接入（停止词/确认之后、bypass 之前）、
    `loader.py` 的 `_validate_semantic_gate` 与 `embodied.py` 的参数转发、两个测试文件、
    `tools/addressee/`（training/eval/lexicon/dataset 四个脚本），模型产物按仓库惯例放在被 `.gitignore` 忽略的 `models/addressee/`、
-   部署 profile 的 `semantic_gate_*` 段（`mode: shadow`）。
+   部署 profile 的 `semantic_gate_*` 段（先 `shadow`，第 7 条修完后切 `enforce`）。
+7. **2026-11-07 现场会话修正（已实现、已测）**：第一场真实会话（14 句，14:17–14:26）暴露三类漏洞，
+   规则各补一条——① 技能词只在指挥句（正文 ≤10 字）或模型分数 >0 时算证据；② 句中含他人称呼
+   （哥/姐/老师/各位/你们…）判为非对机；③ 正文 <4 字的碎片只在寻址闸门开着的会话里放行。
+   当场的判例：「周哥举手的动作」1.000→拦、「这不是没开始吗智商没开始吗」0.000 但词表命中→拦、
+   「怎么」0.999→拦（无会话）、「那你停下来」0.001→拦（这条在 shadow 下仍被 planner 规划成
+   `mirror_stop` 并把镜面会话停掉，是切 enforce 的直接原因）。代价：「讲个笑话」这类词表外闲聊被拒。
+
 
 ---
 

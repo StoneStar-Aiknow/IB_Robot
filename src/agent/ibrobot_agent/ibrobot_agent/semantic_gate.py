@@ -40,6 +40,39 @@ _SUPPORTED_HASHES = ("fnv1a32",)
 _PUNCT = re.compile(r"[\s，。！？、,.!?~～\"'“”‘’()（）\[\]【】:：;；\-—…]+")
 #: Clamp for the logit, so an absurd weight cannot overflow ``exp``.
 _LOGIT_LIMIT = 30.0
+#: Address terms that point at someone else in the room. The field log caught this
+#: failure first: "周哥举手的动作" scored 1.000 on the skill word 举手 although it was
+#: said to a colleague. The model cannot know who 周哥 is, but a microphone transcript
+#: that names a person in the room is evidence about the addressee, not the vocabulary.
+_ADDRESS_TERMS = (
+    "哥",
+    "姐",
+    "弟",
+    "妹",
+    "老师",
+    "师傅",
+    "老板",
+    "经理",
+    "主任",
+    "同学",
+    "各位",
+    "大家",
+    "你们",
+    "他们",
+    "咱们",
+    "兄弟",
+    "姐妹",
+    "同志",
+    "领导",
+    "阿姨",
+    "叔叔",
+)
+#: A skill word only counts as evidence in a command-sized sentence, or when the model
+#: agrees at all: "这不是没开始吗智商没开始吗" carries 开始 and 镜子 and scored 0.000.
+_LEXICON_MAX_BODY_CHARS = 10
+#: Fragments this short carry no grammar, so the score is mostly the bias ("怎么" 0.999);
+#: they only pass inside a session the addressee gate opened.
+_FRAGMENT_BODY_CHARS = 4
 
 
 def _fnv1a32(text: str) -> int:
@@ -86,6 +119,8 @@ class SemanticDecision:
     lexicon_hit: bool
     wake_prefix: bool
     reason: str
+    #: The address term that made this "someone talking to someone else", if any.
+    address_term: str = ""
 
     @property
     def accepted(self) -> bool:
@@ -190,25 +225,41 @@ class SemanticGate:
         logit = max(-_LOGIT_LIMIT, min(_LOGIT_LIMIT, logit))
         return 1.0 / (1.0 + math.exp(-logit))
 
-    def judge(self, text: str) -> SemanticDecision:
-        """Decide whether ``text`` is addressed to the robot; stop/confirm never come here."""
+    def judge(self, text: str, *, session_open: bool = False) -> SemanticDecision:
+        """Decide whether ``text`` is addressed to the robot; stop/confirm never come here.
+
+        A skill word is evidence only in a command-sized sentence or when the model does
+        not flatly disagree, a sentence naming someone else in the room is not addressed
+        to the robot, and a bare fragment needs a session the addressee gate opened --
+        the three failure classes the first field session produced on 2026-11-07.
+        """
         body = self._body(text)
         raw_normalized = normalize_text(text)
         score = self.score(text)
         lexicon_hit = any(word in raw_normalized or word in body for word in self.lexicon)
         wake_prefix = any(raw_normalized.startswith(prefix) for prefix in self.wake_prefixes)
+        address_term = next((term for term in _ADDRESS_TERMS if term in raw_normalized), "")
         if not body:
             reason = "empty after wake-word stripping"
             return SemanticDecision(text, score, False, lexicon_hit, wake_prefix, reason)
-        if lexicon_hit:
+        if address_term and not wake_prefix:
+            reason = f"names someone else ({address_term})"
+            return SemanticDecision(text, score, True, lexicon_hit, wake_prefix, reason, address_term)
+        rejected = False
+        if lexicon_hit and (len(body) <= _LEXICON_MAX_BODY_CHARS or score > 0.0):
             reason = "skill word"
         elif wake_prefix:
             reason = "wake prefix"
         elif score >= self.threshold:
-            reason = "model"
+            if len(body) < _FRAGMENT_BODY_CHARS and not session_open:
+                reason = f"fragment of {len(body)} chars outside a session"
+                rejected = True
+            else:
+                reason = "model"
         else:
             reason = f"score {score:.3f} below {self.threshold:.2f}"
-        return SemanticDecision(text, score, reason.startswith("score"), lexicon_hit, wake_prefix, reason)
+            rejected = True
+        return SemanticDecision(text, score, rejected, lexicon_hit, wake_prefix, reason, address_term)
 
     def record(self, decision: SemanticDecision, path: str, *, mode: str, **context: Any) -> None:
         """Append one JSON line describing ``decision``; never raises into the bridge.
@@ -232,6 +283,8 @@ class SemanticGate:
             "model": os.path.basename(self.source),
             **context,
         }
+        if decision.address_term:
+            entry["address_term"] = decision.address_term
         try:
             directory = os.path.dirname(path)
             if directory:

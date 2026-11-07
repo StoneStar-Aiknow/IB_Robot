@@ -290,9 +290,17 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
     catalog 技能词 **且** 不以（被 ASR 打烂的）唤醒词开头」时才拦。停止词、确认/取消、bypass 短语在它之前
     处理，永不被拦——安全路径不经过任何模型。技能词表由
     `python3 tools/addressee/emit_lexicon.py --yaml` 从 `skill_catalog` 的 `aliases_zh` 生成，新技能不必重训模型。
+  - **三条词表与语境的修正**（2026-11-07 现场会话发现，均已加回归测试）：
+    ① 技能词只在**指挥句**里算证据——正文 ≤10 字，或模型分数 >0；否则「这不是没开始吗智商没开始吗」
+    只因含「开始/镜子」就放行；
+    ② 句中含**他人称呼**（哥/姐/老师/师傅/各位/你们/他们/领导…）判为非对机——「周哥举手的动作」
+    是对同事说的，原来靠「举手」拿到 1.000；
+    ③ **短碎片**（正文 <4 字）只有在寻址闸门开着的会话里才放行——「怎么」两个字拿不到语法证据，
+    分数几乎等于偏置。
   - **`shadow` 先跑一段时间**：判定照做、日志照写（`semantic_gate_log_path`，JSONL），但一句都不拦。
-    板上部署 profile 现在就是这个态。日志里的每一行都是带模型的判词、分数与上下文（`after_wake`、
-    `active_request`），是下一版模型的标注队列，而不是单边抽样：被放过的错误（该拦没拦）同样在里面。
+    板上部署 profile 现在是 `enforce`（这三条修完之后切换，`shadow` 阶段留下的日志见
+    `/var/log/ibrobot/semantic_gate.jsonl`）。日志里的每一行都是带模型的判词、分数与上下文（`after_wake`、
+    `active_request`、`address_term`），是下一版模型的标注队列，而不是单边抽样：被放过的错误（该拦没拦）同样在里面。
   - **`enforce`** 才真正丢弃，用一个 `Log` 说明「not addressed to me (semantic …)」，与声纹拒绝同一措辞。
   - **模型加载失败默认 fail-open**（`semantic_gate_fail_open: true`）：闸门自己坏掉不能让机器人变聋；
     要让它成为启动期的硬约束，设 `false`，launch 会失败在加载阶段而不是静默降级。

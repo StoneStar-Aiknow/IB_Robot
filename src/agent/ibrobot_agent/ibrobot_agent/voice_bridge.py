@@ -602,7 +602,13 @@ class VoiceBridgeCore:
         gate = self._semantic
         if gate is None:
             return None
-        decision = gate.judge(raw)
+        # A session the addressee gate opened (wake word or vendor wake event) is what
+        # lets a bare fragment through: "怎么" alone is a person mid-conversation, but
+        # only the session says which conversation it belongs to.
+        session_open = bool(self._state.session_id) and (
+            now - self._state.last_activity <= self.config.session_idle_sec
+        )
+        decision = gate.judge(raw, session_open=session_open)
         mode = self.config.semantic_gate_mode
         gate.record(
             decision,
