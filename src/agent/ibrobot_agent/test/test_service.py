@@ -1010,9 +1010,9 @@ class NamedCatalog(FakeCatalog):
 
 
 class CatalogRecordingPlanner(FakePlanner):
-    def plan(self, request, context, catalog, cancel_token):
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
         self.catalog = catalog
-        return super().plan(request, context, catalog, cancel_token)
+        return super().plan(request, context, catalog, cancel_token, on_preview=on_preview)
 
 
 def test_plan_is_presented_with_the_chinese_catalog_names_of_its_steps(tmp_path):

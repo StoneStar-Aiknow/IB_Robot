@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -9,6 +10,7 @@ from ibrobot_agent.contracts import AgentRequest, PlannerIdentity
 from ibrobot_agent.planner import (
     PlannerAdapter,
     PlannerParseError,
+    PlannerRepair,
     RulePlanner,
     build_planner_messages,
     parse_planner_outcome,
@@ -359,8 +361,12 @@ def test_prompt_names_every_legal_reason_code():
         assert value in system, f"prompt does not mention reason_code {value}"
 
 
-def test_rejection_with_an_invented_reason_code_is_still_refused_locally():
-    """The prompt is guidance; the contract stays the authority."""
+def test_an_invented_reason_code_is_repaired_to_a_documented_one():
+    """The prompt is guidance; the contract stays the authority.
+
+    An invented code cannot reach the Gateway, so the refusal is kept and its code is
+    defaulted, with the repair recorded instead of the turn being lost.
+    """
     planner, _ = _planner_adapter(
         {
             "status": "ok",
@@ -369,8 +375,11 @@ def test_rejection_with_an_invented_reason_code_is_still_refused_locally():
         }
     )
 
-    with pytest.raises(PlannerParseError, match="reason_code is invalid"):
-        planner.plan(_request("点个头"), {}, {}, threading.Event())
+    outcome = planner.plan(_request("点个头"), {}, {}, threading.Event())
+
+    assert outcome.kind == "rejected"
+    assert outcome.reason_code == "UNSUPPORTED_TASK"
+    assert outcome.repairs == (PlannerRepair("reason_code", "defaulted", "motion_not_authorized"),)
 
 
 @pytest.mark.parametrize("reason_code", sorted({"UNSUPPORTED_TASK", "OUT_OF_SCOPE", "SAFETY_RESTRICTED"}))

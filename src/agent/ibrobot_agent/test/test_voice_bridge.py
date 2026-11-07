@@ -356,18 +356,33 @@ def test_partial_transcript_stops_once_before_the_utterance_ends():
     core = _core()
     core.on_transcript("挥挥手", now=0.0)
 
-    first = core.on_partial("帮我停", now=1.0)
-    grown = core.on_partial("帮我停一下", now=1.2)
+    first = core.on_partial("停", now=1.0)
+    grown = core.on_partial("停下来", now=1.2)
     unrelated = core.on_partial("今天天气", now=1.3)
 
     assert [action.payload for action in _of(first, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
     assert grown == [] and unrelated == []
     # The final transcript of the same utterance belongs to that stop: no second stop, no request.
-    final = core.on_transcript("帮我停一下", now=2.0)
+    final = core.on_transcript("停下来", now=2.0)
     assert _of(final, PublishRequest) == [] and _of(final, PublishControl) == []
     # A new utterance may stop again, e.g. when the first stop has not taken effect yet.
     retry = core.on_partial("停", now=3.0)
     assert [action.payload for action in _of(retry, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
+
+
+def test_a_growing_partial_is_not_mistaken_for_a_stop_growing_out_of_a_keyword():
+    # Seen on the X2: "停止照镜子" passes through the partial "停止照", and stopping there
+    # cancelled the utterance that was still being spoken.
+    core = _core()
+    core.on_transcript("照镜子", now=0.0)
+
+    assert _of(core.on_partial("停止照", now=1.0), PublishControl) == []
+    assert _of(core.on_partial("停止照镜子", now=1.2), PublishControl) == []
+    # The final transcript still stops on the keyword, after the tail padding.
+    stopped = core.on_transcript("停止照镜子", now=2.0)
+    assert [action.payload for action in _of(stopped, PublishControl)] == [
+        {"operation": "stop", "request_id": "voice-0"}
+    ]
 
 
 def test_final_of_a_partial_stop_does_not_become_a_command_after_the_request_ends():
@@ -375,10 +390,10 @@ def test_final_of_a_partial_stop_does_not_become_a_command_after_the_request_end
     # "帮我停一下" was sent to the Agent as a new request and "继续" was then dropped as busy.
     core = _core()
     core.on_transcript("挥手然后点头再摇头", now=0.0)
-    core.on_partial("帮我停", now=1.0)
+    core.on_partial("停", now=1.0)
     core.on_event(_event("voice-0", "terminal", "CANCELLED", "skill cancelled"), now=1.1)
 
-    final = core.on_transcript("帮我停一下", now=1.8)
+    final = core.on_transcript("停一下", now=1.8)
     (resume,) = _of(core.on_transcript("继续", now=3.0), PublishRequest)
 
     assert _of(final, PublishRequest) == []
