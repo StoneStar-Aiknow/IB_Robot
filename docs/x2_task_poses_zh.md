@@ -19,8 +19,37 @@ URS 是厂商控制模式，准备姿态是具体的双臂关节位置。进入 
 原有 Agent planner、感知模型、Orin 抓取头和音频资源要求不因此消失。
 
 本地位姿文件：`src/robot_config/config/task_poses/x2_example.yaml`。
-其 `grasp_ready` 来自测试参考姿态，**不是已校准的真机抓取准备位**，`hardware_approved` 为 false。
-Mock 测试不改变该字段，真实部署会拒绝执行未批准的姿态。
+`grasp_ready` 使用桌侧准备位：双臂屈肘平举，双手位于桌子两侧。
+**桌侧准备位尚未完成真机校准。** `hardware_approved` 和 `unloaded_operation_approved` 均为 false。
+Mock 测试不改变批准字段。真实部署会拒绝执行未批准的姿态。
+
+桌侧准备位的关节目标单位为 rad，顺序如下：
+`shoulder_pitch / shoulder_roll / shoulder_yaw / elbow / wrist_yaw / wrist_pitch / wrist_roll`。
+
+- 左臂：`[-0.0486, 0.4486, 0.3506, -1.45, 0.0038, 0.0678, -0.0002]`。
+- 右臂：`[-0.0554, -0.4486, -0.3478, -1.45, -0.0029, 0.0678, 0.0001]`。
+
+MuJoCo 预览假设桌面宽 0.70 m、深 0.50 m、高 0.72 m，近边位于模型原点前方 0.32 m。
+预览中的掌心间距约 0.86 m，掌心离地约 0.96 m。
+预览使用旧版刚性手外形及估计相机视角，未使用真机相机标定。
+部署前必须核验实际手指包络、桌面尺寸、相机视野和运动路径。
+
+`grasp_ready` 的别名不再包含 `HOME` 或“双臂放下”。
+
+“双手放下”使用独立休息位 `arms_rest`，沿用修改前的参考角度：
+
+- 左臂：`[0.366, -0.038, -0.008, -1.164, 0.003, 0.007, -0.001]`。
+- 右臂：`[0.364, 0.026, 0.019, -1.175, 0.005, 0.007, -0.003]`。
+
+种子动作 `arms_down` 的双臂都引用 `arms_rest`。
+敬礼、思考、摸头和单臂前举动作的闲置手臂也引用 `arms_rest`。
+抓取入口 `pick_object` 仍引用 `grasp_ready`。
+抓后执行器 HOME 和照镜子 reset 保持原目标。
+`arms_rest` 的两个批准字段也为 false。
+
+种子文件版本升为 3。已有固定动作库需要重新编译。
+编译器验证 `arms_rest` 与各动作之间的往返路径。
+部署时必须同时替换姿态文件与编译产物，并重启节点。
 
 可以另存到 `~/.config/ibrobot/x2/task_poses.yaml`，再在机器人 YAML 引用：
 
@@ -97,8 +126,9 @@ source .shrc_local && colcon test --merge-install \
 运行时测试另通过 ROS 图和厂商 Mock 验证 policy_stream 中的轨迹执行、取消和模式保持。
 这些测试不连接或控制真机，不依赖 LLM，不报告真机时延。
 
-`test_fixed_poses.py` 使用真实固定执行器和左右手几何，验证举臂/单臂种子后回到 HOME，
-覆盖 `return_to_task_pose("grasp_ready")` 与“双臂放下”入口以及左右手依次实际张开。
+`test_fixed_poses.py` 使用真实固定执行器和左右手几何，验证举臂/单臂种子后返回。
+命名返回入口使用 `grasp_ready`，“双臂放下”入口使用 `arms_rest`。
+测试还验证左右手依次实际张开。
 技能子步骤路由由 `test_task_pose_gateway_mock.py` 覆盖，生成姿态的求解、限位及路径由
 `test_core.py`、`test_spec.py` 覆盖。传输、执行反馈与时钟使用 Mock，不属于真机验收。
 手部初始食指关节设为 0.15 rad，确保没有将“两手已张开、跳过输出”当作张手成功。

@@ -125,7 +125,7 @@ def test_configured_pose_choices_bind_catalog_schema_and_roundtrip(tmp_path):
             {
                 "poses": {
                     "arms_forward": {"user_message": "双臂向前伸直", "phrases": ["双手向前伸直", "双臂前举"]},
-                    "arms_down": {"user_message": "回到准备位 HOME", "phrases": ["双臂放下"]},
+                    "arms_down": {"user_message": "双臂放下并回到休息位", "phrases": ["双臂放下"]},
                 }
             }
         )
@@ -153,6 +153,7 @@ def test_configured_pose_choices_bind_catalog_schema_and_roundtrip(tmp_path):
     rebuilt = derive_capability_view_from_registry(json.loads(local.registry_preimage_json))
     for skill, valid, invalid in (
         ("return_to_task_pose", "grasp_ready", "准备位"),
+        ("return_to_task_pose", "arms_rest", "双臂放下"),
         ("free_pose", "arms_forward", "双手向前伸直"),
     ):
         schema = live.parameter_schemas[skill]
@@ -163,7 +164,9 @@ def test_configured_pose_choices_bind_catalog_schema_and_roundtrip(tmp_path):
         jsonschema.validate({"target_name": valid}, schema)
         with pytest.raises(jsonschema.ValidationError):
             jsonschema.validate({"target_name": invalid}, schema)
-    assert "HOME" in choices["return_to_task_pose"][0]["description"]
+    named = {record["target_name"]: record for record in choices["return_to_task_pose"]}
+    assert "双臂放下" in named["arms_rest"]["aliases"]
+    assert "双臂放下" not in named["grasp_ready"]["aliases"]
     assert "双臂前举" in choices["free_pose"][1]["aliases"]
     generated = compile_skill_catalog(
         DevelopmentStagingSkillSource(root),

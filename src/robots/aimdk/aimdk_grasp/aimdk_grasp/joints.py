@@ -96,6 +96,27 @@ def other_side(side: str) -> str:
     return "right" if check_side(side) == "left" else "left"
 
 
+#: Zero placeholders for an explicitly absent hand in the fixed 20-value
+#: command stream. These slots never stand in for measured feedback.
+ABSENT_HAND_COMMAND = np.zeros(len(HAND_PARTS))
+ABSENT_HAND_COMMAND.setflags(write=False)
+
+
+def installed_hands(value) -> tuple[str, ...]:
+    """The hands mounted on the robot, in ``SIDES`` order, each at most once.
+
+    A deployment declares this explicitly (``backend_options.installed_hands``):
+    the platform's hand report cannot tell an absent hand from one it has not
+    enumerated yet, so an absent hand is never inferred.
+    """
+    if isinstance(value, str) or not isinstance(value, list | tuple):
+        raise ValueError(f"installed_hands must be a list of sides from {SIDES}, got {value!r}")
+    sides = [str(side) for side in value]
+    if len(set(sides)) != len(sides) or not set(sides) <= set(SIDES):
+        raise ValueError(f"installed_hands must name each of {SIDES} at most once; got {value!r}")
+    return tuple(side for side in SIDES if side in sides)
+
+
 def swap_side_name(name: str) -> str:
     """``left_*`` <-> ``right_*``; other names unchanged."""
     if name.startswith("left_"):

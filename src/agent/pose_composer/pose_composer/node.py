@@ -229,17 +229,20 @@ class PoseComposerNode(Node):
                 config = self._hand_config
                 if not config:
                     raise RuntimeError("hand_restore_json is not configured for this deployment")
+                from aimdk_grasp.backend import grasp_installed_hands
                 from aimdk_grasp.hand_restore import HandRestorer, build_hand_plans
                 from aimdk_grasp.hand_restore_ros import RuntimeRestorePorts
 
                 plans, missing = build_hand_plans(config["grasp_execution"])
+                installed = grasp_installed_hands(config["grasp_execution"])
                 ports = RuntimeRestorePorts(
                     self,
                     config["interface_description"],
                     gateway_service=config["gateway_status_service"],
                     callback_group=self._callback_group,
+                    installed_hands=installed,
                 )
-                self._hand_restorer_cache = HandRestorer(ports, plans, missing)
+                self._hand_restorer_cache = HandRestorer(ports, plans, missing, installed_hands=installed)
                 self.get_logger().info(f"hand restore ready: hands {sorted(plans)}, unavailable {missing}")
             return self._hand_restorer_cache
 

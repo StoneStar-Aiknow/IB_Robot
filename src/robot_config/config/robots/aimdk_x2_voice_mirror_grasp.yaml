@@ -19,7 +19,7 @@ robot:
     - model_inference
     - moveit_planning
 
-  # Mock reference only: hardware approval remains false in the example file.
+  # Table-side grasp_ready: hardware approval remains false in the example file.
   task_poses:
     file: ../task_poses/x2_example.yaml
   pose_composer:
@@ -172,11 +172,13 @@ robot:
 
 # Runtime prerequisites for pick_object: the model bundles configured above
 # must be installed on the 310P, and the matching grasp head must run on the
-# Orin. Before each request, put the platform in URS, the left arm at HOME
-# (shoulder pitch 0.4 rad, elbow -1.2 rad, everything else 0), left hand open.
-# A half-closed
-# left hand rebuilds the cuRobo planner on the Orin (~50 s) and the request
-# times out.
+# Orin. Before each request, put the platform in URS. The task preparation
+# stage moves both arms to grasp_ready and opens both hands before perception.
+# The packaged table-side pose remains unapproved for hardware; provide a locally
+# calibrated and approved task pose file before hardware deployment.
+# Grasp executor HOME and mirror reset are independent of grasp_ready.
+# A changed hand shape can rebuild the cuRobo planner on the Orin (~50 s)
+# and consume the request budget.
 #
 # Stop the mirror session before a pick. Both skills use policy_stream, so
 # mode switching alone does not arbitrate concurrent arm commands.

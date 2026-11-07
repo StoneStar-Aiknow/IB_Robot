@@ -79,9 +79,9 @@ def compile_library(mjcf, profile, limits, seeds, selected, *, task_poses=None, 
     backend = FixedBackend(profile, limits, body_geometry=body)
     home = dict(zip(model.ARM_JOINTS, [0.4, 0, 0, -1.2, 0, 0, 0] * 2, strict=True))
     if snapshot:
-        if "grasp_ready" not in snapshot["poses"]:
-            raise ValueError("fixed seed compilation requires the configured grasp_ready anchor")
-        home = snapshot["poses"]["grasp_ready"]["joint_positions"]
+        if "arms_rest" not in snapshot["poses"]:
+            raise ValueError("fixed seed compilation requires the configured arms_rest anchor")
+        home = snapshot["poses"]["arms_rest"]["joint_positions"]
     data = {
         "schema_version": 1,
         "joint_names": list(model.ARM_JOINTS),
@@ -171,15 +171,15 @@ def update_fixed_catalog(library, catalog_root):
     }
     manifest["description"]["aliases_zh"] = list(dict.fromkeys(aliases))
     manifest["description"]["summary"] = (
-        "Execute a compiled seed; task-pose arms use configured HOME, never keep-current."
+        "Execute a compiled seed; task-pose arms use configured arms_rest, never keep-current."
     )
     manifest["description"]["when_to_use"] = [
         "the user requests a pose in the compiled enum",
-        "arms_down returns both arms to grasp_ready and runs its configured hand preparation",
+        "arms_down returns both arms to arms_rest and runs its configured hand preparation",
     ]
     manifest["capability"]["summary"] = (
-        "Execute only a listed compiled pose. Single-arm seeds return the other arm to grasp_ready. "
-        "arms_down runs grasp_ready preparation, including its configured hands."
+        "Execute only a listed compiled pose. Single-arm seeds return the other arm to arms_rest. "
+        "arms_down runs arms_rest preparation, including its configured hands."
     )
     path.write_text(yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False))
 

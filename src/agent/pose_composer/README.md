@@ -348,21 +348,24 @@ and feedback while checking the real CPU geometry and both hand-opening paths.
 The workstation additionally runs `test_compiled_geometry_reference.py` against
 MuJoCo FK, gravity and collision distances.
 
-### HOME-bound seeds (seed file version 2)
+### Rest-bound seeds (seed file version 3)
 
 The passive arm of `right_hand_on_head`, `salute`, `thinking`, `right_forward`
-and `left_forward` now uses `{task_pose: grasp_ready}`. It moves to the configured
-HOME preparation target; it does not preserve the current arm pose. HOME means
-the task-pose snapshot, not zero joint angles or a newly inferred hanging pose.
+and `left_forward` uses `{task_pose: arms_rest}`. It moves to the configured
+rest target instead of preserving the current arm pose. `arms_rest` retains the
+previous preparation reference; `grasp_ready` is the separate table-side grasp
+preparation pose. Both are resolved from the task-pose snapshot.
 The composer resolves both anchors before IK and restores their exact values
 after safety projection; an incompatible active target is refused.
 
 `arms_down` / **双臂放下** binds both arms to the same task pose. Execution reuses
 the `return_to_task_pose` preparation runner, including its hardware/unloaded
 approvals, current hand configuration, automatic opening, settle and release
-checks. No second copy of HOME angles or hand-opening code is maintained.
+checks. No second copy of rest angles or hand-opening code is maintained.
+The grab preparation mapping remains `pick_object: grasp_ready`.
 
-Supply the same task-pose YAML used by the deployment when compiling:
+Supply the same task-pose YAML used by the deployment, including `arms_rest`,
+when compiling. The compiler checks roundtrips from `arms_rest`:
 
 ```bash
 source .shrc_local
@@ -389,9 +392,10 @@ The artifact records this scope in `compile_validation`; body paths, static
 gravity, joint limits and speeds are still checked. This option never changes
 the live policy or the runtime's finger monitor.
 
-Changing HOME or its preparation settings requires recompilation. Generated-mode
+Changing either named pose or its preparation settings requires recompilation. Generated-mode
 seed memory also fingerprints this snapshot. Existing version-1 artifacts with
-no named anchors remain loadable.
+no named anchors remain loadable. Version-2 seed artifacts still bind `arms_down`
+to the old anchor; recompile them before deploying the version-3 pose snapshot.
 
 The current commissioning arrival policy checks one fresh joint-state sample
 after a successful trajectory terminal, instead of waiting for `stable_sec`.
@@ -414,6 +418,7 @@ not certify the widened 0.1 rad envelope. The default compiler and online checks
 use the widened envelope and refuse insufficient clearance. Explicit compilation
 with the hand check `off` records its narrower entry-only validation. Compilation
 checks both HOME directions and the 0.005 rad entry uncertainty. These checks cover HOME ↔ each seed; arbitrary
-seed-to-seed transitions are not certified. Return to `grasp_ready` before
+seed-to-seed transitions are not certified. New compilation checks `arms_rest`
+roundtrips. Return to `arms_rest` before
 switching gestures, or retain online path validation. Offline/Mock success is
 not hardware acceptance of the new gestures.

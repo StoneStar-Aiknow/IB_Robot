@@ -1,4 +1,8 @@
-# Mock reference only. Replace with a taught, verified pose before hardware approval.
+# Operator-supplied table-side pose: bent elbows (-1.45 rad), forearms slightly
+# raised, both hands beside the table. Previewed in MuJoCo (palm span ~0.86 m,
+# palm height ~0.96 m); teach and verify on hardware before approval.
+# Assumed table: width 0.70 m, depth 0.50 m, height 0.72 m, near edge x=0.32 m.
+# This preparation target is independent of grasp executor HOME and mirror reset.
 schema_version: 1
 robot_type: x2_ultra_omnihand
 joint_names:
@@ -17,24 +21,50 @@ joint_names:
 - right_wrist_pitch_joint
 - right_wrist_roll_joint
 poses:
-  grasp_ready:
-    description: 抓取准备位 / HOME；双臂回到配置的初始姿态，并张开配置的空手。
-    aliases: [准备位, 回准备位, 初始位, HOME, 双臂放下]
+  arms_rest:
+    description: 双臂放下的休息位。肩部侧摆保留限位余量，并张开配置的空手。
+    aliases: [双臂放下, 放下双臂, 双手放下, 放下双手, 双臂休息位]
     joint_positions:
       left_shoulder_pitch_joint: 0.366
-      left_shoulder_roll_joint: -0.038
+      # 0.141 rad from the inner MC limit, exceeding the 0.1 rad arrival tolerance.
+      left_shoulder_roll_joint: 0.08
       left_shoulder_yaw_joint: -0.008
       left_elbow_joint: -1.164
       left_wrist_yaw_joint: 0.003
       left_wrist_pitch_joint: 0.007
       left_wrist_roll_joint: -0.001
       right_shoulder_pitch_joint: 0.364
-      right_shoulder_roll_joint: 0.026
+      right_shoulder_roll_joint: -0.08
       right_shoulder_yaw_joint: 0.019
       right_elbow_joint: -1.175
       right_wrist_yaw_joint: 0.005
       right_wrist_pitch_joint: 0.007
       right_wrist_roll_joint: -0.003
+    position_tolerance_rad: 0.1
+    stable_sec: 0.3
+    timeout_sec: 30.0
+    max_state_age_sec: 0.5
+    hardware_approved: false
+    hands: {left: open, right: open}
+    unloaded_operation_approved: false
+  grasp_ready:
+    description: 抓取准备位。双臂屈肘平举，双手位于桌子两侧，并张开配置的空手。
+    aliases: [准备位, 回准备位, 初始位, 抓取准备位, 桌侧准备位]
+    joint_positions:
+      left_shoulder_pitch_joint: -0.0486
+      left_shoulder_roll_joint: 0.4486
+      left_shoulder_yaw_joint: 0.3506
+      left_elbow_joint: -1.45
+      left_wrist_yaw_joint: 0.0038
+      left_wrist_pitch_joint: 0.0678
+      left_wrist_roll_joint: -0.0002
+      right_shoulder_pitch_joint: -0.0554
+      right_shoulder_roll_joint: -0.4486
+      right_shoulder_yaw_joint: -0.3478
+      right_elbow_joint: -1.45
+      right_wrist_yaw_joint: -0.0029
+      right_wrist_pitch_joint: 0.0678
+      right_wrist_roll_joint: 0.0001
     position_tolerance_rad: 0.1
     stable_sec: 0.3
     timeout_sec: 30.0

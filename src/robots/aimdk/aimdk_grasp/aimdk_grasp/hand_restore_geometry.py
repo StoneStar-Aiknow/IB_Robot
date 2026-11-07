@@ -86,15 +86,21 @@ class SideSweep:
     side: str
 
     def check(self, feedback, frames, *, left_arm=None, right_arm=None):
-        hands = {side: feedback.hand(side) for side in ("left", "right")}
+        hands = {side: feedback.hand(side) for side in self.geometry.checks}
         hands[self.side] = np.asarray(frames, float)
         return self.geometry.check(feedback, hands, left_arm=left_arm, right_arm=right_arm)
 
 
 class DualHandCollision:
+    """The articulated checks of the installed hands; with both, also hand against hand.
+
+    A side model carries its own hand and only the wrist on the opposite side,
+    so a robot with one hand removed is modelled by that hand's side model alone.
+    """
+
     def __init__(self, checks):
-        if set(checks) != {"left", "right"}:
-            raise ValueError("both physical hand models are required")
+        if not checks or not set(checks) <= {"left", "right"}:
+            raise ValueError("one or both physical hand models are required")
         self.checks = dict(checks)
         self.indices = {}
         self.leg_hulls = {}
@@ -200,6 +206,8 @@ class DualHandCollision:
                         f"arm_bound={link_margins[link] - hold_margins[link]:.6f}, "
                         f"shape_hold={hold_margins[link]:.6f}); sample={sample_offset + frame}",
                     )
+        if len(placed) < 2:
+            return minimum
         left, right = placed["left"], placed["right"]
         lo = {side: (balls[..., :3] - balls[..., 3:]).min(axis=1) for side, balls in placed.items()}
         hi = {side: (balls[..., :3] + balls[..., 3:]).max(axis=1) for side, balls in placed.items()}

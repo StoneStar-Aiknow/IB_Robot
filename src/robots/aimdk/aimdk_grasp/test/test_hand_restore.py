@@ -45,13 +45,18 @@ class Ports:
 
     def observe(self):
         stamp = self.now if self.frozen_at is None else self.frozen_at
-        feedback = Feedback(stamp, dict(self.body), self.hands["left"].copy(), True, self.hands["right"].copy())
+        left, right = (self.hands.get(side) for side in ("left", "right"))
+        feedback = Feedback(
+            stamp, dict(self.body), None if left is None else left.copy(), True, None if right is None else right.copy()
+        )
         return Observation(feedback, self.now - stamp, self.board, self.runtime, self.gateway)
 
     def publish(self, left, right):
         self.sent.append((self.phase, left.copy(), right.copy()))
         if self.follow:
-            self.hands = {"left": left.copy(), "right": right.copy()}
+            self.hands = {
+                side: values.copy() for side, values in (("left", left), ("right", right)) if side in self.hands
+            }
         self.board = replace(self.board, stiffness=np.full(14, 40.0), damping=np.full(14, 2.0))
 
     def release(self):
@@ -86,6 +91,42 @@ def restore():
 def prepare(restorer, ports, ctx, sides=("left", "right")):
     restorer.preflight(ctx, sides, arm_target=ports.body, arm_must_move=False)
     restorer.begin(ctx)
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_one_installed_hand_opens_without_reading_or_preserving_an_absent_hand(restore, side):
+    restorer, ports, ctx, _ = restore
+    other = "right" if side == "left" else "left"
+    restorer.installed_hands = (side,)
+    restorer.plans = {side: restorer.plans[side]}
+    del ports.hands[other]
+    prepare(restorer, ports, ctx, (side,))
+    assert not restorer.open_hand(ctx, side)
+    restorer.confirm(ctx, (side,), lambda: None)
+    np.testing.assert_allclose(ports.hands[side], restorer.plans[side].open_pose)
+    assert ports.sent
+    for _, left, right in ports.sent:
+        np.testing.assert_array_equal(left if other == "left" else right, np.zeros(10))
+    with pytest.raises(RestoreError, match=f"cannot open the {other}"):
+        restorer.preflight(ctx, (other,), arm_target=ports.body, arm_must_move=False)
+
+
+@pytest.mark.parametrize("installed", [("left",), ("right",), ()])
+def test_restore_models_follow_the_declared_mounts(monkeypatch, installed):
+    from aimdk_grasp import backend
+    from aimdk_grasp.robot_model import config_directory
+
+    def robot(config):
+        side = config["backend_options"]["arm_side"]
+        assert side in installed
+        return SimpleNamespace(hand=HandMapping(planning_model(config_directory(side)), PRESETS, side=side))
+
+    monkeypatch.setattr(backend, "x2_robot", robot)
+    plans, missing = build_hand_plans({"backend_options": {"installed_hands": list(installed)}})
+    assert set(plans) == set(installed)
+    restorer = HandRestorer(None, plans, missing, installed_hands=installed)
+    assert (restorer.geometry is not None) is bool(installed)
+    assert set(missing) == {"left", "right"} - set(installed)
 
 
 @pytest.mark.parametrize(

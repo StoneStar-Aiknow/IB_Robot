@@ -96,6 +96,18 @@ def test_rigid_pair_reuse_agrees_with_checking_all_real_fk_frames(geometry, monk
     assert len(compared) >= 2
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_single_hand_geometry_checks_arms_and_fingers_without_opposite_feedback(geometry, side):
+    checker = DualHandCollision({side: geometry.checks[side]})
+    observed = replace(feedback(geometry), **{f"{'right' if side == 'left' else 'left'}_hand": None})
+    assert checker.sweep(side).check(observed, [observed.hand(side)]) > 0
+    q = observed.vector(LEFT_ARM + RIGHT_ARM)
+    checker.check_arm_path(observed, LEFT_ARM + RIGHT_ARM, [q, q], finger_radius=0.025)
+    invalid = dict(observed.positions, **{f"{side}_wrist_roll_joint": 3.0})
+    with pytest.raises(RestoreError, match="limits"):
+        checker.sweep(side).check(replace(observed, positions=invalid), [observed.hand(side)])
+
+
 def test_right_sweep_uses_right_native_mapping_and_both_models(geometry):
     observed = feedback(geometry)
     right = observed.right_hand.copy()

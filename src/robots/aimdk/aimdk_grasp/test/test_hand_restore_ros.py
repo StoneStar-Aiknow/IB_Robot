@@ -31,6 +31,37 @@ def wait_for(predicate, timeout=5.0):
     pytest.fail("Mock ROS condition did not arrive")
 
 
+def test_body_only_feedback_binding_needs_no_hand_interface():
+    from aimdk_grasp.feedback import FeedbackHistory
+    from aimdk_grasp.feedback_ros import subscribe_feedback
+
+    callbacks = {}
+    subscriptions = SimpleNamespace(
+        subscribe=lambda _kind, endpoint, _qos, _depth, fn: callbacks.update({endpoint: fn})
+    )
+    views = (("joint.state", LEFT_ARM + RIGHT_ARM), ("joint.head_state", HEAD))
+    interfaces = {
+        name: {"kind": "topic", "direction": "publish", "message_type": "sensor_msgs/msg/JointState", "endpoint": name}
+        for name, _ in views
+    }
+    interfaces["runtime.status"] = {
+        "kind": "topic",
+        "direction": "publish",
+        "message_type": "ibrobot_msgs/msg/RuntimeStatus",
+        "endpoint": "status",
+    }
+    history = FeedbackHistory(required_hands=())
+    subscribe_feedback(subscriptions, {"interfaces": interfaces}, history)
+    for name, joints in views:
+        message = JointState(name=list(joints), position=[0.1] * len(joints))
+        message.header.stamp.sec = 1
+        callbacks[name](message, time.monotonic())
+    callbacks["status"](RuntimeStatus(lifecycle="ACTIVE"), time.monotonic())
+    feedback = history.latest()
+    assert feedback.healthy and feedback.left_hand is feedback.right_hand is None
+    np.testing.assert_allclose(feedback.vector(LEFT_ARM + RIGHT_ARM), [0.1] * 14)
+
+
 def test_public_feedback_ownership_stream_order_and_stop(monkeypatch):
     assert os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID")
     assert os.environ["ROS_LOCALHOST_ONLY"] == "1"

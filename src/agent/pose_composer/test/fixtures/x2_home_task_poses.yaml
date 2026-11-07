@@ -16,7 +16,7 @@ joint_names:
 - right_wrist_pitch_joint
 - right_wrist_roll_joint
 poses:
-  grasp_ready:
+  arms_rest:
     joint_positions:
       left_shoulder_pitch_joint: 0.4
       left_shoulder_roll_joint: 0
@@ -32,6 +32,28 @@ poses:
       right_wrist_yaw_joint: 0
       right_wrist_pitch_joint: 0
       right_wrist_roll_joint: 0
+    position_tolerance_rad: 0.1
+    stable_sec: 0.3
+    timeout_sec: 180.0
+    hardware_approved: false
+    hands: {left: open, right: open}
+    unloaded_operation_approved: false
+  grasp_ready:
+    joint_positions:
+      left_shoulder_pitch_joint: -0.0486
+      left_shoulder_roll_joint: 0.4486
+      left_shoulder_yaw_joint: 0.3506
+      left_elbow_joint: -1.45
+      left_wrist_yaw_joint: 0.0038
+      left_wrist_pitch_joint: 0.0678
+      left_wrist_roll_joint: -0.0002
+      right_shoulder_pitch_joint: -0.0554
+      right_shoulder_roll_joint: -0.4486
+      right_shoulder_yaw_joint: -0.3478
+      right_elbow_joint: -1.45
+      right_wrist_yaw_joint: -0.0029
+      right_wrist_pitch_joint: 0.0678
+      right_wrist_roll_joint: 0.0001
     position_tolerance_rad: 0.1
     stable_sec: 0.3
     timeout_sec: 180.0

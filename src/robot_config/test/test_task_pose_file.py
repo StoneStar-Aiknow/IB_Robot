@@ -13,6 +13,63 @@ ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "config/task_poses/x2_example.yaml"
 
 
+@pytest.mark.parametrize(
+    "robot_file",
+    ["aimdk_x2_grasp_task_poses_310p.yaml", "aimdk_x2_voice_mirror_grasp.yaml"],
+)
+def test_grasp_ready_uses_table_side_pose(robot_file):
+    from robot_config.loader import _load_robot_section
+    from robot_config.task_poses import resolve_task_pose_file
+
+    expected = {
+        "left_shoulder_pitch_joint": -0.0486,
+        "left_shoulder_roll_joint": 0.4486,
+        "left_shoulder_yaw_joint": 0.3506,
+        "left_elbow_joint": -1.45,
+        "left_wrist_yaw_joint": 0.0038,
+        "left_wrist_pitch_joint": 0.0678,
+        "left_wrist_roll_joint": -0.0002,
+        "right_shoulder_pitch_joint": -0.0554,
+        "right_shoulder_roll_joint": -0.4486,
+        "right_shoulder_yaw_joint": -0.3478,
+        "right_elbow_joint": -1.45,
+        "right_wrist_yaw_joint": -0.0029,
+        "right_wrist_pitch_joint": 0.0678,
+        "right_wrist_roll_joint": 0.0001,
+    }
+    path, config = _load_robot_section(ROOT / "config/robots" / robot_file)
+    resolve_task_pose_file(config, path)
+    task_poses = config["task_poses"]
+    pose = task_poses["poses"]["grasp_ready"]
+    assert set(task_poses["joint_names"]) == set(expected)
+    assert pose["joint_positions"] == pytest.approx(expected, abs=1e-9)
+    assert task_poses["skill_entry_poses"] == {"pick_object": "grasp_ready"}
+    assert pose["hands"] == {"left": "open", "right": "open"}
+    assert pose["hardware_approved"] is False
+    assert pose["unloaded_operation_approved"] is False
+    assert "HOME" not in pose["aliases"]
+    assert "双臂放下" not in pose["aliases"]
+    rest = task_poses["poses"]["arms_rest"]
+    assert rest["joint_positions"] != pose["joint_positions"]
+    assert "双手放下" in rest["aliases"]
+    assert rest["hands"] == {"left": "open", "right": "open"}
+    assert rest["hardware_approved"] is False
+    assert rest["unloaded_operation_approved"] is False
+
+    # Both entry points must stay within the grasp runtime's declared MC limits.
+    _, grasp_config = _load_robot_section(ROOT / "config/robots/aimdk_x2_grasp.yaml")
+    for target in (pose, rest):
+        for name, position in target["joint_positions"].items():
+            lower, upper = grasp_config["arm_limits"][name]
+            assert lower <= position <= upper, name
+
+    # Accepted tracking error must not take a resting shoulder across its MC limit.
+    for name in ("left_shoulder_roll_joint", "right_shoulder_roll_joint"):
+        lower, upper = grasp_config["arm_limits"][name]
+        position = rest["joint_positions"][name]
+        assert min(position - lower, upper - position) > rest["position_tolerance_rad"]
+
+
 def test_task_pose_file_changes_execution_identity_and_stays_frozen(tmp_path):
     source = yaml.safe_load(EXAMPLE.read_text())
     file = tmp_path / "poses.yaml"

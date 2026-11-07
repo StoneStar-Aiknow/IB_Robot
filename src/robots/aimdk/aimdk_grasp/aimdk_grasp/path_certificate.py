@@ -273,9 +273,14 @@ class Certificate:
 
     def shape_matches(self, feedback, *, entry):
         reference = self.backend.observation(dict(zip(self.backend.ARM_JOINTS, [0.0] * 14, strict=True)))
+        try:
+            hands = {s: feedback.hand(s) for s in ("left", "right")}
+        except ValueError:
+            # Certificates are proven with both hands mounted; one hand absent falls back online.
+            return False
         return (
             all(
-                np.max(np.abs(feedback.hand(s) - reference.hand(s)))
+                np.max(np.abs(hands[s] - reference.hand(s)))
                 <= self.data["finger_entry_rad" if entry else "finger_radius_rad"]
                 for s in ("left", "right")
             )

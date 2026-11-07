@@ -3,13 +3,13 @@ name: free_pose
 version: 1.0.0
 semantic_level: skill
 description:
-  summary: Hold the arms in a pose the user describes in their own words, such as both arms straight forward, both hands over the head, a bent-arm pose, hands on hips or a hand on the head.
+  summary: Move to a described arm pose, using arms_rest for lowered or idle arms.
   category: body_pose
   when_to_use:
   - the user asks for an arm pose or posture by describing it (straight, raised, bent, spread, on the hips, on the head, at the chin)
   - the user adjusts the current arm pose (higher, lower, the other arm too, put one arm down)
   - the user asks to put the arms down or back
-  - the user requests the arms_down seed, which returns both arms to the configured grasp_ready task pose
+  - the user requests the arms_down seed, which returns both arms to the configured arms_rest task pose
   do_not_use:
   - condition: wave hello or goodbye
     instead_use: wave_hand

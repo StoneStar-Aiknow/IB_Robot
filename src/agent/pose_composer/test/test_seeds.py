@@ -34,13 +34,22 @@ def test_seeds_load_once_per_version_and_answer_their_phrases(tmp_path):
         memory.close()
 
 
-@pytest.mark.parametrize("name,passive", [("right_forward", "left"), ("left_forward", "right")])
-def test_single_arm_seed_returns_the_other_arm_to_configured_home(name, passive):
+@pytest.mark.parametrize(
+    "name,passive",
+    [
+        ("right_forward", "left"),
+        ("left_forward", "right"),
+        ("salute", "left"),
+        ("thinking", "left"),
+        ("right_hand_on_head", "left"),
+    ],
+)
+def test_single_arm_seed_returns_the_other_arm_to_rest_instead_of_grasp_ready(name, passive):
     _, entries = read_seed_file(SEEDS)
     seed = next(s for s in entries if s["id"] == name)
     robot = load()
-    home = robot.task_poses["poses"]["grasp_ready"]["joint_positions"]
-    start = dict(home)
+    home = robot.task_poses["poses"]["arms_rest"]["joint_positions"]
+    start = dict(robot.task_poses["poses"]["grasp_ready"]["joint_positions"])
     start[f"{passive}_elbow_joint"] = -1.7
     target = spec.compose(seed["description"], start).frames[0]
     joints = [n for n in home if n.startswith(passive + "_")]
@@ -48,12 +57,14 @@ def test_single_arm_seed_returns_the_other_arm_to_configured_home(name, passive)
     assert target[f"{passive}_elbow_joint"] != start[f"{passive}_elbow_joint"]
 
 
-def test_arms_down_is_exact_home_and_not_profile_rest():
+def test_arms_down_returns_from_grasp_ready_to_exact_configured_rest():
     _, entries = read_seed_file(SEEDS)
     seed = next(s for s in entries if s["id"] == "arms_down")
     robot = load()
-    target = spec.compose(seed["description"], dict(robot.rest)).frames[0]
-    assert target == robot.task_poses["poses"]["grasp_ready"]["joint_positions"]
+    start = robot.task_poses["poses"]["grasp_ready"]["joint_positions"]
+    target = spec.compose(seed["description"], dict(start)).frames[0]
+    assert target == robot.task_poses["poses"]["arms_rest"]["joint_positions"]
+    assert target != start
 
 
 def test_named_home_fails_if_unconfigured_and_never_falls_back_to_current(monkeypatch):
@@ -72,7 +83,8 @@ def test_reference_cannot_be_combined_with_keep_or_ik():
         spec.compose({"kind": "pose", "left": {"task_pose": "grasp_ready", "keep": True}}, dict(load().rest))
 
 
-def test_home_changes_invalidate_seed_memory_fingerprint(monkeypatch):
+@pytest.mark.parametrize("pose_name", ["arms_rest", "grasp_ready"])
+def test_task_pose_changes_invalidate_seed_memory_fingerprint(monkeypatch, pose_name):
     import copy
     from dataclasses import replace
 
@@ -88,6 +100,6 @@ def test_home_changes_invalidate_seed_memory_fingerprint(monkeypatch):
     before = fingerprint("prompt", "model", str(path))
     changed = copy.deepcopy(robot.task_poses)
     changed.pop("digest")
-    changed["poses"]["grasp_ready"]["joint_positions"]["left_shoulder_pitch_joint"] += 0.02
+    changed["poses"][pose_name]["joint_positions"]["left_shoulder_pitch_joint"] += 0.02
     monkeypatch.setattr(model, "_ROBOT", replace(robot, task_poses=normalize_task_poses(changed)))
     assert fingerprint("prompt", "model", str(path)) != before

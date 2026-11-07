@@ -1,4 +1,4 @@
-"""HOME-bound seeds are compiled and validated without hardware or a ROS graph."""
+"""Rest-bound seeds are compiled separately from grasp preparation without hardware or a ROS graph."""
 
 import copy
 from pathlib import Path
@@ -54,13 +54,14 @@ def test_current_compiler_rejects_home_with_insufficient_widened_finger_clearanc
 def test_explicit_hand_check_off_records_scope_and_keeps_home(compile_home, anchors):
     library = compile_home(hand_path_check="off")
     assert library["compile_validation"] == {"hand": "off", "body": "online"}
-    assert library["poses"]["arms_down"]["target"] == anchors["poses"]["grasp_ready"]["joint_positions"]
+    assert library["poses"]["arms_down"]["target"] == anchors["poses"]["arms_rest"]["joint_positions"]
 
 
 def test_compiled_down_uses_exact_snapshot_and_the_frozen_backend(compiled_home, anchors):
     backend = FixedBackend(PROFILE, library=compiled_home, task_poses=anchors)
-    target = anchors["poses"]["grasp_ready"]["joint_positions"]
+    target = anchors["poses"]["arms_rest"]["joint_positions"]
     assert compiled_home["poses"]["arms_down"]["target"] == target
+    assert target != anchors["poses"]["grasp_ready"]["joint_positions"]
     assert backend.task_poses["digest"] == compiled_home["task_poses"]["digest"]
     composer = FixedComposer(backend.library)
     prepared = composer.compose("双臂放下", dict(backend.rest))
@@ -73,7 +74,7 @@ def test_runtime_cannot_load_an_old_or_falsified_home_anchor(compiled_home, anch
     data = copy.deepcopy(compiled_home)
     runtime = copy.deepcopy(anchors)
     if fault == "changed_home":
-        runtime["poses"]["grasp_ready"]["joint_positions"]["left_shoulder_pitch_joint"] += 0.02
+        runtime["poses"]["arms_rest"]["joint_positions"]["left_shoulder_pitch_joint"] += 0.02
     elif fault == "missing_home":
         runtime = {}
     else:
@@ -83,9 +84,16 @@ def test_runtime_cannot_load_an_old_or_falsified_home_anchor(compiled_home, anch
         FixedBackend(PROFILE, library=data, task_poses=runtime)
 
 
-def test_compiler_rejects_missing_anchor_instead_of_using_hardcoded_home(compile_home):
-    with pytest.raises(ValueError, match="not configured"):
-        compile_home(task_poses=None)
+@pytest.mark.parametrize("missing", ["snapshot", "arms_rest"])
+def test_compiler_rejects_missing_rest_anchor_instead_of_using_grasp_ready_or_hardcoded_home(
+    compile_home, anchors, missing
+):
+    if missing == "snapshot":
+        anchors = None
+    else:
+        anchors["poses"].pop("arms_rest")
+    with pytest.raises(ValueError, match="arms_rest|not configured"):
+        compile_home(task_poses=anchors)
 
 
 def test_old_keep_is_still_rejected_and_not_silently_reinterpreted(tmp_path, compile_home):
