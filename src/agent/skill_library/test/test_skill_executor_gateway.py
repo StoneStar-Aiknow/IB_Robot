@@ -20,7 +20,7 @@ from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, PRIMITIVE
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import compute_workflow_digest
 from ibrobot_msgs.action import ExecuteNavigation, ExecuteProgram, ExecuteTaskPlan, PrimitiveCommand, SkillCommand
-from ibrobot_msgs.msg import ExecutionEvent
+from ibrobot_msgs.msg import ExecutionEvent, HeldObject
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
     CancelExecution,
@@ -143,7 +143,7 @@ def _skill_implementation(profile_name, primitive_sequence, *, schema_version=1)
 
 
 def _write_test_catalog(
-    root, profile_name, *, include_relative=True, include_navigation=False, bad_primitive=False
+    root, profile_name, *, include_relative=True, include_navigation=False, include_recovery=False, bad_primitive=False
 ) -> None:
     """Stage a minimal DevelopmentStagingSkillSource catalog (move [+ relative] [+ bad])."""
     skills_dir = root / "config" / "skills"
@@ -159,6 +159,8 @@ def _write_test_catalog(
         enabled_skills.append({"name": "bad", "implementation": profile_name, "planner_visible": True})
     if include_navigation:
         enabled_skills.append({"name": "nav_straight", "implementation": profile_name, "planner_visible": True})
+    if include_recovery:
+        enabled_skills.append({"name": "return_to_task_pose", "implementation": profile_name, "planner_visible": True})
 
     _write_yaml(
         profiles_dir / f"{profile_name}.yaml",
@@ -185,6 +187,28 @@ def _write_test_catalog(
         skills_dir / "move" / "implementations" / f"{profile_name}.yaml",
         _skill_implementation(profile_name, [{"primitive_name": "move_to_named_pose", "pose_name": "home"}]),
     )
+
+    if include_recovery:
+        _write_yaml(
+            skills_dir / "return_to_task_pose" / "manifest.yaml",
+            _skill_manifest(
+                "return_to_task_pose",
+                "Return an empty arm to its task pose.",
+                parameters={
+                    "type": "object",
+                    "properties": {"target_name": {"type": "string", "enum": ["grasp_ready"]}},
+                    "required": ["target_name"],
+                    "additionalProperties": False,
+                },
+                recovery_policy="never_retry",
+                anchor_pose="home",
+                profile_name=profile_name,
+            ),
+        )
+        _write_yaml(
+            skills_dir / "return_to_task_pose" / "implementations" / f"{profile_name}.yaml",
+            _skill_implementation(profile_name, [{"primitive_name": "move_to_named_pose", "pose_name": "home"}]),
+        )
 
     if include_relative:
         _write_yaml(
@@ -337,6 +361,7 @@ def gateway_rig(request, tmp_path):
     hold_validate_primitive = test_config.pop("_hold_validate_primitive", False)
     serve_task_executor = hold_task_executor or test_config.pop("_task_executor", False)
     serve_navigation = test_config.pop("_navigation", False)
+    include_recovery = test_config.pop("_recovery", False)
     mock_node = rclpy.create_node(f"mock_{suffix}")
     client_node = rclpy.create_node(f"client_{suffix}")
 
@@ -371,6 +396,7 @@ def gateway_rig(request, tmp_path):
         profile_name,
         include_relative=not serve_navigation,
         include_navigation=serve_navigation,
+        include_recovery=include_recovery,
     )
     overrides = {
         "active_control_mode": _TEST_CONTROL_MODE,
@@ -603,6 +629,52 @@ def test_minimal_program_gateway_single_step_round_trip(gateway_rig):
     assert result.state == "SUCCEEDED"
     assert result.completed_step_count == 1
     assert result.execution_id
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True, "_recovery": True}], indirect=True)
+@pytest.mark.parametrize(
+    "held_state,held_reason,skill_names,expected_error",
+    [
+        ("uncertain", "DROP_HOME_FAILED", ["return_to_task_pose"], ""),
+        ("uncertain", "GRASP_UNCERTAIN", ["return_to_task_pose"], "HELD_OBJECT_RECOVERY_REQUIRED"),
+        ("uncertain", "DROP_HOME_FAILED", ["move"], "HELD_OBJECT_RECOVERY_REQUIRED"),
+        ("uncertain", "DROP_HOME_FAILED", ["return_to_task_pose", "move"], "HELD_OBJECT_RECOVERY_REQUIRED"),
+        ("picked", "DROP_HOME_FAILED", ["return_to_task_pose"], "SKILL_BUSY"),
+        ("claimed", "DROP_HOME_FAILED", ["return_to_task_pose"], "SKILL_BUSY"),
+        ("recovering", "DROP_HOME_FAILED", ["return_to_task_pose"], "SKILL_BUSY"),
+    ],
+)
+def test_program_custody_admission_allows_only_empty_hand_recovery(
+    gateway_rig, held_state, held_reason, skill_names, expected_error
+):
+    """Exercise the Program entry, not just the policy's recovery predicate."""
+    held = HeldObject(
+        custody_id="earlier-custody",
+        root_task_id="earlier-pick",
+        state=held_state,
+        reason_code=held_reason,
+    )
+    gateway_rig.executor_node._handle_held_object(held)
+    steps = [
+        workflow_step(
+            skill_name=name,
+            target_name="grasp_ready" if name == "return_to_task_pose" else "",
+            timeout_sec=1.0,
+        )
+        for name in skill_names
+    ]
+    result = _send_program(gateway_rig, _program_goal(gateway_rig, steps=steps))
+
+    assert result.success is (not expected_error)
+    assert result.error_code == expected_error
+    assert result.state == ("FAILED" if expected_error else "SUCCEEDED")
+    assert result.completed_step_count == (0 if expected_error else 1)
+    assert len(gateway_rig.downstream_goals) == (0 if expected_error else 1)
+    # Gateway admission and even a successful pose do not clear custody;
+    # only fresh verification from the custody owner may publish that change.
+    assert gateway_rig.executor_node._held_object_custody() == ("earlier-pick", held_state, held_reason)
+    status = _get_status(gateway_rig)
+    assert not status.busy and not status.active_task_id
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)

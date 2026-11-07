@@ -1,14 +1,14 @@
-# The voice/gesture/mirror skills plus the grasp skills, for the deployment that
-# runs aimdk_x2_voice_mirror_grasp with the grasp pipeline switched on.
+# Voice, gesture, mirror and pick-to-place skills for aimdk_x2_voice_mirror_grasp.
 #
-# This profile only compiles when grasp_execution is enabled: pick_object's
-# implementation targets the grasp_pipeline delegated executor, which the robot
-# config registers from grasp_execution. Naming it while the pipeline is off fails
-# with an unknown-executor diagnostic, which is the intended guard against
-# exposing a skill nothing can run.
+# This profile only compiles when grasp_execution and placement_execution are
+# both enabled: pick_object and place_in_container target the grasp_pipeline and
+# placement_pipeline delegated executors, which the robot config registers from
+# those sections. Naming them while a pipeline is off fails with an
+# unknown-executor diagnostic, which is the intended guard against exposing a
+# skill nothing can run.
 #
-# The matching robot config enables this pipeline and requires its model bundles
-# and delegated grasp head to be available at launch.
+# The matching robot config enables both pipelines and requires their model
+# bundles and delegated grasp head to be available at launch.
 # Single-hand and dual-hand deployments share this catalog. The mounting and
 # preparation policy belongs to robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml.
 schema_version: 1
@@ -48,4 +48,7 @@ enabled_skills:
   planner_visible: true
 - name: return_to_task_pose
   implementation: x2_runtime_v1
+  planner_visible: true
+- name: place_in_container
+  implementation: aimdk_x2_grasp
   planner_visible: true

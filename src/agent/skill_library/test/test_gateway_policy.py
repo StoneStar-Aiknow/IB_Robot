@@ -741,3 +741,173 @@ def test_atomic_admission_returns_duplicate_or_conflict_without_new_lease_or_act
     assert lease.owner is owner
     assert ledger.query("task-1", first.prepared_request.identity.payload_hash).state == "active"
     assert policy.finalize(first).state == "terminal"
+
+
+def _held_policy() -> GatewayPolicy:
+    templates = {
+        **EXPANDED_SKILL_TEMPLATES,
+        "place_in_container": {
+            "capability": {
+                "parameters": _parameters(
+                    {
+                        "target_name": {"type": "string", "freeform": True},
+                        "container_name": {"type": "string", "freeform": True},
+                    },
+                    ["target_name", "container_name"],
+                )
+            },
+            "primitive_sequence": [],
+        },
+        "return_to_task_pose": {
+            "capability": {"parameters": _parameters({"target_name": {"type": "string", "freeform": True}}, [])},
+            "primitive_sequence": [],
+        },
+    }
+    return GatewayPolicy(
+        TIMEOUT_POLICY,
+        build_skill_requirements(templates, PRIMITIVE_CONTRACT_V2.descriptors),
+        parameter_schemas=build_skill_parameter_schemas(templates),
+        ledger=BoundedRequestLedger(2),
+        lease=RootExecutionLease(),
+    )
+
+
+def _recovery(task_id):
+    return _request(
+        task_id=task_id,
+        skill_name="return_to_task_pose",
+        motion_direction=None,
+        motion_distance=None,
+        target_name="grasp_ready",
+    )
+
+
+def test_a_dropped_object_whose_hand_opened_admits_only_a_recovery_pose():
+    """DROP_HOME_FAILED: the hand is open and empty, only its way home failed."""
+    policy = _held_policy()
+    snapshot = _snapshot(
+        held_object_task_id="program-1", held_object_state="uncertain", held_object_reason="DROP_HOME_FAILED"
+    )
+    owner = ExecutionOwner.skill_command("task-2")
+
+    assert policy.evaluate(_recovery("task-2"), snapshot, owner=owner).admitted
+    other = policy.evaluate(_request(task_id="task-2"), snapshot, owner=owner)
+    assert (other.admitted, other.error_code) == (False, gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED)
+    assert "recovery pose" in other.message
+    assert not policy.evaluate(_place("task-2"), snapshot, owner=owner).admitted
+    error, token = policy.admit_workflow(
+        ExecutionOwner.workflow("program-2"), snapshot, timeout_sec=5.0, skill_names=["return_to_task_pose"]
+    )
+    assert error == "" and token is not None
+    policy._lease.release(token)
+    for names in ([], ["return_to_task_pose", "relative"], ["relative"]):
+        assert policy.admit_workflow(
+            ExecutionOwner.workflow("program-3"), snapshot, timeout_sec=5.0, skill_names=names
+        ) == (gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED, None)
+    assert policy.admit_external_primitive("primitive-1", "digest", snapshot) == (
+        gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED,
+        None,
+    )
+
+
+@pytest.mark.parametrize("reason", ["", "DROP_RECOVERY_FAILED", "GRASP_UNCERTAIN", "RECOVERY_FAILED", "CLAIM_EXPIRED"])
+def test_an_uncertain_custody_that_may_still_hold_the_object_refuses_the_recovery_pose(reason):
+    """Opening the hand there could drop what it still holds: a person checks first."""
+    policy = _held_policy()
+    snapshot = _snapshot(held_object_task_id="program-1", held_object_state="uncertain", held_object_reason=reason)
+
+    decision = policy.evaluate(_recovery("task-2"), snapshot, owner=ExecutionOwner.skill_command("task-2"))
+    assert (decision.admitted, decision.error_code) == (False, gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED)
+    assert "manual check" in decision.message
+    assert policy.admit_workflow(
+        ExecutionOwner.workflow("program-2"), snapshot, timeout_sec=5.0, skill_names=["return_to_task_pose"]
+    ) == (gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED, None)
+
+
+@pytest.mark.parametrize("state", ["picked", "claimed", "recovering"])
+def test_a_held_object_refuses_the_recovery_pose_even_with_a_recoverable_reason(state):
+    policy = _held_policy()
+    snapshot = _snapshot(
+        held_object_task_id="program-1", held_object_state=state, held_object_reason="DROP_HOME_FAILED"
+    )
+
+    decision = policy.evaluate(_recovery("task-2"), snapshot, owner=ExecutionOwner.skill_command("task-2"))
+    assert not decision.admitted
+
+
+def _place(task_id):
+    return _request(
+        task_id=task_id,
+        skill_name="place_in_container",
+        motion_direction=None,
+        motion_distance=None,
+        target_name="apple",
+        container_name="basket",
+    )
+
+
+@pytest.mark.parametrize("state", ["picked", "claimed", "recovering", "uncertain"])
+def test_carried_object_blocks_every_other_root_until_custody_ends(state):
+    """While a pick holds an object, a mirror/gesture/new program would race its put-back."""
+    policy = _held_policy()
+    snapshot = _snapshot(held_object_task_id="program-1", held_object_state=state)
+
+    other = policy.evaluate(_request(task_id="task-2"), snapshot, owner=ExecutionOwner.skill_command("task-2"))
+    expected_code = gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED if state == "uncertain" else gateway_policy.SKILL_BUSY
+    assert (other.admitted, other.error_code) == (False, expected_code)
+    assert ("manual check" in other.message) == (state == "uncertain")
+    place_elsewhere = policy.evaluate(_place("task-2"), snapshot, owner=ExecutionOwner.skill_command("task-2"))
+    assert not place_elsewhere.admitted
+    assert policy.admit_workflow(ExecutionOwner.workflow("program-2"), snapshot, timeout_sec=5.0) == (
+        expected_code,
+        None,
+    )
+    assert policy.admit_external_primitive("primitive-1", "digest", snapshot) == (expected_code, None)
+
+
+def test_only_the_holding_programs_place_step_may_start():
+    policy = _held_policy()
+    root = ExecutionOwner.workflow("program-1")
+    child = ExecutionOwner.internal_child(root, "place_in_container")
+    snapshot = _snapshot(
+        busy=True, active_task_id="program-1", held_object_task_id="program-1", held_object_state="picked"
+    )
+
+    assert policy.evaluate(_place("program-1"), snapshot, owner=child).admitted
+    relative = policy.evaluate(
+        _request(task_id="program-1"), snapshot, owner=ExecutionOwner.internal_child(root, "relative")
+    )
+    assert (relative.admitted, relative.error_code) == (False, gateway_policy.SKILL_BUSY)
+
+
+def test_no_custody_state_no_longer_blocks():
+    snapshot = _snapshot(held_object_task_id="program-1", held_object_state="")
+    decision = _held_policy().evaluate(
+        _request(task_id="task-2"), snapshot, owner=ExecutionOwner.skill_command("task-2")
+    )
+    assert decision.admitted
+
+
+@pytest.mark.parametrize("reason", ["GRASP_UNCERTAIN", "GRIP_LOST", "RECOVERY_FAILED", "CLAIM_EXPIRED"])
+def test_uncertain_custody_releases_execution_lease_and_allows_authorized_recovery(reason):
+    policy = _held_policy()
+    admission = policy.admit(_recovery("pick-1"), _snapshot(), ExecutionOwner.skill_command("pick-1"))
+    assert admission.admitted
+    policy.finalize(admission, error_code=reason)
+    assert policy._lease.owner is None
+
+    snapshot = _snapshot(held_object_task_id="pick-1", held_object_state="uncertain", held_object_reason=reason)
+    assert not snapshot.is_busy
+    blocked = policy.admit(_recovery("reset-1"), snapshot, ExecutionOwner.skill_command("reset-1"))
+    assert not blocked.admitted and blocked.error_code == gateway_policy.HELD_OBJECT_RECOVERY_REQUIRED
+    assert policy._lease.owner is None  # The custody gate has not acquired an execution lease.
+
+    authorized = replace(snapshot, held_object_manual_reset=True)
+    recovery = policy.admit(_recovery("reset-1"), authorized, ExecutionOwner.skill_command("reset-1"))
+    assert recovery.admitted
+    policy.finalize(recovery)
+    assert policy._lease.owner is None
+
+    ready = policy.admit(_request(task_id="next-1"), _snapshot(), ExecutionOwner.skill_command("next-1"))
+    assert ready.admitted
+    policy.finalize(ready)

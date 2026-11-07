@@ -46,7 +46,7 @@ def _voice_mirror_grasp_context():
         timeout_policy={"task_budget_sec": 180.0},
     )
     delegated = dict(context.delegated_executors)
-    for executor in ("pose_composer", "grasp_pipeline", "mirror_session", "runtime_play_audio"):
+    for executor in ("pose_composer", "grasp_pipeline", "placement_pipeline", "mirror_session", "runtime_play_audio"):
         delegated.update(_context(executor).delegated_executors)
     delegated["grasp_pipeline"] = replace(
         delegated["grasp_pipeline"],
@@ -76,6 +76,7 @@ def test_voice_mirror_grasp_preserves_skills_and_compiles_preparation_budget():
         "pick_object",
         "free_pose",
         "return_to_task_pose",
+        "place_in_container",
     }
     assert set(snapshot.enabled_skill_names) == expected
     assert set(snapshot.planner_visible_skill_names) == expected
@@ -86,14 +87,15 @@ def test_voice_mirror_grasp_preserves_skills_and_compiles_preparation_budget():
     assert pick["executor"] == "grasp_pipeline"
     assert pick["timeout_sec"] == 150.0
     assert "preparation posture" in str(snapshot.capability_view["pick_object"])
+    assert snapshot.templates["place_in_container"]["executor"] == "placement_pipeline"
     assert snapshot.templates["mirror_start"]["executor"] == "mirror_session"
     assert snapshot.templates["self_introduction"]["executor"] == "runtime_play_audio"
     assert snapshot.templates["self_introduction"]["binding"] == {"clip": "self_intro", "motion": "wave"}
     assert snapshot.capability_view["self_introduction"]["moves_robot"] is True
 
 
-@pytest.mark.parametrize("missing", ["pose_composer", "grasp_pipeline"])
-def test_voice_mirror_grasp_requires_both_task_pose_and_grasp_executors(missing):
+@pytest.mark.parametrize("missing", ["pose_composer", "grasp_pipeline", "placement_pipeline"])
+def test_voice_mirror_grasp_requires_task_pose_grasp_and_placement_executors(missing):
     context = _voice_mirror_grasp_context()
     delegated = dict(context.delegated_executors)
     delegated.pop(missing)

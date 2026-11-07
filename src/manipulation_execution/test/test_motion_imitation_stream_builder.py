@@ -277,6 +277,7 @@ def test_bad_zone_settings_stop_the_launch_with_the_field_named(tmp_path, case, 
         generate_motion_imitation_stream_nodes(stream_config(**overrides))
 
 
+@pytest.mark.model_bundle("yolox_x_640", "pear_parameter_network", "zipvoice")
 def test_zone_profile_is_dexhand_rec_plus_the_two_board_files():
     # D15: parsed only; the files live on the board, so the builder is not run.
     # The base is read beside the zone profile, not by name: before a build the

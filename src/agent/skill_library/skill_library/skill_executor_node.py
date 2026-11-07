@@ -78,6 +78,7 @@ from ibrobot_msgs.action import (
 )
 from ibrobot_msgs.msg import (
     ExecutionEvent,
+    HeldObject,
     RuntimeStatus,
     SkillCapabilityStatus,
     SkillDiagnostic,
@@ -86,6 +87,7 @@ from ibrobot_msgs.msg import (
     WorkflowStep,
 )
 from ibrobot_msgs.srv import (
+    AuthorizeHeldReset,
     BeginWorkflowExecution,
     CancelExecution,
     FinalizeWorkflowExecution,
@@ -97,6 +99,7 @@ from ibrobot_msgs.srv import (
     MoveToConfiguration,
     PlayAudioFile,
     ReloadSkillCatalog,
+    SetPerceptionPaused,
     SetRuntimeMode,
     SetSoundFollowing,
     ValidatePrimitive,
@@ -109,6 +112,7 @@ from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
+from skill_library.carry_handover import HELD_CUSTODY_STATES, motion_stop_is_unknown, retains_for_place
 from skill_library.execution_store import (
     ExecutionBusyError,
     ExecutionConflictError,
@@ -386,6 +390,7 @@ class _WorkflowExecution:
     runtime_generation_released: bool = False
     child_results: dict[int, object] = field(default_factory=dict)
     late_cleanup_callback: Callable[[], None] | None = None
+    perception_pause_owner: str = ""
 
 
 @dataclass(frozen=True)
@@ -450,11 +455,17 @@ class _LateCleanupConfirmation:
                 wrapped_result = future.result()
             except Exception:
                 return
-            result = getattr(wrapped_result, "result", wrapped_result)
-            if getattr(result, "error_code", "") not in {PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "POSE_STOP_UNKNOWN"}:
-                self.confirm()
+            self.confirm_result(wrapped_result)
 
         result_future.add_done_callback(confirm_terminal)
+
+    def confirm_result(self, wrapped_result) -> bool:
+        """An Action reply is not a cleanup acknowledgement when stopping is unknown."""
+        result = getattr(wrapped_result, "result", wrapped_result)
+        if result is None or motion_stop_is_unknown(result):
+            return False
+        self.confirm()
+        return True
 
     def watch_goal_future(self, goal_future, cancel_goal: Callable[[object], None]) -> None:
         def confirm_late_goal(future) -> None:
@@ -656,6 +667,7 @@ class SkillExecutorNode(Node):
         # The X2 mirror session's start/stop switch (std_srvs/SetBool).
         self.declare_parameter("mirror_session_service", "", descriptor=startup_descriptor)
         self.declare_parameter("mirror_session_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("motion_imitation_pause_service", "", descriptor=startup_descriptor)
         # How long the session may take to answer stop; mirror_stop's timeout must exceed it.
         self.declare_parameter(
             "mirror_session_stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC, descriptor=startup_descriptor
@@ -678,6 +690,7 @@ class SkillExecutorNode(Node):
         self.declare_parameter("pose_catalog_json", "{}", descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
+        self.declare_parameter("held_object_topic", "/manipulation/held_object")
         self.declare_parameter("semantic_map_target_service", "")
         self.declare_parameter("semantic_map_stand_off_distance_m", 0.3)
         self.declare_parameter(
@@ -1055,6 +1068,19 @@ class SkillExecutorNode(Node):
                 self._semantic_map_target_service,
                 callback_group=callback_group,
             )
+        self._held_object = None
+        if self._placement_execution.get("backend"):
+            # A pick that hands over to place keeps custody between the two steps;
+            # the latched state gates every other admission until it ends.
+            self.create_subscription(
+                HeldObject,
+                self.get_parameter("held_object_topic").get_parameter_value().string_value,
+                self._handle_held_object,
+                QoSProfile(
+                    depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+                ),
+                callback_group=callback_group,
+            )
         self.create_subscription(
             PoseStamped,
             self._ee_pose_topic,
@@ -1079,6 +1105,12 @@ class SkillExecutorNode(Node):
             self, PrimitiveCommand, self._primitive_action_name, callback_group=callback_group
         )
         self._motion_mode_client = self.create_client(SetBool, self._motion_mode_service, callback_group=callback_group)
+        pause_service = str(self.get_parameter("motion_imitation_pause_service").value).strip()
+        self._motion_imitation_pause_client = (
+            self.create_client(SetPerceptionPaused, pause_service, callback_group=callback_group)
+            if pause_service
+            else None
+        )
         self._pick_client = ActionClient(
             self,
             PickObject,
@@ -1201,6 +1233,16 @@ class SkillExecutorNode(Node):
             GetSkillGatewayStatus,
             self._skill_gateway_status_service,
             self._get_gateway_status,
+            callback_group=callback_group,
+        )
+        self._manual_reset_authorization = None
+        self._authorize_held_reset_client = self.create_client(
+            AuthorizeHeldReset, "/manipulation/authorize_held_reset", callback_group=callback_group
+        )
+        self._authorize_held_reset_server = self.create_service(
+            AuthorizeHeldReset,
+            "/embodied/authorize_held_reset",
+            self._authorize_held_reset,
             callback_group=callback_group,
         )
         registry_event_qos = QoSProfile(
@@ -1417,7 +1459,10 @@ class SkillExecutorNode(Node):
             program_owner = ExecutionOwner.workflow(program.root_task_id)
             admission_started = time.monotonic()
             workflow_error, lease_token = self._gateway_policy.admit_workflow(
-                program_owner, self._runtime_snapshot(), timeout_sec=program.task_budget_sec
+                program_owner,
+                self._runtime_snapshot(),
+                timeout_sec=program.task_budget_sec,
+                skill_names=[step.skill_name for step in program.steps],
             )
             self._audit(
                 "gateway_admission",
@@ -1589,10 +1634,7 @@ class SkillExecutorNode(Node):
                 fill_execution_detail(result.execution_detail, child_detail)
                 result.message = short_message(child_result.message)
                 if not child_result.success:
-                    cleanup_pending = child_result.error_code in {
-                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
-                        SKILL_CANCEL_TIMEOUT,
-                    } or (child_detail.schema_version == 1 and child_detail.recovery_state == "UNKNOWN")
+                    cleanup_pending = motion_stop_is_unknown(child_result)
                     checkpoint = getattr(goal_handle, "_program_step_checkpoint", None)
                     if child_result.error_code == "SKILL_CANCELLED" and checkpoint:
                         self._execution_store.record_resume_checkpoint(
@@ -1749,21 +1791,31 @@ class SkillExecutorNode(Node):
         return bool(record is not None and record.stop_requested)
 
     def _finalize_program_admission(self, admission, owner) -> None:
-        workflow = None
         with self._state_guard():
-            if self._active_skill_admission is not None:
-                self._active_skill_admission = None
+            workflow = self._active_workflow
+            if workflow is None:
+                # Admission can fail before a workflow snapshot is retained.
+                with suppress(Exception):
+                    self._gateway_policy.release_workflow(owner, admission.lease_token)
+                return
+            if workflow.owner is not owner or workflow.lease_token is not admission.lease_token:
+                return
+            active_child = self._active_skill_admission
+            if isinstance(active_child, _WorkflowChildAdmission) and active_child.workflow is workflow:
+                # An exception in the Program wrapper must not free a child
+                # whose physical stop is still unconfirmed. Late cleanup retries.
+                return
+            try:
+                if not self._cleanup_terminal_workflow(workflow):
+                    return
+            except Exception as exc:
+                self.get_logger().error(f"failed to finalize program {workflow.root_task_id}: {exc}")
+                return
+            self._active_skill_admission = None
             self._active_skill_owner = None
             self._active_audit_context = None
             self._active_runtime_bundle = None
-            workflow = self._active_workflow
             self._active_workflow = None
-        if workflow is not None and not workflow.runtime_generation_released:
-            with suppress(Exception):
-                self._runtime_coordinator.release(workflow.bundle.generation)
-            workflow.runtime_generation_released = True
-        with suppress(Exception):
-            self._gateway_policy.release_workflow(owner, admission.lease_token)
 
     def _execution_auth_ok(self, request) -> bool:
         return is_caller_authorized(
@@ -3274,6 +3326,91 @@ class SkillExecutorNode(Node):
         self._fill_catalog_diagnostics(response, result.diagnostics)
         return response
 
+    def _authorize_held_reset(self, request, response):
+        """Record an operator check while idle; this endpoint never dispatches motion."""
+        token = None
+        try:
+            with self._state_guard():
+                snapshot = self._runtime_snapshot()
+                held = self._held_object
+                if request.schema_version == 1 and request.inspect_only:
+                    response.success = True
+                    if held is not None:
+                        response.custody_id = held.custody_id
+                        response.state, response.reason_code = held.state, held.reason_code
+                    return response
+                if (
+                    request.schema_version != 1
+                    or not request.request_id.strip()
+                    or not request.operator_confirmed_empty
+                    or not request.operator_note.strip()
+                ):
+                    response.error_code = "OPERATOR_CHECK_REQUIRED"
+                    response.message = "schema 1, request ID, explicit empty-hand confirmation and note are required"
+                    return response
+                if snapshot.is_busy or snapshot.unresolved_unknown:
+                    response.error_code = "SKILL_BUSY"
+                    response.message = "reset authorization requires an idle Gateway with a definite motion terminal"
+                    return response
+                if not snapshot.motion_authorized:
+                    response.error_code = "MOTION_NOT_AUTHORIZED"
+                    return response
+                if (
+                    held is None
+                    or held.state != "uncertain"
+                    or not request.custody_id
+                    or held.custody_id != request.custody_id
+                ):
+                    response.error_code = "STALE_CUSTODY"
+                    response.message = "the operator check must match the current uncertain custody"
+                    return response
+                if self._runtime_enabled:
+                    status, reason = self._runtime_status_for_admission()
+                    if status is None or status.lifecycle != "ACTIVE" or status.stop_latched or status.faults:
+                        response.error_code = "RUNTIME_NOT_READY"
+                        response.message = reason or "runtime must be ACTIVE, with no faults or latched stop"
+                        return response
+                owner = ExecutionOwner.skill_command("operator-reset:" + request.request_id)
+                token = self._gateway_lease.acquire(owner)
+                if token is None:
+                    response.error_code = "SKILL_BUSY"
+                    return response
+            started = time.monotonic()
+            client = self._authorize_held_reset_client
+            if not client.wait_for_service(timeout_sec=self._rpc_timeout):
+                response.error_code = "SERVER_UNAVAILABLE"
+                return response
+            future = client.call_async(request)
+            if not self._wait_for_future(future, timeout_sec=self._rpc_timeout):
+                response.error_code = "RESET_AUTHORIZATION_UNKNOWN"
+                response.message = "operator-check response timed out; no recovery motion was authorized here"
+                return response
+            result = future.result()
+            if result is None:
+                response.error_code = "RESET_AUTHORIZATION_UNKNOWN"
+                return response
+            response.success, response.error_code, response.message = result.success, result.error_code, result.message
+            response.custody_id, response.remaining_sec = result.custody_id, result.remaining_sec
+            response.state, response.reason_code = held.state, held.reason_code
+            if result.success:
+                with self._state_guard():
+                    self._manual_reset_authorization = (request.custody_id, started + result.remaining_sec)
+                self.get_logger().info(
+                    "operator held reset authorized: "
+                    + json.dumps(
+                        {
+                            "request_id": request.request_id,
+                            "custody_id": request.custody_id,
+                            "reason": held.reason_code,
+                            "operator_note": request.operator_note,
+                        }
+                    )
+                )
+            return response
+        finally:
+            if token is not None:
+                self._gateway_lease.release(token)
+
     def _get_skill_snapshot(self, request, response):
         response.success = False
         if request.schema_version != 1 or (request.generation > 0 and not request.registry_epoch):
@@ -3323,6 +3460,17 @@ class SkillExecutorNode(Node):
             self._latest_ee_pose = msg
             self._latest_ee_pose_monotonic = time.monotonic()
 
+    def _handle_held_object(self, msg: HeldObject) -> None:
+        with self._state_guard():
+            self._held_object = msg
+
+    def _held_object_custody(self) -> tuple[str, str, str]:
+        """(root task, state, reason) of a carried object still in custody, or empty strings."""
+        msg = getattr(self, "_held_object", None)
+        if msg is None or str(msg.state) not in HELD_CUSTODY_STATES:
+            return "", "", ""
+        return str(msg.root_task_id), str(msg.state), str(getattr(msg, "reason_code", ""))
+
     def _handle_joint_state(self, msg: JointState) -> None:
         self._latest_joint_state = msg
 
@@ -3340,6 +3488,7 @@ class SkillExecutorNode(Node):
 
     def _runtime_snapshot(self) -> RuntimeSnapshot:
         owner = self._gateway_lease.owner
+        held_task_id, held_state, held_reason = self._held_object_custody()
         active_workflow = self._active_workflow
         active_control_mode = self._active_control_mode
         if getattr(self, "_runtime_enabled", False):
@@ -3375,6 +3524,21 @@ class SkillExecutorNode(Node):
             unresolved_unknown=bool(
                 getattr(getattr(self, "_execution_store", None), "has_unresolved_unknown", lambda: False)()
             ),
+            held_object_task_id=held_task_id,
+            held_object_state=held_state,
+            held_object_reason=held_reason,
+            held_object_manual_reset=self._manual_held_reset_is_current(),
+        )
+
+    def _manual_held_reset_is_current(self):
+        authorization = getattr(self, "_manual_reset_authorization", None)
+        held = getattr(self, "_held_object", None)
+        return bool(
+            authorization
+            and held is not None
+            and held.state == "uncertain"
+            and held.custody_id == authorization[0]
+            and time.monotonic() < authorization[1]
         )
 
     def _ee_pose_is_fresh(self) -> bool:
@@ -3701,7 +3865,9 @@ class SkillExecutorNode(Node):
                 retained_bundle = self._runtime_coordinator.retain(bundle.generation)
             except Exception as exc:
                 return self._set_begin_failure(response, "SKILL_SNAPSHOT_NOT_RETAINED", str(exc))
-            error_code, lease_token = workflow_policy.admit_workflow(owner, snapshot, timeout_sec=duration_sec)
+            error_code, lease_token = workflow_policy.admit_workflow(
+                owner, snapshot, timeout_sec=duration_sec, skill_names=[step.skill_name for step in steps]
+            )
             if error_code or lease_token is None:
                 with suppress(Exception):
                     self._runtime_coordinator.release(bundle.generation)
@@ -3799,6 +3965,10 @@ class SkillExecutorNode(Node):
             if not active.policy.release_workflow(active.owner, active.lease_token):
                 return False
             active.lease_released = True
+        if active.perception_pause_owner:
+            owner_id = active.perception_pause_owner
+            active.perception_pause_owner = ""
+            self._resume_motion_imitation(owner_id)
         return True
 
     @staticmethod
@@ -5981,6 +6151,73 @@ class SkillExecutorNode(Node):
             self._retained_admission_cleanup.pop(id(admission), None)
             return True
 
+    def _pause_workflow_motion_imitation(self, workflow: _WorkflowExecution) -> bool:
+        """Hold one root owner across preparation and every manipulation step.
+
+        Called outside the state lock after child admission, which prevents
+        root finalization/expiry while the pause acknowledgement is pending.
+        Delegations keep their own owners; ending one cannot resume the stream
+        between the root workflow's return, pick and place steps.
+        """
+        if getattr(self, "_motion_imitation_pause_client", None) is None or workflow.perception_pause_owner:
+            return True
+        from robot_runtime.task_poses import RETURN_TASK_POSE
+
+        templates = workflow.bundle.snapshot.templates
+        if not any(
+            step.skill_name == RETURN_TASK_POSE
+            or templates.get(step.skill_name, {}).get("executor") in {"grasp_pipeline", "placement_pipeline"}
+            for step in workflow.workflow_steps
+        ):
+            return True
+        owner_id = f"workflow:{workflow.root_lease_nonce}"
+        if not self._pause_motion_imitation(owner_id):
+            return False
+        workflow.perception_pause_owner = owner_id
+        return True
+
+    def _pause_motion_imitation(self, owner_id: str) -> bool:
+        """Require acknowledgement before motion; a missing stream never starts motion."""
+        client = getattr(self, "_motion_imitation_pause_client", None)
+        if client is None:
+            return True
+        try:
+            if not client.wait_for_service(timeout_sec=self._rpc_timeout):
+                return False
+            future = client.call_async(SetPerceptionPaused.Request(owner_id=owner_id, paused=True))
+            if not self._wait_for_future(future, timeout_sec=self._rpc_timeout):
+                # A late successful pause must not leave an idle stream held forever.
+                # The motion has not been submitted. Owner fencing makes this
+                # compensating release harmless to any later manipulation.
+                self._resume_motion_imitation(owner_id)
+                return False
+            response = future.result()
+            return bool(response is not None and response.success and response.paused)
+        except Exception as exc:
+            self.get_logger().warning(f"mirror perception pause failed: {exc}")
+            self._resume_motion_imitation(owner_id)
+            return False
+
+    def _resume_motion_imitation(self, owner_id: str) -> None:
+        """Release only this owner; never block a ROS result callback waiting on another RPC."""
+        client = getattr(self, "_motion_imitation_pause_client", None)
+        if client is None:
+            return
+        try:
+            future = client.call_async(SetPerceptionPaused.Request(owner_id=owner_id, paused=False))
+
+            def completed(done):
+                try:
+                    response = done.result()
+                    if response is None or not response.success:
+                        self.get_logger().warning(f"mirror perception resume rejected: owner={owner_id}")
+                except Exception as exc:
+                    self.get_logger().warning(f"mirror perception resume failed: owner={owner_id}: {exc}")
+
+            future.add_done_callback(completed)
+        except Exception as exc:
+            self.get_logger().warning(f"mirror perception resume failed: owner={owner_id}: {exc}")
+
     def _execute_pick_skill(
         self,
         goal_handle,
@@ -6071,6 +6308,13 @@ class SkillExecutorNode(Node):
         pick_goal.mode = PickObject.Goal.MODE_EXECUTE
         pick_goal.supervised_direct = False
         pick_goal.release_after_success = False
+        workflow = getattr(self, "_active_workflow", None)
+        placement = getattr(self, "_placement_execution", {})
+        pick_goal.retain_for_place = bool(
+            placement.get("backend")
+            and workflow is not None
+            and retains_for_place(workflow.workflow_steps, int(goal.dispatch_binding.workflow_step_index))
+        )
         delegated_admission = self._active_skill_admission
         delegated_nonce = pick_goal.dispatch_binding.dispatch_nonce
         cleanup_key = self._register_delegated_dispatch(
@@ -6083,7 +6327,17 @@ class SkillExecutorNode(Node):
         late_cleanup.add_callback(
             lambda: self._confirm_delegated_terminal(delegated_admission, delegated_nonce, cleanup_key)
         )
+        late_cleanup.add_callback(lambda: self._resume_motion_imitation(delegated_nonce))
         try:
+            if not self._pause_motion_imitation(delegated_nonce):
+                delegated_terminal = True  # No delegated motion has been submitted.
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    "PERCEPTION_PAUSE_FAILED",
+                    "mirror perception did not acknowledge pause; pick was not submitted",
+                )
             send_future = self._pick_client.send_goal_async(pick_goal, feedback_callback=_feedback_cb)
             if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
                 late_cleanup.watch_goal_future(send_future, self._best_effort_cancel_goal)
@@ -6142,9 +6396,8 @@ class SkillExecutorNode(Node):
                     PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                     "pick execution state is unknown",
                 )
-            delegated_terminal = True
-            late_cleanup.confirm()
             action_result = result_future.result()
+            delegated_terminal = late_cleanup.confirm_result(action_result)
             pick_result = action_result.result if action_result is not None else None
             # ROS can deliver the result before queued feedback and unregister
             # its callback. Reconcile the typed bounded tail, in source order,
@@ -6176,7 +6429,7 @@ class SkillExecutorNode(Node):
                 and "result_future" in locals()
                 and self._cancel_goal(pick_handle, result_future, late_cleanup)
             ):
-                delegated_terminal = True
+                delegated_terminal = late_cleanup.confirm_result(result_future.result())
             return self._abort_skill(
                 result,
                 goal_handle,
@@ -6209,6 +6462,8 @@ class SkillExecutorNode(Node):
         if not pick_result.success:
             fill_execution_detail(result.execution_detail, pick_result.execution_detail)
             code = pick_result.error_code or "PICK_FAILED"
+            if motion_stop_is_unknown(pick_result):
+                code = PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
             if code == "CANCELED":
                 code = "SKILL_TIMEOUT" if timed_out else "SKILL_CANCELLED"
             return self._abort_skill(
@@ -6435,10 +6690,7 @@ class SkillExecutorNode(Node):
     @staticmethod
     def _place_public_error(place_result) -> str:
         """Preserve the irreversible release state in the public error code."""
-        if str(place_result.error_code) in {
-            PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
-            "PRIMITIVE_CANCEL_CLEANUP_TIMEOUT",
-        }:
+        if motion_stop_is_unknown(place_result):
             return PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
         if int(place_result.release_status) == PlaceObject.Result.RELEASE_UNKNOWN:
             return "PLACE_RELEASE_STATE_UNKNOWN"
@@ -6476,11 +6728,14 @@ class SkillExecutorNode(Node):
         def feedback_cb(feedback_msg) -> None:
             place_feedback = feedback_msg.feedback
             phase = str(place_feedback.phase)
-            if phase and (not completed_phases or completed_phases[-1] != phase):
+            detail = ExecutionDetail.from_value(place_feedback.execution_detail)
+            fill_execution_detail(result.execution_detail, detail)
+            if detail.phase_state == "SUCCEEDED" and phase and (not completed_phases or completed_phases[-1] != phase):
                 completed_phases.append(phase)
             feedback = SkillCommand.Feedback()
             feedback.state = "executing"
             feedback.detail = f"place:{phase}:{place_feedback.detail}"
+            fill_execution_detail(feedback.execution_detail, detail)
             goal_handle.publish_feedback(feedback)
 
         place_goal = PlaceObject.Goal()
@@ -6523,7 +6778,17 @@ class SkillExecutorNode(Node):
         late_cleanup.add_callback(
             lambda: self._confirm_delegated_terminal(delegated_admission, delegated_nonce, cleanup_key)
         )
+        late_cleanup.add_callback(lambda: self._resume_motion_imitation(delegated_nonce))
         try:
+            if not self._pause_motion_imitation(delegated_nonce):
+                delegated_terminal = True  # No delegated motion has been submitted.
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    "PERCEPTION_PAUSE_FAILED",
+                    "mirror perception did not acknowledge pause; placement was not submitted",
+                )
             send_future = self._place_client.send_goal_async(place_goal, feedback_callback=feedback_cb)
             if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
                 late_cleanup.watch_goal_future(send_future, self._best_effort_cancel_goal)
@@ -6557,7 +6822,6 @@ class SkillExecutorNode(Node):
                             PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                             "placement cancellation state is unknown",
                         )
-                    delegated_terminal = True
                     break
                 if time.monotonic() >= deadline:
                     if not self._cancel_goal(place_handle, result_future, late_cleanup):
@@ -6568,7 +6832,6 @@ class SkillExecutorNode(Node):
                             PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                             "placement timeout cleanup state is unknown",
                         )
-                    delegated_terminal = True
                     break
                 time.sleep(_WAIT_POLL_SEC)
             if not result_future.done():
@@ -6579,9 +6842,8 @@ class SkillExecutorNode(Node):
                     PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
                     "placement execution state is unknown",
                 )
-            delegated_terminal = True
-            late_cleanup.confirm()
             action_result = result_future.result()
+            delegated_terminal = late_cleanup.confirm_result(action_result)
             place_result = action_result.result if action_result is not None else None
         except Exception:
             self.get_logger().error(f"delegated placement execution failed:\n{traceback.format_exc()}")
@@ -6591,7 +6853,7 @@ class SkillExecutorNode(Node):
                 and "result_future" in locals()
                 and self._cancel_goal(place_handle, result_future, late_cleanup)
             ):
-                delegated_terminal = True
+                delegated_terminal = late_cleanup.confirm_result(result_future.result())
             return self._abort_skill(
                 result,
                 goal_handle,
@@ -6621,7 +6883,9 @@ class SkillExecutorNode(Node):
                 "placement executor identity does not match the registry snapshot",
             )
         result.debug_output_dir = str(getattr(place_result, "debug_output_dir", ""))
-        if goal_handle.is_cancel_requested and place_result.error_code == "PLACE_CANCELLED":
+        fill_execution_detail(result.execution_detail, place_result.execution_detail)
+        result.executed_primitives = [f"placement_pipeline:{phase}" for phase in place_result.completed_phases]
+        if goal_handle.is_cancel_requested and place_result.error_code in {"PLACE_CANCELLED", "CANCELED"}:
             return self._cancel_skill(result, goal_handle, result.executed_primitives, goal.skill_name)
         if not place_result.success or not place_result.place_succeeded:
             return self._abort_skill(
@@ -7088,6 +7352,20 @@ class SkillExecutorNode(Node):
                 result = self._abort_skill(result, deferred_goal_handle, [], "SKILL_REJECTED", reason)
             else:
                 remaining_budget = workflow.deadline_unix_sec - self._ros_time_sec()
+                if remaining_budget > 0.0:
+                    if not self._pause_workflow_motion_imitation(workflow):
+                        result = self._abort_skill(
+                            result,
+                            deferred_goal_handle,
+                            [],
+                            "PERCEPTION_PAUSE_FAILED",
+                            "mirror perception did not acknowledge the workflow pause",
+                        )
+                    elif goal_handle.is_cancel_requested:
+                        result = self._cancel_skill(result, deferred_goal_handle, [], goal.skill_name)
+                    else:
+                        # Pause RPC time belongs to the root budget too.
+                        remaining_budget = workflow.deadline_unix_sec - self._ros_time_sec()
                 if remaining_budget <= 0.0:
                     result = self._abort_skill(
                         result,
@@ -7096,7 +7374,7 @@ class SkillExecutorNode(Node):
                         "SKILL_TASK_DEADLINE_EXPIRED",
                         "workflow task budget expired",
                     )
-                else:
+                elif not result.error_code:
                     result = self._execute_skill_child(
                         deferred_goal_handle,
                         validation_done=True,
@@ -7113,7 +7391,7 @@ class SkillExecutorNode(Node):
             )
 
         duration_sec = time.monotonic() - started
-        cleanup_unknown = result.error_code in {PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, SKILL_CANCEL_TIMEOUT}
+        cleanup_unknown = motion_stop_is_unknown(result)
         with self._state_guard():
             if self._active_skill_admission is admission:
                 if result.success and self._active_workflow is workflow:

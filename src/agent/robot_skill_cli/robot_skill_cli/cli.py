@@ -105,6 +105,14 @@ def _build_parser() -> argparse.ArgumentParser:
     describe_parser.add_argument("skill")
     subparsers.add_parser("list-poses", help="list configured named poses")
     subparsers.add_parser("status", help="query Capability Gateway status")
+    subparsers.add_parser("held-status", help="read the current custody ID, state and original failure")
+    reset_parser = subparsers.add_parser(
+        "authorize-held-reset", help="record an operator's empty-hand check; no motion"
+    )
+    reset_parser.add_argument("--request-id", required=True)
+    reset_parser.add_argument("--custody-id", required=True)
+    reset_parser.add_argument("--operator-confirmed-empty", required=True, action="store_true")
+    reset_parser.add_argument("--note", required=True)
     validate_parser = subparsers.add_parser("validate", help="validate one skill without executing it")
     validate_parser.add_argument("skill")
     _add_skill_parameters(validate_parser)
@@ -457,6 +465,27 @@ def _run_reload_catalog(args: argparse.Namespace, context, bridge) -> dict[str, 
         raise _CommandError(
             result["error_code"] or "SKILL_SCHEMA_INVALID",
             result["message"] or "skill catalog reload failed",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    return result
+
+
+def _run_authorize_held_reset(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    inspect = args.command == "held-status"
+    if not inspect and not all(value.strip() for value in (args.request_id, args.custody_id, args.note)):
+        raise _CliArgumentError("request ID, custody ID and operator note must be non-empty")
+    result = bridge.authorize_held_reset(
+        request_id="" if inspect else args.request_id,
+        custody_id="" if inspect else args.custody_id,
+        operator_confirmed_empty=False if inspect else args.operator_confirmed_empty,
+        operator_note="" if inspect else args.note,
+        inspect_only=inspect,
+        timeout_sec=_plan_rpc_timeout(context),
+    )
+    if not result["success"]:
+        raise _CommandError(
+            result.get("error_code") or "RESET_REJECTED",
+            result.get("message") or "reset rejected",
             exit_code=EXIT_GATEWAY_REJECTED,
         )
     return result
@@ -1352,6 +1381,8 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
     try:
         if args.command == "status":
             return bridge.get_status(timeout_sec=_status_preflight_timeout(context))
+        if args.command in {"held-status", "authorize-held-reset"}:
+            return _run_authorize_held_reset(args, context, bridge)
         if args.command == "reload-catalog":
             return _run_reload_catalog(args, context, bridge)
         if args.command == "validate":

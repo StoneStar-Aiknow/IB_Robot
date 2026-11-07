@@ -71,6 +71,17 @@ def test_grasp_ready_uses_table_side_pose(robot_file):
         assert min(position - lower, upper - position) > rest["position_tolerance_rad"]
 
 
+@pytest.mark.parametrize(("tolerance", "accepted"), [(0.1, True), (0.11, False)])
+def test_position_tolerance_is_bounded_at_one_tenth_of_a_radian(tolerance, accepted):
+    data = yaml.safe_load(EXAMPLE.read_text())
+    data["poses"]["grasp_ready"]["position_tolerance_rad"] = tolerance
+    if accepted:
+        assert normalize_task_poses(data)["poses"]["grasp_ready"]["position_tolerance_rad"] == tolerance
+    else:
+        with pytest.raises(ValueError, match="position_tolerance_rad"):
+            normalize_task_poses(data)
+
+
 def test_task_pose_file_changes_execution_identity_and_stays_frozen(tmp_path):
     source = yaml.safe_load(EXAMPLE.read_text())
     file = tmp_path / "poses.yaml"
@@ -197,6 +208,7 @@ def test_voice_mirror_grasp_resolves_task_poses_without_losing_deployment_featur
         "pick_object",
         "free_pose",
         "return_to_task_pose",
+        "place_in_container",
     }
     assert config["voice_asr"]["enabled"] is True
     assert config["mirror_session"]["enabled"] is True
