@@ -21,9 +21,30 @@ CATALOG = Path(__file__).resolve().parents[2] / "src" / "agent" / "skill_catalog
 
 #: Aliases that are also ordinary dialogue. As an override the lexicon can only
 #: ever accept, so an everyday "是的" or "同意" here would defeat the gate for
-#: the most common back-channels in a meeting.
+#: the most common back-channels in a meeting. A bare negation belongs here for
+#: the same reason: "不是" is an answer, and as a skill word it let the question
+#: "是不是" through.
 DIALOGUE_WORDS = frozenset(
-    {"是的", "对", "对的", "好", "好的", "行", "可以", "同意", "嗯", "嗯嗯", "没错", "了解", "明白"}
+    {
+        "是的",
+        "对",
+        "对的",
+        "好",
+        "好的",
+        "行",
+        "可以",
+        "同意",
+        "嗯",
+        "嗯嗯",
+        "没错",
+        "了解",
+        "明白",
+        "不是",
+        "不对",
+        "没有",
+        "不用",
+        "别",
+    }
 )
 
 

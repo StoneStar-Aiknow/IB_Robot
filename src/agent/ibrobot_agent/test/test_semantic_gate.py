@@ -12,7 +12,9 @@ from ibrobot_agent.semantic_gate import SEMANTIC_GATE_MODES, SemanticGate, norma
 from ibrobot_agent.voice_bridge import Log, PublishRequest, VoiceBridgeConfig, VoiceBridgeCore
 
 SCOPE = {"channel_id": "voice_asr", "principal_id": "local_operator", "robot_scope": "aimdk_x2"}
-REPO_MODEL = Path(__file__).resolve().parents[3].parent / "models" / "addressee" / "addressee_zh_v1.json"
+REPO_ROOT = Path(__file__).resolve().parents[3].parent
+REPO_MODEL = REPO_ROOT / "models" / "addressee" / "addressee_zh_v1.json"
+EMIT_LEXICON = REPO_ROOT / "tools" / "addressee" / "emit_lexicon.py"
 
 
 def _weigh(text: str, weight: float, *, bias: float = 0.0, dim: int = 4096) -> list[list[float]]:
@@ -269,3 +271,18 @@ def test_the_shipped_model_scores_field_sentences_as_trained():
 
 def test_modes_are_the_documented_set():
     assert SEMANTIC_GATE_MODES == ("off", "shadow", "enforce")
+
+
+@pytest.mark.skipif(not EMIT_LEXICON.exists(), reason="lexicon tool not present")
+def test_the_generated_lexicon_holds_no_bare_negation():
+    # "不是" is an answer, and as a skill word it let the question "是不是" through the gate.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("emit_lexicon", EMIT_LEXICON)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    words = module.catalog_lexicon(module.CATALOG)
+
+    assert "不是" not in words
+    assert "挥手" in words
