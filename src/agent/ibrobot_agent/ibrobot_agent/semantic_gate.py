@@ -71,8 +71,9 @@ _ADDRESS_TERMS = (
 #: agrees at all: "这不是没开始吗智商没开始吗" carries 开始 and 镜子 and scored 0.000.
 _LEXICON_MAX_BODY_CHARS = 10
 #: Fragments this short carry no grammar, so the score is mostly the bias ("怎么" 0.999);
-#: they only pass inside a session the addressee gate opened.
-_FRAGMENT_BODY_CHARS = 4
+#: they only pass inside a session the addressee gate opened. Three characters still name
+#: a skill ("挥挥手", "点点头"), which is why the line sits at three, not four.
+_FRAGMENT_BODY_CHARS = 3
 
 
 def _fnv1a32(text: str) -> int:
@@ -246,7 +247,7 @@ class SemanticGate:
             reason = f"names someone else ({address_term})"
             return SemanticDecision(text, score, True, lexicon_hit, wake_prefix, reason, address_term)
         rejected = False
-        if lexicon_hit and (len(body) <= _LEXICON_MAX_BODY_CHARS or score > 0.0):
+        if lexicon_hit and (len(body) <= _LEXICON_MAX_BODY_CHARS or score >= self.threshold):
             reason = "skill word"
         elif wake_prefix:
             reason = "wake prefix"
