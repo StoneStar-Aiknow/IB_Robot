@@ -25,7 +25,9 @@ def launch_setup(context, *_args, **_kwargs):
     config_path = resolve_robot_config_path(
         config_name=configurations.get("robot_config") or None, config_path=configurations.get("config_path") or None
     )
-    config = load_robot_config_dict(config_path, defer_interface_binding=True)
+    # The shared configuration also declares the 310P's voice/perception models.
+    # This host starts only the head; its backend checks its own local assets.
+    config = load_robot_config_dict(config_path, defer_interface_binding=True, require_local_model_artifacts=False)
     config["_config_path"] = str(config_path)
     if configurations.get("control_mode"):
         config["default_control_mode"] = configurations["control_mode"]

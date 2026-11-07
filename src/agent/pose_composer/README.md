@@ -281,6 +281,16 @@ aliases; unknown descriptions and relative adjustments fail with
 `POSE_NOT_IN_LIBRARY`, without an LLM fallback. `return_to_task_pose` uses the
 same fixed execution backend and the configured hand-opening state machine.
 
+The combined `aimdk_x2_voice_mirror_grasp` entry already declares fixed mode and
+its portable artifact path. `pose_compile_library --robot-config <robot.yaml>`
+reads that entry's runtime profile, arm limits and resolved task-pose snapshot,
+including `task_poses.hands: installed`. It does not require an existing artifact.
+The legacy explicit `--profile`, `--limits` and `--task-poses` inputs remain
+supported; they cannot be mixed with `--robot-config`. `--mjcf`, `--seeds` and
+`--output` may still select workstation inputs and a candidate output path.
+See the [combined configuration guide](../../../docs/x2_voice_mirror_grasp_config_zh.md)
+for mounting switches and the command for all 12 deployed seeds.
+
 Compile an artifact **on a workstation** with the official model available:
 
 ```bash

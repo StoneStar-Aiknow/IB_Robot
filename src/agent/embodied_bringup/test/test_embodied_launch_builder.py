@@ -123,6 +123,26 @@ def test_launch_does_not_inject_legacy_skill_templates():
     assert "skill_templates_json" not in params
 
 
+@pytest.mark.parametrize("portable", [True, False])
+def test_runtime_audio_clips_resolve_workspace_before_reaching_the_executor(tmp_path, monkeypatch, portable):
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    clip = tmp_path / "commissioning/audio/self_introduction.wav"
+    clip.parent.mkdir(parents=True)
+    clip.touch()
+    configured_path = "$(env WORKSPACE)/commissioning/audio/self_introduction.wav" if portable else str(clip)
+    config = {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "hermes",
+            "runtime_play_audio": {"enabled": True, "clips": {"self_intro": configured_path}},
+        }
+    }
+    nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
+    params = _skill_executor_params(nodes)
+    assert _decode_launch_json_string(params["runtime_play_audio_clips_json"]) == {"self_intro": str(clip)}
+    assert config["embodied"]["runtime_play_audio"]["clips"]["self_intro"] == configured_path
+
+
 @pytest.mark.parametrize("service", [None, "/custom/move_to_joint"])
 def test_providerless_motion_defaults_match_digest_endpoints(service):
     execution = {} if service is None else {"move_configuration_service": service}

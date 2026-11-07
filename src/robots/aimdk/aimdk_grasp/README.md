@@ -95,6 +95,14 @@ Changing these settings requires matching configuration on both hosts and a
 restart of the affected nodes. Mock checks do not establish hardware approval
 for a new right-hand grasp deployment.
 
+The combined voice/mirror/grasp entry is the existing robot configuration
+`aimdk_x2_voice_mirror_grasp.yaml` on **both** hosts. It declares
+`task_poses.hands: installed`, so the canonical loader selects open-hand requests
+from the same `installed_hands` declaration. The task-pose source retains both
+arms and its hardware approvals; no per-mounting pose file or catalog is needed.
+Its fixed artifact must be compiled again after mounting or pose settings change.
+See the [shared configuration and launch guide](../../../../docs/x2_voice_mirror_grasp_config_zh.md).
+
 ## Planning model
 
 `aimdk_grasp.planning_model.build_planning_model()` generates the planning URDF

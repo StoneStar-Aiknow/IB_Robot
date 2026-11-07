@@ -407,15 +407,17 @@ def generate_embodied_nodes(
         clips = play_audio.get("clips", {})
         if not isinstance(clips, dict) or not clips:
             raise ValueError("embodied.runtime_play_audio.clips must map clip names to file paths")
+        resolved_clips = {}
         for clip_name, clip_path in clips.items():
             if not isinstance(clip_name, str) or not str(clip_name).strip():
                 raise ValueError("embodied.runtime_play_audio.clips keys must be clip names")
             if not isinstance(clip_path, str) or not clip_path.strip():
                 raise ValueError(f"embodied.runtime_play_audio clip {clip_name!r} must be a file path")
+            resolved_clips[clip_name] = str(Path(resolve_ros_path(clip_path)).expanduser())
         common_params.update(
             runtime_play_audio_enabled=True,
             runtime_play_audio_service=str(play_audio.get("service", "/voice_tts/play")),
-            runtime_play_audio_clips_json=json.dumps(clips),
+            runtime_play_audio_clips_json=json.dumps(resolved_clips),
             asr_control_topic=str(play_audio.get("asr_control_topic", "/voice_control")),
         )
     pose_composer = robot_config.get("pose_composer", {})

@@ -184,33 +184,79 @@ def update_fixed_catalog(library, catalog_root):
     path.write_text(yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False))
 
 
-def main():
+def configuration_inputs(config_path):
+    """Read the same robot and task-pose configuration used by both live launches."""
+    from aimdk_robot.mock_physics import CACHE, PINNED_COMMIT
+    from ament_index_python.packages import get_package_share_directory
+
+    from robot_config.fixed_poses import fixed_library_path
+    from robot_config.loader import _load_robot_section
+    from robot_config.task_poses import resolve_task_pose_file
+    from robot_runtime.launch_support import resolve_profile_argument
+
+    path, config = _load_robot_section(config_path)
+    if (config.get("runtime") or {}).get("provider") != "aimdk_robot":
+        raise ValueError("fixed X2 compilation requires runtime.provider: aimdk_robot")
+    if (config.get("pose_composer") or {}).get("mode") != "fixed":
+        raise ValueError("--robot-config requires pose_composer.mode: fixed")
+    resolve_task_pose_file(config, path)
+    policy = (config["pose_composer"].get("path_validation") or {}).get("hand", "online")
+    return {
+        "mjcf": CACHE / PINNED_COMMIT / "X2_URDF-v1.3.0" / "scene.xml",
+        "profile": resolve_profile_argument("aimdk_robot", config["runtime"]["profile"]),
+        "limits": config.get("arm_limits"),
+        "seeds": Path(get_package_share_directory("pose_composer")) / "seeds/x2_poses.yaml",
+        "task_poses": config.get("task_poses"),
+        "hand_path_check": "off" if policy == "off" else "online",
+        "output": fixed_library_path(config, path),
+    }
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mjcf", required=True)
-    parser.add_argument("--profile", required=True)
-    parser.add_argument("--seeds", required=True)
-    parser.add_argument("--limits", required=True, help="YAML mapping of all 14 arm limits")
+    parser.add_argument("--robot-config", help="canonical robot YAML; derives model, limits, task poses and output")
+    parser.add_argument("--mjcf")
+    parser.add_argument("--profile")
+    parser.add_argument("--seeds")
+    parser.add_argument("--limits", help="YAML mapping of all 14 arm limits")
     parser.add_argument("--task-poses", help="SSOT task-pose YAML; required for task_pose arm anchors")
     parser.add_argument("--catalog-root", help="optional candidate catalog copy whose free_pose enum is refreshed")
     parser.add_argument(
         "--hand-path-check",
         choices=("online", "off"),
-        default="online",
+        default=None,
         help="off checks the reference hand entry only; live policy still independently gates execution",
     )
     parser.add_argument("--pose", action="append", required=True)
-    parser.add_argument("--output", required=True)
-    args = parser.parse_args()
+    parser.add_argument("--output")
+    args = parser.parse_args(argv)
+    if args.robot_config:
+        if args.profile or args.limits or args.task_poses:
+            parser.error("--robot-config cannot be combined with --profile, --limits or --task-poses")
+        inputs = configuration_inputs(args.robot_config)
+    else:
+        if not all((args.mjcf, args.profile, args.seeds, args.limits, args.output)):
+            parser.error("provide --robot-config or all of --mjcf, --profile, --seeds, --limits and --output")
+        inputs = {
+            "profile": args.profile,
+            "limits": yaml.safe_load(Path(args.limits).read_text()),
+            "task_poses": yaml.safe_load(Path(args.task_poses).read_text()) if args.task_poses else None,
+            "hand_path_check": "online",
+        }
+    mjcf = args.mjcf or inputs["mjcf"]
+    seeds = args.seeds or inputs["seeds"]
+    output = Path(args.output or inputs["output"])
     data = compile_library(
-        args.mjcf,
-        args.profile,
-        yaml.safe_load(Path(args.limits).read_text()),
-        args.seeds,
+        mjcf,
+        inputs["profile"],
+        inputs["limits"],
+        seeds,
         args.pose,
-        task_poses=yaml.safe_load(Path(args.task_poses).read_text()) if args.task_poses else None,
-        hand_path_check=args.hand_path_check,
+        task_poses=inputs["task_poses"],
+        hand_path_check=args.hand_path_check or inputs["hand_path_check"],
     )
-    with Path(args.output).open("x") as stream:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("x") as stream:
         json.dump(data, stream, ensure_ascii=False, allow_nan=False)
     if args.catalog_root:
         update_fixed_catalog(data, args.catalog_root)

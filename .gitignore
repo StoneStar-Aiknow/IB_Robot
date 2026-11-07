@@ -8,6 +8,9 @@ logs
 venv
 tmp/
 
+# Offline X2 geometry/targets are deployment assets, not source model files.
+/commissioning/fixed_poses*.json
+
 # Vendor SDK reference trees (never vendored: see
 # src/robots/aimdk/aimdk_robot/README.md). AimDK is ~490 MB and its message
 # package currently carries no license declaration. Root-anchored: this must
