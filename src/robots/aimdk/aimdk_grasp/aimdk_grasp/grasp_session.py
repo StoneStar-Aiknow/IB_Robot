@@ -34,6 +34,21 @@ STRATEGIES = [
 ]
 
 
+def check_approach_order(value):
+    """An ordering of every existing approach distance, never a reduced search space."""
+    if value is None:
+        return None
+    if not isinstance(value, list | tuple) or any(
+        isinstance(distance, bool) or not isinstance(distance, int | float) for distance in value
+    ):
+        raise ValueError("approach_order_m must order [0.05, 0.07, 0.10, 0.15]")
+    order = tuple(float(distance) for distance in value)
+    expected = {abs(pair[0]) for pair in STRATEGIES}
+    if len(order) != len(expected) or set(order) != expected:
+        raise ValueError("approach_order_m must order [0.05, 0.07, 0.10, 0.15] once each")
+    return order
+
+
 def select_plan(
     planner,
     feedback,
@@ -51,6 +66,7 @@ def select_plan(
     priority=None,
     goalset_group=None,
     first_tier_longest_first=False,
+    approach_order_m=None,
     later=None,
     later_alone=True,
     mixed_retry=False,
@@ -72,19 +88,23 @@ def select_plan(
     """
     if deadline is not None and not np.isfinite(deadline):
         raise ValueError("Finite monotonic planning deadline required")
+    approach_order_m = check_approach_order(approach_order_m)
     if strategies is None:
         # Try the short complete motion first for response latency. Preserve the
         # entire original search space, but visit each approach distance before
         # repeating it with a different lift. A failed approach/contact cannot
         # benefit from changing only the last segment's offset.
         strategies = STRATEGIES
-        if getattr(planner, "planning_profile", "default") == "latency":
+        if approach_order_m is not None or getattr(planner, "planning_profile", "default") == "latency":
             by_approach = {}
             # After the short reach, try medium clearance before the longest
             # approach. Keep the remaining clearance and lift alternatives.
             medium = [pair for pair in STRATEGIES[:-1] if pair[0] == -0.10]
             other = [pair for pair in STRATEGIES[:-1] if pair[0] != -0.10]
-            for pair in [STRATEGIES[-1], *medium, *other]:
+            ordered = [STRATEGIES[-1], *medium, *other]
+            if approach_order_m is not None:
+                ordered = sorted(STRATEGIES, key=lambda pair: approach_order_m.index(abs(pair[0])))
+            for pair in ordered:
                 by_approach.setdefault(pair[0], []).append(pair)
             # A longer lift can make a reachable contact branch fail. Give each
             # approach its shortest existing lift before spending time on more.
@@ -131,6 +151,8 @@ def select_plan(
         raise ValueError("strategy_quota must be a positive integer")
     report["strategy_quota"] = strategy_quota
     report["strategies"] = strategies.tolist()
+    if approach_order_m is not None:
+        report["approach_order_m"] = list(approach_order_m)
     # Exhaust every strategy on one priority tier before the next: within one
     # strategy a lower tier used to succeed before the preferred tier reached
     # the approach distance it needed (plan6: side grasps all failed at 5 cm and
@@ -157,9 +179,11 @@ def select_plan(
 
     for number, tier in enumerate(tiers):
         order = list(strategies)
-        if number == 0 and first_tier_longest_first:
+        if number == 0 and first_tier_longest_first and approach_order_m is None:
             # Stable: longest approach first, the original order within one distance.
             order.sort(key=lambda pair: -abs(pair[0]))
+            report["first_tier_strategies"] = np.asarray(order).tolist()
+        elif number == 0 and approach_order_m is not None:
             report["first_tier_strategies"] = np.asarray(order).tolist()
         queues = [(approach, lift, list(tier)) for approach, lift in order]
         # A second, exhaustive pass preserves the original search space. Retain each
@@ -227,6 +251,8 @@ def select_plan(
                         row["requested_approach_m"] = approach
                         row["approach_m"] = actual_offset
                     row["wall_s"] = time.perf_counter() - start
+                    if hasattr(planner, "approach_seed_traces"):
+                        row["approach_seeds"] = [dict(trace) for trace in planner.approach_seed_traces]
                     # Not once its approach was published: the arm may be moving on it.
                     if wants_lift and row["lift_method"] == "hold" and not row.get("approach_ready"):
                         if fallback is None:
@@ -258,6 +284,8 @@ def select_plan(
                     else:
                         raise RuntimeError("Planner returned an invalid failed goalset index") from exc
                 finally:
+                    if hasattr(planner, "approach_seed_traces"):
+                        row["approach_seeds"] = [dict(trace) for trace in planner.approach_seed_traces]
                     row["wall_s"] = time.perf_counter() - start
                     print(json.dumps(row), flush=True)
                     # Not over an error on its way out: a deadline or cancel raised

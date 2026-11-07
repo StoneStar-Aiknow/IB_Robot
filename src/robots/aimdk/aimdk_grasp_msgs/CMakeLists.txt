@@ -9,6 +9,7 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(ibrobot_msgs REQUIRED)
 
 # The X2 grasp pipeline and its grasp head on another host (aimdk_grasp): an
 # internal protocol of the X2's two-host deployment, not a robot-agnostic contract.
@@ -21,7 +22,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/RefineGraspPlan.srv"
   "srv/WatchGraspTarget.srv"
   "action/PlanGraspCandidates.action"
-  DEPENDENCIES action_msgs builtin_interfaces sensor_msgs
+  "action/PlanPlace.action"
+  DEPENDENCIES action_msgs builtin_interfaces sensor_msgs ibrobot_msgs
 )
 
 ament_export_dependencies(rosidl_default_runtime)

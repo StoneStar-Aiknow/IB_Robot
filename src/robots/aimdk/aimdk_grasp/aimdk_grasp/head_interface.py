@@ -53,6 +53,7 @@ class HeadEndpoints:
     refine: str
     watch: str
     status: str
+    plan_place: str
 
 
 def head_endpoints(namespace: str = DEFAULT_NAMESPACE) -> HeadEndpoints:
@@ -64,4 +65,5 @@ def head_endpoints(namespace: str = DEFAULT_NAMESPACE) -> HeadEndpoints:
         refine=f"{root}/refine",
         watch=f"{root}/watch",
         status=f"{root}/watch_status",
+        plan_place=f"{root}/plan_place",
     )

@@ -8,3 +8,4 @@ GraspPlanStep[] release
 int32 candidate_index
 # The planner's report (JSON object).
 string report_json
+GraspPlanStep[] carry_steps

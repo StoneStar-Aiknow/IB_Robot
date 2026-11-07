@@ -63,6 +63,18 @@ def test_unicast_discovery_covers_indices_through_32_without_replacing_transport
         assert fast.find(f".//{{*}}{tag}") is None
 
 
+@pytest.mark.parametrize("mode", ["local_only", "lan_multicast", "static_peers"])
+def test_fastdds_sizes_builtin_udp_socket_buffers_without_replacing_transports(mode):
+    network = config(mode=mode)["network"]
+    binding = {"interface": "eth0", "address": "192.0.2.10"}
+    rtps = ET.fromstring(fastdds.render(network, binding)).find("{*}participant/{*}rtps")
+    expected = str(2 * 1024 * 1024)
+    assert rtps.findtext("{*}sendSocketBufferSize") == expected
+    assert rtps.findtext("{*}listenSocketBufferSize") == expected
+    for tag in ("userTransports", "useBuiltinTransports", "defaultUnicastLocatorList"):
+        assert rtps.find(f".//{{*}}{tag}") is None
+
+
 def test_multicast_keeps_vendor_discovery_and_transport_defaults():
     network = config(mode="lan_multicast")["network"]
     binding = {"interface": "eth0", "address": "192.0.2.10"}

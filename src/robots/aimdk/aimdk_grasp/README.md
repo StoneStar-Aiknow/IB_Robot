@@ -10,6 +10,49 @@ message libraries.
 
 The migration is incremental; this README records what has landed.
 
+## Rejected placement paths and recovery evidence
+
+When `plan_pose` rejects an interpolated candidate, its exception includes the
+existing fine-check violations and an archive path. Archives default to
+`~/.ros/x2_path_failures/`; set `IBROBOT_X2_PATH_FAILURES_DIR` on the planning
+process to choose another directory. Recording is synchronous and adds time to
+a failed request. Copy or remove old archives between experiments as needed.
+Failure to write an archive is logged and the candidate remains rejected.
+
+Each archive contains the timed joint path, measured and adjusted planning
+starts, target palm transform, active palm-frame attachment, both scene
+resolutions, both robot configurations, model asset bytes and hashes, package
+versions, IK seed, optimized positions when available, and the fine checker's
+per-sample results. The built robot configuration retains the actual cached
+`default_joint_position`. The summary gives the first invalid sample and the
+first and worst samples per constraint, including joint values and model
+bounds, world sphere positions, and self-collision link pairs from the checker's
+pair mask and padding. Costs, radians and metres are reported separately.
+
+From the workspace root, inspect a trusted local archive without CUDA or ROS I/O:
+
+```bash
+source .shrc_local && python3 -m aimdk_grasp.path_diagnostics /path/to/pose_failure_123.pkl
+```
+
+Add `--recheck` to rerun the fine checker on the archived trajectory on a CUDA
+host. Use the recorded cuRobo/Torch versions for numerical comparisons. The
+checker uses the saved model assets, fine scene and active attachment; it does
+not run another search or command the robot. Archives use pickle and must come
+from a trusted recording. A rejected candidate or three unsuccessful searches
+do not establish that placement is infeasible.
+
+The pick executor logs `held custody recovery:` with the full take-back or
+drop-home result, custody ID, monotonic start/end times, failed phases, executor
+report and any exception type/traceback. Streaming failures include the last
+sent full-channel command and send time, the feedback and controller echo used
+by the checks with their receive times, thresholds, tracking/locked-joint peaks
+and control-loop gap. These samples are retained before executor cleanup; an
+echo can precede the failing check, as its receive time shows. No tolerance or
+collision geometry is changed by recording. Model bounds in the path archive,
+controller limits in the stream report and the final compensated command must
+be evaluated separately.
+
 To deploy the X2 `pick_object` skill and call it, see
 [the X2 grasp skill guide](../../../../docs/aimdk_x2_grasp_skill.md).
 
@@ -102,6 +145,62 @@ from the same `installed_hands` declaration. The task-pose source retains both
 arms and its hardware approvals; no per-mounting pose file or catalog is needed.
 Its fixed artifact must be compiled again after mounting or pose settings change.
 See the [shared configuration and launch guide](../../../../docs/x2_voice_mirror_grasp_config_zh.md).
+
+### Mirror perception during pick and place
+
+The combined `aimdk_x2_voice_mirror_grasp` profile enables
+`motion_imitation_stream.pause_during_manipulation`. For a workflow containing
+`return_to_task_pose`, a pick or a place, the Gateway waits for
+`/motion_imitation_stream/set_paused` to acknowledge a unique root pause owner
+before its first child can move. This covers the complete
+`return_to_task_pose -> pick_object -> place_in_container` workflow, including
+the pick's entry-pose preparation and gaps between steps. Pick/place delegations
+also retain their own pause owners. The stream removes its compressed-image
+subscription, empties its decode/YOLOX/PEAR queues and retires cached detections
+and in-flight results. It submits no new model requests while paused. Requests
+already running on a model server may finish, but their results are discarded.
+
+This releases the mirror reader of
+`/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed`; it does not stop
+the platform camera publisher or the grasp head's RGB-D capture and execution
+watch. Stop the motion-imitation session before manipulating, as required by
+the shared arm control mode. Pausing its perception does not arbitrate motions.
+
+A definite child terminal releases only that delegation's pause owner; the root
+owner keeps perception paused until the whole workflow is finalized. Definite
+root success, failure or completed cancellation releases the root owner. An
+abandoned typed workflow is released on budget expiry only after child cleanup
+is confirmed. A timed-out goal response or unconfirmed stop keeps it paused;
+late confirmed cleanup can finalize a Program and release its root owner.
+Uncertain object custody alone does not extend the pause after motion ends.
+On resume the stream creates a fresh subscription and waits for new
+frames and person detections. The status topic reports `paused` and
+`pause_owners`. Other profiles retain their previous behavior unless they opt in.
+
+### Recovering uncertain object custody
+
+`uncertain` describes object custody, not a running Gateway execution. Once
+motion has ended, the Gateway releases its execution lease and resumes mirror
+perception even if custody remains uncertain. New motion that requires custody
+recovery reports `HELD_OBJECT_RECOVERY_REQUIRED`, rather than `SKILL_BUSY`.
+The operator recovery endpoint remains available while the Gateway is idle.
+
+After an operator has checked that the hand is empty, use `robot-skill` with the
+same robot configuration to:
+
+1. Run `held-status` to obtain the current custody ID and failure reason.
+2. Run `authorize-held-reset --request-id operator-check-001 --custody-id CURRENT_CUSTODY_ID
+   --operator-confirmed-empty --note "Operator checked the empty hand"` with that ID.
+3. Run `execute return_to_task_pose --task-id operator-reset-001 --target-name grasp_ready`.
+4. Run `held-status` again after fresh feedback has confirmed an open hand at
+   the original home pose for one second. Custody then becomes `released` with
+   reason `MANUAL_RESET_COMPLETE`.
+
+Authorization lasts 60 seconds and is bound to the current custody ID. It
+permits the recovery skill; authorization itself issues no motion and does not
+clear custody. An expired authorization needs a new operator check. Active
+motion or an unconfirmed stop still blocks this authorization, because an
+object check cannot certify that the controller has stopped.
 
 ## Planning model
 
@@ -220,15 +319,32 @@ turns them into `R_palm` goals, so the planner never assumes which hand the gras
 model was trained for. A plan is three timed segments (`trajectory.TimedTrajectory`):
 an approach found by a batched contact screen and a goalset solve (its TrajOpt seed
 lifts the hand up and out from where it hangs, then comes down into the approach pose
-from 18 cm above, so the hand does not sweep through a low target on its way up), a
+from a configurable height above it), a
 straight grasp line along the palm axis, and a vertical lift that leaves the carried target out of
 its fine check (or a hold when the line cannot be planned). `warmup()` compiles and
 captures every kernel and graph before the first request. A CUDA or Warp failure
 raises `PlannerFault`, never a candidate failure, so the owner rebuilds the planner.
 
-The planner is migrated from the standalone pipeline with its tuned constants
-unchanged; the offline replay limits and the CPU sphere kinematics it carried for
-analysis tools are not.
+`backend_options.planning.approach_over_height_m` sets that seed waypoint height
+along normalized `lift_up`, relative to the candidate approach pose, with unchanged
+palm orientation. The default and both X2 robot profiles use `0.18` (18 cm); set
+`0.12` to compare the 12 cm seed. This is distinct from the approach
+standoff along the grasp axis. It is an optimizer hint, not a commanded waypoint
+or an obstacle-clearance guarantee. TrajOpt and the full fine checks still decide
+whether the path is executable. `graph_seed_trace` records the requested and
+constructed seed and height; failed raised-pose IK falls back to the escape seed,
+and failed escape IK to native straight seeds, with a reason recorded in each case.
+
+The X2 profiles also set `planning.approach_order_m: [0.10, 0.15, 0.07, 0.05]`:
+try the 10 cm grasp-axis approach first, including side grasps, then the remaining
+distances. Each distance gets its shortest existing lift first; all original
+approach/lift pairs and deferred candidates remain available within the request
+deadline. The setting must contain every existing distance exactly once. Omitting
+it retains the historical profile ordering and the longest-first side-grasp tier.
+
+The planner was migrated from the standalone pipeline. Seed height and approach
+ordering are now explicit request settings; collision and joint checks remain
+independent of those search hints.
 
 `aimdk_grasp.planner_service.GraspPlanningService` owns one warmed planner across
 requests: it rebuilds it only when the locked joints change or after a `PlannerFault`,
@@ -258,8 +374,9 @@ runtime's `joint.arm_stream`, starting from and checked against the MC command
 the runtime reports on `joint.arm_command_state`. The X2 settings: tracking 0.3
 rad and arrival 0.2 rad, MC's 40 / 2 gains required, commands 5 mrad inside the
 robot configuration's MC arm limits, the right arm and head locked, and each
-retreat ending with MC's command at a fixed home (`HOME_COMMAND`), so landings do
-not ratchet.
+retreat ending with MC's command back at the one the goal took over (the task
+start, whatever moved the arm there; not the global `HOME_COMMAND`), so landings
+do not ratchet.
 
 At kp 40 the arm settles below its command by gravity torque / kp.
 `aimdk_grasp.arm_gravity.GravityShaper` raises each waypoint by the predicted sag
@@ -330,10 +447,30 @@ The `PickObject` result keeps `error_code` and puts an account for the Agent in
 object are, each retry with its reason, what to do next and the last detail.
 `pipeline_timings_json` carries the retries as `retries`.
 
+Placement uses `placement_execution.pipeline.max_attempts` (default 2 total
+observations) and `execute_reserve_s` (default 15 s). A search that exhausts its
+placement candidates, a planning timeout, or a changed observation can request
+a fresh capture and container estimate. Before retrying, the pipeline checks
+that grip is still confirmed, the measured holding arm is within 0.02 rad of
+the retained handover pose, cancellation is absent, and the remaining planning
+budget can repeat the last preparation while preserving the execution reserve.
+GPU/planner faults, invalid models, an uncertain/lost grip, or a moved holding
+arm do not trigger a planning retry. A planning failure sends no opening command;
+the existing custody recovery policy remains responsible for a retained object.
+
+Pick reports retain `first_execution_failure`, `execution_failures`, and each
+attempt's execution outcome independently of the final `error_code`. The same
+failure summaries and retry history appear in the terminal log. Thus a regrasp
+that later finds no path cannot erase the preceding `GRIP_LOST`. Placement keeps
+`first_failure`, `first_execution_failure`, `failures`, and retry decisions in
+its report. A failed partial rollback, later home plan, or cleanup cannot erase
+the triggering execution failure. Final cancellation,
+unknown-stop, and custody states retain their own meaning.
+
 | `error_code` | Arm and object | Next step for the Agent |
 |---|---|---|
 | `TARGET_NOT_VISIBLE` | not moved | check the name or ask for the object to be put in view |
-| `NO_EXECUTABLE_CANDIDATE` | not moved | ask for the object to be moved closer or turned |
+| `NO_EXECUTABLE_CANDIDATE` | no path in the final observation; earlier execution may have occurred, see `first_execution_failure` | check the earlier failure and current custody before another request |
 | `OBSERVATION_UNAVAILABLE`, `REOBSERVE_REQUIRED` | not moved | wait, keep things still, try again |
 | `TARGET_MOVED` | home, hand open | keep the object still, try again |
 | `GRASP_VERIFICATION_FAILED` | home, hand open; the object may have moved or fallen | look again before retrying |

@@ -86,13 +86,14 @@ HAND_OFFSETS = {"left": 0, "right": len(HAND_PARTS)}
 
 class HandIO(Protocol):
     channel_joints: tuple[str, ...]
+    touch_configured: bool
 
     def feedback(self) -> JointSample:
         """Native positions under the stream's ``channel_joints`` names."""
         ...
 
     def touch(self) -> Mapping[str, float] | None:
-        """Max reading per touch pad of the grasping hand (FINGERS pad names), or None without a touch sensor."""
+        """Max per grasping-hand pad (FINGERS names), or None without a sensor or fresh data."""
         ...
 
     def publish(self, positions: Sequence[float]) -> None: ...
@@ -144,6 +145,54 @@ class OmniHandEffector:
         self._grip = None
         self._preserved_hand = None
 
+    def suspend(self) -> None:
+        """Stop keepalives for handover while retaining the grip observation."""
+        self.io.release()
+
+    def snapshot(self) -> str:
+        import json
+
+        if self._grip is None or self.command is None:
+            raise ValueError("no verified grip to hand over")
+        return json.dumps(
+            {
+                "contacts": list(self._grip["contacts"]),
+                "command": self._grip["command"].tolist(),
+                "direction": self._grip["direction"].tolist(),
+            }
+        )
+
+    def restore(self, state: str) -> None:
+        import json
+
+        grip = json.loads(state)
+        command = np.asarray(grip["command"], dtype=float)
+        direction = np.asarray(grip["direction"], dtype=float)
+        contacts = tuple(grip["contacts"])
+        if (
+            command.shape != (10,)
+            or direction.shape != (10,)
+            or not np.isfinite([command, direction]).all()
+            or "thumb" not in contacts
+            or len(contacts) < 2
+            or any(name not in FINGERS for name in contacts)
+        ):
+            raise ValueError("invalid frozen grip state")
+        self.mapping.check(command)
+        self._measured()  # Require healthy, fresh feedback before publishing.
+        self._grip = dict(contacts=contacts, command=command.copy(), direction=direction.copy())
+        self._lost_since = None
+        self._send(command)
+
+    def released(self) -> bool:
+        """Fresh open-hand feedback and no tactile contact are required."""
+        touch = self.io.touch()
+        return bool(
+            np.max(np.abs(self._measured() - self.mapping.preset("open"))) <= OPEN_HAND_TOLERANCE_RAD
+            and touch is not None
+            and all(value < CONTACT_TOUCH for value in touch.values())
+        )
+
     def holding(self) -> str | None:
         """While an object is carried: '' while the grip holds, the reason once it is lost, None if unknown.
 
@@ -157,6 +206,7 @@ class OmniHandEffector:
         try:
             measured = self._measured()
         except _Failed:
+            self._lost_since = None
             return None  # the arm's supervision reports stale feedback
         touch = self.io.touch()
         lags, pressing = {}, []
@@ -166,8 +216,16 @@ class OmniHandEffector:
             if lags[finger] >= HOLD_LAG_RAD or (touch is not None and touch.get(pad, 0.0) >= CONTACT_TOUCH):
                 pressing.append(finger)
         if "thumb" in pressing and len(pressing) >= 2:
+            self.report.setdefault("holding", []).append(dict(at=self.io.monotonic(), lags=lags, pressing=pressing))
+            if len(self.report["holding"]) > 3000:
+                del self.report["holding"][:1000]
             self._lost_since = None
             return ""
+        if touch is None and self.io.touch_configured:
+            # An unavailable sensor is not a fresh no-contact reading. Joint
+            # lag may still prove a grip above, but cannot disprove its touch.
+            self._lost_since = None
+            return None
         now = self.io.monotonic()
         self._lost_since = now if self._lost_since is None else self._lost_since
         if now - self._lost_since < GRIP_LOST_S:
@@ -385,6 +443,7 @@ class RosHandIO:
         self._touch_received = float("-inf")
         self._touch_subscriptions = OnDemandSubscriptions(node.context, f"{node.get_name()}_touch")
         touch = interfaces.get("touch.hands")
+        self.touch_configured = touch is not None
         if touch is not None:
             self._touch_subscriptions.subscribe(
                 Float64MultiArray,

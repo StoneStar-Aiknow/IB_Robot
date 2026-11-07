@@ -53,6 +53,7 @@ class SimHand:
         self.blocks: dict[int, float] = {}  # joint index -> furthest native position reachable
         self.touching: set[str] = set()  # pads pressed against the object
         self.touch_sensor = touch_sensor
+        self.touch_configured = touch_sensor
         self.published, self.released, self.refused, self.stale = [], 0, None, False
         self.freeze_feedback_after_publish: int | None = None
         self.feedback_frozen = False
@@ -192,6 +193,64 @@ def test_a_grip_whose_fingers_close_onto_their_command_has_lost_the_object(mappi
     assert act(effector, EffectorAction.RELEASE).succeeded and effector.holding() is None
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_missing_touch_after_handover_is_unknown_until_fresh_contact_returns(mapping, right_mapping, side):
+    active = mapping if side == "left" else right_mapping
+    hand = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
+    pick = OmniHandEffector(hand, active)
+    for finger in ("thumb", "index"):
+        flex = FINGERS[finger][1]
+        hand.block(
+            finger, active.preset("open")[flex] + 0.4 * (active.preset("close")[flex] - active.preset("open")[flex])
+        )
+    assert act(pick, EffectorAction.CLOSE).held is True
+    state = pick.snapshot()
+    pick.suspend()
+    hand.blocks.clear()
+    hand.wait(0.1)
+    # Like the vendor mock, fresh touch alone certifies this frozen grip.
+    hand.touch = lambda: {"thumb": 100.0, "index_finger": 100.0}
+    place = OmniHandEffector(hand, active)
+    place.restore(state)
+    assert place.holding() == ""
+    sent = len(hand.full_published)
+
+    hand.touch = lambda: None
+    assert place.holding() is None
+    hand.wait(1.0)
+    assert place.holding() is None
+    hand.touch = lambda: {"thumb": 100.0, "index_finger": 100.0}
+    assert place.holding() == ""
+    assert len(hand.full_published) == sent
+
+    hand.touch = lambda: {"thumb": 0.0, "index_finger": 0.0}
+    assert place.holding() == ""
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert "no longer press" in place.holding()
+
+
+def test_unknown_joint_feedback_interrupts_the_grip_loss_debounce(mapping):
+    hand = SimHand(mapping.preset("open"))
+    effector = OmniHandEffector(hand, mapping)
+    for finger in ("thumb", "middle"):
+        flex = FINGERS[finger][1]
+        hand.block(
+            finger, mapping.preset("open")[flex] + 0.4 * (mapping.preset("close")[flex] - mapping.preset("open")[flex])
+        )
+    assert act(effector, EffectorAction.CLOSE).held is True
+    hand.blocks.clear()
+    hand.touching.clear()
+    hand.wait(0.1)
+    assert effector.holding() == ""
+    hand.stale = True
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert effector.holding() is None
+    hand.stale = False
+    assert effector.holding() == ""
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert "no longer press" in effector.holding()
+
+
 def test_a_close_that_touches_nothing_holds_nothing(mapping):
     hand = SimHand(mapping.preset("open"))
     outcome = act(OmniHandEffector(hand, mapping), EffectorAction.CLOSE)
@@ -199,15 +258,19 @@ def test_a_close_that_touches_nothing_holds_nothing(mapping):
     np.testing.assert_allclose(hand.command, mapping.preset("close"))
 
 
-def test_without_touch_a_finger_held_back_is_contact(mapping):
+@pytest.mark.parametrize("touch_configured", [True, False])
+def test_without_touch_a_finger_held_back_is_contact(mapping, touch_configured):
     hand = SimHand(mapping.preset("open"), touch_sensor=False)
+    hand.touch_configured = touch_configured
     close, open_hand = mapping.preset("close"), mapping.preset("open")
     for finger in ("thumb", "middle"):
         flex = FINGERS[finger][1]
         hand.block(finger, open_hand[flex] + 0.3 * (close[flex] - open_hand[flex]), touch=False)
-    outcome = act(OmniHandEffector(hand, mapping), EffectorAction.CLOSE)
+    effector = OmniHandEffector(hand, mapping)
+    outcome = act(effector, EffectorAction.CLOSE)
     assert outcome.held is True
     assert all(row["by"] == "lag" and row["lag_rad"] >= CONTACT_LAG_RAD for row in outcome.report["contacts"].values())
+    assert effector.holding() == ""
 
 
 def test_a_halt_during_the_close_holds_the_fingers_where_they_are(mapping):

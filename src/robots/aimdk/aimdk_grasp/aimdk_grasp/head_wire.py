@@ -100,6 +100,7 @@ def plan_to_msg(plan: GraspPlan):
         release=[step_to_msg(step) for step in plan.release or ()],
         candidate_index=int(plan.candidate_index),
         report_json=to_json(plan.report),
+        carry_steps=[step_to_msg(step) for step in plan.carry_steps or ()],
     )
 
 
@@ -109,6 +110,42 @@ def plan_from_msg(message) -> GraspPlan:
         int(message.candidate_index),
         tuple(step_from_msg(step) for step in message.release) if message.has_release else None,
         from_json(message.report_json),
+        tuple(step_from_msg(step) for step in message.carry_steps) or None,
+    )
+
+
+def container_to_json(container):
+    return to_json(
+        {
+            "opening": container.opening,
+            "normal": container.normal,
+            "rim_height_m": container.rim_height_m,
+            "report": dict(container.report),
+        }
+    )
+
+
+def container_from_json(text):
+    from manipulation_execution.grasp_pipeline.contracts import ContainerEstimate
+
+    return ContainerEstimate(**from_json(text))
+
+
+def place_to_result(plan, result):
+    for name in ("transfer", "release", "retreat"):
+        setattr(result, name, [step_to_msg(step) for step in getattr(plan, name)])
+    result.container_json, result.report_json = container_to_json(plan.container), to_json(plan.report)
+    result.success = True
+    return result
+
+
+def place_from_result(result):
+    from manipulation_execution.grasp_pipeline.contracts import PlacePlan
+
+    return PlacePlan(
+        *(tuple(step_from_msg(step) for step in getattr(result, name)) for name in ("transfer", "release", "retreat")),
+        container_from_json(result.container_json),
+        from_json(result.report_json),
     )
 
 

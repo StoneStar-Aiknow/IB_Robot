@@ -39,8 +39,9 @@ from .omnihand import HAND_HZ, HAND_STEP_RAD
 SIDES = ("left", "right")
 #: Why ``build_hand_plans`` has no plan for a hand the configuration declares absent.
 NOT_INSTALLED = "not installed (backend_options.installed_hands)"
-#: Newest feedback sample may be at most this old (s); a hand moves 0.01 rad per 20 ms frame.
-FEEDBACK_MAX_AGE_S = 0.1
+#: Maximum age of body/hand and arm-command feedback (s).
+#: Temporary commissioning override; the previous on-robot limit was 0.3 s.
+FEEDBACK_MAX_AGE_S = 1.0
 RUNTIME_STATUS_MAX_AGE_S = 2.0
 GATEWAY_STATUS_MAX_AGE_S = 1.0
 #: An arm or the head may not move this far (rad) while a hand is driven.

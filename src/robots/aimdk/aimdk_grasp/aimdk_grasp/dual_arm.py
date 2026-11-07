@@ -192,6 +192,17 @@ class ArmServices:
         for side, estimate in scenes.estimates.items():
             self.services[side].preload(feedback, estimate)
 
+    def needs_rebuild(self, feedback):
+        """True if either arm's planner would rebuild; None if one is busy and none is known to."""
+        answers = [service.needs_rebuild(feedback) for service in self.services.values()]
+        return True if True in answers else (None if None in answers else False)
+
+    def refresh(self, feedback, scenes):
+        rebuilt = False
+        for side, estimate in scenes.estimates.items():
+            rebuilt = self.services[side].refresh(feedback, estimate) or rebuilt
+        return rebuilt
+
 
 class AutomaticHead:
     """Two per-arm heads sharing their camera, IMU and reentrant GPU lock."""

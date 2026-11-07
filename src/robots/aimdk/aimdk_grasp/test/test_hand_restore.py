@@ -12,6 +12,7 @@ import pytest
 from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.hand_restore import (
+    FEEDBACK_MAX_AGE_S,
     VENDOR_STIFFNESS,
     CommandBoard,
     GatewayState,
@@ -157,7 +158,7 @@ def test_long_arm_check_refreshes_owner_and_detects_live_changes_before_dispatch
                 if fault == "owner":
                     ports.gateway = replace(ports.gateway, active_task_id="other")
                 elif fault == "stale":
-                    ports.frozen_at = ports.now - 0.2
+                    ports.frozen_at = ports.now - (FEEDBACK_MAX_AGE_S + 0.1)
                 elif fault == "head":
                     ports.body[HEAD[0]] += 0.02
             guard()
@@ -264,7 +265,7 @@ def test_preflight_refuses_before_output(restore, fault, code):
     elif fault == "nan_age":
         ports.gateway = replace(ports.gateway, age_s=float("nan"))
     elif fault == "stale":
-        ports.frozen_at = ports.now - 1
+        ports.frozen_at = ports.now - (FEEDBACK_MAX_AGE_S + 0.1)
     elif fault == "stop":
         ports.runtime = replace(ports.runtime, ok=False)
     elif fault == "mode":
@@ -313,7 +314,7 @@ def test_mid_open_failure_always_releases_and_never_opens_right(restore, fault, 
         elif fault == "timeout":
             ctx.deadline = ports.now
         elif fault == "stale":
-            ports.frozen_at = ports.now - 1
+            ports.frozen_at = ports.now - (FEEDBACK_MAX_AGE_S + 0.1)
         elif fault == "owner":
             ports.gateway = replace(ports.gateway, active_task_id="another")
         elif fault == "mode":
@@ -439,3 +440,41 @@ def test_arm_guard_allows_finger_drift_within_covered_bound_and_reports_excess(r
     ports.hands[side][4] -= 0.002
     with pytest.raises(RestoreError, match="phase=trajectory_sent.*joint_index=4.*delta=0.101000.*limit=0.100000"):
         restorer.guard_arm_motion(ctx, initial, "trajectory_sent")
+
+
+@pytest.mark.parametrize("field", ["feedback", "command"])
+@pytest.mark.parametrize("age_s", [0.300888, 0.999999, 1.0, 1.000001, -0.001, float("nan"), float("inf")])
+def test_temporary_one_second_feedback_age_guard(restore, field, age_s):
+    restorer, ports, ctx, _ = restore
+    original_observe = ports.observe
+
+    def observe():
+        observation = original_observe()
+        if field == "feedback":
+            return replace(observation, feedback_age_s=age_s)
+        return replace(observation, command=replace(observation.command, age_s=age_s))
+
+    ports.observe = observe
+    if 0 <= age_s <= 1.0:
+        observation = restorer._observe(ctx)
+        assert (observation.feedback_age_s if field == "feedback" else observation.command.age_s) == age_s
+    else:
+        with pytest.raises(RestoreError) as error:
+            restorer._observe(ctx)
+        assert error.value.code == "HAND_FEEDBACK_STALE"
+    assert not ports.sent
+
+
+def test_temporary_age_override_still_rejects_unhealthy_feedback(restore):
+    restorer, ports, ctx, _ = restore
+    original_observe = ports.observe
+
+    def observe():
+        observation = original_observe()
+        return replace(observation, feedback=replace(observation.feedback, healthy=False), feedback_age_s=0.300888)
+
+    ports.observe = observe
+    with pytest.raises(RestoreError) as error:
+        restorer._observe(ctx)
+    assert error.value.code == "HAND_FEEDBACK_STALE"
+    assert not ports.sent

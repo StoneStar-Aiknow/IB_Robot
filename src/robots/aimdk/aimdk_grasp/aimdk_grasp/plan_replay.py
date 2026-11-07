@@ -68,11 +68,15 @@ def x2_service(config_name: str):
         gripper=robot.gripper,
         planning_profile=planning.planning_profile,
         approach_seed_policy=planning.approach_seed_policy,
+        approach_over_height_m=planning.approach_over_height_m,
+        approach_order_m=planning.approach_order_m,
         max_goalset=planning.max_goalset,
     )
     return service, dict(
         planning_profile=planning.planning_profile,
         approach_seed_policy=planning.approach_seed_policy,
+        approach_over_height_m=planning.approach_over_height_m,
+        approach_order_m=planning.approach_order_m,
         max_goalset=planning.max_goalset,
     )
 

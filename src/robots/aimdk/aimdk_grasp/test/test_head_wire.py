@@ -1,5 +1,7 @@
 """The X2 grasp pipeline's data survives the trip to the grasp head and back."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -11,11 +13,13 @@ from aimdk_grasp import head_wire as wire  # noqa: E402
 
 from manipulation_execution.grasp_pipeline.contracts import (  # noqa: E402
     ArmSegment,
+    ContainerEstimate,
     Effect,
     EffectorAction,
     GraspPlan,
     Hold,
     Move,
+    PlacePlan,
     SegmentKind,
 )
 
@@ -63,6 +67,27 @@ def test_a_step_whose_positions_do_not_fill_rows_is_refused():
     message.positions = message.positions[:-1]
     with pytest.raises(wire.WireError, match="whole rows"):
         wire.step_from_msg(message)
+
+
+def test_carry_and_place_paths_survive_the_generated_wire_types():
+    from aimdk_grasp_msgs.action import PlanPlace
+
+    source = _plan(None)
+    carry = replace(source, carry_steps=source.steps)
+    received = wire.plan_from_msg(wire.plan_to_msg(carry))
+    assert len(received.carry_steps) == len(carry.carry_steps)
+    np.testing.assert_array_equal(received.carry_steps[1].segment.positions, carry.carry_steps[1].segment.positions)
+
+    container = ContainerEstimate([[0, 0, 0.1], [0.5, 0, 0.1], [0, 0.5, 0.1]], [0, 0, 1], 0.1)
+    plan = PlacePlan(
+        (source.steps[1],), (Effect(EffectorAction.RELEASE),), (Move(source.steps[1].segment.reversed()),), container
+    )
+    result = wire.place_to_result(plan, PlanPlace.Result())
+    restored = wire.place_from_result(result)
+    assert result.success and restored.release[0].action is EffectorAction.RELEASE
+    np.testing.assert_array_equal(restored.transfer[0].segment.positions, plan.transfer[0].segment.positions)
+    np.testing.assert_array_equal(restored.retreat[0].segment.positions, plan.retreat[0].segment.positions)
+    np.testing.assert_array_equal(restored.container.opening, plan.container.opening)
 
 
 def test_depth_comes_back_to_the_millimetre_with_its_holes():

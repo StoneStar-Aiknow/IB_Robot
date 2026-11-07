@@ -22,6 +22,7 @@ import threading
 import time
 from contextlib import nullcontext
 
+import numpy as np
 import rclpy
 from aimdk_grasp.fixed_pose_backend import START_TOLERANCE_RAD
 from builtin_interfaces.msg import Duration
@@ -45,6 +46,7 @@ from pose_composer.memory import PoseMemory
 
 POINT_RATE_HZ = 25.0
 FIXED_START_TOLERANCE_RAD = START_TOLERANCE_RAD
+
 _trace = create_trace_logger("ib_trace.pose_composer")
 
 
@@ -122,8 +124,22 @@ class PoseComposerNode(Node):
             simulation=param("task_pose_simulation"),
             backend=backend_for(self),
         )
-        self._joint_received = {}
+        # On hardware, task poses are always sent raised by the predicted gravity
+        # sag, so the measured arms land on the configured target. A simulated
+        # arm follows its command exactly and gets none. Free poses keep their
+        # compiled commands unchanged.
+        self._task_pose_commands = None
         self._hand_config = json.loads(param("hand_restore_json") or "{}")
+        if not param("task_pose_simulation"):
+            from aimdk_grasp.sag_compensation import SagCompensation, deployed_hands
+
+            self._task_pose_commands = SagCompensation(
+                backend_for(self).model.ARM_JOINTS,
+                json.loads(param("arm_limits_json") or "null"),
+                installed_hands=deployed_hands(self._hand_config.get("grasp_execution")),
+            )
+            self.get_logger().info(f"task pose sag compensation: {self._task_pose_commands.describe()}")
+        self._joint_received = {}
         self._hand_restorer_cache = None
         self._hand_lock = threading.Lock()
         self._trajectory_modes = set(json.loads(param("trajectory_modes_json")))
@@ -469,12 +485,14 @@ class PoseComposerNode(Node):
                     dict(self._joint_received),
                 )
 
+        commands = getattr(self, "_task_pose_commands", None)
+        shaping = {} if commands is None else {"commands": commands}
         try:
             skipped = self._task_pose_runner.execute(
                 name,
                 digest,
                 read_state=read_state,
-                move=lambda plan, deadline: self._run_trajectory(goal_handle, plan, deadline=deadline),
+                move=lambda plan, deadline: self._run_trajectory(goal_handle, plan, deadline=deadline, **shaping),
                 cancelled=lambda: goal_handle.is_cancel_requested,
                 timeout_sec=request.timeout_sec,
                 motion_limits=self._motion_limits,
@@ -579,7 +597,7 @@ class PoseComposerNode(Node):
             raise ComposeError("POSE_RUNTIME_UNAVAILABLE", "runtime is not active or has a latched stop")
         return str(status.active_mode)
 
-    def _run_trajectory(self, goal_handle, plan, *, deadline=None) -> tuple[bool, str, str]:
+    def _run_trajectory(self, goal_handle, plan, *, deadline=None, commands=None) -> tuple[bool, str, str]:
         def named_refusal():
             if deadline is None:
                 return None
@@ -647,9 +665,20 @@ class PoseComposerNode(Node):
             except (ValueError, RuntimeError) as exc:
                 return False, "HAND_CAPABILITY_MISSING", str(exc)
         dispatch_started = time.monotonic()
+        # ``commands`` raises what is sent by the predicted sag; every check here
+        # and in the runtime keeps comparing the measured arm with the plan.
+        sent = positions if commands is None else commands(positions)
+        if commands is not None:
+            raised = np.asarray(sent, dtype=float) - np.asarray(positions, dtype=float)
+            worst = np.unravel_index(int(np.argmax(np.abs(raised))), raised.shape)
+            self._task_pose_runner.report["sag_compensation"] = {
+                "max_rad": float(abs(raised[worst])),
+                "joint": backend_for(self).model.ARM_JOINTS[worst[1]],
+                "final_rad": [float(v) for v in raised[-1]],
+            }
         for k in range(1, len(times)):
             point = JointTrajectoryPoint()
-            point.positions = [float(v) for v in positions[k]]
+            point.positions = [float(v) for v in sent[k]]
             sec = float(times[k])
             point.time_from_start = Duration(sec=int(sec), nanosec=int((sec - int(sec)) * 1e9))
             goal.trajectory.points.append(point)
