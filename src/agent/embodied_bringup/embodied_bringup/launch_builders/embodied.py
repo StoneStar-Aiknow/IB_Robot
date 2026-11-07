@@ -916,7 +916,14 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     }
     # /voice_partial, /voice_status and /voice_control are fixed by voice_asr_node; the bridge keeps
     # its own defaults for them and the loader rejects YAML overrides that could only break them.
-    for field_name in ("confirm_mode", "busy_message", "addressee_trigger"):
+    for field_name in (
+        "confirm_mode",
+        "busy_message",
+        "addressee_trigger",
+        "semantic_gate_mode",
+        "semantic_gate_model_path",
+        "semantic_gate_log_path",
+    ):
         if field_name in voice_bridge:
             params[field_name] = str(voice_bridge[field_name])
     for field_name in (
@@ -931,6 +938,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "speaker_max_age_sec",
         "speaker_merge_margin",
         "measurement_grace_sec",
+        "semantic_gate_threshold",
     ):
         if field_name in voice_bridge:
             params[field_name] = float(voice_bridge[field_name])
@@ -964,6 +972,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "mute_asr_during_tts",
         "speaker_check_enabled",
         "speaker_reject_short",
+        "semantic_gate_fail_open",
     ):
         if field_name in voice_bridge:
             params[field_name] = bool(voice_bridge[field_name])
@@ -974,6 +983,8 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "cancel_phrases",
         "wake_phrases",
         "silent_skills",
+        "semantic_gate_lexicon",
+        "semantic_gate_wake_prefixes",
     ):
         if field_name in voice_bridge:
             params[f"{field_name}_json"] = json.dumps(list(voice_bridge[field_name]), ensure_ascii=False)

@@ -41,13 +41,23 @@ from ibrobot_agent.addressee import (
 from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE, TERMINAL_REQUEST_STATES
 from ibrobot_agent.execution_feedback import FeedbackTracker, execution_reply
 from ibrobot_agent.presentation import presentation_digest
+from ibrobot_agent.semantic_gate import SEMANTIC_GATE_MODES, SemanticGate
 
 CONFIRM_MODES = ("auto", "voice_confirm")
 _ACTIVE_ASR_STATES = {"listening", "recognizing"}
 #: A refusal can contain a confirm word ("不执行" has 执行, "我不确定" has 确定); it must never
 #: acknowledge a plan. "没" is left out on purpose: "没问题" is consent.
 _NEGATION_MARKERS = ("不", "别")
-_PHRASE_FIELDS = ("stop_phrases", "bypass_phrases", "confirm_phrases", "cancel_phrases", "wake_phrases", "silent_skills")
+_PHRASE_FIELDS = (
+    "stop_phrases",
+    "bypass_phrases",
+    "confirm_phrases",
+    "cancel_phrases",
+    "wake_phrases",
+    "silent_skills",
+    "semantic_gate_lexicon",
+    "semantic_gate_wake_prefixes",
+)
 
 
 @dataclass(frozen=True)
@@ -130,6 +140,33 @@ class VoiceBridgeConfig:
     busy_message: str = "我正在执行上一个任务，请稍等。"
     # Domain term -> homophones the ASR model prefers (e.g. 夹爪 jiā zhǎo is heard as 家找/家长).
     text_corrections: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    #: Semantic gate (``semantic_gate.py``): the L3 decision the wake/voiceprint gate cannot
+    #: make -- whether the words were meant for the robot at all. ``off`` keeps the bridge
+    #: behaving exactly as before it existed; ``shadow`` judges and records into
+    #: ``semantic_gate_log_path`` without ever dropping an utterance, which is how the
+    #: thresholds get calibrated on the deployment's own traffic; ``enforce`` drops the
+    #: utterances the gate vetoes. Without ``wake_phrases`` or ``vendor_session`` the bridge
+    #: admits every utterance, so this is the only thing standing between a meeting in the
+    #: room and the planner.
+    semantic_gate_mode: str = "off"
+    #: Trained model (see ``tools/addressee``). Required as soon as the mode is not ``off``.
+    semantic_gate_model_path: str = ""
+    #: Below this score an utterance is only vetoed when no skill word or wake prefix matches.
+    #: Deliberately low: the field corpus' scores are bimodal (half of them are 0.000, three
+    #: quarters 1.000), so a low threshold costs little specificity and buys recall, and a
+    #: dropped command is the failure the user feels.
+    semantic_gate_threshold: float = 0.10
+    #: Skill words that always win over the model (the catalog's ``aliases_zh``): an unseen
+    #: skill scores badly by construction, see the module docstring.
+    semantic_gate_lexicon: tuple[str, ...] = ()
+    #: Leading wake-word spellings the ASR produces (灵犀 heard as 林星/年轻人/...): a sentence
+    #: that starts with one was said to the robot, whatever the model thinks of the rest.
+    semantic_gate_wake_prefixes: tuple[str, ...] = ()
+    #: JSONL of every judgement (shadow and enforce alike). Empty: ROS log only.
+    semantic_gate_log_path: str = ""
+    #: A model that will not load disables the gate instead of failing the launch. The gate
+    #: can only drop utterances it is confident about, so running without it is the safe side.
+    semantic_gate_fail_open: bool = True
 
     def __post_init__(self) -> None:
         if not str(self.robot_scope).strip():
@@ -180,6 +217,12 @@ class VoiceBridgeConfig:
                 raise ValueError("text_corrections entries need a term and at least one misrecognized variant")
             corrections.append((term, variants))
         object.__setattr__(self, "text_corrections", tuple(corrections))
+        if self.semantic_gate_mode not in SEMANTIC_GATE_MODES:
+            raise ValueError(f"semantic_gate_mode must be one of {SEMANTIC_GATE_MODES}")
+        if self.semantic_gate_mode != "off" and not str(self.semantic_gate_model_path).strip():
+            raise ValueError("semantic_gate_model_path is required unless semantic_gate_mode is off")
+        if not 0.0 <= float(self.semantic_gate_threshold) <= 1.0:
+            raise ValueError("semantic_gate_threshold must be in [0, 1]")
 
     @property
     def pairs_by_segment(self) -> bool:
@@ -351,6 +394,9 @@ class VoiceBridgeCore:
         )
         #: Transcripts held for their measurement, in arrival order (``on_heard``).
         self._held: list[_HeldTranscript] = []
+        #: L3 semantic gate, or None when off/unloadable; ``semantic_status`` says which and why,
+        #: so the node can report a model that silently disabled itself.
+        self._semantic, self.semantic_status = SemanticGate.from_config(config)
 
     @property
     def active_request_id(self) -> str:
@@ -543,6 +589,37 @@ class VoiceBridgeCore:
         # Accepted trade-off: an utterance like "不停地挥手" also stops the robot.
         return any(phrase in normalized for phrase in self.config.stop_phrases)
 
+    def _judge_semantics(
+        self, raw: str, normalized: str, now: float, *, session_opened: bool
+    ) -> list[Action] | None:
+        """Run the L3 gate; returns the actions that stop the utterance, or None to let it through.
+
+        Shadow mode records the verdict and returns None, which is what makes the log a
+        labelled sample rather than a sample of rejections only: its false negatives (a
+        command the gate would have dropped) are exactly what the next threshold has to
+        account for.
+        """
+        gate = self._semantic
+        if gate is None:
+            return None
+        decision = gate.judge(raw)
+        mode = self.config.semantic_gate_mode
+        gate.record(
+            decision,
+            self.config.semantic_gate_log_path,
+            mode=mode,
+            session_id=self._state.session_id,
+            after_wake=bool(session_opened),
+            active_request=bool(self._state.active_request_id),
+            normalized=normalized,
+        )
+        if not decision.rejected or mode != "enforce":
+            return None
+        # Same wording as the addressee verdict on purpose: "not addressed to me" is one
+        # concept, whichever layer decided it, and the shadow log carries the score for
+        # the ones that only look that way.
+        return [Log(f"not addressed to me (semantic {decision.score:.2f}: {decision.reason}); ignored {raw!r}")]
+
     def _route_transcript(
         self,
         raw: str,
@@ -568,6 +645,9 @@ class VoiceBridgeCore:
         if not verdict.addressed:
             return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
         raw, normalized = verdict.raw, verdict.normalized
+        semantic_block = self._judge_semantics(raw, normalized, now, session_opened=session_opened)
+        if semantic_block is not None:
+            return semantic_block
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
             return [Log(f"ignored bypass utterance {raw!r}")]
         if state.active_request_id:
@@ -935,6 +1015,15 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         feedback_only=bool(values["feedback_only"]),
         busy_message=str(values["busy_message"]),
         text_corrections=_corrections(values.get("text_corrections_json", "{}")),
+        semantic_gate_mode=str(values["semantic_gate_mode"]),
+        semantic_gate_model_path=str(values["semantic_gate_model_path"]),
+        semantic_gate_threshold=float(values["semantic_gate_threshold"]),
+        semantic_gate_lexicon=_string_tuple(values["semantic_gate_lexicon_json"], "semantic_gate_lexicon"),
+        semantic_gate_wake_prefixes=_string_tuple(
+            values["semantic_gate_wake_prefixes_json"], "semantic_gate_wake_prefixes"
+        ),
+        semantic_gate_log_path=str(values["semantic_gate_log_path"]),
+        semantic_gate_fail_open=bool(values["semantic_gate_fail_open"]),
     )
 
 
@@ -1112,6 +1201,7 @@ def _build_node_class():
                 f"(channel={values['channel_id']}, confirm_mode={confirm_mode}, "
                 f"tts={'on' if self._speaker else 'off'})"
             )
+            self.get_logger().info(self._core.semantic_status)
             if self._speaker is None:
                 self.get_logger().warning(
                     "TTS is off: each exact plan is rendered only to this log; nobody hears it before the robot moves"

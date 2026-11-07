@@ -3242,6 +3242,36 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         # itself. With the gate off nothing captures one and the check would
         # silently accept every utterance.
         errors.append(f"{prefix}.speaker_check_enabled requires an enabled gate: set wake_phrases or addressee_trigger")
+    errors.extend(_validate_semantic_gate(voice_bridge, prefix))
+    return errors
+
+
+def _validate_semantic_gate(voice_bridge: dict[str, Any], prefix: str) -> list[str]:
+    """Fail at load time on a gate that could only run in a degraded shape."""
+    errors: list[str] = []
+    mode = voice_bridge.get("semantic_gate_mode", "off")
+    if mode not in {"off", "shadow", "enforce"}:
+        errors.append(f"{prefix}.semantic_gate_mode must be off, shadow or enforce")
+        return errors
+    model_path = voice_bridge.get("semantic_gate_model_path", "")
+    if not isinstance(model_path, str):
+        errors.append(f"{prefix}.semantic_gate_model_path must be a string path")
+        return errors
+    if mode != "off" and not model_path.strip():
+        # shadow without a model would log nothing; enforce would drop everything.
+        errors.append(f"{prefix}.semantic_gate_model_path is required when semantic_gate_mode is {mode}")
+    threshold = voice_bridge.get("semantic_gate_threshold", 0.1)
+    if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0 < threshold < 1:
+        errors.append(f"{prefix}.semantic_gate_threshold must be in (0, 1)")
+    for field_name in ("semantic_gate_lexicon", "semantic_gate_wake_prefixes"):
+        value = voice_bridge.get(field_name, [])
+        if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+            errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")
+    if "semantic_gate_fail_open" in voice_bridge and not isinstance(voice_bridge["semantic_gate_fail_open"], bool):
+        errors.append(f"{prefix}.semantic_gate_fail_open must be a boolean")
+    log_path = voice_bridge.get("semantic_gate_log_path", "")
+    if not isinstance(log_path, str):
+        errors.append(f"{prefix}.semantic_gate_log_path must be a string path")
     return errors
 
 
