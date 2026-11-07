@@ -56,6 +56,7 @@ _PHRASE_FIELDS = (
     "wake_phrases",
     "silent_skills",
     "semantic_gate_lexicon",
+    "semantic_gate_dialogue_requests",
     "semantic_gate_wake_prefixes",
 )
 
@@ -161,6 +162,7 @@ class VoiceBridgeConfig:
     semantic_gate_lexicon: tuple[str, ...] = ()
     #: Leading wake-word spellings the ASR produces (灵犀 heard as 林星/年轻人/...): a sentence
     #: that starts with one was said to the robot, whatever the model thinks of the rest.
+    semantic_gate_dialogue_requests: tuple[str, ...] = ()
     semantic_gate_wake_prefixes: tuple[str, ...] = ()
     #: JSONL of every judgement (shadow and enforce alike). Empty: ROS log only.
     semantic_gate_log_path: str = ""
@@ -1025,6 +1027,9 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         semantic_gate_model_path=str(values["semantic_gate_model_path"]),
         semantic_gate_threshold=float(values["semantic_gate_threshold"]),
         semantic_gate_lexicon=_string_tuple(values["semantic_gate_lexicon_json"], "semantic_gate_lexicon"),
+        semantic_gate_dialogue_requests=_string_tuple(
+            values["semantic_gate_dialogue_requests_json"], "semantic_gate_dialogue_requests"
+        ),
         semantic_gate_wake_prefixes=_string_tuple(
             values["semantic_gate_wake_prefixes_json"], "semantic_gate_wake_prefixes"
         ),

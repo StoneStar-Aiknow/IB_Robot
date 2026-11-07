@@ -28,6 +28,7 @@ def test_the_gate_is_off_by_default():
     assert config.semantic_gate_model_path == ""
     assert config.semantic_gate_threshold == pytest.approx(0.10)
     assert config.semantic_gate_lexicon == ()
+    assert config.semantic_gate_dialogue_requests == ()
     assert config.semantic_gate_wake_prefixes == ()
     assert config.semantic_gate_fail_open is True
 
@@ -52,6 +53,7 @@ def test_threshold_must_be_a_probability():
 def test_phrase_lists_are_declared_as_json_parameters():
     defaults = node_parameter_defaults()
     assert json.loads(defaults["semantic_gate_lexicon_json"]) == []
+    assert json.loads(defaults["semantic_gate_dialogue_requests_json"]) == []
     assert json.loads(defaults["semantic_gate_wake_prefixes_json"]) == []
     assert defaults["semantic_gate_mode"] == "off"
 

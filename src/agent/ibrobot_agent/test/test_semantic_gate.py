@@ -274,6 +274,20 @@ def test_modes_are_the_documented_set():
 
 
 @pytest.mark.skipif(not EMIT_LEXICON.exists(), reason="lexicon tool not present")
+def test_a_request_to_talk_is_addressed_to_the_robot(tmp_path):
+    # The corpus holds commands and meetings but almost no small talk, so the model scores
+    # "讲个故事" at zero; a request to talk can only ever start a conversation, so the
+    # configured phrases outrank the model.
+    gate = _quiet_gate(threshold=0.90, dialogue_requests=["讲个故事", "讲个笑话"])
+
+    decision = gate.judge("你来讲个故事")
+
+    assert decision.accepted
+    assert decision.reason == "dialogue request"
+    # Someone else is still someone else: naming them wins over the request phrase.
+    assert gate.judge("周哥你来讲个故事").rejected
+
+
 def test_the_generated_lexicon_holds_no_bare_negation():
     # "不是" is an answer, and as a skill word it let the question "是不是" through the gate.
     import importlib.util

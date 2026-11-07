@@ -198,6 +198,22 @@ robot:
           - 招手
           - 再见
           - 嗨
+        # Requests to talk are addressed to whatever can answer them. Without this list
+        # the gate read "讲个故事" as chatter, because the corpus that trained the model
+        # holds commands and meetings but almost no small talk.
+        semantic_gate_dialogue_requests:
+          - 讲个故事
+          - 讲一个故事
+          - 讲个笑话
+          - 讲一个笑话
+          - 说个笑话
+          - 讲个段子
+          - 唱首歌
+          - 唱一首歌
+          - 背首诗
+          - 聊聊天
+          - 陪我聊聊
+          - 说点什么
         # Corrupted wake words the model was trained to recognise as opening an
         # utterance; a hit accepts it even when the rest scores low.
         semantic_gate_wake_prefixes:

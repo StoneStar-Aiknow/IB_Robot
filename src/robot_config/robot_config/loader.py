@@ -3263,7 +3263,11 @@ def _validate_semantic_gate(voice_bridge: dict[str, Any], prefix: str) -> list[s
     threshold = voice_bridge.get("semantic_gate_threshold", 0.1)
     if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0 < threshold < 1:
         errors.append(f"{prefix}.semantic_gate_threshold must be in (0, 1)")
-    for field_name in ("semantic_gate_lexicon", "semantic_gate_wake_prefixes"):
+    for field_name in (
+        "semantic_gate_lexicon",
+        "semantic_gate_dialogue_requests",
+        "semantic_gate_wake_prefixes",
+    ):
         value = voice_bridge.get(field_name, [])
         if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
             errors.append(f"{prefix}.{field_name} must be a list of non-empty strings")

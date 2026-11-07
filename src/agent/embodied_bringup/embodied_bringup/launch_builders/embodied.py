@@ -984,6 +984,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "wake_phrases",
         "silent_skills",
         "semantic_gate_lexicon",
+        "semantic_gate_dialogue_requests",
         "semantic_gate_wake_prefixes",
     ):
         if field_name in voice_bridge:

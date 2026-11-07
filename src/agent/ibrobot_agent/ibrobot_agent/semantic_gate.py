@@ -137,6 +137,7 @@ class SemanticGate:
         *,
         threshold: float,
         lexicon: tuple[str, ...] = (),
+        dialogue_requests: tuple[str, ...] = (),
         wake_prefixes: tuple[str, ...] = (),
         source: str = "",
     ) -> None:
@@ -160,6 +161,9 @@ class SemanticGate:
         self._wake_words = tuple(str(item) for item in payload.get("wake_words", ()))
         self.threshold = float(threshold)
         self.lexicon = tuple(item for item in (normalize_text(str(entry)) for entry in lexicon) if item)
+        self.dialogue_requests = tuple(
+            item for item in (normalize_text(str(entry)) for entry in dialogue_requests) if item
+        )
         self.wake_prefixes = tuple(
             item for item in (normalize_text(str(entry)) for entry in wake_prefixes) if item
         )
@@ -194,6 +198,7 @@ class SemanticGate:
                 path,
                 threshold=float(config.semantic_gate_threshold),
                 lexicon=tuple(config.semantic_gate_lexicon),
+                dialogue_requests=tuple(config.semantic_gate_dialogue_requests),
                 wake_prefixes=tuple(config.semantic_gate_wake_prefixes),
             )
         except (OSError, ValueError) as error:
@@ -247,7 +252,12 @@ class SemanticGate:
             reason = f"names someone else ({address_term})"
             return SemanticDecision(text, score, True, lexicon_hit, wake_prefix, reason, address_term)
         rejected = False
-        if lexicon_hit and (len(body) <= _LEXICON_MAX_BODY_CHARS or score >= self.threshold):
+        # A request to talk is addressed to whatever can talk back, and it can only ever
+        # start a conversation, so it outranks the model instead of arguing with it.
+        request_hit = next((phrase for phrase in self.dialogue_requests if phrase in raw_normalized), "")
+        if request_hit:
+            reason = "dialogue request"
+        elif lexicon_hit and (len(body) <= _LEXICON_MAX_BODY_CHARS or score >= self.threshold):
             reason = "skill word"
         elif wake_prefix:
             reason = "wake prefix"
