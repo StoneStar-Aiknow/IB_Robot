@@ -312,6 +312,37 @@ def test_a_request_to_talk_is_addressed_to_the_robot(tmp_path):
     assert gate.judge("周哥你来讲个故事").rejected
 
 
+@pytest.mark.skipif(not EMIT_LEXICON.exists(), reason="lexicon tool not present")
+def test_asking_what_the_robot_just_did_is_addressed_to_the_robot():
+    # "你刚刚做了什么" is a question only this robot can answer, yet the corpus holds commands
+    # and meetings, so the model scores it at zero like any other talk between colleagues.
+    gate = _quiet_gate(
+        threshold=0.90,
+        lexicon=("自我介绍",),
+        dialogue_requests=(
+            "你做了什么",
+            "你刚刚做了什么",
+            "你做了哪些",
+            "做了哪些动作",
+            "干了什么",
+            "执行了什么",
+            "还做了什么",
+        ),
+    )
+
+    for text in ("你刚刚做了什么", "你做了哪些动作", "你刚才干了什么", "你刚刚执行了什么"):
+        decision = gate.judge(text)
+        assert decision.accepted, text
+        assert decision.reason == "dialogue request"
+
+    # A question that names a skill is still a question, not an order to run it again.
+    question = gate.judge("你在做自我介绍的时候还做了什么")
+    assert question.accepted
+    assert question.reason == "dialogue request"
+    # The same words as an order stay an order.
+    assert gate.judge("做个自我介绍").reason == "skill word"
+
+
 def test_the_generated_lexicon_holds_no_bare_negation():
     # "不是" is an answer, and as a skill word it let the question "是不是" through the gate.
     import importlib.util

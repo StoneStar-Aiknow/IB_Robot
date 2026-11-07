@@ -215,6 +215,17 @@ robot:
           - 聊聊天
           - 陪我聊聊
           - 说点什么
+          # Questions about what the robot just did. The corpus has no such phrasing, so
+          # the model scores them at zero even though only this robot can answer them.
+          - 你做了什么
+          - 你刚刚做了什么
+          - 你刚才做了什么
+          - 你做了哪些
+          - 你都做了哪些
+          - 做了哪些动作
+          - 干了什么
+          - 执行了什么
+          - 还做了什么
         # Corrupted wake words the model was trained to recognise as opening an
         # utterance; a hit accepts it even when the rest scores low.
         semantic_gate_wake_prefixes:

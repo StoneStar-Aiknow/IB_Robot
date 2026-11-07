@@ -302,7 +302,7 @@ if decision is not None and decision.rejected:
 | `semantic_gate_threshold` | `0.10` | 否决线：低于此分且无技能词才拦 |
 | `semantic_gate_model_only_threshold` | `0.90` | 无技能词的句子要单独过的接受线（2026-11-07 现场事后加） |
 | `semantic_gate_lexicon_json` | `"[]"` | 技能词表（`tools/addressee/emit_lexicon.py` 从 catalog 生成） |
-| `semantic_gate_dialogue_requests_json` | `"[]"` | 对话请求短语（讲个故事/讲个笑话…），命中放行 |
+| `semantic_gate_dialogue_requests_json` | `"[]"` | 对话请求短语（讲个故事/讲个笑话…）与追问自己的问句（你做了什么/做了哪些动作/干了什么/执行了什么/还做了什么），命中放行 |
 | `semantic_gate_wake_prefixes_json` | `"[]"` | 唤醒词变体前缀，命中放行 |
 | `semantic_gate_log_path` | `""` | 判定日志（JSONL，空=只进 ROS 日志） |
 | `semantic_gate_fail_open` | `true` | 模型加载失败时是否放行（false 则启动即报错） |
