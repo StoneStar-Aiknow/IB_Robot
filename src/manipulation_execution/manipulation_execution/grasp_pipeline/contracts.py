@@ -317,6 +317,9 @@ class GraspPlan:
         if self.release is not None:
             object.__setattr__(self, "release", tuple(self.release))
 
+    #: Complete alternative forward sequence ending at the carry handover pose.
+    carry_steps: tuple[Step, ...] | None = None
+
 
 class MotionState(enum.Enum):
     SUCCEEDED = "succeeded"
@@ -459,3 +462,136 @@ class GraspBackends:
     watch: TargetWatch | None = None
     close: Callable[[], None] = lambda: None
     prepare: Callable[[], None] | None = None
+    held_object: Callable | None = None
+    #: The empty hand's way home after a retained object drops: (held, deadline, cancelled) -> Move.
+    plan_home: Callable | None = None
+
+
+@dataclass(frozen=True)
+class HeldObject:
+    custody_id: str
+    target_query: str
+    arm_side: str
+    joint_names: tuple[str, ...]
+    joint_positions: tuple[float, ...]
+    home_positions: tuple[float, ...]
+    radius_m: float
+    points_in_palm: tuple[float, ...]
+    effector_state_json: str
+    lift_m: float = 0.0
+    observation_id: str = ""
+    lifted_at_ns: int = 0
+    frame_id: str = ""
+    #: The way from the handover pose back to ``home_positions`` that pick
+    #: drove (its moves reversed), row-major Nxjoints, with N times from zero.
+    #: Empty when the backend records none.
+    return_positions: tuple[float, ...] = ()
+    return_times: tuple[float, ...] = ()
+
+    def __post_init__(self):
+        if not self.custody_id or not self.target_query or not self.arm_side:
+            raise ValueError("held object needs an identity, target and arm")
+        if not self.joint_names or len(set(self.joint_names)) != len(self.joint_names):
+            raise ValueError("held object needs distinct joint names")
+        for values in (self.joint_positions, self.home_positions):
+            if len(values) != len(self.joint_names) or not np.isfinite(values).all():
+                raise ValueError("held object needs finite handover and home positions")
+        if not np.isfinite(self.radius_m) or self.radius_m <= 0:
+            raise ValueError("held object needs a positive radius")
+        if len(self.points_in_palm) % 3 or not np.isfinite(self.points_in_palm).all():
+            raise ValueError("held points must be finite xyz triples")
+        if self.return_positions or self.return_times:
+            rows = len(self.return_times)
+            times = np.asarray(self.return_times, float)
+            if (
+                rows < 2
+                or len(self.return_positions) != rows * len(self.joint_names)
+                or not np.isfinite(self.return_positions).all()
+                or times[0] != 0
+                or np.any(np.diff(times) <= 0)
+            ):
+                raise ValueError("return path needs N >= 2 finite rows and times increasing from zero")
+
+
+@dataclass(frozen=True)
+class ContainerEstimate:
+    #: Convex opening vertices in base coordinates, ordered around its normal.
+    opening: np.ndarray
+    normal: np.ndarray
+    rim_height_m: float
+    report: Mapping = field(default_factory=dict)
+    scene: object = None
+
+    def __post_init__(self):
+        opening = _frozen(
+            self.opening,
+            float,
+            lambda a: a.ndim == 2 and a.shape[1] == 3 and len(a) >= 3 and np.isfinite(a).all(),
+            "opening needs finite Nx3 vertices",
+        )
+        normal = _frozen(
+            self.normal,
+            float,
+            lambda a: a.shape == (3,) and np.isfinite(a).all() and np.isclose(np.linalg.norm(a), 1),
+            "normal must be a unit vector",
+        )
+        object.__setattr__(self, "opening", opening)
+        object.__setattr__(self, "normal", normal)
+
+
+@dataclass(frozen=True)
+class PlacePlan:
+    transfer: tuple[Step, ...]
+    release: tuple[Step, ...]
+    retreat: tuple[Step, ...]
+    container: ContainerEstimate
+    report: Mapping = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not any(isinstance(s, Move) for s in self.transfer):
+            raise ValueError("placement must move the held object")
+        if sum(isinstance(s, Effect) and s.action is EffectorAction.RELEASE for s in self.release) != 1:
+            raise ValueError("placement releases exactly once")
+        if any(isinstance(s, Effect) for s in (*self.transfer, *self.retreat)):
+            raise ValueError("transfer and retreat cannot actuate the hand")
+        if any(isinstance(s, Effect) and s.action is not EffectorAction.RELEASE for s in self.release):
+            raise ValueError("placement cannot close or preshape the hand")
+
+
+@dataclass(frozen=True)
+class PlaceVerdict:
+    success: bool
+    reason_code: str = ""
+    report: Mapping = field(default_factory=dict)
+
+
+class ContainerProposer(Protocol):
+    def propose(self, observation: Observation, query: str, held: HeldObject, *, deadline: float, cancelled: Flag): ...
+
+
+class PlacePlanner(Protocol):
+    def plan(
+        self, observation: Observation, container, held: HeldObject, *, deadline: float, cancelled: Flag
+    ) -> PlacePlan: ...
+
+    # Optional: the empty hand's collision-checked way home from where it rests
+    # after a drop in transfer. Without it the arm stays where it released.
+    def plan_home(self, held: HeldObject, *, deadline: float, cancelled: Flag) -> Move: ...
+
+
+class PlaceVerifier(Protocol):
+    def verify(
+        self, observation: Observation, plan: PlacePlan, held: HeldObject, *, deadline: float, cancelled: Flag
+    ) -> PlaceVerdict: ...
+
+
+@dataclass(frozen=True)
+class PlaceBackends:
+    observation: ObservationSource
+    proposer: ContainerProposer
+    planner: PlacePlanner
+    verifier: PlaceVerifier
+    executor: MotionExecutor
+    effector: EndEffector
+    restore: Callable[[HeldObject], None]
+    close: Callable[[], None] = lambda: None

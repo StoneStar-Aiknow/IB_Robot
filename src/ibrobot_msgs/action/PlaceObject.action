@@ -28,7 +28,12 @@ string[] diagnostic_details
 string pipeline_timings_json
 string debug_output_dir
 DelegatedExecutorIdentity actual_executor
+ExecutionDetail execution_detail
+uint32 last_feedback_sequence
+ExecutionDetail[] execution_history
 ---
 string phase
 float32 progress
 string detail
+ExecutionDetail execution_detail
+uint32 sequence

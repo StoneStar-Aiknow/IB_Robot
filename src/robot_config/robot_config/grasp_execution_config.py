@@ -77,6 +77,7 @@ _SCHEMA: dict[str, Any] = {
     "backend": _string(),
     # Read by the backend factory, which validates it.
     "backend_options": _mapping(),
+    "held_lease_s": _POSITIVE,
     # Runtime command streams the backend publishes to; bound against the live
     # runtime description by robot_config.interface_binding.
     "command_interfaces": _strings(),

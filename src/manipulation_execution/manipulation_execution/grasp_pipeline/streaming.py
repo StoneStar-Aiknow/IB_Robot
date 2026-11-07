@@ -132,9 +132,10 @@ class StreamConfig:
     #: A TARGET segment is reached by a straight joint line at this speed, at least min_s.
     target_speed_rad_s: float = 0.05
     target_min_s: float = 1.0
-    #: Where a sequence leaves the controller's command (return_home), and the band
-    #: inside which it is left alone (tolerance) or not touched at all (max: not a correction).
-    home_command: Mapping[str, float] | None = None
+    #: return_home puts the controller's command back where this executor took it over
+    #: in the current goal (False: left to the sequence), and the band inside which it is
+    #: left alone (tolerance) or not touched at all (max: not a correction).
+    home_at_takeover: bool = False
     home_tolerance_rad: float = 0.005
     home_max_rad: float = 0.1
 
@@ -180,11 +181,14 @@ class StreamExecutor:
         self._first_at: float | None = None  # when this executor first sent
         self._stopped = ""
         self.report: dict = {"segments": []}
+        self._feedback_sample = None
+        self._command_sample = None
 
     # -- MotionExecutor -------------------------------------------------------------
 
     def execute(self, segment: ArmSegment, *, carrying: bool, halted: Flag, cancelled: Flag) -> MotionOutcome:
         names = segment.joint_names
+        self._feedback_sample = self._command_sample = None
         try:
             self._admit()
             if not set(names) <= set(self._channel):
@@ -195,7 +199,9 @@ class StreamExecutor:
             raised = self._raise(timed)
             offset, held = self._baseline(sample, names)
         except StreamFailure as exc:
-            return MotionOutcome(MotionState.FAILED, str(exc))
+            row = {"name": segment.name}
+            self.report["segments"].append(row)
+            return self._end(row, MotionState.FAILED, str(exc), names)
         return self._follow(segment.name, names, timed, raised, offset, held, halted, cancelled)
 
     def hold(self, seconds: float, *, carrying: bool, cancelled: Flag) -> MotionOutcome:
@@ -282,15 +288,15 @@ class StreamExecutor:
         self._stopped = ""
 
     def return_home(self, home: ArmSegment, *, cancelled: Flag) -> MotionOutcome | None:
-        """Move the controller's command to ``home_command`` (None: the caller's default).
+        """Put the controller's command back where this goal took it over (None: the caller's default).
 
         Aiming at the measured pose a previous sequence ended at ratchets: under load
         each landing settles a little differently and the next plan starts there.
-        A fixed command settles the same way every time. Inside home_tolerance_rad
-        nothing moves; beyond home_max_rad it is not a correction and is left alone.
+        The command the task started from -- whatever pose and sag compensation set
+        it -- settles the same way every time. Inside home_tolerance_rad nothing
+        moves; beyond home_max_rad it is not a correction and is left alone.
         """
-        target = self.config.home_command
-        report = None if target is None else self.io.command()
+        report = self.io.command() if self.config.home_at_takeover and self._initial is not None else None
         if report is None:
             return None
         if self.io.monotonic() - report.received_at > self.config.feedback_max_age_s:
@@ -298,9 +304,11 @@ class StreamExecutor:
         names = home.joint_names
         try:
             board = np.array([report.positions[name] for name in names], dtype=float)
-            delta = np.array([target[name] for name in names], dtype=float) - board
-        except KeyError as exc:
+            target = self._initial[[self._channel.index(name) for name in names]]
+        except (KeyError, ValueError) as exc:
             return MotionOutcome(MotionState.FAILED, f"home command lacks {exc}")
+        delta = target - board
+        self.report["home_command"] = target.tolist()
         off = float(np.max(np.abs(delta)))
         self.report["home_command_off_rad"] = off
         if off <= self.config.home_tolerance_rad:
@@ -322,14 +330,14 @@ class StreamExecutor:
         config, period = self.config, 1.0 / self.config.rate_hz
         index = [self._channel.index(joint) for joint in names]
         locked = [joint for joint in config.locked_joints if joint not in names]
-        start_sample = self._fresh(self.io.feedback())
-        locked_start = self._vector(start_sample, locked) if locked else np.zeros(0)
         row = {"name": name, "seconds": float(timed.times[-1])}
         self.report["segments"].append(row)
         started = last_tick = self.io.monotonic()
         arrived_since = None
         last_command = None
         try:
+            start_sample = self._fresh(self.io.feedback())
+            locked_start = self._vector(start_sample, locked) if locked else np.zeros(0)
             while True:
                 tick = self.io.monotonic()
                 if cancelled():
@@ -346,16 +354,23 @@ class StreamExecutor:
                     )
                 self._admit()
                 sample = self._fresh(self.io.feedback())
+                row["control_gap_s"] = tick - last_tick
                 if last_command is not None and not 0 <= tick - last_tick <= config.max_control_gap_s:
                     raise StreamFailure("control loop timing overrun")
                 elapsed = tick - started if last_command is not None else 0.0
                 if elapsed > timed.times[-1] + config.timeout_margin_s:
                     raise StreamFailure("arrival timeout")
                 actual = self._vector(sample, names)
-                if last_command is not None and np.max(np.abs(actual - last_command)) > config.tracking_error_rad:
-                    raise StreamFailure("tracking anomaly")
-                if locked and np.max(np.abs(self._vector(sample, locked) - locked_start)) > config.arrived_error_rad:
-                    raise StreamFailure("a joint locked into the planner's model moved")
+                if last_command is not None:
+                    error = float(np.max(np.abs(actual - last_command)))
+                    row["tracking_peak_rad"] = max(row.get("tracking_peak_rad", 0.0), error)
+                    if error > config.tracking_error_rad:
+                        raise StreamFailure("tracking anomaly")
+                if locked:
+                    error = float(np.max(np.abs(self._vector(sample, locked) - locked_start)))
+                    row["locked_peak_rad"] = max(row.get("locked_peak_rad", 0.0), error)
+                    if error > config.arrived_error_rad:
+                        raise StreamFailure("a joint locked into the planner's model moved")
                 self._check_report()
                 if last_command is None:
                     started = tick  # the timed path begins with the first command
@@ -377,11 +392,31 @@ class StreamExecutor:
 
     def _end(self, row, state, reason, names, report=None) -> MotionOutcome:
         row.update(state=state.value, reason=reason)
+        report = dict(report or {})
+        if state is not MotionState.SUCCEEDED:
+            # Capture the samples used by the failing checks before another
+            # feedback read or finish() can replace the evidence.
+            report["stream_diagnostics"] = self._failure_snapshot()
+        row.update(report)
         try:
             stopped_at = self._vector(self.io.feedback(), names)
         except (KeyError, StreamFailure):
             stopped_at = None
-        return MotionOutcome(state, reason, stopped_at, report or {})
+        return MotionOutcome(state, reason, stopped_at, report)
+
+    def _failure_snapshot(self):
+        from dataclasses import asdict
+
+        return {
+            "observed_at": self.io.monotonic(),
+            "clock": "executor_monotonic",
+            "channel_joints": list(self._channel),
+            "last_sent_at": self._history[-1][0] if self._history else None,
+            "last_sent_positions": None if self._last is None else self._last.tolist(),
+            "feedback": None if self._feedback_sample is None else asdict(self._feedback_sample),
+            "controller_echo": None if self._command_sample is None else asdict(self._command_sample),
+            "limits_and_thresholds": asdict(self.config),
+        }
 
     # -- pieces ---------------------------------------------------------------------
 
@@ -393,6 +428,7 @@ class StreamExecutor:
             raise StreamFailure(f"runtime does not admit output: {refusal}")
 
     def _fresh(self, sample: JointSample) -> JointSample:
+        self._feedback_sample = sample
         age = self.io.monotonic() - sample.received_at
         if not sample.healthy or not 0 <= age <= self.config.feedback_max_age_s:
             raise StreamFailure("feedback unhealthy or stale")
@@ -455,6 +491,7 @@ class StreamExecutor:
     def _baseline(self, sample: JointSample, names: Sequence[str]) -> tuple[np.ndarray, np.ndarray]:
         """(offset of the driven joints' command from the measured pose, full command holding the others)."""
         report = self.io.command()
+        self._command_sample = report
         measured_channel = self._vector(sample, self._channel)
         index = [self._channel.index(joint) for joint in names]
         if report is not None:
@@ -505,6 +542,7 @@ class StreamExecutor:
 
     def _check_report(self) -> None:
         report = self.io.command()
+        self._command_sample = report
         if report is None or self._last is None:
             return
         if self.io.monotonic() - report.received_at > self.config.feedback_max_age_s:

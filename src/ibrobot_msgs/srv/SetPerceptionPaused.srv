@@ -1,0 +1,8 @@
+# Idempotent pause ownership. Releasing one owner never releases another.
+# This service does not command hardware or stop the camera publisher.
+string owner_id
+bool paused
+---
+bool success
+bool paused
+string message

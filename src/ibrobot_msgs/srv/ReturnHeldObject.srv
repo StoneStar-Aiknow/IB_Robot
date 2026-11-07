@@ -1,0 +1,8 @@
+string custody_id
+string claim_token
+# released, held (at the handover pose), lost, uncertain
+string outcome
+string reason_code
+---
+bool success
+string reason_code

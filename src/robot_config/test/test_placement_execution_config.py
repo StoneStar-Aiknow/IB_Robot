@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from robot_config.loader import load_robot_config_dict
+from robot_config.placement_execution_config import validate_placement_execution_config
 
 CONFIG = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
 PC_CONFIG = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
@@ -131,3 +132,49 @@ def test_pc_placement_contract_uses_grounding_masks_without_a_separate_segmenter
 def test_invalid_placement_contract_fails_before_launch(tmp_path, mutation, message):
     with pytest.raises(ValueError, match=message):
         load_robot_config_dict(_write(tmp_path, mutation))
+
+
+@pytest.mark.parametrize("attempts", [0, -1, True, 1.5])
+def test_backend_placement_rejects_invalid_retry_budget(attempts):
+    config = {
+        "enabled": True,
+        "executor": "placement_pipeline",
+        "required_args": ["target_name", "container_name"],
+        "action_name": "/manipulation/execute_place",
+        "backend": "aimdk_grasp.remote_head:x2_remote_place_backends",
+    }
+    assert validate_placement_execution_config(config) == []
+    config["pipeline"] = {"max_attempts": attempts}
+    assert any("max_attempts" in error for error in validate_placement_execution_config(config))
+
+
+@pytest.mark.parametrize("reserve", [0.0, 15.0, -1.0, True, "15", float("nan"), float("inf")])
+def test_backend_placement_checks_execution_reserve(reserve):
+    config = {
+        "enabled": True,
+        "executor": "placement_pipeline",
+        "required_args": ["target_name", "container_name"],
+        "action_name": "/manipulation/execute_place",
+        "backend": "aimdk_grasp.remote_head:x2_remote_place_backends",
+        "pipeline": {"max_attempts": 2, "execute_reserve_s": reserve},
+    }
+    errors = validate_placement_execution_config(config)
+    if type(reserve) is float and reserve in (0.0, 15.0):
+        assert errors == []
+    else:
+        assert any("execute_reserve_s" in error for error in errors)
+
+
+@pytest.mark.parametrize("threshold", [-0.1, 1.1, float("nan"), float("inf"), True, "0.50", None])
+def test_backend_placement_rejects_invalid_container_threshold(threshold):
+    config = {
+        "enabled": True,
+        "executor": "placement_pipeline",
+        "required_args": ["target_name", "container_name"],
+        "action_name": "/manipulation/execute_place",
+        "backend": "aimdk_grasp.remote_head:x2_remote_place_backends",
+        "perception": {"box_threshold": 0.50},
+    }
+    assert validate_placement_execution_config(config) == []
+    config["perception"]["box_threshold"] = threshold
+    assert any("box_threshold" in error for error in validate_placement_execution_config(config))

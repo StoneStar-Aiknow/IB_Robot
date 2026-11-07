@@ -165,6 +165,35 @@ def test_a_platform_that_does_not_follow_stops_the_segment(setup, reason):
     setup(arm)
     outcome = run(executor, line(np.zeros(3), [0.6, 0.0, 0.0], seconds=1.5))
     assert outcome.state is MotionState.FAILED and reason in outcome.reason
+    evidence = outcome.report["stream_diagnostics"]
+    assert evidence["observed_at"] == arm.t
+    assert evidence["limits_and_thresholds"]["tracking_error_rad"] == 0.3
+    if evidence["feedback"] is not None:
+        assert evidence["feedback"]["received_at"] == arm.t - arm.feedback_delay
+        assert evidence["feedback"]["positions"]["head"] == arm.head
+    if evidence["controller_echo"] is not None:
+        assert evidence["controller_echo"]["received_at"] <= arm.t
+    if arm.published:
+        np.testing.assert_array_equal(evidence["last_sent_positions"], arm.published[-1])
+        assert evidence["last_sent_at"] <= arm.t
+    assert executor.report["segments"][-1]["reason"] == outcome.reason
+    executor.finish()
+    assert outcome.report["stream_diagnostics"] == evidence
+
+
+def test_peak_tracking_error_and_triggering_sample_survive_a_later_read():
+    arm = SimArm()
+    executor = StreamExecutor(arm, CONFIG)
+    arm.stuck = True
+    outcome = run(executor, line(np.zeros(3), [0.6, 0.0, 0.0], seconds=1.5))
+    evidence = outcome.report["stream_diagnostics"]
+    assert executor.report["segments"][-1]["tracking_peak_rad"] > 0.3
+    actual = np.array([evidence["feedback"]["positions"][name] for name in CHANNEL])
+    assert np.max(np.abs(actual[:3] - evidence["last_sent_positions"][:3])) > 0.3
+    arm.measured[:] = 9
+    arm.t += 1
+    executor.finish()
+    assert evidence["feedback"]["positions"][DRIVEN[0]] == 0
 
 
 def test_a_report_that_does_not_follow_says_which_joint_and_how_stale_it_is():
@@ -314,27 +343,47 @@ def test_the_shaper_raise_is_relative_to_the_segment_start():
 
 
 @pytest.mark.parametrize(("board_off", "moves"), [(0.003, False), (0.05, True), (0.2, False)])
-def test_return_home_moves_the_controllers_command_to_the_fixed_home(board_off, moves):
-    arm = SimArm(start=(0.4, 0.0, -1.2, 0.5, 0.5))
-    arm.target[:3] = [0.4 + board_off, 0.0, -1.2]  # where the last landing left the command
-    arm.measured[:3] = arm.target[:3] - SAG[:3]
-    home_command = {"l0": 0.4, "l1": 0.0, "l2": -1.2}
-    executor = StreamExecutor(
-        arm, StreamConfig(tracking_error_rad=0.3, arrival_error_rad=0.2, home_command=home_command)
-    )
-    home = ArmSegment("approach", SegmentKind.TRAJECTORY, DRIVEN, np.zeros((2, 3)), np.array([0.0, 1.0]))
-    outcome = executor.return_home(home, cancelled=lambda: False)
+def test_return_home_puts_the_command_back_where_the_goal_took_it_over(board_off, moves):
+    # A task start far from any global HOME (shoulder roll 0.45): only the takeover counts.
+    start = np.array([-0.05, 0.45, 0.35])
+    arm = SimArm(start=(*start, 0.5, 0.5))
+    takeover = arm.target.copy()
+    executor = StreamExecutor(arm, StreamConfig(**{**CONFIG.__dict__, "home_at_takeover": True}))
+    assert run(executor, line(start, start + [0.2, 0.0, 0.0])).state is MotionState.SUCCEEDED
+    # The way back lands the command a little off the one the goal started from.
+    back = start + [board_off, 0.0, 0.0]
+    assert run(executor, line(start + [0.2, 0.0, 0.0], back)).state is MotionState.SUCCEEDED
+    np.testing.assert_allclose(arm.target[:3], takeover[:3] + [board_off, 0.0, 0.0], atol=1e-3)
+    sent = len(arm.published)
+    outcome = executor.return_home(line(back, back), cancelled=lambda: False)
     assert outcome.state is MotionState.SUCCEEDED
-    assert bool(arm.published) == moves
+    assert executor.report["home_command"] == pytest.approx(takeover[:3].tolist())
+    assert (len(arm.published) > sent) == moves
     if moves:
-        np.testing.assert_allclose(arm.target[:3], [0.4, 0.0, -1.2], atol=1e-9)
+        np.testing.assert_allclose(arm.target[:3], takeover[:3], atol=1e-9)
     elif board_off > 0.1:
-        assert executor.report["home_command_skipped"][0] == pytest.approx(0.6)
+        assert executor.report["home_command_skipped"][0] == pytest.approx(takeover[0] + board_off, abs=1e-3)
+    np.testing.assert_allclose(arm.target[3:], takeover[3:])  # the other joints are held
 
 
-def test_return_home_without_a_home_command_leaves_it_to_the_sequence():
-    executor = StreamExecutor(SimArm(), CONFIG)
+def test_return_home_is_left_to_the_sequence_unless_configured_and_taken_over():
+    assert StreamExecutor(SimArm(), CONFIG).return_home(line(np.zeros(3), np.zeros(3)), cancelled=lambda: False) is None
+    executor = StreamExecutor(SimArm(), StreamConfig(**{**CONFIG.__dict__, "home_at_takeover": True}))
+    # Nothing sent in this goal: no takeover command to return to.
     assert executor.return_home(line(np.zeros(3), np.zeros(3)), cancelled=lambda: False) is None
+
+
+def test_each_goal_returns_to_its_own_takeover_command():
+    arm = SimArm()
+    executor = StreamExecutor(arm, StreamConfig(**{**CONFIG.__dict__, "home_at_takeover": True}))
+    run(executor, line(np.zeros(3), [0.2, 0.0, 0.0]))
+    executor.finish()
+    # The next goal starts where the last one left the command: that is its home now.
+    second = arm.target.copy()
+    here = arm.measured[:3].copy()
+    run(executor, line(here, here + [0.05, 0.0, 0.0]))
+    assert executor.return_home(line(here, here), cancelled=lambda: False).state is MotionState.SUCCEEDED
+    np.testing.assert_allclose(arm.target, second, atol=1e-9)
 
 
 def test_hold_keeps_the_last_command_and_finish_hands_the_robot_back():

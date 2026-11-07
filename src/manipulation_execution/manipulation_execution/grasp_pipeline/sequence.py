@@ -16,7 +16,9 @@ retracing or releasing without knowing where the target is would be that guess.
 
 from __future__ import annotations
 
+import traceback
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -71,6 +73,10 @@ class SequenceResult:
     phases: list[dict] = field(default_factory=list)
     reason_code: str = ""
     recovery_state: str = "NOT_NEEDED"
+    execution_report: dict = field(default_factory=dict)
+    exception: dict = field(default_factory=dict)
+    #: The triggering execution failure, before recovery can fail for another reason.
+    first_failure: dict = field(default_factory=dict)
 
 
 class _Stopped(Exception):
@@ -102,12 +108,19 @@ class GraspSequence:
         result = SequenceResult()
         done: list[Step] = []
         state = {"carrying": False, "moved": None, "failed": None}
+        grip_lost: list[str | None] = []
         watch = self._backends.watch
         failed = getattr(watch, "failed", None)
 
         def halted() -> bool:
             # Only while moving toward the target with nothing held, and only once.
-            if state["carrying"] or watch is None:
+            if state["carrying"]:
+                holding = getattr(self._backends.effector, "holding", None)
+                reason = holding() if holding is not None else None
+                if holding is not None and reason != "":
+                    grip_lost.append(reason)
+                return bool(grip_lost)
+            if watch is None:
                 return False
             if state["moved"] is None and state["failed"] is None:
                 state["moved"] = watch.moved()
@@ -127,9 +140,26 @@ class GraspSequence:
                 if isinstance(step, Move):
                     outcome = self._move(step.segment, state["carrying"], halted, cancelled, result)
                     if outcome.state is MotionState.HALTED:
+                        if grip_lost:
+                            if grip_lost[0] is None:
+                                raise _Stopped("GRASP_UNCERTAIN", "grip feedback unavailable during lift")
+                            result.held, result.lost = False, grip_lost[0]
+                            result.reason_code = "GRIP_LOST"
+                            self._remember_failure(result, "GRASP_VERIFICATION_FAILED", result.lost)
+                            result.recovery_state = "IN_PROGRESS"
+                            self._on_phase("recover", "start", {"recovery_state": "IN_PROGRESS"})
+                            back = step.segment.walked_back(
+                                self._stopped_at(step.segment, cancelled),
+                                path_progress=outcome.report.get("path_progress"),
+                            )
+                            if back is not None:
+                                self._expect(self._move(back, True, _never, cancelled, result))
+                            abandoned = True
+                            break
                         blind(step.name)
                         result.retreated = {"step": step.name, "reason": str(state["moved"])}
                         result.reason_code = "TARGET_MOVED"
+                        self._remember_failure(result, "TARGET_MOVED", f"target moved: {state['moved']}")
                         self._on_phase(
                             step.name,
                             "end",
@@ -200,11 +230,13 @@ class GraspSequence:
                 self._on_phase("verify", "start", {})
                 holding = getattr(self._backends.effector, "holding", None)
                 grip = holding() if holding is not None else None
-                verified = result.held is True and grip == ""
+                verified = result.held is True and (grip == "" or holding is None)
                 if not verified:
                     result.held = False if grip else None
                     result.reason_code = "GRIP_LOST" if grip else "GRASP_UNCERTAIN"
                     result.lost = str(grip or "")
+                    if grip is None:
+                        raise _Stopped("GRASP_UNCERTAIN", "grip state unknown at handover")
                     abandoned = True
                 self._on_phase(
                     "verify",
@@ -233,6 +265,7 @@ class GraspSequence:
                 )
             return result
         except GraspFailure as failure:
+            result.exception = {"type": type(failure).__name__, "traceback": traceback.format_exc()}
             if result.recovery_state in {"IN_PROGRESS", "FAILED"}:
                 self._stop(result, failure.code, str(failure))
                 return result
@@ -256,11 +289,15 @@ class GraspSequence:
                 self._stop(result, "INTERNAL_ERROR", f"{failure}; then {type(exc).__name__}: {exc}")
             return result
         except _Stopped as stopped:
+            result.exception = {"type": type(stopped).__name__, "traceback": traceback.format_exc()}
             self._stop(result, stopped.code, str(stopped))
             return result
         except Exception as exc:  # noqa: BLE001 - stop in place and say why
+            result.exception = {"type": type(exc).__name__, "traceback": traceback.format_exc()}
             self._stop(result, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
             return result
+        finally:
+            result.execution_report = deepcopy(getattr(self._backends.executor, "report", {}))
 
     # -- steps -----------------------------------------------------------------
 
@@ -391,9 +428,48 @@ class GraspSequence:
         self._expect(executor.hold(HALT_SETTLE_S, carrying=False, cancelled=cancelled))
         return executor.measured(segment.joint_names)
 
+    def take_back(self, plan: GraspPlan, *, cancelled: Flag = _never) -> SequenceResult:
+        """Return an unclaimed carry to its source using the executed forward path."""
+        result = SequenceResult(held=True)
+        try:
+            self._recover(plan, list(plan.steps), {"carrying": True}, cancelled, result)
+            result.succeeded, result.released_after_success, result.held = True, True, False
+        except Exception as exc:
+            result.exception = {"type": type(exc).__name__, "traceback": traceback.format_exc()}
+            self._stop(result, getattr(exc, "code", "MOTION_FAILED"), str(exc))
+        finally:
+            result.execution_report = deepcopy(getattr(self._backends.executor, "report", {}))
+            for part in (self._backends.executor, self._backends.effector):
+                finish = getattr(part, "finish", None)
+                if finish is not None:
+                    finish()
+        return result
+
+    def home_after_drop(self, go_home: Callable[[], Move], *, cancelled: Flag = _never) -> SequenceResult:
+        """Open the hand a retained object fell from, then drive it home on a fresh plan."""
+        result = SequenceResult(held=False)
+        try:
+            self._expect_effect(self._act(EffectorAction.RELEASE, _never, cancelled, result))
+            self._expect(self._move(go_home().segment, False, _never, cancelled, result))
+            result.succeeded, result.at_rest = True, True
+        except Exception as exc:
+            result.exception = {"type": type(exc).__name__, "traceback": traceback.format_exc()}
+            self._stop(result, getattr(exc, "code", "MOTION_FAILED"), str(exc))
+        finally:
+            result.execution_report = deepcopy(getattr(self._backends.executor, "report", {}))
+            for part in (self._backends.executor, self._backends.effector):
+                finish = getattr(part, "finish", None)
+                if finish is not None:
+                    finish()
+        return result
+
     # -- taking the plan back ----------------------------------------------------
 
     def _recover(self, plan, done, state, cancelled, result) -> None:
+        if result.reason_code or result.error_code:
+            self._remember_failure(
+                result, result.error_code or "GRASP_VERIFICATION_FAILED", result.message or result.lost
+            )
         if result.recovery_state != "IN_PROGRESS":
             result.recovery_state = "IN_PROGRESS"
             self._on_phase("recover", "start", {"recovery_state": "IN_PROGRESS"})
@@ -449,7 +525,17 @@ class GraspSequence:
         correction = ArmSegment("home_correction", SegmentKind.TARGET, home.joint_names, np.stack([here, home.start]))
         self._expect(self._move(correction, False, _never, cancelled, result))
 
+    def _remember_failure(self, result: SequenceResult, code: str, message: str) -> None:
+        if not result.first_failure:
+            result.first_failure = {
+                "phase": self._current_phase,
+                "error_code": code,
+                "reason_code": result.reason_code or code,
+                "message": message,
+            }
+
     def _stop(self, result: SequenceResult, code: str, message: str) -> None:
+        self._remember_failure(result, code, message)
         result.succeeded, result.at_rest = False, False
         result.error_code, result.message = code, message
         result.reason_code = result.reason_code or code
