@@ -795,13 +795,7 @@ def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
 @pytest.mark.parametrize(
     "payload",
     [
-        # A question that also carries steps or a reason: the model's intent is ambiguous.
-        {
-            "kind": "needs_clarification",
-            "user_message": "哪只手？",
-            "missing_fields": ["hand"],
-            "steps": [{"schema_version": 1, "skill_name": "wave_hand"}],
-        },
+        # A question that also carries a reason: the model's intent is ambiguous.
         {"kind": "needs_clarification", "user_message": "哪只手？", "missing_fields": ["hand"], "reason_code": "X"},
         {"kind": "rejected", "user_message": "做不到。", "reason_code": "OUT_OF_SCOPE", "summary": "wave_hand"},
         # Workflow replies are never repaired.
@@ -819,6 +813,28 @@ def test_empty_fields_a_reply_does_not_use_are_ignored(payload):
 def test_a_reply_whose_fields_contradict_its_kind_still_fails_closed(payload):
     with pytest.raises(PlannerParseError):
         _parse(payload)
+
+
+def test_a_question_that_also_carries_a_workflow_keeps_the_question():
+    # Nothing can run from a clarification, so the workflow it also carries is dropped and
+    # audited instead of failing the whole turn: the user hears the question, not "failed".
+    outcome = _parse(
+        {
+            "kind": "needs_clarification",
+            "user_message": "你是想让我举手吗？",
+            "missing_fields": ["hand"],
+            "steps": [{"schema_version": 1, "skill_name": "raise_hand"}],
+            "summary": "举手",
+        }
+    )
+
+    assert outcome.kind == "needs_clarification"
+    assert outcome.steps == ()
+    assert outcome.summary == ""
+    assert outcome.repairs == (
+        PlannerRepair("steps", "defaulted", [{"schema_version": 1, "skill_name": "raise_hand"}]),
+        PlannerRepair("summary", "defaulted", "举手"),
+    )
 
 
 def test_repairs_stay_out_of_what_the_robot_is_asked_to_do():
