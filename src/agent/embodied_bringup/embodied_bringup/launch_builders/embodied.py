@@ -939,6 +939,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "speaker_merge_margin",
         "measurement_grace_sec",
         "semantic_gate_threshold",
+        "semantic_gate_model_only_threshold",
     ):
         if field_name in voice_bridge:
             params[field_name] = float(voice_bridge[field_name])

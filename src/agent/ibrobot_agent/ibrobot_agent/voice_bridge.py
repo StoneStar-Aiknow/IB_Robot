@@ -157,6 +157,11 @@ class VoiceBridgeConfig:
     #: quarters 1.000), so a low threshold costs little specificity and buys recall, and a
     #: dropped command is the failure the user feels.
     semantic_gate_threshold: float = 0.10
+    #: Score a sentence with no skill word and no wake prefix must reach on its own. The
+    #: low ``semantic_gate_threshold`` is a veto line, not an admission line: a character-bag
+    #: model scores "清代你会过" 1.000 because it shares "你会" with "你会做什么", so a
+    #: model-only decision needs a score that actually means something.
+    semantic_gate_model_only_threshold: float = 0.90
     #: Skill words that always win over the model (the catalog's ``aliases_zh``): an unseen
     #: skill scores badly by construction, see the module docstring.
     semantic_gate_lexicon: tuple[str, ...] = ()
@@ -225,6 +230,8 @@ class VoiceBridgeConfig:
             raise ValueError("semantic_gate_model_path is required unless semantic_gate_mode is off")
         if not 0.0 <= float(self.semantic_gate_threshold) <= 1.0:
             raise ValueError("semantic_gate_threshold must be in [0, 1]")
+        if not float(self.semantic_gate_threshold) <= float(self.semantic_gate_model_only_threshold) <= 1.0:
+            raise ValueError("semantic_gate_model_only_threshold must be in [semantic_gate_threshold, 1]")
 
     @property
     def pairs_by_segment(self) -> bool:
@@ -1026,6 +1033,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         semantic_gate_mode=str(values["semantic_gate_mode"]),
         semantic_gate_model_path=str(values["semantic_gate_model_path"]),
         semantic_gate_threshold=float(values["semantic_gate_threshold"]),
+        semantic_gate_model_only_threshold=float(values["semantic_gate_model_only_threshold"]),
         semantic_gate_lexicon=_string_tuple(values["semantic_gate_lexicon_json"], "semantic_gate_lexicon"),
         semantic_gate_dialogue_requests=_string_tuple(
             values["semantic_gate_dialogue_requests_json"], "semantic_gate_dialogue_requests"

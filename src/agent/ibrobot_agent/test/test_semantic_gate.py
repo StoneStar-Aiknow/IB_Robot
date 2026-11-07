@@ -106,9 +106,33 @@ def test_naming_someone_else_in_the_room_is_not_addressed_to_the_robot():
     assert "someone else" in decision.reason
 
 
+def test_a_skill_word_inside_a_remark_about_the_robot_is_not_a_command():
+    # 2026-11-07 field session: "周哥举手的动作" reached the ASR as "这首歌举手的动作" -- the
+    # name vanished, the catalog word did not, and the robot raised its hand for a sentence
+    # that was about the action rather than asking for it.
+    gate = _quiet_gate(lexicon=("举手",))
+    decision = gate.judge("这首歌举手的动作")
+    assert decision.lexicon_hit
+    assert decision.rejected
+    # The same word in command position still passes without the model's help.
+    assert not _quiet_gate(lexicon=("鼓掌",)).judge("做个鼓掌的动作").rejected
+
+
+def test_a_mid_range_model_score_alone_does_not_open_the_pipeline():
+    # "放不下" scored 0.433 (vocabulary overlap) and the robot answered a colleague with
+    # sympathy. A score that merely clears the veto line is not evidence of an addressee.
+    payload = _payload([], bias=0.0)  # every sentence scores exactly 0.5
+    decision = SemanticGate(payload, threshold=0.10).judge("放不下")
+    assert decision.rejected
+    assert "without a skill word" in decision.reason
+    lenient = SemanticGate(payload, threshold=0.10, model_only_threshold=0.40)
+    assert not lenient.judge("放不下").rejected
+
+
 def test_a_bare_fragment_needs_a_session_the_addressee_gate_opened():
     # "怎么" scored 0.999: two characters carry no grammar, so the score is mostly the bias.
-    gate = _quiet_gate()
+    # The admission line is lowered here so the fragment rule, not the threshold, decides.
+    gate = _quiet_gate(model_only_threshold=0.80)
     assert gate.judge("挥").rejected
     assert not gate.judge("挥", session_open=True).rejected
 

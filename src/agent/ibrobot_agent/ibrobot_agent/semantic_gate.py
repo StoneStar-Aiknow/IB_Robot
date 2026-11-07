@@ -74,6 +74,38 @@ _LEXICON_MAX_BODY_CHARS = 10
 #: they only pass inside a session the addressee gate opened. Three characters still name
 #: a skill ("挥挥手", "点点头"), which is why the line sits at three, not four.
 _FRAGMENT_BODY_CHARS = 3
+#: Where a skill word may start to read as an instruction addressed to the robot: "做个鼓掌"
+#: yes, "这首歌举手的动作" (an ASR-mangled "周哥举手的动作") no. The field session of
+#: 2026-11-07 shows why the bare word is not enough: the sentence is *about* the action.
+_LEXICON_LEAD_CHARS = 3
+#: Verbs and request words that make a sentence imperative even when the skill word sits
+#: later: "我想看挥手" is a command, "这首歌举手的动作" is a remark about one.
+_COMMAND_MARKERS = (
+    "帮我",
+    "给我",
+    "帮忙",
+    "麻烦",
+    "请",
+    "做个",
+    "做一个",
+    "做一次",
+    "来一个",
+    "来个",
+    "一下",
+    "能不能",
+    "会不会",
+    "要不要",
+    "你会",
+    "可以",
+    "想",
+    "吗",
+    "吧",
+)
+#: Score a sentence with no skill word and no wake prefix must reach on its own. The model
+#: is a character bag: "清代你会过" shares "你会" with "你会做什么" and scored 1.000, while
+#: genuine requests without catalog vocabulary sit far lower. 0.90 is where the corpus'
+#: bimodal scores actually separate the two.
+_MODEL_ONLY_THRESHOLD = 0.90
 
 
 def _fnv1a32(text: str) -> int:
@@ -139,6 +171,7 @@ class SemanticGate:
         lexicon: tuple[str, ...] = (),
         dialogue_requests: tuple[str, ...] = (),
         wake_prefixes: tuple[str, ...] = (),
+        model_only_threshold: float = _MODEL_ONLY_THRESHOLD,
         source: str = "",
     ) -> None:
         feature = payload.get("feature")
@@ -160,6 +193,7 @@ class SemanticGate:
         self._pad = str(feature.get("pad", "<>")) or "<>"
         self._wake_words = tuple(str(item) for item in payload.get("wake_words", ()))
         self.threshold = float(threshold)
+        self.model_only_threshold = float(model_only_threshold)
         self.lexicon = tuple(item for item in (normalize_text(str(entry)) for entry in lexicon) if item)
         self.dialogue_requests = tuple(
             item for item in (normalize_text(str(entry)) for entry in dialogue_requests) if item
@@ -200,6 +234,7 @@ class SemanticGate:
                 lexicon=tuple(config.semantic_gate_lexicon),
                 dialogue_requests=tuple(config.semantic_gate_dialogue_requests),
                 wake_prefixes=tuple(config.semantic_gate_wake_prefixes),
+                model_only_threshold=float(config.semantic_gate_model_only_threshold),
             )
         except (OSError, ValueError) as error:
             if not config.semantic_gate_fail_open:
@@ -207,7 +242,8 @@ class SemanticGate:
             return None, f"semantic gate {mode} disabled: {error}"
         return gate, (
             f"semantic gate {mode}: {path} (threshold={gate.threshold:.2f}, "
-            f"lexicon={len(gate.lexicon)}, trained={gate.created_at or 'unknown'})"
+            f"model-only={gate.model_only_threshold:.2f}, lexicon={len(gate.lexicon)}, "
+            f"trained={gate.created_at or 'unknown'})"
         )
 
     def _body(self, text: str) -> str:
@@ -230,6 +266,15 @@ class SemanticGate:
                 logit += weight * (1.0 + math.log(count))
         logit = max(-_LOGIT_LIMIT, min(_LOGIT_LIMIT, logit))
         return 1.0 / (1.0 + math.exp(-logit))
+
+    def _leading_skill_word(self, body: str) -> bool:
+        """Whether a catalog word opens the sentence, or a request word makes it imperative."""
+        positions = [body.find(word) for word in self.lexicon if word in body]
+        if not positions:
+            return False
+        if min(positions) < _LEXICON_LEAD_CHARS:
+            return True
+        return any(marker in body for marker in _COMMAND_MARKERS)
 
     def judge(self, text: str, *, session_open: bool = False) -> SemanticDecision:
         """Decide whether ``text`` is addressed to the robot; stop/confirm never come here.
@@ -257,16 +302,30 @@ class SemanticGate:
         request_hit = next((phrase for phrase in self.dialogue_requests if phrase in raw_normalized), "")
         if request_hit:
             reason = "dialogue request"
-        elif lexicon_hit and (len(body) <= _LEXICON_MAX_BODY_CHARS or score >= self.threshold):
+        elif (
+            lexicon_hit
+            and self._leading_skill_word(body)
+            and (len(body) <= _LEXICON_MAX_BODY_CHARS or score >= self.threshold)
+        ):
             reason = "skill word"
         elif wake_prefix:
             reason = "wake prefix"
-        elif score >= self.threshold:
+        elif lexicon_hit:
+            # The word is there but the sentence is about the action, not a request for it,
+            # and a character-bag model cannot tell the two apart ("这首歌举手的动作" 1.000).
+            reason = f"mentions a skill word without asking for it ({len(body)} chars)"
+            rejected = True
+        elif score >= self.model_only_threshold:
             if len(body) < _FRAGMENT_BODY_CHARS and not session_open:
                 reason = f"fragment of {len(body)} chars outside a session"
                 rejected = True
             else:
                 reason = "model"
+        elif score >= self.threshold:
+            # High enough for the old rule, but the vocabulary overlap that produced it is
+            # not evidence: without a skill word, only a clear score may open the pipeline.
+            reason = f"score {score:.3f} below {self.model_only_threshold:.2f} without a skill word"
+            rejected = True
         else:
             reason = f"score {score:.3f} below {self.threshold:.2f}"
             rejected = True

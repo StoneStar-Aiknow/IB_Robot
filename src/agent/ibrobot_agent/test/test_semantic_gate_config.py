@@ -27,6 +27,7 @@ def test_the_gate_is_off_by_default():
     assert config.semantic_gate_mode == "off"
     assert config.semantic_gate_model_path == ""
     assert config.semantic_gate_threshold == pytest.approx(0.10)
+    assert config.semantic_gate_model_only_threshold == pytest.approx(0.90)
     assert config.semantic_gate_lexicon == ()
     assert config.semantic_gate_dialogue_requests == ()
     assert config.semantic_gate_wake_prefixes == ()
@@ -50,6 +51,15 @@ def test_threshold_must_be_a_probability():
             VoiceBridgeConfig(**SCOPE, semantic_gate_threshold=bad)
 
 
+def test_the_model_only_threshold_cannot_underbid_the_veto_line():
+    # Equal to the veto line is allowed: everything above it is admitted by the model alone.
+    VoiceBridgeConfig(**SCOPE, semantic_gate_threshold=0.10, semantic_gate_model_only_threshold=0.10)
+    with pytest.raises(ValueError, match="semantic_gate_model_only_threshold"):
+        VoiceBridgeConfig(**SCOPE, semantic_gate_threshold=0.30, semantic_gate_model_only_threshold=0.20)
+    with pytest.raises(ValueError, match="semantic_gate_model_only_threshold"):
+        VoiceBridgeConfig(**SCOPE, semantic_gate_model_only_threshold=1.5)
+
+
 def test_phrase_lists_are_declared_as_json_parameters():
     defaults = node_parameter_defaults()
     assert json.loads(defaults["semantic_gate_lexicon_json"]) == []
@@ -64,6 +74,7 @@ def test_parameters_round_trip_into_the_config():
             semantic_gate_mode="shadow",
             semantic_gate_model_path="/var/lib/ibrobot/addressee/model.json",
             semantic_gate_threshold=0.25,
+            semantic_gate_model_only_threshold=0.85,
             semantic_gate_lexicon_json=json.dumps(["挥挥手", "抓取"], ensure_ascii=False),
             semantic_gate_wake_prefixes_json=json.dumps(["灵犀", "林星"], ensure_ascii=False),
             semantic_gate_log_path="/var/log/ibrobot/semantic.jsonl",
@@ -73,6 +84,7 @@ def test_parameters_round_trip_into_the_config():
     assert config.semantic_gate_mode == "shadow"
     assert config.semantic_gate_model_path == "/var/lib/ibrobot/addressee/model.json"
     assert config.semantic_gate_threshold == pytest.approx(0.25)
+    assert config.semantic_gate_model_only_threshold == pytest.approx(0.85)
     assert config.semantic_gate_lexicon == ("挥挥手", "抓取")
     assert config.semantic_gate_wake_prefixes == ("灵犀", "林星")
     assert config.semantic_gate_log_path == "/var/log/ibrobot/semantic.jsonl"

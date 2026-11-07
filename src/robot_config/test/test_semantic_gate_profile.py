@@ -40,6 +40,27 @@ def test_an_unknown_mode_is_rejected():
     assert any("semantic_gate_mode must be off, shadow or enforce" in error for error in errors)
 
 
+def test_the_model_only_threshold_must_not_underbid_the_threshold():
+    errors = _validate_agent_voice_bridge(
+        _bridge(
+            semantic_gate_mode="enforce",
+            semantic_gate_model_path="/tmp/model.json",
+            semantic_gate_threshold=0.30,
+            semantic_gate_model_only_threshold=0.20,
+        )
+    )
+    assert any("must not be below semantic_gate_threshold" in error for error in errors)
+    for bad in (0, 1.5, True):
+        errors = _validate_agent_voice_bridge(
+            _bridge(
+                semantic_gate_mode="enforce",
+                semantic_gate_model_path="/tmp/model.json",
+                semantic_gate_model_only_threshold=bad,
+            )
+        )
+        assert any("semantic_gate_model_only_threshold must be in (0, 1]" in error for error in errors), bad
+
+
 def test_the_threshold_must_stay_inside_the_open_unit_interval():
     for bad in (0, 1, 2.5):
         errors = _validate_agent_voice_bridge(

@@ -87,6 +87,7 @@ robot:
         # this path on the board; a missing file only disables the gate (fail_open).
         semantic_gate_model_path: /root/workspace/lyx/addressee/addressee_zh_v1.json
         semantic_gate_threshold: 0.10
+        semantic_gate_model_only_threshold: 0.90
         semantic_gate_log_path: /var/log/ibrobot/semantic_gate.jsonl
         semantic_gate_fail_open: true
         # A catalog alias beats the model: "帮我抓取橘子" is rare in the corpus but

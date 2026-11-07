@@ -3263,6 +3263,11 @@ def _validate_semantic_gate(voice_bridge: dict[str, Any], prefix: str) -> list[s
     threshold = voice_bridge.get("semantic_gate_threshold", 0.1)
     if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0 < threshold < 1:
         errors.append(f"{prefix}.semantic_gate_threshold must be in (0, 1)")
+    model_only = voice_bridge.get("semantic_gate_model_only_threshold", 0.9)
+    if isinstance(model_only, bool) or not isinstance(model_only, int | float) or not 0 < model_only <= 1:
+        errors.append(f"{prefix}.semantic_gate_model_only_threshold must be in (0, 1]")
+    elif isinstance(threshold, int | float) and not isinstance(threshold, bool) and model_only < threshold:
+        errors.append(f"{prefix}.semantic_gate_model_only_threshold must not be below semantic_gate_threshold")
     for field_name in (
         "semantic_gate_lexicon",
         "semantic_gate_dialogue_requests",
