@@ -27,7 +27,7 @@
    打分、判定、shadow 日志）、`voice_bridge.py` 接入（停止词/确认之后、bypass 之前）、
    `loader.py` 的 `_validate_semantic_gate` 与 `embodied.py` 的参数转发、两个测试文件、
    `tools/addressee/`（training/eval/lexicon/dataset 四个脚本），模型产物按仓库惯例放在被 `.gitignore` 忽略的 `models/addressee/`、
-   部署 profile 的 `semantic_gate_*` 段（先 `shadow`，第 7 条修完后切 `enforce`）。
+   部署 profile 的 `semantic_gate_*` 段（`mode: enforce`，2026-11-07 14:38 起在板端运行）。
 7. **2026-11-07 现场会话修正（已实现、已测）**：第一场真实会话（14 句，14:17–14:26）暴露三类漏洞，
    规则各补一条——① 技能词只在指挥句（正文 ≤10 字）或模型分数 >0 时算证据；② 句中含他人称呼
    （哥/姐/老师/各位/你们…）判为非对机；③ 正文 <3 字的碎片只在寻址闸门开着的会话里放行。
@@ -225,60 +225,91 @@ LLM 的漏判集中在 `飞个吻`、`玛丽帮我挥一下手`、`帮我抓取�
 
 ```mermaid
 flowchart TD
-    A[ASR final transcript] --> B[停止词 / 猜测确认]
-    B -->|停止或应答| B1[原逻辑，不经闸门]
-    B -->|普通语句| C[AddresseeGate L1/L2]
-    C -->|未通过| C1[丢弃并记日志]
-    C -->|通过| D[SemanticGate L3]
-    D -->|技能词表命中| E[放行]
-    D -->|唤醒前缀| E
-    D -->|score >= 0.10| E
-    D -->|score < 0.10| F{mode}
-    F -->|shadow| E
-    F -->|enforce| G[丢弃并记日志]
-    E --> H[bypass / busy / 短句过滤 → /agent/request]
+    A["ASR final transcript"] --> B{"停止词 / 猜测确认"}
+    B -->|"停止或应答"| B1["原逻辑，不经闸门"]
+    B -->|"普通语句"| C{"回声窗口内？"}
+    C -->|"是"| C1["忽略（机器人自己的话）"]
+    C -->|"否"| D{"AddresseeGate L1/L2"}
+    D -->|"未通过"| D1["丢弃并记日志"]
+    D -->|"通过（当前 fail-open）"| E{"SemanticGate L3"}
+    E -->|"对话请求 / 唤醒前缀"| F["放行"]
+    E -->|"技能词在指挥位置"| F
+    E -->|"无技能词且 score >= 0.90"| F
+    E -->|"技能词非指挥位置 / score < 0.90"| G{"mode"}
+    G -->|"shadow"| F
+    G -->|"enforce"| H["丢弃并记 semantic_gate.jsonl"]
+    F --> I["bypass / busy / 短句过滤"]
+    I --> J["/agent/request"]
 ```
+
+判定顺序就是上面这张图的顺序，四条规则按优先级排列：他人称呼（拦）→ 对话请求（放）→ 技能词（看位置）
+→ 唤醒前缀（放）→ 模型分数（看 0.90 这条线）。
+
+注意 L1/L2 现在实际是 **fail-open** 的：profile 没有配 `addressee_trigger: vendor_session`，也没有
+`wake_phrases`，所以 `AddresseeGate` 对每一句都放行——真正在判定的只有 L3 和停止词/回声这两条规则。
+
+### 4.2.1 实际运行链路（2026-11-07 部署态）
+
+```mermaid
+flowchart LR
+    MIC["麦克风"] --> ASR["voice_asr<br/>sherpa-onnx 480ms"]
+    ASR -->|"/voice_command"| VB["voice_bridge<br/>（L3 闸门 + 停止词 + 回声）"]
+    VB -->|"放行"| REQ["/agent/request"]
+    REQ --> SVC["ibrobot_agent service"]
+    SVC -->|"catalog + 安全约束"| PL["planner<br/>qwen3.8-27b<br/>HTTP 10.42.0.100:18094"]
+    PL -->|"step 列表"| GATE["技能网关<br/>motion_authorized / control_mode"]
+    GATE --> EXEC["skill_executor"]
+    EXEC --> RT["aimdk_runtime<br/>named_motion"]
+    RT --> MC["厂商 MC<br/>STAND_DEFAULT"]
+```
+
+这条链上没有任何 jev 协议，也没有 laya：L3 是仓内的 `semantic_gate.py`（字符袋逻辑回归，
+纯标准库、约 45 µs/句、不出网），planner 是 OpenAI 兼容的 HTTP 服务，执行侧是 ROS 2 服务与
+`/aima/*` 厂商接口。laya/Vega 只在选型实验里出现过（Vega 零样本 67.6% @58 ms、
+laya multilingual 41–59% @22 ms，均低于仓内词袋模型），没有进入部署。
 
 ### 4.3 代码接入点
 
 | 文件 | 改动 | 规模 |
 |------|------|------|
 | `src/agent/ibrobot_agent/ibrobot_agent/semantic_gate.py` | 新增：`SemanticGate`（加载 model.json、特征、打分、词表、判定），ROS-free | 约 180 行 |
-| `src/agent/ibrobot_agent/ibrobot_agent/voice_bridge.py` | `VoiceBridgeConfig` 加 7 个字段；`_route_transcript` 在 `judge()` 之后插入 4 行调用；启动时加载模型（失败按 `fail_open` 处理）；`_PHRASE_FIELDS` 加 `semantic_gate_lexicon` | 约 40 行 |
+| `src/agent/ibrobot_agent/ibrobot_agent/voice_bridge.py` | `VoiceBridgeConfig` 加 11 个字段（mode / model_path / threshold / model_only_threshold / lexicon / dialogue_requests / wake_prefixes / log_path / fail_open / 两个短语列表参数）；`_route_transcript` 在 `judge()` 之后插入判定调用；启动时加载模型（失败按 `fail_open` 处理）；`_PHRASE_FIELDS` 加 3 个词表字段 | 约 60 行 |
 | `src/agent/ibrobot_agent/ibrobot_agent/voice_bridge.py` | 校验：`mode=enforce` 必须有模型路径；阈值有序；词表非空 | 约 15 行 |
-| `src/robot_config/config/robots/aimdk_x2_voice_mirror_all.yaml` | 追加 `semantic_gate` 段，`mode: shadow` | 8 行 |
+| `src/robot_config/config/robots/aimdk_x2_voice_mirror_all.yaml` | 追加 `semantic_gate` 段，`mode: enforce`（现场部署，站点 planer 地址不随仓） | 30 行 |
 | `src/agent/ibrobot_agent/test/test_semantic_gate.py` | 决策表、阈值边界、词表兜底、唤醒前缀、短句、模型缺失 fail_open | 约 200 行 |
 | `src/agent/ibrobot_agent/test/test_semantic_gate_config.py` | 参数解析与校验 | 约 80 行 |
 | `tools/addressee/{build_dataset.py,train.py,export_model.py,eval_model.py}` | 数据→训练→导出→评测 | 约 400 行 |
 
-调用点（`voice_bridge.py:565` 之后）：
+调用点（`voice_bridge.py` 的 `_route_transcript`，在 `self._gate.judge()` 之后、`bypass_phrases` 之前）：
 
 ```python
-verdict = self._gate.judge(...)
-if not verdict.addressed:
-    return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
-raw, normalized = verdict.raw, verdict.normalized
-if self._semantic is not None:
-    decision = self._semantic.judge(raw, normalized)
-    if decision.rejected:
-        self._log_semantic(raw, normalized, decision, enforced=self.config.semantic_gate_enforce)
-        if self.config.semantic_gate_enforce:
-            return [Log(f"semantic gate rejected {raw!r} (score={decision.score:.3f})")]
+decision = self._judge_semantics(raw, now)
+if decision is not None and decision.rejected:
+    if self.config.semantic_gate_mode == "enforce":
+        return [Log(f"semantic gate rejected {raw!r} ({decision.reason})")]
+    return [Log(f"semantic gate would reject {raw!r} ({decision.reason})")]
 ```
+
+`_judge_semantics()` 负责把 `session_open`（当前会话未闲置）算出来传给 `judge(text, session_open=...)`，
+并按 `semantic_gate_mode` 决定记日志还是直接丢弃；`off` 时整个函数直接返回 `None`，链路与接入前完全一致。
 
 ### 4.4 配置项（`VoiceBridgeConfig` 新增，参数自动声明）
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `semantic_gate_mode` | `"off"` | `off` / `shadow`（只记录）/ `enforce` |
-| `semantic_gate_model_path` | `""` | model.json 绝对路径；空=未配置 |
-| `semantic_gate_threshold` | `0.10` | 低于此分才考虑拦截 |
-| `semantic_gate_lexicon_json` | `"[]"` | 技能词表（可由 catalog 生成） |
+| `semantic_gate_mode` | `"off"` | `off` / `shadow`（只记录）/ `enforce`（丢弃） |
+| `semantic_gate_model_path` | `""` | model.json 绝对路径；`mode≠off` 时必填 |
+| `semantic_gate_threshold` | `0.10` | 否决线：低于此分且无技能词才拦 |
+| `semantic_gate_model_only_threshold` | `0.90` | 无技能词的句子要单独过的接受线（2026-11-07 现场事后加） |
+| `semantic_gate_lexicon_json` | `"[]"` | 技能词表（`tools/addressee/emit_lexicon.py` 从 catalog 生成） |
+| `semantic_gate_dialogue_requests_json` | `"[]"` | 对话请求短语（讲个故事/讲个笑话…），命中放行 |
 | `semantic_gate_wake_prefixes_json` | `"[]"` | 唤醒词变体前缀，命中放行 |
 | `semantic_gate_log_path` | `""` | 判定日志（JSONL，空=只进 ROS 日志） |
-| `semantic_gate_fail_open` | `true` | 模型加载失败时是否放行 |
+| `semantic_gate_fail_open` | `true` | 模型加载失败时是否放行（false 则启动即报错） |
 
-校验：`enforce` 必须有 `model_path` 且文件存在、`threshold ∈ [0,1]`、`lexicon` 元素非空；
+校验（`src/robot_config/robot_config/loader.py` 的 `_validate_semantic_gate`）：`enforce` 必须有
+`model_path`；`threshold ∈ (0,1)`；`model_only_threshold ∈ (0,1]` 且不得低于 `threshold`；
+三个词表都是非空字符串列表；`fail_open` 是 bool；`log_path` 是字符串。
 `shadow` 允许无模型（退化为空操作）。
 
 ### 4.5 模型产物格式（`model.json`，125 KB）
@@ -332,9 +363,10 @@ flowchart LR
 每条被判定的语句写一行 JSONL：
 
 ```json
-{"ts":"2026-11-07T12:03:11+0800","mode":"shadow","text":"回到抓取的初始状态",
- "score":0.02,"lexicon":false,"wake_prefix":false,"decision":"reject","enforced":false,
- "session_id":"…","after_wake":false,"prev_tts":true}
+{"ts":"2026-11-07T14:57:11+0800","mode":"enforce","text":"这首歌举手的动作",
+ "score":1.0,"lexicon":true,"wake_prefix":false,"decision":"reject",
+ "reason":"mentions a skill word without asking for it","address_term":"",
+ "session_id":"voice-session-b3b7b0aad8fc"}
 ```
 
 - `shadow` 期间这些日志就是下一版训练集；配合板上标注页（听录音/看文本，勾是/不是）可闭环。
@@ -359,12 +391,16 @@ flowchart LR
 
 ### 5.2 三阶段上线
 
-| 阶段 | 动作 | 判据 | 工作量 |
-|------|------|------|--------|
-| P0 shadow | 接入 + `mode: shadow` + 日志 | 采集 3 天现场判定分布，确认分数双峰、无异常 | 1 天 |
-| P1 校准 | 用 shadow 日志里的会话内样本重标阈值；补会话上下文特征 | 冻结集召回 ≥ 0.95、误杀 ≤ 0.15 | 2–3 天（需标注） |
-| P2 enforce | 打开拦截，观察 1 周 | 无「机器人不搭理」投诉、planner 无效调用下降 | 1 天 |
-| P3 可选 | 歧义带 LLM 复核 / 微调更大模型 | 召回再 +2pp 才值得 | 3–5 天 |
+实际进度（2026-11-07）：P0 与 P1 的现场校准已合并走完——14:17 先 `shadow` 采了 14 句就抓到了
+「同事对话把镜面会话停掉」这个硬伤，14:38 直接切 `enforce`，之后用 40 句真实语流做了两轮规则修正
+（见 §0 第 7、8 条）。下面的表保留原计划，`状态` 列写实际。
+
+| 阶段 | 动作 | 判据 | 工作量 | 状态 |
+|------|------|------|--------|------|
+| P0 shadow | 接入 + `mode: shadow` + 日志 | 采集判定分布，确认分数双峰、无异常 | 1 天 | **已完成**（14:17–14:37） |
+| P1 校准 | 用现场日志的会话内样本重标阈值；补上下文特征 | 冻结集召回 ≥ 0.95、误杀 ≤ 0.15 | 2–3 天（需标注） | **进行中**：已完成 5 条规则修正；冻结集仍需双人标注 |
+| P2 enforce | 打开拦截，观察 1 周 | 无「机器人不搭理」投诉、planner 无效调用下降 | 1 天 | **运行中**（14:38 起，含 15:23 的 A+C 修正） |
+| P3 可选 | 歧义带 LLM 复核 / 微调更大模型 | 召回再 +2pp 才值得 | 3–5 天 | 未开始 |
 
 回滚：改 `mode: off` 一行，重编 profile 或直接改板端 yaml 后重启；不涉及代码。
 
