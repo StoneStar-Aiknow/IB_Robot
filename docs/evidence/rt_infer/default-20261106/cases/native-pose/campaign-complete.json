@@ -1,0 +1,14 @@
+{
+  "status": "executed",
+  "numeric_checks": "passed",
+  "roles": [
+    "pear"
+  ],
+  "process_exits": [
+    {
+      "role": "pear",
+      "pid": 2273,
+      "returncode": 0
+    }
+  ]
+}

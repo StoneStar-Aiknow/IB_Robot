@@ -1,0 +1,20 @@
+{
+  "version": "2026.11.05-candidate10",
+  "prefix": "/opt/rt-infer/pr581-oee-2026.11.05",
+  "state": {
+    "status": "not-started-this-boot"
+  },
+  "module_loaded": false,
+  "ipc": null,
+  "device_users": [],
+  "management_device_users": [
+    1505,
+    1510,
+    1512,
+    1533,
+    1534,
+    1557,
+    1712
+  ],
+  "compatibility": "passed"
+}

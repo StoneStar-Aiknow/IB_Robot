@@ -1,0 +1,103 @@
+[
+  {
+    "name": "rt_infer_scheduler_supervisor-1",
+    "pid": 3075,
+    "returncode": 0,
+    "cmd": [
+      "/data/rtinfer-default-finish-20261106/install/lib/robot_config/rt_infer_scheduler_supervisor",
+      "--ros-args",
+      "-r",
+      "__node:=rt_infer_scheduler_supervisor",
+      "--params-file",
+      "/tmp/launch_params_kur7zjov"
+    ]
+  },
+  {
+    "name": "rt_infer_client-3",
+    "pid": 3079,
+    "returncode": 0,
+    "cmd": [
+      "/data/rtinfer-default-finish-20261106/install/lib/inference_service/rt_infer_client",
+      "--role",
+      "yolox",
+      "--rt-infer-config",
+      "/tmp/rt-infer-mz9gwvt3.json",
+      "--node-main",
+      "scripts.rt_infer.verify_default_integration:worker_main",
+      "--",
+      "--config",
+      "/data/rtinfer-default-finish-20261106/final-v3/soft-full-1/config.json",
+      "--workload-role",
+      "yolox",
+      "--ros-args",
+      "-r",
+      "__node:=rtinfer_verify_yolox"
+    ]
+  },
+  {
+    "name": "rt_infer_client-5",
+    "pid": 3083,
+    "returncode": 0,
+    "cmd": [
+      "/data/rtinfer-default-finish-20261106/install/lib/inference_service/rt_infer_client",
+      "--role",
+      "vl",
+      "--rt-infer-config",
+      "/tmp/rt-infer-mz9gwvt3.json",
+      "--node-main",
+      "scripts.rt_infer.verify_default_integration:worker_main",
+      "--",
+      "--config",
+      "/data/rtinfer-default-finish-20261106/final-v3/soft-full-1/config.json",
+      "--workload-role",
+      "vl",
+      "--ros-args",
+      "-r",
+      "__node:=rtinfer_verify_vl"
+    ]
+  },
+  {
+    "name": "rt_infer_client-2",
+    "pid": 3077,
+    "returncode": 0,
+    "cmd": [
+      "/data/rtinfer-default-finish-20261106/install/lib/inference_service/rt_infer_client",
+      "--role",
+      "pear",
+      "--rt-infer-config",
+      "/tmp/rt-infer-mz9gwvt3.json",
+      "--node-main",
+      "scripts.rt_infer.verify_default_integration:worker_main",
+      "--",
+      "--config",
+      "/data/rtinfer-default-finish-20261106/final-v3/soft-full-1/config.json",
+      "--workload-role",
+      "pear",
+      "--ros-args",
+      "-r",
+      "__node:=rtinfer_verify_pear"
+    ]
+  },
+  {
+    "name": "rt_infer_client-4",
+    "pid": 3081,
+    "returncode": 0,
+    "cmd": [
+      "/data/rtinfer-default-finish-20261106/install/lib/inference_service/rt_infer_client",
+      "--role",
+      "tts",
+      "--rt-infer-config",
+      "/tmp/rt-infer-mz9gwvt3.json",
+      "--node-main",
+      "scripts.rt_infer.verify_default_integration:worker_main",
+      "--",
+      "--config",
+      "/data/rtinfer-default-finish-20261106/final-v3/soft-full-1/config.json",
+      "--workload-role",
+      "tts",
+      "--ros-args",
+      "-r",
+      "__node:=rtinfer_verify_tts"
+    ]
+  }
+]

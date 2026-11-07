@@ -123,6 +123,26 @@ def test_launch_does_not_inject_legacy_skill_templates():
     assert "skill_templates_json" not in params
 
 
+@pytest.mark.parametrize("portable", [True, False])
+def test_runtime_audio_clips_resolve_workspace_before_reaching_the_executor(tmp_path, monkeypatch, portable):
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+    clip = tmp_path / "commissioning/audio/self_introduction.wav"
+    clip.parent.mkdir(parents=True)
+    clip.touch()
+    configured_path = "$(env WORKSPACE)/commissioning/audio/self_introduction.wav" if portable else str(clip)
+    config = {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "hermes",
+            "runtime_play_audio": {"enabled": True, "clips": {"self_intro": configured_path}},
+        }
+    }
+    nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
+    params = _skill_executor_params(nodes)
+    assert _decode_launch_json_string(params["runtime_play_audio_clips_json"]) == {"self_intro": str(clip)}
+    assert config["embodied"]["runtime_play_audio"]["clips"]["self_intro"] == configured_path
+
+
 @pytest.mark.parametrize("service", [None, "/custom/move_to_joint"])
 def test_providerless_motion_defaults_match_digest_endpoints(service):
     execution = {} if service is None else {"move_configuration_service": service}
@@ -1636,6 +1656,20 @@ def test_voice_bridge_reads_the_segment_tagged_transcripts_when_the_gate_pairs_b
     assert "transcript_topic" not in plain_params
 
 
+def test_external_audio_echo_filter_uses_segment_identity_even_without_speaker_gate():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        voice_asr_extra={
+            "input_mode": "external_vad",
+            "audio_input": {"topic": "/x2/speech_chunk"},
+            "transcript_topic": "/x2/transcript",
+        },
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+    assert _decode_launch_string(params["speech_chunk_topic"]) == "/x2/speech_chunk"
+    assert _decode_launch_string(params["transcript_topic"]) == "/x2/transcript"
+
+
 def test_voice_bridge_refuses_an_unbound_wake_event():
     with pytest.raises(ValueError, match="wake_event must be bound to a runtime description"):
         _voice_bridge_nodes(
@@ -1643,3 +1677,33 @@ def test_voice_bridge_refuses_an_unbound_wake_event():
             addressee_trigger="vendor_session",
             wake_event={"interface": "audio.wake_event", "type": "ibrobot_msgs/msg/SpeechWakeEvent"},
         )
+
+
+def test_pose_composer_gives_the_gateway_its_action_only_when_enabled(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+    assert "pose_composer_enabled" not in _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    config["pose_composer"] = {"enabled": True}
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    assert params["pose_composer_enabled"] is True
+    assert _decode_launch_string(params["pose_composer_action"]) == "/pose_composer/execute"
+    assert json.loads(_decode_launch_string(params["pose_catalog_json"])) == {}
+
+
+@pytest.mark.parametrize("memory", [False, True])
+@pytest.mark.parametrize("lookup", [None, False, True])
+def test_agent_pose_lookup_and_writable_feedback_are_independent(memory, lookup):
+    from embodied_bringup.launch_builders.embodied import _pose_memory_agent_params
+
+    config = {"pose_composer": {"enabled": True, "memory": {"enabled": memory}}}
+    if lookup is not None:
+        config["pose_composer"]["lookup"] = {"enabled": lookup}
+    params = _pose_memory_agent_params(config, {"pose_composer_enabled": True})
+    assert params["pose_lookup_service"] == ("/pose_composer/lookup" if lookup is not False else "")
+    assert params["pose_feedback_service"] == ("/pose_composer/feedback" if memory else "")
+    assert "pose_feedback_phrases_json" not in params
+    assert _pose_memory_agent_params(config, {"pose_composer_enabled": False}) == {
+        "pose_lookup_service": "",
+        "pose_feedback_service": "",
+    }

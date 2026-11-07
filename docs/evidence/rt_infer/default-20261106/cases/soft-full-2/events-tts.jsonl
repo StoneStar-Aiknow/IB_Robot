@@ -1,0 +1,5 @@
+{"stage": "handle_close_begin", "pid": 3393, "monotonic_ns": 1516189057224, "model": "fm"}
+{"stage": "handle_close_end", "pid": 3393, "monotonic_ns": 1516191443942, "model": "fm"}
+{"stage": "handle_close_begin", "pid": 3393, "monotonic_ns": 1516191704020, "model": "te"}
+{"stage": "handle_close_end", "pid": 3393, "monotonic_ns": 1518657488762, "model": "te"}
+{"stage": "worker_finished", "pid": 3393, "monotonic_ns": 1518662355767}

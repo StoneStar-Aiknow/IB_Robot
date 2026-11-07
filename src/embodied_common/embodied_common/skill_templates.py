@@ -58,6 +58,8 @@ SUPPORTED_SKILL_EXECUTORS = {
     # Playback of a recorded clip (the self-introduction): the catalog binds the
     # clip name, the deployment profile resolves the file.
     "runtime_play_audio",
+    # An arm pose composed from the user's description (target_name).
+    "pose_composer",
 }
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 

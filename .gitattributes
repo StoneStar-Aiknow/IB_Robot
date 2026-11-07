@@ -4,3 +4,6 @@ src/robots/aimdk/aimdk_description/meshes/**/*.STL filter=lfs diff=lfs merge=lfs
 third_party/wheels/**/*.whl binary
 third_party/vendor/**/*.so binary
 third_party/patches/fast_calib/**/*.patch whitespace=-blank-at-eol
+
+# Preserve RT-Infer distribution checksums on all clients.
+third_party/vendor/rt-infer/** -text

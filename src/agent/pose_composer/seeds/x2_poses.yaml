@@ -1,0 +1,104 @@
+# Seed poses for the X2 pose memory: pinned, recalled without a model call.
+#
+# Each is a description in the composer's own vocabulary (directions, or the
+# hand at a body point), not joint angles: the composer solves it against the
+# robot's current joint travel when it loads the seeds (and again whenever the
+# travel, rest pose, model or prompt changes), so a seed can never carry a
+# target outside the travel. The poses are the reference answers checked in
+# simulation (evidence phase1/02_reference_answers.png). Bump version to make
+# robots reload the file.
+version: 3
+poses:
+  - id: arms_down
+    user_message: 好的，双臂放下并回到休息位
+    phrases: [双臂放下, 放下双臂, 双手放下, 放下双手, 双臂休息位]
+    description:
+      kind: pose
+      left: {task_pose: arms_rest}
+      right: {task_pose: arms_rest}
+  - id: arms_forward
+    user_message: 好的，双手向前伸直
+    phrases: [双手向前伸直, 双手向前平举, 两只手向前伸直, 双手往前伸]
+    description:
+      kind: pose
+      left: {upper: [1, 0, 0], fore: [1, 0, 0]}
+      right: {upper: [1, 0, 0], fore: [1, 0, 0]}
+  - id: arms_up
+    user_message: 好的，双手举过头顶
+    phrases: [双手举过头顶, 双手都举过头顶, 双手举高, 举起双手, 双手举起来]
+    description:
+      kind: pose
+      left: {upper: [0, 0, 1], fore: [0, 0, 1]}
+      right: {upper: [0, 0, 1], fore: [0, 0, 1]}
+  - id: arms_out
+    user_message: 好的，双手侧平举
+    phrases: [双手侧平举, 双臂侧平举, 双手向两边伸直]
+    description:
+      kind: pose
+      left: {upper: [0, 1, 0], fore: [0, 1, 0]}
+      right: {upper: [0, -1, 0], fore: [0, -1, 0]}
+  - id: arms_v
+    user_message: 好的，欢呼
+    phrases: [欢呼, 欢呼一下, 双手举成V字]
+    description:
+      kind: pose
+      left: {upper: [0, 0.7, 0.7], fore: [0, 0.7, 0.7]}
+      right: {upper: [0, -0.7, 0.7], fore: [0, -0.7, 0.7]}
+  - id: flex
+    user_message: 好的，秀一下肌肉
+    phrases: [秀一下肌肉, 秀肌肉, 做一个弯曲手臂的姿势, 弯曲手臂]
+    description:
+      kind: pose
+      left: {upper: [0, 1, 0], fore: [0, 0, 1]}
+      right: {upper: [0, -1, 0], fore: [0, 0, 1]}
+  - id: surrender
+    user_message: 好的，举手投降
+    phrases: [投降, 做投降的姿势, 举手投降]
+    description:
+      kind: pose
+      left: {upper: [0, 1, 0], fore: [0, 0, 1]}
+      right: {upper: [0, -1, 0], fore: [0, 0, 1]}
+  - id: hands_on_hips
+    user_message: 好的，双手叉腰
+    phrases: [双手叉腰, 叉腰]
+    description:
+      kind: pose
+      left: {hand_to: waist_left, elbow: out}
+      right: {hand_to: waist_right, elbow: out}
+  - id: right_hand_on_head
+    user_message: 好的，右手靠近头顶，左臂回到休息位
+    phrases: [右手摸头顶, 右手摸头, 摸头]
+    description:
+      kind: pose
+      left: {task_pose: arms_rest}
+      # The articulated open hand needs clearance beyond the wrist landmark.
+      # Body frame offset (cm): x forward, y left, z up. No head contact.
+      right: {hand_to: head_top, elbow: out, offset_cm: [0, -5, 5]}
+  - id: salute
+    user_message: 好的，右手敬礼，左臂回到休息位
+    phrases: [敬礼, 敬个礼]
+    description:
+      kind: pose
+      left: {task_pose: arms_rest}
+      right: {hand_to: forehead, elbow: out, offset_cm: [7, -3, 0]}
+  - id: thinking
+    user_message: 好的，右手在下巴外侧做思考姿势，左臂回到休息位
+    phrases: [做一个思考的姿势, 思考, 托下巴]
+    description:
+      kind: pose
+      left: {task_pose: arms_rest}
+      right: {hand_to: chin, elbow: down, offset_cm: [8, -3, 0]}
+  - id: right_forward
+    user_message: 好的，右手向前伸直，左臂回到休息位
+    phrases: [右手向前伸直, 右手往前伸]
+    description:
+      kind: pose
+      left: {task_pose: arms_rest}
+      right: {upper: [1, 0, 0], fore: [1, 0, 0]}
+  - id: left_forward
+    user_message: 好的，左手向前伸直，右臂回到休息位
+    phrases: [左手向前伸直, 左手往前伸]
+    description:
+      kind: pose
+      left: {upper: [1, 0, 0], fore: [1, 0, 0]}
+      right: {task_pose: arms_rest}

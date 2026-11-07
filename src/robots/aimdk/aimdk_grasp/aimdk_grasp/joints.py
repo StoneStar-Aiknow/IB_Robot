@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from robot_runtime.hand_mounts import installed_hands as installed_hands
+
 ARM_PARTS = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw", "elbow", "wrist_yaw", "wrist_pitch", "wrist_roll")
 LEFT_ARM = tuple(f"left_{part}_joint" for part in ARM_PARTS)
 RIGHT_ARM = tuple(f"right_{part}_joint" for part in ARM_PARTS)
@@ -94,6 +96,12 @@ _NATIVE_SIGNS.setflags(write=False)
 
 def other_side(side: str) -> str:
     return "right" if check_side(side) == "left" else "left"
+
+
+#: Zero placeholders for an explicitly absent hand in the fixed 20-value
+#: command stream. These slots never stand in for measured feedback.
+ABSENT_HAND_COMMAND = np.zeros(len(HAND_PARTS))
+ABSENT_HAND_COMMAND.setflags(write=False)
 
 
 def swap_side_name(name: str) -> str:

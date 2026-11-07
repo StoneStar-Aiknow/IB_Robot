@@ -1,0 +1,11 @@
+{
+  "runtime_source_unchanged": true,
+  "changed_after_measurement": [
+    "docs/rt_infer_periodic.md"
+  ],
+  "added_after_measurement": [
+    "docs/rt_infer_default_integration_validation.md"
+  ],
+  "task_file_count": 47,
+  "report_tables_verified": true
+}

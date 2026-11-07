@@ -7,7 +7,10 @@
 # with an unknown-executor diagnostic, which is the intended guard against
 # exposing a skill nothing can run.
 #
-# The robot config documents the four edits that turn the pipeline on together.
+# The matching robot config enables this pipeline and requires its model bundles
+# and delegated grasp head to be available at launch.
+# Single-hand and dual-hand deployments share this catalog. The mounting and
+# preparation policy belongs to robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml.
 schema_version: 1
 name: aimdk_x2_voice_mirror_grasp
 robot_name: aimdk_x2_voice_mirror_grasp
@@ -37,5 +40,12 @@ enabled_skills:
   implementation: x2_runtime_v1
   planner_visible: true
 - name: pick_object
-  implementation: aimdk_x2_grasp
+  # Reuse the preparation-aware 150 s implementation, not its robot profile.
+  implementation: aimdk_x2_grasp_task_poses
+  planner_visible: true
+- name: free_pose
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: return_to_task_pose
+  implementation: x2_runtime_v1
   planner_visible: true

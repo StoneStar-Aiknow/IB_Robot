@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 from ibrobot_agent.addressee import Voiceprint
+from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE
 from ibrobot_agent.presentation import presentation_digest
 from ibrobot_agent.voice_bridge import (
     Log,
@@ -53,14 +54,108 @@ def test_transcript_becomes_agent_request_and_stop_phrase_bypasses_planner():
     assert [action.payload for action in _of(stop, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
 
 
-def test_busy_channel_drops_new_utterance_and_tells_user():
+def test_busy_channel_drops_new_utterance_and_briefly_names_current_task():
     core = _core()
     core.on_transcript("挥手", now=0.0)
 
     actions = core.on_transcript("点头", now=1.0)
 
     assert _of(actions, PublishRequest) == []
-    assert [action.text for action in _of(actions, Speak)] == [VoiceBridgeConfig.busy_message]
+    assert [a.text for a in _of(actions, Speak)] == ["正在做挥手，请稍等。"]
+    assert core.active_request_id == "voice-0"
+
+
+def test_busy_speech_is_rate_limited_and_expires_without_controlling_execution():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    first = core.on_transcript("你好", now=1.0)
+    assert [a.text for a in _of(first, Speak)] == ["正在做双手交叉放在胸前，请稍等。"]
+    assert not _of(first, PublishControl) and not _of(first, PublishRequest)
+    assert not _of(core.on_transcript("你好", now=2.0), Speak)
+    assert not core.speech_is_current(_of(first, Speak)[0], now=7.0)
+    later = core.on_transcript("你好", now=12.0)
+    assert len(_of(later, Speak)) == 1
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=13.0)
+    assert not core.speech_is_current(_of(later, Speak)[0], now=13.1)
+
+
+def test_acceptance_gets_one_async_receipt_and_never_waits_for_playback():
+    core = _core()
+    core.on_transcript("双手侧平举", now=0.0)
+    response = {"request_id": "voice-0", "accepted": True, "state": "RECEIVED"}
+    actions = core.on_response(response, now=0.01)
+    assert [a.text for a in _of(actions, Speak)] == ["收到，正在准备。"]
+    assert not _of(actions, Speak)[0].then
+    assert not core.on_response(response, now=0.02)
+    stop = core.on_partial("停", now=0.03)
+    assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
+
+
+def test_delayed_playback_text_and_captured_audio_cannot_trigger_busy_loop():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    core.note_speech("上次任务还没有完成任何步骤，现在重新执行。", now=1.0)
+    core.note_audio(("mic", 10), captured_at=1.2)
+    core.note_speech("上次任务还没有完成任何步骤，现在重新执行。", now=5.0, finished=True)
+    # ASR final arrives after the old playback+1s window, with a misrecognized first word.
+    actions = core.on_transcript("这个任务还没有完成任何步骤现在重新执行", now=6.24)
+    assert not _of(actions, Speak) and not _of(actions, PublishRequest)
+    actions = core.on_transcript("识别完全错误的内容", now=25.0, segment=("mic", 10))
+    assert not _of(actions, Speak) and not _of(actions, PublishRequest)
+    stop = core.on_transcript("停", now=25.1, segment=("mic", 10))
+    assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
+
+
+def test_internal_english_summary_is_not_sent_to_chinese_tts():
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    presentation = {
+        "summary": "continue_cross_arms_on_chest",
+        "steps": [{"skill_name": "free_pose", "target_name": "双手交叉放在胸前"}],
+        "execution_mode": ASYNC_PRESENTATION_MODE,
+    }
+    event = _event(
+        "voice-0",
+        "presentation",
+        "MAY_EXECUTE",
+        detail={
+            "presentation": presentation,
+            "presentation_digest": presentation_digest(presentation),
+            "async_display": True,
+        },
+    )
+    actions = core.on_event(event, now=1.0)
+    assert [a.text for a in _of(actions, Speak)] == ["正在执行：双手交叉放在胸前。"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "正在执行：free_pose: 双手交叉放在胸前。",
+        "正在执行：continue_cross_arms_on_chest。",
+        "正在执行：free_pose: 双手侧平举 (remembered)。",
+        "做一个V字动作。",
+    ],
+)
+def test_deployed_chinese_tts_never_receives_internal_english(text):
+    import re
+
+    from ibrobot_agent.voice_bridge import _tts_text
+
+    spoken = _tts_text(text)
+    assert re.search(r"[\u4e00-\u9fff]", spoken)
+    assert not re.search("[A-Za-z_]", spoken)
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_save_question_is_spoken_only_after_success(structured):
+    core = _core()
+    core.on_transcript("双手交叉放在胸前", now=0.0)
+    detail = {"save_prompt": "刚才这个动作到位吗？可以保存吗？"}
+    if structured:
+        detail.update(execution_id="pose-execution", gateway_sequence=1)
+    actions = core.on_event(_event("voice-0", "terminal", "SUCCEEDED", detail=detail), now=1.0)
+    assert [a.text for a in _of(actions, Speak)] == ["执行完成。刚才这个动作到位吗？可以保存吗？"]
 
 
 def test_auto_mode_executes_without_second_confirmation_once_plan_is_rendered():
@@ -92,7 +187,7 @@ def test_async_presentation_is_announced_without_a_receipt_or_a_confirmation_pro
 
     assert _of(actions, PublishControl) == []
     (speak,) = _of(actions, Speak)
-    assert speak.text == "正在执行：nod_yes。" and speak.then == ()
+    assert speak.text == "正在执行：当前动作。" and speak.then == ()
     assert not core.awaiting_confirmation
     assert any("cannot gate" in log.message for log in _of(actions, Log)) == (confirm_mode == "voice_confirm")
     # The robot is moving: a stop word still reaches the request.
@@ -259,69 +354,36 @@ def test_failed_terminal_is_spoken_without_technical_english():
 
 
 def test_speech_thread_survives_a_tts_error_and_still_acknowledges_later_plans():
-    """One raising render must not end the only consumer of the speech queue."""
-    import json
-    import logging
+    """A failed utterance cannot acknowledge a plan or kill later playback."""
     import threading
 
-    from ibrobot_agent.voice_bridge import _build_node_class
+    from ibrobot_agent.speech_pipeline import SpeechPipeline
 
-    node_class = _build_node_class()
     acknowledged = threading.Event()
+    attempts = []
+    receipts = []
 
-    class _Publisher:
-        def __init__(self, published: threading.Event | None = None) -> None:
-            self.messages: list[str] = []
-            self._published = published
+    def play(action, audio):
+        attempts.append(action.text)
+        if len(attempts) == 1:
+            raise RuntimeError("TTS service died mid-call")
+        return True
 
-        def publish(self, message) -> None:
-            self.messages.append(message.data)
-            if self._published is not None:
-                self._published.set()
+    def complete(action):
+        receipts.extend(action.then)
+        acknowledged.set()
 
-    class _Speaker:
-        def __init__(self) -> None:
-            self.attempts: list[str] = []
-
-        def speak(self, text: str) -> bool:
-            self.attempts.append(text)
-            if len(self.attempts) == 1:
-                raise RuntimeError("TTS service died mid-call")
-            return True
-
-    node = node_class.__new__(node_class)
-    node.get_logger = lambda: logging.getLogger("voice-bridge-test")
-    # Nothing to interrupt: speaking mutes ASR.
-    node._core = _core()
-    node._core_lock = threading.Lock()
-    node._mute_asr = True
-    node._asr_state = "listening"
-    node._deaf_until = 0.0
-    node._echo_until = 0.0
-    node._resume_settle_sec = 0.0
-    node._speaker = _Speaker()
-    node._control_publisher = _Publisher(acknowledged)
-    node._asr_control_publisher = _Publisher()
-    node._speech_wakeup = threading.Condition()
-    first = Speak("准备执行：点头。", then=(PublishControl({"control_type": "presentation_rendered", "n": 1}),))
-    second = Speak("准备执行：摇头。", then=(PublishControl({"control_type": "presentation_rendered", "n": 2}),))
-    node._speech_queue = [first, second]
-    node._speech_closed = False
-
-    speech_thread = threading.Thread(target=node._speech_loop, daemon=True)
-    speech_thread.start()
-
-    assert acknowledged.wait(timeout=5.0), "speech thread died on the first render"
-    assert node._speaker.attempts == ["准备执行：点头。", "准备执行：摇头。"]
-    # The plan whose speech failed is never acknowledged; the next one still is.
-    assert [json.loads(message)["n"] for message in node._control_publisher.messages] == [2]
-    # ASR is resumed after the failed render too, so the microphone is not left muted.
-    assert node._asr_control_publisher.messages == ["stop", "start", "stop", "start"]
-    with node._speech_wakeup:
-        node._speech_closed = True
-        node._speech_wakeup.notify_all()
-    speech_thread.join(timeout=1.0)
-    assert not speech_thread.is_alive()
+    pipeline = SpeechPipeline(synthesize=lambda action: action.text, play=play, completed=complete)
+    first = Speak("准备执行：点头。", then=(1,))
+    second = Speak("准备执行：摇头。", then=(2,))
+    try:
+        pipeline.submit(first)
+        pipeline.submit(second)
+        assert acknowledged.wait(timeout=5.0)
+        assert attempts == [first.text, second.text]
+        assert receipts == [2]
+    finally:
+        pipeline.close()
 
 
 @pytest.mark.parametrize("utterance", ["帮我停一下", "别动了谢谢", "快停下来", "STOP please"])
@@ -357,11 +419,14 @@ def test_partial_transcript_stops_once_before_the_utterance_ends():
     core.on_transcript("挥挥手", now=0.0)
 
     first = core.on_partial("停", now=1.0)
-    grown = core.on_partial("停下来", now=1.2)
+    # Both sides of this step matter: "停下" is itself a stop phrase, "停下来" only
+    # grows out of one. Neither may stop a second time inside the same utterance.
+    grown = core.on_partial("停下", now=1.2)
+    grown_further = core.on_partial("停下来", now=1.25)
     unrelated = core.on_partial("今天天气", now=1.3)
 
     assert [action.payload for action in _of(first, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
-    assert grown == [] and unrelated == []
+    assert grown == [] and grown_further == [] and unrelated == []
     # The final transcript of the same utterance belongs to that stop: no second stop, no request.
     final = core.on_transcript("停下来", now=2.0)
     assert _of(final, PublishRequest) == [] and _of(final, PublishControl) == []
@@ -445,7 +510,7 @@ def test_continuation_event_is_spoken_without_releasing_the_channel():
         _event("voice-0", "continuation", "PLANNING", "上次任务已完整完成 1/3 步，现在继续剩余部分"), now=1.0
     )
 
-    assert [action.text for action in _of(actions, Speak)] == ["上次任务已完整完成 1/3 步，现在继续剩余部分"]
+    assert [action.text for action in _of(actions, Speak)] == ["从当前位置继续准备。"]
     assert core.active_request_id == "voice-0"
 
 
@@ -454,7 +519,7 @@ def test_continuation_event_is_spoken_without_releasing_the_channel():
     [
         (
             {"accepted": False, "state": "BUSY", "reason_code": "BUSY", "message": "robot scope has an active request"},
-            VoiceBridgeConfig.busy_message,
+            None,
         ),
         (
             {
@@ -473,7 +538,7 @@ def test_rejected_admission_is_spoken_in_chinese(response, spoken):
 
     actions = core.on_response({"request_id": "voice-0", **response}, now=1.0)
 
-    assert [action.text for action in _of(actions, Speak)] == [spoken]
+    assert [action.text for action in _of(actions, Speak)] == ([] if spoken is None else [spoken])
 
 
 @pytest.mark.parametrize(
@@ -520,7 +585,7 @@ def _speaking_node(core, heard_during_playback):
             self.data = data
 
     class _Speaker:
-        def speak(self, text: str) -> bool:
+        def play(self, audio) -> bool:
             for heard in heard_during_playback:
                 node._on_transcript(_Message(heard))
             return True
@@ -549,7 +614,7 @@ def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
     # The robot hears its own busy reply and then the user's stop word.
     node = _speaking_node(core, [VoiceBridgeConfig.busy_message, "停"])
 
-    node._render_speech(Speak(VoiceBridgeConfig.busy_message))
+    node._render_speech(Speak(VoiceBridgeConfig.busy_message), [])
 
     assert node._asr_control_publisher.messages == []  # ASR was never muted
     assert [json.loads(data) for data in node._control_publisher.messages] == [
@@ -558,12 +623,33 @@ def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
     assert node._request_publisher.messages == []  # the echo was not routed as a command
 
 
+def test_terminal_feedback_does_not_delay_stop_control():
+    """Speech submission must not hold up the independent stop publisher."""
+    core = _core()
+    core.on_transcript("双手侧平举", now=0.0)
+    node = _speaking_node(core, [])
+    submitted = []
+
+    class Pipeline:
+        def submit(self, action):
+            submitted.append(action)
+            return True
+
+    node._speech_pipeline = Pipeline()
+    node._execute([Speak("正在做双手侧平举，请稍等。", kind="busy")])
+    node._execute(core.on_partial("停", now=1.0))
+    assert node._control_publisher.messages
+    node._execute(core.on_event(_event("voice-0", "terminal", "CANCELLED"), now=2.0))
+    assert submitted[-1].text == "已停止。"
+    assert submitted[-1].kind == "terminal"
+
+
 def test_reply_with_a_stop_word_still_mutes_asr():
     core = _core()
     core.on_transcript("挥挥手", now=0.0)
     node = _speaking_node(core, ["已停止"])
 
-    node._render_speech(Speak("已停止。"))
+    node._render_speech(Speak("已停止。"), [])
 
     assert node._asr_control_publisher.messages == ["stop", "start"]
     assert node._control_publisher.messages == []
@@ -641,7 +727,7 @@ def test_a_previewed_plan_on_the_receipt_path_is_still_rendered_before_its_recei
 
     assert _of(actions, PublishControl) == []
     (speak,) = _of(actions, Speak)
-    assert speak.text == "准备执行：nod_yes。"
+    assert speak.text == "准备执行：当前动作。"
     (ack,) = speak.then
     assert ack.payload["operation"] == "presentation_rendered"
 
@@ -909,6 +995,32 @@ MODEL = "campplus@test"
 ALICE = Voiceprint((1.0, 0.0, 0.0), MODEL)
 BOB = Voiceprint((0.0, 1.0, 0.0), MODEL)
 SPEAKER = {**WAKE, "speaker_check_enabled": True, "speaker_min_similarity": 0.5, "speaker_max_age_sec": 2.5}
+
+
+def test_verified_speech_renews_the_window_even_while_the_robot_is_busy():
+    core = _core(**SPEAKER)
+    core.on_measurement("speaker", ALICE, now=1.0, segment=_seg(1))
+    core.on_transcript("灵犀灵犀挥个手", now=1.0, segment=_seg(1))
+    for index, moment in enumerate((10.0, 20.0, 30.0), start=2):
+        core.on_measurement("speaker", ALICE, now=moment, segment=_seg(index))
+        actions = core.on_transcript("继续聊一会儿", now=moment, segment=_seg(index))
+        assert not _of(actions, PublishRequest)
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=31.0)
+    core.on_measurement("speaker", ALICE, now=40.0, segment=_seg(5))
+    actions = core.on_transcript("举个手", now=40.0, segment=_seg(5))
+    assert [action.payload["text"] for action in _of(actions, PublishRequest)] == ["举个手"]
+
+
+@pytest.mark.parametrize("voice", [BOB, None, Voiceprint(ALICE.vector, "other-model")])
+def test_unverified_speech_does_not_renew_the_window_while_busy(voice):
+    core = _core(**SPEAKER)
+    core.on_measurement("speaker", ALICE, now=1.0, segment=_seg(1))
+    core.on_transcript("灵犀灵犀挥个手", now=1.0, segment=_seg(1))
+    core.on_measurement("speaker", voice, now=10.0, segment=_seg(2))
+    core.on_transcript("继续聊一会儿", now=10.0, segment=_seg(2))
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=11.0)
+    core.on_measurement("speaker", ALICE, now=14.0, segment=_seg(3))
+    assert not _of(core.on_transcript("举个手", now=14.0, segment=_seg(3)), PublishRequest)
 
 
 def test_enabling_the_check_makes_the_node_subscribe_to_the_voiceprints():

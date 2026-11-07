@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -135,6 +136,16 @@ def _resolve_topic(source: str, robot_config: dict[str, Any] | None) -> str:
 
 
 def _extract_field(stdout: str, field: str) -> object | None:
+    # The X2 FastDDS build writes discovery diagnostics to stdout, even after
+    # the YAML message. Strip only its timestamped diagnostic lines; otherwise
+    # valid JointState YAML becomes unparseable. The source/field allowlist is
+    # unchanged.
+    stdout = re.sub(r"\x1b\[[0-9;]*m", "", stdout)
+    stdout = "\n".join(
+        line
+        for line in stdout.splitlines()
+        if not re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[(?:Warning|Error|Info)\]", line)
+    )
     # ros2 topic echo prints the message first and a trailing document separator;
     # parsing from the first separator would discard that message entirely.
     try:

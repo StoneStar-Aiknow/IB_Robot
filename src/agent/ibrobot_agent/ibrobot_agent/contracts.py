@@ -104,6 +104,7 @@ _PLANNER_FIELDS = {
     "reason_code",
     "steps",
     "summary",
+    "pose_feedback",
 }
 
 
@@ -323,11 +324,17 @@ class PlannerOutcome:
     #: Provenance only: never part of to_dict() or equality, so digests and stored outcomes
     #: describe what the robot was asked to do, not how the model's reply was fitted to it.
     repairs: tuple[PlannerRepair, ...] = field(default=(), compare=False)
+    pose_feedback: str | None = None
 
     def __post_init__(self) -> None:
         if self.kind not in {"conversation", "read_only", "needs_clarification", "rejected", "workflow"}:
             raise ValueError("PlannerOutcome.kind is invalid")
         object.__setattr__(self, "user_message", _non_empty_text(self.user_message, "user_message", max_length=150))
+        if self.pose_feedback is not None:
+            if self.pose_feedback not in {"accept", "decline", "clarify", "new_task", "offer"}:
+                raise ValueError("pose_feedback is invalid")
+            if self.pose_feedback in {"clarify", "offer"} and self.kind not in {"conversation", "needs_clarification"}:
+                raise ValueError("clarify/offer cannot carry an executable outcome")
         normalized_missing_fields = tuple(
             _non_empty_text(field_name, "missing_fields item", max_length=64) for field_name in self.missing_fields
         )
@@ -394,6 +401,8 @@ class PlannerOutcome:
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"kind": self.kind, "user_message": self.user_message}
+        if self.pose_feedback is not None:
+            result["pose_feedback"] = self.pose_feedback
         if self.query_kind is not None:
             result["query_kind"] = self.query_kind
         if self.skill_name is not None:
@@ -481,9 +490,14 @@ class ExecutionResult:
         if self.status not in {"succeeded", "failed", "cancelled", "unknown"}:
             raise ValueError("ExecutionResult.status is invalid")
         object.__setattr__(self, "error_code", _text(self.error_code, "error_code", max_length=64))
-        object.__setattr__(self, "message", _text(self.message, "message", max_length=300))
         if not isinstance(self.detail, Mapping):
             raise TypeError("detail must be a mapping")
+        message = _text(self.message, "message")
+        if len(message) > 300:
+            # Diagnostic verbosity must never change an established execution state.
+            object.__setattr__(self, "detail", {**self.detail, "raw_message": message, "message_truncated": True})
+            message = message[:299] + "…"
+        object.__setattr__(self, "message", message)
         if self.task_ref is not None and not isinstance(self.task_ref, TaskRef):
             raise TypeError("task_ref must be a TaskRef or None")
 
@@ -648,6 +662,30 @@ class CatalogPort(Protocol):
     def get_catalog(self, status: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
+class PosePreviewPort(Protocol):
+    """Compose an arm pose while the plan is prepared (pose_composer's ComposeArmPose).
+
+    Returns ``success``, ``error_code``, ``message``, ``kind`` (pose, sequence,
+    rejected, no_motion), ``user_message``, ``composition_id``,
+    ``description_json``, ``duration_sec`` and ``approximate``.
+    """
+
+    def compose(self, text: str, *, session_id: str = "", utterance: str = "") -> Mapping[str, Any]: ...
+
+
+class PoseMemoryPort(Protocol):
+    """pose_composer's memory: LookupArmPose and ArmPoseFeedback.
+
+    ``lookup`` returns ``hit``, ``pose_id``, ``state`` and ``user_message`` for a
+    confirmed remembered pose; ``feedback`` takes good, bad or next_task and
+    returns ``success``, ``pose_id`` and ``message``.
+    """
+
+    def lookup(self, text: str) -> Mapping[str, Any]: ...
+
+    def feedback(self, session_id: str, verdict: str) -> Mapping[str, Any]: ...
+
+
 class EventSink(Protocol):
     def publish(self, event: AgentEvent) -> None: ...
 
@@ -790,6 +828,7 @@ def planner_outcome_from_mapping(payload: Mapping[str, Any], *, steps: Sequence[
         reason_code=payload.get("reason_code"),
         steps=normalized_steps,
         summary=payload.get("summary", ""),
+        pose_feedback=payload.get("pose_feedback"),
     )
 
 

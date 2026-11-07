@@ -394,9 +394,9 @@ class TestSkipLogging:
         # Each skipped entry is reported exactly once (teleop, navigation,
         # task_executor and rerun_visualizer moved out of the builtin table;
         # their skip behavior is pinned by their owning packages through
-        # injected entry points; benchmark is the retained enabled-predicate
-        # skip under this context).
-        assert len([message for message in messages if "skipped" in message]) == 1
+        # injected entry points; benchmark and rt_infer_scheduler are the
+        # retained enabled-predicate skips under this context).
+        assert len([message for message in messages if "skipped" in message]) == 2
 
     def test_mock_skip_skips_are_logged_with_the_key(self, monkeypatch):
         context = LaunchBuildContext(

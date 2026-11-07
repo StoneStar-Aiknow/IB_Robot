@@ -1,0 +1,34 @@
+# Compose an arm pose from a description in the user's words (pose_composer).
+#
+# Called while a plan is being prepared, before it is presented: the composed
+# joint targets are kept by the composer under composition_id and executed by
+# ExecuteArmPose for the same text, so what the user confirms is what runs.
+
+string text
+# The Agent conversation the request belongs to: relative instructions ("a bit
+# higher") are read against that conversation's last pose only.
+string session_id
+# The user's own words when they differ from text (the planner may rephrase);
+# kept as a second way to recall the same pose from memory. "" if unknown.
+string utterance
+---
+bool success
+# "" on success; otherwise POSE_EMPTY_TEXT, POSE_NO_JOINT_STATE, POSE_MODEL_FAILED,
+# POSE_NOT_EXECUTABLE, POSE_NO_SAFE_PATH or POSE_BUSY.
+string error_code
+string message
+# pose | sequence (motion follows), rejected | no_motion (nothing will move).
+string kind
+# One spoken sentence for the user: what the robot will do, or why not.
+string user_message
+string composition_id
+# The model's per-arm description, as JSON (directions or body points).
+string description_json
+# Planned motion time from the current pose, including holds.
+float32 duration_sec
+# Some part could only be approximated (out of reach or too close to the body).
+bool approximate
+# The pose came from the pose memory (no language model call).
+bool from_memory
+# The remembered pose this composition is (or will become once it succeeds); "" if not memorable.
+string pose_id

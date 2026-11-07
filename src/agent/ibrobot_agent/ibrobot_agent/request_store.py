@@ -201,10 +201,63 @@ class SQLiteRequestStore(RequestStore):
     def is_robot_quarantined(self, robot_scope: str) -> bool:
         with self._transaction(read_only=True):
             row = self._connection.execute(
-                "SELECT 1 FROM requests WHERE robot_scope = ? AND state = 'UNKNOWN' LIMIT 1",
+                """SELECT 1 FROM requests r WHERE robot_scope = ? AND state = 'UNKNOWN'
+                AND NOT EXISTS (SELECT 1 FROM request_resolutions s WHERE
+                    s.robot_scope=r.robot_scope AND s.channel_id=r.channel_id
+                    AND s.principal_id=r.principal_id AND s.request_id=r.request_id) LIMIT 1""",
                 (robot_scope,),
             ).fetchone()
             return row is not None
+
+    def reconcile_unknown(self, key, *, caller_scope, terminal, operator_scope, evidence):
+        """Record verified Gateway evidence without changing or replaying the UNKNOWN request.
+
+        The offline maintenance caller must hold both deployment/writer locks.
+        Evidence must identify the exact submitted Program and catalog, not idle status.
+        """
+        if not operator_scope.strip() or not evidence.strip():
+            raise ValueError("operator and evidence are required")
+        with self._transaction():
+            row = self._fetch_row(key)
+            if row is None or row["state"] != "UNKNOWN" or not row["may_have_submitted"]:
+                raise ValueError("only a submitted UNKNOWN request can be reconciled")
+            ref = _task_ref_from_json(row["task_ref_json"])
+            if ref is None:
+                raise ValueError("request has no saved task identity")
+            expected = {
+                "request_id": key.request_id,
+                "robot_id": key.robot_scope,
+                "caller_scope": caller_scope,
+                "program_digest": ref.plan_digest,
+                "actual_registry_epoch": ref.registry_epoch,
+                "actual_registry_generation": ref.registry_generation,
+                "actual_registry_digest": ref.registry_digest,
+            }
+            if any(terminal.get(k) != v for k, v in expected.items()):
+                raise ValueError("Gateway terminal identity differs from saved request")
+            state = terminal.get("state")
+            completed = terminal.get("completed_step_count")
+            if state not in {"SUCCEEDED", "FAILED", "CANCELED"} or not terminal.get("execution_id"):
+                raise ValueError("a definite Gateway terminal is required")
+            if type(completed) is not int or not 0 <= completed <= ref.expected_step_count:
+                raise ValueError("invalid Gateway progress")
+            if state == "SUCCEEDED" and completed != ref.expected_step_count:
+                raise ValueError("incomplete success cannot be reconciled")
+            proof = {"operator_scope": operator_scope, "evidence": evidence, "gateway_terminal": dict(terminal)}
+            values = _request_key_tuple(key)
+            previous = self._connection.execute(
+                "SELECT proof_json FROM request_resolutions WHERE robot_scope=? AND channel_id=? AND principal_id=? AND request_id=?",
+                values,
+            ).fetchone()
+            if previous is not None:
+                if previous["proof_json"] != to_canonical_json(proof):
+                    raise ValueError("reconciliation evidence is immutable")
+                return
+            self._connection.execute(
+                "INSERT INTO request_resolutions VALUES (?, ?, ?, ?, ?, ?)",
+                (*values, to_canonical_json(proof), self._clock()),
+            )
+            self._append_event_locked(key, event_type="operator_reconciled", state="UNKNOWN", detail=proof)
 
     def recover_interrupted_requests(self, robot_scope: str) -> int:
         """Converge abandoned requests before the deployment owner accepts work.
@@ -562,6 +615,14 @@ class SQLiteRequestStore(RequestStore):
                     detail_json TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     PRIMARY KEY (robot_scope, channel_id, principal_id, request_id, sequence)
+                );
+                CREATE TABLE IF NOT EXISTS request_resolutions (
+                    robot_scope TEXT NOT NULL, channel_id TEXT NOT NULL,
+                    principal_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                    proof_json TEXT NOT NULL, resolved_at TEXT NOT NULL,
+                    PRIMARY KEY (robot_scope, channel_id, principal_id, request_id),
+                    FOREIGN KEY (robot_scope, channel_id, principal_id, request_id)
+                        REFERENCES requests(robot_scope, channel_id, principal_id, request_id)
                 );
                 -- Additive and optional: older binaries still open a database that has it.
                 CREATE INDEX IF NOT EXISTS requests_session_idx

@@ -26,6 +26,25 @@ from ibrobot_agent.contracts import (
 )
 
 
+@pytest.mark.parametrize("length", [300, 301])
+def test_execution_message_length_preserves_terminal_and_diagnostics(length):
+    message = "诊" * length
+    detail = {"completed_step_count": 3}
+    result = ExecutionResult("failed", None, "HAND_PRESERVED_MOVED", message, detail)
+    assert result.status == "failed"
+    assert result.error_code == "HAND_PRESERVED_MOVED"
+    assert len(result.message) <= 300
+    assert detail == {"completed_step_count": 3}
+    assert result.detail["completed_step_count"] == 3
+    if length > 300:
+        assert result.message == message[:299] + "…"
+        assert result.detail["raw_message"] == message
+        assert result.detail["message_truncated"] is True
+    else:
+        assert result.message == message
+        assert result.detail == detail
+
+
 def _request() -> AgentRequest:
     return AgentRequest(
         schema_version=1,

@@ -40,6 +40,9 @@ setup(
             "global_inference_scheduler_node = inference_service.global_inference_scheduler_node:main",
             "model_service_node = inference_service.model_service_node:main",
             "recording_node = inference_service.recording_node:main",
+            # RT-Infer client wrapper: execs the real node main under the
+            # vendor priorityctl so the node process is the tracked client.
+            "rt_infer_client = inference_service.rt_infer_client:main",
         ],
         # Cross-package launch-builder registration (openspec change
         # ``migrate-business-launch-builders``): robot_config discovers this

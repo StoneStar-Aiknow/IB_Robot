@@ -1,14 +1,10 @@
 """Bridge final ASR transcripts into the incubating Agent request contract.
 
-``voice_asr_node`` publishes plain final text (``std_msgs/String``); the Agent
-only accepts the JSON envelope on ``/agent/request`` and blocks execution until
-a client acknowledges the exact-plan ``presentation`` event.  This module is the
-voice client of that contract: it wraps utterances into requests, routes stop
-keywords to ``/agent/control`` (already from partial transcripts, so motion stops
-before the utterance ends), renders presentations (log, optional TTS) before
-acknowledging them, and speaks Agent replies.  While a request can still be
-interrupted, speaking never mutes ASR: the stop keyword stays live and the
-bridge's own replies (which therefore carry no stop word) are filtered out.
+``voice_asr_node`` publishes final transcripts. This client wraps them into
+Agent requests and sends stop controls immediately. Typed Programs display
+plans asynchronously; only legacy Agent Plans wait for presentation receipts.
+Synthesis and playback run as separate serial stages. Ordinary ready speech
+is replaceable; dependent presentation receipts remain ordered.
 
 ``VoiceBridgeCore`` is ROS-free and returns transport actions so the protocol
 logic is unit-testable; ``VoiceBridgeNode`` only executes those actions.
@@ -19,13 +15,15 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import tempfile
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from typing import Any
 
 from embodied_common.control_phrases import STOP_PHRASES
@@ -42,6 +40,8 @@ from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE, TERMINAL_REQUEST_ST
 from ibrobot_agent.execution_feedback import FeedbackTracker, execution_reply
 from ibrobot_agent.presentation import presentation_digest
 from ibrobot_agent.semantic_gate import SEMANTIC_GATE_MODES, SemanticGate
+from ibrobot_agent.speech_pipeline import SpeechPipeline
+from ibrobot_agent.speech_policy import GraspSpeechPolicy
 
 CONFIRM_MODES = ("auto", "voice_confirm")
 _ACTIVE_ASR_STATES = {"listening", "recognizing"}
@@ -133,6 +133,8 @@ class VoiceBridgeConfig:
     session_idle_sec: float = 120.0
     min_text_chars: int = 2
     request_timeout_sec: float = 180.0
+    speech_mode: str = "standard"
+    speech_messages_json: str = "{}"
     speak_replies: bool = True
     # Consume execution feedback for this text channel without accepting speech commands.
     feedback_only: bool = False
@@ -176,6 +178,7 @@ class VoiceBridgeConfig:
     semantic_gate_fail_open: bool = True
 
     def __post_init__(self) -> None:
+        GraspSpeechPolicy(self.speech_mode, json.loads(self.speech_messages_json))
         if not str(self.robot_scope).strip():
             raise ValueError("robot_scope must be the Agent's robot scope")
         if self.confirm_mode not in CONFIRM_MODES:
@@ -292,6 +295,11 @@ class Speak:
     then: tuple[Any, ...] = ()
     execution_id: str = ""
     terminal: bool = False
+    request_id: str = ""
+    kind: str = "reply"
+    expires_at: float = float("inf")
+    notice: Any = None
+    important: bool = False
 
 
 @dataclass(frozen=True)
@@ -370,6 +378,9 @@ class _BridgeState:
     # Stopped by this channel but not yet terminal: the Agent may not have seen
     # the stop when it publishes the preview, so the channel drops it itself.
     stopped_request_id: str = ""
+    task_label: str = "当前任务"
+    last_busy_at: float = float("-inf")
+    receipt_spoken: bool = False
 
 
 def _normalize(text: str) -> str:
@@ -393,6 +404,9 @@ class VoiceBridgeCore:
         self.config = config
         self._state = _BridgeState()
         self._feedback = FeedbackTracker()
+        self._speech_policy = GraspSpeechPolicy(config.speech_mode, json.loads(config.speech_messages_json))
+        self._receipt_due: dict[str, float] = {}
+        self._announced_requests: set[str] = set()
         self._id_factory = id_factory or (lambda: f"voice-{uuid.uuid4().hex[:12]}")
         self._gate = AddresseeGate(
             trigger=config.addressee_trigger,
@@ -406,6 +420,50 @@ class VoiceBridgeCore:
         #: L3 semantic gate, or None when off/unloadable; ``semantic_status`` says which and why,
         #: so the node can report a model that silently disabled itself.
         self._semantic, self.semantic_status = SemanticGate.from_config(config)
+        self._recent_speech: deque[tuple[str, float]] = deque(maxlen=16)
+        self._speech_windows: deque[list[float]] = deque(maxlen=16)
+        self._echo_segments: OrderedDict[Segment, None] = OrderedDict()
+
+    def note_speech(self, text: str, now: float, *, finished: bool = False) -> None:
+        self._recent_speech.append((_normalize(text), now))
+        if finished:
+            if self._speech_windows:
+                self._speech_windows[-1][1] = now + 1.0
+        else:
+            self._speech_windows.append([now, float("inf")])
+
+    def note_audio(self, segment: Segment, captured_at: float) -> None:
+        if any(start <= captured_at <= end for start, end in self._speech_windows):
+            self._echo_segments[segment] = None
+            while len(self._echo_segments) > 128:
+                self._echo_segments.popitem(last=False)
+
+    def is_recent_echo(self, text: str, now: float) -> bool:
+        if self.is_stop_text(text):
+            return False
+        value = _normalize(text)
+        return len(value) >= 6 and any(
+            now - stamp <= 20.0 and SequenceMatcher(None, value, spoken).ratio() >= 0.78
+            for spoken, stamp in self._recent_speech
+        )
+
+    def speech_is_current(self, action: Speak, now: float) -> bool:
+        if action.notice is not None:
+            if (
+                not action.terminal
+                and action.request_id
+                and (
+                    action.request_id in self._state.finished_request_ids
+                    or self._state.stopped_request_id == action.request_id
+                )
+            ):
+                return False
+            return self._speech_policy.is_current(action.notice, now)
+        return action.kind not in ("busy", "receipt") or (
+            action.request_id == self.active_request_id
+            and self._state.stopped_request_id != action.request_id
+            and now < action.expires_at
+        )
 
     @property
     def active_request_id(self) -> str:
@@ -481,6 +539,8 @@ class VoiceBridgeCore:
         if self.config.feedback_only:
             return []
         heard_at = now if heard_at is None else heard_at
+        if not self.is_stop_text(text) and (segment in self._echo_segments or self.is_recent_echo(text, now)):
+            return [Log(f"ignored recent playback echo: {text!r}")]
         stopped_by_partial, self._state.utterance_stopped = self._state.utterance_stopped, False
         heard = str(text).strip()
         raw = self.config.correct(heard)
@@ -666,7 +726,18 @@ class VoiceBridgeCore:
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
             return [Log(f"ignored bypass utterance {raw!r}")]
         if state.active_request_id:
-            return [Log(f"busy with {state.active_request_id}; dropped {raw!r}"), *self._say(self.config.busy_message)]
+            actions = [Log(f"busy with {state.active_request_id}; dropped {raw!r}")]
+            if now - state.last_busy_at >= 10.0 and state.stopped_request_id != state.active_request_id:
+                state.last_busy_at = now
+                actions.append(
+                    Speak(
+                        f"正在做{state.task_label}，请稍等。",
+                        request_id=state.active_request_id,
+                        kind="busy",
+                        expires_at=now + 5.0,
+                    )
+                )
+            return actions
         if len(normalized) < self.config.min_text_chars:
             return [Log(f"ignored short utterance {raw!r}")]
         self._gate.note_handled(heard_at)
@@ -685,6 +756,9 @@ class VoiceBridgeCore:
             payload["reply_to_request_id"] = state.clarification_request_id
             state.clarification_request_id = ""
         state.active_request_id = request_id
+        state.task_label = _spoken_label(raw)
+        state.last_busy_at = float("-inf")
+        state.receipt_spoken = False
         state.active_since = now
         state.last_activity = now
         state.known_request_ids.add(request_id)
@@ -703,8 +777,14 @@ class VoiceBridgeCore:
                 return []
             message = str(payload.get("message", "")).strip()
             reason = payload.get("reason_code", "")
-            spoken = self.config.busy_message if reason == "BUSY" else _spoken_reply(payload.get("state"), message)
-            return [Log(f"request {request_id} not admitted: {reason} {message}"), *self._say(spoken)]
+            actions = [Log(f"request {request_id} not admitted: {reason} {message}")]
+            if reason != "BUSY":
+                actions.extend(self._say(_spoken_reply(payload.get("state"), message)))
+            return actions
+        if payload.get("accepted") is True and request_id == self.active_request_id and not self._state.receipt_spoken:
+            self._state.receipt_spoken = True
+            self._receipt_due[request_id] = now + 3.0
+            return []
         return []
 
     def on_event(self, payload: dict[str, Any], now: float) -> list[Action]:
@@ -714,7 +794,7 @@ class VoiceBridgeCore:
                 key.get(name) == getattr(self.config, name) for name in ("channel_id", "principal_id", "robot_scope")
             ):
                 return []
-            return self._execution_speech(payload)
+            return self._execution_speech(payload, now)
         if not isinstance(key, dict) or not self._owns(key):
             return []
         request_id = str(key["request_id"])
@@ -726,36 +806,71 @@ class VoiceBridgeCore:
         if event_type == "continuation":
             # The Agent resolved "继续" against its ledgers; tell the user what resumes.
             message = str(payload.get("user_message", "")).strip()
-            return [Log(f"request {request_id} continuation: {message}"), *self._say(message)]
+            detail = payload.get("detail") or {}
+            continuation = detail.get("continuation") or {}
+            target = (continuation.get("interrupted_step") or {}).get("target_name")
+            if target:
+                self._state.task_label = _spoken_label(target)
+            return [Log(f"request {request_id} continuation: {message}"), *self._say("从当前位置继续准备。")]
         if event_type == "reply_preview":
             return self._on_reply_preview(payload, request_id)
         if state not in TERMINAL_REQUEST_STATES:
-            return self._execution_speech(payload)
+            return self._execution_speech(payload, now)
         silent = self._silent(request_id)
-        previewed = self._take_preview(request_id)
+        self._take_preview(request_id)
         if not self._finish(request_id):
             return []
         if event_type == "needs_clarification":
             self._state.clarification_request_id = request_id
         message = str(payload.get("user_message", "")).strip()
         if isinstance(payload.get("detail"), dict) and payload["detail"].get("execution_id"):
-            return self._execution_speech(payload)
+            return self._execution_speech(payload, now)
         spoken = "" if silent else _spoken_reply(state, message)
+        detail = payload.get("detail") or {}
+        if state == "SUCCEEDED" and isinstance(detail, dict) and detail.get("save_prompt"):
+            spoken = "执行完成。" + str(detail["save_prompt"])
         log = Log(f"request {request_id} {event_type} {state}: {message}")
-        if previewed and spoken == previewed:
-            return [log, Log(f"request {request_id} reply was already said as its preview")]
-        return [log, *self._say(spoken)]
 
-    def _execution_speech(self, payload: dict[str, Any]) -> list[Action]:
+        return [log, *self._say(spoken, kind="terminal")]
+
+    def _execution_speech(self, payload: dict[str, Any], now: float) -> list[Action]:
         if payload.get("event_type") not in {"execution_progress", "terminal", "quarantined", "failed", "cancelled"}:
             return []
+        detail = payload.get("detail") or {}
+        if detail.get("current_skill") == "pick_object":
+            # Accept every ordered fact, including silent stages, before selecting speech.
+            self._feedback.accept(payload)
+            if not self.config.speak_replies:
+                return []
+            return self._notices(self._speech_policy.observe(payload, now))
         accepted = self._feedback.accept(payload)
         if accepted is None or not self.config.speak_replies:
             return []
         execution_id, text, terminal = accepted
         if self._silent(str(payload.get("request_id", ""))):
             return [Log(f"request {payload.get('request_id')} speech suppressed: its output is speech itself")]
-        return [Speak(text, execution_id=execution_id, terminal=terminal)]
+        detail = payload.get("detail") or {}
+        if payload.get("state") == "SUCCEEDED" and detail.get("save_prompt"):
+            text += str(detail["save_prompt"])
+        return [Speak(text, execution_id=execution_id, terminal=terminal, kind="terminal" if terminal else "reply")]
+
+    def _notices(self, notices) -> list[Action]:
+        return [
+            Speak(
+                n.text,
+                execution_id=n.execution_id,
+                terminal=n.terminal,
+                request_id=n.request_id,
+                kind="terminal" if n.terminal else "reply",
+                notice=n,
+                important=n.important,
+            )
+            for n in notices
+        ]
+
+    def note_playback(self, action: Speak, now: float) -> None:
+        if action.notice is not None:
+            self._speech_policy.played(action.notice, now)
 
     def _on_reply_preview(self, payload: dict[str, Any], request_id: str) -> list[Action]:
         """Say the reply the planner is still producing, once per request.
@@ -777,7 +892,7 @@ class VoiceBridgeCore:
             return [Log(f"request {request_id} reply preview held silent: {message}")]
         self._state.preview_request_id = request_id
         self._state.preview_text = message
-        return [Log(f"request {request_id} reply preview: {message}"), *self._say(message)]
+        return [Log(f"request {request_id} reply preview deferred until plan classification: {message}")]
 
     def _take_preview(self, request_id: str) -> str:
         if self._state.preview_request_id != request_id:
@@ -791,6 +906,17 @@ class VoiceBridgeCore:
         state = self._state
         # A held transcript whose grace period ran out without a measurement.
         actions: list[Action] = self.release_held(now)
+        if self.config.speak_replies:
+            actions += self._notices(self._speech_policy.tick(now))
+        for request_id, due in list(self._receipt_due.items()):
+            if now >= due:
+                self._receipt_due.pop(request_id, None)
+                if request_id == state.active_request_id and request_id not in self._announced_requests:
+                    actions.append(
+                        Speak(
+                            "好呀，我在准备了，稍等一下。", request_id=request_id, kind="receipt", expires_at=now + 3.0
+                        )
+                    )
         if state.pending is not None and now >= state.pending.deadline:
             request_id = state.pending.request_id
             state.pending = None
@@ -836,11 +962,33 @@ class VoiceBridgeCore:
         if not isinstance(presentation, dict) or presentation_digest(presentation) != detail.get("presentation_digest"):
             return [Log(f"presentation digest mismatch for {request_id}; not acknowledging")]
         summary = _presentation_summary(presentation, payload.get("user_message", ""))
+        self._state.task_label = _spoken_label(summary)
+        self._receipt_due.pop(request_id, None)
         plan_log = Log("exact plan " + json.dumps(presentation, ensure_ascii=False, sort_keys=True))
         if self._is_silent_presentation(presentation):
             # The clip is the reply: announcing the plan and then saying "执行完成。" would talk over it.
             self._state.silent_request_id = request_id
             return [plan_log]
+        pick_steps = [
+            step
+            for step in presentation.get("steps", [])
+            if isinstance(step, dict) and step.get("skill_name") == "pick_object"
+        ]
+        if pick_steps and (
+            detail.get("async_display") is True or presentation.get("execution_mode") == ASYNC_PRESENTATION_MODE
+        ):
+            if request_id in self._announced_requests:
+                return [plan_log]
+            self._announced_requests.add(request_id)
+            self._receipt_due.pop(request_id, None)
+            target = str(pick_steps[0].get("target_name", ""))
+            if not re.search(r"[\u4e00-\u9fff]", target):
+                target = "这个东西"
+            return (
+                [plan_log, *self._notices([self._speech_policy.start(request_id, target, now)])]
+                if self.config.speak_replies
+                else [plan_log]
+            )
         if detail.get("async_display") is True or presentation.get("execution_mode") == ASYNC_PRESENTATION_MODE:
             # Typed Programs execute without waiting for any client: there is no receipt to give, and
             # asking for a confirmation that cannot hold the robot back would mislead the user.
@@ -849,10 +997,6 @@ class VoiceBridgeCore:
                 if self.config.confirm_mode == "voice_confirm"
                 else []
             )
-            if self._state.preview_request_id == request_id:
-                # The preview already told the user what is about to happen, and nothing waits on
-                # this line; saying it again only delays the answer behind it.
-                return [plan_log, *gate, Log(f"request {request_id} plan was already announced by its preview")]
             return [plan_log, *gate, *self._say(f"正在执行：{summary}。")]
         acknowledgement = PublishControl(
             {
@@ -903,6 +1047,7 @@ class VoiceBridgeCore:
 
     def _finish(self, request_id: str) -> bool:
         """Release ``request_id``; return False when it was already finished."""
+        self._receipt_due.pop(request_id, None)
         if request_id in self._state.finished_request_ids:
             return False
         if self._state.silent_request_id == request_id:
@@ -918,10 +1063,10 @@ class VoiceBridgeCore:
             self._state.pending = None
         return True
 
-    def _say(self, text: str) -> list[Action]:
+    def _say(self, text: str, *, kind: str = "reply") -> list[Action]:
         if not text or not self.config.speak_replies:
             return []
-        return [Speak(text)]
+        return [Speak(text, kind=kind)]
 
 
 def _spoken_reply(state: Any, message: str) -> str:
@@ -929,11 +1074,28 @@ def _spoken_reply(state: Any, message: str) -> str:
     return execution_reply(str(state), fallback=message)
 
 
+def _spoken_label(text: str) -> str:
+    value = re.sub(r"[A-Za-z_][A-Za-z_0-9-]*", "", str(text).replace("V字", "胜利手势"))
+    value = value.strip(" ：:，,。()（）")
+    return value[:18] if re.search(r"[\u4e00-\u9fff]", value) else "当前动作"
+
+
+def _tts_text(text: str) -> str:
+    """The deployed Chinese frontend rejects English words and internal IDs."""
+    text = str(text).replace("free_pose", "自由姿态").replace("(remembered)", "").replace("V字", "胜利手势")
+    text = re.sub(r"[A-Za-z_][A-Za-z_0-9-]*", "", text).strip()
+    return text if re.search(r"[\u4e00-\u9fff]", text) else "正在处理。"
+
+
 def _presentation_summary(presentation: dict[str, Any], fallback: Any) -> str:
+    steps = presentation.get("steps") or []
+    targets = [str(step.get("target_name", "")) for step in steps if isinstance(step, dict)]
+    if any(re.search(r"[\u4e00-\u9fff]", target) for target in targets):
+        return _spoken_label("、".join(targets))
     summary = presentation.get("summary")
     if isinstance(summary, str) and summary.strip():
-        return summary.strip()
-    return str(fallback or "").strip() or "当前计划"
+        return _spoken_label(summary)
+    return _spoken_label(fallback)
 
 
 def _string_tuple(value: Any, name: str) -> tuple[str, ...]:
@@ -961,6 +1123,7 @@ def node_parameter_defaults() -> dict[str, Any]:
     """ROS parameter defaults: transport names plus every ``VoiceBridgeConfig`` default, declared once."""
     defaults: dict[str, Any] = {
         "input_topic": "/voice_command",
+        "speech_chunk_topic": "",
         # voice_asr_node publishes/listens on these fixed names; an empty partial_topic disables
         # the realtime (partial-transcript) stop.
         "partial_topic": "/voice_partial",
@@ -1025,6 +1188,8 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         session_idle_sec=float(values["session_idle_sec"]),
         min_text_chars=int(values["min_text_chars"]),
         request_timeout_sec=float(values["request_timeout_sec"]),
+        speech_mode=str(values["speech_mode"]),
+        speech_messages_json=str(values["speech_messages_json"]),
         speak_replies=bool(values["speak_replies"]),
         speak_reply_previews=bool(values["speak_reply_previews"]),
         feedback_only=bool(values["feedback_only"]),
@@ -1055,7 +1220,7 @@ def _corrections(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
 
 
 class _Speaker:
-    """Serialize TTS synthesize+play, muting ASR so the robot does not hear itself."""
+    """Independent blocking adapters for synthesis and whole-utterance playback."""
 
     def __init__(self, node: Any, *, synthesis_service: str, playback_service: str, timeout_sec: float) -> None:
         from ibrobot_msgs.srv import PlayAudioFile, SynthesizeSpeech
@@ -1066,41 +1231,45 @@ class _Speaker:
         self._playback_type = PlayAudioFile
         self._synthesize = node.create_client(SynthesizeSpeech, synthesis_service)
         self._playback = node.create_client(PlayAudioFile, playback_service)
-        self._lock = threading.Lock()
         self._closing = threading.Event()
 
     def close(self) -> None:
         self._closing.set()
 
-    def speak(self, text: str) -> bool:
-        with self._lock:
-            if not self._synthesize.wait_for_service(timeout_sec=2.0) or not self._playback.wait_for_service(
-                timeout_sec=2.0
-            ):
-                self._node.get_logger().error("TTS services are unavailable")
+    def synthesize(self, text: str) -> Any:
+        if self._closing.is_set() or not self._synthesize.wait_for_service(timeout_sec=2.0):
+            return None
+        request = self._synthesis_type.Request()
+        request.text = text
+        result = self._call(self._synthesize, request)
+        if result is None or not result.success or not result.audio_segments:
+            self._node.get_logger().error(f"TTS synthesis failed: {getattr(result, 'message', 'timeout')}")
+            return None
+        return result.audio_segments
+
+    def play(self, segments: Any) -> bool:
+        if self._closing.is_set() or not self._playback.wait_for_service(timeout_sec=2.0):
+            return False
+        for segment in segments:
+            if self._closing.is_set():
                 return False
-            request = self._synthesis_type.Request()
-            request.text = text
-            result = self._call(self._synthesize, request)
-            if result is None or not result.success or not result.audio_segments:
-                self._node.get_logger().error(f"TTS synthesis failed: {getattr(result, 'message', 'timeout')}")
-                return False
-            for segment in result.audio_segments:
-                descriptor, path = tempfile.mkstemp(prefix="ibrobot-voice-bridge-", suffix=".wav")
-                try:
-                    with os.fdopen(descriptor, "wb") as stream:
-                        stream.write(bytes(segment.audio_data))
-                    play = self._playback_type.Request()
-                    play.file_path = path
-                    played = self._call(self._playback, play)
-                    if played is None or not played.success:
-                        self._node.get_logger().error(f"TTS playback failed: {getattr(played, 'message', 'timeout')}")
-                        return False
-                finally:
-                    os.unlink(path)
-            return True
+            descriptor, path = tempfile.mkstemp(prefix="ibrobot-voice-bridge-", suffix=".wav")
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(bytes(segment.audio_data))
+                play = self._playback_type.Request()
+                play.file_path = path
+                played = self._call(self._playback, play)
+                if played is None or not played.success:
+                    self._node.get_logger().error(f"TTS playback failed: {getattr(played, 'message', 'timeout')}")
+                    return False
+            finally:
+                os.unlink(path)
+        return True
 
     def _call(self, client: Any, request: Any) -> Any:
+        if self._closing.is_set():
+            return None
         future = client.call_async(request)
         deadline = time.monotonic() + self._timeout_sec
         while not future.done() and time.monotonic() < deadline and not self._closing.is_set():
@@ -1136,9 +1305,7 @@ def _build_node_class():
                 if values["tts_enabled"]
                 else None
             )
-            self._speech_queue: list[Speak] = []
-            self._speech_wakeup = threading.Condition()
-            self._speech_closed = False
+            self._speech_pipeline = None
             # Muting ASR still lets it publish the utterance it had already started, and that text
             # would be routed as a new command (possibly re-triggering this very reply). Ignore
             # transcripts until the ASR resume has settled.
@@ -1152,9 +1319,20 @@ def _build_node_class():
             self._request_publisher = self.create_publisher(String, str(values["request_topic"]), 10)
             self._control_publisher = self.create_publisher(String, str(values["control_topic"]), 10)
             self._asr_control_publisher = self.create_publisher(String, str(values["asr_control_topic"]), 10)
+            self._active_audio_segments: dict[str, int] = {}
+            if values["speech_chunk_topic"]:
+                from ibrobot_msgs.msg import SpeechAudioChunk
+
+                self.create_subscription(
+                    SpeechAudioChunk,
+                    str(values["speech_chunk_topic"]),
+                    self._on_audio_chunk,
+                    50,
+                    callback_group=inbound,
+                )
             if self._core.config.feedback_only:
                 transcript_topic = "feedback only"
-            elif self._core.config.pairs_by_segment:
+            elif self._core.config.pairs_by_segment or values["transcript_topic"]:
                 from ibrobot_msgs.msg import SpeechTranscript
 
                 if not values["transcript_topic"]:
@@ -1212,8 +1390,14 @@ def _build_node_class():
                     SpeechWakeEvent, str(values["wake_event_topic"]), self._on_wake_event, 10, callback_group=inbound
                 )
             self.create_timer(0.2, self._on_tick, callback_group=inbound)
-            self._speech_thread = threading.Thread(target=self._speech_loop, daemon=True)
-            self._speech_thread.start()
+            if self._speaker is not None:
+                self._speech_pipeline = SpeechPipeline(
+                    synthesize=lambda action: self._speaker.synthesize(_tts_text(action.text)),
+                    play=self._render_speech,
+                    is_current=self._speech_is_current,
+                    completed=lambda action: self._execute(action.then),
+                    log=lambda message: self.get_logger().info(message),
+                )
             confirm_mode = self._core.config.confirm_mode
             self.get_logger().info(
                 f"voice bridge ready: {transcript_topic} -> {values['request_topic']} "
@@ -1231,6 +1415,22 @@ def _build_node_class():
 
         def _on_segment_transcript(self, message: Any) -> None:
             self._hear(str(message.text), (str(message.source_id), int(message.segment_sequence)))
+
+        def _on_audio_chunk(self, message: Any) -> None:
+            source = str(message.source_id)
+            if message.state == message.STATE_BEGIN:
+                self._active_audio_segments[source] = int(message.sequence)
+                if len(self._active_audio_segments) > 16:
+                    del self._active_audio_segments[next(iter(self._active_audio_segments))]
+            sequence = self._active_audio_segments.get(source)
+            if sequence is not None:
+                stamp = message.header.stamp
+                age = self.get_clock().now().nanoseconds / 1e9 - (stamp.sec + stamp.nanosec / 1e9)
+                captured_at = time.monotonic() - max(0.0, age) if stamp.sec else time.monotonic()
+                with self._core_lock:
+                    self._core.note_audio((source, sequence), captured_at)
+            if message.state == message.STATE_END:
+                self._active_audio_segments.pop(source, None)
 
         def _hear(self, text: str, segment: Segment | None) -> None:
             if self._core.config.feedback_only:
@@ -1307,46 +1507,26 @@ def _build_node_class():
                         self.get_logger().info(f"[say] {action.text}")
                         self._execute(action.then)
                     else:
-                        with self._speech_wakeup:
-                            if action.terminal and action.execution_id:
-                                self._speech_queue = [
-                                    queued
-                                    for queued in self._speech_queue
-                                    if queued.execution_id != action.execution_id or queued.terminal
-                                ]
-                            self._speech_queue.append(action)
-                            self._speech_wakeup.notify()
+                        self._speech_pipeline.submit(action)
 
-        def _speech_loop(self) -> None:
-            while True:
-                with self._speech_wakeup:
-                    while not self._speech_queue and not self._speech_closed:
-                        self._speech_wakeup.wait()
-                    if self._speech_closed:
-                        return
-                    action = self._speech_queue.pop(0)
-                try:
-                    self._render_speech(action)
-                except Exception as error:
-                    # This thread is the only consumer of the speech queue. Letting one failed
-                    # render end it would silence every later reply and withhold the plan
-                    # acknowledgements chained behind them while the node still looks alive.
-                    dropped = "; dependent actions dropped" if action.then else ""
-                    self.get_logger().error(f"speech rendering failed: {error!r}{dropped}")
+        def _speech_is_current(self, action: Speak) -> bool:
+            with self._core_lock:
+                return self._core.speech_is_current(action, time.monotonic())
 
         def destroy_node(self):
-            with self._speech_wakeup:
-                self._speech_closed = True
-                self._speech_queue.clear()
-                self._speech_wakeup.notify_all()
-            if self._speaker is not None:
-                self._speaker.close()
-            self._speech_thread.join(timeout=1.0)
+            if self._speech_pipeline is not None:
+                self._speech_pipeline.close(stop=self._speaker.close)
+                self._speech_pipeline = None
             return super().destroy_node()
 
-        def _render_speech(self, action: Speak) -> None:
+        def _render_speech(self, action: Speak, audio: Any) -> bool:
+            text = _tts_text(action.text)
             with self._core_lock:
+                if not self._core.speech_is_current(action, time.monotonic()):
+                    return False
+                self._core.note_playback(action, time.monotonic())
                 interruptible = self._core.interruptible
+                self._core.note_speech(text, time.monotonic())
             # Muting ASR would also drop the stop keyword, so it is only done while nothing can move.
             # A reply that itself contains a stop word would stop the request it talks about, so it
             # still mutes (and says so).
@@ -1361,8 +1541,8 @@ def _build_node_class():
             elif filter_echo:
                 self._echo_until = float("inf")
             try:
-                self.get_logger().info(f"[say] {action.text}")
-                spoken = self._speaker.speak(action.text)
+                self.get_logger().info(f"[say] {text}")
+                spoken = self._speaker.play(audio)
             finally:
                 settled = time.monotonic() + self._resume_settle_sec
                 if muted:
@@ -1370,10 +1550,9 @@ def _build_node_class():
                     self._deaf_until = settled
                 elif filter_echo:
                     self._echo_until = settled
-            if spoken:
-                self._execute(action.then)
-            elif action.then:
-                self.get_logger().error("speech was not rendered; dependent actions dropped")
+                with self._core_lock:
+                    self._core.note_speech(text, time.monotonic(), finished=True)
+            return spoken
 
     return VoiceBridgeNode
 

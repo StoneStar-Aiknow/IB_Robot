@@ -1,0 +1,14 @@
+{
+  "status": "reproduced_in_current_and_clean_HEAD",
+  "exit_code": 124,
+  "fixture": "simulation_env line861 -> _wait_for line729",
+  "deselected_ids": [
+    "src/robot_config/test/test_navigation_simulation.py::test_navigation_simulation[gazebo-lekiwi_lidar]",
+    "src/robot_config/test/test_navigation_simulation.py::test_navigation_simulation[gazebo-lekiwi_nav_grasp]",
+    "src/robot_config/test/test_navigation_simulation.py::test_navigation_simulation[mujoco-lekiwi_lidar]",
+    "src/robot_config/test/test_navigation_simulation.py::test_navigation_simulation[mujoco-lekiwi_nav_grasp]"
+  ],
+  "current_log": "/tmp/rtinfer-default-finish/colcon-full-stack.log",
+  "baseline_log": "/tmp/rtinfer-default-finish/baseline-navigation-stack.log",
+  "scope": "same shared fixture timeout reproduced; four parameter cases deselected as a group, not four independently completed hangs"
+}

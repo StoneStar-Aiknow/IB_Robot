@@ -1,0 +1,34 @@
+schema_version: 1
+name: return_to_task_pose
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Reach a configured task pose, open explicitly configured hands, and verify stable arrival.
+  category: recovery
+  when_to_use:
+  - prepare the arms for a configured task
+  - return to a taught joint posture
+  - prepare empty hands when the named pose explicitly requests opening
+  aliases_zh: [回准备位, 回任务初始位, 进入抓取初始状态]
+  aliases_en: [task ready pose]
+  motion_scope: [arm, gripper]
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 30.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Reach target_name from the local task-pose file without language-model pose generation, then open the hands that pose declares; fail if unknown.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      target_name: {type: string, freeform: true}
+    required: [target_name]
+  recovery_policy: never_retry
+  required_capabilities: [joint.trajectory]
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

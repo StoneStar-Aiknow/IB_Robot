@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Mapping
@@ -39,6 +40,8 @@ from ibrobot_agent.contracts import (
     PlannerIdentity,
     PlannerOutcome,
     PlanProposal,
+    PoseMemoryPort,
+    PosePreviewPort,
     PresentationPort,
     RegistryIdentity,
     RequestKey,
@@ -48,7 +51,16 @@ from ibrobot_agent.contracts import (
     request_hash_text,
 )
 from ibrobot_agent.execution_feedback import execution_reply
-from ibrobot_agent.planner import RulePlanner, direct_command_outcome, read_only_outcome
+from ibrobot_agent.planner import (
+    _HYPOTHETICAL_MARKERS,
+    _NEGATION_MARKERS,
+    RulePlanner,
+    direct_command_outcome,
+    planner_outcome_from_payload,
+    read_only_outcome,
+)
+from ibrobot_agent.planning_timing import planning_report, planning_stage
+from ibrobot_agent.planning_timing import snapshot as planning_timing_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 _trace = create_trace_logger("ib_trace.agent")
@@ -175,6 +187,9 @@ class AgentService:
         max_planning_workers: int = 1,
         robot_scope: str = "so101_single_arm",
         direct_commands: Mapping[str, str] | None = None,
+        pose_preview: PosePreviewPort | None = None,
+        pose_skills: frozenset[str] = frozenset({"free_pose"}),
+        pose_memory: PoseMemoryPort | None = None,
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -191,6 +206,22 @@ class AgentService:
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
+        # Arm poses described in words are composed before the plan is presented,
+        # so the user confirms the pose that will run, and an unreachable or
+        # unsafe one is answered without preparing anything.
+        self._pose_preview = pose_preview
+        self._pose_skills = frozenset(pose_skills)
+        # Remembered poses: a confirmed one is recalled without planning, and the
+        # user's save intent is interpreted by the existing planner.
+        self._pose_memory = pose_memory
+        self._pose_memory_identity = PlannerIdentity(
+            route="pose_memory",
+            returned_model="none",
+            protocol="pose_memory_lookup",
+            prompt_version="none",
+            schema_version=planner.identity.schema_version,
+            config_digest=hashlib.sha256(b"pose-memory-v1").hexdigest(),
+        )
         # A shortcut is not the model's decision, so a proposal it produced
         # must not be recorded under the model's identity.
         self._direct_identity = PlannerIdentity(
@@ -361,7 +392,7 @@ class AgentService:
             _LOGGER.exception("Could not persist planner worker failure for request %s", request.request_id)
 
     def _plan_one(self, request: AgentRequest) -> None:
-        with trace_scope(request.request_id):
+        with planning_report(), trace_scope(request.request_id):
             self._plan_one_traced(request)
 
     def _plan_one_traced(self, request: AgentRequest) -> None:
@@ -373,7 +404,7 @@ class AgentService:
                 self._active[key] = cancel_token
             gateway_error = None
             try:
-                with trace_stage(_trace, "agent.catalog", request_id=request.request_id):
+                with planning_stage(_trace, "agent.catalog", request_id=request.request_id):
                     status = self._catalog.get_status()
                     catalog = self._catalog.get_catalog(status)
             except Exception as exc:
@@ -401,15 +432,23 @@ class AgentService:
                     event_type="needs_clarification",
                 )
                 return
+            pending_save = (
+                dict(self._pose_memory.feedback(_pose_session(request), "status")) if self._pose_memory else {}
+            )
             # "继续" keeps its own request id and ledger row; only the text the planner sees
             # becomes the interrupted request's original text, plus how far it got.
             planned_request = request
             planner_context: dict[str, Any] = {
                 "messages": self._conversation.context(request),
                 "clarification": clarification,
+                "pending_pose_save": pending_save if pending_save.get("pose_id") else None,
             }
             replayed: PlannerOutcome | None = None
-            if request.reply_to_request_id is None and is_continue_request(request.text):
+            if (
+                not pending_save.get("pose_id")
+                and request.reply_to_request_id is None
+                and is_continue_request(request.text)
+            ):
                 decision = self._resolve_continuation(request)
                 if decision.text is None:
                     self._conversation.append_assistant(request, decision.message)
@@ -438,14 +477,26 @@ class AgentService:
                         state="PLANNING",
                         detail_json=json.dumps({"step_count": len(replayed.steps)}, sort_keys=True),
                     )
-            query = None if replayed is not None else read_only_outcome(planned_request.text)
+            query = (
+                None if replayed is not None or pending_save.get("pose_id") else read_only_outcome(planned_request.text)
+            )
             direct = (
                 None
-                if replayed is not None or query is not None
+                if replayed is not None or query is not None or pending_save.get("pose_id")
                 else direct_command_outcome(planned_request.text, self._direct_commands, catalog)
             )
+            remembered = (
+                None
+                if replayed is not None or query is not None or direct is not None or pending_save.get("pose_id")
+                else self._traced_pose_lookup(request, planned_request.text, catalog, planner_context)
+            )
             planned_by = self._planner.identity
-            if replayed is not None:
+            if remembered is not None:
+                # A confirmed remembered pose: the model is not asked; the Gateway still
+                # validates the workflow, and the composer still checks the pose.
+                outcome = remembered
+                planned_by = self._pose_memory_identity
+            elif replayed is not None:
                 outcome = replayed
                 planned_by = LEDGER_REPLAY_IDENTITY
             elif query is not None:
@@ -460,16 +511,33 @@ class AgentService:
                 outcome = direct
                 planned_by = self._direct_identity
             else:
-                with trace_stage(_trace, "agent.planner", request_id=request.request_id):
-                    outcome = self._planner.plan(
-                        planned_request,
-                        planner_context,
-                        _planner_catalog(catalog),
-                        cancel_token,
-                        on_preview=lambda text: self._emit_reply_preview(key, text, cancel_token),
+                try:
+                    with planning_stage(_trace, "agent.planner", request_id=request.request_id):
+                        outcome = self._planner.plan(
+                            planned_request,
+                            planner_context,
+                            _planner_catalog(catalog),
+                            cancel_token,
+                            # Storage claims are rendered only after the actual commit.
+                            on_preview=None
+                            if pending_save.get("pose_id")
+                            else lambda text: self._emit_reply_preview(key, text, cancel_token),
+                        )
+                except Exception:
+                    if not pending_save.get("pose_id") or cancel_token.is_set():
+                        raise
+                    _LOGGER.exception("Could not interpret save confirmation; preserving the offer")
+                    self._finish_answered(
+                        key,
+                        record.planning_generation,
+                        "暂时没能确认你的意思，请明确同意或拒绝保存。",
+                        event_type="pose_feedback",
                     )
+                    return
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
+                return
+            if self._apply_pose_feedback(key, record.planning_generation, request, outcome, pending_save):
                 return
             if outcome.kind != "workflow":
                 if outcome.kind == "read_only" and not status:
@@ -498,9 +566,15 @@ class AgentService:
                 raise RuntimeError("Gateway registry is not ready")
             if status.get("control_plane_ready", True) is False:
                 raise RuntimeError("Gateway control plane is not ready")
+            outcome = self._bind_catalog_targets(outcome, catalog)
             self._validate_workflow(outcome, catalog)
             outcome = self._bind_step_schema_versions(outcome, catalog)
-            outcome = self._bind_summary_to_catalog_names(outcome, catalog)
+            outcome = self._bind_summary_to_catalog_names(outcome, catalog, pose_skills=self._pose_skills)
+            if not self._preview_pose(key, record.planning_generation, request, outcome):
+                return
+            if cancel_token.is_set():
+                self._finish_cancel_before_execution(key, record.planning_generation)
+                return
             identity = RegistryIdentity(
                 epoch=str(status["registry_epoch"]),
                 generation=int(status["registry_generation"]),
@@ -554,8 +628,18 @@ class AgentService:
                 terminal_message = execution_reply(
                     self._request_state_for_result(execution_result), execution_result.detail
                 )
+                save_prompt = ""
+                if execution_result.status == "succeeded" and self._pose_memory is not None:
+                    try:
+                        offer = dict(self._pose_memory.feedback(_pose_session(request), "offer"))
+                        if offer.get("pose_id"):
+                            save_prompt = str(offer.get("message", ""))
+                    except Exception:
+                        _LOGGER.exception("Could not offer pose save confirmation")
                 try:
-                    self._conversation.append_assistant(request, terminal_message)
+                    self._conversation.append_assistant(
+                        request, " ".join(filter(None, (terminal_message, save_prompt)))
+                    )
                 finally:
                     # A conversation-memory failure must not hide an already
                     # persisted execution result from the waiting client.
@@ -564,7 +648,7 @@ class AgentService:
                         "terminal",
                         self._request_state_for_result(execution_result),
                         terminal_message,
-                        detail=execution_result.detail,
+                        detail={**execution_result.detail, **({"save_prompt": save_prompt} if save_prompt else {})},
                     )
         except Exception as exc:
             try:
@@ -585,6 +669,162 @@ class AgentService:
                 self._active.pop(key, None)
             with self._queue_condition:
                 self._queued_or_active.discard(key)
+
+    def _preview_pose(self, key: RequestKey, generation: int, request: AgentRequest, outcome: PlannerOutcome) -> bool:
+        """Compose the plan's leading pose step now; False when the request was answered instead.
+
+        Only a pose that is the first step can be composed from the arm pose
+        measured now; a later one depends on the steps before it and is composed
+        when it runs (the executor says so in its result).
+        """
+        if self._pose_preview is None or not outcome.steps or outcome.steps[0].skill_name not in self._pose_skills:
+            return True
+        text = str(outcome.steps[0].target_name or "").strip()
+        with planning_stage(_trace, "agent.pose_preview", request_id=request.request_id):
+            composed = dict(self._pose_preview.compose(text, session_id=_pose_session(request), utterance=request.text))
+        detail = {
+            "text": text,
+            "kind": str(composed.get("kind", "")),
+            "composition_id": str(composed.get("composition_id", "")),
+            "description": _json_or_text(composed.get("description_json", "")),
+            "duration_sec": round(float(composed.get("duration_sec", 0.0) or 0.0), 2),
+            "approximate": bool(composed.get("approximate", False)),
+            "error_code": str(composed.get("error_code", "")),
+            "from_memory": bool(composed.get("from_memory", False)),
+            "pose_id": str(composed.get("pose_id", "")),
+        }
+        spoken = str(composed.get("user_message", "")).strip()
+        if not composed.get("success"):
+            message = f"这个姿势现在做不了：{composed.get('message') or composed.get('error_code')}"
+            self._conversation.append_assistant(request, message)
+            self._finish_answered(
+                key, generation, message, error_code=str(composed.get("error_code") or "POSE_FAILED"),
+                event_type="pose_refused",
+            )  # fmt: skip
+            return False
+        if detail["kind"] in ("rejected", "no_motion"):
+            message = spoken or "这个姿势我不做。"
+            self._conversation.append_assistant(request, message)
+            self._finish_answered(key, generation, message, event_type="pose_refused")
+            return False
+        self._emit(key, "pose_preview", "PLANNING", spoken or text, detail=detail)
+        return True
+
+    def _apply_pose_feedback(self, key, generation, request, outcome, pending) -> bool:
+        """Apply the planner's decision to the exact pending pose, never its prose."""
+        decision = outcome.pose_feedback
+        if not pending.get("pose_id") and decision is None:
+            return False
+        self._store.record_event(
+            key,
+            event_type="pose_save_decision",
+            state="PLANNING",
+            detail_json=json.dumps(
+                {"decision": decision, "pending_pose_id": pending.get("pose_id")}, ensure_ascii=False
+            ),
+        )
+        session = _pose_session(request)
+        message = ""
+        allow_followup = False
+        if self._pose_memory is None:
+            message = "当前没有可用的动作保存服务。"
+        elif decision == "offer":
+            if pending.get("pose_id"):
+                message = str(pending.get("message") or "刚才动作到位、同意保存吗？")
+            else:
+                offer = dict(self._pose_memory.feedback(session, "offer"))
+                message = (
+                    str(offer.get("message")) if offer.get("pose_id") else "需要先成功完成两次相近动作，才能确认保存。"
+                )
+        elif not pending.get("pose_id"):
+            message = "当前没有待确认的保存动作。"
+        elif decision is None or decision == "clarify":
+            message = "刚才动作到位、同意保存吗？请明确确认或拒绝保存。"
+        else:
+            # One planning worker serializes this session. Recheck after the model
+            # call; the Composer additionally checks expiry and achieved targets.
+            current = dict(self._pose_memory.feedback(session, "status"))
+            if current.get("pose_id") != pending["pose_id"]:
+                message = "保存确认已过期或动作已改变，请重新发起保存。"
+            elif decision == "new_task":
+                self._pose_memory.feedback(session, "next_task")
+                return False
+            elif decision == "decline":
+                self._pose_memory.feedback(session, "next_task")
+                message = "好的，这次不保存。"
+                allow_followup = True
+            elif decision == "accept":
+                result = dict(self._pose_memory.feedback(session, "good"))
+                allow_followup = (
+                    result.get("success")
+                    and result.get("pose_id") == pending["pose_id"]
+                    and result.get("message") == "confirmed"
+                )
+                message = (
+                    "好的，这个姿势我记住了。"
+                    if allow_followup
+                    else "保存未完成，确认可能已过期或动作已改变，请重新确认。"
+                )
+        # Do not let model prose claim successful storage or execute a new task
+        # when confirmation is absent, ambiguous or stale.
+        if outcome.kind == "workflow" and allow_followup:
+            # The write result can be spoken immediately, without gating the new motion.
+            self._emit(key, "reply_preview", "PLANNING", message)
+            self._conversation.append_assistant(request, message)
+            return False
+        self._conversation.append_assistant(request, message)
+        self._finish_answered(key, generation, message, event_type="pose_feedback")
+        return True
+
+    def _traced_pose_lookup(self, request: AgentRequest, text: str, catalog: Mapping[str, Any], context: dict):
+        if self._pose_memory is None:
+            return None
+        with planning_stage(_trace, "agent.pose_lookup", request_id=request.request_id):
+            return self._remembered_pose_outcome(text, catalog, context)
+
+    def _remembered_pose_outcome(
+        self, text: str, catalog: Mapping[str, Any], context: dict | None = None
+    ) -> PlannerOutcome | None:
+        """A one-step free_pose workflow for words a confirmed remembered pose answers, else None."""
+        if self._pose_memory is None or not self._pose_skills:
+            return None
+        folded = _fold(text)
+        if not folded or any(marker in folded for marker in (*_NEGATION_MARKERS, *_HYPOTHETICAL_MARKERS)):
+            return None
+        skills = catalog.get("skills")
+        entry = next(
+            (
+                skill
+                for skill in (skills if isinstance(skills, list | tuple) else ())
+                if isinstance(skill, Mapping)
+                and skill.get("name") in self._pose_skills
+                and skill.get("planner_visible", True)
+                and (not self._allowed_skills or skill.get("name") in self._allowed_skills)
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        try:
+            hit = dict(self._pose_memory.lookup(text))
+        except Exception:  # noqa: BLE001 - fall back to planning
+            _LOGGER.exception("pose memory lookup failed")
+            return None
+        if not hit.get("hit"):
+            if context is not None:
+                context["remembered_poses"] = hit.get("poses", [])
+            return None
+        schema_version = entry.get("schema_version", 1)
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+            schema_version = 1
+        return planner_outcome_from_payload(
+            {
+                "kind": "workflow",
+                "user_message": str(hit.get("user_message") or f"好的，{text.strip()}")[:150],
+                "summary": f"{entry['name']}: {text.strip()} (remembered)"[:300],
+                "steps": [{"schema_version": schema_version, "skill_name": entry["name"], "target_name": text.strip()}],
+            }
+        )
 
     def _resolve_continuation(self, request: AgentRequest) -> ContinuationDecision:
         """Read both ledgers for "继续"; any read failure refuses instead of guessing."""
@@ -712,6 +952,30 @@ class AgentService:
         suffix = f"，另有 {remaining} 项。" if remaining else "。"
         return f"{prefix}：{'、'.join(visible)}{suffix}"
 
+    @staticmethod
+    def _bind_catalog_targets(outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> PlannerOutcome:
+        """Resolve only unique explicit aliases; never guess a motion target."""
+        by_name = {item.get("name"): item for item in catalog.get("skills", []) if isinstance(item, Mapping)}
+        steps = []
+        for step in outcome.steps:
+            capability = by_name.get(step.skill_name, {})
+            schema = capability.get("parameters", {}).get("properties", {}).get("target_name", {})
+            allowed = schema.get("enum")
+            target = step.target_name
+            if isinstance(allowed, list) and target not in allowed:
+                matches = {
+                    option.get("target_name")
+                    for option in capability.get("target_options", [])
+                    if isinstance(option, Mapping)
+                    and target in option.get("aliases", [])
+                    and option.get("target_name") in allowed
+                }
+                if len(matches) != 1:
+                    raise RuntimeError(f"invalid or ambiguous target_name for {step.skill_name}: {target!r}")
+                step = dataclasses.replace(step, target_name=next(iter(matches)))
+            steps.append(step)
+        return dataclasses.replace(outcome, steps=tuple(steps))
+
     def _validate_workflow(self, outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> None:
         skills = catalog.get("skills", [])
         if not isinstance(skills, list):
@@ -758,7 +1022,12 @@ class AgentService:
         return dataclasses.replace(outcome, steps=tuple(steps))
 
     @staticmethod
-    def _bind_summary_to_catalog_names(outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> PlannerOutcome:
+    def _bind_summary_to_catalog_names(
+        outcome: PlannerOutcome,
+        catalog: Mapping[str, Any],
+        *,
+        pose_skills: frozenset[str] = frozenset({"free_pose"}),
+    ) -> PlannerOutcome:
         """Name the workflow by its steps' Chinese catalog names, not by the model's text.
 
         The summary is what clients render before the robot moves (the voice channel speaks
@@ -766,7 +1035,16 @@ class AgentService:
         validated steps.  When a step has no Chinese name the planner's summary is kept as
         is: it is never partly rewritten, and a renderer that cannot use it fails visibly.
         """
-        names = [_chinese_skill_name(catalog, step.skill_name) for step in outcome.steps]
+        # A pose skill's aliases can enumerate opposite seed actions. Its
+        # validated Chinese target names the requested pose; the first alias
+        # only names the first seed. Keep the planner's summary for opaque IDs.
+        names = []
+        for step in outcome.steps:
+            name = _chinese_skill_name(catalog, step.skill_name)
+            if name is not None and step.skill_name in pose_skills:
+                target = step.target_name
+                name = target if any(0x4E00 <= ord(char) <= 0x9FFF for char in target) else None
+            names.append(name)
         if not names or None in names:
             return outcome
         summary = "、".join(names)
@@ -899,6 +1177,9 @@ class AgentService:
                 raise RuntimeError("required event transport is unavailable")
             return
         detail = dict(detail or {})
+        timings = planning_timing_snapshot()
+        if timings:
+            detail["planning_timing"] = timings
         with self._emit_lock:
             sequence = self._store.record_event(
                 key,
@@ -925,6 +1206,21 @@ class AgentService:
                 # The ledger is authoritative; a broken transport must not reopen
                 # the request through the outer failure handler.
                 _LOGGER.exception("Could not publish Agent event for %s", key.request_id)
+
+
+def _pose_session(request: AgentRequest) -> str:
+    return f"{request.channel_id}/{request.principal_id}/{request.session_id}"
+
+
+def _fold(text: str) -> str:
+    return re.sub(r"[\s，。！？、,.!?；;：:～~]+", "", str(text)).casefold()
+
+
+def _json_or_text(value: Any) -> Any:
+    try:
+        return json.loads(value) if isinstance(value, str) and value else value
+    except ValueError:
+        return value
 
 
 def _ledger_replay_outcome(steps) -> PlannerOutcome:

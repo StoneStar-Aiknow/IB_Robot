@@ -100,8 +100,10 @@ class Harness:
             time.sleep(0.05)
         raise AssertionError(f"timed out waiting for {what} (last value: {last!r})")
 
-    def wait_active(self):
-        return self.wait_for(lambda: self.status().lifecycle == "ACTIVE", "the runtime to reach ACTIVE")
+    def wait_active(self, timeout_s: float = TIMEOUT_S):
+        return self.wait_for(
+            lambda: self.status().lifecycle == "ACTIVE", "the runtime to reach ACTIVE", timeout_s=timeout_s
+        )
 
     def enable_navigation(self, enable: bool = True):
         request = SetBool.Request()
@@ -2304,7 +2306,9 @@ def test_a_claw_contributes_no_tactile_frames():
 _RIGHT_PITCH = projection.VENDOR_ARM_ORDER.index("right_shoulder_pitch_joint")
 
 
-def _replay_harness(tmp_path: Path, *, duration_s: float, named_motion: dict | None = None, **mock_params) -> Harness:
+def _replay_harness(
+    tmp_path: Path, *, duration_s: float, named_motion: dict | None = None, runtime_mode: str = "stream", **mock_params
+) -> Harness:
     """The OmniHand profile on an X2 with only a left hand, ``wave`` recorded as a right shoulder
     pitch out-and-back to -0.3 rad."""
     import json
@@ -2328,8 +2332,14 @@ def _replay_harness(tmp_path: Path, *, duration_s: float, named_motion: dict | N
     profile["vendor"]["named_motion"].update(named_motion or {})
     (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
     harness = Harness(tmp_path / "profile.yaml", hand_type="dexterous", right_hand_type="none", **mock_params)
-    harness.wait_active()
-    assert harness.set_mode("stream").success
+    try:
+        # Initial DDS discovery, hand verification and ADD/ENABLE retries can
+        # outlast the ordinary RPC deadline on a cold test context.
+        harness.wait_active(timeout_s=2 * TIMEOUT_S)
+        assert harness.set_mode(runtime_mode).success
+    except BaseException:
+        harness.shutdown()
+        raise
     return harness
 
 
@@ -2343,10 +2353,11 @@ def _start_wave(harness, target: str = ""):
     return handle.get_result_async()
 
 
-def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path):
+@pytest.mark.parametrize("runtime_mode", ["stream", "policy_stream"])
+def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path, runtime_mode):
     """In the stream mode the gesture streams on the arm channel, no preset is asked for, and the
     public arm stream is refused rather than interleaved while it runs."""
-    harness = _replay_harness(tmp_path, duration_s=2.0)
+    harness = _replay_harness(tmp_path, duration_s=2.0, runtime_mode=runtime_mode)
     try:
         pitches: list[float] = []
         result_future = _start_wave(harness)
@@ -2370,6 +2381,8 @@ def test_stream_mode_replays_the_recording_and_owns_the_arm_channel(tmp_path):
         assert min(pitches) == pytest.approx(-0.3, abs=0.03)
         assert 0.9 not in pitches
         assert harness.mock.last_preset is None
+        assert harness.status().active_mode == runtime_mode
+        assert harness.mock.current_action() == "UPPERBODY_REMOTE_SPLIT"
         # The installed left hand is held, the absent right one gets dummies: the platform
         # drops an upper-body command whose hand_pos does not fit hand_sub_mode.
         sent = harness.mock.last_upper_body
@@ -2792,5 +2805,192 @@ def test_the_views_keep_their_rate_under_a_burst_of_platform_state():
         assert sent > 250, sent
         assert len(views) >= 35, len(views)  # 50 Hz
         assert harness.status().lifecycle == "ACTIVE", harness.status().faults
+    finally:
+        harness.shutdown()
+
+
+# --- joint.trajectory: caller-computed arm trajectories on the same replay ---
+
+_TRAJECTORY_ACTION = "/arm_trajectory_controller/follow_joint_trajectory"
+
+
+def _trajectory_goal(harness, joints, positions, seconds: float):
+    from control_msgs.action import FollowJointTrajectory
+    from rclpy.action import ActionClient
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    client = ActionClient(harness.node, FollowJointTrajectory, _TRAJECTORY_ACTION)
+    assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+    goal = FollowJointTrajectory.Goal()
+    goal.trajectory.joint_names = list(joints)
+    point = JointTrajectoryPoint()
+    point.positions = [float(p) for p in positions]
+    point.time_from_start.sec = int(seconds)
+    point.time_from_start.nanosec = int((seconds - int(seconds)) * 1e9)
+    goal.trajectory.points = [point]
+    future = client.send_goal_async(goal)
+    harness.wait_for(future.done, "the trajectory goal response")
+    return future.result()
+
+
+def _trajectory_result(harness, handle):
+    future = handle.get_result_async()
+    harness.wait_for(future.done, "the trajectory result")
+    return future.result()
+
+
+def test_a_partial_trajectory_goal_moves_its_joints_and_holds_the_rest(tmp_path):
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint", "right_elbow_joint"], [-1.0, -0.5], 1.5)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, result.result.error_string
+        # Action results and vendor commands arrive on separate DDS channels.
+        # Wait for wire delivery instead of assuming their callback order.
+        harness.wait_for(
+            lambda: harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(-1.0, abs=1e-6),
+            "the final trajectory target on the vendor wire",
+        )
+        sent = list(harness.mock.last_upper_body.arm_pos)
+        assert sent[_RIGHT_PITCH] == pytest.approx(-1.0, abs=1e-6)
+        assert sent[projection.VENDOR_ARM_ORDER.index("right_elbow_joint")] == pytest.approx(-0.5, abs=1e-6)
+        held = [
+            v
+            for k, v in enumerate(sent)
+            if projection.VENDOR_ARM_ORDER[k] not in ("right_shoulder_pitch_joint", "right_elbow_joint")
+        ]
+        assert held == pytest.approx([0.0] * len(held), abs=1e-6)  # the mock starts every joint at zero
+    finally:
+        harness.shutdown()
+
+
+def test_a_trajectory_goal_naming_an_unknown_joint_is_rejected(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        handle = _trajectory_goal(harness, ["left_knee_joint"], [0.1], 1.0)
+        assert not handle.accepted
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("joint", "target", "seconds", "reason"),
+    [
+        ("right_elbow_joint", 0.5, 1.0, "outside"),  # elbow travel is [-2.3556, 0]
+        ("right_shoulder_pitch_joint", -2.5, 0.2, "rad/s"),
+    ],
+)
+def test_a_trajectory_goal_outside_travel_or_speed_moves_nothing(tmp_path, joint, target, seconds, reason):
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        sent = harness.mock.upper_body_count
+        handle = _trajectory_goal(harness, [joint], [target], seconds)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.INVALID_GOAL
+        assert reason in result.result.error_string
+        time.sleep(0.3)
+        assert harness.mock.upper_body_count == sent
+    finally:
+        harness.shutdown()
+
+
+def test_a_trajectory_goal_outside_the_trajectory_mode_is_refused(tmp_path):
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        assert harness.set_mode("idle").success
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.3], 1.0)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.INVALID_GOAL
+        assert "does not replay trajectories" in result.result.error_string
+    finally:
+        harness.shutdown()
+
+
+def test_a_cancelled_trajectory_holds_where_it_is(tmp_path):
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-1.5], 3.0)
+        assert handle.accepted
+        harness.wait_for(
+            lambda: harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] < -0.2, "the motion to be under way"
+        )
+        cancel = handle.cancel_goal_async()
+        harness.wait_for(cancel.done, "the cancel response")
+        _trajectory_result(harness, handle)
+        # The hold is the target sent one tracking lag before the cancel, so it may sit
+        # slightly short of the pose observed when the cancel was sent.
+        held = harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH]
+        assert -1.5 < held < -0.1
+        time.sleep(0.4)
+        assert harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(held, abs=1e-6)
+    finally:
+        harness.shutdown()
+
+
+_MJCF = Path.home() / ".cache/ibrobot/agibot_x2_urdf/575cc6b988f976c23550e0db85aa1e5475d3652d/X2_URDF-v1.3.0/scene.xml"
+
+
+@pytest.mark.skipif(
+    not _MJCF.exists(), reason="official X2 MuJoCo model not fetched (ros2 run aimdk_robot aimdk_fetch_x2_mjcf)"
+)
+def test_with_simulated_arms_a_trajectory_is_tracked_with_lag_and_sag(tmp_path):
+    """The physics mock reaches a target late and holds it short, and the follow check still passes."""
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0, physics_mjcf=str(_MJCF))
+    try:
+        received: list[float] = []
+        harness.node.create_subscription(
+            JointState,
+            "/joint_states",
+            lambda m: received.append(m.position[list(m.name).index("right_shoulder_pitch_joint")]),
+            _sensor_qos(),
+        )
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint", "right_elbow_joint"], [-1.57, -0.05], 3.0)
+        assert handle.accepted
+        future = handle.get_result_async()
+        lags = []
+        while not future.done():
+            sent = harness.mock.last_upper_body
+            if sent is not None and received:
+                lags.append(received[-1] - sent.arm_pos[_RIGHT_PITCH])
+            time.sleep(0.05)
+        result = future.result().result
+        assert result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, result.error_string
+        assert max(lags) > 0.02  # the arm trails the command on the way up
+        time.sleep(1.0)
+        sag = received[-1] - (-1.57)
+        assert 0.0 < sag < 0.25  # held short of the target against gravity, not dropped
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_task_pose_trajectory_in_policy_stream_preserves_mode_and_can_stop(tmp_path, cancel):
+    from action_msgs.msg import GoalStatus
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        assert harness.set_mode("policy_stream").success
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.3], 1.5)
+        assert handle.accepted
+        if cancel:
+            stopped = handle.cancel_goal_async()
+            harness.wait_for(stopped.done, "planned-trajectory cancel response")
+            assert stopped.result().goals_canceling
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
+        assert result.status == (GoalStatus.STATUS_CANCELED if cancel else GoalStatus.STATUS_SUCCEEDED)
+        assert harness.status().active_mode == "policy_stream"
     finally:
         harness.shutdown()

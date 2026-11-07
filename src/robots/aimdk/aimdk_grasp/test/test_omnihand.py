@@ -393,6 +393,40 @@ def test_finish_discards_the_old_preserved_pose(mapping, right_mapping, side):
     np.testing.assert_array_equal(io.full_published[-1][other_slice], io.other)
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_grasp_and_release_with_only_the_declared_hand_present(mapping, right_mapping, side):
+    active = mapping if side == "left" else right_mapping
+    io = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
+    original = io.feedback
+    active_names = io.channel_joints[:10] if side == "left" else io.channel_joints[10:]
+
+    def feedback():
+        sample = original()
+        return JointSample(sample.received_at, {name: sample.positions[name] for name in active_names})
+
+    io.feedback = feedback
+    effector = OmniHandEffector(io, active, absent_other=True)
+    close, opened = active.preset("close"), active.preset("open")
+    for finger in ("thumb", "index"):
+        flex = FINGERS[finger][1]
+        io.block(finger, opened[flex] + 0.4 * (close[flex] - opened[flex]))
+    assert act(effector, EffectorAction.PRESHAPE).succeeded
+    assert act(effector, EffectorAction.CLOSE).held is True
+    io.blocks.clear()
+    io.touching.clear()
+    assert act(effector, EffectorAction.RELEASE).succeeded
+    effector.finish()
+    absent_slice = slice(10, 20) if side == "left" else slice(0, 10)
+    for command in io.full_published:
+        np.testing.assert_array_equal(command[absent_slice], np.zeros(10))
+    active.require_open(io.measured)
+    count = len(io.full_published)
+    io.feedback = original  # A newly attached hand must not receive the absent-hand placeholder.
+    outcome = act(effector, EffectorAction.PRESHAPE)
+    assert not outcome.succeeded and "installed_hands" in outcome.reason
+    assert len(io.full_published) == count
+
+
 def test_the_right_hand_opens_and_grips_in_its_own_slots(right_mapping):
     hand = RightSimHand(np.asarray(RELEASE) * HAND_SIGNS)
     effector = OmniHandEffector(hand, right_mapping)

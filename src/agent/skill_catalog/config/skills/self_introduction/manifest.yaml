@@ -3,14 +3,14 @@ name: self_introduction
 version: 1.0.0
 semantic_level: skill
 description:
-  summary: Introduce the robot with its recorded self-introduction.
+  summary: Introduce the robot with its recorded self-introduction while waving one hand.
   category: social_interaction
   when_to_use:
   - introduce itself
   - tell the audience who it is
   - answer "who are you"
   do_not_use:
-  - condition: greet one person casually
+  - condition: greet one person casually without introducing itself
     instead_use: wave_hand
   aliases_zh:
   - 自我介绍
@@ -22,17 +22,18 @@ description:
   - introduce yourself
   - self introduction
   - who are you
-  motion_scope: []
+  motion_scope:
+  - arm
   anchor_pose: none
-  intensity: subtle
-  # Playback of the recorded clip; measured on the robot.
+  intensity: moderate
+  # Playback of the recorded clip, measured on the robot; the wave runs inside it.
   duration_sec_estimate: 36.0
   requires_motion_params: false
 capability:
   schema_version: 1
-  summary: Play the robot's recorded self-introduction.
+  summary: Play the robot's recorded self-introduction and wave one hand while it plays.
   domain: social
-  moves_robot: false
+  moves_robot: true
   required_control_mode: named_motion
   parameters:
     type: object
@@ -41,5 +42,7 @@ capability:
     required: []
   # Playing the clip again is the caller's decision; nothing is retried here.
   recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
 implementations:
   x2_runtime_v1: implementations/x2_runtime_v1.yaml

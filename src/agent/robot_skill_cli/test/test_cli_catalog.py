@@ -1,6 +1,7 @@
 import argparse
 import builtins
 import copy
+import hashlib
 import importlib
 import json
 import math
@@ -28,6 +29,35 @@ CONFIG_PATH = Path(__file__).resolve().parent / "fixtures" / "so101_single_arm_o
 
 def _shipped(config_name: str) -> Path:
     return resolve_robot_config_path(config_name=config_name)
+
+
+@pytest.mark.parametrize("hand,body", [("online", "online"), ("off", "online"), ("online", "off")])
+def test_fixed_path_policy_identity_agrees_between_cli_and_gateway(tmp_path, hand, body):
+    from robot_runtime.path_validation import path_validation_identity
+    from robot_skill_cli.catalog import compile_local_snapshot
+    from skill_library.skill_executor_node import SkillExecutorNode
+
+    config = load_robot_config_dict(CONFIG_PATH)
+    # This checks catalog/descriptor identity, so only the artifact's choice
+    # metadata is needed; no pose executor is constructed by this test.
+    artifact = tmp_path / "fixed.json"
+    artifact.write_text(json.dumps({"poses": {"example": {"user_message": "Example", "phrases": ["example"]}}}))
+    config["pose_composer"] = {
+        "enabled": True,
+        "mode": "fixed",
+        "fixed_library": str(artifact),
+        "fixed_library_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+        "path_validation": {"hand": hand, "body": body},
+    }
+    snapshot = compile_local_snapshot(config, CONFIG_PATH)
+    runtime = object.__new__(SkillExecutorNode)
+    runtime._pose_composer_enabled = True
+    runtime._pose_composer_action = "/pose_composer/execute"
+    runtime._pose_validation_identity = path_validation_identity(config["pose_composer"])
+    runtime._skill_templates = {}
+    runtime._pick_action_name = runtime._place_action_name = runtime._semantic_map_target_service = ""
+    runtime._grasp_execution = runtime._placement_execution = {}
+    assert snapshot.delegated_executors["pose_composer"] == runtime._delegated_executor_descriptors()["pose_composer"]
 
 
 # Repository-level fixtures (other robot packages, model bundles) live outside this package.
@@ -1727,3 +1757,14 @@ def test_planner_catalog_view_keeps_skills_that_predate_the_visibility_flag():
     )
 
     assert [skill["name"] for skill in projected["skills"]] == ["nod_yes"]
+
+
+def test_planner_catalog_preserves_canonical_pose_choices_without_sharing_mutable_aliases():
+    from robot_skill_cli.catalog import planner_catalog_view
+
+    options = [{"target_name": "grasp_ready", "description": "准备位 HOME", "aliases": ["回准备位"]}]
+    view = {"skills": [{"name": "return_to_task_pose", "planner_visible": True, "target_options": options}]}
+    projected = planner_catalog_view(view)
+    assert projected["skills"][0]["target_options"] == options
+    projected["skills"][0]["target_options"][0]["aliases"].clear()
+    assert options[0]["aliases"] == ["回准备位"]

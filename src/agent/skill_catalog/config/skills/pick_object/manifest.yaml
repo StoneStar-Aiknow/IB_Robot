@@ -3,7 +3,7 @@ name: pick_object
 version: 1.0.0
 semantic_level: skill
 description:
-  summary: Detect, grasp, verify, and transport the requested object to the configured container pose.
+  summary: Verify any configured task preparation posture, then detect, grasp, verify, and transport the requested object to the configured container pose.
   category: manipulation
   when_to_use:
   - pick up a visible object identified by a text query
@@ -25,7 +25,7 @@ description:
   requires_motion_params: false
 capability:
   schema_version: 1
-  summary: Detect, grasp, verify, and transport the requested object to the configured container pose.
+  summary: Verify any configured task preparation posture before fresh perception, then detect, grasp, verify, and transport the requested object to the configured container pose.
   domain: manipulation
   moves_robot: true
   required_control_mode: moveit_planning
@@ -41,6 +41,7 @@ capability:
   recovery_policy: ask_user
 implementations:
   aimdk_x2_grasp: implementations/aimdk_x2_grasp.yaml
+  aimdk_x2_grasp_task_poses: implementations/aimdk_x2_grasp_task_poses.yaml
   lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
   lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
 description_variants:
@@ -67,4 +68,27 @@ description_variants:
     anchor_pose: none
     intensity: moderate
     duration_sec_estimate: 40.0
+    requires_motion_params: false
+  aimdk_x2_grasp_task_poses:
+    summary: >-
+      Verify the configured preparation posture, then detect and grasp the requested object
+      with the selected hand, lift and hold it, then put it back.
+      The X2 selects the arm from the object's side unless its configuration forces one arm.
+      Use a short English object phrase for target_name, such as "an apple";
+      translate Chinese object names and preserve attributes such as color.
+    category: manipulation
+    when_to_use:
+    - prepare the arms before detecting and grasping a visible object
+    aliases_zh:
+    - "\u6293\u53D6\u7269\u4F53"
+    - "\u62FF\u8D77\u7269\u4F53"
+    aliases_en:
+    - pick object
+    - grasp object
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 70.0
     requires_motion_params: false

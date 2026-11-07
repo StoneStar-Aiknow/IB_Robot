@@ -170,6 +170,9 @@ class AimdkVendorMock(Node):
         self.declare_parameter("arm_command_stiffness", 40.0)
         self.declare_parameter("arm_command_damping", 2.0)
         self.declare_parameter("arm_command_offset", 0.0)
+        # Path to the official X2 MuJoCo scene (aimdk_fetch_x2_mjcf). Empty: the
+        # arms follow commands at once; set: they are simulated (mock_physics).
+        self.declare_parameter("physics_mjcf", "")
 
         self._lock = threading.Lock()
         self._action = str(self.get_parameter("initial_action").value)
@@ -203,6 +206,12 @@ class AimdkVendorMock(Node):
         # simulated physically; it is modelled as a follower that reaches what
         # it was told, which is what the contract's streaming tests observe.
         self._positions: dict[str, float] = {}
+        self._physics = None
+        mjcf = str(self.get_parameter("physics_mjcf").value)
+        if mjcf:
+            from aimdk_robot.mock_physics import ArmPhysics  # noqa: PLC0415
+
+            self._physics = ArmPhysics(mjcf, ARM_JOINTS)
 
         group = ReentrantCallbackGroup()
         self.create_service(SetMcAction, "/aimdk_5Fmsgs/srv/SetMcAction", self._set_action, callback_group=group)
@@ -271,6 +280,11 @@ class AimdkVendorMock(Node):
         self.create_timer(1.0, self._publish_pmu)
         self.create_timer(0.03, self._publish_audio_capture)
 
+    def destroy_node(self) -> None:
+        if self._physics is not None:
+            self._physics.stop()
+        super().destroy_node()
+
     def current_action(self) -> str:
         """The MC action the platform currently reports (test inspection)."""
         with self._lock:
@@ -280,6 +294,8 @@ class AimdkVendorMock(Node):
         """Place joints without a command, as if the platform moved them itself."""
         with self._lock:
             self._positions.update({str(name): float(value) for name, value in positions.items()})
+        if self._physics is not None:
+            self._physics.place(positions)
 
     def preset_running(self) -> bool:
         with self._lock:
@@ -520,6 +536,10 @@ class AimdkVendorMock(Node):
                 self._positions[name] = float(value) - sag
             for name, value in zip(HEAD_JOINTS, list(message.head_pos), strict=False):
                 self._positions[name] = float(value)
+            if self._physics is not None:
+                self._physics.set_targets(
+                    {n: self._positions[n] for n in ARM_JOINTS + HEAD_JOINTS if n in self._positions}
+                )
             if int(message.hand_sub_mode) == projection.HAND_SUB_MODE_CLAW and len(hand_pos) == 2:
                 self._positions["left_hand"], self._positions["right_hand"] = hand_pos[0], hand_pos[1]
             elif int(message.hand_sub_mode) == projection.HAND_SUB_MODE_DEXTEROUS_JOINT and len(hand_pos) == 20:
@@ -657,6 +677,8 @@ class AimdkVendorMock(Node):
     def _publish_joint_states(self) -> None:
         with self._lock:
             positions = dict(self._positions)
+        if self._physics is not None:
+            positions.update(self._physics.positions())
         publishing = {str(group) for group in self.get_parameter("publish_joint_groups").value}
         for group, (publisher, names) in self._joint_pubs.items():
             if group not in publishing:

@@ -1,0 +1,15 @@
+{"model": "decode", "iteration": 1, "release_ns": 126581909330636, "start_ns": 126581909330636, "finish_ns": 126582032740506, "execute_ms": 123.40987, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 2, "release_ns": 126582042823397, "start_ns": 126582042823397, "finish_ns": 126582109424100, "execute_ms": 66.600703, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 3, "release_ns": 126582114033214, "start_ns": 126582114033214, "finish_ns": 126582184250324, "execute_ms": 70.21711, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 4, "release_ns": 126582189242095, "start_ns": 126582189242095, "finish_ns": 126582241350116, "execute_ms": 52.108021, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 5, "release_ns": 126582246386131, "start_ns": 126582246386131, "finish_ns": 126582300960741, "execute_ms": 54.57461, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 6, "release_ns": 126582306322303, "start_ns": 126582306322303, "finish_ns": 126582360582251, "execute_ms": 54.259948, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 7, "release_ns": 126582365786860, "start_ns": 126582365786860, "finish_ns": 126582406214100, "execute_ms": 40.42724, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 8, "release_ns": 126582411855715, "start_ns": 126582411855715, "finish_ns": 126582562208657, "execute_ms": 150.352942, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 9, "release_ns": 126582568526548, "start_ns": 126582568526548, "finish_ns": 126582669275559, "execute_ms": 100.749011, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 10, "release_ns": 126582673820168, "start_ns": 126582673820168, "finish_ns": 126582713696053, "execute_ms": 39.875885, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 11, "release_ns": 126582718357798, "start_ns": 126582718357798, "finish_ns": 126582784857981, "execute_ms": 66.500183, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 12, "release_ns": 126582789442408, "start_ns": 126582789442408, "finish_ns": 126582835770220, "execute_ms": 46.327812, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 13, "release_ns": 126582840995663, "start_ns": 126582840995663, "finish_ns": 126582890249491, "execute_ms": 49.253828, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 14, "release_ns": 126582895050012, "start_ns": 126582895050012, "finish_ns": 126582944890194, "execute_ms": 49.840182, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 15, "release_ns": 126582949933892, "start_ns": 126582949933892, "finish_ns": 126582989137694, "execute_ms": 39.203802, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}

@@ -8,9 +8,9 @@ from typing import Any
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch.actions import ExecuteProcess
 from launch_ros.actions import Node
-from skill_catalog.source import resolve_development_source_root
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
+from embodied_common import pose_composer_contract as POSE_COMPOSER
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
@@ -28,6 +28,7 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
 from robot_config.voice_contract import SPEAKER_EMBEDDING_OUTPUT_TOPIC, VOICE_TRANSCRIPT_TOPIC
 from robot_runtime import contract as RUNTIME
+from skill_catalog.source import resolve_development_source_root
 
 logger = get_colored_logger("embodied_bringup")
 
@@ -122,6 +123,19 @@ def apply_planner_base_url(robot_config: dict[str, Any], planner_base_url: str) 
     if not isinstance(planner, dict):
         return
     planner["base_url"] = url
+
+
+def _pose_memory_agent_params(robot_config: dict, common_params: dict) -> dict:
+    composer = robot_config.get("pose_composer") or {}
+    if not common_params.get("pose_composer_enabled"):
+        return {"pose_lookup_service": "", "pose_feedback_service": ""}
+    memory = composer.get("memory") or {}
+    return {
+        "pose_lookup_service": POSE_COMPOSER.LOOKUP_SERVICE if POSE_COMPOSER.lookup_enabled(composer) else "",
+        "pose_feedback_service": POSE_COMPOSER.FEEDBACK_SERVICE
+        if isinstance(memory, dict) and memory.get("enabled") is True
+        else "",
+    }
 
 
 def generate_embodied_nodes(
@@ -393,16 +407,31 @@ def generate_embodied_nodes(
         clips = play_audio.get("clips", {})
         if not isinstance(clips, dict) or not clips:
             raise ValueError("embodied.runtime_play_audio.clips must map clip names to file paths")
+        resolved_clips = {}
         for clip_name, clip_path in clips.items():
             if not isinstance(clip_name, str) or not str(clip_name).strip():
                 raise ValueError("embodied.runtime_play_audio.clips keys must be clip names")
             if not isinstance(clip_path, str) or not clip_path.strip():
                 raise ValueError(f"embodied.runtime_play_audio clip {clip_name!r} must be a file path")
+            resolved_clips[clip_name] = str(Path(resolve_ros_path(clip_path)).expanduser())
         common_params.update(
             runtime_play_audio_enabled=True,
             runtime_play_audio_service=str(play_audio.get("service", "/voice_tts/play")),
-            runtime_play_audio_clips_json=json.dumps(clips),
+            runtime_play_audio_clips_json=json.dumps(resolved_clips),
             asr_control_topic=str(play_audio.get("asr_control_topic", "/voice_control")),
+        )
+    pose_composer = robot_config.get("pose_composer", {})
+    if isinstance(pose_composer, dict) and pose_composer.get("enabled") is True:
+        # Arm poses composed from a description; pose_composer's own builder launches the node.
+        from robot_runtime.path_validation import path_validation_identity
+        from robot_runtime.task_poses import pose_catalog
+
+        common_params.update(
+            pose_catalog_json=json.dumps(pose_catalog(robot_config.get("task_poses"), pose_composer), sort_keys=True),
+            pose_composer_enabled=True,
+            pose_composer_action=POSE_COMPOSER.EXECUTE_ACTION,
+            task_poses_json=json.dumps(robot_config.get("task_poses") or {}, sort_keys=True),
+            pose_validation_identity_json=json.dumps(path_validation_identity(pose_composer), sort_keys=True),
         )
     if arm_surface:
         common_params.update(
@@ -660,6 +689,12 @@ def generate_embodied_nodes(
                             "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
                         ),
                         "gateway_caller_token": agent_config.get("caller_token", ""),
+                        # Compose arm poses while the plan is prepared, so the presented pose is the one run.
+                        "pose_compose_service": POSE_COMPOSER.COMPOSE_SERVICE
+                        if common_params.get("pose_composer_enabled")
+                        else "",
+                        # Recall confirmed poses and supply pending save context to the planner.
+                        **_pose_memory_agent_params(robot_config, common_params),
                     }
                 ],
             )
@@ -920,6 +955,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "confirm_mode",
         "busy_message",
         "addressee_trigger",
+        "speech_mode",
         "semantic_gate_mode",
         "semantic_gate_model_path",
         "semantic_gate_log_path",
@@ -948,7 +984,11 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     pairs_by_segment = (
         voice_bridge.get("speaker_check_enabled") is True or voice_bridge.get("addressee_trigger") == "vendor_session"
     )
-    if pairs_by_segment:
+    audio_input = voice_asr.get("audio_input") or {}
+    chunk_topic = str(audio_input.get("topic", ""))
+    if voice_asr.get("input_mode") == "external_vad" and chunk_topic:
+        params["speech_chunk_topic"] = chunk_topic
+    if pairs_by_segment or params.get("speech_chunk_topic"):
         # The gate pairs each transcript with its segment's voiceprint and wake
         # event, so the bridge reads the segment-tagged copy the ASR publishes;
         # one source of truth, as for input_topic.
@@ -990,6 +1030,8 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     ):
         if field_name in voice_bridge:
             params[f"{field_name}_json"] = json.dumps(list(voice_bridge[field_name]), ensure_ascii=False)
+    if "speech_messages" in voice_bridge:
+        params["speech_messages_json"] = json.dumps(voice_bridge["speech_messages"], ensure_ascii=False)
     if "text_corrections" in voice_bridge:
         params["text_corrections_json"] = json.dumps(dict(voice_bridge["text_corrections"]), ensure_ascii=False)
     return Node(

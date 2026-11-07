@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
+from typing import Any
 
 import rclpy
 from builtin_interfaces.msg import Duration as DurationMsg
@@ -29,9 +30,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -39,6 +37,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
+from embodied_common import pose_composer_contract as POSE_COMPOSER
 from embodied_common.caller_auth import is_caller_authorized
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.dispatch_binding import (
@@ -66,6 +65,7 @@ from embodied_common.workflow_contracts import (
     validate_workflow_steps,
 )
 from ibrobot_msgs.action import (
+    ExecuteArmPose,
     ExecuteNamedMotion,
     ExecuteNavigation,
     ExecuteProgram,
@@ -105,6 +105,9 @@ from ibrobot_msgs.srv import (
 from robot_config.contract_utils import qos_profile_from_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_runtime import contract as RUNTIME
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
 from skill_library.execution_store import (
     ExecutionBusyError,
@@ -448,7 +451,7 @@ class _LateCleanupConfirmation:
             except Exception:
                 return
             result = getattr(wrapped_result, "result", wrapped_result)
-            if getattr(result, "error_code", "") != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
+            if getattr(result, "error_code", "") not in {PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "POSE_STOP_UNKNOWN"}:
                 self.confirm()
 
         result_future.add_done_callback(confirm_terminal)
@@ -567,6 +570,54 @@ def _load_json_list(raw_value: str) -> list[str]:
 _WAIT_POLL_SEC = 0.005
 
 
+def _play_audio_failure(future, skill_name: str) -> tuple[str, str] | None:
+    """``(error_code, message)`` for a finished playback call that failed, else None."""
+    try:
+        response = future.result()
+    except Exception as exc:
+        return "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}"
+    if response is None or not response.success:
+        code = str(getattr(response, "error_code", "") or "PLAY_AUDIO_FAILED")
+        return code, str(getattr(response, "message", "") or f"{skill_name} failed")
+    return None
+
+
+class _CompositeBranchGoal:
+    """A skill goal handle for one branch of a composite skill.
+
+    The branch's executor reads the request, publishes feedback and sees a
+    cancel request (the root's, or one the composite raises through
+    ``stop_requested``) as usual, but its terminal call is kept here, so the
+    composite ends the root goal exactly once. It carries no resume token and
+    records no motion checkpoint: a composite step restarts as a whole.
+    """
+
+    def __init__(self, goal_handle, *, stop_requested: Callable[[], bool]) -> None:
+        self._goal_handle = goal_handle
+        self._stop_requested = stop_requested
+        self.terminal = ""
+
+    @property
+    def request(self):
+        return self._goal_handle.request
+
+    @property
+    def is_cancel_requested(self) -> bool:
+        return bool(self._goal_handle.is_cancel_requested) or bool(self._stop_requested())
+
+    def publish_feedback(self, feedback) -> None:
+        self._goal_handle.publish_feedback(feedback)
+
+    def succeed(self) -> None:
+        self.terminal = "succeeded"
+
+    def abort(self) -> None:
+        self.terminal = "aborted"
+
+    def canceled(self) -> None:
+        self.terminal = "canceled"
+
+
 class SkillExecutorNode(Node):
     """Expose skill and primitive actions with explicit safety validation."""
 
@@ -619,6 +670,12 @@ class SkillExecutorNode(Node):
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
+        # Arm poses composed from a description (ibrobot_msgs/action/ExecuteArmPose).
+        self.declare_parameter("pose_composer_action", "", descriptor=startup_descriptor)
+        self.declare_parameter("pose_composer_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("task_poses_json", "{}", descriptor=startup_descriptor)
+        self.declare_parameter("pose_validation_identity_json", "{}", descriptor=startup_descriptor)
+        self.declare_parameter("pose_catalog_json", "{}", descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -686,6 +743,12 @@ class SkillExecutorNode(Node):
             self.get_parameter("validate_primitive_service").get_parameter_value().string_value
         )
         self._named_poses = load_json_mapping(self.get_parameter("named_poses_json").get_parameter_value().string_value)
+        from robot_runtime.task_poses import normalize_task_poses
+
+        task_poses = json.loads(self.get_parameter("task_poses_json").value)
+        self._task_poses = normalize_task_poses(task_poses) if task_poses else {}
+        self._pose_validation_identity = json.loads(self.get_parameter("pose_validation_identity_json").value)
+        self._pose_catalog = json.loads(self.get_parameter("pose_catalog_json").value)
         self._named_targets = load_json_mapping(
             self.get_parameter("named_targets_json").get_parameter_value().string_value
         )
@@ -751,6 +814,12 @@ class SkillExecutorNode(Node):
         )
         if self._runtime_named_motion_enabled and not self._runtime_named_motion_action:
             raise ValueError("runtime_named_motion_action must be set when runtime_named_motion_enabled is true")
+        self._pose_composer_enabled = self.get_parameter("pose_composer_enabled").value is True
+        self._pose_composer_action = (
+            self.get_parameter("pose_composer_action").get_parameter_value().string_value.strip()
+        )
+        if self._pose_composer_enabled and not self._pose_composer_action:
+            raise ValueError("pose_composer_action must be set when pose_composer_enabled is true")
         if self._runtime_named_motion_enabled and not self._runtime_enabled:
             # Admission (mode, capabilities, stop latch) comes from the runtime status.
             raise ValueError("runtime_named_motion requires runtime admission (runtime_enabled)")
@@ -1033,8 +1102,30 @@ class SkillExecutorNode(Node):
             if self._runtime_named_motion_enabled
             else None
         )
+        self._pose_composer_client = (
+            ActionClient(self, ExecuteArmPose, self._pose_composer_action, callback_group=callback_group)
+            if self._pose_composer_enabled
+            else None
+        )
         self._mirror_session_client = (
             self.create_client(SetBool, self._mirror_session_service, callback_group=callback_group)
+            if self._mirror_session_enabled
+            else None
+        )
+        self._mirror_session_state_lock = RLock()
+        self._mirror_session_state = None
+        self._mirror_session_start_latched = False
+        self._mirror_session_seen_holding = False
+        self._mirror_session_state_sub = (
+            self.create_subscription(
+                String,
+                MIRROR_SESSION.STATE_TOPIC,
+                self._on_mirror_session_state,
+                QoSProfile(
+                    depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+                ),
+                callback_group=callback_group,
+            )
             if self._mirror_session_enabled
             else None
         )
@@ -1324,8 +1415,15 @@ class SkillExecutorNode(Node):
             goal_handle._program_step_checkpoint = None
             self._execution_store.mark_committing(record.execution_id)
             program_owner = ExecutionOwner.workflow(program.root_task_id)
+            admission_started = time.monotonic()
             workflow_error, lease_token = self._gateway_policy.admit_workflow(
                 program_owner, self._runtime_snapshot(), timeout_sec=program.task_budget_sec
+            )
+            self._audit(
+                "gateway_admission",
+                task_id=program.root_task_id,
+                duration_sec=time.monotonic() - admission_started,
+                error_code=workflow_error or "",
             )
             program_admission = _ProgramAdmission(
                 SimpleNamespace(
@@ -1872,6 +1970,7 @@ class SkillExecutorNode(Node):
             primitive_contracts=getattr(self, "_primitive_descriptors", PRIMITIVE_CONTRACT_V1.descriptors),
             primitive_contract_digest=getattr(self, "_primitive_contract_digest", PRIMITIVE_CONTRACT_V1.digest),
             delegated_executors=self._delegated_executor_descriptors(),
+            pose_catalog=getattr(self, "_pose_catalog", {}),
         )
         snapshot = SkillCatalogCompiler().compile(
             source,
@@ -1892,8 +1991,14 @@ class SkillExecutorNode(Node):
                 f"runtime enabled={runtime_enabled}, catalog enabled={catalog_enabled}"
             )
         named_runtime_enabled = bool(getattr(self, "_runtime_named_motion_enabled", False))
+        # A clip bound with a motion runs that motion through the same executor.
         named_catalog_enabled = any(
             str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME
+            or (
+                str(template.get("executor", "")).strip() == RUNTIME_PLAY_AUDIO_EXECUTOR
+                and isinstance(template.get("binding"), Mapping)
+                and "motion" in template["binding"]
+            )
             for template in (getattr(snapshot, "templates", None) or {}).values()
             if isinstance(template, Mapping)
         )
@@ -1902,6 +2007,26 @@ class SkillExecutorNode(Node):
                 "runtime_named_motion configuration mismatch: "
                 f"runtime enabled={named_runtime_enabled}, catalog enabled={named_catalog_enabled}"
             )
+        pose_runtime_enabled = bool(getattr(self, "_pose_composer_enabled", False))
+        pose_catalog_enabled = any(
+            str(template.get("executor", "")).strip() == POSE_COMPOSER.EXECUTOR
+            for template in (getattr(snapshot, "templates", None) or {}).values()
+            if isinstance(template, Mapping)
+        )
+        if pose_runtime_enabled != pose_catalog_enabled:
+            raise ValueError(
+                "pose_composer configuration mismatch: "
+                f"runtime enabled={pose_runtime_enabled}, catalog enabled={pose_catalog_enabled}"
+            )
+        if getattr(self, "_task_poses", {}):
+            from robot_runtime.task_poses import RETURN_TASK_POSE
+
+            templates = snapshot.templates
+            if (templates.get(RETURN_TASK_POSE) or {}).get("executor") != POSE_COMPOSER.EXECUTOR:
+                raise ValueError("task_poses requires return_to_task_pose in the skill catalog")
+            for skill in self._task_poses["skill_entry_poses"]:
+                if (templates.get(skill) or {}).get("executor") != "grasp_pipeline":
+                    raise ValueError("task-pose preparation requires a configured grasp_pipeline skill")
         sound_runtime_enabled = bool(getattr(self, "_sound_following_enabled", False))
         sound_catalog_enabled = "sound_following" in snapshot.enabled_skill_names
         if sound_runtime_enabled != sound_catalog_enabled:
@@ -1979,11 +2104,32 @@ class SkillExecutorNode(Node):
             configured_executors.add(MIRROR_SESSION_EXECUTOR)
         if getattr(self, "_play_audio_enabled", False):
             configured_executors.add(RUNTIME_PLAY_AUDIO_EXECUTOR)
+        if getattr(self, "_pose_composer_enabled", False):
+            configured_executors.add(POSE_COMPOSER.EXECUTOR)
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
             configured_executors.add("semantic_map_query")
         for name in sorted(configured_executors):
+            if name == POSE_COMPOSER.EXECUTOR:
+                endpoint_name = getattr(self, "_pose_composer_action", "")
+                if not getattr(self, "_pose_composer_enabled", False) or not endpoint_name:
+                    continue
+                from robot_runtime.task_poses import task_pose_identity
+
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_action",
+                        configuration={
+                            **task_pose_identity(getattr(self, "_task_poses", {})),
+                            **getattr(self, "_pose_validation_identity", {}),
+                        },
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
             if name == named_motion.EXECUTOR_NAME:
                 endpoint_name = getattr(self, "_runtime_named_motion_action", "")
                 if not getattr(self, "_runtime_named_motion_enabled", False) or not endpoint_name:
@@ -2095,48 +2241,51 @@ class SkillExecutorNode(Node):
         """
         goal = goal_handle.request
         result = SkillCommand.Result()
+        motion = named_motion.bound_motion_name(template)
+        client, error_code, reason = self._prepare_runtime_named_motion(goal.skill_name, motion)
+        if client is None:
+            return self._abort_skill(result, goal_handle, [], error_code, reason)
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+        return self._run_runtime_named_motion(goal_handle, client, motion, timeout_sec)
+
+    def _prepare_runtime_named_motion(self, skill_name: str, motion: str) -> tuple[Any, str, str]:
+        """Check, before anything is dispatched, that the runtime can run ``motion`` now.
+
+        Returns ``(client, "", "")``, or ``(None, error_code, reason)``.
+        """
         client = getattr(self, "_runtime_named_motion_client", None)
         if client is None:
-            return self._abort_skill(
-                result,
-                goal_handle,
-                [],
+            return (
+                None,
                 named_motion.RUNTIME_UNAVAILABLE,
                 "runtime named motion executor is not enabled for this deployment",
             )
-        motion = named_motion.bound_motion_name(template)
         if not motion:
-            return self._abort_skill(
-                result, goal_handle, [], named_motion.INVALID_BINDING, "skill template binds no motion"
-            )
+            return None, named_motion.INVALID_BINDING, "skill template binds no motion"
         status, reason = self._runtime_status_for_admission()
         if status is None:
-            return self._abort_skill(result, goal_handle, [], named_motion.PLATFORM_NOT_READY, reason)
+            return None, named_motion.PLATFORM_NOT_READY, reason
         names, error_code, reason = named_motion.advertised_motion_names(
-            status.capabilities_json, self._required_capabilities_for_skill(goal.skill_name)
+            status.capabilities_json, self._required_capabilities_for_skill(skill_name)
         )
         if names is None:
-            return self._abort_skill(result, goal_handle, [], error_code, reason)
+            return None, error_code, reason
         if motion not in names:
             # Checked here because the runtime rejects an unknown name at goal
             # acceptance, which carries no reason.
-            return self._abort_skill(
-                result,
-                goal_handle,
-                [],
-                named_motion.UNKNOWN,
-                f"runtime does not advertise named motion {motion!r}",
-            )
-        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+            return None, named_motion.UNKNOWN, f"runtime does not advertise named motion {motion!r}"
         if not client.wait_for_server(timeout_sec=self._rpc_timeout):
-            return self._abort_skill(
-                result,
-                goal_handle,
-                [],
+            return (
+                None,
                 named_motion.RUNTIME_UNAVAILABLE,
                 f"named motion action unavailable: {self._runtime_named_motion_action}",
             )
+        return client, "", ""
 
+    def _run_runtime_named_motion(self, goal_handle, client, motion: str, timeout_sec: float) -> SkillCommand.Result:
+        """Dispatch a prepared named motion and end ``goal_handle`` with its outcome."""
+        goal = goal_handle.request
+        result = SkillCommand.Result()
         executed = [f"{named_motion.EXECUTOR_NAME}:{motion}"]
         motion_goal = ExecuteNamedMotion.Goal()
         motion_goal.name = motion
@@ -2271,6 +2420,213 @@ class SkillExecutorNode(Node):
         goal_handle.succeed()
         return result
 
+    def _execute_pose_composer_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+        named_pose: str = "",
+    ) -> SkillCommand.Result:
+        """Move the arms to the pose ``target_name`` describes, through the pose composer.
+
+        The composer executes the composition it prepared for the same text
+        while the plan was prepared (or composes again and says so), plans the
+        path from the measured pose and hands it to the runtime's
+        joint.trajectory action, which checks it once more. A cancel is
+        forwarded; the runtime holds the arms where they are.
+        """
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        client = getattr(self, "_pose_composer_client", None)
+        text = named_pose or str(goal.target_name or "").strip()
+        if client is None:
+            return self._abort_skill(
+                result, goal_handle, [], "POSE_COMPOSER_UNAVAILABLE", "pose composer is not enabled for this deployment"
+            )
+        if not text:
+            return self._abort_skill(result, goal_handle, [], "POSE_EMPTY_TEXT", "target_name must describe the pose")
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 60.0))
+        if not client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "POSE_COMPOSER_UNAVAILABLE",
+                f"pose composer action unavailable: {self._pose_composer_action}",
+            )
+        executed = [f"task_pose:{named_pose}" if named_pose else f"{POSE_COMPOSER.EXECUTOR}:{goal.skill_name}"]
+        pose_goal = ExecuteArmPose.Goal()
+        pose_goal.timeout_sec = timeout_sec
+        # A deployment with articulated-hand checks also binds free-pose arm
+        # trajectories to the Gateway owner while checking preserved fingers.
+        lease = getattr(self, "_gateway_lease", None)
+        owner = lease.owner if lease is not None else None
+        pose_goal.gateway_task_id = owner.root_task_id if owner is not None else str(goal.dispatch_binding.root_task_id)
+        if named_pose:
+            pose_goal.named_pose = named_pose
+            pose_goal.task_poses_digest = getattr(self, "_task_poses", {}).get("digest", "")
+        else:
+            pose_goal.text = text
+
+        def feedback_cb(feedback_msg) -> None:
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = (
+                f"{POSE_COMPOSER.EXECUTOR}:{feedback_msg.feedback.state}:{feedback_msg.feedback.progress:.2f}"
+            )
+            goal_handle.publish_feedback(feedback)
+
+        admission = self._active_skill_admission
+        nonce = uuid.uuid4().hex
+        cleanup_key = self._register_delegated_dispatch(nonce, admission, goal.dispatch_binding)
+        terminal = False
+        late_cleanup = _LateCleanupConfirmation()
+        late_cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, cleanup_key))
+        send_future = result_future = cancel_future = None
+        try:
+            send_future = client.send_goal_async(pose_goal, feedback_callback=feedback_cb)
+            if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+                late_cleanup.watch_goal_future(send_future, lambda handle: handle.cancel_goal_async())
+                return self._abort_skill(
+                    result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "pose goal response timed out: arm motion state is unknown",
+                )  # fmt: skip
+            pose_handle = send_future.result()
+            if pose_handle is None or not pose_handle.accepted:
+                terminal = True
+                return self._abort_skill(result, goal_handle, [], "POSE_REJECTED", "pose composer refused the goal")
+            result_future = pose_handle.get_result_async()
+            deadline = time.monotonic() + timeout_sec
+            while rclpy.ok() and not result_future.done():
+                if goal_handle.is_cancel_requested and cancel_future is None:
+                    cancel_future = pose_handle.cancel_goal_async()
+                    self._audit_cancel_propagated()
+                if time.monotonic() >= deadline:
+                    if cancel_future is None:
+                        cancel_future = pose_handle.cancel_goal_async()
+                    late_cleanup.watch_result_future(result_future)
+                    return self._abort_skill(
+                        result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        "pose still running at the skill deadline; cancel sent, admission held until it ends",
+                    )  # fmt: skip
+                time.sleep(_WAIT_POLL_SEC)
+            if not result_future.done():
+                late_cleanup.watch_result_future(result_future)
+                return self._abort_skill(
+                    result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, "pose execution state is unknown"
+                )
+            wrapped = result_future.result()
+            pose_outcome = getattr(wrapped, "result", None) if wrapped is not None else None
+            if pose_outcome is None or pose_outcome.error_code == "POSE_STOP_UNKNOWN":
+                return self._abort_skill(
+                    result, goal_handle, executed, PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "POSE_STOP_UNKNOWN: physical stop unconfirmed; Gateway admission retained; "
+                    + (str(pose_outcome.message) if pose_outcome is not None else "no pose result"),
+                )  # fmt: skip
+            terminal = True
+        except Exception:
+            self.get_logger().error(f"pose composer execution failed:\n{traceback.format_exc()}")
+            if result_future is not None:
+                late_cleanup.watch_result_future(result_future)
+            elif send_future is not None:
+                late_cleanup.watch_goal_future(send_future, lambda handle: handle.cancel_goal_async())
+            else:
+                terminal = True
+            return self._abort_skill(
+                result, goal_handle, executed if send_future is not None else [],
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT if send_future is not None else "POSE_FAILED",
+                "pose execution state is unknown",
+            )  # fmt: skip
+        finally:
+            if terminal:
+                late_cleanup.confirm()
+        pose_result = getattr(wrapped, "result", None) if wrapped is not None else None
+        if pose_result is None:
+            return self._abort_skill(result, goal_handle, executed, "POSE_FAILED", "pose composer returned no result")
+        message = str(pose_result.message).strip()
+        if pose_result.error_code == "POSE_CANCELLED":
+            self._cancel_skill(result, goal_handle, executed, goal.skill_name)
+            result.message = message or result.message
+            return result
+        if not pose_result.success:
+            return self._abort_skill(
+                result, goal_handle, executed, str(pose_result.error_code) or "POSE_FAILED", message or "pose failed"
+            )
+        result.success = True
+        result.error_code = ""
+        result.message = message or "pose reached"
+        result.executed_primitives = executed
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
+
+    def _execute_prepared_pick_skill(self, goal_handle, template, *, effective_timeout_sec=None):
+        """A declared preparation phase within the admitted pick, never nested admission.
+
+        The pose snapshot is part of the catalog identity. The grasp action is
+        dispatched only after the pose server verifies fresh, stable feedback;
+        its perception/planning therefore starts after preparation completes.
+        """
+        from robot_runtime.task_poses import RETURN_TASK_POSE
+
+        config = getattr(self, "_task_poses", {})
+        name = config.get("skill_entry_poses", {}).get(goal_handle.request.skill_name)
+        if not name:
+            return self._execute_pick_skill(goal_handle, template, effective_timeout_sec=effective_timeout_sec)
+        if goal_handle.is_cancel_requested:
+            result = SkillCommand.Result()
+            self._cancel_skill(result, goal_handle, [], goal_handle.request.skill_name)
+            return result
+        budget = float(effective_timeout_sec or goal_handle.request.timeout_sec or template.get("timeout_sec", 120.0))
+        started = time.monotonic()
+        ready, reason = self._ensure_skill_capabilities(RETURN_TASK_POSE)
+        if not ready:
+            return self._abort_skill(SkillCommand.Result(), goal_handle, [], "CAPABILITY_MISSING", reason)
+        child = _DeferredTerminalGoalHandle(goal_handle)
+        feedback = SkillCommand.Feedback()
+        feedback.state, feedback.detail = "preparing", f"task_pose:{name}"
+        goal_handle.publish_feedback(feedback)
+        prepared = self._execute_pose_composer_skill(
+            child,
+            template,
+            effective_timeout_sec=min(budget, config["poses"][name]["timeout_sec"]),
+            named_pose=name,
+        )
+        if not prepared.success:
+            child.commit()
+            return prepared
+        if getattr(self, "_runtime_enabled", False):
+            status, reason = self._runtime_status_for_admission()
+            required = self._required_control_mode_for_skill(goal_handle.request.skill_name)
+            expected = self._runtime_mode_for(required or self._skill_required_control_mode)
+            if status is None or status.active_mode != expected:
+                return self._abort_skill(
+                    SkillCommand.Result(),
+                    goal_handle,
+                    list(prepared.executed_primitives),
+                    "CONTROL_MODE_MISMATCH",
+                    reason or "runtime mode changed during task preparation",
+                )
+        remaining = budget - (time.monotonic() - started)
+        if goal_handle.is_cancel_requested:
+            result = SkillCommand.Result()
+            self._cancel_skill(result, goal_handle, list(prepared.executed_primitives), goal_handle.request.skill_name)
+            return result
+        if remaining <= 0:
+            return self._abort_skill(
+                SkillCommand.Result(),
+                goal_handle,
+                list(prepared.executed_primitives),
+                "TASK_POSE_TIMEOUT",
+                "preparation exhausted the pick budget",
+            )
+        result = self._execute_pick_skill(goal_handle, template, effective_timeout_sec=remaining)
+        result.executed_primitives = [f"task_pose:{name}", *result.executed_primitives]
+        result.message = f"{result.message}; {prepared.message}".lstrip("; ")
+        return result
+
     def _note_named_motion_cancel(self, motion: str, cancel_future) -> None:
         if _cancel_accepted(cancel_future):
             self._audit_cancel_propagated()
@@ -2354,7 +2710,7 @@ class SkillExecutorNode(Node):
         effective_timeout_sec: float | None = None,
         left_idle: bool = False,
     ):
-        """Start or stop the mirror session; the Gateway does not track it past the reply.
+        """Start or stop the persistent mirror session.
 
         The session answers start once it holds the runtime mode, and stop once
         it has observed the runtime back in idle. ``left_idle`` says admission
@@ -2387,6 +2743,12 @@ class SkillExecutorNode(Node):
                 give_back=True,
             )
 
+        if start and getattr(self, "_mirror_session_enabled", False):
+            # Latch before dispatch: the service reply can beat the state-topic
+            # callback, and a timeout does not prove that takeover never happened.
+            with self._mirror_session_state_lock:
+                self._mirror_session_start_latched = True
+                self._mirror_session_seen_holding = False
         future = client.call_async(SetBool.Request(data=MIRROR_SESSION_COMMANDS[command]))
         if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
             return self._fail_mirror_session(
@@ -2416,7 +2778,48 @@ class SkillExecutorNode(Node):
                 message or f"{skill_name} failed",
                 give_back=start and left_idle,
             )
+        if not start and getattr(self, "_mirror_session_enabled", False) and self._runtime_idle_for_admission():
+            with self._mirror_session_state_lock:
+                self._mirror_session_start_latched = False
         return self._succeed_mirror_session(result, goal_handle, skill_name, response.message)
+
+    def _on_mirror_session_state(self, message: String) -> None:
+        try:
+            state = json.loads(message.data)
+            if (
+                not isinstance(state, dict)
+                or state.get("state") not in MIRROR_SESSION.STATES
+                or type(state.get("holding")) is not bool
+                or type(state.get("releasing")) is not bool
+                or isinstance(state.get("stamp"), bool)
+                or not math.isfinite(float(state["stamp"]))
+            ):
+                raise ValueError("invalid mirror session state")
+        except (KeyError, TypeError, ValueError, OverflowError):
+            state = None
+        with self._mirror_session_state_lock:
+            self._mirror_session_state = state
+            if state is not None and state["holding"] and self._mirror_session_start_latched:
+                self._mirror_session_seen_holding = True
+
+    def _mirror_session_allows_skill(self, skill_name: str) -> tuple[bool, str]:
+        """Mode equality alone cannot arbitrate a session that outlives its start action."""
+        if not getattr(self, "_mirror_session_enabled", False):
+            return True, ""
+        if self._active_mirror_session_command(skill_name):
+            return True, ""
+        with self._mirror_session_state_lock:
+            state = self._mirror_session_state
+            now = self.get_clock().now().nanoseconds / 1e9
+            if state is None or not 0 <= now - float(state["stamp"]) <= MIRROR_SESSION.STATE_STALE_SEC:
+                return False, "mirror session state is unknown or stale; stop mirror before other skills"
+            if state["state"] != MIRROR_SESSION.STATE_WAIT or state["holding"] or state["releasing"]:
+                return False, "mirror session owns the arms; execute mirror_stop before other skills"
+            if self._mirror_session_start_latched:
+                if not self._mirror_session_seen_holding or not self._runtime_idle_for_admission():
+                    return False, "mirror takeover or release is unconfirmed; execute mirror_stop first"
+                self._mirror_session_start_latched = False
+        return True, ""
 
     def _publish_asr_control(self, command: str) -> None:
         """Mute (stop) or restore (start) the ASR while a recorded clip plays."""
@@ -2428,12 +2831,22 @@ class SkillExecutorNode(Node):
         publisher.publish(message)
 
     def _execute_play_audio_skill(self, goal_handle, template, *, effective_timeout_sec: float | None = None):
-        """Play the clip the catalog binds for this skill, muting the ASR while it runs."""
+        """Play the clip the catalog binds for this skill, muting the ASR while it runs.
+
+        A binding that also names a runtime motion plays the clip and runs the
+        motion together (the self-introduction waves while it speaks). Every
+        check for both happens before anything is dispatched; the playback
+        request goes out first and the motion straight after it, without
+        waiting for either to be accepted, so the robot does not keep the user
+        waiting. A playback request that cannot be sent sends no motion.
+        """
         result = SkillCommand.Result()
         skill_name = str(goal_handle.request.skill_name)
         binding = template.get("binding") if isinstance(template, Mapping) else None
         clip = str((binding or {}).get("clip", "")).strip() if isinstance(binding, Mapping) else ""
         path = str(self._play_audio_clips.get(clip, "")).strip() if clip else ""
+        binds_motion = isinstance(binding, Mapping) and "motion" in binding
+        motion = named_motion.bound_motion_name(template) if binds_motion else ""
         if not clip or not path:
             return self._abort_skill(
                 result,
@@ -2468,33 +2881,99 @@ class SkillExecutorNode(Node):
                 "PLAY_AUDIO_SERVICE_UNAVAILABLE",
                 f"playback service unavailable: {self._play_audio_service}",
             )
+        motion_client = None
+        if binds_motion:
+            motion_client, error_code, reason = self._prepare_runtime_named_motion(skill_name, motion)
+            if motion_client is None:
+                return self._abort_skill(result, goal_handle, [], error_code, reason)
+        executed = [f"runtime_play_audio:{clip}"]
+        deadline = time.monotonic() + timeout_sec
         self._publish_asr_control("stop")
         try:
-            future = client.call_async(PlayAudioFile.Request(file_path=path))
-            if not self._wait_for_future(
-                future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested
-            ):
+            try:
+                future = client.call_async(PlayAudioFile.Request(file_path=path))
+            except Exception as exc:
+                # Nothing was sent, so no motion is sent either.
+                return self._abort_skill(
+                    result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} playback request failed: {exc}"
+                )
+            if motion_client is not None:
+                return self._finish_play_audio_with_motion(
+                    goal_handle, future, motion_client, motion, deadline, executed
+                )
+            if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
                 if goal_handle.is_cancel_requested:
                     return self._cancel_skill(result, goal_handle, [], skill_name)
-                return self._abort_skill(
-                    result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out"
-                )
-            try:
-                response = future.result()
-            except Exception as exc:
-                return self._abort_skill(
-                    result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} failed: {exc}"
-                )
-            if response is None or not response.success:
-                code = str(getattr(response, "error_code", "") or "PLAY_AUDIO_FAILED")
-                message = str(getattr(response, "message", "") or f"{skill_name} failed")
-                return self._abort_skill(result, goal_handle, [], code, message)
+                return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out")
+            failure = _play_audio_failure(future, skill_name)
+            if failure is not None:
+                return self._abort_skill(result, goal_handle, [], *failure)
         finally:
             self._publish_asr_control("start")
+        return self._succeed_play_audio(result, goal_handle, executed, f"{skill_name}: played {clip}")
+
+    def _finish_play_audio_with_motion(self, goal_handle, future, client, motion: str, deadline: float, executed):
+        """Run the bound motion while the clip plays, then end the skill once for both.
+
+        The motion runs through the named-motion executor against a proxy that
+        keeps its terminal call, so only this method ends ``goal_handle``. A
+        playback failure while the motion runs cancels the motion and waits for
+        its terminal state; a motion whose state is unknown is reported as
+        such. The playback service has no cancel: a skill cancel or timeout
+        stops waiting for it, and the clip may keep playing.
+        """
+        result = SkillCommand.Result()
+        skill_name = str(goal_handle.request.skill_name)
+
+        def playback_failed() -> bool:
+            return future.done() and _play_audio_failure(future, skill_name) is not None
+
+        branch = _CompositeBranchGoal(goal_handle, stop_requested=playback_failed)
+        motion_result = self._run_runtime_named_motion(branch, client, motion, max(0.0, deadline - time.monotonic()))
+        executed = [*executed, *motion_result.executed_primitives]
+        audio_failure = _play_audio_failure(future, skill_name) if future.done() else None
+        if branch.terminal not in {"succeeded", "canceled"}:
+            message = motion_result.message
+            if audio_failure is not None:
+                message = f"{message}; playback also failed: {audio_failure[1]}"
+            return self._abort_skill(result, goal_handle, executed, motion_result.error_code, message)
+        if audio_failure is not None:
+            return self._abort_skill(result, goal_handle, executed, *audio_failure)
+        if goal_handle.is_cancel_requested:
+            return self._cancel_play_audio(result, goal_handle, executed, skill_name)
+        if branch.terminal != "succeeded":
+            return self._abort_skill(
+                result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} ended without a result"
+            )
+        if not self._wait_for_future(
+            future,
+            max(0.0, deadline - time.monotonic()),
+            cancel_requested=lambda: goal_handle.is_cancel_requested,
+        ):
+            if goal_handle.is_cancel_requested:
+                return self._cancel_play_audio(result, goal_handle, executed, skill_name)
+            return self._abort_skill(
+                result, goal_handle, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out after {motion} ended"
+            )
+        failure = _play_audio_failure(future, skill_name)
+        if failure is not None:
+            return self._abort_skill(result, goal_handle, executed, *failure)
+        clip = executed[0].partition(":")[2]
+        return self._succeed_play_audio(
+            result, goal_handle, executed, f"{skill_name}: played {clip} and {motion_result.message}"
+        )
+
+    def _cancel_play_audio(self, result, goal_handle, executed, skill_name: str):
+        self._cancel_skill(result, goal_handle, executed, skill_name)
+        # The playback service cannot be cancelled: say so instead of implying silence.
+        result.message = f"{result.message}; the motion has ended, the recorded clip may still be playing"
+        return result
+
+    def _succeed_play_audio(self, result, goal_handle, executed, message: str):
         result.success = True
         result.error_code = ""
-        result.message = f"{skill_name}: played {clip}"
-        result.executed_primitives = [f"runtime_play_audio:{clip}"]
+        result.message = short_message(message)
+        result.executed_primitives = executed
         self._set_result_catalog_identity(result)
         result.diagnostics = []
         goal_handle.succeed()
@@ -3754,6 +4233,9 @@ class SkillExecutorNode(Node):
 
     def _ensure_skill_control_mode(self, skill_name: str, goal_handle) -> tuple[bool, str]:
         """Verify ownership before dispatch, using only the explicitly selected path."""
+        mirror_ready, mirror_reason = self._mirror_session_allows_skill(skill_name)
+        if not mirror_ready:
+            return False, mirror_reason
         if getattr(self, "_runtime_enabled", False):
             with self._motion_mode_switch_lock:
                 if goal_handle is not None and goal_handle.is_cancel_requested:
@@ -3872,6 +4354,14 @@ class SkillExecutorNode(Node):
         result.success = False
         result.error_code = error_code
         result.message = short_message(message)
+        if (
+            getattr(goal_handle.request, "skill_name", "") in {"free_pose", "return_to_task_pose"}
+            and error_code == "TASK_POSE_NOT_REACHED"
+        ):
+            fill_execution_detail(
+                result.execution_detail,
+                ExecutionDetail(1, "verify", "FAILED", "verify", error_code, "NOT_NEEDED", 0, "MANUAL_CHECK"),
+            )
         if getattr(goal_handle.request, "skill_name", "") == "pick_object":
             detail = ExecutionDetail.from_value(result.execution_detail)
             if error_code in {"PICK_SERVER_UNAVAILABLE", "PICK_GOAL_REJECTED"}:
@@ -6253,7 +6743,9 @@ class SkillExecutorNode(Node):
             except ValueError:
                 result = SkillCommand.Result()
                 return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", "task budget is invalid")
+            admission_started = time.monotonic()
             admission = self._gateway_policy.admit(request, self._runtime_snapshot(), owner)
+            admission_sec = time.monotonic() - admission_started
             prepared = admission.prepared_request
             audit_context = {
                 "task_id": prepared.identity.task_id if prepared is not None else _binding_task_id(goal),
@@ -6273,6 +6765,9 @@ class SkillExecutorNode(Node):
                 )
                 self._active_runtime_generation_retained = self._active_runtime_bundle is not None
         self._audit("requested", **audit_context)
+        self._audit(
+            "gateway_admission", duration_sec=admission_sec, error_code=admission.error_code or "", **audit_context
+        )
         if not admission.admitted:
             self._audit("precondition_rejected", error_code=admission.error_code, **audit_context)
             result = SkillCommand.Result()
@@ -6360,7 +6855,11 @@ class SkillExecutorNode(Node):
             if cleanup_unknown:
                 result.success = False
                 result.error_code = SKILL_CANCEL_TIMEOUT
-                result.message = "cancel cleanup timed out"
+                result.message = (
+                    "cancel cleanup timed out; " + result.message
+                    if "POSE_STOP_UNKNOWN" in result.message
+                    else "cancel cleanup timed out"
+                )
                 self._audit(
                     "terminal",
                     error_code=result.error_code,
@@ -6642,7 +7141,11 @@ class SkillExecutorNode(Node):
         if cleanup_unknown:
             result.success = False
             result.error_code = SKILL_CANCEL_TIMEOUT
-            result.message = "cancel cleanup timed out"
+            result.message = (
+                "cancel cleanup timed out; " + result.message
+                if "POSE_STOP_UNKNOWN" in result.message
+                else "cancel cleanup timed out"
+            )
             deferred_goal_handle.force_abort()
             self._retain_admission_cleanup(
                 admission,
@@ -6694,7 +7197,11 @@ class SkillExecutorNode(Node):
         # what takes the runtime out of idle, so a failed start knows the mode
         # is the Gateway's to give back.
         mirror_command = self._active_mirror_session_command(goal.skill_name)
-        if mirror_command == "stop" and self._runtime_idle_for_admission():
+        if (
+            mirror_command == "stop"
+            and not getattr(self, "_mirror_session_start_latched", False)
+            and self._runtime_idle_for_admission()
+        ):
             return self._succeed_mirror_session(
                 result, goal_handle, goal.skill_name, "runtime already idle", called=False
             )
@@ -6716,7 +7223,7 @@ class SkillExecutorNode(Node):
         )
         template = active_templates.get(goal.skill_name, {})
         if str(template.get("executor", "")).strip() == "grasp_pipeline":
-            return self._execute_pick_skill(
+            return self._execute_prepared_pick_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
@@ -6738,6 +7245,15 @@ class SkillExecutorNode(Node):
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == POSE_COMPOSER.EXECUTOR:
+            from robot_runtime.task_poses import RETURN_TASK_POSE
+
+            return self._execute_pose_composer_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+                named_pose=goal.target_name if goal.skill_name == RETURN_TASK_POSE else "",
             )
         if str(template.get("executor", "")).strip() == "sound_following":
             return self._execute_sound_following_skill(

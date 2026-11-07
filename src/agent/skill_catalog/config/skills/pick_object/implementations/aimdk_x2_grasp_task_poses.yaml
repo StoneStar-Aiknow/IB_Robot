@@ -1,0 +1,7 @@
+schema_version: 1
+kind: delegated_executor
+robot: aimdk_x2_grasp_task_poses
+executor: grasp_pipeline
+required_args: [target_name]
+# Includes the configured preparation phase within the same admitted task.
+timeout_sec: 150.0

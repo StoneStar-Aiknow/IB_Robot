@@ -1712,7 +1712,7 @@ completion_tokens=... reasoning_chars=...`（logger `ibrobot_agent.planner`）�
 | `agent.voice_bridge.addressee_trigger` | `wake_phrase`（默认）或 `vendor_session`。前者要求话语以 `wake_phrases` 开头；后者用于**先吃掉自身唤醒词再放行语音**的平台（X2 实测如此），此时唤醒词到不了文本层，**只有唤醒事件能开会话**（必须配 `wake_event`），会话首句是唤醒事件指明那一段的转写；静默 `session_gap_sec` 后会话结束，下一句没有新唤醒就被拒绝。`vendor_session` 下配 `wake_phrases` 会被拒绝 |
 | `agent.voice_bridge.session_gap_sec` | 有限正数，默认 15 秒。仅 `vendor_session` 下生效：会话内转写间隔超过它即结束会话，之后需要新的唤醒事件。必须大于最长话语加 ASR 定稿延迟（间隔在最终转写之间测量）；偏小会让用户停顿后的追问也要重说唤醒词 |
 | `agent.voice_bridge.wake_phrases` | 非空字符串列表，省略该键表示**接受每一句话**（现有部署的行为）。配置后，一句话必须以其中之一**开头**才算是对机器人说的；命中后唤醒词会被**从文本中剥离**再送给 planner。空列表会被拒绝（那是一道没人能打开的门）。停止词**不受此门控**，安全优先 |
-| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；窗口**只被真正被处理的话续期**，被忽略的话不会把它撑开。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
+| `agent.voice_bridge.wake_window_sec` | 有限正数，默认 12 秒。`wake_phrase` 下：唤醒后在该时长内的后续话无需再点名；实际处理的指令、窗口内声纹比对通过的语音均会续期，缺失或不可比的声纹不为被忽略的语音续期。`vendor_session` 下：唤醒事件等待它那一句转写的最长时间，过期作废 |
 | `agent.voice_bridge.speaker_check_enabled` | 布尔，默认 false。开启后窗口内的话要与**会话首句**（说唤醒词那句，或 `vendor_session` 下唤醒事件指明的那一句）的声纹匹配才转发。要求门控已开启（配 `wake_phrases` 或 `addressee_trigger: vendor_session`，锚点来自会话首句），且要求 `voice_asr.speaker_embedding.enabled: true`（否则没人发布可比对的声纹，门看起来在过滤实际全放行）——两条都 fail closed |
 | `agent.voice_bridge.speaker_min_similarity` | `(0, 1]`，默认 0.60。余弦相似度下限。默认值是 X2 真机测试用的值（2026-10-24，campplus，≥2 s 片段）：旁人与锚点 0.28–0.56，用户本人在锚点累积后 0.67–0.84。离线语料的数字不能作依据——其分组标签并非同一个人。**仍须用真人录音现场标定**（方法见 `ibrobot_agent/README.md`）：取决于模型、麦克风、房间与说话人相似度 |
 | `agent.voice_bridge.speaker_max_age_sec` | 有限正数，默认 2.5 秒。声纹按语音段与转写配对；某段的声纹超过这个时长仍没有等到它的转写（ASR 丢弃了该段）即丢弃，只限制内存，不决定谁判定谁 |
@@ -2304,3 +2304,71 @@ Apache-2.0
 文本、语言、优先级、动作名和目标侧由每次 `runtime-demo speak` / `runtime-demo motion`
 请求传入，不在机器人 YAML 中固化。业务包只依赖中立 `ibrobot_msgs`，不依赖 robot_config、
 robot_runtime 或厂商 SDK。详细命令见 [交互示范指南](../../docs/aimdk_interaction_demo.md)。
+
+## X2 镜子/抓取：可选欧拉文本唤醒与声纹
+
+The shared entry for one or two hands is
+[`config/robots/aimdk_x2_voice_mirror_grasp.yaml`](config/robots/aimdk_x2_voice_mirror_grasp.yaml).
+Both the 310P pipeline and the Orin grasp-head launch select
+`robot_config:=aimdk_x2_voice_mirror_grasp`. Mounting is declared once in
+`grasp_execution.backend_options.installed_hands` and `arm_side`.
+`task_poses.hands: installed` resolves the prepared hands from that declaration
+without changing arm targets or granting hardware approval.
+See the [configuration and launch guide](../../docs/x2_voice_mirror_grasp_config_zh.md)
+for right-only, left-only and dual-hand settings and fixed-artifact preparation.
+
+`aimdk_x2_voice_mirror_grasp` 默认启用“欧拉欧拉”文本唤醒。
+`speaker_check_enabled: false`、`speaker_embedding.enabled: false` 保持声纹校验关闭。
+系统不加载声纹模型，不区分说话人。
+总 YAML 使用以下列表，删除 `wake_phrases` 键可恢复直接接收普通语音：
+
+```yaml
+robot:
+  embodied:
+    agent:
+      voice_bridge:
+        wake_phrases:
+          - 欧拉欧拉
+          - 欧拉欧啦
+          - 欧拉鸥拉
+          - 欧拉偶拉
+          - 欧啦欧拉
+          - 欧啦欧啦
+          - 欧啦鸥拉
+          - 欧啦偶拉
+          - 鸥拉欧拉
+          - 鸥拉欧啦
+          - 鸥拉鸥拉
+          - 鸥拉偶拉
+          - 偶拉欧拉
+          - 偶拉欧啦
+          - 偶拉鸥拉
+          - 偶拉偶拉
+```
+
+启用后，ASR 文本前缀触发 60 秒滑动窗口。
+文本唤醒不依赖厂商 `audio.wake_event`。
+标准唤醒词为“欧拉欧拉”。
+列表包含“欧拉、欧啦、鸥拉、偶拉”两两组合的 16 个前缀。
+“欧/鸥”与“拉/啦”覆盖同音转写，“偶”覆盖近音转写。
+规则只匹配句首，并在转交 Agent 前剥离前缀。
+
+重复词之间的空格不影响匹配。
+唤醒词与指令之间支持逗号或感叹号。
+单次“欧拉”和“好啦好啦”不在前缀列表中。
+仅启用文本唤醒不需要声纹模型。
+
+总配置沿用厂商处理后的 `external_vad` 和 `audio.speech` 输入。
+启用声纹校验前，确认厂商语音流持续输出音频。
+声纹校验需要同时启用 `speaker_embedding.enabled` 和 `speaker_check_enabled`。
+声纹校验还需部署 `models/campplus-speaker`（默认 `torch_cpu`）。
+本配置不修改厂商唤醒服务或麦克风设备。
+
+使用声纹校验时，首次建议说“欧拉欧拉，现在请你帮我做一个挥手动作”。
+这让同一语音段包含足够长的人声。
+启用声纹校验后，通过校验的本人指令续期。
+旁人未通过校验的指令不续期，再次点名重设声纹锚点。
+停止词始终旁路。
+
+声纹校验仍保留原有边界：首句无有效声纹则无锚点。
+声纹消息缺失仍超时放行，不能作为身份认证。

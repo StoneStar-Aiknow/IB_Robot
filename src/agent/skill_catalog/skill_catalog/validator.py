@@ -40,6 +40,9 @@ RUNTIME_NAMED_MOTION_EXECUTOR = "runtime_named_motion"
 MIRROR_SESSION_EXECUTOR = "mirror_session"
 # Delegated executor that plays a recorded clip the deployment profile resolves.
 RUNTIME_PLAY_AUDIO_EXECUTOR = "runtime_play_audio"
+# Delegated executor that composes an arm pose from the user's words; its only
+# argument is target_name, the description (see validate_implementation).
+POSE_COMPOSER_EXECUTOR = "pose_composer"
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
@@ -552,8 +555,20 @@ def validate_implementation(
             _validate_play_audio(
                 implementation,
                 capability_parameters,
+                manifest.get("capability", {}),
+                delegated_executors,
                 diagnostics,
                 source_relative_path=source_relative_path,
+            )
+        elif executor_name == POSE_COMPOSER_EXECUTOR and (
+            required_args != ["target_name"] or set(capability_parameters) != {"target_name"}
+        ):
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                "pose_composer skills take exactly target_name (the pose in the user's words)",
+                source_relative_path=source_relative_path,
+                field_path="required_args",
             )
         elif (
             not isinstance(required_args, list)
@@ -659,11 +674,19 @@ def _validate_runtime_named_motion(
 def _validate_play_audio(
     implementation: Mapping[str, Any],
     capability_parameters: Any,
+    capability: Mapping[str, Any],
+    delegated_executors: Mapping[str, DelegatedExecutorDescriptor],
     diagnostics: list[SkillDiagnostic],
     *,
     source_relative_path: str,
 ) -> None:
-    """A clip playback skill binds exactly one clip and takes no arguments."""
+    """A clip playback skill binds exactly one clip and takes no arguments.
+
+    It may also bind one runtime motion to run while the clip plays. Such a
+    skill moves the robot, so its capability must say so and require what a
+    runtime_named_motion skill requires, and the deployment must provide that
+    executor.
+    """
     if implementation.get("required_args") != []:
         _error(
             diagnostics,
@@ -690,7 +713,9 @@ def _validate_play_audio(
             field_path="binding",
         )
         return
-    _exact_fields(binding, {"clip"}, diagnostics, source_relative_path=source_relative_path, field_path="binding")
+    _exact_fields(
+        binding, {"clip", "motion"}, diagnostics, source_relative_path=source_relative_path, field_path="binding"
+    )
     clip = binding.get("clip")
     if not isinstance(clip, str) or not clip.strip():
         _error(
@@ -699,6 +724,52 @@ def _validate_play_audio(
             "binding.clip must be a non-empty clip name",
             source_relative_path=source_relative_path,
             field_path="binding.clip",
+        )
+    if "motion" not in binding:
+        return
+    motion = binding.get("motion")
+    if not isinstance(motion, str) or not NAME_PATTERN.fullmatch(motion):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "binding.motion must be a runtime motion name",
+            source_relative_path=source_relative_path,
+            field_path="binding.motion",
+        )
+    if capability.get("moves_robot") is not True:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "a clip played with a motion moves the robot; capability.moves_robot must be true",
+            source_relative_path=source_relative_path,
+            field_path="capability.moves_robot",
+        )
+    if capability.get("required_control_mode") != "named_motion":
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "a clip played with a motion requires the named_motion control mode",
+            source_relative_path=source_relative_path,
+            field_path="capability.required_control_mode",
+        )
+    required_capabilities = capability.get("required_capabilities", [])
+    if not isinstance(required_capabilities, list) or not NAMED_MOTION_CAPABILITIES & set(
+        item for item in required_capabilities if isinstance(item, str)
+    ):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "a clip played with a motion must require motion.named or motion.posture",
+            source_relative_path=source_relative_path,
+            field_path="capability.required_capabilities",
+        )
+    if RUNTIME_NAMED_MOTION_EXECUTOR not in delegated_executors:
+        _error(
+            diagnostics,
+            "SKILL_REFERENCE_MISSING",
+            "a clip played with a motion needs the runtime_named_motion executor",
+            source_relative_path=source_relative_path,
+            field_path="binding.motion",
         )
 
 

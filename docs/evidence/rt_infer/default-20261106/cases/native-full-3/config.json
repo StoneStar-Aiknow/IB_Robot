@@ -1,0 +1,30 @@
+{
+  "mode": "native",
+  "output": "/data/rtinfer-default-finish-20261106/final-v3/native-full-3",
+  "duration": 95.0,
+  "rounds": 1,
+  "roles": [
+    "pear",
+    "yolox",
+    "tts",
+    "vl"
+  ],
+  "models": {
+    "pear": "/data/rtinfer-migration-20261104/models/pear/pear_parameter_network_bs1.om",
+    "yolox": "/data/rtinfer-migration-20261104/models/yolox/yolox_x_640_bs1.om",
+    "te": "/data/rtinfer-migration-20261104/models/te/text_encoder_t256_p29_f3072.om",
+    "fm": "/data/rtinfer-migration-20261104/models/fm/fm_decoder_f1537_mask_noif_mixed.om",
+    "vision": "/data/rtinfer-migration-20261104/models/vision/internvl3_1b_vision_b4_fp16.om",
+    "prefill": "/data/rtinfer-migration-20261104/models/prefill/llm_prefill_fp16.om",
+    "decode": "/data/rtinfer-migration-20261104/models/decode/llm_decode_fp16.om"
+  },
+  "references": "/data/rtinfer-migration-20261104/references",
+  "numeric_cases": "/data/rtinfer-default-finish-20261106/numeric-cases",
+  "create_numeric_cases": false,
+  "lifecycle_probe": false,
+  "bundles": {
+    "pear": "/data/IB_Robot-pr581-oee-summit/models/pear_parameter_network",
+    "yolox": "/data/IB_Robot-pr581-oee-summit/models/yolox_x_640",
+    "tts": "/data/IB_Robot-pr581-oee-summit/models/zipvoice"
+  }
+}

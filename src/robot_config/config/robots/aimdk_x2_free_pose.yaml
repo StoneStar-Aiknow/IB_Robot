@@ -1,0 +1,84 @@
+# AgiBot X2 Agent that moves the arms to poses described in words, next to the
+# preset gestures: "双手向前伸直", "做一个弯曲手臂的姿势", "右手摸头顶".
+#
+# The free_pose skill hands the user's description (target_name) to the pose
+# composer: a language model describes each arm (directions, or the hand at a
+# named body point), a solver on the official X2 model turns that into joints
+# inside the runtime's travel and clear of the body, and the path runs through
+# the runtime's joint.trajectory action in the stream mode the gestures already
+# use. The Agent composes the pose while it prepares the plan, so the pose it
+# presents is the one that runs.
+#
+# Needs the OmniHand runtime profile (it declares joint.trajectory and the arm
+# travel) and the official model: ros2 run aimdk_robot aimdk_fetch_x2_mjcf.
+# In simulation, AIMDK_MOCK_PHYSICS_MJCF=<that scene.xml> makes the vendor mock
+# simulate the arms. Launch with control_mode:=named_motion and
+# authorize_motion:=true; the planner key comes from KIMICODE_API_KEY.
+robot:
+  # The skill catalog validates the robot context name against the catalog
+  # profile's robot_name; this is the same robot, so it keeps that identity.
+  name: aimdk_x2_skills
+  base_config: aimdk_x2_skills.yaml
+
+  # capabilities.requires stays the skills list: joint.trajectory is not an
+  # application arm surface here (embodied.arm_surface stays false). The
+  # free_pose skill requires it of the runtime, which the Gateway checks
+  # against the live runtime status before every dispatch.
+
+  embodied:
+    skill_catalog_profile: aimdk_x2_free_pose
+    entry_mode: agent
+    execution_store_path: /tmp/ibrobot-x2-free-pose/executions.sqlite3
+    agent:
+      enabled: true
+      incubation: true
+      execution_enabled: true
+      channel_id: agent_cli
+      principal_id: local_operator
+      test_allowlist:
+        - free_pose
+        - wave_hand
+        - handshake
+        - raise_hand
+        - blow_kiss
+        - clap_hands
+      ledger_path: /tmp/ibrobot-x2-free-pose/requests.sqlite3
+      conversation_path: /tmp/ibrobot-x2-free-pose/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-x2-free-pose/agent.lock
+      max_session_turns: 12
+      clarification_ttl_sec: 300.0
+      event_queue_size: 128
+      planner:
+        mode: vlm
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-for-coding
+        timeout_sec: 120.0
+        # kimi-for-coding accepts only temperature=1.
+        temperature: 1.0
+        catalog_view: planner
+
+  pose_composer:
+    enabled: true
+    # The model the description form was selected with in simulation
+    # (DeepSeek-V4.1-Flash: 92 % of in-scope and 79 % of held-out instructions
+    # correct, 3.3 s median), served OpenAI-compatibly on this host's planner
+    # relay. Point it at any OpenAI-compatible endpoint; keys only by
+    # api_key_env.
+    llm:
+      provider: openai_compatible
+      base_url: http://127.0.0.1:18081/v1
+      model: DeepSeek-V4.1-Flash-1017
+      timeout_sec: 60.0
+      temperature: 0.3
+    # Poses the robot has done, shared by every conversation and kept across
+    # restarts. Two successful similar poses allow a save question; only explicit
+    # consent interpreted by the Agent confirms saving. New tasks never confirm
+    # a candidate. A confirmed pose is recalled without a generation model call. The seeds
+    # are pinned reference poses, re-solved against the current joint travel.
+    memory:
+      enabled: true
+      max_poses: 500
+      candidate_ttl_days: 7
+      seeds: true

@@ -77,6 +77,13 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
             return "物体已经抓起并通过验证。"
         return "执行完成。"
     if state == "FAILED":
+        if (
+            context.get("current_skill") in {"free_pose", "return_to_task_pose"}
+            and detail.schema_version == 1
+            and detail.failed_phase == "verify"
+            and detail.reason_code == "TASK_POSE_NOT_REACHED"
+        ):
+            return "动作执行结束，未校验通过。"
         if detail.schema_version != 1:
             return "执行失败，请查看执行记录或联系操作员。"
         if detail.suggested_action == "MANUAL_CHECK":

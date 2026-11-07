@@ -652,10 +652,13 @@ catalog implementation 的 `binding: {command: start|stop}` 声明（编译期�
 `~/set_session`（`std_srvs/SetBool`）发送 `true`（start）或 `false`（stop）。
 
 1. Gateway 常规准入。两个技能的控制模式都是 `model_inference`，映射到运行时 `policy_stream`；Gateway
-   在调用执行器之前把运行时切到该模式，会话只接管已切好的模式。例外：运行时已经是 idle 时，`mirror_stop`
-   在准入之前直接报成功（“runtime already idle”），不切模式、不调用会话。
+   在调用执行器之前把运行时切到该模式，会话只接管已切好的模式。例外：没有未确认启动且运行时已经是 idle
+   时，`mirror_stop` 直接报成功（“runtime already idle”），不切模式、不调用会话。
 2. 执行器在技能超时内等待会话应答。会话在接管模式后应答 start，在观察到运行时回到 idle 后应答 stop。
-   Gateway 在应答之后不再跟踪会话。
+   Gateway 在应答之后继续订阅 `/mirror_session/state`，只有新鲜的 WAIT、未占用且未释放中状态才允许其他技能。
+   STANDBY / MIRRORING、心跳过期或格式错误均拒绝其他技能，包括映射到同一个 policy_stream 的手势和抓取。
+   start 发出前同步锁存接管意图，防止应答先于状态回调到达；超时不会解除锁存。观察到本轮占用后再观察到
+   WAIT 和运行时 idle，或显式 stop 成功且确认 idle，才解除锁存。start / stop 本身不受该门禁阻挡。
 3. 归还模式：`mirror_start` 失败（会话拒绝、超时、调用异常、等待期间被取消）且这次准入正是把运行时从
    idle 切出来的那一次，或者会话服务不可达（start 和 stop 都算，没有会话来释放），Gateway 在报失败之前把
    运行时从技能的模式请求回 idle，结果附在 message 里。只在新鲜的准入状态显示运行时正处于技能的模式、且

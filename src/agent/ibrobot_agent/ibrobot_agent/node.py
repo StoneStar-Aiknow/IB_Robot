@@ -29,7 +29,7 @@ from std_srvs.srv import Trigger
 
 from embodied_common.agent_terminal_contract import classify_agent_terminal, stable_agent_execution_error_code
 from embodied_common.canon import sha256_text, to_canonical_json
-from embodied_common.execution_detail import execution_context, short_message
+from embodied_common.execution_detail import execution_context
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
 from ibrobot_agent.async_presentation import AsyncPresentationPort, ModeRoutingPresentationPort
@@ -141,6 +141,93 @@ class _UnavailableCatalog:
 
     def get_catalog(self, status):
         raise RuntimeError("Agent catalog adapter is not configured")
+
+
+class _RosPosePreview:
+    """pose_composer clients on a private node and executor, called from the planning worker.
+
+    ComposeArmPose always; read-only lookup and writable feedback are independently wired.
+    """
+
+    def __init__(
+        self, service: str, *, timeout_sec: float, lookup_service: str = "", feedback_service: str = ""
+    ) -> None:
+        from rclpy.executors import SingleThreadedExecutor
+
+        from ibrobot_msgs.srv import ArmPoseFeedback, ComposeArmPose, LookupArmPose
+
+        self._request_type = ComposeArmPose.Request
+        self._timeout_sec = timeout_sec
+        self._node = rclpy.create_node("ibrobot_agent_pose_preview")
+        self._client = self._node.create_client(ComposeArmPose, service)
+        self._lookup = self._node.create_client(LookupArmPose, lookup_service) if lookup_service else None
+        self._feedback = self._node.create_client(ArmPoseFeedback, feedback_service) if feedback_service else None
+        self._executor = SingleThreadedExecutor()
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(target=self._spin, name="agent-pose-preview", daemon=True)
+        self._thread.start()
+
+    def _spin(self) -> None:
+        # Shutdown of the shared context ends the spin; that is not an error.
+        with contextlib.suppress(Exception):
+            self._executor.spin()
+
+    @property
+    def has_pose_services(self) -> bool:
+        return self._lookup is not None or self._feedback is not None
+
+    def _call(self, client, request, timeout_sec: float):
+        if not client.wait_for_service(timeout_sec=min(5.0, timeout_sec)):
+            return None
+        future = client.call_async(request)
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return future.result() if future.done() else None
+
+    def compose(self, text: str, *, session_id: str = "", utterance: str = ""):
+        request = self._request_type()
+        request.text, request.session_id, request.utterance = text, session_id, utterance
+        response = self._call(self._client, request, self._timeout_sec)
+        if response is None:
+            return {
+                "success": False,
+                "error_code": "POSE_COMPOSER_UNAVAILABLE",
+                "message": "pose composer did not answer",
+            }
+        return {
+            name: getattr(response, name)
+            for name in (
+                "success", "error_code", "message", "kind", "user_message", "composition_id",
+                "description_json", "duration_sec", "approximate", "from_memory", "pose_id",
+            )
+        }  # fmt: skip
+
+    def lookup(self, text: str):
+        if self._lookup is None:
+            return {"hit": False, "poses": []}
+        from ibrobot_msgs.srv import LookupArmPose
+
+        response = self._call(self._lookup, LookupArmPose.Request(text=text), 2.0)
+        if response is None:
+            return {"hit": False}
+        result = {name: getattr(response, name) for name in ("hit", "pose_id", "state", "user_message")}
+        result["poses"] = json.loads(response.catalog_json or "[]")
+        return result
+
+    def feedback(self, session_id: str, verdict: str):
+        if self._feedback is None:
+            return {"success": False, "pose_id": "", "message": "pose memory feedback is disabled"}
+        from ibrobot_msgs.srv import ArmPoseFeedback
+
+        response = self._call(self._feedback, ArmPoseFeedback.Request(session_id=session_id, verdict=verdict), 2.0)
+        if response is None:
+            return {"success": False, "pose_id": "", "message": "pose memory did not answer"}
+        return {name: getattr(response, name) for name in ("success", "pose_id", "message")}
+
+    def close(self) -> None:
+        self._executor.shutdown(timeout_sec=1.0)
+        self._node.destroy_node()
 
 
 class _RosBridgeCatalog:
@@ -461,7 +548,7 @@ class _RosExecutionAdapter:
                     execution_status,
                     presentation.task_ref,
                     str(result.error_code),
-                    short_message(result.message),
+                    str(result.message),
                     _program_terminal_detail(result),
                 )
             except Exception:
@@ -688,7 +775,7 @@ class _RosExecutionAdapter:
                         status,
                         presentation.task_ref,
                         str(execution.get("error_code", "")),
-                        short_message(execution.get("message", "")),
+                        str(execution.get("message", "")),
                         {
                             "submitted": True,
                             # The step list is already in the proposal; keep the terminal small.
@@ -713,7 +800,7 @@ class _RosExecutionAdapter:
                     status,
                     presentation.task_ref,
                     str(result.error_code),
-                    short_message(result.message),
+                    str(result.message),
                     _program_terminal_detail(result),
                 )
             time.sleep(0.02)
@@ -870,6 +957,12 @@ class IncubationAgentNode(Node):
         self.declare_parameter("gateway_caller_scope", "agent_incubation:local_operator")
         self.declare_parameter("gateway_caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR")
         self.declare_parameter("gateway_caller_token", "")
+        # ibrobot_msgs/srv/ComposeArmPose; empty: arm poses are composed only when they run.
+        self.declare_parameter("pose_compose_service", "")
+        self.declare_parameter("pose_compose_timeout_sec", 90.0)
+        # Independent read-only lookup and writable memory feedback endpoints; empty disables each.
+        self.declare_parameter("pose_lookup_service", "")
+        self.declare_parameter("pose_feedback_service", "")
         ledger_path = str(self.get_parameter("ledger_path").value).strip()
         if not ledger_path:
             ledger_path = str(Path.home() / ".ros" / "ibrobot_agent" / "requests.sqlite3")
@@ -958,6 +1051,17 @@ class IncubationAgentNode(Node):
         ):
             raise ValueError("allowed_skills_json must be a JSON array of non-empty strings")
         allowed_skills = set(decoded_allowlist)
+        pose_service = str(self.get_parameter("pose_compose_service").value).strip()
+        self._pose_preview = (
+            _RosPosePreview(
+                pose_service,
+                timeout_sec=float(self.get_parameter("pose_compose_timeout_sec").value),
+                lookup_service=str(self.get_parameter("pose_lookup_service").value).strip(),
+                feedback_service=str(self.get_parameter("pose_feedback_service").value).strip(),
+            )
+            if pose_service
+            else None
+        )
         self._service = AgentService(
             planner=active_planner,
             catalog=catalog,
@@ -974,6 +1078,10 @@ class IncubationAgentNode(Node):
             ),
             robot_scope=str(self.get_parameter("robot_scope").value),
             direct_commands=_direct_commands_from_config(str(self.get_parameter("planner_config_json").value)),
+            pose_preview=self._pose_preview,
+            pose_memory=self._pose_preview
+            if self._pose_preview is not None and self._pose_preview.has_pose_services
+            else None,
         )
         self._request_subscription = self.create_subscription(
             String,
@@ -1138,6 +1246,8 @@ class IncubationAgentNode(Node):
             finally:
                 if self._bridge is not None:
                     self._bridge.close()
+                if getattr(self, "_pose_preview", None) is not None:
+                    self._pose_preview.close()
         finally:
             self._deployment_lock.close()
 
@@ -1271,7 +1381,7 @@ def _planner_from_config(raw: str):
             route="vlm",
             returned_model=config["model"],
             protocol=str(config.get("api_protocol", "chat_completions")),
-            prompt_version="agent-planner-v3",
+            prompt_version="agent-planner-v4",
             schema_version="1",
             config_digest=sha256_text(to_canonical_json(config)),
         ),

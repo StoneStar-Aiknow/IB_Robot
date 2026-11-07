@@ -19,6 +19,8 @@
   <!-- runtime contract layer (the only IB-Robot packages a runtime may depend on) -->
   <exec_depend>ibrobot_msgs</exec_depend>
   <exec_depend>robot_runtime</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
 
   <!-- vendor interface definitions: provided by a developer-supplied AimDK
        overlay, NOT vendored into this repository (no license declared upstream;
@@ -36,6 +38,8 @@
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>audio_common_msgs</exec_depend>
+  <!-- joint.trajectory is served as control_msgs/FollowJointTrajectory -->
+  <exec_depend>control_msgs</exec_depend>
 
   <exec_depend>ros2launch</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
@@ -44,6 +48,7 @@
   <test_depend>ibrobot_msgs</test_depend>
   <test_depend>robot_runtime</test_depend>
   <test_depend>aimdk_dataplane</test_depend>
+  <test_depend>audio_common_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

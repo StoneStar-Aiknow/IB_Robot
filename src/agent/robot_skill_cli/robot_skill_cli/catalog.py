@@ -9,6 +9,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from embodied_common.capability_view import project_capability_timeout_policy
+from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
+from embodied_common.mirror_session_contract import SESSION_SERVICE as MIRROR_SESSION_SERVICE
+from embodied_common.pose_composer_contract import EXECUTE_ACTION as POSE_COMPOSER_ACTION
+from embodied_common.primitive_contracts import primitive_contract_for_version
+from embodied_common.visual_game_contracts import build_visual_game_capability_view
+from robot_config.config_path import resolve_robot_config_path
+from robot_config.loader import (
+    get_effective_visual_game_policies,
+    load_robot_config_dict,
+    robot_config_digest,
+    robot_context_schema_version,
+    robot_execution_endpoints,
+    robot_supported_control_modes,
+)
+from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.digest import (
     derive_capability_digest,
@@ -23,22 +39,6 @@ from skill_catalog.source import (
     DirectoryReleaseSkillSource,
     resolve_development_source_root,
 )
-
-from embodied_common.capability_view import project_capability_timeout_policy
-from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
-from embodied_common.mirror_session_contract import SESSION_SERVICE as MIRROR_SESSION_SERVICE
-from embodied_common.primitive_contracts import primitive_contract_for_version
-from embodied_common.visual_game_contracts import build_visual_game_capability_view
-from robot_config.config_path import resolve_robot_config_path
-from robot_config.loader import (
-    get_effective_visual_game_policies,
-    load_robot_config_dict,
-    robot_config_digest,
-    robot_context_schema_version,
-    robot_execution_endpoints,
-    robot_supported_control_modes,
-)
-from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 _LIST_CAPABILITY_FIELDS = (
     "summary",
@@ -322,6 +322,20 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         )
         delegated[descriptor.name] = descriptor
 
+    pose_composer = robot_config.get("pose_composer", {})
+    if isinstance(pose_composer, dict) and pose_composer.get("enabled") is True:
+        from robot_runtime.task_poses import task_pose_identity
+
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="pose_composer",
+                endpoint_name=POSE_COMPOSER_ACTION,
+                endpoint_kind="ros_action",
+                configuration=task_pose_identity(robot_config.get("task_poses"), pose_composer),
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
     semantic_mapping = robot_config.get("semantic_mapping", {})
     if isinstance(semantic_mapping, dict) and semantic_mapping.get("enabled", False):
         interfaces = semantic_mapping.get("interfaces", {})
@@ -361,6 +375,8 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         execution_endpoints=robot_execution_endpoints(robot_config),
         supported_control_modes=robot_supported_control_modes(robot_config),
     )
+    from robot_runtime.task_poses import pose_catalog
+
     primitive_contract = primitive_contract_for_version(robot_context.context_schema_version)
     return compile_skill_catalog(
         source,
@@ -370,6 +386,7 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
             primitive_contracts=primitive_contract.descriptors,
             primitive_contract_digest=primitive_contract.digest,
             delegated_executors=delegated,
+            pose_catalog=pose_catalog(robot_config.get("task_poses"), pose_composer),
         ),
     )
 
@@ -485,6 +502,7 @@ _PLANNER_SKILL_FIELDS = (
     "moves_robot",
     "required_control_mode",
     "parameters",
+    "target_options",
     "schema_version",
 )
 

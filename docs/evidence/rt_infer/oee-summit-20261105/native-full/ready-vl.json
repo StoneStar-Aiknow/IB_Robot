@@ -1,0 +1,12 @@
+{
+  "pid": 1839,
+  "affinity": [
+    11
+  ],
+  "persistent_io": null,
+  "safe_args_batch": null,
+  "stream_priority": null,
+  "runtime_libraries": [
+    "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so"
+  ]
+}

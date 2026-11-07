@@ -85,6 +85,7 @@ class InternVlVision(VisionLanguagePort):
     _vision: object = field(default=None, init=False)
     _generator: object = field(default=None, init=False)
     _prompt_ids: object = field(default=None, init=False)
+    _rt_infer_warmups: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if self.prompt_mode not in ("observe", "chatter"):
@@ -246,6 +247,13 @@ class InternVlVision(VisionLanguagePort):
             return None
 
         self.last_error = ""
+        self._rt_infer_warmups += 1
+        import os
+
+        if self._rt_infer_warmups == 3 and os.environ.get("RTINFER_LAUNCH_TOKEN"):
+            from inference_service.rt_infer_client import mark_runtime_ready
+
+            mark_runtime_ready()
         return self._detokenizer.decode(result["tokens"]).strip()
 
 

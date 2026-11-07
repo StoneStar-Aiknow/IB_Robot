@@ -233,6 +233,8 @@ def derive_capability_view_from_registry(registry_preimage: Mapping[str, Any]) -
             ):
                 raise ValueError("registry skill capability fields are invalid")
             expected_fields.add("required_capabilities")
+        if "target_options" in capability:
+            expected_fields.add("target_options")
         if set(capability) != expected_fields:
             raise ValueError("registry skill capability fields are invalid")
         rebuilt = dict(capability)

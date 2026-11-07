@@ -130,9 +130,13 @@ def test_the_head_binds_to_the_runtime_the_robot_side_host_runs_and_refuses_any_
     module = _launch_module()
     path = tmp_path / "robot.yaml"
     path.write_text(json.dumps({"robot": x2()}), encoding="utf-8")
-    monkeypatch.setattr(
-        module, "load_robot_config_dict", lambda config_path, **_k: json.loads(Path(config_path).read_text())["robot"]
-    )
+    loads = []
+
+    def load(config_path, **options):
+        loads.append(options)
+        return json.loads(Path(config_path).read_text())["robot"]
+
+    monkeypatch.setattr(module, "load_robot_config_dict", load)
     monkeypatch.setattr(module, "check_launch_dds", lambda _context: None)
     isolated, bound = [], []
     monkeypatch.setattr(module, "isolate_launch_cpus", lambda head: isolated.append(head))
@@ -145,6 +149,7 @@ def test_the_head_binds_to_the_runtime_the_robot_side_host_runs_and_refuses_any_
     monkeypatch.setattr(module, "generate_bound_runtime_actions", bind)
     context = SimpleNamespace(launch_configurations={"config_path": str(path), "control_mode": "moveit_planning"})
     (node,) = module.launch_setup(context)
+    assert loads[0] == {"defer_interface_binding": True, "require_local_model_artifacts": False}
     assert vars(node).get("_Node__node_executable") == "x2_grasp_head_node"
     assert bound[0]["start_provider"] is False and isolated[0].cpu_isolation.node == {4, 5, 6, 7}
     # The head waits for the robot side however long it takes, unless told otherwise.

@@ -26,6 +26,27 @@ runtime:
   type: x2_ultra_omnihand
 use_sim: false
 joint_state_topic: /joint_states
+# Conformance start pose (issue #194): the suite resets the arms here before every
+# arm-moving test. It is the robot's own measured rest pose (first sample of the
+# raise_hand recording, rounded), from which every conformance trajectory target
+# (+0.25 on the first two arm joints, +1.5 on the first) stays inside vendor.arm.limits;
+# from all-zero the earlier stream tests leave the elbows outside their travel.
+conformance:
+  start_positions:
+    left_shoulder_pitch_joint: 0.366
+    left_shoulder_roll_joint: -0.038
+    left_shoulder_yaw_joint: -0.008
+    left_elbow_joint: -1.164
+    left_wrist_yaw_joint: 0.003
+    left_wrist_pitch_joint: 0.007
+    left_wrist_roll_joint: -0.001
+    right_shoulder_pitch_joint: 0.364
+    right_shoulder_roll_joint: 0.026
+    right_shoulder_yaw_joint: 0.019
+    right_elbow_joint: -1.175
+    right_wrist_yaw_joint: 0.005
+    right_wrist_pitch_joint: 0.007
+    right_wrist_roll_joint: -0.003
 joints:
 - left_shoulder_pitch_joint
 - left_shoulder_roll_joint
@@ -69,6 +90,9 @@ modes:
   stream:
     controllers: []
     allows_stream: true
+    # joint.trajectory goals are replayed on the arm stream in this mode
+    # (vendor.named_motion.trajectory_modes), like the recorded gestures.
+    allows_trajectory: true
     transitions:
     - idle
     - policy_stream
@@ -77,6 +101,7 @@ modes:
   policy_stream:
     controllers: []
     allows_stream: true
+    allows_trajectory: true
     transitions:
     - idle
     - stream
@@ -168,11 +193,17 @@ command_channels:
   type: twist
   modes:
   - locomotion
-trajectory_actions: []
+# The vendor MC tier has no trajectory endpoint; this runtime serves one itself
+# by replaying the goal on the upper-body stream (see named_motion), with the
+# same admission, ease-in, cancel-and-hold and follow check as the recordings.
+trajectory_actions:
+- /arm_trajectory_controller/follow_joint_trajectory
 capabilities:
   joint.state:
     joint_count: 14
     rate_hz: 50.0
+  joint.trajectory:
+    joint_count: 14
   joint.position_stream:
     joint_count: 14
     rate_hz: 50.0
@@ -431,6 +462,27 @@ vendor:
     fault_groups:
     - arm
     - head
+
+
+  # Arm joint travel for joint.trajectory goals, from the official X2 Ultra URDF
+  # (aimdk_description, X2_URDF-v1.3.0 <limit>). A goal outside it is refused,
+  # not clamped. The streaming channels are not checked against it here.
+  arm:
+    limits:
+      left_shoulder_pitch_joint: [-3.08, 2.04]
+      left_shoulder_roll_joint: [-0.061, 3.0456]
+      left_shoulder_yaw_joint: [-2.556, 2.556]
+      left_elbow_joint: [-2.3556, 0.0]
+      left_wrist_yaw_joint: [-2.556, 2.556]
+      left_wrist_pitch_joint: [-0.5236, 0.5236]
+      left_wrist_roll_joint: [-1.5097, 0.724]
+      right_shoulder_pitch_joint: [-3.08, 2.04]
+      right_shoulder_roll_joint: [-3.0456, 0.061]
+      right_shoulder_yaw_joint: [-2.556, 2.556]
+      right_elbow_joint: [-2.3556, 0.0]
+      right_wrist_yaw_joint: [-2.556, 2.556]
+      right_wrist_pitch_joint: [-0.5236, 0.5236]
+      right_wrist_roll_joint: [-0.724, 1.5097]
   # Head travel, from the platform's own McServoStatus comments
   # (yaw -0.38..0.38, pitch -0.35..0.35 rad). A target outside it is refused,
   # not clamped: clamping would execute a motion the caller did not ask for.
@@ -515,6 +567,7 @@ vendor:
     # which is verified for dexterous hands only.
     trajectory_modes:
     - stream
+    - policy_stream
     trajectory_blend_speed_radps: 0.5
     trajectory_blend_min_s: 0.5
     # A recording faster than this anywhere is refused at startup. The

@@ -88,3 +88,18 @@ def test_legacy_and_non_grasp_success_do_not_claim_a_grasp():
 )
 def test_incomplete_display_facts_preserve_success_without_claiming_a_verified_grasp(detail):
     assert execution_reply("SUCCEEDED", {"current_skill": "pick_object", "execution_detail": detail}) == "执行完成。"
+
+
+@pytest.mark.parametrize("skill", ["free_pose", "return_to_task_pose"])
+def test_pose_arrival_failure_reports_motion_end_without_claiming_verified_success(skill):
+    context = {
+        "current_skill": skill,
+        "execution_detail": ExecutionDetail(
+            1, "verify", "FAILED", "verify", "TASK_POSE_NOT_REACHED", "NOT_NEEDED", 0, "MANUAL_CHECK"
+        ).to_dict(),
+    }
+    assert execution_reply("FAILED", context) == "动作执行结束，未校验通过。"
+    assert "结果未知" in execution_reply("UNKNOWN", context)
+    assert execution_reply("CANCELLED", context) == "已停止。"
+    context["current_skill"] = "pick_object"
+    assert "操作员" in execution_reply("FAILED", context)

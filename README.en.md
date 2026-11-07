@@ -749,3 +749,7 @@ export DISPLAY=:1
 **User Guide**: <https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html>\
 **Project Home**: <https://atomgit.com/openEuler/IB_Robot>\
 **Feedback**: <https://atomgit.com/openEuler/IB_Robot/issues>
+
+### RT-Infer
+
+[Ascend 310P RC software scheduling: deployment and multi-model validation](docs/rt_infer_deployment.md).

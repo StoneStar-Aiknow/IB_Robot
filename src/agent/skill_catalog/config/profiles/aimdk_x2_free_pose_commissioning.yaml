@@ -1,0 +1,24 @@
+schema_version: 1
+name: aimdk_x2_free_pose_commissioning
+robot_name: aimdk_x2_skills
+enabled_skills:
+# Keep contract redirects valid, but hide presets from planning. The Agent's
+# test_allowlist also admits only free_pose in this commissioning deployment.
+- name: wave_hand
+  implementation: x2_runtime_v1
+  planner_visible: false
+- name: handshake
+  implementation: x2_runtime_v1
+  planner_visible: false
+- name: raise_hand
+  implementation: x2_runtime_v1
+  planner_visible: false
+- name: blow_kiss
+  implementation: x2_runtime_v1
+  planner_visible: false
+- name: clap_hands
+  implementation: x2_runtime_v1
+  planner_visible: false
+- name: free_pose
+  implementation: x2_runtime_v1
+  planner_visible: true

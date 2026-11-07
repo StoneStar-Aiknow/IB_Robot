@@ -8,6 +8,9 @@ logs
 venv
 tmp/
 
+# Offline X2 geometry/targets are deployment assets, not source model files.
+/commissioning/fixed_poses*.json
+
 # Vendor SDK reference trees (never vendored: see
 # src/robots/aimdk/aimdk_robot/README.md). AimDK is ~490 MB and its message
 # package currently carries no license declaration. Root-anchored: this must
@@ -54,3 +57,6 @@ docs/superpowers/
 # Machine-local real-hardware paths
 /.aero_hand_teleop.env
 third_party/vendor/**/*.so
+!third_party/vendor/rt-infer/2026.11.06/lib/libruntime.so
+!third_party/vendor/rt-infer/2026.11.06/lib/periodic_control_bridge.so
+!third_party/vendor/rt-infer/2026.11.06/lib/persistent_acl_bridge.so

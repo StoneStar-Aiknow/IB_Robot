@@ -1,5 +1,75 @@
 # ibrobot_agent 架构契约
 
+## 语音合成与播放流水线
+
+- 1 个线程串行合成，另 1 个线程串行播放。播放 A 时支持合成 B、C。
+- 播放空闲时选择最新有效的已合成普通公告。如果 B、C 均就绪，只播 C。
+  如果 B 已就绪而 C 仍在合成，立即播 B。
+- 普通回复、预告和阶段提示允许丢弃。已经领取播放的公告不抢断。
+- 同一次合成返回的多个音频段作为一组播放。组内保序，不按段替换。
+- 终态优先清除旧普通公告，包括在途合成结果。终态不被新普通公告替换。
+- 携带 `then` 的旧协议展示保留顺序屏障。只有整组播放成功才确认。
+- 合成期间不静音 ASR。静音、回声过滤和播放窗口仅覆盖播放调用。
+- 等待任务有容量上限。容量不足先淘汰普通公告，保护项满载时拒绝新任务并记录原因。
+- 调度日志记录合成、播放和丢弃事件。播放服务返回不代表硬件播放完成确认。
+- 本次不改变动作授权和执行契约。typed Program 仍不等待 TTS。
+
+## 抓取分级播报
+
+在 `robot.embodied.agent.voice_bridge` 配置：
+
+```yaml
+speech_mode: standard  # concise / standard / detailed
+speech_messages:
+  start: "好呀，我来拿{target}。"
+  success: "{target}拿起来啦，已经确认抓住了。"
+  plan: "我还在找合适的下手位置，稍等一下呀。"
+```
+
+- 默认 standard。concise 过滤普通阶段，等待 10 秒才生成等待说明。
+- standard 对规划等待 4 秒才生成提示，另允许接近提示。普通播放间隔 4 秒。
+- detailed 增加观察、识别、手型、闭合、抬升与验证。普通播放间隔 3 秒。
+- concise 普通等待说明间隔 15 秒。其它模式同阶段重复等待也至少隔 15 秒。
+- 模式筛选、阶段计时和限频发生在合成前。简洁模式不会先合成详细阶段。
+- 恢复和重试采用已知原因。缺少退回完成证据时不声称已退回。
+- 终态和人工处置不受普通限频。普通公告在阶段结束后失效。
+- `speech_messages` 是覆盖映射。完整键见 `GraspSpeechPolicy.DEFAULT_MESSAGES`。
+  启动校验未知键、占位符、长度和中文内容。普通模板禁止停止词。
+- 模板修改后重启 voice bridge。不会额外调用语言模型润色。
+- 英文目标不擅自翻译，使用“这个东西”。成功话语不提前于执行终态。
+- 为避免未经分类的 preview 绕过抓取策略，voice bridge 延后所有 preview。
+  普通会话在最终回答时播报；非抓取动作在 presentation 时播报。
+  此策略可能推迟普通会话的首次出声，不影响执行授权或 legacy 回执。
+- 测试只使用假适配器和本地状态，不启动硬件 runtime。
+
+## 语音反馈与动作保存验收
+
+- 接受回执延迟 3 秒。计划先返回时省略回执，避免重复播报。任务执行不等待播报。
+- 忙碌提示简短描述当前任务，间隔至少 10 秒，排队超过 5 秒或任务已结束时丢弃。
+- 外部分段音频按采集时间及段标识关联播放窗口；普通文本入口用近期播报文本相似度兜底。
+  停止词始终走快速通道。此过滤不是声学回声消除，真实环境仍需验证。
+- TTS 播报使用中文目标名称，技术摘要保留在日志，英文标识不传给中文前端。
+- 两次相近绝对姿态成功完成后询问“刚才这个动作到位吗？可以保存吗？”。
+  当前会话在 60 秒内明确同意才确认保存；否定、换话题、超时不保存。
+  未确认候选不参与动作缓存命中；近似姿态单独说明，种子库保持可用。
+- 保存意图由现有 Agent 在同一次规划调用中判断，无单独分类器或确认短语白名单。
+  `pending_pose_save` 提供会话内待确认动作 ID 和询问内容，规划结果使用 `pose_feedback`
+  （accept/decline/clarify/new_task/offer）表达决定，不要求模型回传动作 ID。
+  程序重新核验待确认动作；Composer 继续检查有效期和实际到达的目标。
+  含糊回复、缺少决定或模型失败保留确认、不延长有效期。拒绝保存只取消确认，不封禁动作。
+  保存和新动作可在同一个 workflow 结果中表达；新动作仍走原有 Gateway 校验。
+  移除了 `pose_feedback_phrases_json` 和 `pose_composer.memory.feedback` 旧配置。
+- 原文未命中时，LookupArmPose 的 `catalog_json` 返回当前可复用动作的标准表达、别名、
+  活动手臂和姿态描述，作为本次 Agent 上下文 `remembered_poses`。
+  Agent 可修正明确的识别错误并选择完整符合约束的标准表达；Composer 再次查库，
+  命中后跳过姿态生成模型，但仍做当前姿态与路径校验。
+  不符合左右手、高度、幅度等要求时保留完整描述生成；含义不确定时询问用户。
+  原始指令含相对要求时，即使 Agent 返回固定标准表达也不复用固定缓存。
+  此修改扩展了 ROS 服务响应，部署需同时重建 `ibrobot_msgs`、`ibrobot_agent` 和 `pose_composer`。
+- Mock 验收入口：`colcon test --merge-install --packages-select ibrobot_agent pose_composer`。
+  `test_agent_memory_mock.py` 用真实 Agent、Composer、SQLite 验证保存确认及召回免模型调用；
+  语音路由、确认分支和失败分支分别由 `test_voice_bridge.py`、`test_pose_preview.py` 专项覆盖。
+
 `ibrobot_agent` 是 IB-Robot 自然语言 Agent 的孵化运行时包。它把用户的自然语言请求转成
 严格校验的 canonical Program，并把全部机器人执行委托给既有 Capability Gateway 链路
 （Agent ExecutionPort → `ExecuteProgram` → ExecutionStore → Safety Guard → Skill Executor）。
@@ -94,6 +164,16 @@ execution 的幂等、查询、事件和终态。旧 Agent Plan 服务只作为�
   （字段、动作、原值）写入 ledger 的 `planner_outcome` 事件 `planner_repairs` 并记 warning 日志，不进入
   digest。workflow 回复从不修正；字段与类型矛盾（如澄清带 `steps`、对话带 `summary`）仍然拒绝。
 - 终态未知（UNKNOWN）进入 robot-scope quarantine，需人工介入。
+- 因适配器错误留下的 UNKNOWN 可在停机后使用 `ibrobot_agent_reconcile` 对账。
+  工具必须独占 Agent 部署锁和 Gateway 账本写锁，以只读方式读取 Gateway；请求 ID、机器人、
+  caller scope、Program 摘要、registry 身份及完成步数必须与保存的 TaskRef 一致，且机器人没有
+  未完成或 UNKNOWN 的 Gateway 执行。只接受确定终态，不以“网关空闲”代替证据。
+  原请求及 UNKNOWN 终态保持不变，独立保存操作者、证据和 Gateway 结果；同一旧请求不会重放，
+  其他未对账 UNKNOWN 仍阻止新任务。只在下一次启动时重新计算隔离状态。
+- 执行结果 `message` 为最多 300 字符的摘要；超长时截断，原文保存于 `detail.raw_message`，
+  并设置 `detail.message_truncated=true`。诊断长度不改变已收到的执行终态或触发额外取消。
+- `free_pose`、`return_to_task_pose` 收到 `TASK_POSE_NOT_REACHED` 时，回复“动作执行结束，未校验通过。”。
+  该回复表示结束位置未通过校验；执行终态仍为 `FAILED`，错误码及校验阶段保留在执行记录中。
 - 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
   供人工通过 Gateway 核实；确定未提交的中断请求转为 FAILED 或 CANCELLED_BEFORE_EXECUTION。
   不重放旧请求，不以 Gateway 空闲推断成功；已有终态和其他 robot scope 的记录保持原样。
@@ -190,7 +270,8 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
   保持常开，因此房间里的每一句话都会到达桥接，无论是否对机器人说的。配置 `wake_phrases` 后，一句话必须以
   其中之一**开头**才被转发；命中后唤醒词从文本中剥离（ASR 会丢掉逗号，「灵犀灵犀，挥个手」实际到达的是
   「灵犀灵犀挥个手」，planner 不应看到前缀）。命中即开 `wake_window_sec` 窗口，窗口内的后续话无需再点名，
-  但**只有被真正处理的话才续期窗口**——否则旁边的持续交谈会把它一直撑开，门控退化为常开。
+  被真正处理的话会续期窗口；当前窗口内通过声纹比对的话也会续期，即使机器人忙或文本太短而未提交指令。
+  续期至本句转写到达时间加 `wake_window_sec`；声纹缺失、不可比或被拒绝的闲聊不续期，过期后仍需重新唤醒。
   句中提及不算点名（「昨天我跟灵犀说过这个事」被忽略），这是用前缀匹配而非包含匹配的原因。
   **停止词不受此门控**：安全优先于寻址。ASR 把专名读成同音词是常态（X-ASR 实测「灵犀」→「林夕」/「林溪」），
   用现成的 `text_corrections` 吸收即可，门控在纠正之后判定。
@@ -412,3 +493,27 @@ typed Program 路径不产生 `presentation_rendered`。
 - `chat_tui` 为单操作员本地终端，不提供多通道并发接入；Agent 节点一次只绑定一个 `channel_id`，
   语音与终端不能同时作为同一 Agent 的入口。
 - UNKNOWN 恢复采用保守隔离，不自动重放或推断旧任务终态；需操作员依据保留的 TaskRef 完成核实。
+
+### X2 可选欧拉文本唤醒部署
+
+`aimdk_x2_voice_mirror_grasp` 默认启用 `wake_phrase` + `欧拉欧拉`，声纹校验保持关闭。
+删除总 YAML 的 `wake_phrases` 键可恢复直接接收普通语音。
+近音列表包含“欧拉、欧啦、鸥拉、偶拉”两两组合的 16 个前缀。
+规则只匹配句首，剥离前缀后再转交 Agent。
+单次“欧拉”、句中提及和“好啦好啦”不触发唤醒。
+
+不依赖厂商播放应答推导的唤醒事件。沿用现场持续采音方式，不修改厂商服务。
+启用声纹校验后，首句声纹建锚，可信后续语音累积更新。
+再次点名重设声纹锚点。
+
+唤醒窗口为 60 秒。
+系统实际处理指令后，刷新窗口至本句转写到达后的 60 秒。
+窗口内声纹比对通过的后续语音也刷新窗口。
+拒绝的旁人话语不续期。
+
+仅启用文本唤醒不需要 CAMPPlus 模型。
+启用声纹校验时，需下载 CAMPPlus bundle。
+使用声纹校验时，首次将“欧拉欧拉”与 3 至 6 秒完整指令连说。
+这可避免短唤醒残留成为无效锚点。
+
+这是 ASR 文本触发，不是专用 KWS；短首句无锚点和缺失测量的 fail-open 边界保持不变。

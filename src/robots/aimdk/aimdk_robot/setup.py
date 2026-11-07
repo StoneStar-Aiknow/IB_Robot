@@ -27,6 +27,7 @@ setup(
             "aimdk_runtime = aimdk_robot.runtime_node:main",
             "aimdk_vendor_mock = aimdk_robot.vendor_mock_node:main",
             "aimdk_record_named_motion = aimdk_robot.record_named_motion:main",
+            "aimdk_fetch_x2_mjcf = aimdk_robot.mock_physics:fetch_main",
         ],
     },
 )

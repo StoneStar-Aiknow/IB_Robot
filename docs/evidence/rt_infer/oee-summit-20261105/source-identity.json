@@ -1,0 +1,16 @@
+{
+  "commit": "02141043ec09a046b1c7cfa2720115ca8f60e554",
+  "tree": "79c542004c36769183fc8c0be0be877a1b2195cd",
+  "branch": "port/pr581-oee-summit-2026",
+  "status": "",
+  "python": "/usr/bin/python3.11",
+  "script_hashes": {
+    "scripts/rt_infer/periodic/baseline.py": "efb7f7c72c23139044b9cf58e72c2e0d3cae89cf3cc73fa08f45c5232ca36228",
+    "scripts/rt_infer/periodic/latency_periodic10.py": "1cee5efb94f00c1692c4fafe6f44f0606ac59f2a9449a9e0a7553a4ce81e7083",
+    "scripts/rt_infer/periodic/metrics.py": "e595316bdb8834786c521fadf0c88f67dffe0162de3feb8209056065107c6ac8",
+    "scripts/rt_infer/periodic/periodic_control.py": "781e0ca230f68222c0bb848a11483f3af0b93e820bf55aaa1072cbcfa8f6ce1b",
+    "scripts/rt_infer/periodic/persistent_acl.py": "811cc0b3116bc42b8602f0c7f2205a391b34d35fcfcfcee0f4681a4882c78360",
+    "scripts/rt_infer/periodic/run.py": "710c2b68d1bb7a484d3da9f07c6cc94ae9da7cca4273fbc460911170d0c03f40",
+    ".shrc_local": "dc2218d0ae036df52880e800237a76dc9ce38cd915cfda16b63daceb5ab346b1"
+  }
+}

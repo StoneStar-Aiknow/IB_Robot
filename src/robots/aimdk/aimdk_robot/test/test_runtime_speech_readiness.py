@@ -26,6 +26,7 @@ if str(_PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_ROOT))
 
 from aimdk_robot.runtime_node import OBSERVED_INTERFACES  # noqa: E402
+from audio_common_msgs.msg import AudioDataStamped  # noqa: E402
 from builtin_interfaces.msg import Time  # noqa: E402
 
 from ibrobot_msgs.msg import SpeechAudioChunk  # noqa: E402
@@ -104,7 +105,8 @@ def test_observed_interfaces_stay_a_narrow_allowlist():
     assert OBSERVED_INTERFACES == (SPEECH, CAPTURE)
 
 
-def test_unknown_then_ready_through_the_real_runtime_status(profile):
+@pytest.mark.parametrize("interface_name", (SPEECH, CAPTURE))
+def test_unknown_then_ready_through_the_real_runtime_status(profile, interface_name):
     description, observed = _description_and_observed(profile)
     node = FakeNode()
     monitor = InterfaceMonitor(node, {"interfaces": observed})
@@ -116,19 +118,22 @@ def test_unknown_then_ready_through_the_real_runtime_status(profile):
     kwargs = {
         "runtime_name": str(profile["runtime"]["name"]),
         "required": ("interaction.audio_capture",),
-        "interfaces": (SPEECH,),
+        "interfaces": (interface_name,),
     }
 
     # Silence before the first heartbeat is the normal idle state: the vendor
     # stream is wake-word gated. Reporting it as readiness is exactly the bug
     # that produced "interface 'audio.speech' is unknown: no sample".
     assert _reported_state(_status(profile, description, monitor)) == "unknown"
-    with pytest.raises(ValueError, match=f"{SPEECH}.*unknown"):
+    with pytest.raises(ValueError, match=f"{interface_name}.*unknown"):
         validate_runtime_snapshot(_status(profile, description, monitor), **kwargs)
 
-    monitor.observe(SPEECH, description["interfaces"][SPEECH], _heartbeat())
+    sample = _heartbeat() if interface_name == SPEECH else AudioDataStamped()
+    if interface_name == CAPTURE:
+        sample.audio.data = [0] * 64
+    monitor.observe(interface_name, description["interfaces"][interface_name], sample)
     status = _status(profile, description, monitor)
-    assert _reported_state(status) == "ready"
+    assert json.loads(status.interface_description_json)["states"][interface_name]["state"] == "ready"
     validate_runtime_snapshot(status, **kwargs)
 
 

@@ -1,0 +1,37 @@
+[
+  {
+    "path": "bin/aicore_scheduler",
+    "sha256": "752c59291a3b3b270b92822b440f7b1d85e8735950ba106f2da34a534c484ea1",
+    "unchanged": true
+  },
+  {
+    "path": "lib/libruntime.so",
+    "sha256": "51ea244f2d8aac50b497500dc3fed0e905837684861f7f369fa52f464ce55264",
+    "unchanged": true
+  },
+  {
+    "path": "modules/5.10.0-openeuler/aicore_device.ko",
+    "sha256": "0ff837d764754475a2cb723d7eab75e129dd400fafd3bd85a7210fb45b3fdf6d",
+    "unchanged": true
+  },
+  {
+    "path": "artifacts/svm.ko",
+    "sha256": "6441b69ea03273fb064571223c83f6fc665971391c9679db2687c77045b037b7",
+    "unchanged": true
+  },
+  {
+    "path": "bin/om_probe",
+    "sha256": "21ad46c80db4eb42c9959e8f79761f1690f7521aba2fe9cf0cd3eb850d38bbe1",
+    "unchanged": true
+  },
+  {
+    "path": "lib/periodic_control_bridge.so",
+    "sha256": "49d4f81537d9e09c4db979a6e15bb1d15bcf5f281c6360ca253438cfb26e8a5f",
+    "unchanged": true
+  },
+  {
+    "path": "lib/persistent_acl_bridge.so",
+    "sha256": "da2833178ff2605a1775c17b77900556d5234fab5d64748e7340e44c31881628",
+    "unchanged": true
+  }
+]

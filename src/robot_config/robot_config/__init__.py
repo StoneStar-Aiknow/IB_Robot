@@ -29,6 +29,9 @@ _LAZY_EXPORTS = {
     "PerceptionRuntimeConfig": ("robot_config.perception_runtime_config", "PerceptionRuntimeConfig"),
     "PerceptionRuntimeConfigError": ("robot_config.perception_runtime_config", "PerceptionRuntimeConfigError"),
     "parse_perception_runtime_config": ("robot_config.perception_runtime_config", "parse_perception_runtime_config"),
+    "RtInferConfig": ("robot_config.rt_infer_config", "RtInferConfig"),
+    "RtInferConfigError": ("robot_config.rt_infer_config", "RtInferConfigError"),
+    "parse_rt_infer_config": ("robot_config.rt_infer_config", "parse_rt_infer_config"),
     "bind_robot_interfaces": ("robot_config.interface_binding", "bind_robot_interfaces"),
     "build_contract_from_robot_config_dict": (
         "robot_config.loader",
@@ -108,6 +111,9 @@ __all__ = [
     "PerceptionRuntimeConfig",
     "PerceptionRuntimeConfigError",
     "parse_perception_runtime_config",
+    "RtInferConfig",
+    "RtInferConfigError",
+    "parse_rt_infer_config",
     # Launch builders
     "generate_ros2_control_nodes",
     "generate_camera_nodes",

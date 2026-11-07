@@ -1,0 +1,156 @@
+{
+  "robot_config": {
+    "current": {
+      "passed": 1799,
+      "skipped": 31,
+      "failed_ids": [
+        "robot_config.src.robot_config.test.test_aimdk_x2_skills_config::test_named_motion_mode_selects_the_runtime_stream_mode_without_a_dispatcher",
+        "robot_config.src.robot_config.test.test_aimdk_x2_skills_config::test_the_runtime_waiter_checks_the_wake_event_is_declared_but_not_that_it_is_ready",
+        "robot_config.src.robot_config.test.test_embodied_entry_config::test_lekiwi_hybrid_stage_ships_periodic_sound_following_inactive",
+        "robot_config.src.robot_config.test.test_embodied_entry_config::test_lekiwi_non_hybrid_stages_keep_sound_orientation_disabled",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_navi_overlay_binds_on_both_physics_platforms[gazebo]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_navi_overlay_binds_on_both_physics_platforms[mujoco]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_lio_overlay_binds_on_both_physics_platforms[gazebo]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_lio_overlay_binds_on_both_physics_platforms[mujoco]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_a_consumer_left_enabled_for_an_excluded_interface_fails_the_binding[gazebo]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_a_consumer_left_enabled_for_an_excluded_interface_fails_the_binding[mujoco]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[gazebo-lekiwi_lidar]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[gazebo-lekiwi_nav_grasp]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[mujoco-lekiwi_lidar]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[mujoco-lekiwi_nav_grasp]",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_mid360_mount_still_mounts_without_require_model",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_shipped_provider_fragments_are_byte_identical",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_lekiwi_migration_effective_sets",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_migration_keeps_the_robot_config_consumers_unchanged",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_semantic_mapping_interfaces_gate_the_waiter_without_live_binding",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_query_only_semantic_mapping_adds_no_gate",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_semantic_mapping_declaration_stays_separate_from_contract_requirements",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_the_shipped_lekiwi_rgbd_camera_satisfies_the_semantic_gate",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[-gazebo-sdk-True-gazebo]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[true-gazebo-sdk-True-gazebo]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[true--sdk-True-sdk]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[false--sdk-False-sdk]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[--sdk-False-sdk]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[--gazebo-False-gazebo]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_gazebo_emits_platform_world_and_full_spawn_pose_only",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_gazebo_without_a_started_world_spawns_into_an_empty_world",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_mujoco_hand_off_passes_scene_and_spawn_by_name_only",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_mujoco_without_a_started_world_hands_an_empty_scene",
+        "robot_config.src.robot_config.test.test_teleop_operator_forwarding::test_forwarder_declares_the_same_arguments_and_the_deprecation_notice",
+        "robot_config.src.robot_config.test.test_tts_playback_config::test_invalid_tts_playback_settings_are_rejected[chunk_ms-5-chunk_ms must be an integer between 20 and 200]",
+        "robot_config.src.robot_config.test.test_unitree_g1_config::test_configuration_is_valid",
+        "robot_config.src.robot_config.test.test_unitree_g1_config::test_it_selects_the_g1_runtime_provider"
+      ]
+    },
+    "clean_HEAD": {
+      "passed": 1746,
+      "skipped": 31,
+      "failed_ids": [
+        "robot_config.src.robot_config.test.test_aimdk_x2_skills_config::test_named_motion_mode_selects_the_runtime_stream_mode_without_a_dispatcher",
+        "robot_config.src.robot_config.test.test_aimdk_x2_skills_config::test_the_runtime_waiter_checks_the_wake_event_is_declared_but_not_that_it_is_ready",
+        "robot_config.src.robot_config.test.test_embodied_entry_config::test_lekiwi_hybrid_stage_ships_periodic_sound_following_inactive",
+        "robot_config.src.robot_config.test.test_embodied_entry_config::test_lekiwi_non_hybrid_stages_keep_sound_orientation_disabled",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_navi_overlay_binds_on_both_physics_platforms[gazebo]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_navi_overlay_binds_on_both_physics_platforms[mujoco]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_lio_overlay_binds_on_both_physics_platforms[gazebo]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_nav_grasp_lio_overlay_binds_on_both_physics_platforms[mujoco]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_a_consumer_left_enabled_for_an_excluded_interface_fails_the_binding[gazebo]",
+        "robot_config.src.robot_config.test.test_navgrasp_sim_overlays::test_a_consumer_left_enabled_for_an_excluded_interface_fails_the_binding[mujoco]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[gazebo-lekiwi_lidar]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[gazebo-lekiwi_nav_grasp]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[mujoco-lekiwi_lidar]",
+        "robot_config.src.robot_config.test.test_navigation_simulation::test_staged_navigation_overlay_resolves_the_production_stage[mujoco-lekiwi_nav_grasp]",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_mid360_mount_still_mounts_without_require_model",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_shipped_provider_fragments_are_byte_identical",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_lekiwi_migration_effective_sets",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_migration_keeps_the_robot_config_consumers_unchanged",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_semantic_mapping_interfaces_gate_the_waiter_without_live_binding",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_query_only_semantic_mapping_adds_no_gate",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_semantic_mapping_declaration_stays_separate_from_contract_requirements",
+        "robot_config.src.robot_config.test.test_peripheral_overrides::test_the_shipped_lekiwi_rgbd_camera_satisfies_the_semantic_gate",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[-gazebo-sdk-True-gazebo]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[true-gazebo-sdk-True-gazebo]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[true--sdk-True-sdk]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[false--sdk-False-sdk]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[--sdk-False-sdk]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_selection_matrix_resolves_like_the_runtime_entries[--gazebo-False-gazebo]",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_gazebo_emits_platform_world_and_full_spawn_pose_only",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_gazebo_without_a_started_world_spawns_into_an_empty_world",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_mujoco_hand_off_passes_scene_and_spawn_by_name_only",
+        "robot_config.src.robot_config.test.test_runtime_provider_platform::test_mujoco_without_a_started_world_hands_an_empty_scene",
+        "robot_config.src.robot_config.test.test_teleop_operator_forwarding::test_forwarder_declares_the_same_arguments_and_the_deprecation_notice",
+        "robot_config.src.robot_config.test.test_tts_playback_config::test_invalid_tts_playback_settings_are_rejected[chunk_ms-5-chunk_ms must be an integer between 20 and 200]",
+        "robot_config.src.robot_config.test.test_unitree_g1_config::test_configuration_is_valid",
+        "robot_config.src.robot_config.test.test_unitree_g1_config::test_it_selects_the_g1_runtime_provider"
+      ]
+    },
+    "new_failure_ids": [],
+    "identical_failure_ids": true
+  },
+  "inference_service": {
+    "current": {
+      "passed": 969,
+      "skipped": 1,
+      "failed_ids": [
+        "inference_service.test.test_ascend_ffmpeg_video_codec::test_ffmpeg_resolution_order_and_child_only_library_path",
+        "inference_service.test.test_ascend_ffmpeg_video_codec::test_standard_ascend_wrapper_honors_explicit_prefix"
+      ]
+    },
+    "clean_HEAD": {
+      "passed": 940,
+      "skipped": 1,
+      "failed_ids": [
+        "inference_service.test.test_ascend_ffmpeg_video_codec::test_ffmpeg_resolution_order_and_child_only_library_path",
+        "inference_service.test.test_ascend_ffmpeg_video_codec::test_standard_ascend_wrapper_honors_explicit_prefix"
+      ]
+    },
+    "new_failure_ids": [],
+    "identical_failure_ids": true
+  },
+  "voice_tts_service": {
+    "current": {
+      "passed": 163,
+      "skipped": 2,
+      "failed_ids": [
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_passes_the_generated_nodes_through",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_is_skipped_when_exit_on_init_failure_is_false",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[true]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[default]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[string]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[none]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[missing]"
+      ]
+    },
+    "clean_HEAD": {
+      "passed": 163,
+      "skipped": 2,
+      "failed_ids": [
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_passes_the_generated_nodes_through",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_is_skipped_when_exit_on_init_failure_is_false",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[true]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[default]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[string]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[none]",
+        "voice_tts_service.src.voice_tts_service.test.test_voice_tts_launch_builder::test_build_failure_stops_the_launch_otherwise[missing]"
+      ]
+    },
+    "new_failure_ids": [],
+    "identical_failure_ids": true
+  },
+  "visual_interaction": {
+    "current": {
+      "passed": 629,
+      "skipped": 0,
+      "failed_ids": []
+    },
+    "clean_HEAD": {
+      "passed": 628,
+      "skipped": 0,
+      "failed_ids": []
+    },
+    "new_failure_ids": [],
+    "identical_failure_ids": true
+  }
+}

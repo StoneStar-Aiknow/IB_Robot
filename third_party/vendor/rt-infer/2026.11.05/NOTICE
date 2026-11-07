@@ -1,0 +1,6 @@
+RT-Infer binary distribution
+
+The asset owner authorized publication of these binaries and driver modules.
+No RT-Infer scheduler, runtime or device-kernel implementation source is included.
+The repository license does not automatically relicense vendor binaries.
+Existing third-party notices and module license metadata remain applicable.

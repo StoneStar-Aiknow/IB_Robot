@@ -981,6 +981,7 @@ class _GatewayPolicyStub:
         self.finalize_raises = finalize_raises
         self.admission = SimpleNamespace(
             admitted=True,
+            error_code="",
             effective_timeout_sec=1.0,
             prepared_request=SimpleNamespace(identity=SimpleNamespace(task_id="task-1", payload_hash="digest")),
         )

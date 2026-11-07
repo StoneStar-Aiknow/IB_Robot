@@ -1,0 +1,32 @@
+{
+  "status": "executed",
+  "numeric_checks": "passed",
+  "roles": [
+    "pear",
+    "yolox",
+    "tts",
+    "vl"
+  ],
+  "process_exits": [
+    {
+      "role": "pear",
+      "pid": 2801,
+      "returncode": 0
+    },
+    {
+      "role": "yolox",
+      "pid": 2802,
+      "returncode": 0
+    },
+    {
+      "role": "tts",
+      "pid": 2803,
+      "returncode": 0
+    },
+    {
+      "role": "vl",
+      "pid": 2804,
+      "returncode": 0
+    }
+  ]
+}
