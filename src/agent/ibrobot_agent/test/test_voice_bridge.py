@@ -354,69 +354,36 @@ def test_failed_terminal_is_spoken_without_technical_english():
 
 
 def test_speech_thread_survives_a_tts_error_and_still_acknowledges_later_plans():
-    """One raising render must not end the only consumer of the speech queue."""
-    import json
-    import logging
+    """A failed utterance cannot acknowledge a plan or kill later playback."""
     import threading
 
-    from ibrobot_agent.voice_bridge import _build_node_class
+    from ibrobot_agent.speech_pipeline import SpeechPipeline
 
-    node_class = _build_node_class()
     acknowledged = threading.Event()
+    attempts = []
+    receipts = []
 
-    class _Publisher:
-        def __init__(self, published: threading.Event | None = None) -> None:
-            self.messages: list[str] = []
-            self._published = published
+    def play(action, audio):
+        attempts.append(action.text)
+        if len(attempts) == 1:
+            raise RuntimeError("TTS service died mid-call")
+        return True
 
-        def publish(self, message) -> None:
-            self.messages.append(message.data)
-            if self._published is not None:
-                self._published.set()
+    def complete(action):
+        receipts.extend(action.then)
+        acknowledged.set()
 
-    class _Speaker:
-        def __init__(self) -> None:
-            self.attempts: list[str] = []
-
-        def speak(self, text: str) -> bool:
-            self.attempts.append(text)
-            if len(self.attempts) == 1:
-                raise RuntimeError("TTS service died mid-call")
-            return True
-
-    node = node_class.__new__(node_class)
-    node.get_logger = lambda: logging.getLogger("voice-bridge-test")
-    # Nothing to interrupt: speaking mutes ASR.
-    node._core = _core()
-    node._core_lock = threading.Lock()
-    node._mute_asr = True
-    node._asr_state = "listening"
-    node._deaf_until = 0.0
-    node._echo_until = 0.0
-    node._resume_settle_sec = 0.0
-    node._speaker = _Speaker()
-    node._control_publisher = _Publisher(acknowledged)
-    node._asr_control_publisher = _Publisher()
-    node._speech_wakeup = threading.Condition()
-    first = Speak("准备执行：点头。", then=(PublishControl({"control_type": "presentation_rendered", "n": 1}),))
-    second = Speak("准备执行：摇头。", then=(PublishControl({"control_type": "presentation_rendered", "n": 2}),))
-    node._speech_queue = [first, second]
-    node._speech_closed = False
-
-    speech_thread = threading.Thread(target=node._speech_loop, daemon=True)
-    speech_thread.start()
-
-    assert acknowledged.wait(timeout=5.0), "speech thread died on the first render"
-    assert node._speaker.attempts == ["准备执行：点头。", "准备执行：摇头。"]
-    # The plan whose speech failed is never acknowledged; the next one still is.
-    assert [json.loads(message)["n"] for message in node._control_publisher.messages] == [2]
-    # ASR is resumed after the failed render too, so the microphone is not left muted.
-    assert node._asr_control_publisher.messages == ["stop", "start", "stop", "start"]
-    with node._speech_wakeup:
-        node._speech_closed = True
-        node._speech_wakeup.notify_all()
-    speech_thread.join(timeout=1.0)
-    assert not speech_thread.is_alive()
+    pipeline = SpeechPipeline(synthesize=lambda action: action.text, play=play, completed=complete)
+    first = Speak("准备执行：点头。", then=(1,))
+    second = Speak("准备执行：摇头。", then=(2,))
+    try:
+        pipeline.submit(first)
+        pipeline.submit(second)
+        assert acknowledged.wait(timeout=5.0)
+        assert attempts == [first.text, second.text]
+        assert receipts == [2]
+    finally:
+        pipeline.close()
 
 
 @pytest.mark.parametrize("utterance", ["帮我停一下", "别动了谢谢", "快停下来", "STOP please"])
@@ -600,7 +567,7 @@ def _speaking_node(core, heard_during_playback):
             self.data = data
 
     class _Speaker:
-        def speak(self, text: str) -> bool:
+        def play(self, audio) -> bool:
             for heard in heard_during_playback:
                 node._on_transcript(_Message(heard))
             return True
@@ -629,7 +596,7 @@ def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
     # The robot hears its own busy reply and then the user's stop word.
     node = _speaking_node(core, [VoiceBridgeConfig.busy_message, "停"])
 
-    node._render_speech(Speak(VoiceBridgeConfig.busy_message))
+    node._render_speech(Speak(VoiceBridgeConfig.busy_message), [])
 
     assert node._asr_control_publisher.messages == []  # ASR was never muted
     assert [json.loads(data) for data in node._control_publisher.messages] == [
@@ -638,20 +605,25 @@ def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
     assert node._request_publisher.messages == []  # the echo was not routed as a command
 
 
-def test_terminal_feedback_discards_queued_busy_speech_without_delaying_stop_control():
-    import threading
-
+def test_terminal_feedback_does_not_delay_stop_control():
+    """Speech submission must not hold up the independent stop publisher."""
     core = _core()
     core.on_transcript("双手侧平举", now=0.0)
     node = _speaking_node(core, [])
-    node._speech_queue = []
-    node._speech_wakeup = threading.Condition()
-    node._execute([Speak("正在做双手侧平举，请稍等。", kind="busy"), Speak("收到，正在准备。", kind="receipt")])
-    # _execute queues TTS, it never invokes the blocking speaker in the input callback.
+    submitted = []
+
+    class Pipeline:
+        def submit(self, action):
+            submitted.append(action)
+            return True
+
+    node._speech_pipeline = Pipeline()
+    node._execute([Speak("正在做双手侧平举，请稍等。", kind="busy")])
     node._execute(core.on_partial("停", now=1.0))
     assert node._control_publisher.messages
     node._execute(core.on_event(_event("voice-0", "terminal", "CANCELLED"), now=2.0))
-    assert [action.text for action in node._speech_queue] == ["已停止。"]
+    assert submitted[-1].text == "已停止。"
+    assert submitted[-1].kind == "terminal"
 
 
 def test_reply_with_a_stop_word_still_mutes_asr():
@@ -659,7 +631,7 @@ def test_reply_with_a_stop_word_still_mutes_asr():
     core.on_transcript("挥挥手", now=0.0)
     node = _speaking_node(core, ["已停止"])
 
-    node._render_speech(Speak("已停止。"))
+    node._render_speech(Speak("已停止。"), [])
 
     assert node._asr_control_publisher.messages == ["stop", "start"]
     assert node._control_publisher.messages == []

@@ -218,10 +218,11 @@ def test_slow_tts_is_not_a_motion_gate_and_terminal_drops_queued_stages(rig):
     assert terminal["state"] == "SUCCEEDED" and not rig.speech_gate.is_set()
     wait_until(lambda: rig.speech)
     wait_until(lambda: any(entry[1] for entry in rig.voice._core._feedback._seen.values()))
-    with rig.voice._speech_wakeup:
-        assert all(item.terminal for item in rig.voice._speech_queue)
     rig.speech_gate.set()
     wait_until(lambda: "物体已经抓起并通过验证。" in rig.speech)
+    # Stale in-flight synthesis cannot revive a stage after the terminal.
+    wait_until(lambda: rig.played)
+    assert len(rig.played) == 1
     assert rig.mock.closes == 1
 
 

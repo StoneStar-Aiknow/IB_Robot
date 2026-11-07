@@ -949,7 +949,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     }
     # /voice_partial, /voice_status and /voice_control are fixed by voice_asr_node; the bridge keeps
     # its own defaults for them and the loader rejects YAML overrides that could only break them.
-    for field_name in ("confirm_mode", "busy_message", "addressee_trigger"):
+    for field_name in ("confirm_mode", "busy_message", "addressee_trigger", "speech_mode"):
         if field_name in voice_bridge:
             params[field_name] = str(voice_bridge[field_name])
     for field_name in (
@@ -1014,6 +1014,8 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     ):
         if field_name in voice_bridge:
             params[f"{field_name}_json"] = json.dumps(list(voice_bridge[field_name]), ensure_ascii=False)
+    if "speech_messages" in voice_bridge:
+        params["speech_messages_json"] = json.dumps(voice_bridge["speech_messages"], ensure_ascii=False)
     if "text_corrections" in voice_bridge:
         params["text_corrections_json"] = json.dumps(dict(voice_bridge["text_corrections"]), ensure_ascii=False)
     return Node(
