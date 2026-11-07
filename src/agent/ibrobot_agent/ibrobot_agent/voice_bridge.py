@@ -782,9 +782,10 @@ class VoiceBridgeCore:
                 actions.extend(self._say(_spoken_reply(payload.get("state"), message)))
             return actions
         if payload.get("accepted") is True and request_id == self.active_request_id and not self._state.receipt_spoken:
+            # Say it now: the plan may arrive in well under a second, and a receipt scheduled for
+            # three seconds later would either speak over the answer or arrive after it.
             self._state.receipt_spoken = True
-            self._receipt_due[request_id] = now + 3.0
-            return []
+            return [Log(f"request {request_id} accepted"), *self._say("收到，正在准备。")]
         return []
 
     def on_event(self, payload: dict[str, Any], now: float) -> list[Action]:
@@ -817,7 +818,7 @@ class VoiceBridgeCore:
         if state not in TERMINAL_REQUEST_STATES:
             return self._execution_speech(payload, now)
         silent = self._silent(request_id)
-        self._take_preview(request_id)
+        previewed = self._take_preview(request_id)
         if not self._finish(request_id):
             return []
         if event_type == "needs_clarification":
@@ -830,6 +831,8 @@ class VoiceBridgeCore:
         if state == "SUCCEEDED" and isinstance(detail, dict) and detail.get("save_prompt"):
             spoken = "执行完成。" + str(detail["save_prompt"])
         log = Log(f"request {request_id} {event_type} {state}: {message}")
+        if previewed and spoken == previewed:
+            return [log, Log(f"request {request_id} reply was already said as its preview")]
 
         return [log, *self._say(spoken, kind="terminal")]
 
@@ -892,7 +895,7 @@ class VoiceBridgeCore:
             return [Log(f"request {request_id} reply preview held silent: {message}")]
         self._state.preview_request_id = request_id
         self._state.preview_text = message
-        return [Log(f"request {request_id} reply preview deferred until plan classification: {message}")]
+        return [Log(f"request {request_id} reply preview: {message}"), *self._say(message)]
 
     def _take_preview(self, request_id: str) -> str:
         if self._state.preview_request_id != request_id:
@@ -997,6 +1000,10 @@ class VoiceBridgeCore:
                 if self.config.confirm_mode == "voice_confirm"
                 else []
             )
+            if self._state.preview_request_id == request_id:
+                # The preview already told the user what is about to happen, and nothing waits on
+                # this line; saying it again only delays the answer behind it.
+                return [plan_log, *gate, Log(f"request {request_id} plan was already announced by its preview")]
             return [plan_log, *gate, *self._say(f"正在执行：{summary}。")]
         acknowledgement = PublishControl(
             {

@@ -57,8 +57,12 @@ def test_tracker_discards_duplicates_stale_and_post_terminal_events():
 
 
 def test_text_feedback_bridge_checks_scope_and_never_submits_or_acknowledges():
+    # ``detailed`` narrates the observe phase; ``standard`` deliberately stays quiet until the
+    # plan, so this test asks for the mode that is supposed to speak here.
     core = VoiceBridgeCore(
-        VoiceBridgeConfig(channel_id="text", principal_id="operator", robot_scope="robot", feedback_only=True)
+        VoiceBridgeConfig(
+            channel_id="text", principal_id="operator", robot_scope="robot", feedback_only=True, speech_mode="detailed"
+        )
     )
     payload = event()
     assert core.on_heard("抓取苹果", 0) == []
