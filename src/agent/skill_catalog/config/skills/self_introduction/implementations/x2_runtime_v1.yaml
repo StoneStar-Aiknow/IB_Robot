@@ -5,6 +5,11 @@ executor: runtime_play_audio
 binding:
   # Logical clip name; embodied.runtime_play_audio.clips resolves the file path.
   clip: self_intro
+  # Runtime motion name (motion.named.names) run while the clip plays: the
+  # same recorded wave the wave_hand skill replays, started right after the
+  # playback request.
+  motion: wave
 required_args: []
-# The clip runs 34.5 s; the timeout covers playback plus service startup.
+# The clip runs 34.5 s and the wave ends well inside it; the timeout covers
+# playback plus service startup.
 timeout_sec: 60.0

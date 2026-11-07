@@ -78,7 +78,8 @@ robot:
         # would talk over the self-introduction.
         silent_skills:
           - self_introduction
-    # The self-introduction plays a recorded clip; the catalog binds the name.
+    # The self-introduction plays a recorded clip and waves while it plays; the
+    # catalog binds the clip name and the runtime motion (runtime_named_motion below).
     runtime_play_audio:
       enabled: true
       service: /voice_tts/play

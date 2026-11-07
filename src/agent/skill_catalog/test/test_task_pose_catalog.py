@@ -88,6 +88,8 @@ def test_voice_mirror_grasp_preserves_skills_and_compiles_preparation_budget():
     assert "preparation posture" in str(snapshot.capability_view["pick_object"])
     assert snapshot.templates["mirror_start"]["executor"] == "mirror_session"
     assert snapshot.templates["self_introduction"]["executor"] == "runtime_play_audio"
+    assert snapshot.templates["self_introduction"]["binding"] == {"clip": "self_intro", "motion": "wave"}
+    assert snapshot.capability_view["self_introduction"]["moves_robot"] is True
 
 
 @pytest.mark.parametrize("missing", ["pose_composer", "grasp_pipeline"])
