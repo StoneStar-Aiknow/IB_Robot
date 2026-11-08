@@ -11,6 +11,8 @@ long cover          session STANDBY or MIRRORING    ``mirror_stop`` (Gateway)
 head touch held     any session state               ``operator_touch``
 (``tick``)          on/off stable ``stable_s``      the light
 (``tick``)          on for ``max_session_s``        ``mirror_stop`` (Gateway)
+(``tick``)          the person left after a round   ``mirror_stop`` (Gateway)
+                    of ``leave_stop_min_round_s``
 ==================  ==============================  ==========================
 
 * The session state is the ``state`` of the newest message on the session
@@ -41,6 +43,16 @@ head touch held     any session state               ``operator_touch``
   an answered stop, or one not sent because ``send_enabled`` is False, is not.
   A later ``mirror_start`` while the session is on does not restart the count:
   the session answers "already on" and no WAIT comes.
+* The leave stop (``leave_stop_min_round_s`` > 0): a round (MIRRORING/running)
+  that ran at least that long and was cancelled because the person is gone
+  (``cancel_reason`` in ``LEAVE_CANCEL_REASONS``) stops the session once it is
+  back in STANDBY (cooldown or ready), instead of waiting there for the next
+  person. The round is timed from the state messages' receive times, from the
+  first MIRRORING/running to the first message after it. A shorter round, or a
+  cancel for another reason (a stalled stream, a head touch), stays in STANDBY
+  as before. Due, the stop goes and is retried exactly like the session
+  timeout's (the two share the attempts and the record); a new round before it
+  is answered calls it off, and WAIT clears it.
 """
 
 from __future__ import annotations
@@ -60,7 +72,7 @@ from manipulation_execution.mirror_operator.gesture import DOUBLE_COVER, LONG_CO
 from manipulation_execution.mirror_operator.judge import CoverJudge, GrayFrame
 from manipulation_execution.mirror_operator.led import ON, LedPolicy, status_note
 from manipulation_execution.mirror_operator.touch import TouchDetector
-from manipulation_execution.mirror_session.core import SessionState
+from manipulation_execution.mirror_session.core import Phase, SessionState
 
 GATEWAY_TIMEOUT_S = RESULT_WAIT_SEC
 STOP_TIMEOUT_S = DEFAULT_STOP_TIMEOUT_SEC + STOP_TIMEOUT_MARGIN_SEC
@@ -68,6 +80,11 @@ TOUCH_TIMEOUT_S = 2.0
 TIMEOUT_RETRY_S = 2.0
 FRAME_HZ_WINDOW_S = 1.0
 SESSION_ON = (SessionState.STANDBY.value, SessionState.MIRRORING.value)
+# The demo hooks' cancel reasons that mean the person is gone (mirror_session.demo).
+# The others -- stale, no_pose: the stream stalled; operator_touch -- may leave
+# the person standing there.
+LEAVE_CANCEL_REASONS = ("no_actor", "too_far")
+_BACK_IN_STANDBY = (Phase.COOLDOWN.value, Phase.READY.value)
 _STATES = tuple(state.value for state in SessionState)
 TOUCH_INTERFACE = "touch.head"
 
@@ -179,6 +196,13 @@ class Operator:
         self._timeout_next_at = 0.0
         self._timeout_done = False
         self._timeout_record: dict | None = None
+        self._timeout_cause = ""  # what sent the newest stop: session_timeout or leave
+        # the leave stop: the running round's start, the length of the round that just ended,
+        # whether the stop is due, and the newest round judged
+        self._round_started_at: float | None = None
+        self._round_ran_s: float | None = None
+        self._leave_due = False
+        self._leave_last: dict | None = None
 
     # ------------------------------------------------------------------
     # inputs
@@ -221,7 +245,7 @@ class Operator:
             return True
 
     def on_state(self, message: str | Mapping) -> None:
-        """One session state message (the JSON text or its mapping); only ``state`` is read."""
+        """One session state message (the JSON text or its mapping): ``state``, ``phase``, ``cancel_reason``."""
         with self._lock:
             now = self._clock()
             try:
@@ -239,8 +263,35 @@ class Operator:
                 self._wait_at = now
                 self._timeout_started_at = None
                 self._timeout_attempts, self._timeout_next_at, self._timeout_done = 0, 0.0, False
-            elif self._timeout_started_at is None:
+                self._round_started_at, self._round_ran_s, self._leave_due = None, None, False
+                self._timeout_cause = ""
+                return
+            if self._timeout_started_at is None:
                 self._timeout_started_at = now
+            self._follow_round(state, content.get("phase"), content.get("cancel_reason"), now)
+
+    def _follow_round(self, state: str, phase: object, cancel_reason: object, now: float) -> None:
+        """Time the rounds; the leave stop is due when one long enough ended because the person left."""
+        if (state, phase) == (SessionState.MIRRORING.value, Phase.RUNNING.value):
+            if self._round_started_at is None:
+                self._round_started_at, self._round_ran_s = now, None
+                self._leave_due = False  # someone is mirrored again
+            return
+        if self._round_started_at is not None:
+            self._round_ran_s, self._round_started_at = now - self._round_started_at, None
+        if state != SessionState.STANDBY.value or phase not in _BACK_IN_STANDBY or self._round_ran_s is None:
+            return
+        ran, self._round_ran_s = self._round_ran_s, None
+        limit = self._config.leave_stop_min_round_s
+        self._leave_due = limit > 0 and ran >= limit and cancel_reason in LEAVE_CANCEL_REASONS
+        self._leave_last = {
+            "round_s": round(ran, 3),
+            "cancel_reason": cancel_reason,
+            "stop": self._leave_due,
+            "at": now,
+        }
+        verdict = "leave stop" if self._leave_due else "stay"
+        self._log("info", f"round of {ran:.1f} s ended ({cancel_reason}): {verdict}")
 
     def tick(self) -> None:
         """Call timeouts, the session timeout and the light; the node calls it about 10 times a second."""
@@ -275,9 +326,11 @@ class Operator:
         self._log("info", f"{gesture}: {action}")
 
     def _session_timeout(self, now: float) -> None:
+        """The session timeout's stop, and the leave stop's: one stop, retried until WAIT."""
         limit = self._config.max_session_s
         started = self._timeout_started_at
-        if limit <= 0 or started is None or self._timeout_done or now - started < limit:
+        timed_out = limit > 0 and started is not None and now - started >= limit
+        if self._timeout_done or not (timed_out or self._leave_due):
             return
         record = self._timeout_record
         if self._timeout_attempts and record is not None:
@@ -292,10 +345,14 @@ class Operator:
             return  # silent: no session to stop until a state message comes again
         self._timeout_attempts += 1
         self._timeout_next_at = now + TIMEOUT_RETRY_S
+        self._timeout_cause = "session_timeout" if timed_out else "leave"
         action = self._send("gateway", "mirror_stop", now, for_timeout=True)
         if not self._send_enabled:
             self._timeout_done = True
-        self._log("info", f"session timeout ({limit:g} s, attempt {self._timeout_attempts}): {action}")
+        if timed_out:
+            self._log("info", f"session timeout ({limit:g} s, attempt {self._timeout_attempts}): {action}")
+        else:
+            self._log("info", f"leave stop (attempt {self._timeout_attempts}): {action}")
 
     def _send(self, channel: str, call: str, now: float, *, for_timeout: bool = False) -> str:
         # for_timeout: set before the call is made, since a missing service answers within it
@@ -420,6 +477,7 @@ class Operator:
             frame = self._frame
             state = self._session_state(now)
             started = self._timeout_started_at
+            round_at = self._round_started_at
             return {
                 "send_enabled": self._send_enabled,
                 "frame_hz": len(self._frame_times) / FRAME_HZ_WINDOW_S,
@@ -455,7 +513,15 @@ class Operator:
                     "fired": self._timeout_attempts > 0,
                     "attempts": self._timeout_attempts,
                     "done": self._timeout_done,
+                    "cause": self._timeout_cause,
                     "last": _age(self._timeout_record, now),
+                },
+                "leave_stop": {
+                    "enabled": self._config.leave_stop_min_round_s > 0,
+                    "min_round_s": self._config.leave_stop_min_round_s,
+                    "round_s": None if round_at is None else round(now - round_at, 3),
+                    "due": self._leave_due,
+                    "last": _age(self._leave_last, now),
                 },
                 "led": {
                     "available": not self._led_unavailable,

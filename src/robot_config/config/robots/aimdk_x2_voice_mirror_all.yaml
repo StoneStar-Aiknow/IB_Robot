@@ -295,6 +295,13 @@ robot:
             # In-process inference_service; the node's default stays ais_bench
             # for the older flat model directories.
             backend: inference_service
+    # The standing-zone selector: only the person whose feet are inside the floor
+    # quad is mirrored. The zone is the 2026-10-28 field calibration; the camera
+    # rides the head and the robot stands still, so it holds on any X2 standing
+    # the same way. Both files are validated at launch: a bad one stops the launch
+    # with the field named. Delete both lines to go back to ActorSelector.
+    actor_zone_file: $(find robot_config)/config/actor_zone/actor_zone.yaml
+    actor_tuning_file: $(find robot_config)/config/actor_zone/actor_tuning.yaml
 
   # The mirror drives the upper body itself. The demo rules are the relaxed
   # copy: a reply's TTS synthesis shares this board's single NPU with the

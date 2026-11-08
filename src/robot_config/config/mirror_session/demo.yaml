@@ -11,7 +11,10 @@
 #              max_value (0..255): no more than 5 % of the pixels brighter than 45.
 # operator:    read by the operator node; unset keys = its defaults. max_session_s: a round
 #              (STANDBY or MIRRORING) is stopped like a long cover after this long; 0 = off.
+#              leave_stop_min_round_s: a round that ran this long and was cancelled because the
+#              person left (no_actor / too_far) stops the session once back in STANDBY, instead
+#              of waiting there for max_session_s; a shorter round stays in STANDBY. 0 = off.
 session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0}
 timing:      {start_confirm_s: 1.5, cancel_confirm_s: 2.0}
 cover_judge: {percentile: 95, max_value: 45}
-operator:    {max_session_s: 60.0}
+operator:    {max_session_s: 60.0, leave_stop_min_round_s: 10.0}

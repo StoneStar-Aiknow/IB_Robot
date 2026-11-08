@@ -21,6 +21,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchContext
 from launch_ros.utilities import evaluate_parameters
@@ -28,6 +29,7 @@ from launch_ros.utilities import evaluate_parameters
 from inference_service.launch_builders.perception_models import generate_perception_model_nodes
 from manipulation_execution.launch_builders.motion_imitation_stream import (
     generate_motion_imitation_stream_nodes,
+    motion_imitation_stream_parameters,
 )
 from robot_config.loader import load_robot_config_dict, resolve_robot_config_path
 
@@ -245,6 +247,7 @@ def test_a_zone_without_a_tuning_file_uses_the_defaults(tmp_path):
         ("bad_zone", "actor_zone_file.*floor_quad"),
         ("missing_zone", "actor_zone_file.*cannot read"),
         ("relative_zone", "actor_zone_file must be an absolute path"),
+        ("unknown_package", "actor_zone_file must be an absolute path"),
         ("bad_tuning", "actor_tuning_file.*release_hold_s"),
         ("tuning_without_zone", "need actor_zone_file"),
         ("candidates_without_zone", "need actor_zone_file"),
@@ -262,6 +265,7 @@ def test_bad_zone_settings_stop_the_launch_with_the_field_named(tmp_path, case, 
         "bad_zone": lambda: {"actor_zone_file": _zone_files(bad, zone=_NEAR_EDGE_TOO_LOW)[0]},
         "missing_zone": lambda: {"actor_zone_file": str(tmp_path / "absent.yaml")},
         "relative_zone": lambda: {"actor_zone_file": "zone/actor_zone.yaml"},
+        "unknown_package": lambda: {"actor_zone_file": "$(find no_such_package_x2)/actor_zone.yaml"},
         "bad_tuning": lambda: {
             "actor_zone_file": zone_file,
             "actor_tuning_file": _zone_files(bad, tuning="version: 1\nrelease_hold_s: 31.0\n")[1],
@@ -299,3 +303,103 @@ def test_zone_profile_is_dexhand_rec_plus_the_two_board_files():
         k: v for k, v in base.items() if k not in provenance
     }
     assert zone["_config_sources"] == [*base["_config_sources"], zone["_config_path"]]
+
+
+# ----- the standing-zone selector in aimdk_x2_voice_mirror_all -----
+# Two lines in its motion_imitation_stream block turn the selector on with the
+# zone calibrated in the field, committed under robot_config/config/actor_zone;
+# deleting them must give back exactly the old stream parameters.
+
+_ALL_ZONE_FILE = "$(find robot_config)/config/actor_zone/actor_zone.yaml"
+_ALL_TUNING_FILE = "$(find robot_config)/config/actor_zone/actor_tuning.yaml"
+_ZONE_DIR = Path(get_package_share_directory("robot_config")) / "config/actor_zone"
+# Parameters only the zone selector adds to the stream node.
+_ZONE_ONLY_PARAMETERS = {"actor_zone_file", "actor_tuning_file", "actor_candidates_topic"}
+_HALF_TOPIC = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
+
+
+def _voice_mirror_all_path():
+    return resolve_robot_config_path(config_name="aimdk_x2_voice_mirror_all")
+
+
+def _voice_mirror_all():
+    # Live profile: interfaces bind at launch, as in the tests above.
+    return load_robot_config_dict(_voice_mirror_all_path(), defer_interface_binding=True)
+
+
+def _duplicate_keys(path):
+    """(key, line) for every key repeated within one mapping of a YAML file.
+
+    The loader keeps the last of two equal keys without a word, so two lines
+    pasted into the wrong block would silently replace a sibling.
+    """
+    duplicates = []
+
+    def walk(node):
+        if isinstance(node, yaml.MappingNode):
+            seen = set()
+            for key, value in node.value:
+                if key.value in seen:
+                    duplicates.append((key.value, key.start_mark.line + 1))
+                seen.add(key.value)
+                walk(value)
+        elif isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                walk(item)
+
+    walk(yaml.compose(Path(path).read_text(encoding="utf-8")))
+    return duplicates
+
+
+# These read the YAML or the committed zone only, so they need no model bundle.
+
+
+def test_voice_mirror_all_has_no_repeated_key():
+    assert _duplicate_keys(_voice_mirror_all_path()) == []
+
+
+def test_voice_mirror_all_names_the_committed_zone():
+    own = yaml.safe_load(_voice_mirror_all_path().read_text(encoding="utf-8"))
+    stream = own["robot"]["motion_imitation_stream"]
+    assert stream["actor_zone_file"] == _ALL_ZONE_FILE
+    assert stream["actor_tuning_file"] == _ALL_TUNING_FILE
+
+
+def test_the_committed_zone_resolves_and_passes_the_launch_check():
+    config = stream_config(actor_zone_file=_ALL_ZONE_FILE, actor_tuning_file=_ALL_TUNING_FILE)
+    stream = parameters(generate_motion_imitation_stream_nodes(config)[0])
+    assert stream["actor_zone_file"] == str(_ZONE_DIR / "actor_zone.yaml")
+    assert stream["actor_tuning_file"] == str(_ZONE_DIR / "actor_tuning.yaml")
+
+
+# Loading the profile validates the perception services' bundles under
+# $WORKSPACE/models, so these skip without them, like the end-to-end test above.
+@pytest.mark.model_bundle("yolox_x_640")
+@pytest.mark.model_bundle("pear_parameter_network")
+@pytest.mark.model_bundle("zipvoice")
+def test_voice_mirror_all_without_the_two_lines_keeps_the_old_stream_parameters():
+    config = _voice_mirror_all()
+    stream = config["motion_imitation_stream"]
+    on = motion_imitation_stream_parameters(config)
+
+    del stream["actor_zone_file"]
+    del stream["actor_tuning_file"]
+    off = motion_imitation_stream_parameters(config)
+
+    assert on["actor_zone_file"] == str(_ZONE_DIR / "actor_zone.yaml")
+    assert on["actor_tuning_file"] == str(_ZONE_DIR / "actor_tuning.yaml")
+    assert not _ZONE_ONLY_PARAMETERS & off.keys()
+    assert off == {k: v for k, v in on.items() if k not in _ZONE_ONLY_PARAMETERS}
+
+
+@pytest.mark.model_bundle("yolox_x_640")
+@pytest.mark.model_bundle("pear_parameter_network")
+@pytest.mark.model_bundle("zipvoice")
+def test_the_switch_lines_leave_the_rest_of_the_stream_block_in_place():
+    stream = _voice_mirror_all()["motion_imitation_stream"]
+    assert stream["frame_source"]["topic"] == _HALF_TOPIC
+    hands = stream["mock_playback"]["hands"]
+    assert hands["enabled"] is True
+    assert hands["perception"]["parameters"]["camera_topic"] == _HALF_TOPIC
+    assert "actor_zone_file" not in hands
+    assert "actor_zone_file" not in stream["mock_playback"]
