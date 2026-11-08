@@ -1807,7 +1807,7 @@ class LeftArmPlanner:
                 return False
         return True
 
-    def _linear_grasp_segment(self, start, goal, check_deadline):
+    def _linear_grasp_segment(self, start, goal, check_deadline, extra_seeds=None):
         """The grasp segment along the palm line without TrajOpt, or (None, reason); see _linear_grasp.
 
         Local IK (seeded at the approach end) gives the contact state. Interior
@@ -1818,6 +1818,9 @@ class LeftArmPlanner:
         acceleration and jerk are within _linear_grasp_limit_fraction of the
         solver's limits. Call with the grasp phase's collision mask (hand links
         disabled for the coarse IK); the fine check covers every link.
+        ``extra_seeds`` (Kx7 joint states) replace the last min(K, seeds // 2)
+        copies of the start seed of the local IK; the nearest-to-start choice
+        and every check below are unchanged.
         """
         import torch
         from scipy.interpolate import CubicSpline
@@ -1825,9 +1828,15 @@ class LeftArmPlanner:
         check_deadline()
         state = self._state(start)
         seeds = self.motion.ik_solver.config.num_seeds
-        result = self.motion.ik_solver.solve_pose(
-            self._goal_pose(goal[None]), state, seed_config=state.position[:, None].repeat(1, seeds, 1)
-        )
+        seed_config = state.position[:, None].repeat(1, seeds, 1)
+        if extra_seeds is not None and len(extra_seeds):
+            half = min(len(extra_seeds), seeds // 2)
+            seed_config = seed_config.clone()
+            seed_config[:, seeds - half :] = torch.as_tensor(
+                np.asarray(extra_seeds[:half]), dtype=seed_config.dtype, device=seed_config.device
+            ).reshape(1, half, -1)
+            seed_config = seed_config.contiguous()
+        result = self.motion.ik_solver.solve_pose(self._goal_pose(goal[None]), state, seed_config=seed_config)
         check_deadline()
         if result is None or result.success is None or not bool(result.success.any()):
             return None, "ik"
@@ -2164,6 +2173,74 @@ class LeftArmPlanner:
             raise RuntimeError("no checked path to home")
         return self._joined(reach, finish)
 
+    def _place_screen(self, start, transforms, check_deadline):
+        """Batched per-candidate screen IK over Kx4x4 palm goals, fine-checked with the carried object.
+
+        Returns (feasible K mask, KxS coarse success, KxSx7 states). A goal is
+        feasible iff one of its states passes valid_positions (complete model,
+        attachment); states are checked incrementally as in _fine_valid_states.
+        Coarse states only seed later solves; nothing here authorizes a path.
+        """
+        success, positions = [], []
+        for offset in range(0, len(transforms), self._screen_batch_size):
+            check_deadline()
+            batch = self._batch_contact_ik(transforms[offset : offset + self._screen_batch_size], start)
+            success.append(batch[0])
+            positions.append(batch[1])
+        success, positions = np.concatenate(success), np.concatenate(positions)
+        check_deadline()
+        valid = np.zeros_like(success)
+        checked = np.zeros_like(success)
+        batch = success & (np.cumsum(success, axis=1) == 1)
+        while batch.any():
+            valid[batch] = self.valid_positions(positions[batch])
+            checked |= batch
+            batch = success & ~checked & ~valid.any(axis=1, keepdims=True)
+        return valid.any(axis=1), success, positions
+
+    @staticmethod
+    def _place_pair(start, screen, index):
+        """(cost, above state index) of a screened candidate's cheapest joint route.
+
+        cost = max joint travel from ``start`` to an above state plus the max
+        joint gap from that state to the nearest release state (rad).
+        """
+        above_success, above_q, release_success, release_q = screen
+        ups = above_q[index][above_success[index]]
+        downs = release_q[index][release_success[index]]
+        reach = np.max(np.abs(ups - np.asarray(start, dtype=ups.dtype)), axis=1)
+        gap = np.max(np.abs(ups[:, None] - downs[None]), axis=2)
+        cost = reach[:, None] + gap
+        above_index = int(np.unravel_index(np.argmin(cost), cost.shape)[0])
+        return float(cost[above_index].min()), above_index
+
+    def _place_opening_screen(self, screen, candidates, opening, check_deadline):
+        """Opening-hand check at the screened release states of ``candidates``.
+
+        Returns (K mask: a release state passed, KxS states known to pass,
+        states checked). States are checked incrementally as in _place_screen,
+        with the opening spheres attached as in a round's opening stage. Those
+        spheres sit in the palm frame, so the result depends almost only on the
+        release palm pose: a candidate with no passing state would fail its
+        round's opening check after a transfer and a descent were planned for
+        it. Callers only reorder by this; the round's own check stays the
+        authority, so no candidate is dropped here.
+        """
+        _, _, release_success, release_q = screen
+        wanted = np.zeros(len(release_success), dtype=bool)
+        wanted[list(candidates)] = True
+        success = release_success & wanted[:, None]
+        valid = np.zeros_like(success)
+        checked = np.zeros_like(success)
+        with self._attachment(opening):
+            batch = success & (np.cumsum(success, axis=1) == 1)
+            while batch.any():
+                check_deadline()
+                valid[batch] = self.valid_positions(release_q[batch])
+                checked |= batch
+                batch = success & ~checked & ~valid.any(axis=1, keepdims=True)
+        return valid.any(axis=1), valid, int(checked.sum())
+
     def plan_place(
         self, feedback, targets, home, now, *, check_deadline, deadline, opening=None, return_path=None, max_rounds=3
     ):
@@ -2174,10 +2251,28 @@ class LeftArmPlanner:
         reachable one (chunks of max_goalset), whose seed then drives a single
         TrajOpt solve. A candidate whose descent, opening, retreat or home
         fails is dropped and the goalset solved again, at most ``max_rounds``
-        times. ``opening`` (palm-frame spheres the opening fingers sweep) is
+        times. With the screen IK (deployed), both ends of every candidate are
+        screened in two batched IKs first: only candidates whose above *and*
+        release poses have a fine-valid state are tried, cheapest joint route
+        first (_place_pair), without the goalset IK; the transfer is seeded
+        with that route's above state, and the descent's local release IK gets
+        the candidate's release states as extra seeds. The native descent found
+        the release only from the transfer's end, one branch, and missed it on
+        recorded inputs whose other branches reach it inside the unchanged
+        tolerances. ``opening`` (palm-frame spheres the opening fingers sweep) is
         checked once at the release pose; the open, empty hand then retreats
-        and goes home with nothing attached.
+        and goes home with nothing attached. With the screen, the opening is
+        also pre-checked at every candidate's screened release states, and
+        candidates without a passing state are tried last (never dropped): on
+        the X2 (2026-11-08) 6 of 8 failed rounds failed the opening, each after
+        ~1 s of transfer and descent planning.
+
+        ``place_report["timings_s"]`` holds the screen, opening screen and
+        per-round stage durations (s) and the total, also when the search is
+        exhausted.
         """
+        started = time.perf_counter()
+        timings = {"screen": None, "opening_screen": None, "rounds": []}
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
         if not self.carrying:
@@ -2188,35 +2283,106 @@ class LeftArmPlanner:
         releases = np.stack([rigid(release) for _, release in targets])
         remaining, failures, stages = list(range(len(targets))), [], {}
         rounds = 0
+        screen = None
+        opening_valid = None
+        opening_report = None
+
+        def report(**fields):
+            timings["total"] = round(time.perf_counter() - started, 4)
+            self.place_report = {
+                **fields,
+                "candidates": len(targets),
+                "failed_stages": dict(stages),
+                **({"opening_screen": opening_report} if opening_report is not None else {}),
+                "timings_s": timings,
+            }
+
+        if getattr(self, "screen_ik", None) is not None:
+            began = time.perf_counter()
+            above_ok, above_success, above_q = self._place_screen(q, aboves, check_deadline)
+            release_ok, release_success, release_q = self._place_screen(q, releases, check_deadline)
+            screen = (above_success, above_q, release_success, release_q)
+            remaining = [i for i in remaining if above_ok[i] and release_ok[i]]
+            # Cheapest joint-space route first (see _place_pair): the preference
+            # order alone (least palm turn) picked far arm motions from the task
+            # start in the 3090 mock (transfer 2.2 -> 6.3 s).
+            remaining.sort(key=lambda i: self._place_pair(q, screen, i)[0])
+            timings["screen"] = round(time.perf_counter() - began, 4)
+            if not remaining:
+                failures.append(f"no candidate of {len(targets)} with a reachable above and release pose")
+            elif opening is not None and len(opening):
+                began = time.perf_counter()
+                opening_ok, opening_valid, checked = self._place_opening_screen(
+                    screen, remaining, opening, check_deadline
+                )
+                # Stable: the joint-route order holds within each group.
+                remaining.sort(key=lambda i: not opening_ok[i])
+                timings["opening_screen"] = round(time.perf_counter() - began, 4)
+                opening_report = {
+                    "checked_states": checked,
+                    "deprioritized": sum(not opening_ok[i] for i in remaining),
+                }
         while remaining and rounds < max_rounds:
             check_deadline()
-            chunk = remaining[: self.max_goalset]
-            selection = self.motion.ik_solver.solve_pose(self._goal_pose(aboves[chunk]), self._state(q), return_seeds=1)
-            check_deadline()
-            if selection is None or selection.success is None or not bool(selection.success.any()):
-                failures.append(f"no reachable opening pose among {len(chunk)} candidates")
-                remaining = remaining[len(chunk) :]
-                continue
+            release_seeds = None
+            if screen is None:
+                chunk = remaining[: self.max_goalset]
+                selection = self.motion.ik_solver.solve_pose(
+                    self._goal_pose(aboves[chunk]), self._state(q), return_seeds=1
+                )
+                check_deadline()
+                if selection is None or selection.success is None or not bool(selection.success.any()):
+                    failures.append(f"no reachable opening pose among {len(chunk)} candidates")
+                    remaining = remaining[len(chunk) :]
+                    continue
+                index = chunk[self._input_goal_index(int(selection.goalset_index.reshape(-1)[0].item()), len(chunk))]
+                seed = selection.solution[:, 0:1].clone()
+            else:
+                index = remaining[0]
+                ups = screen[1][index][screen[0][index]]
+                downs = screen[3][index][screen[2][index]]
+                above_index = self._place_pair(q, screen, index)[1]
+                distance = np.max(np.abs(downs - ups[above_index]), axis=1)
+                if opening_valid is None:
+                    order = np.argsort(distance, kind="stable")
+                else:
+                    # Release states known to pass the opening first, then by distance.
+                    order = np.lexsort((distance, ~opening_valid[index][screen[2][index]]))
+                release_seeds = downs[order]
+                seed = self._state(ups[above_index]).position[:, None]
             rounds += 1
-            index = chunk[self._input_goal_index(int(selection.goalset_index.reshape(-1)[0].item()), len(chunk))]
-            seed = selection.solution[:, 0:1].clone()
             stage = "transfer"
+            round_times = {"candidate": int(index)}
+            timings["rounds"].append(round_times)
+            clock = [time.perf_counter()]
+
+            def lap(name, round_times=round_times, clock=clock):
+                tick = time.perf_counter()
+                round_times[name] = round(tick - clock[0], 4)
+                clock[0] = tick
+
             try:
                 transfer = self.plan_pose(feedback, aboves[index], now, deadline=deadline, seed_config=seed)
+                lap(stage)
                 stage = "descend"
-                descend, reason = self._linear_grasp_segment(transfer.positions[-1], releases[index], check_deadline)
+                descend, reason = self._linear_grasp_segment(
+                    transfer.positions[-1], releases[index], check_deadline, extra_seeds=release_seeds
+                )
                 if descend is None:
                     raise RuntimeError(f"descent: {reason}")
+                lap(stage)
                 stage = "opening"
                 if opening is not None and len(opening):
                     with self._attachment(opening):
                         if not self.valid_positions(descend.positions[-1:]).all():
                             raise RuntimeError(f"opening hand: {self.violations(descend.positions[-1:])}")
+                lap(stage)
                 with self._without_placed_object():
                     stage = "retreat"
                     retreat, reason = self._linear_grasp_segment(descend.positions[-1], aboves[index], check_deadline)
                     if retreat is None:
                         raise RuntimeError(f"retreat: {reason}")
+                    lap(stage)
                     stage = "home"
                     # The retreat ends where the transfer ended: the transfer,
                     # checked with the closed hand and object, leads back.
@@ -2229,23 +2395,24 @@ class LeftArmPlanner:
                         back=transfer,
                         return_path=return_path,
                     )
+                    lap(stage)
                 check_deadline()
-                self.place_report = {
-                    "candidate": index,
-                    "rounds": rounds,
-                    "candidates": len(targets),
-                    "failed_stages": dict(stages),
-                }
+                report(candidate=index, rounds=rounds)
                 return transfer, descend, retreat, home_path
             except (TimeoutError, PlannerFault):
+                lap(stage)
+                round_times["failed"] = stage
+                report(rounds=rounds)
                 raise
             except RuntimeError as exc:
                 if device_fault(exc):
                     raise PlannerFault(str(exc)) from exc
+                lap(stage)
+                round_times["failed"] = stage
                 failures.append(f"candidate {index} at {stage}: {exc}")
                 stages[stage] = stages.get(stage, 0) + 1
                 remaining.remove(index)
-        self.place_report = {"rounds": rounds, "candidates": len(targets), "failed_stages": dict(stages)}
+        report(rounds=rounds)
         raise PlacementSearchExhausted(f"no complete placement path after {rounds} rounds {stages}: {failures[-3:]}")
 
     def plan_home(self, feedback, home, *, check_deadline, deadline, return_path=None):

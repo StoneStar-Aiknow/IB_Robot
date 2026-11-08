@@ -85,3 +85,47 @@ def test_exhausted_placement_candidates_have_a_typed_recoverable_failure():
             deadline=float("inf"),
         )
     assert len(calls) == 1
+
+
+def test_place_request_logs_its_timings_also_for_a_failed_search(monkeypatch, capsys):
+    import json
+
+    joints = tuple(f"j{i}" for i in range(7))
+    feedback = SimpleNamespace(vector=lambda names: np.zeros(7))
+    admitted = SimpleNamespace(live=SimpleNamespace(feedback=feedback), admitted_at=0.0)
+
+    class Service:
+        @contextmanager
+        def session(self, *args, **kwargs):
+            yield self
+
+        def plan_place(self, *args, **kwargs):
+            self.place_report = {"rounds": 3, "failed_stages": {"opening": 3}, "timings_s": {"total": 0.5}}
+            raise PlacementSearchExhausted("no complete placement path after 3 rounds")
+
+    spheres = SimpleNamespace(arm=joints, last_link_frames=np.eye(4)[:3][None, None], link_indices={"R_palm": 0})
+    arm = SimpleNamespace(spheres=spheres, gpu=nullcontext(), service=Service())
+    planner = X2PlacePlanner(SimpleNamespace(arms={"right": arm}), {"right": SimpleNamespace(place=None)})
+    held = SimpleNamespace(
+        arm_side="right", joint_names=joints, joint_positions=np.zeros(7), home_positions=np.zeros(7), return_times=()
+    )
+    monkeypatch.setattr(place_request, "measured_spheres", lambda *args: None)
+    monkeypatch.setattr(place_request, "place_targets", lambda *args: [(np.eye(4), np.eye(4))])
+    monkeypatch.setattr(place_request, "placement_cover", lambda *args: np.zeros((1, 4)))
+    monkeypatch.setattr(place_request, "opening_cover", lambda *args: np.zeros((1, 4)))
+
+    with pytest.raises(GraspFailure):
+        planner.plan(
+            SimpleNamespace(robot_state=admitted),
+            SimpleNamespace(scene="snapshot"),
+            held,
+            deadline=float("inf"),
+            cancelled=lambda: False,
+        )
+    lines = [json.loads(line) for line in capsys.readouterr().err.splitlines() if line.startswith('{"place_plan"')]
+    assert len(lines) == 1
+    trace = lines[0]["place_plan"]
+    assert trace["arm_side"] == "right" and trace["outcome"] == "PlacementSearchExhausted"
+    assert trace["planner"]["failed_stages"] == {"opening": 3}
+    assert set(trace["timings_s"]) >= {"targets", "gpu_wait", "session", "plan_place", "total"}
+    assert "recheck" not in trace["timings_s"]  # the search failed before the recheck
