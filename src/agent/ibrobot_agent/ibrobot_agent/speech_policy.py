@@ -52,6 +52,9 @@ _MESSAGES = {
     "reason_GRIP_LOST": "物体滑落了，请先检查物体的位置吧。",
     "reason_GRASP_VERIFICATION_FAILED": "这次还没能确认抓稳，请检查一下物体位置吧。",
     "reason_EXECUTION_BUDGET_INSUFFICIENT": "剩余时间不够啦，这次没有开始新的抓取动作，请检查任务预算吧。",
+    "mirror_busy": "照镜子正在进行，本次动作未执行，也不会排队。请结束照镜子后重新下达指令。",
+    "mirror_unknown": "照镜子状态尚未确认，本次动作未执行，也不会排队。请操作员确认照镜子状态后重新下达指令。",
+    "mirror_release_unconfirmed": "照镜子结束后的控制权释放尚未确认，后续动作未执行，也不会排队。请操作员确认机器人状态后重新下达指令。",
 }
 _PHASES = {
     "dispatch": "调度",
@@ -65,7 +68,13 @@ _PHASES = {
     "verify": "持握验证",
     "recover": "恢复",
 }
+_MIRROR_KEYS = {
+    "MIRROR_SESSION_BUSY": "mirror_busy",
+    "MIRROR_SESSION_STATE_UNKNOWN": "mirror_unknown",
+    "MIRROR_SESSION_RELEASE_UNCONFIRMED": "mirror_release_unconfirmed",
+}
 _IMPORTANT_KEYS = {"canceled", "not_started", "unknown", "recovery_failed", "manual_check", "failed"}
+_IMPORTANT_KEYS.update(_MIRROR_KEYS.values())
 _IMPORTANT_KEYS.update(key for key in _MESSAGES if key.startswith("reason_"))
 #: Lines a deployment may switch off with an empty template: recovery runs before a retry and
 #: before a final failure alike, so a deployment that announces only the outcome needs them gone.
@@ -308,6 +317,13 @@ class GraspSpeechPolicy:
                 if item.phase in {"lift", "verify", "close", "approach"}:
                     return "success"
             return "completed"
+        if (
+            detail.schema_version in {1, 2}
+            and detail.phase in {"admission", "release"}
+            and detail.recovery_state == "NOT_NEEDED"
+            and detail.reason_code in _MIRROR_KEYS
+        ):
+            return _MIRROR_KEYS[detail.reason_code]
         if detail.suggested_action == "MANUAL_CHECK":
             return "manual_check"
         key = "reason_" + detail.reason_code

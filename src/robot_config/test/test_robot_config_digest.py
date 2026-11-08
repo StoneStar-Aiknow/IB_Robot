@@ -58,6 +58,18 @@ def test_robot_config_digest_covers_execution_semantics_and_defaults():
     assert robot_config_digest(original) != robot_config_digest(changed)
 
 
+def test_display_completion_changes_execution_identity_without_changing_targets():
+    original = _config()
+    original["pose_composer"] = {"mode": "fixed", "fixed_library_sha256": "a" * 64}
+    changed = copy.deepcopy(original)
+    changed["pose_composer"]["display_completion"] = {
+        "pose_ids": ["arms_up"],
+        "mode": "playback_only",
+    }
+    assert robot_config_digest(original) != robot_config_digest(changed)
+    assert original["pose_composer"]["fixed_library_sha256"] == changed["pose_composer"]["fixed_library_sha256"]
+
+
 def test_robot_context_schema_version_requires_explicit_navigation_endpoint():
     original = _config()
     explicit_default = copy.deepcopy(original)

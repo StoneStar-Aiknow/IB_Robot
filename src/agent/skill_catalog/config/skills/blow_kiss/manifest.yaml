@@ -44,3 +44,31 @@ capability:
   - motion.named
 implementations:
   x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml
+description_variants:
+  aimdk_x2_summit:
+    summary: Blow a kiss as an affectionate farewell or thanks. Open installed hands
+      before arm playback.
+    category: social_emotion
+    when_to_use:
+    - show affection
+    - say a warm goodbye
+    - thank someone warmly
+    do_not_use:
+    - condition: greet someone formally
+      instead_use: handshake
+    - condition: applaud someone
+      instead_use: clap_hands
+    aliases_zh:
+    - 飞吻
+    - 飞个吻
+    aliases_en:
+    - blow a kiss
+    - blow kiss
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 45.0
+    requires_motion_params: false

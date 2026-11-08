@@ -2637,6 +2637,9 @@ def _wave_goal(harness, resume_token: str = ""):
     assert client.wait_for_server(timeout_sec=TIMEOUT_S)
     goal = ExecuteNamedMotion.Goal()
     goal.name, goal.resume_token = "wave", resume_token
+    harness.wait_for(
+        lambda: harness.runtime._named_motion._admission_failure() is None, "healthy named-motion admission"
+    )
     handle_future = client.send_goal_async(goal)
     harness.wait_for(lambda: handle_future.done(), "the goal decision")
     handle = handle_future.result()
@@ -3004,7 +3007,8 @@ def test_task_pose_trajectory_in_policy_stream_preserves_mode_and_can_stop(tmp_p
 def _returning_wave(tmp_path, **config):
     return _replay_harness(
         tmp_path,
-        duration_s=1.4,
+        # Keep a wide enough excursion window for DDS scheduling on the board.
+        duration_s=2.4,
         named_motion={
             "cancel_return_motions": ["wave"],
             "trajectory_cancel_return_settle_s": 0.6,
@@ -3070,12 +3074,19 @@ def test_cancel_return_reaches_nonzero_measured_origin_and_owns_arm(tmp_path):
 def test_cancel_return_failure_is_not_safe_cancel(tmp_path, failure):
     from action_msgs.msg import GoalStatus
 
-    config = {"trajectory_cancel_return_timeout_s": 0.1} if failure == "budget" else {}
-    harness = _returning_wave(tmp_path, **config)
+    harness = _returning_wave(tmp_path)
     try:
         handle = _wave_goal(harness)
-        harness.wait_for(lambda: (_right_pitch(harness) or 0) < -0.2, "wave excursion")
-        if failure == "not_following":
+        early_result = handle.get_result_async()
+        harness.wait_for(
+            lambda: early_result.done() or (_right_pitch(harness) or 0) < -0.2, "wave excursion or premature terminal"
+        )
+        assert not early_result.done(), early_result.result().result.message
+        if failure == "budget":
+            # Inject the return budget only after playback is observed, so this
+            # case tests cancellation failure rather than startup scheduling.
+            harness.runtime._named_motion._return_timeout_s = 0.1
+        elif failure == "not_following":
             harness.mock.set_parameters([rclpy.parameter.Parameter("follow_commands", value=False)])
         elif failure in {"stale", "nan"}:
             harness.mock.set_parameters(
@@ -3161,8 +3172,10 @@ def test_cancel_return_production_wave_covers_actual_path_and_budget(tmp_path):
         harness.shutdown()
 
 
-@pytest.mark.parametrize("failure", ["missing_hand", "unconfirmed_final"])
-def test_summit_recording_requires_measured_hands_and_confirmed_final_pose(tmp_path, failure):
+@pytest.mark.parametrize(
+    "failure", ["missing_hand", "unconfirmed_final", "small_hand_error", "stale_final", "cancel_hand_error"]
+)
+def test_summit_recording_playback_only_preserves_entry_and_cancel_checks(tmp_path, failure):
     import yaml
     from action_msgs.msg import GoalStatus
     from rclpy.action import ActionClient
@@ -3188,8 +3201,13 @@ def test_summit_recording_requires_measured_hands_and_confirmed_final_pose(tmp_p
 
             def final_not_reached():
                 sample = original()
-                if sample and server._running and harness.mock.upper_body_count > 200:
-                    return ([value + 0.2 for value in sample[0]], sample[1])
+                # Entry captures the unmodified start before _running is set.
+                # Do not depend on a received frame count: DDS rates differ by host.
+                if sample and server._running:
+                    if failure == "stale_final":
+                        return sample[0], sample[1] - 1000
+                    offset = 0.08 if failure in {"small_hand_error", "cancel_hand_error"} else 0.3
+                    return (sample[0][:10] + [value + offset for value in sample[0][10:]], sample[1])
                 return sample
 
             harness.runtime.measured_hand_sample = final_not_reached
@@ -3201,17 +3219,87 @@ def test_summit_recording_requires_measured_hands_and_confirmed_final_pose(tmp_p
         handle = pending.result()
         assert handle.accepted
         result = handle.get_result_async()
-        harness.wait_for(result.done, "recorded failure result", timeout_s=20)
+        if failure == "cancel_hand_error":
+            harness.wait_for(
+                lambda: server._running and harness.mock.upper_body_count > before, "recorded motion before cancel"
+            )
+            canceled = handle.cancel_goal_async()
+            harness.wait_for(canceled.done, "display cancel response")
+            assert canceled.result().goals_canceling
+        harness.wait_for(result.done, "recorded result", timeout_s=30)
         terminal = result.result()
+        if failure in {"small_hand_error", "unconfirmed_final", "stale_final"}:
+            assert terminal.status == GoalStatus.STATUS_SUCCEEDED
+            assert terminal.result.success
+            assert "final pose not verified" in terminal.result.message
+            assert harness.runtime.output_admitted()
+            return
         assert terminal.status == GoalStatus.STATUS_ABORTED
         assert not terminal.result.success
         if failure == "missing_hand":
             assert harness.mock.upper_body_count == before
             assert "hand" in terminal.result.message.lower()
         else:
-            assert harness.mock.upper_body_count > before + 200
-            assert "FINAL_POSE_UNCONFIRMED" in terminal.result.message
+            assert harness.mock.upper_body_count > before
+            assert (
+                "cancel return" if failure == "cancel_hand_error" else "FINAL_POSE_UNCONFIRMED"
+            ) in terminal.result.message
             assert not harness.runtime.output_admitted()
             assert harness.runtime._arm_owner is None
+    finally:
+        harness.shutdown()
+
+
+def test_display_playback_only_does_not_require_measured_excursion(tmp_path):
+    harness = _replay_harness(
+        tmp_path,
+        duration_s=1.0,
+        follow_commands=False,
+        named_motion={"display_completion": {"motions": ["wave"], "mode": "playback_only"}},
+    )
+    try:
+        future = _start_wave(harness)
+        harness.wait_for(future.done, "display playback terminal")
+        result = future.result().result
+        assert result.success, result.message
+        assert "final pose not verified" in result.message
+        assert harness.runtime.output_admitted()
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("opt_in", [False, True])
+def test_display_trajectory_tolerance_opt_out_requires_runtime_profile_opt_in(tmp_path, opt_in):
+    from control_msgs.action import FollowJointTrajectory
+    from control_msgs.msg import JointTolerance
+    from rclpy.action import ActionClient
+    from trajectory_msgs.msg import JointTrajectoryPoint
+
+    harness = _replay_harness(
+        tmp_path, duration_s=1.0, follow_commands=False, named_motion={"allow_unverified_trajectories": opt_in}
+    )
+    try:
+        client = ActionClient(harness.node, FollowJointTrajectory, _TRAJECTORY_ACTION)
+        assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory.joint_names = list(projection.VENDOR_ARM_ORDER)
+        positions = [0.0] * 14
+        positions[_RIGHT_PITCH] = -0.3
+        point = JointTrajectoryPoint(positions=positions)
+        point.time_from_start.sec = 1
+        goal.trajectory.points = [point]
+        goal.goal_tolerance = [
+            JointTolerance(name=name, position=-1.0, velocity=-1.0, acceleration=-1.0)
+            for name in projection.VENDOR_ARM_ORDER
+        ]
+        harness.wait_for(
+            lambda: harness.runtime._named_motion._admission_failure(planned=True) is None,
+            "healthy trajectory admission",
+        )
+        pending = client.send_goal_async(goal)
+        harness.wait_for(pending.done, "display trajectory accepted")
+        result = _trajectory_result(harness, pending.result()).result
+        assert (result.error_code == FollowJointTrajectory.Result.SUCCESSFUL) is opt_in
+        assert ("final pose not verified" if opt_in else "did not follow") in result.error_string
     finally:
         harness.shutdown()

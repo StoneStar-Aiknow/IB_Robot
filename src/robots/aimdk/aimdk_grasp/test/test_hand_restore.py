@@ -559,3 +559,25 @@ def test_fingers_stuck_under_the_thumb_are_retried_with_the_thumb_cleared(restor
     assert not restorer.open_hand(ctx, "left")
     assert restorer.open_paths_taken["left"] == ["together", "thumb_clear"]
     np.testing.assert_allclose(ports.hands["left"], plan.open_pose)
+
+
+@pytest.mark.parametrize("failure", [None, "cancel", "owner"])
+def test_gesture_preparation_opens_installed_hands_in_order_and_always_releases(restore, failure):
+    restorer, ports, ctx, _ = restore
+    if failure == "cancel":
+        ports.cancelled = True
+    if failure == "owner":
+        ports.gateway = replace(ports.gateway, active_task_id="someone-else")
+    body = dict(ports.body)
+    if failure:
+        with pytest.raises(RestoreError):
+            restorer.prepare_open_hands(ctx)
+        assert not ports.sent
+    else:
+        assert restorer.prepare_open_hands(ctx) == ("left", "right")
+        for side in ("left", "right"):
+            np.testing.assert_allclose(ports.hands[side], restorer.plans[side].open_pose)
+        phases = [item[0] for item in ports.sent]
+        assert phases.index("opening_left") < phases.index("opening_right")
+        assert ports.body == body
+    assert ports.releases >= 1

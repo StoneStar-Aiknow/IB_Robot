@@ -1,0 +1,10 @@
+schema_version: 1
+kind: delegated_executor
+robot: aimdk_x2_summit
+executor: runtime_named_motion
+binding:
+  # Runtime motion name advertised by the aimdk_robot profile (motion.named.names).
+  motion: handshake
+required_args: []
+# Includes checked hand opening. Above the runtime's own preset_timeout_s (30 s) so the runtime reports first.
+timeout_sec: 90.0

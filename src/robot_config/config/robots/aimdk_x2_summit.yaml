@@ -4,54 +4,38 @@ robot:
   runtime:
     cancel_return_motions: wave,short_wave,invite,self_intro,explain
     profile: x2_ultra_omnihand_summit
-  default_control_mode: moveit_planning
-  skill_required_control_mode: moveit_planning
+  # One deployment for mirror, presentation and fruit delivery. Mirror takes
+  # over model_inference; the Gateway still selects each skill's own mode.
+  default_control_mode: model_inference
+  skill_required_control_mode: model_inference
   skill_supported_control_modes:
+  - model_inference
   - moveit_planning
   - named_motion
+  pose_composer:
+    display_completion:
+      pose_ids: [arms_forward, arms_up, arms_out, arms_v, flex, surrender, right_forward, left_forward]
+      mode: playback_only
   # Voiceprint for the speaker check below (CAMPPlus on the CPU). The bundle ships in the
   # deployment's models/ directory, next to the ASR bundle.
   voice_asr:
     speaker_embedding:
       enabled: true
   mirror_session:
-    enabled: false
+    enabled: true
   motion_imitation_stream:
-    enabled: false
-  perception_services:
-    services:
-    - id: grasp_grounding
-      enabled: true
-      required: true
-      bundle_path: models/grounding_dino_swint_seq8_1280x720
-      deployment: ascend_310p
-      adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
-      service_type: ibrobot_msgs/srv/GroundingDetect
-      endpoint: /perception/grasp/grounding_detect
-      node_name: grasp_grounding_detect
-      runtime_options:
-        device_id: 0
-    - id: grasp_segmentation
-      enabled: true
-      required: true
-      bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
-      deployment: ascend_310p
-      adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
-      service_type: ibrobot_msgs/srv/SegmentDetections
-      endpoint: /perception/grasp/segment_detections
-      node_name: grasp_segment_detections
-      runtime_options:
-        device_id: 0
-    - id: grasp_generation
-      enabled: true
-      required: true
-      bundle_path: models/graspgenx_omnihand_left_x2
-      deployment: torch_npu
-      adapter_class: perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin
-      service_type: ibrobot_msgs/srv/GenerateGrasps
-      endpoint: /perception/grasp/generate_grasps
-      node_name: grasp_generate_grasps
+    enabled: true
+    pause_during_manipulation: true
+  # Inherit both HRI services and all three grasp services from the combined
+  # base instead of replacing its model list. CBF stays disabled as in that
+  # base: both executors share policy_stream without an arm-owner identity.
+  cbf_safety:
+    hands_installed: [true, true]
   embodied:
+    runtime_named_motion:
+      hand_preparation:
+        factory: aimdk_grasp.hand_restore_ros:create_named_motion_hand_preparer
+        motions: [wave, raise_hand, blow_kiss, clap, handshake]
     skill_catalog_profile: aimdk_x2_summit
     agent:
       test_allowlist:
@@ -67,11 +51,13 @@ robot:
       - introduce_in_detail
       - explain_pick_scope
       - offer_fruit_menu
-      - mimic_not_ready
+      - mirror_start
+      - mirror_stop
       - pick_object
       - place_in_container
       - return_to_task_pose
       - invite_visitor
+      - free_pose
       planner:
         fruit_delivery:
           container_name: an orange bowl
@@ -86,11 +72,17 @@ robot:
           介绍一下芯片和系统: introduce_platform
           你的Agent有什么用: introduce_agent
           随便玩一下: invite_visitor
+          开始照镜子: mirror_start
+          停止照镜子: mirror_stop
+          动作模仿: mirror_start
+          跟着我做: mirror_start
+          学我的动作: mirror_start
       voice_bridge:
         persistent_session: true
         # After "欧拉欧拉" only the voice that woke the robot is followed; stop words still
         # work from any voice.
         speaker_check_enabled: true
+        speaker_min_similarity: 0.45
         # Intent (semantic) gate: the model ships with the deployment, and a missing or stale
         # model stops the bridge at launch instead of silently turning the gate off.
         semantic_gate_model_path: $(env WORKSPACE)/models/addressee/addressee_zh_v1.json
@@ -140,6 +132,7 @@ robot:
           - 随便玩一下
           - 我想体验一下
           - 动作模仿
+          - 照镜子
           - 跟着我做
           - 学我的动作
           - 选水果
@@ -159,7 +152,6 @@ robot:
         - introduce_in_detail
         - explain_pick_scope
         - offer_fruit_menu
-        - mimic_not_ready
         - invite_visitor
         stop_phrases:
         - 别动了
@@ -212,5 +204,4 @@ robot:
         intro_detail: $(env WORKSPACE)/commissioning/audio/summit/intro_detail.wav
         pick_scope: $(env WORKSPACE)/commissioning/audio/summit/pick_scope.wav
         fruit_menu: $(env WORKSPACE)/commissioning/audio/summit/fruit_menu.wav
-        mimic_unavailable: $(env WORKSPACE)/commissioning/audio/summit/mimic_unavailable.wav
         invitation: $(env WORKSPACE)/commissioning/audio/summit/invitation.wav

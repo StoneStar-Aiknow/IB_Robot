@@ -1801,3 +1801,19 @@ def test_voice_bridge_uses_planner_container_ssot():
     params = _normalize_launch_param_mapping(bridge._Node__parameters[0])
     assert _decode_launch_string(params["gift_container_name"]) == delivery["container_name"]
     assert __import__("yaml").safe_load(params["gift_container_label"]) == delivery["container_label"]
+
+
+def test_display_named_motion_hand_preparation_binds_public_runtime_and_model(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+    preparation = {
+        "factory": "aimdk_grasp.hand_restore_ros:create_named_motion_hand_preparer",
+        "motions": ["wave", "blow_kiss"],
+    }
+    config["embodied"]["runtime_named_motion"] = {**_NAMED_MOTION_BINDING, "hand_preparation": preparation}
+    config["grasp_execution"] = {"backend_options": {"installed_hands": ["right"]}}
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+    binding = json.loads(_decode_launch_string(params["named_motion_hand_preparation_json"]))
+    assert binding["motions"] == preparation["motions"]
+    assert binding["interface_description"] == config["runtime"]["interface_description"]
+    assert binding["grasp_execution"] == config["grasp_execution"]
+    assert binding["gateway_status_service"] == "/embodied/get_skill_gateway_status"

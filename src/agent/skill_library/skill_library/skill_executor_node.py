@@ -698,6 +698,7 @@ class SkillExecutorNode(Node):
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("named_motion_hand_preparation_json", "{}", descriptor=startup_descriptor)
         # Arm poses composed from a description (ibrobot_msgs/action/ExecuteArmPose).
         self.declare_parameter("pose_composer_action", "", descriptor=startup_descriptor)
         self.declare_parameter("pose_composer_enabled", False, descriptor=startup_descriptor)
@@ -847,6 +848,9 @@ class SkillExecutorNode(Node):
         self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
         self._runtime_named_motion_action = (
             self.get_parameter("runtime_named_motion_action").get_parameter_value().string_value.strip()
+        )
+        self._named_motion_hand_preparation_config = json.loads(
+            self.get_parameter("named_motion_hand_preparation_json").value
         )
         if self._runtime_named_motion_enabled and not self._runtime_named_motion_action:
             raise ValueError("runtime_named_motion_action must be set when runtime_named_motion_enabled is true")
@@ -1157,6 +1161,19 @@ class SkillExecutorNode(Node):
             if self._runtime_named_motion_enabled
             else None
         )
+        self._named_motion_hand_preparer = None
+        self._hand_preparation_motions = ()
+        preparation = self._named_motion_hand_preparation_config
+        if preparation:
+            from importlib import import_module
+
+            if not self._runtime_named_motion_enabled:
+                raise ValueError("hand preparation requires runtime_named_motion")
+            module, factory = preparation["factory"].split(":")
+            self._hand_preparation_motions = tuple(preparation["motions"])
+            self._named_motion_hand_preparer = getattr(import_module(module), factory)(
+                self, preparation, callback_group=callback_group
+            )
         self._pose_composer_client = (
             ActionClient(self, ExecuteArmPose, self._pose_composer_action, callback_group=callback_group)
             if self._pose_composer_enabled
@@ -1337,6 +1354,10 @@ class SkillExecutorNode(Node):
         )
 
     def destroy_node(self):
+        preparer = getattr(self, "_named_motion_hand_preparer", None)
+        if preparer is not None:
+            preparer.close()
+            self._named_motion_hand_preparer = None
         store = getattr(self, "_execution_store", None)
         if store is not None:
             store.close()
@@ -2220,7 +2241,14 @@ class SkillExecutorNode(Node):
                         endpoint_name=endpoint_name,
                         endpoint_kind="ros_action",
                         # The serving runtime is part of the identity the catalog binds.
-                        configuration={"runtime_name": getattr(self, "_runtime_name", "")},
+                        configuration={
+                            "runtime_name": getattr(self, "_runtime_name", ""),
+                            **(
+                                {"hand_preparation": self._named_motion_hand_preparation_config}
+                                if getattr(self, "_named_motion_hand_preparation_config", {})
+                                else {}
+                            ),
+                        },
                     )
                 )
                 descriptors[descriptor.name] = descriptor
@@ -2367,6 +2395,40 @@ class SkillExecutorNode(Node):
         goal = goal_handle.request
         result = SkillCommand.Result()
         executed = [f"{named_motion.EXECUTOR_NAME}:{motion}"]
+        deadline = time.monotonic() + timeout_sec
+        preparer = getattr(self, "_named_motion_hand_preparer", None)
+        if preparer is not None and motion in self._hand_preparation_motions:
+            lease = getattr(self, "_gateway_lease", None)
+            owner = lease.owner if lease is not None else None
+            task_id = owner.root_task_id if owner is not None else str(goal.dispatch_binding.root_task_id)
+
+            def preparation_feedback(state, fraction):
+                feedback = SkillCommand.Feedback()
+                feedback.state = "preparing"
+                feedback.detail = f"hand_preparation:{state}:{fraction:.2f}"
+                goal_handle.publish_feedback(feedback)
+
+            try:
+                sides = preparer.prepare(
+                    task_id, deadline, lambda: goal_handle.is_cancel_requested, preparation_feedback
+                )
+                executed[:0] = [f"hand_preparation:open_{side}" for side in sides]
+                if goal_handle.is_cancel_requested or time.monotonic() >= deadline:
+                    raise RuntimeError("gesture canceled or timed out after hand preparation")
+            except Exception as exc:
+                if goal_handle.is_cancel_requested or getattr(exc, "code", "") == "POSE_CANCELLED":
+                    self._set_result_catalog_identity(result)
+                    goal_handle.canceled()
+                    result.success = False
+                    result.message = f"hand preparation canceled; arm gesture not sent: {exc}"
+                    return result
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    getattr(exc, "code", named_motion.FAILED),
+                    f"hand preparation failed; arm gesture not sent: {exc}",
+                )
         motion_goal = ExecuteNamedMotion.Goal()
         motion_goal.name = motion
         # The runtime applies the side its profile declares for this name.
@@ -2415,7 +2477,6 @@ class SkillExecutorNode(Node):
                     f"runtime refused named motion {motion} (another motion is playing or the name is unknown)",
                 )
             result_future = motion_handle.get_result_async()
-            deadline = time.monotonic() + timeout_sec
             while rclpy.ok() and not result_future.done():
                 if goal_handle.is_cancel_requested and cancel_future is None:
                     cancel_future = motion_handle.cancel_goal_async()
@@ -2793,7 +2854,9 @@ class SkillExecutorNode(Node):
         """Start or stop the persistent mirror session.
 
         The session answers start once it holds the runtime mode, and stop once
-        it has observed the runtime back in idle. ``left_idle`` says admission
+        it has observed the runtime back in idle. Stop also waits for fresh
+        released ownership in the Gateway, using the same budget as discovery
+        and the service reply. ``left_idle`` says admission
         switched the runtime out of idle for this start: if the start then
         fails, that mode is the Gateway's to give back. So is the mode when no
         session is there to answer, for start and stop alike.
@@ -2814,6 +2877,8 @@ class SkillExecutorNode(Node):
         start = command == "start"
         client = getattr(self, "_mirror_session_client", None)
         timeout_sec = float(effective_timeout_sec or request.timeout_sec or self._rpc_timeout)
+        deadline = time.monotonic() + timeout_sec
+        stop_stamp = self.get_clock().now().nanoseconds / 1e9 if not start else 0.0
         if client is None or not client.wait_for_service(timeout_sec=min(timeout_sec, self._rpc_timeout)):
             return self._fail_mirror_session(
                 result,
@@ -2823,14 +2888,38 @@ class SkillExecutorNode(Node):
                 give_back=True,
             )
 
-        if start and getattr(self, "_mirror_session_enabled", False):
-            # Latch before dispatch: the service reply can beat the state-topic
-            # callback, and a timeout does not prove that takeover never happened.
+        if getattr(goal_handle, "is_cancel_requested", False):
+            # Admission may already have moved idle -> policy_stream. No session
+            # request has been sent, so return only the mode this start acquired
+            # and preserve any pre-existing ownership latch.
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "SKILL_CANCELLED",
+                "canceled before mirror dispatch",
+                give_back=start and left_idle,
+                canceled=True,
+            )
+        if time.monotonic() >= deadline:
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "MIRROR_SESSION_TIMEOUT",
+                f"{skill_name} timed out",
+                give_back=start and left_idle,
+            )
+        if getattr(self, "_mirror_session_enabled", False):
+            # Latch only when dispatch is about to happen. A canceled or expired
+            # undispatched start must not create new takeover uncertainty.
             with self._mirror_session_state_lock:
                 self._mirror_session_start_latched = True
                 self._mirror_session_seen_holding = False
         future = client.call_async(SetBool.Request(data=MIRROR_SESSION_COMMANDS[command]))
-        if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
+        if not self._wait_for_future(
+            future,
+            max(0.0, deadline - time.monotonic()),
+            cancel_requested=lambda: goal_handle.is_cancel_requested,
+        ):
             return self._fail_mirror_session(
                 result,
                 goal_handle,
@@ -2858,10 +2947,64 @@ class SkillExecutorNode(Node):
                 message or f"{skill_name} failed",
                 give_back=start and left_idle,
             )
-        if not start and getattr(self, "_mirror_session_enabled", False) and self._runtime_idle_for_admission():
+        if not start and getattr(self, "_mirror_session_enabled", False):
+            # Service completion and state-topic callbacks can arrive in either order.
+            # Only this stop waits; ordinary skills keep rejecting immediately.
+            while True:
+                if getattr(goal_handle, "is_cancel_requested", False):
+                    return self._cancel_skill(result, goal_handle, [], skill_name)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fill_execution_detail(
+                        result.execution_detail,
+                        ExecutionDetail(
+                            1,
+                            "release",
+                            "FAILED",
+                            "release",
+                            "MIRROR_SESSION_RELEASE_UNCONFIRMED",
+                            "NOT_NEEDED",
+                            0,
+                            "MANUAL_CHECK",
+                        ),
+                    )
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        [],
+                        "MIRROR_SESSION_TIMEOUT",
+                        "mirror stop release was not confirmed; subsequent steps were not executed",
+                    )
+                if self._mirror_release_confirmed(not_before=stop_stamp):
+                    break
+                time.sleep(min(remaining, 0.02))
             with self._mirror_session_state_lock:
                 self._mirror_session_start_latched = False
+        if getattr(goal_handle, "is_cancel_requested", False):
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "SKILL_CANCELLED",
+                "canceled after mirror response",
+                give_back=start and left_idle,
+                canceled=True,
+            )
         return self._succeed_mirror_session(result, goal_handle, skill_name, response.message)
+
+    def _mirror_release_confirmed(self, *, not_before: float = 0.0) -> bool:
+        """Require the same fresh ownership evidence the following skill will use."""
+        with self._mirror_session_state_lock:
+            state = self._mirror_session_state
+            now = self.get_clock().now().nanoseconds / 1e9
+            released = (
+                state is not None
+                and not_before <= float(state["stamp"]) <= now
+                and now - float(state["stamp"]) <= MIRROR_SESSION.STATE_STALE_SEC
+                and state["state"] == MIRROR_SESSION.STATE_WAIT
+                and not state["holding"]
+                and not state["releasing"]
+            )
+        return released and self._runtime_idle_for_admission()
 
     def _on_mirror_session_state(self, message: String) -> None:
         try:
@@ -2883,23 +3026,39 @@ class SkillExecutorNode(Node):
                 self._mirror_session_seen_holding = True
 
     def _mirror_session_allows_skill(self, skill_name: str) -> tuple[bool, str]:
-        """Mode equality alone cannot arbitrate a session that outlives its start action."""
+        allowed, message, _reason = SkillExecutorNode._mirror_session_admission(self, skill_name)
+        return allowed, message
+
+    def _mirror_session_admission(self, skill_name: str) -> tuple[bool, str, str]:
+        """Keep ownership reasons structured without changing shared mode admission."""
         if not getattr(self, "_mirror_session_enabled", False):
-            return True, ""
+            return True, "", ""
         if self._active_mirror_session_command(skill_name):
-            return True, ""
+            return True, "", ""
         with self._mirror_session_state_lock:
             state = self._mirror_session_state
             now = self.get_clock().now().nanoseconds / 1e9
             if state is None or not 0 <= now - float(state["stamp"]) <= MIRROR_SESSION.STATE_STALE_SEC:
-                return False, "mirror session state is unknown or stale; stop mirror before other skills"
+                return (
+                    False,
+                    "mirror session state is unknown or stale; stop mirror before other skills",
+                    "MIRROR_SESSION_STATE_UNKNOWN",
+                )
             if state["state"] != MIRROR_SESSION.STATE_WAIT or state["holding"] or state["releasing"]:
-                return False, "mirror session owns the arms; execute mirror_stop before other skills"
+                return (
+                    False,
+                    "mirror session owns the arms; execute mirror_stop before other skills",
+                    "MIRROR_SESSION_BUSY",
+                )
             if self._mirror_session_start_latched:
                 if not self._mirror_session_seen_holding or not self._runtime_idle_for_admission():
-                    return False, "mirror takeover or release is unconfirmed; execute mirror_stop first"
+                    return (
+                        False,
+                        "mirror takeover or release is unconfirmed; execute mirror_stop first",
+                        "MIRROR_SESSION_RELEASE_UNCONFIRMED",
+                    )
                 self._mirror_session_start_latched = False
-        return True, ""
+        return True, "", ""
 
     def _publish_asr_control(self, command: str) -> None:
         """Mute (stop) or restore (start) the ASR while a recorded clip plays."""
@@ -7639,15 +7798,42 @@ class SkillExecutorNode(Node):
         # what takes the runtime out of idle, so a failed start knows the mode
         # is the Gateway's to give back.
         mirror_command = self._active_mirror_session_command(goal.skill_name)
-        if (
-            mirror_command == "stop"
-            and not getattr(self, "_mirror_session_start_latched", False)
-            and self._runtime_idle_for_admission()
-        ):
-            return self._succeed_mirror_session(
-                result, goal_handle, goal.skill_name, "runtime already idle", called=False
+        if mirror_command == "stop":
+            if goal_handle.is_cancel_requested:
+                return self._cancel_skill(result, goal_handle, [], goal.skill_name)
+            # An unconfirmed start RPC can still be pending while WAIT/idle is
+            # fresh. Send stop to serialize behind that request before allowing
+            # another producer to enter the shared runtime mode.
+            if not getattr(self, "_mirror_session_start_latched", False) and self._mirror_release_confirmed():
+                with self._mirror_session_state_lock:
+                    self._mirror_session_start_latched = False
+                return self._succeed_mirror_session(
+                    result, goal_handle, goal.skill_name, "runtime already idle", called=False
+                )
+            # Stop releases a producer: never take over policy_stream to stop it.
+            status, reason = self._runtime_status_for_admission()
+            if status is None:
+                return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", reason)
+            active_bundle = getattr(self, "_active_runtime_bundle", None)
+            templates = (
+                self._mutable_templates(active_bundle.snapshot.templates)
+                if active_bundle is not None
+                else self._skill_templates
+            )
+            return self._execute_mirror_session_skill(
+                goal_handle,
+                templates[goal.skill_name],
+                effective_timeout_sec=effective_timeout_sec,
             )
         mirror_left_idle = mirror_command == "start" and self._runtime_idle_for_admission()
+
+        mirror_ready, mirror_message, mirror_reason = self._mirror_session_admission(goal.skill_name)
+        if not mirror_ready:
+            fill_execution_detail(
+                result.execution_detail,
+                ExecutionDetail(1, "admission", "FAILED", "admission", mirror_reason, "NOT_NEEDED", 0, "WAIT_USER"),
+            )
+            return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", mirror_message)
 
         control_mode_ready, control_mode_reason = self._ensure_skill_control_mode(goal.skill_name, goal_handle)
         if not control_mode_ready:

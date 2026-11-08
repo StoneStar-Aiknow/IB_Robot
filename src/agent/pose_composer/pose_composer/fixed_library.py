@@ -2,12 +2,38 @@
 
 import time
 import uuid
+from collections.abc import Mapping
 from types import SimpleNamespace
 
 from embodied_common.pose_composer_contract import PREPARED_TTL_SEC
 from pose_composer.errors import ComposeError
 from pose_composer.memory import normalize
 from robot_runtime.pose_backend import Composition
+
+
+def display_pose_policy(value, library=None):
+    """Opt in named display targets without changing functional task-pose arrival."""
+    if value is None or (isinstance(value, Mapping) and not value):
+        return {}
+    keys = {"pose_ids", "mode"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise ValueError(f"pose_composer.display_completion requires exactly {sorted(keys)}")
+    names = value["pose_ids"]
+    if not isinstance(names, list) or not names or any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("display_completion.pose_ids must be a non-empty list of pose IDs")
+    if len(names) != len(set(names)):
+        raise ValueError("display_completion.pose_ids must be distinct")
+    allowed = {"arms_forward", "arms_up", "arms_out", "arms_v", "flex", "surrender", "right_forward", "left_forward"}
+    if any(name not in allowed for name in names) or value["mode"] != "playback_only":
+        raise ValueError("only supported display poses may use playback_only completion")
+    if library is not None:
+        for name in names:
+            if name not in library["poses"]:
+                raise ValueError(f"display completion pose {name!r} is not in the fixed library")
+            description = library["poses"][name]["description"]
+            if all(description[side].get("task_pose") for side in ("left", "right")):
+                raise ValueError("display completion cannot override a functional task-pose anchor")
+    return dict(value)
 
 
 class FixedComposer:

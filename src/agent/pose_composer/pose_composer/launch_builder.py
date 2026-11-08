@@ -55,6 +55,7 @@ _KEYS = frozenset(
         "fixed_library_sha256",
         "interfaces",
         "path_validation",
+        "display_completion",
     }
 )
 _MEMORY_KEYS = frozenset({"enabled", "path", "max_poses", "candidate_ttl_days", "seeds"})
@@ -214,6 +215,9 @@ def generate_pose_composer_nodes(robot_config: dict, *, use_sim: bool | None = N
     if mode not in {"generated", "fixed"}:
         raise ValueError("pose_composer.mode must be generated or fixed")
     if mode == "fixed":
+        from pose_composer.fixed_library import display_pose_policy
+
+        display = display_pose_policy(config.get("display_completion"))
         if config.get("llm") or memory_settings(robot_config) is not None:
             raise ValueError("fixed mode does not allow language generation or mutable pose memory")
         if config.get("max_hand_displacement_m", 0):
@@ -235,6 +239,7 @@ def generate_pose_composer_nodes(robot_config: dict, *, use_sim: bool | None = N
                         "fixed_library": config["fixed_library"],
                         "fixed_library_sha256": config["fixed_library_sha256"],
                         "path_validation_json": json.dumps(config["path_validation"], sort_keys=True),
+                        "display_completion_json": json.dumps(display, sort_keys=True),
                         "runtime_profile": str(profile),
                         "arm_limits_json": json.dumps(robot_config.get("arm_limits")),
                         "task_poses_json": json.dumps(robot_config.get("task_poses") or {}, sort_keys=True),
@@ -249,6 +254,8 @@ def generate_pose_composer_nodes(robot_config: dict, *, use_sim: bool | None = N
                 ],
             )
         ]
+    if config.get("display_completion"):
+        raise ValueError("display_completion requires a fixed pose library")
     mjcf = str(config.get("mjcf_path", "") or "").strip()
     if not mjcf:
         from aimdk_robot.mock_physics import CACHE, PINNED_COMMIT

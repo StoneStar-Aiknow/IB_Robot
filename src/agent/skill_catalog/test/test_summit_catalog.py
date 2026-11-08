@@ -20,7 +20,6 @@ CLIP_SKILLS = {
     "introduce_in_detail",
     "explain_pick_scope",
     "offer_fruit_menu",
-    "mimic_not_ready",
     "invite_visitor",
 }
 
@@ -29,7 +28,7 @@ CLIP_SKILLS = {
 def snapshot():
     context = _context()
     delegated = dict(context.delegated_executors)
-    for executor in ("pose_composer", "grasp_pipeline", "placement_pipeline", "runtime_play_audio"):
+    for executor in ("pose_composer", "grasp_pipeline", "placement_pipeline", "runtime_play_audio", "mirror_session"):
         delegated.update(_context(executor).delegated_executors)
     delegated["grasp_pipeline"] = replace(
         delegated["grasp_pipeline"],
@@ -59,7 +58,13 @@ def test_the_catalog_matches_the_deployment_allowlist(snapshot, deployment):
     enabled = set(snapshot.enabled_skill_names)
     assert enabled == set(deployment["agent"]["test_allowlist"])
     assert enabled >= CLIP_SKILLS
-    assert not {"mirror_start", "mirror_stop", "free_pose"} & enabled
+    assert {"mirror_start", "mirror_stop"} <= enabled
+    assert "mimic_not_ready" not in enabled
+    assert snapshot.templates["free_pose"]["executor"] == "pose_composer"
+    for name, command in (("mirror_start", "start"), ("mirror_stop", "stop")):
+        assert snapshot.templates[name]["executor"] == "mirror_session"
+        assert snapshot.templates[name]["binding"]["command"] == command
+        assert snapshot.capability_view[name]["required_control_mode"] == "model_inference"
 
 
 def test_every_clip_skill_is_silent_and_resolves_its_clip(snapshot, deployment):
@@ -87,6 +92,9 @@ def test_each_social_clip_selects_its_recorded_gesture(snapshot):
 
 
 def test_the_planner_is_told_the_three_fruits(snapshot):
+    # The catalog adapter uses the first Chinese alias to name the action.
+    # Fruit choices must not make every pick appear to request a lemon.
+    assert snapshot.aliases["pick_object"][0] == "抓取水果"
     assert snapshot.templates["pick_object"]["implementation_identity"].endswith("#aimdk_x2_summit_fruit")
     assert snapshot.templates["pick_object"]["timeout_sec"] == 150.0
     assert snapshot.templates["place_in_container"]["executor"] == "placement_pipeline"
@@ -94,3 +102,13 @@ def test_the_planner_is_told_the_three_fruits(snapshot):
     summary = snapshot.capability_view["pick_object"]["summary"]
     for target in ('"a lemon"', '"an apple"', '"an orange"'):
         assert target in summary
+
+
+def test_legacy_gestures_bind_summit_hand_preparation_budget(snapshot, deployment):
+    motions = deployment["runtime_named_motion"]["hand_preparation"]["motions"]
+    assert set(motions) == {"wave", "raise_hand", "blow_kiss", "clap", "handshake"}
+    for skill in ("wave_hand", "raise_hand", "blow_kiss", "clap_hands", "handshake"):
+        template = snapshot.templates[skill]
+        assert template["timeout_sec"] == 90.0
+        assert template["implementation_identity"].endswith("#aimdk_x2_summit")
+        assert "Open installed hands" in snapshot.capability_view[skill]["summary"]

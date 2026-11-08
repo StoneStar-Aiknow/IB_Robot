@@ -23,6 +23,11 @@ _GRASP_REASONS = {
     "GRASP_VERIFICATION_FAILED": "这次未通过抓取验证，请检查物体位置后重新下达指令。",
     "EXECUTION_BUDGET_INSUFFICIENT": "剩余时间不足，本次没有开始新的抓取动作，请检查任务预算。",
 }
+_MIRROR_REASONS = {
+    "MIRROR_SESSION_BUSY": "照镜子正在进行，本次动作未执行，也不会排队。请结束照镜子后重新下达指令。",
+    "MIRROR_SESSION_STATE_UNKNOWN": "照镜子状态尚未确认，本次动作未执行，也不会排队。请操作员确认照镜子状态后重新下达指令。",
+    "MIRROR_SESSION_RELEASE_UNCONFIRMED": "照镜子结束后的控制权释放尚未确认，后续动作未执行，也不会排队。请操作员确认机器人状态后重新下达指令。",
+}
 _ACTIONS = {
     "WAIT_USER": "本次任务未完成，请调整现场或补充信息后重新下达指令。",
     "WAIT_SERVICE": "服务暂时不可用，请等待服务恢复后重新下达指令。",
@@ -140,6 +145,12 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
             return "动作执行结束，未校验通过。"
         if detail.schema_version not in {1, 2}:
             return "执行失败，请查看执行记录或联系操作员。"
+        if (
+            detail.phase in {"admission", "release"}
+            and detail.recovery_state == "NOT_NEEDED"
+            and detail.reason_code in _MIRROR_REASONS
+        ):
+            return _MIRROR_REASONS[detail.reason_code]
         if detail.suggested_action == "MANUAL_CHECK":
             return failure_stage + _ACTIONS["MANUAL_CHECK"]
         if context.get("current_skill") == "pick_object":

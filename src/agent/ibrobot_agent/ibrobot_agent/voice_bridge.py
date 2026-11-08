@@ -554,6 +554,11 @@ class VoiceBridgeCore:
             self._mirror_stop_request_id = ""
             detail = payload.get("detail") or {}
             facts = detail.get("execution_detail") or {}
+            # Version zero is the generated placeholder for executors without
+            # phase/recovery facts. Its UNKNOWN defaults do not contradict a
+            # confirmed mirror stop. Fresh unheld WAIT is still required below.
+            if type(facts.get("schema_version")) is int and facts["schema_version"] == 0:
+                facts = {}
             self._mirror_stop_failed = payload.get("state") != "SUCCEEDED" or any(
                 item.get("recovery_state") in {"FAILED", "UNKNOWN"}
                 or item.get("phase_state") == "UNKNOWN"
@@ -934,7 +939,17 @@ class VoiceBridgeCore:
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
             return [Log(f"ignored bypass utterance {raw!r}")]
         if not state.active_request_id and not self._mirror_idle(now):
-            actions = [Log(f"mirror ownership unresolved; dropped {raw!r}")]
+            mirror = self._mirror_state or {}
+            actions = [
+                Log(
+                    f"mirror ownership unresolved; dropped {raw!r} "
+                    f"(state={mirror.get('state', 'unknown')}, "
+                    f"fresh={now <= mirror.get('expires_at', float('-inf'))}, "
+                    f"holding={mirror.get('holding')}, releasing={mirror.get('releasing')}, "
+                    f"stop_failed={self._mirror_stop_failed}, stop_pending={self._mirror_stop_pending}, "
+                    f"stop_request={self._mirror_stop_request_id!r})"
+                )
+            ]
             if not self._mirror_busy_spoken:
                 self._mirror_busy_spoken = True
                 actions.append(

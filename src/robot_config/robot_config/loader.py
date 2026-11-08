@@ -608,7 +608,9 @@ def validate_arm_surface_config(robot_config: dict[str, Any]) -> list[str]:
 
 # The neutral action a runtime_named_motion executor dispatches to.
 RUNTIME_NAMED_MOTION_ACTION_TYPE = "ibrobot_msgs/action/ExecuteNamedMotion"
-_RUNTIME_NAMED_MOTION_DECLARED_KEYS = frozenset({"enabled", "interface", "kind", "type", "requires"})
+_RUNTIME_NAMED_MOTION_DECLARED_KEYS = frozenset(
+    {"enabled", "interface", "kind", "type", "requires", "hand_preparation"}
+)
 # Keys interface binding records on the declaration once the live description is bound.
 _RUNTIME_NAMED_MOTION_BOUND_KEYS = frozenset({"endpoint", "capability", "_interface_source"})
 
@@ -646,6 +648,26 @@ def validate_runtime_named_motion_config(robot_config: dict[str, Any]) -> list[s
     requires = capabilities.get("requires", []) if isinstance(capabilities, dict) else []
     if not {"motion.named", "motion.posture"} & {str(name) for name in requires or []}:
         errors.append(f"{prefix} requires capabilities motion.named or motion.posture")
+    if "hand_preparation" in config:
+        preparation = config["hand_preparation"]
+        path = f"{prefix}.hand_preparation"
+        if not isinstance(preparation, dict) or set(preparation) != {"factory", "motions"}:
+            errors.append(f"{path} requires exactly factory and motions")
+        else:
+            factory, motions = preparation["factory"], preparation["motions"]
+            if not isinstance(factory, str) or not re.fullmatch(
+                r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", factory
+            ):
+                errors.append(f"{path}.factory must be a module:function binding")
+            if (
+                not isinstance(motions, list)
+                or not motions
+                or any(not isinstance(name, str) or not name.strip() for name in motions)
+                or len(motions) != len(set(motions))
+            ):
+                errors.append(f"{path}.motions must contain distinct non-empty motion names")
+        if not isinstance(robot_config.get("grasp_execution"), dict) or not robot_config["grasp_execution"]:
+            errors.append(f"{path} requires grasp_execution for the deployed hand model")
     return errors
 
 

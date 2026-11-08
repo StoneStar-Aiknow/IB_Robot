@@ -519,6 +519,11 @@ vendor:
     trajectory_follow_min_ratio: 0.3
     trajectory_resume_ttl_s: 120.0
     trajectory_hold_lag_s: 0.05
+    # Only normal completion of reviewed, empty-hand social recordings. Cancel return remains strict.
+    display_completion:
+      motions: [short_wave, invite, self_intro, explain, wave, raise_hand, blow_kiss, clap]
+      mode: playback_only
+    allow_unverified_trajectories: true
     trajectories:
       wave: trajectories/wave.json
       handshake: trajectories/handshake.json

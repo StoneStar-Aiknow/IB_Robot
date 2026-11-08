@@ -42,3 +42,28 @@ capability:
   - motion.named
 implementations:
   x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml
+description_variants:
+  aimdk_x2_summit:
+    summary: Offer a hand for a handshake. Open installed hands before arm playback.
+    category: social_greeting
+    when_to_use:
+    - greet someone formally
+    - close an agreement
+    - welcome a visitor
+    do_not_use:
+    - condition: greet someone casually from a distance
+      instead_use: wave_hand
+    aliases_zh:
+    - 握手
+    - 握个手
+    aliases_en:
+    - handshake
+    - shake hands
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 45.0
+    requires_motion_params: false

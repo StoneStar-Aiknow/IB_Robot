@@ -38,6 +38,7 @@ moved the arm since; otherwise it plays from the start and says why.
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -53,6 +54,12 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from aimdk_robot import projection
 from aimdk_robot import trajectory as traj
 from aimdk_robot import vendor_gateway as vg
+from aimdk_robot.display_completion import (
+    display_completion_policy,
+    final_pose_evidence,
+    final_pose_reached,
+    goal_acceptance_disabled,
+)
 from aimdk_robot.projection import CommandRejected
 from ibrobot_msgs.action import ExecuteNamedMotion
 from robot_runtime.contract import LIFECYCLE_ACTIVE
@@ -191,6 +198,7 @@ class NamedMotionServer:
         self._max_speed = max_speed
         arm = vendor.get("arm") or {}
         self._arm_limits = {str(k): (float(v[0]), float(v[1])) for k, v in (arm.get("limits") or {}).items()}
+        self._display_completion = display_completion_policy(config.get("display_completion"), self._trajectories)
         if self._return_motions:
             values = [
                 self._return_timeout_s,
@@ -376,7 +384,19 @@ class NamedMotionServer:
 
         try:
             ok, _code, message = self._run_trajectory(
-                "trajectory", mode, "", "", goal_handle, generation, epoch, recorded=plan, on_progress=on_progress
+                "trajectory",
+                mode,
+                "",
+                "",
+                goal_handle,
+                generation,
+                epoch,
+                recorded=plan,
+                on_progress=on_progress,
+                verify_completion=not (
+                    self._node.vendor_config.get("named_motion", {}).get("allow_unverified_trajectories") is True
+                    and goal_acceptance_disabled(goal_handle.request.goal_tolerance, projection.VENDOR_ARM_ORDER)
+                ),
             )
         except _Superseded as superseded:
             return self._fail_trajectory(goal_handle, result, superseded.message)
@@ -807,6 +827,7 @@ class NamedMotionServer:
         *,
         recorded: traj.ArmTrajectory | None = None,
         on_progress=None,
+        verify_completion=True,
     ) -> tuple[bool, int, str]:
         """Replay a trajectory on the arm channel, easing in from the measured pose.
 
@@ -815,6 +836,9 @@ class NamedMotionServer:
         """
         planned = recorded is not None
         recorded = recorded or self._trajectories.get(name)
+        display = self._display_completion
+        if not planned and display and name in display["motions"]:
+            verify_completion = False
         if recorded is None:
             return (
                 False,
@@ -975,28 +999,53 @@ class NamedMotionServer:
                     on_progress(min(reached / recorded.duration, 1.0), point)
                 tick += 1
                 time.sleep(max(0.0, started + tick * period - time.monotonic()))
-            if recorded.hands:
+            self._still_current(generation, epoch)
+            if goal_handle.is_cancel_requested:
+                if return_on_cancel:
+                    self._return_cancelled(
+                        name, mode, start + (hand_start or []), history, goal_handle, generation, epoch, 1.0
+                    )
+                raise self._cancel_replay(name, mode, recorded, recorded.duration, epoch)
+            if not self._node.output_admitted() or self._node.current_mode() != mode:
+                raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "runtime unavailable at motion end")
+            if recorded.hands and verify_completion:
                 # Success requires new feedback acquired after the final target was sent.
                 final_at = time.monotonic()
                 deadline = final_at + self._return_settle_s
+                arm_tolerance = hand_tolerance = self._return_tolerance
                 while True:
                     self._still_current(generation, epoch)
+                    if not self._node.output_admitted() or self._node.current_mode() != mode:
+                        raise _Superseded(
+                            ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "runtime unavailable at motion end"
+                        )
                     arm_sample, hand_sample = self._node.measured_arm_sample(), self._node.measured_hand_sample()
                     types = self._node._dataplane.hand_types
                     desired_hands = [
                         v if vg.hand_type_family(types[k // 10]) == "dexterous" else 0.0 for k, v in enumerate(hands)
                     ]
-                    if (
-                        arm_sample
-                        and hand_sample
-                        and min(arm_sample[1], hand_sample[1]) >= final_at
-                        and max(abs(a - b) for a, b in zip(arm_sample[0], point, strict=True)) <= self._return_tolerance
-                        and max(abs(a - b) for a, b in zip(hand_sample[0], desired_hands, strict=True))
-                        <= self._return_tolerance
+                    evidence = final_pose_evidence(
+                        arm_sample, hand_sample, point, desired_hands, final_at, time.monotonic()
+                    )
+                    evidence.update(
+                        motion=name,
+                        policy="strict",
+                        arm_tolerance_rad=arm_tolerance,
+                        hand_tolerance_rad=hand_tolerance,
+                    )
+                    if arm_sample and any(
+                        not self._arm_limits[joint][0] <= value <= self._arm_limits[joint][1]
+                        for joint, value in zip(projection.VENDOR_ARM_ORDER, arm_sample[0], strict=True)
                     ):
+                        raise CommandRejected("FINAL_POSE_UNCONFIRMED", "measured arm outside joint limits")
+                    if final_pose_reached(evidence, arm_tolerance, hand_tolerance):
+                        self._node.get_logger().info(f"recorded completion: {json.dumps(evidence, sort_keys=True)}")
                         break
                     if time.monotonic() >= deadline:
-                        raise CommandRejected("FINAL_POSE_UNCONFIRMED", "recorded arm/hand final pose not measured")
+                        self._node.get_logger().error(
+                            f"recorded completion failed: {json.dumps(evidence, sort_keys=True)}"
+                        )
+                        raise CommandRejected("FINAL_POSE_UNCONFIRMED", json.dumps(evidence, sort_keys=True))
                     if goal_handle.is_cancel_requested:
                         self._return_cancelled(
                             name, mode, start + hand_start, history, goal_handle, generation, epoch, 1.0
@@ -1011,18 +1060,23 @@ class NamedMotionServer:
                 recorded.hands and isinstance(exc, CommandRejected) and exc.reason == "FINAL_POSE_UNCONFIRMED"
             ):
                 # Unconfirmed return must not admit fresh work after releasing ownership.
-                self._node._set_fault("cancel_return", f"cancel return unconfirmed: {exc}")
+                phase = "cancel return" if self._returning else "recorded completion"
+                self._node._set_fault(
+                    "cancel_return" if self._returning else "recorded_completion", f"{phase} unconfirmed: {exc}"
+                )
                 self._node._push_control()
                 if not isinstance(exc, _Superseded):
-                    raise _Superseded(
-                        ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, f"cancel return failed: {exc}"
-                    ) from exc
+                    raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, f"{phase} failed: {exc}") from exc
             raise
         finally:
             self._node.release_arm(generation)
             with self._lock:
                 if self._running == (name, generation):
                     self._returning = False
+        if not verify_completion:
+            message = f"display playback finished: {name}; final pose not verified ({total:.1f}s){resume_note}"
+            self._node.get_logger().info(message)
+            return True, ExecuteNamedMotion.Result.NONE, message
         joint = max(range(len(start)), key=commanded_peak.__getitem__)
         if (
             commanded_peak[joint] >= FOLLOW_CHECK_MIN_RAD

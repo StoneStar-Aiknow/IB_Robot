@@ -14,6 +14,22 @@
 - 调度日志记录合成、播放和丢弃事件。播放服务返回不代表硬件播放完成确认。
 - 本次不改变动作授权和执行契约。typed Program 仍不等待 TTS。
 
+## 照镜子退出后的语音入口
+
+Gateway 在同一停止超时预算内等待停止服务应答、新鲜的 `WAIT`、控制权已释放和健康的 runtime idle，
+确认完成后才执行后续步骤。停止不再为退出操作切入 `policy_stream`。确认超时、失败或取消会终止
+后续步骤，不排队重试。启动请求尚未发送就取消时，只归还本次启动从 idle 取得的控制模式。
+上一次启动尚未确认时，即使暂时收到 `WAIT` 和 idle，也必须发送停止请求，排除迟到的启动请求。
+
+语音桥只有在停止请求成功，且收到新鲜的 `WAIT`、`holding=false`、`releasing=false`
+状态后，才接收后续动作指令。`execution_detail.schema_version=0` 表示执行器未提供阶段明细；
+其中默认的 `UNKNOWN/MANUAL_CHECK` 不作为停止失败的证据。版本 1/2 的真实未知或恢复失败、
+停止请求失败及过期状态仍阻止后续动作。拦截日志记录状态新鲜度、控制权和停止确认标志。
+
+Gateway 的拒绝或释放失败通过 `MIRROR_SESSION_BUSY`、`MIRROR_SESSION_STATE_UNKNOWN`、
+`MIRROR_SESSION_RELEASE_UNCONFIRMED` 区分，并明确播报动作未执行、不排队。真实取消、未知结果、
+恢复失败，以及放置 v2 的松开和验证事实保持原有优先级。
+
 ## 抓取分级播报
 
 在 `robot.embodied.agent.voice_bridge` 配置：

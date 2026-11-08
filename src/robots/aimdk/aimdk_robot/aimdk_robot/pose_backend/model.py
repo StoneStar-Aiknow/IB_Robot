@@ -57,8 +57,12 @@ def _recorded_extremes(profile: dict, profile_dir: Path) -> dict[str, tuple[floa
     hi: dict[str, float] = {}
     for rel in ((profile.get("vendor") or {}).get("named_motion") or {}).get("trajectories", {}).values():
         recorded = json.loads((profile_dir / rel).read_text())
-        for i, name in enumerate(recorded["joints"]):
-            values = [row[i] for row in recorded["positions"]]
+        if recorded.get("format") == "ibrobot.fixed_motion.delivery":
+            joints, positions = recorded["arms"]["joints"], recorded["arms"]["positions_rad"]
+        else:
+            joints, positions = recorded["joints"], recorded["positions"]
+        for i, name in enumerate(joints):
+            values = [row[i] for row in positions]
             lo[name] = min(lo.get(name, values[0]), min(values))
             hi[name] = max(hi.get(name, values[0]), max(values))
     return {name: (lo[name], hi[name]) for name in lo}

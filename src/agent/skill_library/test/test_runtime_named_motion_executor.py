@@ -439,3 +439,31 @@ def test_gesture_pick_gesture_share_policy_stream_without_a_mode_switch():
     for skill in ("wave_hand", "pick_object", "handshake"):
         assert node._ensure_skill_control_mode(skill, SimpleNamespace(is_cancel_requested=False)) == (True, "")
         assert node._control_mode_for_runtime(status) == "moveit_planning"
+
+
+@pytest.mark.parametrize("failure", [None, "blocked", "cancel"])
+def test_hand_preparation_uses_root_lease_before_dispatch_and_refuses_arm_on_failure(failure):
+    client = _Client(_Future(_MotionHandle(_Future(_motion_result()))))
+    node = _node(client)
+    node._hand_preparation_motions = ("handshake",)
+    node._gateway_lease = SimpleNamespace(owner=SimpleNamespace(root_task_id="root-owner"))
+    handle = _GoalHandle()
+    calls = []
+
+    def prepare(task, deadline, cancelled, progress):
+        assert not client.goals
+        calls.append(task)
+        progress("opening_right", 0.5)
+        if failure:
+            handle.is_cancel_requested = failure == "cancel"
+            raise RuntimeError("preparation refused")
+        return ("right",)
+
+    node._named_motion_hand_preparer = SimpleNamespace(prepare=prepare)
+    result = _run(node, handle)
+    assert calls == ["root-owner"]
+    assert bool(client.goals) is (failure is None)
+    assert result.success is (failure is None)
+    assert handle.terminal == ("succeeded" if failure is None else "canceled" if failure == "cancel" else "aborted")
+    if failure is None:
+        assert result.executed_primitives[0] == "hand_preparation:open_right"

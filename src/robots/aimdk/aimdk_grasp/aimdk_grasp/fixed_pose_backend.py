@@ -48,8 +48,12 @@ def named_motion_extremes(profile: dict, profile_dir: Path) -> dict:
     named = ((profile.get("vendor") or {}).get("named_motion") or {}).get("trajectories") or {}
     for relative in named.values():
         recorded = json.loads((Path(profile_dir) / relative).read_text())
-        for index, name in enumerate(recorded["joints"]):
-            values = [float(row[index]) for row in recorded["positions"]]
+        if recorded.get("format") == "ibrobot.fixed_motion.delivery":
+            joints, positions = recorded["arms"]["joints"], recorded["arms"]["positions_rad"]
+        else:
+            joints, positions = recorded["joints"], recorded["positions"]
+        for index, name in enumerate(joints):
+            values = [float(row[index]) for row in positions]
             low[name] = min(low.get(name, values[0]), min(values))
             high[name] = max(high.get(name, values[0]), max(values))
     return {name: [low[name], high[name]] for name in sorted(low)}

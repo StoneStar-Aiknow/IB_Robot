@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 import pytest
 
+from embodied_common.execution_detail import ExecutionDetail
 from ibrobot_agent.addressee import Voiceprint
 from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE
 from ibrobot_agent.presentation import presentation_digest
@@ -2056,6 +2057,96 @@ def test_failed_mirror_stop_does_not_release_on_wait_and_can_retry(result):
     core.on_event(_event(retry["request_id"], "terminal", "SUCCEEDED"), 1)
     _mirror_state(core, 1.1)
     assert _of(core.on_heard("挥手", 1.2), PublishRequest)
+
+
+def test_gateway_release_failure_then_default_wire_stop_success_reopens_voice_admission():
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    request = _of(core.on_heard("停止", 0.5), PublishRequest)[0].payload
+    failure = ExecutionDetail(
+        1, "release", "FAILED", "release", "MIRROR_SESSION_RELEASE_UNCONFIRMED", "NOT_NEEDED", 0, "MANUAL_CHECK"
+    )
+    core.on_event(
+        _event(request["request_id"], "terminal", "FAILED", detail={"execution_detail": failure.to_dict()}), 0.6
+    )
+    _mirror_state(core, 0.7)
+    assert not _of(core.on_heard("挥手", 0.8), PublishRequest)
+    retry = _of(core.on_heard("停止", 0.9), PublishRequest)[0].payload
+    core.on_event(
+        _event(retry["request_id"], "terminal", "SUCCEEDED", detail={"execution_detail": ExecutionDetail().to_dict()}),
+        1,
+    )
+    _mirror_state(core, 1.1)
+    assert _of(core.on_heard("挥手", 1.2), PublishRequest)
+
+
+@pytest.mark.parametrize("next_command", ["挥手", "照镜子", "拿柠檬"])
+@pytest.mark.parametrize("wait_before_terminal", [False, True])
+def test_mirror_stop_default_wire_detail_releases_after_confirmed_wait(next_command, wait_before_terminal):
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    request = _of(core.on_heard("停止照镜子", 0.5), PublishRequest)[0].payload
+    if wait_before_terminal:
+        _mirror_state(core, 0.55)
+    core.on_event(
+        _event(
+            request["request_id"],
+            "terminal",
+            "SUCCEEDED",
+            detail={"current_skill": "mirror_stop", "execution_detail": ExecutionDetail().to_dict()},
+        ),
+        0.6,
+    )
+    if not wait_before_terminal:
+        assert not _of(core.on_heard(next_command, 0.65), PublishRequest)
+    _mirror_state(core, 0.7)
+    assert _of(core.on_heard(next_command, 0.8), PublishRequest)
+
+
+@pytest.mark.parametrize("state", ["FAILED", "UNKNOWN", "CANCELLED"])
+def test_mirror_stop_default_wire_detail_does_not_override_a_failed_stop(state):
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    request = _of(core.on_heard("停止", 0.5), PublishRequest)[0].payload
+    core.on_event(
+        _event(request["request_id"], "terminal", state, detail={"execution_detail": ExecutionDetail().to_dict()}),
+        0.6,
+    )
+    _mirror_state(core, 0.7)
+    assert not _of(core.on_heard("挥手", 0.8), PublishRequest)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_mirror_stop_typed_unknown_remains_blocked(version):
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    request = _of(core.on_heard("停止", 0.5), PublishRequest)[0].payload
+    facts = ExecutionDetail(schema_version=version).to_dict()
+    core.on_event(_event(request["request_id"], "terminal", "SUCCEEDED", detail={"execution_detail": facts}), 0.6)
+    _mirror_state(core, 0.7)
+    assert not _of(core.on_heard("挥手", 0.8), PublishRequest)
+
+
+def test_mirror_stop_default_wire_detail_does_not_hide_explicit_manual_check():
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    request = _of(core.on_heard("停止", 0.5), PublishRequest)[0].payload
+    core.on_event(
+        _event(
+            request["request_id"],
+            "terminal",
+            "SUCCEEDED",
+            detail={"execution_detail": ExecutionDetail().to_dict(), "suggested_action": "MANUAL_CHECK"},
+        ),
+        0.6,
+    )
+    _mirror_state(core, 0.7)
+    assert not _of(core.on_heard("挥手", 0.8), PublishRequest)
 
 
 def test_stop_during_active_mirror_start_cancels_then_submits_guarded_stop():

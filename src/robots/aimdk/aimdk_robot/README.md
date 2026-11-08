@@ -945,6 +945,24 @@ result semantics and pending hardware acceptance.
 
 ### Summit audio and recorded gestures
 
+`aimdk_x2_summit` is the combined voice, presentation, mirror and fruit-delivery
+entry. Launch `embodied_bringup/embodied_pipeline.launch.py` with
+`robot_config:=aimdk_x2_summit control_mode:=model_inference`; the 310P deployment
+uses its site overlay and the same control mode. It retains the summit runtime
+profile and recorded motions, exposes `mirror_start` and `mirror_stop`, and
+inherits the two HRI and three grasp model services from the shared base.
+The previous `mimic_not_ready` reply is no longer exposed in this catalog.
+
+Say `开始照镜子` to enter the mirror session and `停止照镜子` before requesting
+a gesture, fixed pose or fruit delivery. The voice bridge and Gateway reject
+other skills while mirror ownership is active or unconfirmed. A confirmed
+mirror stop releases the runtime to idle; another skill can then run without
+restarting the pipeline. During pick/place the Gateway pauses the resident
+mirror perception stream and waits for its acknowledgement before submission.
+Both dexterous hands are installed. The shared base keeps CBF disabled because
+mirror and manipulation use the same stream without an arm-owner identity;
+this entry does not enable the old, uncalibrated single-hand CBF profile.
+
 The `x2_ultra_omnihand_summit` profile adds four original 50 Hz delivery
 recordings: `short_wave`, `invite`, `self_intro`, and `explain`. The loader
 accepts schema 1 `ibrobot.fixed_motion.delivery` with 14 arm angles and 20
@@ -964,9 +982,31 @@ Summit enables cancel return for `wave,short_wave,invite,self_intro,explain`.
 An introduction interrupted by the text `别说了` cancels audio and requests
 motion return along the executed path to this execution's measured origin.
 Safe cancellation requires fresh arm and hand feedback within 0.03 rad.
-Normal recorded completion also requires fresh final-pose feedback. An
-unconfirmed final pose or failed return closes admission before ownership
-is released. Emergency stop still interrupts return.
+Normal recorded completion is strict unless the deployment explicitly selects
+`vendor.named_motion.display_completion.mode: playback_only`. Summit selects
+`short_wave`, `invite`, `self_intro`, `explain`, `wave`, `raise_hand`, `blow_kiss`
+and `clap`. Their normal terminal means **display playback finished; final pose
+not verified**. There is no post-playback arrival, settling, measured excursion,
+or arm/finger precision acceptance. Audio-and-motion skills still require the
+actual audio terminal too. Command validation, admission, arbitration, stop,
+hardware faults, command refusal and timeout remain failures. `handshake`,
+functional preparation, grasping and cancellation return keep their checks.
+An unconfirmed strict completion or cancel return still closes admission.
+
+Summit prepares installed dexterous hands before the legacy arm-only `wave`,
+`raise_hand`, `blow_kiss`, `clap` and `handshake` recordings. Under the same
+Gateway root task and deadline it reuses grasp-ready hand restoration: checks
+the current stationary arm pose and finger sweep, takes over, opens left before
+right and confirms the open hands. It does not move arms to grasp-ready.
+Preparation failure prevents the arm goal. The arm-only runtime stream then
+preserves these hand targets. The four delivery recordings retain their own
+20-channel hand choreography. Summit budgets 90 seconds for each legacy skill
+including preparation; other deployment implementations are unchanged.
+
+The eight fixed empty-hand display poses separately opt in through explicit
+standard goal-tolerance disabling; the summit runtime profile permits this.
+Unconfigured deployments retain strict completion. Mock verification establishes
+control behavior; the operator must still assess physical motion quality.
 
 The supplied motion metadata remains `draft`; permission basis, license,
 and hand firmware metadata have not been supplied. Local vendor Mock

@@ -3,19 +3,19 @@ name: aimdk_x2_summit
 robot_name: aimdk_x2_summit
 enabled_skills:
 - name: wave_hand
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: handshake
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: raise_hand
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: blow_kiss
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: clap_hands
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: greet_visitor
   implementation: aimdk_x2_summit
@@ -38,7 +38,10 @@ enabled_skills:
 - name: offer_fruit_menu
   implementation: x2_runtime_v1
   planner_visible: true
-- name: mimic_not_ready
+- name: mirror_start
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: mirror_stop
   implementation: x2_runtime_v1
   planner_visible: true
 - name: pick_object
@@ -52,4 +55,7 @@ enabled_skills:
   planner_visible: true
 - name: invite_visitor
   implementation: aimdk_x2_summit
+  planner_visible: true
+- name: free_pose
+  implementation: x2_runtime_v1
   planner_visible: true

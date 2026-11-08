@@ -565,7 +565,7 @@ class HandRestorer:
         ctx: RestoreContext,
         sides: Sequence[str],
         *,
-        arm_target: Mapping[str, float],
+        arm_target: Mapping[str, float] | None = None,
         arm_must_move: bool,
     ) -> float:
         """Refuse before any output; returns the least time (s) the hand phase will take.
@@ -582,6 +582,10 @@ class HandRestorer:
         if prepare is not None:
             prepare(ctx)
         obs = self._observe(ctx)
+        if arm_target is None:
+            if arm_must_move:
+                raise RestoreError("HAND_SWEEP_OUT_OF_LIMITS", "moving arms require an explicit target")
+            arm_target = obs.feedback.positions
         if gains_class(obs.command) == "other":
             raise RestoreError(
                 "HAND_ARM_GAINS_UNVERIFIED", "arm gains are neither 40/2 (stream owns the arms) nor the vendor default"
@@ -613,6 +617,25 @@ class HandRestorer:
             self._hand(obs, side)
         self._wait_output_ready(ctx)
         return seconds
+
+    def prepare_open_hands(self, ctx: RestoreContext) -> tuple[str, ...]:
+        """Open installed hands at the current arm pose before a legacy arm-only gesture.
+
+        Uses the same takeover, collision checks, left-before-right opening and confirmation
+        as grasp-ready preparation. Never sends an arm trajectory. Release on every outcome.
+        """
+        sides = tuple(side for side in SIDES if side in self.installed)
+        try:
+            self.preflight(ctx, sides, arm_must_move=False)
+            self.begin(ctx)
+            for side in sides:
+                ctx.progress(f"opening_{side}", 0.0)
+                self.open_hand(ctx, side)
+                ctx.progress(f"opening_{side}", 1.0)
+            self.confirm(ctx, sides, lambda: None)
+            return sides
+        finally:
+            self.ports.release()
 
     def _wait_output_ready(self, ctx: RestoreContext) -> None:
         # The stream owns a status reader of its own; wait for its first heartbeat, with nothing buffered.

@@ -390,6 +390,29 @@ def generate_embodied_nodes(
                 named_motion_config.get("interface", ""), "action", RUNTIME_NAMED_MOTION_ACTION_TYPE
             ),
         )
+        preparation = named_motion_config.get("hand_preparation")
+        if preparation:
+            if (
+                not isinstance(preparation, dict)
+                or set(preparation) != {"factory", "motions"}
+                or not isinstance(preparation["factory"], str)
+                or preparation["factory"].count(":") != 1
+                or not isinstance(preparation["motions"], list)
+                or not preparation["motions"]
+                or any(not isinstance(name, str) or not name for name in preparation["motions"])
+                or not robot_config.get("grasp_execution")
+            ):
+                raise ValueError("invalid runtime_named_motion.hand_preparation deployment binding")
+            common_params["named_motion_hand_preparation_json"] = json.dumps(
+                {
+                    **preparation,
+                    "interface_description": description,
+                    "grasp_execution": robot_config["grasp_execution"],
+                    "gateway_status_service": embodied_config.get(
+                        "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
+                    ),
+                }
+            )
     common_params["motion_imitation_pause_service"] = manipulation_pause_service(robot_config)
     mirror_session = robot_config.get("mirror_session", {})
     if isinstance(mirror_session, dict) and mirror_session.get("enabled") is True:
@@ -1057,6 +1080,14 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         params["speech_messages_json"] = json.dumps(voice_bridge["speech_messages"], ensure_ascii=False)
     if "text_corrections" in voice_bridge:
         params["text_corrections_json"] = json.dumps(dict(voice_bridge["text_corrections"]), ensure_ascii=False)
+    composer = robot_config.get("pose_composer") or {}
+    if "free_pose" in agent_config.get("test_allowlist", []) and composer.get("mode") == "fixed":
+        from robot_runtime.task_poses import pose_catalog
+
+        # The enabled fixed library owns these aliases; do not maintain another phrase list in YAML.
+        aliases = [alias for pose in pose_catalog(None, composer)["free_pose"] for alias in pose["aliases"]]
+        lexicon = list(voice_bridge.get("semantic_gate_lexicon", []))
+        params["semantic_gate_lexicon_json"] = json.dumps(list(dict.fromkeys([*lexicon, *aliases])), ensure_ascii=False)
     return Node(
         package="ibrobot_agent",
         executable="ibrobot_agent_voice_bridge",
