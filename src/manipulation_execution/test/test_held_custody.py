@@ -70,6 +70,26 @@ def test_unclaimed_expiry_puts_back_but_claimed_expiry_only_alarms():
         owner.returned("grip-1", token, "released")
 
 
+def test_failed_place_returns_confirmed_held_object_for_immediate_put_back():
+    owner, _, calls = custody()
+    token, _ = owner.claim("grip-1", "a red apple", "place")
+    owner.returned("grip-1", token, "held", "PLACE_PLAN_FAILED")
+    assert owner.occupied
+    owner.tick()
+    assert calls == ["yield", "recover"]
+    assert owner.state == "released" and owner.reason == "PLACE_FAILED_PUT_BACK"
+    assert not owner.occupied
+
+
+def test_successful_drop_cleanup_ends_custody_and_allows_the_next_pick():
+    owner, _, _ = custody()
+    token, _ = owner.claim("grip-1", "a red apple", "place")
+    owner.returned("grip-1", token, "lost", "GRIP_LOST_IN_TRANSFER")
+    assert not owner.occupied
+    owner.accept(held(), recover=lambda: True, release=lambda: None, holding=lambda: "")
+    assert owner.state == "picked"
+
+
 @pytest.mark.parametrize("drop", [False, True])
 def test_failed_sequence_is_not_truthy_success_and_preserves_recovery_evidence(drop):
     owner, now, _ = custody()

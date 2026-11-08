@@ -56,6 +56,29 @@ def test_tracker_discards_duplicates_stale_and_post_terminal_events():
     assert tracker.accept(event(5, phase="plan")) is None
 
 
+def test_admission_recovery_gate_is_explained_even_without_executor_detail():
+    message = execution_reply("FAILED", {"error_code": "HELD_OBJECT_RECOVERY_REQUIRED"})
+    assert "上一次任务" in message and "需要先恢复" in message
+    assert "查看执行记录" not in message
+
+
+def test_completed_drop_cleanup_is_a_failed_task_that_can_accept_a_new_command():
+    detail = ExecutionDetail(
+        schema_version=2,
+        phase="recover",
+        phase_state="FAILED",
+        failed_phase="observe_container",
+        reason_code="GRIP_LOST_IN_TRANSFER",
+        recovery_state="COMPLETED",
+        release_status="RELEASED",
+        verification_status="NOT_RUN",
+        suggested_action="WAIT_USER",
+    )
+    text = execution_reply("FAILED", {"current_skill": "place_in_container", "execution_detail": detail.to_dict()})
+    assert "没能完成放置" in text and "已完成收尾" in text and "重新下达指令" in text
+    assert "未知" not in text and "放置成功" not in text
+
+
 def test_text_feedback_bridge_checks_scope_and_never_submits_or_acknowledges():
     # ``detailed`` narrates the observe phase; ``standard`` deliberately stays quiet until the
     # plan, so this test asks for the mode that is supposed to speak here.

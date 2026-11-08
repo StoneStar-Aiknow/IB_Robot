@@ -51,6 +51,7 @@ from ibrobot_agent.contracts import (
     request_hash_text,
 )
 from ibrobot_agent.execution_feedback import execution_reply
+from ibrobot_agent.gift_workflow import fruit_label_zh
 from ibrobot_agent.planner import (
     _HYPOTHETICAL_MARKERS,
     _NEGATION_MARKERS,
@@ -629,9 +630,8 @@ class AgentService:
                 )
             else:
                 self._store.finish(key, expected_generation=record.planning_generation, result=execution_result)
-                terminal_message = execution_reply(
-                    self._request_state_for_result(execution_result), execution_result.detail
-                )
+                terminal_detail = {**execution_result.detail, "error_code": execution_result.error_code}
+                terminal_message = execution_reply(self._request_state_for_result(execution_result), terminal_detail)
                 save_prompt = ""
                 if execution_result.status == "succeeded" and self._pose_memory is not None:
                     try:
@@ -652,7 +652,7 @@ class AgentService:
                         "terminal",
                         self._request_state_for_result(execution_result),
                         terminal_message,
-                        detail={**execution_result.detail, **({"save_prompt": save_prompt} if save_prompt else {})},
+                        detail={**terminal_detail, **({"save_prompt": save_prompt} if save_prompt else {})},
                     )
         except Exception as exc:
             try:
@@ -1037,12 +1037,12 @@ class AgentService:
         *,
         pose_skills: frozenset[str] = frozenset({"free_pose"}),
     ) -> PlannerOutcome:
-        """Name the workflow by its steps' Chinese catalog names, not by the model's text.
+        """Name the workflow by its Chinese catalog names and validated step targets.
 
-        The summary is what clients render before the robot moves (the voice channel speaks
-        it), so like the step schema versions it is taken from the catalog for exactly the
-        validated steps.  When a step has no Chinese name the planner's summary is kept as
-        is: it is never partly rewritten, and a renderer that cannot use it fails visibly.
+        Clients render this summary before motion. Use catalog action names;
+        parameterized picks and poses name their validated targets instead of
+        the first alias. When a step has no Chinese name, keep the planner's
+        whole summary rather than partially rewriting it.
         """
         # A pose skill's aliases can enumerate opposite seed actions. Its
         # validated Chinese target names the requested pose; the first alias
@@ -1050,6 +1050,11 @@ class AgentService:
         names = []
         for step in outcome.steps:
             name = _chinese_skill_name(catalog, step.skill_name)
+            if name is not None and step.skill_name == "pick_object":
+                # Fruit aliases enumerate choices; the first alias cannot name
+                # every pick. Share the exact target labels used by gift speech.
+                label = fruit_label_zh(step.target_name)
+                name = f"抓取{label}" if label else "抓取物体"
             if name is not None and step.skill_name in pose_skills:
                 target = step.target_name
                 name = target if any(0x4E00 <= ord(char) <= 0x9FFF for char in target) else None

@@ -27,7 +27,7 @@ description is the deployed GraspGen-X bundle's
 - ``registration_device``, ``depth_scale``, ``calibration_verified``
 - ``watch``: ``stop``, ``log`` or ``off``; ``watch_period_s``; ``watch_frame_timeout_s``,
   ``watch_unknown_timeout_s`` and ``watch_image_age_s`` (``execution_watch.WatchTimeouts``)
-- ``warmup_prompt``: what the warmup detects before goals are accepted
+- ``warmup_prompt``: optional local-backend inference warmup query; empty by default
 - ``head``: the grasp head on another host (``aimdk_grasp.split``); remote_head only
 - ``perception``: PerceptionSettings fields; ``planning``: GraspRequestConfig fields
 
@@ -77,7 +77,7 @@ DEFAULTS = {
     "watch_frame_timeout_s": WatchTimeouts.frame_s,
     "watch_unknown_timeout_s": WatchTimeouts.unknown_s,
     "watch_image_age_s": WatchTimeouts.image_age_s,
-    "warmup_prompt": "a bottle .",
+    "warmup_prompt": "",
     # The grasp head on another host (aimdk_grasp.split), for remote_head only.
     "head": {},
     "perception": {},
@@ -485,12 +485,14 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
                 head.service.prepare(observation.robot_state.live.feedback, scenes)
             else:
                 check_initial_hand(robot.hand, observation.robot_state)
-            proposals = proposer.propose(
-                observation, options["warmup_prompt"], deadline=deadline, cancelled=lambda: False
-            )
-            head.service.prepare(observation.robot_state.live.feedback, proposals.scene)
+            services.wait_ready(deadline=deadline, cancelled=lambda: False)
+            if options["warmup_prompt"]:
+                proposals = proposer.propose(
+                    observation, options["warmup_prompt"], deadline=deadline, cancelled=lambda: False
+                )
+                head.service.prepare(observation.robot_state.live.feedback, proposals.scene)
         except GraspFailure as failure:
-            raise RuntimeError(f"warmup on {options['warmup_prompt']!r}: {failure}") from failure
+            raise RuntimeError(f"grasp startup readiness: {failure}") from failure
         finally:
             if imu is not None:
                 imu.pause()  # idle until a request has a plan to execute

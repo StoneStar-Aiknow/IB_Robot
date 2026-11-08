@@ -29,6 +29,11 @@ _RUNNING = {"ACTIVE", "RUNNING", "EXECUTING"}
 _TARGETS = {"a lemon": "柠檬", "an apple": "苹果", "an orange": "橙子"}
 
 
+def fruit_label_zh(target_name: str) -> str | None:
+    """Translate an exact fruit query for presentation without changing its execution target."""
+    return _TARGETS.get(target_name)
+
+
 @dataclass(frozen=True)
 class Notice:
     text: str
@@ -117,7 +122,7 @@ class GiftWorkflowSpeech:
                 and isinstance(place.get("container_name"), str)
                 and place["container_name"].strip()
             ):
-                pairs[index] = _TARGETS.get(target, "这个物体")
+                pairs[index] = fruit_label_zh(target) or "这个物体"
                 # A generic label avoids reading an English detector query aloud.
                 containers[index] = (
                     self._container_label if place["container_name"] == self._container_name else "指定容器"
@@ -226,6 +231,14 @@ class GiftWorkflowSpeech:
         item.retries[index] = retry
         if terminal:
             item.finished = True
+            if root_state == "FAILED" and context.get("error_code") == "HELD_OBJECT_RECOVERY_REQUIRED":
+                return self._notice(
+                    item,
+                    "held_recovery_required",
+                    "上一次任务的持物状态尚未确认，需要先恢复后才能执行动作。",
+                    now,
+                    terminal=True,
+                )
             return self._terminal(item, root_state, skill, in_pair, pick_index, facts, now)
         if root_state not in _RUNNING or not in_pair:
             return []
@@ -314,6 +327,12 @@ class GiftWorkflowSpeech:
 
     @classmethod
     def _place_failure(cls, facts: Mapping) -> str:
+        if (
+            cls._release(facts) == "RELEASED"
+            and facts.get("reason_code") == "GRIP_LOST_IN_TRANSFER"
+            and facts.get("recovery_state") == "COMPLETED"
+        ):
+            return "这次没能完成放置，已完成收尾，可以重新下达指令。"
         if cls._release(facts) == "RELEASED":
             if facts.get("verification_status") in {"FAILED", "UNCERTAIN"}:
                 return "物体已经松开，但还没确认放置成功，请工作人员检查。"
@@ -323,10 +342,12 @@ class GiftWorkflowSpeech:
     def _terminal(self, item, state, skill, in_pair, pick_index, facts, now):
         if (
             state == "UNKNOWN"
-            or facts.get("recovery_state") in ("UNKNOWN", "FAILED")
+            or facts.get("recovery_state") == "UNKNOWN"
             or (skill == "place_in_container" and self._release(facts) == "UNKNOWN")
         ):
             key, text = "E06", "执行状态尚未确认，请工作人员检查机器人和物体。"
+        elif facts.get("recovery_state") == "FAILED":
+            key, text = "recovery_failed", "自动收尾未完成，请工作人员检查机器人和物体。"
         elif state in {"CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}:
             key, text = "cancelled", "任务已停止，请工作人员确认现场状态。"
         elif state == "FAILED":

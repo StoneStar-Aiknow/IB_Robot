@@ -89,8 +89,21 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
         )
     if state in {"CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}:
         return "已停止。" if state != "CANCELLED_BEFORE_EXECUTION" else "任务已取消，尚未开始执行。"
-    if detail.schema_version in {1, 2} and detail.recovery_state in {"FAILED", "UNKNOWN"} and state in _TERMINALS:
-        return failure_stage + "恢复未完成或状态尚未确认，请操作员检查机器人。"
+    if state == "FAILED" and context.get("error_code") == "HELD_OBJECT_RECOVERY_REQUIRED":
+        return "上一次任务的持物状态尚未确认，需要先恢复后才能执行动作。"
+    if detail.schema_version in {1, 2} and state in _TERMINALS:
+        if detail.recovery_state == "UNKNOWN":
+            return failure_stage + "恢复状态尚未确认，请操作员检查机器人。"
+        if detail.recovery_state == "FAILED":
+            return failure_stage + "自动收尾未完成，请操作员检查机器人。"
+        if (
+            state == "FAILED"
+            and placing
+            and detail.reason_code == "GRIP_LOST_IN_TRANSFER"
+            and detail.recovery_state == "COMPLETED"
+            and detail.release_status == "RELEASED"
+        ):
+            return "这次没能完成放置，已完成收尾，可以重新下达指令。"
     if state == "SUCCEEDED":
         if placing:
             if (

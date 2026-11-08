@@ -24,7 +24,7 @@ def event(sequence=1, *, terminal=False, root=None, **facts):
         schema_version=2,
         phase=facts.pop("phase", "verify_place"),
         phase_state="SUCCEEDED" if terminal else "RUNNING",
-        recovery_state="NOT_NEEDED",
+        recovery_state=facts.pop("recovery_state", "NOT_NEEDED"),
         suggested_action="NONE",
         **facts,
     )
@@ -75,6 +75,36 @@ def test_unknown_release_does_not_turn_into_verified_success():
         event(terminal=True, release_status="UNKNOWN", verification_status="SUCCESS", place_succeeded=False), 1
     )
     assert done.token.startswith("E06:") and "领取" not in done.text
+
+
+def test_recovered_drop_is_announced_as_failed_but_ready_for_a_new_request():
+    (done,) = policy().accept(
+        event(
+            terminal=True,
+            root="FAILED",
+            release_status="RELEASED",
+            reason_code="GRIP_LOST_IN_TRANSFER",
+            recovery_state="COMPLETED",
+        ),
+        1,
+    )
+    assert "已完成收尾" in done.text and "重新下达指令" in done.text
+    assert "领取" not in done.text and "尚未确认" not in done.text
+
+
+def test_failed_cleanup_with_confirmed_release_is_not_called_an_unknown_execution():
+    (done,) = policy().accept(
+        event(terminal=True, root="FAILED", release_status="RELEASED", recovery_state="FAILED"), 1
+    )
+    assert "自动收尾未完成" in done.text and "尚未确认" not in done.text
+
+
+def test_admission_gate_names_the_prior_custody_without_claiming_a_new_pick_failed():
+    payload = event(terminal=True, root="FAILED")
+    payload["detail"].update(error_code="HELD_OBJECT_RECOVERY_REQUIRED", current_skill="", execution_detail={})
+    (done,) = policy().accept(payload, 1)
+    assert "上一次任务" in done.text and "需要先恢复" in done.text
+    assert "没能完成抓取" not in done.text and "执行状态尚未确认" not in done.text
 
 
 def test_real_preparation_phases_do_not_advance_beyond_transfer():

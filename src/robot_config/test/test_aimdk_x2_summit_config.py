@@ -24,6 +24,13 @@ def test_the_mirror_and_its_models_stay_down(config):
     assert services == {"grasp_grounding", "grasp_segmentation", "grasp_generation"}
 
 
+def test_fruit_grasp_can_select_either_installed_hand(config):
+    grasp = config["grasp_execution"]
+    assert grasp["backend_options"]["arm_side"] == "auto"
+    assert set(grasp["backend_options"]["installed_hands"]) == {"left", "right"}
+    assert {"joint.arm_stream", "joint.hand_stream"} <= set(grasp["command_interfaces"])
+
+
 def test_the_voice_bridge_section_is_valid(config):
     assert _validate_agent_voice_bridge(config["embodied"]["agent"]["voice_bridge"]) == []
 

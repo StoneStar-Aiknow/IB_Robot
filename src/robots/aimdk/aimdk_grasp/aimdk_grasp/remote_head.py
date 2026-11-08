@@ -57,6 +57,16 @@ WATCH_DISARM_S = 3.0
 _HEAD_PLAN_ID = "x2_grasp_head_plan_id"
 
 
+def _prepare_remote_models(camera, services):
+    """Require configured services and fresh registered feedback, without a target query."""
+    deadline = time.monotonic() + WARMUP_BUDGET_S
+    try:
+        services.wait_ready(deadline=deadline, cancelled=lambda: False)
+        camera.capture(deadline=deadline, cancelled=lambda: False)
+    except GraspFailure as failure:
+        raise RuntimeError(f"grasp startup readiness: {failure}") from failure
+
+
 @dataclass(frozen=True)
 class RemoteCapture:
     """``Observation.robot_state`` of a capture the grasp head keeps."""
@@ -575,13 +585,8 @@ def x2_remote_grasp_backends(
     )
 
     def prepare() -> None:
-        """Wait for the head, then warm the models on one of its captures."""
-        deadline = time.monotonic() + WARMUP_BUDGET_S
-        try:
-            observation = camera.capture(deadline=deadline, cancelled=lambda: False)
-            proposer.propose(observation, options["warmup_prompt"], deadline=deadline, cancelled=lambda: False)
-        except GraspFailure as failure:
-            raise RuntimeError(f"warmup on {options['warmup_prompt']!r}: {failure}") from failure
+        """Wait for configured services and a fresh head capture; targets belong to goals."""
+        _prepare_remote_models(camera, services)
 
     def close() -> None:
         for closer in reversed(closers):

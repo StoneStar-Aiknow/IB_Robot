@@ -49,6 +49,7 @@ class PlacePipeline:
 
     def run(self, held, query, *, deadline, cancelled, on_phase=lambda *_: None):
         result, starts = PlaceOutcome(), {}
+        execution_started = False
         planning_deadline = deadline - self.execute_reserve_s
 
         def phase(name, event, detail):
@@ -198,6 +199,7 @@ class PlacePipeline:
                     result.report.setdefault("retries", []).append(dict(record))
             result.report["plan"] = dict(plan.report)
             plan_home = getattr(backends.planner, "plan_home", None)
+            execution_started = True
             execution = PlaceSequence(backends, on_phase=phase).run(
                 plan,
                 cancelled=lambda: cancelled() or self.clock() >= deadline,
@@ -237,6 +239,30 @@ class PlacePipeline:
         except GraspFailure as failure:
             remember_failure(failure.reason_code, str(failure))
             result.reason_code, result.message = failure.reason_code, str(failure)
+            if not execution_started and failure.reason_code == "GRIP_LOST_IN_TRANSFER":
+                # A fresh, affirmative lost-grip report is different from
+                # unavailable feedback. Reuse the controlled drop cleanup;
+                # never clear custody merely because placement failed.
+                failed_phase = result.execution_detail.failed_phase or result.execution_detail.phase
+                plan_home = getattr(backends.planner, "plan_home", None)
+                recovery = PlaceSequence(backends, on_phase=phase).recover_before_transfer(
+                    go_home=None
+                    if plan_home is None
+                    else lambda: plan_home(held, deadline=deadline, cancelled=cancelled),
+                    cancelled=lambda: cancelled() or self.clock() >= deadline,
+                )
+                result.custody_outcome, result.release_status = recovery.custody_outcome, recovery.release_status
+                result.report["drop_recovery"] = {
+                    "state": recovery.recovery_state,
+                    "reason_code": recovery.reason_code,
+                    "message": recovery.message,
+                    "custody_outcome": recovery.custody_outcome,
+                }
+                result.execution_detail = replace(
+                    result.execution_detail, failed_phase=failed_phase, recovery_state=recovery.recovery_state
+                )
+                if recovery.message:
+                    result.message += f"; recovery: {recovery.message}"
         except Exception as exc:
             result.reason_code, result.message = "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}"
             remember_failure(result.reason_code, result.message)

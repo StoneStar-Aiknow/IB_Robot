@@ -1090,6 +1090,62 @@ def test_plan_summary_is_kept_when_a_step_has_no_chinese_catalog_name():
         assert AgentService._bind_summary_to_catalog_names(outcome, catalog).summary == "wave_hand、nav_turn"
 
 
+def test_terminal_preserves_admission_error_for_the_voice_channel(tmp_path):
+    class BlockedExecution(FakeExecution):
+        def execute(self, *args, **kwargs):
+            result = super().execute(*args, **kwargs)
+            return replace(result, status="failed", error_code="HELD_OBJECT_RECOVERY_REQUIRED")
+
+    events = Events()
+    service = AgentService(
+        planner=FakePlanner(
+            PlannerOutcome(
+                kind="workflow", user_message="挥手", summary="挥手", steps=(CanonicalWorkflowStep(1, "wave_hello"),)
+            )
+        ),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        execution=BlockedExecution(execution_mode=ASYNC_PRESENTATION_MODE),
+        presentation=ModeRoutingPresentationPort(
+            async_port=AsyncPresentationPort(), legacy_port=PresentationGate(0.05)
+        ),
+        event_sink=events,
+        execution_enabled=True,
+        allowed_skills={"wave_hello"},
+    )
+    try:
+        request = _request(text="挥手")
+        assert service.send_message(request).accepted
+        _wait_state(service, request.to_key(), {"FAILED"})
+        _wait_for_event(events, "terminal")
+        terminal = next(event for event in events.items if event.event_type == "terminal")
+        assert terminal.detail["error_code"] == "HELD_OBJECT_RECOVERY_REQUIRED"
+        assert "需要先恢复" in terminal.user_message
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("catalog_name", ["柠檬", "抓取水果"])
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [("a lemon", "抓取柠檬"), ("an apple", "抓取苹果"), ("an orange", "抓取橙子"), ("a red cup", "抓取物体")],
+)
+def test_pick_summary_names_the_requested_object_instead_of_the_first_fruit_alias(catalog_name, target, expected):
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="准备抓取并放进容器。",
+        summary="pick_object、place_in_container",
+        steps=(
+            CanonicalWorkflowStep(1, "pick_object", target_name=target),
+            CanonicalWorkflowStep(1, "place_in_container", target_name=target, container_name="an orange bowl"),
+        ),
+    )
+    catalog = {CATALOG_SKILL_NAMES_ZH: {"pick_object": catalog_name, "place_in_container": "放进容器"}}
+    bound = AgentService._bind_summary_to_catalog_names(outcome, catalog)
+    assert bound.summary == f"{expected}、放进容器"
+    assert bound.steps == outcome.steps
+
+
 @pytest.mark.parametrize("target", ["双手举过头顶", "arms_up"])
 def test_pose_summary_cannot_name_the_opposite_first_seed_alias(target):
     outcome = PlannerOutcome(

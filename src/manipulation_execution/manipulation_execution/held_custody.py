@@ -190,7 +190,10 @@ class HeldCustody:
                 raise GraspFailure("STALE_CLAIM", "claim has expired")
             self.state = {"held": "picked", "released": "released", "lost": "lost", "uncertain": "uncertain"}[outcome]
             self.owner, self.reason = "pick" if outcome == "held" else "", reason
-            self.deadline = self.clock() + self.lease_s
+            # A terminal place failure returns the original, still-held
+            # handover pose for put-back. Start that recovery at the next
+            # tick instead of blocking new commands for another full lease.
+            self.deadline = self.clock() if outcome == "held" and reason else self.clock() + self.lease_s
             self.token, self._unknown_since = "", None
             self.changed()
 
@@ -226,7 +229,8 @@ class HeldCustody:
                     self._unknown_since = None
                     if self.clock() >= self.deadline:
                         self.state = "recovering"
-                        recovery = self.recover, ("released", "LEASE_EXPIRED_PUT_BACK"), "RECOVERY_FAILED"
+                        done = "PLACE_FAILED_PUT_BACK" if self.reason else "LEASE_EXPIRED_PUT_BACK"
+                        recovery = self.recover, ("released", done), "RECOVERY_FAILED"
                         self.changed()
         if recovery is not None:
             motion, done, failed = recovery

@@ -66,6 +66,7 @@ description_variants:
     - condition: the visitor wants a fruit gift without naming one
       instead_use: offer_fruit_menu
     aliases_zh:
+    - 抓取水果
     - 柠檬
     - 苹果
     - 橙子
