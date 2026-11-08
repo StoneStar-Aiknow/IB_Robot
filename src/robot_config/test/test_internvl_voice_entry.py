@@ -28,6 +28,7 @@ BASELINE = "4442113e"
 PACKAGE = Path(__file__).resolve().parents[1]
 ROBOTS = PACKAGE / "config" / "robots"
 ENTRY = ROBOTS / "aimdk_x2_voice_mirror_all.yaml"
+GRASP = ROBOTS / "aimdk_x2_voice_mirror_grasp.yaml"
 BLOCK_START = "  # feat/x2-internvl-voice\n"
 BLOCK_END = "  # /feat/x2-internvl-voice\n"
 
@@ -129,3 +130,12 @@ class TestNothingElseChanges:
             pytest.skip(f"{BASELINE} is not reachable")
 
         assert _without_block(text) == baseline.stdout
+
+
+class TestGraspProfile:
+    def test_grasp_does_not_inherit_the_clips_or_the_look(self):
+        """voice_mirror_grasp's base_config is the entry: without its own block it would start the look."""
+        config = _load_robot_section(GRASP)[1]
+
+        assert config["internvl_voice"]["enabled"] is False
+        assert contract.normalize(config["internvl_voice"]) == (None, [])

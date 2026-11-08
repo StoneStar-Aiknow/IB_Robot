@@ -302,3 +302,12 @@ robot:
   cbf_safety:
     enabled: false
   # /feat/x2-cbf-safety
+
+  # feat/x2-internvl-voice
+  # Off here: this profile turns the mirror's voice off (mirror_session.voice
+  # above), so nothing would speak the clips, and the InternVL look would load
+  # its models on the 310P next to the grasp models. Without this block the
+  # look node is inherited from aimdk_x2_voice_mirror_all.yaml and starts.
+  internvl_voice:
+    enabled: false
+  # /feat/x2-internvl-voice
