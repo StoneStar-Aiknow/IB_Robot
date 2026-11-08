@@ -212,7 +212,12 @@ class TaskPoseRunner:
         for side in sides:
             arms_still_there()
             with self._stage(f"opening_{side}", progress):
-                hand_skipped = self._hand_call(lambda side=side: restorer.open_hand(context, side))
+                try:
+                    hand_skipped = self._hand_call(lambda side=side: restorer.open_hand(context, side))
+                finally:  # which ways the hand was opened (aimdk_grasp.omnihand.OPEN_PATHS)
+                    taken = getattr(restorer, "open_paths_taken", {}).get(side)
+                    if taken:
+                        self.report["stages"][f"opening_{side}"]["paths"] = list(taken)
             self.report["completed_hands"].append(side)
             if hand_skipped:
                 self.report["skipped_hands"].append(side)

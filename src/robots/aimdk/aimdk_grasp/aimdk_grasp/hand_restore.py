@@ -31,10 +31,10 @@ from typing import Protocol
 import numpy as np
 
 from .feedback import Feedback
-from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping, hand_links
-from .joints import ABSENT_HAND_COMMAND, BODY_JOINTS, LEFT_ARM, RIGHT_ARM, arm_joints, other_side
+from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping, hand_links, is_open
+from .joints import ABSENT_HAND_COMMAND, BODY_JOINTS, HAND_PARTS, LEFT_ARM, RIGHT_ARM, arm_joints, other_side
 from .joints import installed_hands as parse_installed_hands
-from .omnihand import HAND_HZ, HAND_STEP_RAD, staged_open_frames
+from .omnihand import HAND_HZ, HAND_STEP_RAD, OPEN_PATHS, THUMB, open_paths
 
 SIDES = ("left", "right")
 #: Why ``build_hand_plans`` has no plan for a hand the configuration declares absent.
@@ -79,6 +79,14 @@ class RestoreError(RuntimeError):
 class CapabilityMissing(RestoreError):
     def __init__(self, message: str):
         super().__init__("HAND_CAPABILITY_MISSING", message)
+
+
+class NotTracking(RestoreError):
+    """``HAND_NOT_TRACKING``, with whether the thumb was among the lagging joints."""
+
+    def __init__(self, message: str, *, thumb: bool):
+        super().__init__("HAND_NOT_TRACKING", message)
+        self.thumb = thumb
 
 
 # -- measurements -----------------------------------------------------------------------------
@@ -341,6 +349,7 @@ class HandRestorer:
     arm_motion_covered: bool = False
     installed_hands: tuple[str, ...] = SIDES
     _baseline: dict | None = field(default=None, init=False, repr=False)
+    open_paths_taken: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
         self.installed_hands = parse_installed_hands(self.installed_hands)
@@ -449,8 +458,9 @@ class HandRestorer:
             if plan is None:
                 reasons.append(f"{side} hand shape cannot be verified ({self.missing.get(side, 'no model')})")
                 continue
-            error = float(np.max(np.abs(self._hand(obs, side) - plan.open_pose)))
-            if error > OPEN_HAND_TOLERANCE_RAD:
+            hand = self._hand(obs, side)
+            error = float(np.max(np.abs(hand - plan.open_pose)))
+            if not is_open(hand, plan.open_pose):
                 reasons.append(f"{side} hand is {error:.3f} rad from open")
         return "; ".join(reasons)
 
@@ -526,6 +536,30 @@ class HandRestorer:
             plan.sweep.check(feedback, frames[start : start + 32], **arms)
         self.guard_arm_motion(ctx, initial)
 
+    def _open_path(self, ctx, plan, start, feedback, initial, *, prefer=(), exclude=(), **arms):
+        """The first collision-free way (:data:`OPEN_PATHS`, ``prefer`` first) to open ``plan``'s hand from ``start``.
+
+        The thumb and the bent fingers can block each other, so no single
+        order opens every hand shape. Raises ``HAND_SWEEP_COLLISION`` before
+        any output when no candidate is collision-free.
+        """
+        paths = dict(open_paths(start, plan.open_pose, plan.mapping.lower, plan.mapping.upper, self.step_rad))
+        refused = []
+        for name in dict.fromkeys((*prefer, *OPEN_PATHS)):
+            if name not in paths or name in exclude:
+                continue
+            try:
+                self._check_hand_sweep(ctx, plan, feedback, paths[name], initial, **arms)
+            except RestoreError as exc:
+                if exc.code != "HAND_SWEEP_COLLISION":
+                    raise
+                refused.append(f"{name}: {exc}")
+                continue
+            return name, paths[name]
+        raise RestoreError(
+            "HAND_SWEEP_COLLISION", f"no collision-free way to open the {plan.side} hand: " + "; ".join(refused)
+        )
+
     def preflight(
         self,
         ctx: RestoreContext,
@@ -570,8 +604,9 @@ class HandRestorer:
         projected = obs.feedback
         for side in sides:
             plan = self.plans[side]
-            frames = staged_open_frames(self._hand(obs, side), plan.open_pose, self.step_rad)
-            self._check_hand_sweep(ctx, plan, projected, frames, obs, left_arm=left_arm, right_arm=right_arm)
+            _, frames = self._open_path(
+                ctx, plan, self._hand(obs, side), projected, obs, left_arm=left_arm, right_arm=right_arm
+            )
             projected = replace(projected, **{f"{side}_hand": plan.open_pose})
             seconds += len(frames) / HAND_HZ + SETTLE_S
         for side in self.installed:
@@ -609,39 +644,61 @@ class HandRestorer:
 
     def _require_left_open(self, obs: Observation) -> None:
         self.require_capabilities(["left"])
-        gap = float(np.max(np.abs(self._hand(obs, "left") - self.plans["left"].open_pose)))
-        if gap > OPEN_HAND_TOLERANCE_RAD:
+        if not is_open(self._hand(obs, "left"), self.plans["left"].open_pose):
             raise RestoreError("HAND_PRESERVED_MOVED", "the left hand must be open before the right hand opens")
 
     def open_hand(self, ctx: RestoreContext, side: str) -> bool:
-        """Open one hand, fingers then thumb, along a collision-checked path; hold the other where it is."""
+        """Open one hand along a collision-checked path, once more another way if it stops tracking.
+
+        Holds the other hand where it is. The paths taken are kept in
+        ``open_paths_taken[side]``.
+        """
         self.require_capabilities([side])
+        self.open_paths_taken.pop(side, None)
         if self._baseline is None:
             raise RestoreError("HAND_NOT_SETTLED", "begin the hand phase before opening a hand")
         plan = self.plans[side]
         obs = self._observe(ctx)
         start = self._hand(obs, side)
+        held = self._held(obs, side)
+        if side == "right" and "left" in self.installed:
+            self._require_left_open(obs)
+        name, frames = self._open_path(ctx, plan, start, obs.feedback, obs)
+        ctx.progress(f"opening_{side}", 0.0)
+        if is_open(start, plan.open_pose):
+            self._confirm(ctx, (side,), lambda: None, SETTLE_S, obs)
+            self._baseline[side] = start.copy()
+            return True
+        final = {**held, side: plan.open_pose}
+        taken = self.open_paths_taken[side] = [name]
+        try:
+            self._drive(ctx, f"opening_{side}", obs, [{**held, side: f} for f in frames[1:]], final, moving=(side,))
+        except NotTracking as stuck:
+            # The tracking limit stays; one more try from where the hand stopped. A stuck thumb
+            # waits for the fingers to open; stuck fingers wait for the thumb to straighten away.
+            obs = self._observe(ctx)
+            self._held(obs, side)
+            prefer = ("fingers_first", "thumb_clear") if stuck.thumb else ("thumb_clear", "thumb_first")
+            try:
+                name, frames = self._open_path(
+                    ctx, plan, self._hand(obs, side), obs.feedback, obs, prefer=prefer, exclude=taken
+                )
+            except RestoreError as exc:
+                raise RestoreError(stuck.code, f"{stuck}; after {taken[0]}, {exc}") from None
+            taken.append(name)
+            sequence = [{**held, side: f} for f in frames[1:]]
+            self._drive(ctx, f"opening_{side}", obs, sequence, final, moving=(side,))
+        self._baseline[side] = plan.open_pose.copy()
+        return False
+
+    def _held(self, obs: Observation, side: str) -> dict:
+        """The measured hands, refusing a preserved hand that drifted from its baseline."""
         held = {s: self._hand(obs, s) for s in self.installed}
         # In particular, do not accept a new preserved pose after the other hand drifted.
         for other in self.installed:
             if other != side and np.max(np.abs(held[other] - self._baseline[other])) > PATH_SHAPE_HOLD_RAD:
                 raise RestoreError("HAND_PRESERVED_MOVED", f"{other} hand moved between preparation stages")
-        if side == "right" and "left" in self.installed:
-            self._require_left_open(obs)
-        # The same staged path preflight checked: fingers first, then the thumb.
-        frames = staged_open_frames(start, plan.open_pose, self.step_rad)
-        self._check_hand_sweep(ctx, plan, obs.feedback, frames, obs)
-        ctx.progress(f"opening_{side}", 0.0)
-        skipped = float(np.max(np.abs(start - plan.open_pose))) <= OPEN_HAND_TOLERANCE_RAD
-        if skipped:
-            self._confirm(ctx, (side,), lambda: None, SETTLE_S, obs)
-            self._baseline[side] = start.copy()
-            return True
-        final = {**held, side: plan.open_pose}
-        sequence = [{**held, side: frame} for frame in frames[1:]]
-        self._drive(ctx, f"opening_{side}", obs, sequence, final, moving=(side,))
-        self._baseline[side] = plan.open_pose.copy()
-        return False
+        return held
 
     def confirm(self, ctx: RestoreContext, sides: Sequence[str], arm_check: Callable[[], None]) -> None:
         """Observe the released hands and the arms together for :data:`OBSERVE_S`; any change is a failure."""
@@ -660,7 +717,7 @@ class HandRestorer:
             for side in self.installed:
                 pose = self._hand(obs, side)
                 if side in sides:
-                    if float(np.max(np.abs(pose - self.plans[side].open_pose))) > OPEN_HAND_TOLERANCE_RAD:
+                    if not is_open(pose, self.plans[side].open_pose):
                         raise RestoreError("HAND_NOT_SETTLED", f"{side} hand is not open after the release")
                 elif side in baseline and float(np.max(np.abs(pose - baseline[side]))) > PATH_SHAPE_HOLD_RAD:
                     raise RestoreError("HAND_PRESERVED_MOVED", f"{side} hand moved during the release")
@@ -716,8 +773,13 @@ class HandRestorer:
                 actual = {side: self._hand(obs, side) for side in self.installed}
                 for side in self.installed:
                     if side in moving:
-                        if float(np.max(np.abs(actual[side] - previous[side]))) > TRACKING_RAD:
-                            raise RestoreError("HAND_NOT_TRACKING", f"{side} hand is not tracking the previous command")
+                        lagging = np.abs(actual[side] - previous[side]) > TRACKING_RAD
+                        if lagging.any():
+                            raise NotTracking(
+                                f"{side} hand is not tracking the previous command "
+                                f"(lagging: {', '.join(HAND_PARTS[i] for i in np.flatnonzero(lagging))})",
+                                thumb=bool(lagging[THUMB].any()),
+                            )
                     elif float(np.max(np.abs(actual[side] - held[side]))) > PATH_SHAPE_HOLD_RAD:
                         raise RestoreError("HAND_PRESERVED_MOVED", f"preserved {side} hand moved during {name}")
                 refusal = ports.refusal()
@@ -726,9 +788,11 @@ class HandRestorer:
                 ports.publish(self._command(frame, "left"), self._command(frame, "right"))
                 previous = {side: np.asarray(frame[side], float) for side in self.installed}
                 last_tick = tick
-                error = max(float(np.max(np.abs(actual[side] - final[side]))) for side in moving)
-                reached = index >= len(sequence)
-                if reached and error <= OPEN_HAND_TOLERANCE_RAD and gains_class(command) == "ready":
+                if name == "takeover":  # holding the measured hands, not opening them
+                    there = all(np.max(np.abs(actual[s] - final[s])) <= OPEN_HAND_TOLERANCE_RAD for s in moving)
+                else:
+                    there = all(is_open(actual[s], final[s]) for s in moving)
+                if index >= len(sequence) and there and gains_class(command) == "ready":
                     settled_at = obs.feedback.received_at if settled_at is None else settled_at
                     if obs.feedback.received_at - settled_at >= SETTLE_S:
                         return

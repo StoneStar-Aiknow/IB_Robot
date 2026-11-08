@@ -151,12 +151,12 @@ robot:
       - joint.arm_stream
       - joint.hand_stream
     backend_options:
-      # Current hardware: right hand mounted, left hand removed (both arms remain).
-      # Two hands: installed_hands: [left, right], arm_side: auto.
+      # Current hardware: both hands mounted; grasp with the right arm.
+      # For automatic arm selection with both hands, set arm_side: auto.
       # Left hand only: installed_hands: [left], arm_side: left.
       # Keep this block identical on the 310P and Orin. Recompile the fixed
       # artifact after changing mounting or task poses; their digest is frozen.
-      installed_hands: [right]
+      installed_hands: [left, right]
       arm_side: right
       planning:
         approach_over_height_m: 0.18

@@ -38,7 +38,7 @@ from manipulation_execution.grasp_pipeline.contracts import (
 
 from .arm_gravity import ArmGravity, require_executable
 from .grasp_session import check_approach_order
-from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
+from .hand import OPEN_HAND_TOLERANCE_RAD, THUMB_ABAD_OPEN_TOLERANCE_RAD, HandMapping
 from .joints import arm_joints
 from .observation import AdmittedState, LiveState
 from .planner import PlannerFault, palm_goals_from_camera_grasps
@@ -156,7 +156,13 @@ def check_initial_hand(mapping: HandMapping, admitted: AdmittedState) -> dict:
             errors[name + "_max_error_rad"] = mapping.require_open(feedback.hand(mapping.side))
         except RuntimeError as exc:
             raise RuntimeError(f"{name.capitalize()} feedback: {exc}") from exc
-    return dict(preset="open", confirmed=True, tolerance_rad=OPEN_HAND_TOLERANCE_RAD, **errors)
+    return dict(
+        preset="open",
+        confirmed=True,
+        tolerance_rad=OPEN_HAND_TOLERANCE_RAD,
+        thumb_abad_tolerance_rad=THUMB_ABAD_OPEN_TOLERANCE_RAD,
+        **errors,
+    )
 
 
 def segment(name: str, trajectory, side: str = "left") -> ArmSegment:

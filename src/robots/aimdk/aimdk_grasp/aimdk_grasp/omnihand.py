@@ -32,7 +32,7 @@ import numpy as np
 from manipulation_execution.grasp_pipeline.contracts import EffectorAction, EffectorOutcome, Flag
 from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
 
-from .hand import OPEN_HAND_TOLERANCE_RAD, PRESERVED_HAND_DRIFT_RAD, HandMapping
+from .hand import PRESERVED_HAND_DRIFT_RAD, HandMapping, is_open
 from .joints import ABSENT_HAND_COMMAND, HAND_PARTS, check_side, other_side
 
 HAND_HZ = 50.0
@@ -84,31 +84,79 @@ FINGERS = {
 HAND_OFFSETS = {"left": 0, "right": len(HAND_PARTS)}
 
 
-def staged_open_frames(start, target, step_rad: float = HAND_STEP_RAD) -> np.ndarray:
-    """The measured start, then the four fingers alone, then the thumb alone.
+#: Native indices of the thumb's joints (either hand); the other seven are the four fingers.
+THUMB = np.zeros(len(HAND_PARTS), dtype=bool)
+THUMB[list(FINGERS["thumb"][0])] = True
+THUMB.setflags(write=False)
+#: Where the thumb waits while the fingers open in the ``thumb_clear`` path:
+#: abduction and flexion straightened (native 0), kept this far inside their limits.
+THUMB_CLEAR_MARGIN_RAD = 0.05
+#: The ways to open a hand, in order of preference. A straight line is the
+#: shortest motion; the staged ones exist because the thumb and the bent fingers
+#: can block each other (2026-11-08: a straight open from a half-closed right
+#: hand stalled the thumb abduction at -1.10 rad under the fingers; after the
+#: thumb had been straightened, the same open reached the preset).
+OPEN_PATHS = ("together", "fingers_first", "thumb_first", "thumb_clear")
 
-    Each stage is a straight line no more than ``step_rad`` per joint per frame.
-    Opening the fingers first frees a thumb folded under them: on 2026-11-08 a
-    straight-line open from a half-closed hand stalled the right thumb abduction
-    at -1.10 rad under the bent fingers until tracking failed, while the same
-    open from an extended hand reached the preset.
-    """
-    start, target = np.asarray(start, float), np.asarray(target, float)
-    if start.shape != (len(HAND_PARTS),) or target.shape != start.shape or not np.isfinite([start, target]).all():
+
+def chained_frames(start, waypoints, step_rad: float = HAND_STEP_RAD) -> np.ndarray:
+    """The measured start, then straight lines through ``waypoints``, at most ``step_rad`` per joint per frame."""
+    start = np.asarray(start, float)
+    points = [np.asarray(point, float) for point in waypoints]
+    if start.shape != (len(HAND_PARTS),) or any(point.shape != start.shape for point in points):
+        raise ValueError("Ten finite hand values required")
+    if not np.isfinite([start, *points]).all():
         raise ValueError("Ten finite hand values required")
     if not np.isfinite(step_rad) or not 0 < step_rad <= HAND_STEP_RAD:
         raise ValueError(f"Hand step must be finite and in (0, {HAND_STEP_RAD}] rad")
-    thumb = np.zeros(len(HAND_PARTS), dtype=bool)
-    thumb[list(FINGERS["thumb"][0])] = True
-    fingers_open = np.where(thumb, start, target)
-    frames = [start]
-    for begin, end in ((start, fingers_open), (fingers_open, target)):
-        span = float(np.max(np.abs(end - begin)))
+    frames, here = [start], start
+    for point in points:
+        span = float(np.max(np.abs(point - here)))
         if span > 0.0:
-            frames.extend(np.linspace(begin, end, int(np.ceil(span / step_rad)) + 1)[1:])
+            frames.extend(np.linspace(here, point, int(np.ceil(span / step_rad)) + 1)[1:])
+            here = point
     if len(frames) == 1:
-        frames.append(target)  # already there: one frame, as a straight line would send
+        frames.append(points[-1] if points else start)  # already there: one frame, as before
     return np.asarray(frames)
+
+
+def open_path(name: str, start, target, lower, upper, step_rad: float = HAND_STEP_RAD) -> np.ndarray:
+    """Frames of one way (:data:`OPEN_PATHS`) to go from ``start`` to ``target``.
+
+    ``together``: every joint on one straight line. ``fingers_first``: the
+    thumb holds while the four fingers open, then the thumb opens.
+    ``thumb_first``: the reverse. ``thumb_clear``: the thumb straightens out of
+    the fingers' way (roll kept), the fingers open, then the thumb comes in to
+    its target. ``lower``/``upper`` are the native joint limits.
+    """
+    start, target = np.asarray(start, float), np.asarray(target, float)
+    if name == "together":
+        waypoints = [target]
+    elif name == "fingers_first":
+        waypoints = [np.where(THUMB, start, target), target]
+    elif name == "thumb_first":
+        waypoints = [np.where(THUMB, target, start), target]
+    elif name == "thumb_clear":
+        lower, upper = np.asarray(lower, float), np.asarray(upper, float)
+        straight = [HAND_PARTS.index("thumb_abad"), HAND_PARTS.index("thumb_mcp")]
+        clear = start.copy()
+        clear[straight] = np.clip(
+            0.0, lower[straight] + THUMB_CLEAR_MARGIN_RAD, upper[straight] - THUMB_CLEAR_MARGIN_RAD
+        )
+        waypoints = [clear, np.where(THUMB, clear, target), target]
+    else:
+        raise ValueError(f"unknown hand open path {name!r}")
+    return chained_frames(start, waypoints, step_rad)
+
+
+def open_paths(start, target, lower, upper, step_rad: float = HAND_STEP_RAD) -> list[tuple[str, np.ndarray]]:
+    """Every distinct :func:`open_path`, in :data:`OPEN_PATHS` order; a path equal to an earlier one is left out."""
+    paths = []
+    for name in OPEN_PATHS:
+        frames = open_path(name, start, target, lower, upper, step_rad)
+        if not any(frames.shape == other.shape and np.array_equal(frames, other) for _, other in paths):
+            paths.append((name, frames))
+    return paths
 
 
 class HandIO(Protocol):
@@ -215,7 +263,7 @@ class OmniHandEffector:
         """Fresh open-hand feedback and no tactile contact are required."""
         touch = self.io.touch()
         return bool(
-            np.max(np.abs(self._measured() - self.mapping.preset("open"))) <= OPEN_HAND_TOLERANCE_RAD
+            is_open(self._measured(), self.mapping.preset("open"))
             and touch is not None
             and all(value < CONTACT_TOUCH for value in touch.values())
         )
@@ -262,30 +310,45 @@ class OmniHandEffector:
     # -- actions --------------------------------------------------------------------
 
     def _open(self, name: str, cancelled: Flag) -> EffectorOutcome:
+        holding = self._grip is not None
         self._grip = None  # whatever was held is let go
         target = self.mapping.preset("open")
-        start = self._measured()
-        row = self.report[name] = {}
+        row = self.report[name] = dict(paths=["together"], frames=0, settle_frames=0)
         if self.command is not None and np.array_equal(self.command, target):
             frames = []  # already commanded open: only wait for the fingers below
         else:
-            # Fingers first, then the thumb, HAND_STEP_RAD per frame (staged_open_frames).
-            frames = list(staged_open_frames(start, target)[1:])
+            # One straight line: an object in the hand is let go by every finger at once.
+            frames = chained_frames(self._measured(), [target])[1:]
+        self._open_along(frames, target, cancelled, name)
+        if float(np.max(np.abs(target - self._measured()))) > OPEN_SHORT_MAX_RAD and not holding:
+            # The thumb and the bent fingers may block each other: straighten the
+            # thumb out of the way, open the fingers, then bring the thumb in.
+            # Not with an object in the hand, which a straightening thumb could knock.
+            row["paths"].append("thumb_clear")
+            frames = open_path("thumb_clear", self._measured(), target, self.mapping.lower, self.mapping.upper)
+            self._open_along(frames[1:], target, cancelled, name)
+        measured = self._measured()
+        short = float(np.max(np.abs(target - measured)))
+        row.update(short_of_target_rad=short, measured=measured.tolist())
+        if short > OPEN_SHORT_MAX_RAD:
+            return EffectorOutcome(False, f"hand blocked {short:.3f} rad short of open", report=dict(row))
+        if not is_open(measured, target):
+            row["open_short"] = True
+        return EffectorOutcome(True, report=dict(row))
+
+    def _open_along(self, frames, target: np.ndarray, cancelled: Flag, name: str) -> None:
+        """Send ``frames`` and hold ``target`` briefly, then until the hand is open, up to :data:`OPEN_SETTLE_MAX_S`."""
+        row = self.report[name]
+        frames = list(frames)
+        if frames:
             frames += [target] * int(CLOSE_SETTLE_S * HAND_HZ)
         for frame in frames:
             self._frame(frame, cancelled, name)
-        waited, ended = 0, self.io.monotonic() + OPEN_SETTLE_MAX_S
-        while np.max(np.abs(self._measured() - target)) > OPEN_HAND_TOLERANCE_RAD and self.io.monotonic() < ended:
+        row["frames"] += len(frames)
+        ended = self.io.monotonic() + OPEN_SETTLE_MAX_S
+        while not is_open(self._measured(), target) and self.io.monotonic() < ended:
             self._frame(target, cancelled, name)
-            waited += 1
-        measured = self._measured()
-        short = float(np.max(np.abs(target - measured)))
-        row.update(frames=len(frames), settle_frames=waited, short_of_target_rad=short, measured=measured.tolist())
-        if short > OPEN_SHORT_MAX_RAD:
-            return EffectorOutcome(False, f"hand blocked {short:.3f} rad short of open", report=dict(row))
-        if short > OPEN_HAND_TOLERANCE_RAD:
-            row["open_short"] = True
-        return EffectorOutcome(True, report=dict(row))
+            row["settle_frames"] += 1
 
     def _close(self, halted: Flag, cancelled: Flag) -> EffectorOutcome:
         self._grip = None

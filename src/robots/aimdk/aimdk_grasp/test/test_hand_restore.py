@@ -27,7 +27,7 @@ from aimdk_grasp.hand_restore import (
     sweep_frames,
 )
 from aimdk_grasp.joints import BODY_JOINTS, LEFT_ARM, RIGHT_ARM
-from aimdk_grasp.omnihand import staged_open_frames
+from aimdk_grasp.omnihand import OPEN_PATHS, THUMB
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS
 
@@ -234,7 +234,7 @@ def test_long_hand_preflight_refreshes_owner_and_checks_every_sample(restore):
         plan.sweep.check = slow_check
     expected = np.concatenate(
         [
-            staged_open_frames(ports.hands[side], restorer.plans[side].open_pose, restorer.step_rad)
+            sweep_frames(ports.hands[side], restorer.plans[side].open_pose, restorer.step_rad)
             for side in ("left", "right")
         ]
     )
@@ -288,6 +288,8 @@ def test_preflight_refuses_before_output(restore, fault, code):
     with pytest.raises(RestoreError) as error:
         prepare(restorer, ports, ctx, sides)
     assert error.value.code == code and not ports.sent
+    if fault == "collision":  # every way to open was tried
+        assert all(name in str(error.value) for name in OPEN_PATHS)
 
 
 @pytest.mark.parametrize(
@@ -335,7 +337,9 @@ def test_mid_open_failure_always_releases_and_never_opens_right(restore, fault, 
     with pytest.raises(RestoreError) as error:
         restorer.open_hand(ctx, "left")
     assert error.value.code == code
-    assert ports.releases == 1 and {row[0] for row in ports.sent} == {"opening_left"}
+    # A hand that stops tracking gets one more try, released like the first.
+    assert ports.releases == (2 if fault == "tracking" else 1)
+    assert {row[0] for row in ports.sent} == {"opening_left"}
 
 
 @pytest.mark.parametrize(
@@ -356,7 +360,7 @@ def test_release_observation_rejects_rebound_or_loss_of_control(restore, fault, 
 
     def fail():
         if fault == "rebound":
-            ports.hands["left"][4] = 0.15  # past the 0.1 rad open tolerance
+            ports.hands["left"][4] = 0.1
         elif fault == "gains":
             ports.board = replace(ports.board, damping=np.zeros(14))
         elif fault == "board":
@@ -479,3 +483,79 @@ def test_temporary_age_override_still_rejects_unhealthy_feedback(restore):
         restorer._observe(ctx)
     assert error.value.code == "HAND_FEEDBACK_STALE"
     assert not ports.sent
+
+
+FINGERS = np.flatnonzero(~THUMB)  # the four fingers' joints
+
+
+def left_opening(ports):
+    return np.array([row[1] for row in ports.sent if row[0] == "opening_left"])
+
+
+def test_the_first_collision_free_way_to_open_is_checked_and_driven(restore):
+    restorer, ports, ctx, _ = restore
+    start, target = ports.hands["left"].copy(), restorer.plans["left"].open_pose
+
+    def thumb_under_fingers(frames):
+        thumb_moved = np.any(np.abs(frames[:, THUMB] - start[THUMB]) > 1e-9, axis=1)
+        curled = np.any(np.abs(frames[:, FINGERS] - target[FINGERS]) > 1e-9, axis=1)
+        return thumb_moved & curled
+
+    def check(_feedback, frames, **_kw):
+        if thumb_under_fingers(np.asarray(frames)).any():
+            raise RestoreError("HAND_SWEEP_COLLISION", "thumb under the curled fingers")
+
+    for plan in restorer.plans.values():
+        plan.sweep = SimpleNamespace(check=check)
+    prepare(restorer, ports, ctx)
+    assert not restorer.open_hand(ctx, "left")
+    assert restorer.open_paths_taken["left"] == ["fingers_first"]
+    sent = left_opening(ports)
+    assert not thumb_under_fingers(sent).any()
+    np.testing.assert_allclose(ports.hands["left"], target)
+
+
+@pytest.mark.parametrize("frees", [True, False])
+def test_a_thumb_stuck_under_the_fingers_is_retried_once_with_the_fingers_first(restore, frees):
+    restorer, ports, ctx, _ = restore
+    prepare(restorer, ports, ctx)
+    start, target = ports.hands["left"].copy(), restorer.plans["left"].open_pose
+    publish = ports.publish
+
+    def interlocked(left, right):
+        publish(left, right)
+        hand = ports.hands["left"]
+        if not frees or np.max(np.abs(hand[FINGERS] - target[FINGERS])) > 0.05:
+            hand[THUMB] = start[THUMB]  # the thumb cannot pass the curled fingers
+
+    ports.publish = interlocked
+    if frees:
+        assert not restorer.open_hand(ctx, "left")
+        np.testing.assert_allclose(ports.hands["left"], target)
+    else:
+        with pytest.raises(RestoreError) as error:
+            restorer.open_hand(ctx, "left")
+        assert error.value.code == "HAND_NOT_TRACKING" and "thumb" in str(error.value)
+    assert restorer.open_paths_taken["left"] == ["together", "fingers_first"]
+    assert ports.releases == 2
+
+
+def test_fingers_stuck_under_the_thumb_are_retried_with_the_thumb_cleared(restore):
+    restorer, ports, ctx, _ = restore
+    prepare(restorer, ports, ctx)
+    plan = restorer.plans["left"]
+    abad, mcp = 1, 2
+    clear = np.clip(0.0, plan.mapping.lower + 0.05, plan.mapping.upper - 0.05)
+    publish = ports.publish
+
+    def interlocked(left, right):
+        held = ports.hands["left"][FINGERS].copy()
+        publish(left, right)
+        hand = ports.hands["left"]
+        if np.max(np.abs(hand[[abad, mcp]] - clear[[abad, mcp]])) > 0.06:
+            hand[FINGERS] = np.where(np.abs(hand[FINGERS] - plan.open_pose[FINGERS]) < 1e-9, hand[FINGERS], held)
+
+    ports.publish = interlocked
+    assert not restorer.open_hand(ctx, "left")
+    assert restorer.open_paths_taken["left"] == ["together", "thumb_clear"]
+    np.testing.assert_allclose(ports.hands["left"], plan.open_pose)
