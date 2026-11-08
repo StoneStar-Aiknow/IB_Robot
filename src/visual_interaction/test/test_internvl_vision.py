@@ -347,7 +347,10 @@ class TestLookBench:
         monkeypatch.setitem(
             sys.modules, "visual_interaction.session.look_say", types.SimpleNamespace(QUESTIONS=questions)
         )
-        gesture, still = tmp_path / "gesture.jpg", tmp_path / "still.jpg"
+        # Same file name in two folders: the frames of a live run are named like this.
+        gesture, still = tmp_path / "a" / "0.jpg", tmp_path / "b" / "0.jpg"
+        gesture.parent.mkdir()
+        still.parent.mkdir()
         cv2.imwrite(str(gesture), frame(150, 1344, 972))
         cv2.imwrite(str(still), frame(90, 1344, 972))
         code = look_bench.main(
@@ -374,6 +377,7 @@ class TestLookBench:
         assert set(report["ask"]) == {f"{key}/{view}" for key in questions for view in ("crop", "whole")}
         assert report["ask"]["q1/crop"]["n"] == 4
         assert [item["synthetic"] for item in report["images"]] == [False, True]
+        assert len(report["answers_last_run"]) == 4
         assert set(report["q3_no_gesture"]["crop"]) == {"q1", "q3.heart", "q3.wave"}
         assert report["load_s"] >= 0 and report["question_failures"] == {}
         assert any(line.startswith("prepare/crop") for line in out)

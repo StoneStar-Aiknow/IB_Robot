@@ -50,7 +50,8 @@ def _yes_no(gesture: str) -> str:
 
 QUESTIONS: dict[str, tuple[str, int]] = {
     Q1: (CHATTER_QUESTION, 16),
-    Q2: ("这个人的手指比的是什么手势？用不超过五个字回答。", 6),
+    # The model repeats "这个人的手指比的是" first: 6 tokens ended before the name.
+    Q2: ("这个人的手指比的是什么手势？用不超过五个字回答。", 14),
     Q3_HEART: (_yes_no("用手比爱心"), 3),
     Q3_THUMB: (_yes_no("竖大拇指"), 3),
     Q3_YEAH: (_yes_no("比剪刀手"), 3),

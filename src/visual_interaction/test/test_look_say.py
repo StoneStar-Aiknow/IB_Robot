@@ -164,7 +164,7 @@ def test_a_specific_action_wins_over_standing_still():
 def test_the_questions_are_the_plan_s_with_their_budgets():
     assert set(QUESTIONS) == {"q1", "q2", "q3.heart", "q3.thumb", "q3.yeah", "q3.wave", "q3.open"}
     assert QUESTIONS["q1"][1] == 16
-    assert QUESTIONS["q2"] == ("这个人的手指比的是什么手势？用不超过五个字回答。", 6)
+    assert QUESTIONS["q2"] == ("这个人的手指比的是什么手势？用不超过五个字回答。", 14)
     assert QUESTIONS["q3.heart"] == ("这个人是在用手比爱心吗？只回答是或不是。", 3)
     assert "竖大拇指" in QUESTIONS["q3.thumb"][0]
     assert "剪刀手" in QUESTIONS["q3.yeah"][0]
@@ -191,6 +191,19 @@ def test_q2_is_asked_only_for_a_vague_hand_gesture():
     [("比心", HEART), ("爱心", HEART), ("大拇指", THUMB), ("点赞", THUMB), ("V字", YEAH), ("剪刀手", YEAH)],
 )
 def test_q2_names_one_of_the_three_hand_gestures(answer, label):
+    assert refine(HAND_ANY, answer) is label
+
+
+@pytest.mark.parametrize(
+    ("answer", "label"),
+    [
+        ("这个人的手指比的是心形手势。", HEART),
+        ('这个人的手指比的是"V"字手势。', YEAH),
+        ('这个人的手指比的是"三"字手势。', HAND_ANY),
+        ("这个人的手指比的是“", HAND_ANY),
+    ],
+)
+def test_q2_answers_read_on_the_board_with_the_question_repeated(answer, label):
     assert refine(HAND_ANY, answer) is label
 
 

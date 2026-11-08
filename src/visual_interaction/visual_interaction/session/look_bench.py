@@ -194,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
                     if timed:
                         ask_s.setdefault(f"{key}/{view}", []).append(answer.seconds)
                         ask_tokens.setdefault(f"{key}/{view}", []).append(answer.tokens)
-                    answers.setdefault(f"{Path(item['path']).name}/{view}", {})[key] = answer.text
+                    answers.setdefault(f"{item['path']}/{view}", {})[key] = answer.text
     report["rss_kb_after_runs"] = _rss_kb()
     report["prepare"] = {view: _stats(values) for view, values in prepare_s.items()}
     report["crop_fallbacks"] = fallbacks
