@@ -46,7 +46,7 @@ def event(
             "gateway_sequence": sequence,
             "state": state,
             "execution_detail": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "phase": phase,
                 "phase_state": phase_state,
                 "retry_count": retry,
@@ -74,20 +74,19 @@ def policy():
 
 def test_complete_mock_trace_separates_step_success_from_root_terminal(policy):
     (start,) = policy.accept(event(), 0)
-    assert start.text == "我来尝试拿苹果，再准备放置。"
+    assert start.text == "好，我来拿苹果，再放到指定容器。请稍等。"
     assert start.token.startswith("F05:") and not start.terminal
-    (picked,) = policy.accept(event(2, state="SUCCEEDED", phase="verify", phase_state="SUCCEEDED"), 1)
-    assert picked.text == "拿到了，接下来准备放置。"
-    assert not picked.terminal and not policy.is_current(start, 1)
+    assert policy.accept(event(2, state="SUCCEEDED", phase="verify", phase_state="SUCCEEDED"), 1) == []
+    assert not policy.is_current(start, 1)
     (moving,) = policy.accept(place(3), 2)
     assert moving.token.startswith("F08:") and not moving.terminal
     # Individual place SUCCEEDED with root ACTIVE is still not task completion.
-    assert policy.accept(place(4, state="SUCCEEDED", phase_state="SUCCEEDED", release_status=1), 3) == []
+    assert policy.accept(place(4, state="SUCCEEDED", phase_state="SUCCEEDED", release_status="RELEASED"), 3) == []
     assert not policy.is_current(moving, 3)
-    (complete,) = policy.accept(terminal(5, release_status=1), 4)
-    assert complete == Notice("放置动作完成了，请工作人员确认后领取。", "r1", "s1", "e1", True, True, complete.token)
+    (complete,) = policy.accept(terminal(5, release_status="RELEASED"), 4)
+    assert complete == Notice("放置步骤已结束，请工作人员确认现场状态。", "r1", "s1", "e1", True, True, complete.token)
     assert policy.is_current(complete, 4)
-    assert policy.accept(terminal(6, release_status=1), 5) == []
+    assert policy.accept(terminal(6, release_status="RELEASED"), 5) == []
     assert policy.owns("r1")
 
 
@@ -131,10 +130,10 @@ def test_actual_flat_position_not_optional_display_index(policy):
     assert notice.token.startswith("F05:")
 
 
-@pytest.mark.parametrize("release", [1, "RELEASED", "RELEASE_RELEASED"])
+@pytest.mark.parametrize("release", ["RELEASED"])
 def test_structured_release_evidence_with_root_success(policy, release):
     (result,) = policy.accept(terminal(release_status=release), 0)
-    assert result.text == "放置动作完成了，请工作人员确认后领取。"
+    assert result.text == "放置步骤已结束，请工作人员确认现场状态。"
 
 
 @pytest.mark.parametrize("facts", [{}, {"message": "released"}, {"place_succeeded": True}, {"success": True}])
@@ -144,7 +143,7 @@ def test_generic_success_does_not_infer_release(policy, facts):
 
 
 def test_earlier_release_fact_is_not_reused_for_generic_terminal(policy):
-    assert policy.accept(place(release_status=1, phase_state="SUCCEEDED"), 0) == []
+    assert policy.accept(place(release_status="RELEASED", phase_state="SUCCEEDED"), 0) == []
     (result,) = policy.accept(terminal(), 1)
     assert result.text == "放置步骤已结束，请工作人员确认现场状态。"
 
@@ -161,7 +160,7 @@ def test_earlier_release_fact_is_not_reused_for_generic_terminal(policy):
     ],
 )
 def test_uncertain_release_or_recovery_overrides_success(policy, facts):
-    payload = terminal(release_status=1)
+    payload = terminal(release_status="RELEASED")
     payload["detail"]["execution_detail"].update(facts)
     (result,) = policy.accept(payload, 0)
     assert result.token.startswith("E06:") and result.important and result.terminal
@@ -169,12 +168,12 @@ def test_uncertain_release_or_recovery_overrides_success(policy, facts):
 
 
 def test_place_failure_is_never_success(policy):
-    payload = place(root="FAILED", state="FAILED", kind="terminal", release_status=1)
+    payload = place(root="FAILED", state="FAILED", kind="terminal", release_status="RELEASED")
     (result,) = policy.accept(payload, 0)
-    assert result.text == "这次没能完成放置，请工作人员协助。"
+    assert result.text == "物体已经松开，动作还未全部完成，请先别靠近。"
 
 
-@pytest.mark.parametrize("release", [0, "NOT_RELEASED", "RELEASE_NOT_RELEASED"])
+@pytest.mark.parametrize("release", ["NOT_RELEASED"])
 def test_explicit_not_released_overrides_inconsistent_root_success(policy, release):
     (result,) = policy.accept(terminal(release_status=release), 0)
     assert result.text == "这次没能完成放置，请工作人员协助。"
@@ -183,7 +182,7 @@ def test_explicit_not_released_overrides_inconsistent_root_success(policy, relea
 def test_pick_failure_blocks_later_contradictory_place_success(policy):
     (failure,) = policy.accept(event(state="FAILED", phase_state="FAILED"), 0)
     assert "没能完成抓取" in failure.text and not failure.terminal
-    (result,) = policy.accept(terminal(release_status=1), 1)
+    (result,) = policy.accept(terminal(release_status="RELEASED"), 1)
     assert "领取" not in result.text and "没能完成放置" in result.text
 
 
@@ -195,9 +194,10 @@ def test_retry_only_on_count_increase_once_per_attempt(policy):
     (retry_again,) = policy.accept(event(4, retry=2, phase="observe"), 3)
     assert retry_again.token.startswith("F12:")
     assert policy.accept(event(5, retry=1, phase="observe"), 4) == []
-    (picked,) = policy.accept(event(6, retry=2, state="SUCCEEDED"), 5)
-    assert picked.text == "拿到了，接下来准备放置。"
-    (result,) = policy.accept(terminal(7, release_status=1), 6)
+    assert policy.accept(event(6, retry=2, state="SUCCEEDED"), 5) == []
+    (result,) = policy.accept(
+        terminal(7, release_status="RELEASED", verification_status="SUCCESS", place_succeeded=True), 6
+    )
     assert "领取" in result.text
 
 
@@ -236,7 +236,7 @@ def test_gateway_order_duplicates_foreign_execution_and_request(policy):
 
 def test_root_terminal_can_promote_same_gateway_sequence_with_new_agent_sequence(policy):
     assert policy.accept(place(3, state="SUCCEEDED", phase_state="SUCCEEDED"), 0) == []
-    payload = terminal(3, release_status=1)
+    payload = terminal(3, release_status="RELEASED", verification_status="SUCCESS", place_succeeded=True)
     assert policy.accept(payload, 1) == []
     payload["sequence"] = 4
     (result,) = policy.accept(payload, 1)
@@ -244,19 +244,21 @@ def test_root_terminal_can_promote_same_gateway_sequence_with_new_agent_sequence
 
 
 def test_terminal_event_without_known_root_outcome_is_conservative(policy):
-    payload = place(kind="terminal", release_status=1)
+    payload = place(kind="terminal", release_status="RELEASED")
     (result,) = policy.accept(payload, 0)
     assert result.terminal and "领取" not in result.text
 
 
 def test_terminal_root_state_does_not_require_terminal_event_type(policy):
-    (result,) = policy.accept(place(root="SUCCEEDED", release_status=1), 0)
+    (result,) = policy.accept(
+        place(root="SUCCEEDED", release_status="RELEASED", verification_status="SUCCESS", place_succeeded=True), 0
+    )
     assert result.terminal and "领取" in result.text
 
 
 def test_current_skill_alone_never_proves_place_finished(policy):
-    assert policy.accept(place(state="SUCCEEDED", phase_state="SUCCEEDED", release_status=1), 0) == []
-    assert policy.accept(place(3, state="SUCCEEDED", phase_state="SUCCEEDED", release_status=1), 1) == []
+    assert policy.accept(place(state="SUCCEEDED", phase_state="SUCCEEDED", release_status="RELEASED"), 0) == []
+    assert policy.accept(place(3, state="SUCCEEDED", phase_state="SUCCEEDED", release_status="RELEASED"), 1) == []
 
 
 def test_request_terminal_after_pick_never_claims_workflow_success(policy):
@@ -272,15 +274,15 @@ def test_later_unrelated_step_invalidates_queued_progress(policy):
 
 
 def test_new_request_and_ended_session_invalidate_old_terminal(policy):
-    (notice,) = policy.accept(terminal(release_status=1), 0)
+    (notice,) = policy.accept(terminal(release_status="RELEASED"), 0)
     assert policy.register("r2", "s1", steps())
     assert not policy.is_current(notice, 1)
-    assert policy.accept(terminal(4, release_status=1), 1) == []
+    assert policy.accept(terminal(4, release_status="RELEASED"), 1) == []
     assert policy.owns("r1")
-    (current,) = policy.accept(terminal(request="r2", release_status=1), 2)
+    (current,) = policy.accept(terminal(request="r2", release_status="RELEASED"), 2)
     policy.end_session("s1")
     assert not policy.is_current(current, 3)
-    assert policy.accept(terminal(4, request="r2", release_status=1), 3) == []
+    assert policy.accept(terminal(4, request="r2", release_status="RELEASED"), 3) == []
     assert not policy.register("r3", "s1", steps())
 
 
@@ -304,7 +306,7 @@ def test_notice_token_identity_age_and_no_timeout_actions(policy):
     assert not policy.is_current(notice, -1)
     assert not policy.is_current(notice, 15)
     assert policy.accept(event(2), 1000) == []
-    (result,) = policy.accept(terminal(release_status=1), 1001)
+    (result,) = policy.accept(terminal(release_status="RELEASED"), 1001)
     assert not policy.is_current(result, 1061)
     assert not policy.is_current(result, float("nan"))
 
@@ -335,7 +337,7 @@ def test_malformed_payloads_ignored(policy, payload):
     ],
 )
 def test_missing_or_malformed_correlation_is_not_evidence(policy, field, value):
-    payload = terminal(release_status=1)
+    payload = terminal(release_status="RELEASED")
     payload["detail"][field] = value
     assert policy.accept(payload, 0) == []
 
@@ -364,7 +366,7 @@ def test_public_unknown_release_reason_is_e06_without_new_ros_field(policy):
 
 
 def test_failed_place_phase_overrides_contradictory_success(policy):
-    payload = terminal(release_status=1)
+    payload = terminal(release_status="RELEASED")
     payload["detail"]["execution_detail"]["phase_state"] = "FAILED"
     (result,) = policy.accept(payload, 0)
     assert result.text == "这次没能完成放置，请工作人员协助。"
@@ -373,10 +375,75 @@ def test_failed_place_phase_overrides_contradictory_success(policy):
 def test_two_pairs_with_same_target_are_matched_by_step_index():
     policy = GiftWorkflowSpeech()
     assert policy.register("r1", "s1", steps() + steps())
-    (first,) = policy.accept(event(state="SUCCEEDED"), 0)
-    (second,) = policy.accept(event(2, index=2, state="SUCCEEDED"), 1)
-    assert first.text == second.text == "拿到了，接下来准备放置。"
-    assert not policy.is_current(first, 1)
-    final = event(3, index=3, skill="place_in_container", root="SUCCEEDED", kind="terminal", release_status=1)
+    assert policy.accept(event(state="SUCCEEDED"), 0) == []
+    assert policy.accept(event(2, index=2, state="SUCCEEDED"), 1) == []
+    final = event(
+        3,
+        index=3,
+        skill="place_in_container",
+        root="SUCCEEDED",
+        kind="terminal",
+        release_status="RELEASED",
+        verification_status="SUCCESS",
+        place_succeeded=True,
+    )
     (result,) = policy.accept(final, 2)
     assert result.terminal and "领取" in result.text
+
+
+@pytest.mark.parametrize("verification", ["NOT_RUN", "UNKNOWN", "FAILED", "UNCERTAIN"])
+def test_release_alone_never_claims_verified_placement(policy, verification):
+    (notice,) = policy.accept(
+        terminal(release_status="RELEASED", verification_status=verification, place_succeeded=True), 0
+    )
+    assert "领取" not in notice.text
+
+
+def test_all_production_facts_are_required_for_verified_success(policy):
+    (notice,) = policy.accept(
+        terminal(release_status="RELEASED", verification_status="SUCCESS", place_succeeded=True), 0
+    )
+    assert "已确认" in notice.text and "工作人员确认后领取" in notice.text
+
+
+def test_real_container_preparation_does_not_swallow_transfer_and_verification(policy):
+    for seq, phase in enumerate(("observe_container", "perceive_container", "plan_place"), 1):
+        assert (
+            policy.accept(place(seq, phase=phase, release_status="NOT_RELEASED", verification_status="NOT_RUN"), seq)
+            == []
+        )
+    (moving,) = policy.accept(place(4, release_status="NOT_RELEASED"), 4)
+    assert moving.token.startswith("F08:")
+    (checking,) = policy.accept(
+        place(5, phase="verify_place", release_status="RELEASED", verification_status="NOT_RUN"), 5
+    )
+    assert "正在确认" in checking.text
+    assert not policy.is_current(moving, 5)
+    assert (
+        policy.accept(place(6, phase="verify_place", release_status="RELEASED", verification_status="NOT_RUN"), 6) == []
+    )
+
+
+@pytest.mark.parametrize("verification", ["FAILED", "UNCERTAIN"])
+def test_failure_preserves_release_but_does_not_authorize_collection(policy, verification):
+    (notice,) = policy.accept(
+        place(root="FAILED", kind="terminal", release_status="RELEASED", verification_status=verification), 0
+    )
+    assert "已经松开" in notice.text and "还没确认放置成功" in notice.text and "领取" not in notice.text
+
+
+def test_place_preparation_retry_is_once_per_actual_attempt(policy):
+    (retry,) = policy.accept(place(retry=1, phase="observe_container", release_status="NOT_RELEASED"), 0)
+    assert retry.token.startswith("F12:")
+    assert policy.accept(place(3, retry=1, phase="plan_place", release_status="NOT_RELEASED"), 1) == []
+    assert policy.accept(place(4, retry=2, phase="observe_container", release_status="NOT_RELEASED"), 2)[
+        0
+    ].token.startswith("F12:")
+
+
+def test_configured_label_is_used_only_for_matching_detector_query():
+    policy = GiftWorkflowSpeech(container_name="an orange bowl", container_label="橙色的碗")
+    workflow = steps()
+    workflow[1]["container_name"] = "an orange bowl"
+    assert policy.register("r1", "s1", workflow)
+    assert "橙色的碗" in policy.accept(event(), 0)[0].text

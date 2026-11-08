@@ -56,8 +56,10 @@ from ibrobot_agent.planner import (
     _NEGATION_MARKERS,
     RulePlanner,
     direct_command_outcome,
+    fruit_delivery_from_config,
     planner_outcome_from_payload,
     read_only_outcome,
+    validate_fruit_delivery,
 )
 from ibrobot_agent.planning_timing import planning_report, planning_stage
 from ibrobot_agent.planning_timing import snapshot as planning_timing_snapshot
@@ -187,6 +189,7 @@ class AgentService:
         max_planning_workers: int = 1,
         robot_scope: str = "so101_single_arm",
         direct_commands: Mapping[str, str] | None = None,
+        fruit_delivery: Mapping[str, str] | None = None,
         pose_preview: PosePreviewPort | None = None,
         pose_skills: frozenset[str] = frozenset({"free_pose"}),
         pose_memory: PoseMemoryPort | None = None,
@@ -203,6 +206,7 @@ class AgentService:
         self._execution_enabled = execution_enabled
         self._allowed_skills = frozenset(allowed_skills or ())
         self._robot_scope = robot_scope
+        self._fruit_delivery = fruit_delivery_from_config({"fruit_delivery": fruit_delivery})
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
@@ -977,6 +981,11 @@ class AgentService:
         return dataclasses.replace(outcome, steps=tuple(steps))
 
     def _validate_workflow(self, outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> None:
+        validate_fruit_delivery(
+            outcome,
+            self._fruit_delivery,
+            required=self._robot_scope == "aimdk_x2_summit" or catalog.get("profile_name") == "aimdk_x2_summit",
+        )
         skills = catalog.get("skills", [])
         if not isinstance(skills, list):
             raise RuntimeError("Gateway catalog skills are invalid")

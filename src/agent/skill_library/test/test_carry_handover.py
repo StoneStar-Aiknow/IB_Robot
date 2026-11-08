@@ -26,3 +26,23 @@ def test_same_target_place_retains_the_pick():
 )
 def test_other_sequences_preserve_the_standalone_pick_policy(steps):
     assert not retains_for_place(steps, 0)
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_stop_unknown_in_supported_detail_versions_stays_unsafe(version):
+    from skill_library.carry_handover import motion_stop_is_unknown
+
+    result = SimpleNamespace(
+        error_code="", execution_detail=SimpleNamespace(schema_version=version, recovery_state="UNKNOWN")
+    )
+    assert motion_stop_is_unknown(result)
+
+
+def test_unknown_release_is_not_unknown_controller_stop():
+    from skill_library.carry_handover import motion_stop_is_unknown
+
+    result = SimpleNamespace(
+        error_code="",
+        execution_detail=SimpleNamespace(schema_version=2, recovery_state="NOT_NEEDED", release_status="UNKNOWN"),
+    )
+    assert not motion_stop_is_unknown(result)

@@ -105,3 +105,21 @@ def test_place_delegation_forwards_runtime_target_and_container_queries():
     assert len(sent_goals) == 1
     assert sent_goals[0].target_query == "marker"
     assert sent_goals[0].container_query == "black bowl"
+
+
+def test_verified_release_followed_by_cleanup_failure_is_not_reported_not_released():
+    result = _result(
+        PlaceObject.Result.RELEASE_RELEASED,
+        PlaceObject.Result.VERIFICATION_SUCCESS,
+        "CLEANUP_FAILED",
+    )
+    assert SkillExecutorNode._place_public_error(result) == "CLEANUP_FAILED"
+
+
+def test_verified_release_does_not_hide_unknown_stop():
+    result = _result(
+        PlaceObject.Result.RELEASE_RELEASED,
+        PlaceObject.Result.VERIFICATION_SUCCESS,
+        "PRIMITIVE_CANCEL_CLEANUP_TIMEOUT",
+    )
+    assert SkillExecutorNode._place_public_error(result) == "CANCEL_CLEANUP_TIMEOUT"

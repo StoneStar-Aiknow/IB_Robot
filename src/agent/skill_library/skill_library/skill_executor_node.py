@@ -51,6 +51,7 @@ from embodied_common.execution_detail import (
     ExecutionDetail,
     fill_execution_context,
     fill_execution_detail,
+    place_result_execution_detail,
     short_message,
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
@@ -6847,6 +6848,7 @@ class SkillExecutorNode(Node):
                 return "PLACE_RELEASED_VERIFICATION_UNCERTAIN"
             if int(place_result.verification_status) == PlaceObject.Result.VERIFICATION_NOT_RUN:
                 return "PLACE_RELEASED_VERIFICATION_NOT_RUN"
+            return str(place_result.error_code or "PLACE_RELEASED_EXECUTION_FAILED")
         return "PLACE_NOT_RELEASED"
 
     def _execute_place_skill(
@@ -7029,7 +7031,7 @@ class SkillExecutorNode(Node):
                 "placement executor identity does not match the registry snapshot",
             )
         result.debug_output_dir = str(getattr(place_result, "debug_output_dir", ""))
-        fill_execution_detail(result.execution_detail, place_result.execution_detail)
+        fill_execution_detail(result.execution_detail, place_result_execution_detail(place_result))
         result.executed_primitives = [f"placement_pipeline:{phase}" for phase in place_result.completed_phases]
         if goal_handle.is_cancel_requested and place_result.error_code in {"PLACE_CANCELLED", "CANCELED"}:
             return self._cancel_skill(result, goal_handle, result.executed_primitives, goal.skill_name)

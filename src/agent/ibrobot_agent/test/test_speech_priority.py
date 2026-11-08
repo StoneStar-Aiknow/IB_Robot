@@ -219,7 +219,7 @@ def test_gift_e06_maps_to_protection_and_retry_stays_low():
     presentation = {
         "steps": [
             {"skill_name": "pick_object", "target_name": "a lemon"},
-            {"skill_name": "place_in_container", "target_name": "a lemon"},
+            {"skill_name": "place_in_container", "target_name": "a lemon", "container_name": "bowl"},
         ],
         "execution_mode": ASYNC_PRESENTATION_MODE,
     }

@@ -23,6 +23,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
 from ibrobot_agent.node import IncubationAgentNode
 from ibrobot_agent.voice_bridge import _build_node_class
@@ -461,6 +462,13 @@ class ContractRig:
 
         self.io.create_service(SynthesizeSpeech, "/voice_tts/synthesize", synthesize, callback_group=group)
         self.io.create_service(PlayAudioFile, "/voice_tts/play", playback, callback_group=group)
+
+        def stop_playback(request, response):
+            self.speech_gate.set()
+            response.success = True
+            return response
+
+        self.io.create_service(Trigger, "/voice_tts/stop", stop_playback, callback_group=group)
         catalog_root = Path(__file__).resolve().parents[2] / "skill_catalog"
         self.gateway = SkillExecutorNode(
             parameter_overrides=parameters(
@@ -600,6 +608,11 @@ class ContractRig:
 
     def close(self):
         self.speech_gate.set()
+        # Close the speech transport while its stop service still has an executor.
+        for node in self.nodes:
+            if getattr(node, "_speech_pipeline", None) is not None:
+                node._speech_pipeline.close(stop=node._speaker.close)
+                node._speech_pipeline = None
         if self.thread:
             # Leave the native wait set before shutdown destroys its guards.
             self.spin_stop.set()

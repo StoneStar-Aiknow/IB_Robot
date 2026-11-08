@@ -1766,3 +1766,13 @@ def test_mirror_monitoring_and_stop_shortcut_follow_actual_session_enablement():
     params = _normalize_launch_param_mapping(vars(agent)["_Node__parameters"][0])
     planner = json.loads(_decode_launch_string(params["planner_config_json"]))
     assert planner["direct_commands"] == {"点头": "nod_yes", "停止照镜子": "mirror_stop"}
+
+
+def test_voice_bridge_uses_planner_container_ssot():
+    from embodied_bringup.launch_builders.embodied import _agent_voice_bridge_node
+
+    delivery = {"container_name": "configured bowl", "container_label": "配置的碗"}
+    bridge = _agent_voice_bridge_node({}, {"planner": {"fruit_delivery": delivery}}, {})
+    params = _normalize_launch_param_mapping(bridge._Node__parameters[0])
+    assert _decode_launch_string(params["gift_container_name"]) == delivery["container_name"]
+    assert __import__("yaml").safe_load(params["gift_container_label"]) == delivery["container_label"]

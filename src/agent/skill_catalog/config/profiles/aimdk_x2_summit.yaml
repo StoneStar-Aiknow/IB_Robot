@@ -44,6 +44,9 @@ enabled_skills:
 - name: pick_object
   implementation: aimdk_x2_summit_fruit
   planner_visible: true
+- name: place_in_container
+  implementation: aimdk_x2_grasp
+  planner_visible: true
 - name: return_to_task_pose
   implementation: x2_runtime_v1
   planner_visible: true

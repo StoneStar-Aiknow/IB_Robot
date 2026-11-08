@@ -75,11 +75,11 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
     placing = context.get("current_skill") == "place_in_container"
     phase = (
         _GRASP_PHASES.get(detail.failed_phase or detail.phase, "")
-        if context.get("current_skill") == "pick_object" and detail.schema_version == 1
+        if context.get("current_skill") == "pick_object" and detail.schema_version in {1, 2}
         else ""
     )
     failure_stage = f"抓取在{phase}阶段失败。" if phase else ""
-    if placing and detail.schema_version == 1:
+    if placing and detail.schema_version in {1, 2}:
         phase = _PLACE_PHASES.get(detail.failed_phase or detail.phase, "")
         failure_stage = f"放置在{phase}阶段失败。" if phase else ""
     if state == "UNKNOWN":
@@ -89,14 +89,21 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
         )
     if state in {"CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}:
         return "已停止。" if state != "CANCELLED_BEFORE_EXECUTION" else "任务已取消，尚未开始执行。"
-    if detail.schema_version == 1 and detail.recovery_state in {"FAILED", "UNKNOWN"} and state in _TERMINALS:
+    if detail.schema_version in {1, 2} and detail.recovery_state in {"FAILED", "UNKNOWN"} and state in _TERMINALS:
         return failure_stage + "恢复未完成或状态尚未确认，请操作员检查机器人。"
     if state == "SUCCEEDED":
         if placing:
-            return "物体已放入指定容器并通过验证。"
+            if (
+                detail.schema_version == 2
+                and detail.release_status == "RELEASED"
+                and detail.verification_status == "SUCCESS"
+                and detail.place_succeeded
+            ):
+                return "物体已放入指定容器并通过验证，请工作人员确认后领取。"
+            return "放置步骤已结束，请工作人员确认现场状态。"
         if (
             context.get("current_skill") == "pick_object"
-            and detail.schema_version == 1
+            and detail.schema_version in {1, 2}
             and detail.phase
             and detail.phase_state == "SUCCEEDED"
         ):
@@ -106,15 +113,19 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
                 return "抓取规划完成，尚未执行抓取。"
             return "物体已经抓起并通过验证。"
         return "执行完成。"
+    if placing and state == "FAILED" and detail.schema_version == 2 and detail.release_status == "RELEASED":
+        if detail.verification_status in {"FAILED", "UNCERTAIN"}:
+            return "物体已经松开，但还没确认放置成功，请工作人员检查。"
+        return "物体已经松开，动作还未全部完成，请先别靠近。"
     if state == "FAILED":
         if (
             context.get("current_skill") in {"free_pose", "return_to_task_pose"}
-            and detail.schema_version == 1
+            and detail.schema_version in {1, 2}
             and detail.failed_phase == "verify"
             and detail.reason_code == "TASK_POSE_NOT_REACHED"
         ):
             return "动作执行结束，未校验通过。"
-        if detail.schema_version != 1:
+        if detail.schema_version not in {1, 2}:
             return "执行失败，请查看执行记录或联系操作员。"
         if detail.suggested_action == "MANUAL_CHECK":
             return failure_stage + _ACTIONS["MANUAL_CHECK"]
@@ -125,7 +136,7 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
         return _ACTIONS[detail.suggested_action]
     if state == "STOPPING":
         return "正在停止。"
-    if detail.schema_version == 1 and detail.phase_state == "RUNNING":
+    if detail.schema_version in {1, 2} and detail.phase_state == "RUNNING":
         if placing:
             return {
                 "observe_container": "正在观察指定容器。",

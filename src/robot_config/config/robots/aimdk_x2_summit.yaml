@@ -64,9 +64,13 @@ robot:
       - offer_fruit_menu
       - mimic_not_ready
       - pick_object
+      - place_in_container
       - return_to_task_pose
       - invite_visitor
       planner:
+        fruit_delivery:
+          container_name: an orange bowl
+          container_label: 橙色的碗
         direct_commands:
           你好: greet_visitor
           你好呀: greet_visitor

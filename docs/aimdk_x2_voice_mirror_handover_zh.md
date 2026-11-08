@@ -442,19 +442,28 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 - 播放服务没有取消接口。技能取消或超时后，录音可能继续播放，结果消息会说明这一点。
 - 挥手复用 `wave_hand` 的 URS 录制轨迹，不含灵巧手动作。
 
-### 14.5 展会配置（`aimdk_x2_summit`，2026-11-07）
+### 14.5 展会配置（`aimdk_x2_summit`，2026-11-08）
 
 `aimdk_x2_summit` 叠加在 `aimdk_x2_voice_mirror_grasp` 上，提供问候、录音问答、预设手势和水果礼物。
 
 - 本版不启用照镜子，也不启动 YOLOX 和 PEAR。说“动作模仿”时播放 `mimic_not_ready`。
-- 本版没有领取盒。`pick_object` 抓起水果后放回原处。成功语请观众找工作人员领取礼物。
+- 水果请求在同一 workflow 内执行相邻的 `pick_object → place_in_container`。
+  两步使用相同目标。固定领取容器为橙色的碗，配置位于 `planner.fruit_delivery`。
+- 放置保留释放后的视觉验证。只有释放、撤离、验证和清理全部成功，才播报放置成功。
+  已释放但验证失败时，提示工作人员检查，不宣布可以领取。
+- 单独抓取仍按原策略放回。持久 session 不会使两个独立请求获得持物交接。
 - 固定问答用录音技能。抓取进度、结果和追问用 ZipVoice 实时合成。
 - 录音不入库。在每个检出目录执行 `python3 commissioning/make_summit_clips.py <录音 zip>`，然后把
   `commissioning/audio/summit/` 复制到板上同一路径。
-- 播放录音时 ASR 静音，观众不能用语音打断。最长的录音是 `introduce_in_detail`（21.9 s）。
+- 介绍录音支持“别说了”打断，配套手势等待安全返回。最长录音为 21.9 s。
+- 抓取和放置期间，“别说了”只取消普通播报。“不玩了”停止任务并保留 session。
+  停止或清理未确认时，系统继续阻止新运动。
 - 现场配置要叠加到 `aimdk_x2_summit.yaml` 上。覆盖 `test_allowlist` 或 `silent_skills` 时，要保留
   该文件列出的技能。
-- 改抓取播报时，改 `voice_bridge.speech_messages`，然后重启 voice bridge。
+- 独立抓取播报使用 `voice_bridge.speech_messages`。成对礼物播报使用 `GiftWorkflowSpeech`。
+  容器识别描述和中文标签均来自 `planner.fruit_delivery`。
+- 2026-11-08 在 310P 真机验证：说“我想要一个橘子”，机器人抓起橘子并放进橙色的碗。
+- 遗留问题：在接近阶段说“不玩了”，任务取消，但恢复状态为失败并报 E06。
 
 ## 15. 镜子“卡顿”的实测结论（2026-10-23 下午）
 

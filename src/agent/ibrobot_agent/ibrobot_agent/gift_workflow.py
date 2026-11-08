@@ -11,12 +11,10 @@ registration, even a non-gift request, invalidates old queued speech.
 (60 s for terminals); expiry only drops speech and never initiates robot actions.
 The bridge must validate channel/principal/robot scope before calling this class.
 
-Release evidence is deliberately a local mock boundary, not a new ROS contract:
-``detail.execution_detail.release_status`` accepts the existing PlaceObject
-numeric values 0/1/2 or NOT_RELEASED/RELEASED/UNKNOWN (also RELEASE_* names).
-A terminal must carry that evidence itself; phase names, free text and generic
-success never prove release. Unknown recovery/release overrides success. Missing
-fields stay conservative. No container verification or recovery commands exist.
+Placement evidence comes from the versioned production ExecutionDetail contract.
+A terminal must carry its own release, verification and full-completion facts;
+phase names, free text and generic success never prove release or placement.
+Missing facts stay conservative. This policy never issues recovery commands.
 """
 
 from __future__ import annotations
@@ -47,6 +45,7 @@ class _Request:
     request_id: str
     session_id: str
     pairs: dict[int, str]
+    containers: dict[int, str] = field(default_factory=dict)
     execution_id: str = ""
     sequence: int = 0
     event_sequence: int = 0
@@ -83,7 +82,9 @@ class GiftWorkflowSpeech:
     registration of the same current request is idempotent.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, container_name: str = "", container_label: str = "指定容器") -> None:
+        self._container_name = container_name
+        self._container_label = container_label
         self._current: _Request | None = None
         self._owned: OrderedDict[str, None] = OrderedDict()
         self._ended: set[str] = set()
@@ -103,6 +104,7 @@ class GiftWorkflowSpeech:
         if not isinstance(steps, Sequence) or isinstance(steps, str | bytes):
             return False
         pairs = {}
+        containers = {}
         for index in range(len(steps) - 1):
             pick, place = _mapping(steps[index]), _mapping(steps[index + 1])
             target = pick.get("target_name")
@@ -112,11 +114,17 @@ class GiftWorkflowSpeech:
                 and isinstance(target, str)
                 and target.strip()
                 and target == place.get("target_name")
+                and isinstance(place.get("container_name"), str)
+                and place["container_name"].strip()
             ):
                 pairs[index] = _TARGETS.get(target, "这个物体")
+                # A generic label avoids reading an English detector query aloud.
+                containers[index] = (
+                    self._container_label if place["container_name"] == self._container_name else "指定容器"
+                )
         if not pairs:
             return False
-        self._current = _Request(request_id, session_id, pairs)
+        self._current = _Request(request_id, session_id, pairs, containers)
         self._owned[request_id] = None
         while len(self._owned) > 256:
             self._owned.popitem(last=False)
@@ -221,7 +229,13 @@ class GiftWorkflowSpeech:
             return self._terminal(item, root_state, skill, in_pair, pick_index, facts, now)
         if root_state not in _RUNNING or not in_pair:
             return []
-        if facts.get("recovery_state") in ("UNKNOWN", "FAILED") or self._release(facts) == "UNKNOWN":
+        # Schema 0 is the Gateway admission placeholder, not a physical warning.
+        # Wait for executor facts rather than alarming on normal dispatch.
+        if facts.get("schema_version") not in {1, 2}:
+            return []
+        if facts.get("recovery_state") in ("UNKNOWN", "FAILED") or (
+            skill == "place_in_container" and self._release(facts) == "UNKNOWN"
+        ):
             return self._notice(item, "E06", "执行状态尚未确认，请工作人员检查机器人和物体。", now)
         if skill == "pick_object":
             if retry > previous_retry:
@@ -230,8 +244,6 @@ class GiftWorkflowSpeech:
             if step_state == "FAILED":
                 item.failed.add(index)
                 return self._notice(item, "pick_failed", "这次没能完成抓取，请工作人员协助。", now)
-            if step_state == "SUCCEEDED" and index not in item.failed:
-                return self._notice(item, "picked", "拿到了，接下来准备放置。", now)
             if (
                 not item.started
                 and retry == 0
@@ -240,12 +252,27 @@ class GiftWorkflowSpeech:
                 and len(item.emitted) == 0
             ):
                 item.started = True
-                return self._notice(item, "F05", f"我来尝试拿{item.pairs[index]}，再准备放置。", now)
+                return self._notice(
+                    item, "F05", f"好，我来拿{item.pairs[index]}，再放到{item.containers[index]}。请稍等。", now
+                )
         elif skill == "place_in_container":
+            if retry > previous_retry:
+                item.failed.discard(index)
+                item.place_phase_rank[index] = 0
+                return self._notice(item, "F12", "刚才没能完成放置准备，我再试一次。", now)
             if step_state == "FAILED":
                 item.failed.add(index)
-                return self._notice(item, "place_failed", "这次没能完成放置，请工作人员协助。", now)
-            rank = {"observe": 0, "perceive": 0, "plan": 0, "approach": 0, "transfer": 1}.get(phase, 2)
+                return self._notice(item, "place_failed", self._place_failure(facts), now)
+            rank = {
+                "observe": 0,
+                "perceive": 0,
+                "plan": 0,
+                "approach": 0,
+                "observe_container": 0,
+                "perceive_container": 0,
+                "plan_place": 0,
+                "transfer": 1,
+            }.get(phase, 2)
             if phase == "transfer" and phase_state != "RUNNING":
                 rank = 2
             previous_rank = item.place_phase_rank.get(index, 0)
@@ -258,44 +285,53 @@ class GiftWorkflowSpeech:
                 and pick_index not in item.failed
                 and index not in item.failed
             ):
-                return self._notice(item, "F08", "正在移动物体，准备放置。", now)
+                return self._notice(item, "F08", f"拿到了，我正在把它送到{item.containers[pick_index]}。", now)
+            if (
+                phase in {"observe_placed", "verify_place"}
+                and phase_state == "RUNNING"
+                and self._release(facts) == "RELEASED"
+            ):
+                return self._notice(item, "verifying", "正在确认物体是否放进容器。", now)
         return []
 
     @staticmethod
     def _release(facts: Mapping) -> str:
+        value = facts.get("release_status")
         if facts.get("reason_code") == "PLACE_RELEASE_STATE_UNKNOWN":
             return "UNKNOWN"
-        value = facts.get("release_status")
-        if type(value) is int:
-            return {0: "NOT_RELEASED", 1: "RELEASED", 2: "UNKNOWN"}.get(value, "UNKNOWN")
-        if isinstance(value, str):
-            return (
-                value.removeprefix("RELEASE_")
-                if value
-                in {
-                    "NOT_RELEASED",
-                    "RELEASED",
-                    "UNKNOWN",
-                    "RELEASE_NOT_RELEASED",
-                    "RELEASE_RELEASED",
-                    "RELEASE_UNKNOWN",
-                }
-                else "UNKNOWN"
-            )
-        return "" if value is None else "UNKNOWN"
+        if value is None:
+            return ""
+        return value if isinstance(value, str) and value in {"NOT_RELEASED", "RELEASED", "UNKNOWN"} else "UNKNOWN"
+
+    @staticmethod
+    def _verified(facts: Mapping) -> bool:
+        return (
+            facts.get("schema_version") == 2
+            and facts.get("release_status") == "RELEASED"
+            and facts.get("verification_status") == "SUCCESS"
+            and facts.get("place_succeeded") is True
+        )
+
+    @classmethod
+    def _place_failure(cls, facts: Mapping) -> str:
+        if cls._release(facts) == "RELEASED":
+            if facts.get("verification_status") in {"FAILED", "UNCERTAIN"}:
+                return "物体已经松开，但还没确认放置成功，请工作人员检查。"
+            return "物体已经松开，动作还未全部完成，请先别靠近。"
+        return "这次没能完成放置，请工作人员协助。"
 
     def _terminal(self, item, state, skill, in_pair, pick_index, facts, now):
         if (
             state == "UNKNOWN"
             or facts.get("recovery_state") in ("UNKNOWN", "FAILED")
-            or self._release(facts) == "UNKNOWN"
+            or (skill == "place_in_container" and self._release(facts) == "UNKNOWN")
         ):
             key, text = "E06", "执行状态尚未确认，请工作人员检查机器人和物体。"
         elif state in {"CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}:
             key, text = "cancelled", "任务已停止，请工作人员确认现场状态。"
         elif state == "FAILED":
             key, text = (
-                ("place_failed", "这次没能完成放置，请工作人员协助。")
+                ("place_failed", self._place_failure(facts))
                 if skill == "place_in_container"
                 else ("pick_failed", "这次没能完成抓取，请工作人员协助。")
             )
@@ -307,8 +343,8 @@ class GiftWorkflowSpeech:
                 or facts.get("phase_state") == "FAILED"
             ):
                 key, text = "place_failed", "这次没能完成放置，请工作人员协助。"
-            elif self._release(facts) == "RELEASED":
-                key, text = "placed", "放置动作完成了，请工作人员确认后领取。"
+            elif self._verified(facts):
+                key, text = "placed", f"已确认物体放进{item.containers[pick_index]}，请工作人员确认后领取。"
             else:
                 key, text = "place_ended", "放置步骤已结束，请工作人员确认现场状态。"
         else:

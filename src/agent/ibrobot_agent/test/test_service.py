@@ -1190,3 +1190,27 @@ def test_catalog_target_rejects_ambiguous_alias():
     }
     with pytest.raises(RuntimeError, match="invalid or ambiguous"):
         AgentService._bind_catalog_targets(outcome, {"skills": [skill]})
+
+
+@pytest.mark.parametrize("delivery", [None, {"container_name": "configured bowl", "container_label": "配置的碗"}])
+def test_summit_service_refuses_unpaired_pick_before_proposal(tmp_path, delivery):
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="好。",
+        summary="水果",
+        steps=(CanonicalWorkflowStep(1, "pick_object", target_name="an apple"),),
+    )
+    service = AgentService(
+        planner=FakePlanner(outcome),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "fruit.db"),
+        robot_scope="aimdk_x2_summit",
+        fruit_delivery=delivery,
+    )
+    try:
+        with pytest.raises(ValueError, match="fruit"):
+            service._validate_workflow(
+                outcome, {"skills": [{"name": "pick_object", "planner_visible": True, "semantic_level": "skill"}]}
+            )
+    finally:
+        service.close()

@@ -300,7 +300,7 @@ class GraspSpeechPolicy:
         if item.state in {"CANCELED", "CANCELLED"}:
             return "canceled"
         if item.state == "SUCCEEDED":
-            if detail.schema_version == 1 and detail.phase_state == "SUCCEEDED" and detail.phase:
+            if detail.schema_version in {1, 2} and detail.phase_state == "SUCCEEDED" and detail.phase:
                 if item.phase == "observe":
                     return "observed"
                 if item.phase in {"perceive", "plan"}:

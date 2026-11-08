@@ -46,7 +46,10 @@ def test_text_pick_place_completes_both_steps_and_releases_custody(tmp_path):
         assert {event.workflow_step_index for event in events if event.current_skill} == {0, 1}
         assert events[-1].sequence == query["last_event_sequence"]
         assert events[-1].execution_detail.phase == "verify_place"
-        wait_until(lambda: "物体已放入指定容器并通过验证。" in rig.speech)
+        assert query["execution_detail"]["release_status"] == "RELEASED"
+        assert query["execution_detail"]["verification_status"] == "SUCCESS"
+        assert query["execution_detail"]["place_succeeded"] is True
+        wait_until(lambda: "物体已放入指定容器并通过验证，请工作人员确认后领取。" in rig.speech)
         wait_until(lambda: rig.played)
         rig.input.publish(String(data=json.dumps(envelope, ensure_ascii=False)))
         wait_until(lambda: len(rig.responses) >= 2)

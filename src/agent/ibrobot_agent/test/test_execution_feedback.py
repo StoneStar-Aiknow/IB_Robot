@@ -111,3 +111,34 @@ def test_pose_arrival_failure_reports_motion_end_without_claiming_verified_succe
 def test_explicit_unknown_recovery_overrides_success():
     detail = ExecutionDetail(schema_version=1).to_dict()
     assert "检查" in execution_reply("SUCCEEDED", {"current_skill": "pick_object", "execution_detail": detail})
+
+
+def test_place_success_requires_complete_versioned_physical_evidence():
+    detail = ExecutionDetail(
+        schema_version=2,
+        phase="verify_place",
+        phase_state="SUCCEEDED",
+        recovery_state="NOT_NEEDED",
+        suggested_action="NONE",
+        release_status="RELEASED",
+        verification_status="SUCCESS",
+        place_succeeded=True,
+    )
+    context = {"current_skill": "place_in_container", "execution_detail": detail.to_dict()}
+    assert "通过验证" in execution_reply("SUCCEEDED", context)
+    for overrides in ({"place_succeeded": False}, {"release_status": "UNKNOWN"}, {"verification_status": "NOT_RUN"}):
+        context["execution_detail"] = replace(detail, **overrides).to_dict()
+        assert "通过验证" not in execution_reply("SUCCEEDED", context)
+
+
+def test_place_failure_reports_known_release_without_claiming_delivery():
+    detail = ExecutionDetail(
+        schema_version=2,
+        phase="verify_place",
+        phase_state="FAILED",
+        recovery_state="NOT_NEEDED",
+        release_status="RELEASED",
+        verification_status="FAILED",
+    )
+    reply = execution_reply("FAILED", {"current_skill": "place_in_container", "execution_detail": detail.to_dict()})
+    assert "已经松开" in reply and "还没确认放置成功" in reply

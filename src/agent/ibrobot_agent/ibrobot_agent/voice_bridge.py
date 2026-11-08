@@ -141,6 +141,8 @@ class VoiceBridgeConfig:
     request_timeout_sec: float = 180.0
     speech_mode: str = "standard"
     speech_messages_json: str = "{}"
+    gift_container_name: str = ""
+    gift_container_label: str = "指定容器"
     speak_replies: bool = True
     # Consume execution feedback for this text channel without accepting speech commands.
     feedback_only: bool = False
@@ -425,7 +427,9 @@ class VoiceBridgeCore:
         self._feedback = FeedbackTracker()
         self._mirror_speech_policy = MirrorSpeechPolicy()
         self._speech_policy = GraspSpeechPolicy(config.speech_mode, json.loads(config.speech_messages_json))
-        self._gift = GiftWorkflowSpeech()
+        self._gift = GiftWorkflowSpeech(
+            container_name=config.gift_container_name, container_label=config.gift_container_label
+        )
         self._generation = 0
         self._latest_request_id = ""
         self._introduction_request_id = ""
@@ -1644,6 +1648,8 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         request_timeout_sec=float(values["request_timeout_sec"]),
         speech_mode=str(values["speech_mode"]),
         speech_messages_json=str(values["speech_messages_json"]),
+        gift_container_name=str(values["gift_container_name"]),
+        gift_container_label=str(values["gift_container_label"]),
         speak_replies=bool(values["speak_replies"]),
         speak_reply_previews=bool(values["speak_reply_previews"]),
         feedback_only=bool(values["feedback_only"]),

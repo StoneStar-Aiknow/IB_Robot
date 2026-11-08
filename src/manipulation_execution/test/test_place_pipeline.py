@@ -355,3 +355,49 @@ def test_drop_with_no_way_home_stops_where_it_released_for_a_manual_check():
     assert "could not return home" in outcome.message
     assert outcome.execution_detail.recovery_state == "FAILED"
     assert outcome.execution_detail.suggested_action == "MANUAL_CHECK"
+
+
+def test_confirmed_release_feedback_precedes_retreat_and_success_waits_for_cleanup():
+    held, backends = fixture()
+    events, finished = [], []
+    backends.executor.finish = lambda: finished.append("executor")
+    backends.effector.finish = lambda: finished.append("effector")
+
+    def phase(name, event, data):
+        detail = data["execution_detail"]
+        events.append((name, event, detail))
+        assert not detail["place_succeeded"] and not finished
+        if name == "release_confirmed":
+            assert backends.effector.log == [EffectorAction.RELEASE]
+            assert [row[0] for row in backends.executor.log] == ["transfer"]
+            assert detail["release_status"] == "RELEASED"
+
+    outcome = run(held, backends, on_phase=phase)
+    assert finished == ["executor", "effector"]
+    assert any(name == "release_confirmed" for name, _, _ in events)
+    assert outcome.execution_detail.place_succeeded
+    assert outcome.execution_detail.verification_status == "SUCCESS"
+
+
+@pytest.mark.parametrize("option", [{"fail_on": "retreat"}, {"cancel_on": "retreat"}])
+def test_post_release_motion_failure_preserves_public_facts(option):
+    held, backends = fixture(**option)
+    outcome = run(held, backends)
+    assert not outcome.success
+    assert outcome.execution_detail.release_status == "RELEASED"
+    assert outcome.execution_detail.verification_status == "NOT_RUN"
+    assert not outcome.execution_detail.place_succeeded
+
+
+def test_cleanup_failure_after_visual_success_retains_public_facts():
+    held, backends = fixture()
+
+    def fail():
+        raise RuntimeError("cleanup failed")
+
+    backends.executor.finish = fail
+    outcome = run(held, backends)
+    assert not outcome.success and outcome.reason_code == "CLEANUP_FAILED"
+    assert outcome.execution_detail.release_status == "RELEASED"
+    assert outcome.execution_detail.verification_status == "SUCCESS"
+    assert not outcome.execution_detail.place_succeeded

@@ -29,7 +29,7 @@ CLIP_SKILLS = {
 def snapshot():
     context = _context()
     delegated = dict(context.delegated_executors)
-    for executor in ("pose_composer", "grasp_pipeline", "runtime_play_audio"):
+    for executor in ("pose_composer", "grasp_pipeline", "placement_pipeline", "runtime_play_audio"):
         delegated.update(_context(executor).delegated_executors)
     delegated["grasp_pipeline"] = replace(
         delegated["grasp_pipeline"],
@@ -89,6 +89,8 @@ def test_each_social_clip_selects_its_recorded_gesture(snapshot):
 def test_the_planner_is_told_the_three_fruits(snapshot):
     assert snapshot.templates["pick_object"]["implementation_identity"].endswith("#aimdk_x2_summit_fruit")
     assert snapshot.templates["pick_object"]["timeout_sec"] == 150.0
+    assert snapshot.templates["place_in_container"]["executor"] == "placement_pipeline"
+    assert snapshot.templates["place_in_container"]["implementation_identity"].endswith("#aimdk_x2_grasp")
     summary = snapshot.capability_view["pick_object"]["summary"]
     for target in ('"a lemon"', '"an apple"', '"an orange"'):
         assert target in summary

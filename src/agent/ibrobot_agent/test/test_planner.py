@@ -10,7 +10,6 @@ from ibrobot_agent.contracts import AgentRequest, PlannerIdentity, PlannerRepair
 from ibrobot_agent.planner import (
     PlannerAdapter,
     PlannerParseError,
-    PlannerRepair,
     RulePlanner,
     build_planner_messages,
     parse_planner_outcome,
@@ -898,3 +897,105 @@ def test_repairs_stay_out_of_what_the_robot_is_asked_to_do():
     # Digests and stored outcomes are built from to_dict(); a repair is provenance, not content.
     assert repaired.to_dict() == strict.to_dict()
     assert repaired == strict
+
+
+@pytest.mark.parametrize("target", ["a lemon", "an apple", "an orange"])
+def test_model_adapter_preserves_generated_fruit_pair_and_prompt(target):
+    from ibrobot_agent.planner import validate_fruit_delivery
+
+    delivery = {"container_name": "configured bowl", "container_label": "配置的碗"}
+
+    class Model:
+        def complete(self, messages, **kwargs):
+            payload = json.loads(messages[1]["content"])
+            assert payload["deployment"]["fruit_delivery"] == delivery
+            assert "adjacent pick_object then place_in_container" in messages[0]["content"]
+            return {
+                "status": "ok",
+                "content": json.dumps(
+                    {
+                        "kind": "workflow",
+                        "user_message": "好，我来拿水果再放进碗里。",
+                        "summary": "领取水果",
+                        "steps": [
+                            {"schema_version": 1, "skill_name": "pick_object", "target_name": target},
+                            {
+                                "schema_version": 1,
+                                "skill_name": "place_in_container",
+                                "target_name": target,
+                                "container_name": delivery["container_name"],
+                            },
+                        ],
+                    }
+                ),
+            }
+
+    planner = PlannerAdapter(
+        Model(),
+        prompt_builder=lambda **kwargs: build_planner_messages(**kwargs, fruit_delivery=delivery),
+        planner_identity=RulePlanner.identity,
+    )
+    outcome = planner.plan(_request("我要水果"), {}, {}, threading.Event())
+    validate_fruit_delivery(outcome, delivery, required=True)
+    assert len(outcome.steps) == 2
+    assert outcome.steps[0].target_name == outcome.steps[1].target_name == target
+
+
+@pytest.mark.parametrize("change", ["single", "wrong_target", "wrong_container", "interleaved", "arm", "missing"])
+def test_fruit_delivery_rejects_incomplete_or_mismatched_model_plans(change):
+    from ibrobot_agent.planner import validate_fruit_delivery
+
+    steps = [
+        {"schema_version": 1, "skill_name": "pick_object", "target_name": "an orange"},
+        {
+            "schema_version": 1,
+            "skill_name": "place_in_container",
+            "target_name": "an orange",
+            "container_name": "configured bowl",
+        },
+    ]
+    delivery = {"container_name": "configured bowl", "container_label": "配置的碗"}
+    if change == "single":
+        steps.pop()
+    elif change == "wrong_target":
+        steps[1]["target_name"] = "an apple"
+    elif change == "wrong_container":
+        steps[1]["container_name"] = "invented bowl"
+    elif change == "interleaved":
+        steps.insert(1, {"schema_version": 1, "skill_name": "nod_yes"})
+    elif change == "arm":
+        steps[1]["arm_side"] = "left"
+    else:
+        delivery = {}
+    outcome = parse_planner_outcome(
+        json.dumps({"kind": "workflow", "user_message": "好。", "summary": "水果", "steps": steps})
+    )
+    with pytest.raises(ValueError):
+        validate_fruit_delivery(outcome, delivery, required=True)
+    validate_fruit_delivery(outcome, {}, required=False)  # Non-exhibition pick is unchanged.
+
+
+@pytest.mark.parametrize("config", [{}, {"container_name": ""}, {"container_name": "bowl", "container_label": 3}])
+def test_fruit_delivery_config_has_no_guessed_defaults(config):
+    from ibrobot_agent.planner import fruit_delivery_from_config
+
+    with pytest.raises(ValueError):
+        fruit_delivery_from_config({"fruit_delivery": config})
+
+
+def test_direct_pick_shortcut_defers_to_model():
+    from ibrobot_agent.planner import direct_command_outcome
+
+    catalog = {"skills": [{"name": "pick_object", "planner_visible": True}]}
+    assert direct_command_outcome("苹果", {"苹果": "pick_object"}, catalog) is None
+
+
+def test_robot_config_rejects_missing_or_invalid_delivery_fields():
+    from robot_config.loader import _validate_planner_latency_options
+
+    for value in ({}, None, [], {"container_name": "bowl", "container_label": ""}):
+        errors = _validate_planner_latency_options({"fruit_delivery": value})
+        assert any("fruit_delivery" in error for error in errors)
+    assert not _validate_planner_latency_options(
+        {"fruit_delivery": {"container_name": "configured bowl", "container_label": "配置的碗"}}
+    )

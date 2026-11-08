@@ -3100,6 +3100,13 @@ def _validate_planner_latency_options(planner: dict[str, Any]) -> list[str]:
     so the values themselves are checked here.
     """
     errors: list[str] = []
+    delivery = planner.get("fruit_delivery")
+    if "fruit_delivery" in planner and (
+        not isinstance(delivery, dict)
+        or set(delivery) != {"container_name", "container_label"}
+        or any(not isinstance(value, str) or not value.strip() for value in delivery.values())
+    ):
+        errors.append("embodied.agent.planner.fruit_delivery requires non-empty container_name and container_label")
     enable_thinking = planner.get("enable_thinking", True)
     if not isinstance(enable_thinking, bool):
         errors.append("embodied.agent.planner.enable_thinking must be a boolean")

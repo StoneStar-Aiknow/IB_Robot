@@ -960,6 +960,11 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "tts_synthesis_service": voice_tts.get("service_name", "/voice_tts/synthesize"),
         "tts_playback_service": voice_tts.get("playback_service_name", "/voice_tts/play"),
     }
+    delivery = agent_config.get("planner", {}).get("fruit_delivery", {})
+    if isinstance(delivery, dict):
+        for field in ("container_name", "container_label"):
+            if field in delivery:
+                params[f"gift_{field}"] = delivery[field]
     # /voice_partial, /voice_status and /voice_control are fixed by voice_asr_node; the bridge keeps
     # its own defaults for them and the loader rejects YAML overrides that could only break them.
     for field_name in (

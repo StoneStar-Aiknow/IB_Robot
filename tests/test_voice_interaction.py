@@ -223,11 +223,16 @@ def test_deferred_admission_retries_busy_after_agent_finally_release():
 def test_validated_adjacent_gift_steps_replace_old_single_pick_speech():
     bridge = core()
     bridge.on_heard("拿个苹果放到礼盒里", 0)
-    steps = [{"skill_name": name, "target_name": "an apple"} for name in ("pick_object", "place_in_container")]
+    steps = [
+        {"skill_name": name, "target_name": "an apple", "container_name": "gift box"}
+        for name in ("pick_object", "place_in_container")
+    ]
     assert not of(present(bridge, steps), Speak)
     start = of(bridge.on_event(event(detail=gift_detail()), 1), Speak)[0]
-    assert start.text == "我来尝试拿苹果，再准备放置。"
-    step_success = event(detail=gift_detail(2, "place_in_container", 1, "SUCCEEDED", release_status=1), sequence=2)
+    assert start.text == "好，我来拿苹果，再放到指定容器。请稍等。"
+    step_success = event(
+        detail=gift_detail(2, "place_in_container", 1, "SUCCEEDED", release_status="RELEASED"), sequence=2
+    )
     assert not of(bridge.on_event(step_success, 2), Speak)
     result = bridge.on_event(
         event(
@@ -243,7 +248,10 @@ def test_validated_adjacent_gift_steps_replace_old_single_pick_speech():
 def test_tampered_presentation_never_registers_gift_policy():
     bridge = core()
     bridge.on_heard("拿苹果放到礼盒", 0)
-    steps = [{"skill_name": name, "target_name": "an apple"} for name in ("pick_object", "place_in_container")]
+    steps = [
+        {"skill_name": name, "target_name": "an apple", "container_name": "gift box"}
+        for name in ("pick_object", "place_in_container")
+    ]
     present(bridge, steps, valid=False)
     assert not bridge._gift.owns("r0")
 
@@ -251,7 +259,10 @@ def test_tampered_presentation_never_registers_gift_policy():
 def test_late_gift_progress_and_old_session_events_do_not_revive_speech():
     bridge = core()
     bridge.on_heard("拿苹果放到礼盒", 0)
-    steps = [{"skill_name": name, "target_name": "an apple"} for name in ("pick_object", "place_in_container")]
+    steps = [
+        {"skill_name": name, "target_name": "an apple", "container_name": "gift box"}
+        for name in ("pick_object", "place_in_container")
+    ]
     present(bridge, steps)
     old = of(bridge.on_event(event(detail=gift_detail()), 1), Speak)[0]
     bridge.end_session(2)

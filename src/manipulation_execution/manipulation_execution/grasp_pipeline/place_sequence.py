@@ -20,7 +20,13 @@ class PlaceSequenceResult:
 class PlaceSequence:
     def __init__(self, backends, *, on_phase=lambda *_: None):
         self.backends, self.phase = backends, on_phase
-        self.sequence = GraspSequence(backends, on_phase=on_phase)
+
+        def sequence_phase(name, event, detail):
+            if name == EffectorAction.RELEASE.value and event == "start":
+                detail = {**detail, "release_status": "UNKNOWN"}
+            on_phase(name, event, detail)
+
+        self.sequence = GraspSequence(backends, on_phase=sequence_phase)
 
     def _remember_failure(self, result, code, message):
         if not result.first_failure:
@@ -107,6 +113,7 @@ class PlaceSequence:
                         raise _Stopped("RELEASE_UNCERTAIN", "open hand and release could not be confirmed")
                     carrying = False
                     result.release_status, result.custody_outcome = "released", "released"
+                    self.phase("release_confirmed", "end", {"release_status": "RELEASED"})
                 elif isinstance(step, Hold):
                     self.sequence._expect(self.sequence._hold(step, carrying, cancelled, record))
             result.success = True
