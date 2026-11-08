@@ -1,5 +1,8 @@
 """Describe the object in the palm frame at contact, using CPU forward kinematics."""
 
+import json
+import sys
+import time
 import uuid
 from types import SimpleNamespace
 
@@ -104,10 +107,63 @@ def return_path(moves):
     return tuple(np.vstack(positions).ravel()), tuple(np.concatenate(times))
 
 
-def held_builder(node, executor, effector):
-    models = {}
+def filter_held_points(local):
+    """Palm-frame object cloud -> (kept cloud, attachment indices, radius m, timings s).
 
-    def build(query, observation, proposals, plan):
+    Pure and picklable, so it can run in a worker process while the arm lifts:
+    on the 310P (2026-11-08) without_fringe alone took 1.3 s of a 1.9 s handover.
+    """
+    timings, tick = {}, [time.perf_counter()]
+
+    def lap(name):
+        now = time.perf_counter()
+        timings[name] = round(now - tick[0], 4)
+        tick[0] = now
+
+    local = without_fringe(np.asarray(local, float))
+    lap("without_fringe")
+    local = without_outliers(local)
+    lap("without_outliers")
+    # Keep a bounded cloud, including extrema, for collision attachment.
+    indices = np.unique(
+        np.r_[
+            np.linspace(0, len(local) - 1, min(len(local), 512), dtype=int),
+            np.argmin(local, axis=0),
+            np.argmax(local, axis=0),
+        ]
+    )
+    # Consumers only see the published subset, so its centre is the sphere's.
+    radius = float(np.max(np.linalg.norm(local - held_center(local[indices]), axis=1)) + 0.01)
+    lap("held_center")
+    return local, indices, radius, timings
+
+
+def _filter_pool():
+    """One spawned worker process: the filter must not take the GIL from the arm's command stream."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
+
+    pool = ProcessPoolExecutor(max_workers=1, mp_context=multiprocessing.get_context("spawn"))
+    pool.submit(filter_held_points, np.zeros((32, 3)) + np.arange(32)[:, None] * 1e-3)  # warm the worker's imports
+    return pool
+
+
+def held_builder(node, executor, effector, *, background=True):
+    """``build(query, observation, proposals, plan)`` -> HeldObject; ``build.prepare`` starts it early.
+
+    ``prepare`` (called when the hand has closed) computes the palm-frame cloud
+    and hands its filtering to a worker process, so it runs while the arm
+    lifts. The palm pose is the planned contact's, which neither the lift nor
+    the fingers change, so the prepared cloud is the one build would compute.
+    ``build`` uses the prepared result for the same plan, and computes inline
+    when there is none or the worker failed.
+    """
+    models = {}
+    pending = {}
+    # Started with the node, so its imports are warm before the first lift.
+    pool = [_filter_pool() if background else None]
+
+    def palm_cloud(observation, proposals, plan):
         side = plan.report["arm_side"]
         if side not in models:
             models[side] = RobotSphereModel(directory=config_directory(side))
@@ -126,17 +182,41 @@ def held_builder(node, executor, effector):
         local = (points - palm[:3, 3]) @ palm[:3, :3]
         if not len(local) or not np.isfinite(local).all():
             raise ValueError("held object has no valid shape")
-        local = without_outliers(without_fringe(local))
-        # Keep a bounded cloud, including extrema, for collision attachment.
-        indices = np.unique(
-            np.r_[
-                np.linspace(0, len(local) - 1, min(len(local), 512), dtype=int),
-                np.argmin(local, axis=0),
-                np.argmax(local, axis=0),
-            ]
-        )
-        # Consumers only see the published subset, so its centre is the sphere's.
-        radius = float(np.max(np.linalg.norm(local - held_center(local[indices]), axis=1)) + 0.01)
+        return side, moves, contact, local
+
+    def prepare(observation, proposals, plan):
+        pending.clear()
+        if not background:
+            return
+        try:
+            started = time.perf_counter()
+            side, moves, contact, local = palm_cloud(observation, proposals, plan)
+            future = pool[0].submit(filter_held_points, local)
+            pending[id(plan)] = (side, moves, contact, len(local), future, time.perf_counter() - started)
+        except Exception as exc:  # noqa: BLE001 - build computes inline instead
+            print(json.dumps({"held_object_prepare_error": f"{type(exc).__name__}: {exc}"}), file=sys.stderr)
+
+    def build(query, observation, proposals, plan):
+        started = time.perf_counter()
+        report = {"prepared": False}
+        filtered = None
+        early = pending.pop(id(plan), None)
+        if early is not None:
+            side, moves, contact, points_in, future, report["prepare_s"] = early
+            try:
+                filtered = future.result(timeout=10.0)
+                report["prepared"] = True
+            except Exception as exc:  # noqa: BLE001 - fall back to the inline filter
+                report["prepare_error"] = f"{type(exc).__name__}: {exc}"
+            report["wait_s"] = round(time.perf_counter() - started, 4)
+        if filtered is None:
+            side, moves, contact, local = palm_cloud(observation, proposals, plan)
+            points_in = len(local)
+            filtered = filter_held_points(local)
+        local, indices, radius, timings = filtered
+        report.update(points_in=points_in, points_kept=len(local), filter_s=timings)
+        report["total_s"] = round(time.perf_counter() - started, 4)
+        print(json.dumps({"held_object": report}), file=sys.stderr, flush=True)
         if not np.isfinite(radius):
             raise ValueError("held object has no valid shape")
         return HeldObject(
@@ -156,4 +236,6 @@ def held_builder(node, executor, effector):
             *return_path(moves),
         )
 
+    build.prepare = prepare
+    build.close = lambda: pool[0] is not None and pool[0].shutdown(wait=False, cancel_futures=True)
     return build

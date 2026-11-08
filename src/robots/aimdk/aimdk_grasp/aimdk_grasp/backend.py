@@ -503,6 +503,8 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
     from .place_request import X2PlacePlanner
 
     robots = head.robots if hasattr(head, "arms") else {robot.side: robot}
+    held = held_builder(node, executor, effector)
+    closers.append(held.close)
     return GraspBackends(
         source,
         proposer,
@@ -512,7 +514,7 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
         head.watch,
         close=close,
         prepare=prepare,
-        held_object=held_builder(node, executor, effector),
+        held_object=held,
         plan_home=X2PlacePlanner(head, robots).plan_home,
     )
 
