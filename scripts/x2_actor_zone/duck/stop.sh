@@ -34,7 +34,7 @@ LOG=$(cat "$STATE/log_dir" 2>/dev/null)
 if alive launch; then
     echo "== 1/3 让机器人退出 URS（发 stop，同长捂）"
     v=$(vendor); echo "   之前：$v"
-    $ENV 'source /root/x2-actor-run/env_actor.sh >/dev/null 2>&1; timeout 15 ros2 service call /mirror_session/set_session std_srvs/srv/SetBool "{data: false}"' 2>&1 | grep -E "success|message" | sed "s/^/   /"
+    $ENV 'source /root/x2-actor-run/env_actor.sh >/dev/null 2>&1; timeout -k 5 15 ros2 service call /mirror_session/set_session std_srvs/srv/SetBool "{data: false}"' 2>&1 | grep -E "success|message" | sed "s/^/   /"
     ok=0
     for _ in 1 2 3 4 5; do
         v=$(vendor)
