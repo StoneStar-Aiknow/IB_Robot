@@ -7,6 +7,7 @@ Pinned here, all without ROS:
   silent: the event says another clip of its pool;
 * an event clears the queued look lines and standby words, never the clip
   playing; at the pop, a look line needs MIRRORING and a standby word STANDBY;
+* the goodbye as a stop's wrap-up begins, and not again at WAIT;
 * the standby rhythm, on a fake clock with a fixed seed;
 * a broken ``clips_json`` still plays the clips it names, with defaults for
   the rest;
@@ -24,7 +25,14 @@ import pytest
 from embodied_common.internvl_voice_contract import parse_playback_json
 from embodied_common.mirror_session_contract import STATE_STALE_SEC
 from embodied_common.mirror_voice_contract import parse_voice_section
-from manipulation_execution.mirror_voice.core import MIRRORING_RUNNING, STANDBY_APPROACH, STANDBY_READY, WAIT_NONE
+from manipulation_execution.mirror_voice.core import (
+    GOODBYE,
+    MIRRORING_RUNNING,
+    STANDBY_APPROACH,
+    STANDBY_READY,
+    WAIT_NONE,
+    TransitionFilter,
+)
 from manipulation_execution.mirror_voice.speaker import (
     STANDBY,
     PrerecordedClips,
@@ -121,6 +129,7 @@ class Harness:
         self.log: list[tuple[str, str]] = []
         self.events: list[str] = []  # playback start / end, speaking changes
         self.state = "WAIT"
+        self.purpose = ""
         self.transition = None
         self.last_beat = self.t
         self.speaker = Speaker(
@@ -140,17 +149,21 @@ class Harness:
         )
         self.speaker.on_state(json.dumps({"state": "WAIT", "last_transition": None}))  # the replay
 
-    def go(self, target, source=None):
-        """Send the transition ``source -> target`` (``STATE/phase``) once."""
+    def go(self, target, source=None, purpose=""):
+        """Send the transition ``source -> target`` (``STATE/phase``) once; ``purpose`` its wrap_purpose."""
         source = source or (self.transition["to"] if self.transition else WAIT_NONE)
         self.transition = {"from": source, "to": target, "t": self.t}
         self.state = target.split("/")[0]
+        self.purpose = purpose
         self.last_beat = self.t
-        return self.speaker.on_state(json.dumps({"state": self.state, "last_transition": self.transition}))
+        return self.speaker.on_state(json.dumps(self.message()))
+
+    def message(self):
+        return {"state": self.state, "wrap_purpose": self.purpose, "last_transition": self.transition}
 
     def heartbeat(self):
         self.last_beat = self.t
-        self.speaker.on_state(json.dumps({"state": self.state, "last_transition": self.transition}))
+        self.speaker.on_state(json.dumps(self.message()))
 
     def run_until(self, end, step=0.1):
         """Tick every ``step`` s, a heartbeat every second, up to ``end``."""
@@ -275,6 +288,106 @@ class TestEventClips:
         assert h.calls.played == []
         assert h.speaker.status()["events_silent"] == 1
         assert_never_synthesized(h)
+
+
+MIRRORING_WRAP_UP = "MIRRORING/wrap_up"
+STANDBY_WRAP_UP = "STANDBY/wrap_up"
+
+
+def transition(source, target, t, purpose=""):
+    return {
+        "state": target.split("/")[0],
+        "wrap_purpose": purpose,
+        "last_transition": {"from": source, "to": target, "t": t},
+    }
+
+
+class TestEarlyGoodbye:
+    def test_a_stops_wrap_up_says_the_goodbye_and_wait_stays_silent(self):
+        h = Harness()
+        h.go(STANDBY_APPROACH)
+        h.go(STANDBY_READY)
+        h.go(MIRRORING_RUNNING)
+        h.t += 1
+
+        assert h.go(MIRRORING_WRAP_UP, purpose="stop") == GOODBYE
+        assert h.played_texts()[-1] in EVENT_TEXTS["goodbye"]
+        h.t += 2
+        assert h.go(WAIT_NONE) is None
+        h.run_until(h.t + 5)
+
+        goodbyes = [text for text in h.played_texts() if text in EVENT_TEXTS["goodbye"]]
+        assert len(goodbyes) == 1
+
+    def test_a_stop_during_the_approach_says_it_at_its_wrap_up(self):
+        h = Harness()
+        h.go(STANDBY_APPROACH)
+
+        assert h.go(STANDBY_WRAP_UP, purpose="stop") == GOODBYE
+        assert h.go(WAIT_NONE) is None
+        assert h.speaker.status()["standby_due_in"] is None
+
+    def test_a_cancels_wrap_up_is_silent_and_so_is_its_cooldown(self):
+        h = Harness()
+        h.go(MIRRORING_RUNNING, source=STANDBY_READY)
+        before = len(h.calls.played)
+
+        assert h.go(MIRRORING_WRAP_UP, purpose="cancel") is None
+        assert h.go("STANDBY/cooldown") is None
+        assert len(h.calls.played) == before
+
+    def test_a_stop_during_a_cancels_wrap_up_says_it_at_wait(self):
+        h = Harness()
+        h.go(MIRRORING_RUNNING, source=STANDBY_READY)
+        h.go(MIRRORING_WRAP_UP, purpose="cancel")
+        h.purpose = "stop"  # no transition: the cancel's wrap-up goes on as the stop's
+        h.heartbeat()
+
+        assert h.go(WAIT_NONE) == GOODBYE
+
+    def test_a_wait_without_a_wrap_up_still_says_it(self):
+        h = Harness()
+        h.go(STANDBY_APPROACH)
+        h.go(STANDBY_READY)
+
+        assert h.go(WAIT_NONE) == GOODBYE
+
+    def test_the_next_visit_says_its_goodbye_again(self):
+        h = Harness()
+        for _ in range(2):
+            h.go(STANDBY_APPROACH, source=WAIT_NONE)
+            h.go(STANDBY_READY)
+            h.go(MIRRORING_RUNNING)
+            h.t += 1
+            assert h.go(MIRRORING_WRAP_UP, purpose="stop") == GOODBYE
+            assert h.go(WAIT_NONE) is None
+            h.t += 1
+
+    def test_a_queued_look_line_is_cleared_and_the_one_playing_finishes_first(self):
+        h = Harness(sync=False, gate=lambda: True)
+        h.speaker.on_utterance(LOOK_TEXTS[0])  # starts playing
+        h.speaker.on_utterance(LOOK_TEXTS[1])  # waits
+
+        h.go(MIRRORING_WRAP_UP, source=MIRRORING_RUNNING, purpose="stop")
+        h.calls.finish()
+
+        played = h.played_texts()
+        assert played == [LOOK_TEXTS[0], played[1]]
+        assert played[1] in EVENT_TEXTS["goodbye"]
+
+    def test_the_filter_says_it_early_only_when_asked(self):
+        # The synthesis mode (switch off) keeps the goodbye at WAIT, the wrap-up silent.
+        for early, at_wrap_up, at_wait in ((False, None, GOODBYE), (True, GOODBYE, None)):
+            words = TransitionFilter(early_goodbye=early)
+            words.feed({"last_transition": None})  # the replay
+            assert words.feed(transition(MIRRORING_RUNNING, MIRRORING_WRAP_UP, 1.0, "stop")) == at_wrap_up
+            assert words.feed(transition(MIRRORING_WRAP_UP, WAIT_NONE, 2.0)) == at_wait
+
+    def test_a_replayed_wrap_up_is_not_spoken_and_wait_then_says_it(self):
+        words = TransitionFilter(early_goodbye=True)
+
+        assert words.feed(transition(MIRRORING_RUNNING, MIRRORING_WRAP_UP, 1.0, "stop")) is None
+        assert words.feed(transition(MIRRORING_WRAP_UP, WAIT_NONE, 2.0)) == GOODBYE
 
 
 class TestQueue:

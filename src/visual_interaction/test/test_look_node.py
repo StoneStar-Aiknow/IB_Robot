@@ -480,7 +480,11 @@ def test_a_window_holds_the_look_until_shortly_before_the_line(rig):
 
 def test_after_five_lines_the_round_stops_looking(rig):
     vision = FakeVision()
-    look = rig(vision, first_after_sec=[0.1, 0.1], gap_sec=[0.1, 0.1], fallback_after_sec=0.5).preload().mirror()
+    look = (
+        rig(vision, first_after_sec=[0.1, 0.1], gap_sec=[0.1, 0.1], fallback_after_sec=0.5, max_per_round=5)
+        .preload()
+        .mirror()
+    )
     look.run(30.0)
     assert len(look.said) == 5
     prepares = vision.prepares

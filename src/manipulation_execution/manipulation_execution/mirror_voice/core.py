@@ -15,9 +15,15 @@ event          transition (``last_transition`` of a state message)
 ``goodbye``    ``-> WAIT/none`` from anywhere else, whatever the reason
 =============  =========================================================
 
-Everything else (``-> STANDBY/cooldown``, ``-> */wrap_up``) is silent. The
-state strings are built from the session's own ``SessionState`` and ``Phase``,
-so renaming a state breaks here at import instead of going quiet.
+Everything else (``-> STANDBY/cooldown``, ``-> */wrap_up``) is silent, with
+one exception in the prerecorded mode (``early_goodbye``): a stop's wrap-up
+(``-> */wrap_up`` whose ``wrap_purpose`` is ``stop``: ``mirror_stop`` or the
+camera covered) always ends in ``WAIT/none``, so the goodbye is said as the
+wrap-up begins and the ``-> WAIT/none`` right after it is silent. The arm's
+way back to the reset pose then covers the time the goodbye takes. A cancel's
+wrap-up goes on to the cooldown and stays silent. The state strings are built
+from the session's own ``SessionState`` and ``Phase``, so renaming a state
+breaks here at import instead of going quiet.
 
 The WAV cache, synthesis and playback order are in ``mirror_voice.speaker``.
 """
@@ -30,11 +36,13 @@ from collections.abc import Mapping, Sequence
 
 from embodied_common.mirror_voice_contract import SERVICE_WAIT_ERROR_SEC, SERVICE_WAIT_REPEAT_SEC
 from manipulation_execution.mirror_session.core import Phase, SessionState
+from manipulation_execution.mirror_session.hooks import WrapUpPurpose
 
 WAIT_NONE = f"{SessionState.WAIT.value}/{Phase.NONE.value}"
 STANDBY_APPROACH = f"{SessionState.STANDBY.value}/{Phase.APPROACH.value}"
 STANDBY_READY = f"{SessionState.STANDBY.value}/{Phase.READY.value}"
 MIRRORING_RUNNING = f"{SessionState.MIRRORING.value}/{Phase.RUNNING.value}"
+WRAP_UPS = frozenset(f"{state.value}/{Phase.WRAP_UP.value}" for state in (SessionState.MIRRORING, SessionState.STANDBY))
 
 GOODBYE = "goodbye"
 TRANSITION_KEYS = ("from", "to", "t")
@@ -65,15 +73,21 @@ class TransitionFilter:
 
     A restarted session starts again from ``WAIT/none`` with no transition,
     and its new transitions have new keys, so each is spoken once.
+
+    ``early_goodbye`` says the goodbye as a stop's wrap-up begins (see the
+    module doc); the next transition, the ``-> WAIT/none`` it ends in, is then
+    silent. A ``-> WAIT/none`` that no stop's wrap-up announced still says it.
     """
 
-    def __init__(self, memory: int = 64):
+    def __init__(self, memory: int = 64, early_goodbye: bool = False):
         if isinstance(memory, bool) or not isinstance(memory, int) or memory < 1:
             raise ValueError("memory must be a positive integer")
         self._memory = memory
         self._keys: deque[tuple] = deque()
         self._seen: set[tuple] = set()
         self._first = True
+        self._early_goodbye = early_goodbye
+        self._goodbye_said = False  # by the transition just before this one
         self.received = 0
         self.events = 0
         self.malformed = 0
@@ -98,8 +112,19 @@ class TransitionFilter:
         if first:
             return None
         event = event_for(transition)
+        if self._early_goodbye:
+            event = self._goodbye_early(message, transition, event)
         if event is not None:
             self.events += 1
+        return event
+
+    def _goodbye_early(self, message: Mapping, transition: Mapping, event: str | None) -> str | None:
+        said, self._goodbye_said = self._goodbye_said, False
+        if transition["to"] in WRAP_UPS and message.get("wrap_purpose") == WrapUpPurpose.STOP.value:
+            self._goodbye_said = True
+            return GOODBYE
+        if event == GOODBYE and said:
+            return None
         return event
 
     def _remember(self, key: tuple) -> None:

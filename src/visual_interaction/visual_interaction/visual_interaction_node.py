@@ -334,10 +334,16 @@ class VisualInteractionNode(Node):
             )
         if self._look_settings is not None:
             self._init_look(self._look_settings)
+        # A look blocks this single-threaded node for a second or more, and the
+        # executor takes one message per subscription per wait. With a queue of
+        # 10 the look read voice status seconds old as fresh, and believed a
+        # clip that had ended was still playing (two 12 s silences on the
+        # board). Depth 1 keeps only the newest; chatter keeps its old queue.
+        latest_only = 1 if self._mode == "look" else 10
         if self._mode in ("chatter", "look"):
             voice_topic = str(self._value("voice_status_topic")).strip()
             if voice_topic:
-                self.create_subscription(String, voice_topic, self._on_voice_status, 10)
+                self.create_subscription(String, voice_topic, self._on_voice_status, latest_only)
 
         self._utterances = self.create_publisher(VisualInteractionUtterance, UTTERANCE_TOPIC, 10)
         self._status = self.create_publisher(String, STATUS_TOPIC, 10)
@@ -349,7 +355,7 @@ class VisualInteractionNode(Node):
         )
         actor_topic = str(self._value("actor_state_topic"))
         if actor_topic:
-            self.create_subscription(ActorState, actor_topic, self._on_actor, 10)
+            self.create_subscription(ActorState, actor_topic, self._on_actor, latest_only)
         if self._mirror_topic is not None:
             # Reliable + transient_local, depth 1, matching the publisher's
             # contract (embodied_common.mirror_session_contract): the latched

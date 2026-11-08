@@ -91,12 +91,13 @@ class LookSettings:
     crop_actor: bool = True
     refine_hand: bool = True
     verify: bool = True
-    first_after_sec: Interval = (2.0, 4.0)
-    gap_sec: Interval = (3.0, 6.0)
-    max_per_round: int = 5
+    # Board 11-08: 5 lines left a 60 s round quiet at the end; zll wanted more.
+    first_after_sec: Interval = (1.0, 2.5)
+    gap_sec: Interval = (2.5, 5.0)
+    max_per_round: int = 8
     fresh_sec: float = 5.0
-    pool_cooldown_sec: float = 15.0
-    fallback_after_sec: float = 2.5
+    pool_cooldown_sec: float = 10.0
+    fallback_after_sec: float = 1.5
     latest_start_sec: float = 2.0
     dump_dir: str = ""
 

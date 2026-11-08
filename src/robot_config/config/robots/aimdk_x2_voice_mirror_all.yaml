@@ -374,12 +374,12 @@ robot:
       crop_actor: true
       refine_hand: true          # second question when the answer is a vague hand gesture
       verify: true               # yes/no check before a line that names a gesture
-      first_after_sec: [2.0, 4.0]
-      gap_sec: [3.0, 6.0]
-      max_per_round: 5
+      first_after_sec: [1.0, 2.5]
+      gap_sec: [2.5, 5.0]
+      max_per_round: 8
       fresh_sec: 5.0
-      pool_cooldown_sec: 15.0
-      fallback_after_sec: 2.5
+      pool_cooldown_sec: 10.0
+      fallback_after_sec: 1.5
       latest_start_sec: 2.0
       dump_dir: ""
   # /feat/x2-internvl-voice

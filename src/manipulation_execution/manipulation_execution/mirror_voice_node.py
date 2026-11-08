@@ -26,8 +26,9 @@ Interfaces:
 * when ``voice_json`` carries an ``utterance_topic``: subscribes it
   (``ibrobot_msgs/VisualInteractionUtterance``, depth 10 as the publisher)
   and admits one visual interaction reply per round — speakable kind, not
-  suppressed, no ASCII letters, the mirror still MIRRORING and the moment
-  still inside ``latest_start_at``. What survives is queued with the state
+  suppressed, no ASCII letters, the mirror still MIRRORING (in the
+  prerecorded mode also still running: the goodbye starts with the wrap-up)
+  and the moment still inside ``latest_start_at``. What survives is queued with the state
   phrases, synthesized on demand, and its files are removed once spoken. The
   refusal counts land in ``~/status`` as ``utterance_refused``;
 * calls ``tts_service`` and ``playback_service``, one call at a time;
@@ -70,6 +71,7 @@ from embodied_common.mirror_voice_contract import NODE_NAME, VoiceSection, from_
 from embodied_common.visual_interaction_contract import UTTERANCE_KINDS
 from ibrobot_msgs.msg import VisualInteractionUtterance
 from ibrobot_msgs.srv import PlayAudioFile, SynthesizeSpeech
+from manipulation_execution.mirror_session.core import Phase
 from manipulation_execution.mirror_voice.asr_mute import AsrMute
 from manipulation_execution.mirror_voice.speaker import (
     ClipFiles,
@@ -232,6 +234,7 @@ class MirrorVoiceNode(Node):
         # utterance gate. The transition filter inside the speaker keeps its
         # own view; this one answers "is the mirror following someone now".
         self._state = ""
+        self._phase = ""
         self._state_at: float | None = None
         self._clip_report: ClipReport | None = None
         if settings.clips_json:
@@ -386,6 +389,7 @@ class MirrorVoiceNode(Node):
         state = payload.get("state") if isinstance(payload, dict) else None
         if isinstance(state, str):
             self._state = state
+            self._phase = payload.get("phase")
             self._state_at = self._now()
         self.speaker.on_state(message.data)
 
@@ -435,9 +439,11 @@ class MirrorVoiceNode(Node):
     def _mirroring_now(self) -> bool:
         # Arrival time, not the publisher's clock: no cross-host agreement to
         # lean on. Two missed heartbeats count as unknown, and unknown gates
-        # the utterance off — the conservative side.
+        # the utterance off — the conservative side. In the prerecorded mode
+        # the goodbye is said as the wrap-up begins: nothing may follow it.
         return (
             self._state == STATE_MIRRORING
+            and (self._clip_report is None or self._phase == Phase.RUNNING.value)
             and self._state_at is not None
             and self._now() - self._state_at <= STATE_STALE_SEC
         )

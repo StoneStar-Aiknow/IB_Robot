@@ -1,7 +1,8 @@
 """The voice node in prerecorded mode (``clips_json``): board only, it needs ibrobot_msgs.
 
 No synthesis client at all, the ASR control publisher and the ASR status
-subscription, the 「用 <dir>，找到 n / N」 count, the ``noclip`` refusal, and a
+subscription, the 「用 <dir>，找到 n / N」 count, the ``noclip`` refusal, no look
+line once the wrap-up (and with it the goodbye) has begun, and a
 status published the moment the voice starts or stops speaking. And the last
 ``start`` of a real process, sent after SIGINT or SIGTERM.
 """
@@ -21,7 +22,7 @@ import pytest
 rclpy = pytest.importorskip("rclpy")
 pytest.importorskip("ibrobot_msgs.msg")
 
-from test_mirror_voice_node import state_message, utterance  # noqa: E402
+from test_mirror_voice_node import utterance  # noqa: E402
 
 from embodied_common.mirror_session_contract import STATE_MIRRORING  # noqa: E402
 from embodied_common.mirror_voice_contract import parse_voice_section, to_json  # noqa: E402
@@ -85,12 +86,28 @@ def test_the_clips_found_are_counted(node, tmp_path):
     assert (report.directory, report.found, report.total) == (str(tmp_path), 2, 3)
 
 
+def mirroring(phase):
+    from std_msgs.msg import String
+
+    return String(data=json.dumps({"state": STATE_MIRRORING, "phase": phase, "last_transition": None}))
+
+
 def test_an_utterance_without_a_clip_is_refused_as_noclip(node):
-    node._on_state(state_message(STATE_MIRRORING))
+    node._on_state(mirroring("running"))
     node._on_utterance(utterance("这句没有录过"))
 
     assert node._utterance_refused["noclip"] == 1
     assert node.speaker.synthesis_calls == 0
+
+
+def test_a_look_line_is_refused_once_the_wrap_up_began(node):
+    node._on_state(mirroring("running"))
+    assert node._mirroring_now()
+    node._on_state(mirroring("wrap_up"))
+    node._on_utterance(utterance(CLIPS["look_wave_01"]))
+
+    assert not node._mirroring_now()
+    assert node._utterance_refused["mirror"] == 1
 
 
 def test_speaking_publishes_the_status_at_once(node):

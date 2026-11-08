@@ -59,6 +59,10 @@ file of ``PrerecordedClips``:
 * an event queued clears the queued utterances and standby words; the clip
   playing finishes. At the pop, an utterance is dropped if the gate is closed
   (the mirror left MIRRORING) and a standby word if the session left STANDBY;
+* the goodbye is said as a stop's wrap-up begins, not when the session
+  reaches WAIT (``core.TransitionFilter`` ``early_goodbye``): the arm's way
+  back to the reset pose covers the time it takes. It also stops the
+  standby words;
 * standby words: only after ``ready`` and while the session is in STANDBY.
   The first ``standby_first_after_s`` after the ready clip ended (or after
   the event, if it had no clip), the next ``standby_gap_s`` after the last
@@ -89,7 +93,7 @@ from typing import Any, Protocol
 
 from embodied_common.mirror_session_contract import STATE_STALE_SEC, STATE_STANDBY
 from embodied_common.mirror_voice_contract import EVENTS, VoiceSection
-from manipulation_execution.mirror_voice.core import PhraseQueue, ServiceWatch, TransitionFilter, pick_phrase
+from manipulation_execution.mirror_voice.core import GOODBYE, PhraseQueue, ServiceWatch, TransitionFilter, pick_phrase
 
 AUDIO_FORMAT = "wav_pcm_s16le"
 FAILURES = ("synthesis", "synthesis_timeout", "audio", "playback", "playback_timeout", "playback_unavailable")
@@ -349,7 +353,7 @@ class Speaker:
         # state it was admitted under may be gone by then. None gates nothing.
         self._utterance_gate = utterance_gate
         self._lock = threading.RLock()
-        self._filter = TransitionFilter()
+        self._filter = TransitionFilter(early_goodbye=clips is not None)
         self._queue = PhraseQueue(section.queue_max)
         self._clips = clips
         self._on_playback_start = on_playback_start
@@ -723,6 +727,9 @@ class Speaker:
         if event == "ready":
             self._standby_reset()
             self._standby_after_ready = True
+        elif event == GOODBYE:
+            # A stop during the approach says it while still in STANDBY.
+            self._standby_reset()
         text = self._pick(event, self._clips.events.get(event, ()))
         if text is None:
             self.events_silent += 1
