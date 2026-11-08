@@ -1,8 +1,9 @@
-# AgiBot X2: the voice + gesture + mirror deployment with grasp enabled.
+# AgiBot X2: voice, gestures, mirror and the pick-to-place workflow.
 #
 # Layered on aimdk_x2_voice_mirror_all for the voice agent, gestures, and mirror.
-# This profile maps gestures, grasp, and mirror to the shared policy_stream and
-# enables the perception services and delegated executor required by grasp.
+# This profile maps gestures, grasp, placement, and mirror to the shared
+# policy_stream, and enables the perception services and the pick/place
+# delegated executors connected to the Orin's grasp head.
 #
 # This profile requires the three grasp model bundles on the 310P and the grasp
 # head on the Orin. Keep the models, Orin head, and robot preparation available
@@ -12,6 +13,11 @@ robot:
   base_config: aimdk_x2_voice_mirror_all.yaml
   name: aimdk_x2_voice_mirror_grasp
 
+  # Release the mirror camera reader and stop new HRI model requests during pick/place.
+  # The grasp head's RGB-D capture and safety checks remain active.
+  motion_imitation_stream:
+    pause_during_manipulation: true
+
   # pick_object declares moveit_planning. The catalog compiler only compiles the
   # modes a deployment lists here, so without it the skill is silently dropped
   # rather than mis-bound.
@@ -20,9 +26,10 @@ robot:
     - model_inference
     - moveit_planning
 
-  # Table-side grasp_ready: hardware approval remains false in the example file.
+  # Table-side grasp_ready and arms_rest, approved on this robot. The committed
+  # commissioning/fixed_poses.json is compiled against exactly these poses.
   task_poses:
-    file: ../task_poses/x2_example.yaml
+    file: ../task_poses/x2_voice_mirror_grasp_approved.yaml
     # Resolve open-hand requests from the explicit mounting declaration below.
     # The same source poses support one or both hands without editing their angles.
     hands: installed
@@ -67,20 +74,20 @@ robot:
     right_wrist_roll_joint: [-0.7240, 1.5710]
 
   control_modes:
-    # Gestures, grasp, and mirror share the vendor's upper-body stream so
-    # sequential skills do not switch between incompatible vendor modes.
+    # Gestures, grasp, placement, and mirror share the vendor's upper-body stream
+    # so sequential skills do not switch between incompatible vendor modes.
     named_motion:
       runtime_mode: policy_stream
       inference:
         enabled: false
       executor:
         enabled: false
-    # The grasp pipeline streams the configured arm and hand through its
-    # delegated executor, so the control-mode executor stays
-    # off. Grasp and mirror both use policy_stream and must not run concurrently.
+    # The pick and place pipelines stream the configured arm and hand through
+    # their delegated executors, so the control-mode executor stays off. They and
+    # the mirror all use policy_stream and must not run concurrently.
     moveit_planning:
-      description: "Grasp pipeline streams the selected arm and hand"
-      description_cn: "抓取流水线流式控制配置的机械臂和灵巧手"
+      description: "Pick and place pipelines stream the configured arm and hand"
+      description_cn: "抓取和放置流水线流式控制配置的机械臂和灵巧手"
       runtime_mode: policy_stream
       inference:
         enabled: false
@@ -137,19 +144,24 @@ robot:
     # cross to the Orin; the vendor forbids subscribing raw camera streams
     # across compute units.
     backend: "aimdk_grasp.remote_head:x2_remote_grasp_backends"
+    held_lease_s: 30.0
     model_deployment: torch_npu
     model_bundle_path: "$(env WORKSPACE)/models/graspgenx_omnihand_left_x2"
     command_interfaces:
       - joint.arm_stream
       - joint.hand_stream
     backend_options:
-      # Current hardware: right hand mounted, left hand removed (both arms remain).
-      # Two hands: installed_hands: [left, right], arm_side: auto.
+      # Current hardware: both hands mounted; grasp with the right arm.
+      # For automatic arm selection with both hands, set arm_side: auto.
       # Left hand only: installed_hands: [left], arm_side: left.
       # Keep this block identical on the 310P and Orin. Recompile the fixed
       # artifact after changing mounting or task poses; their digest is frozen.
-      installed_hands: [right]
+      installed_hands: [left, right]
       arm_side: right
+      planning:
+        approach_over_height_m: 0.18
+        approach_order_m: [0.10, 0.15, 0.07, 0.05]
+        carry_lift_m: 0.15
       detect_service: /perception/grasp/grounding_detect
       generate_grasps_service: /perception/grasp/generate_grasps
       segment_service: /perception/grasp/segment_detections
@@ -159,6 +171,31 @@ robot:
       # p99 0.47 s; the hand hid the target for up to 2.62 s at the end of the
       # grasp segment, so the timeout is well above the median gap.
       watch_frame_timeout_s: 1.0
+      watch_unknown_timeout_s: 4.0
+      watch_image_age_s: 0.5
+      head:
+        namespace: /x2_grasp_head
+        status_timeout_s: 1.0
+        cpu_isolation:
+          node: "4-7"
+          others: "1-3"
+    pipeline:
+      release_after_success: true
+      max_attempts: 3
+      max_regrasps: 1
+      execute_reserve_s: 50.0
+
+  placement_execution:
+    enabled: true
+    executor: placement_pipeline
+    required_args: [target_name, container_name]
+    action_name: /manipulation/execute_place
+    backend: "aimdk_grasp.remote_head:x2_remote_place_backends"
+    perception:
+      # Candidate supported by the saved basket/table detection comparison.
+      box_threshold: 0.50
+    pipeline:
+      max_attempts: 2
 
   # Local Oula text wake is enabled; speaker checking stays off by default.
   voice_asr:
@@ -177,8 +214,8 @@ robot:
       idle_timeout_sec: 1.2
 
   embodied:
-    # The profile exposes pick_object together with the delegated executor
-    # registered by grasp_execution above.
+    # The profile exposes pick_object and place_in_container together with the
+    # delegated executors registered by grasp_execution and placement_execution.
     skill_catalog_profile: aimdk_x2_voice_mirror_grasp
     agent:
       # Override the address with planner_base_url at launch on another bench.
@@ -232,6 +269,7 @@ robot:
         - pick_object
         - free_pose
         - return_to_task_pose
+        - place_in_container
     runtime_play_audio:
       clips:
         self_intro: "$(env WORKSPACE)/commissioning/audio/self_introduction.wav"
@@ -253,8 +291,10 @@ robot:
 # A changed hand shape can rebuild the cuRobo planner on the Orin (~50 s)
 # and consume the request budget.
 #
-# Stop the mirror session before a pick. Both skills use policy_stream, so
-# mode switching alone does not arbitrate concurrent arm commands.
+# Stop the mirror session before a pick. Pick/place and mirror share
+# policy_stream, so mode switching alone does not arbitrate concurrent arm
+# commands. Adjacent pick/place steps retain custody until placement releases
+# the object; a standalone pick keeps its normal put-back behavior.
 
   # feat/x2-cbf-safety
   # Grasp and mirror share policy_stream + joint.arm_stream without arm_owner.

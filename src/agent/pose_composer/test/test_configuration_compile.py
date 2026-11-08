@@ -49,7 +49,7 @@ def test_compiler_uses_the_deployed_mounting_and_task_pose_snapshot(
     assert observed["hand_path_check"] == hand_policy
     for pose in observed["snapshot"]["poses"].values():
         assert pose["hands"] == dict.fromkeys(sides, "open")
-        assert pose["hardware_approved"] is False
+        assert pose["hardware_approved"] is True
     assert json.loads(output.read_text())["digest"] == "command-test"
 
 

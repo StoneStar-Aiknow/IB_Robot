@@ -1,0 +1,8 @@
+schema_version: 1
+kind: delegated_executor
+robot: aimdk_x2_grasp
+executor: placement_pipeline
+required_args:
+- target_name
+- container_name
+timeout_sec: 90.0

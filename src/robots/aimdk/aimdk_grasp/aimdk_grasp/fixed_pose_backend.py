@@ -33,6 +33,71 @@ def digest(value):
     ).hexdigest()
 
 
+#: What ``robot_fingerprint`` covers; change it whenever :func:`motion_inputs` does.
+FINGERPRINT_SCHEME = "x2-fixed-motion-v2"
+
+
+def named_motion_extremes(profile: dict, profile_dir: Path) -> dict:
+    """Per joint, the range the profile's recorded named motions sweep.
+
+    The offline compiler widens its solve limits to these extremes
+    (``aimdk_robot.pose_backend.model``), so they shape the compiled targets.
+    """
+    low: dict[str, float] = {}
+    high: dict[str, float] = {}
+    named = ((profile.get("vendor") or {}).get("named_motion") or {}).get("trajectories") or {}
+    for relative in named.values():
+        recorded = json.loads((Path(profile_dir) / relative).read_text())
+        for index, name in enumerate(recorded["joints"]):
+            values = [float(row[index]) for row in recorded["positions"]]
+            low[name] = min(low.get(name, values[0]), min(values))
+            high[name] = max(high.get(name, values[0]), max(values))
+    return {name: [low[name], high[name]] for name in sorted(low)}
+
+
+def motion_inputs(profile: dict, profile_dir: Path) -> dict:
+    """The runtime-profile content compiled poses depend on, and nothing else.
+
+    Audio, cameras, topics and other interfaces do not change a pose, so a
+    change there must not invalidate a compiled library (2026-11-08: two audio
+    channel counts made an otherwise identical external-microphone profile
+    reject the site's library).
+    """
+    vendor_arm = (profile.get("vendor") or {}).get("arm") or {}
+    return {
+        "arm_joints": list(profile["arm_joints"]),
+        "arm_limits": vendor_arm.get("limits"),
+        "rest": (profile.get("conformance") or {}).get("start_positions"),
+        "named_motion_extremes": named_motion_extremes(profile, profile_dir),
+    }
+
+
+def hand_geometry_files() -> dict:
+    files = {}
+    for side in ("left", "right"):
+        directory = config_directory(side)
+        for path in sorted(directory.rglob("*")):
+            if path.is_file() and path.suffix in {".urdf", ".yaml", ".yml", ".json"}:
+                files[f"{side}/{path.relative_to(directory)}"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
+
+
+def robot_fingerprint(profile: dict, profile_dir: Path, hard_limits, geometry: dict) -> str:
+    return digest(
+        {
+            "scheme": FINGERPRINT_SCHEME,
+            "motion": motion_inputs(profile, profile_dir),
+            "limits": hard_limits,
+            "geometry": geometry,
+        }
+    )
+
+
+def legacy_robot_fingerprint(profile: dict, hard_limits, geometry: dict) -> str:
+    """The fingerprint libraries compiled before :data:`FINGERPRINT_SCHEME` carry: the whole profile."""
+    return digest({"profile": profile, "limits": hard_limits, "geometry": geometry})
+
+
 class FixedBackend:
     ARM_JOINTS = JOINTS
 
@@ -52,13 +117,9 @@ class FixedBackend:
                 for side in ("left", "right")
             }
         )
-        files = {}
-        for side in ("left", "right"):
-            directory = config_directory(side)
-            for path in sorted(directory.rglob("*")):
-                if path.is_file() and path.suffix in {".urdf", ".yaml", ".yml", ".json"}:
-                    files[f"{side}/{path.relative_to(directory)}"] = hashlib.sha256(path.read_bytes()).hexdigest()
-        self.fingerprint = digest({"profile": profile, "limits": self.hard_limits, "geometry": files})
+        files = hand_geometry_files()
+        self.fingerprint = robot_fingerprint(profile, Path(profile_path).parent, self.hard_limits, files)
+        self.legacy_fingerprint = legacy_robot_fingerprint(profile, self.hard_limits, files)
         from .compiled_body_geometry import CompiledGeometry
 
         self.body_geometry = CompiledGeometry(body_geometry) if body_geometry is not None else None
@@ -69,8 +130,12 @@ class FixedBackend:
             payload = {key: value for key, value in data.items() if key != "digest"}
             if data.get("schema_version") != 1 or data.get("digest") != digest(payload):
                 raise ValueError("invalid compiled pose library digest/version")
-            if data.get("robot_fingerprint") != self.fingerprint or data.get("joint_names") != list(JOINTS):
-                raise ValueError("compiled poses do not match the runtime robot model/limits")
+            stored = data.get("robot_fingerprint")
+            if data.get("joint_names") != list(JOINTS) or stored != self.fingerprint:
+                message = "compiled poses do not match the runtime robot model/limits"
+                if data.get("joint_names") == list(JOINTS) and stored == self.legacy_fingerprint:
+                    message += "; the library has the legacy whole-profile fingerprint: run pose_migrate_library"
+                raise ValueError(message)
             if not data.get("poses"):
                 raise ValueError("empty compiled pose library")
             if data.get("task_poses"):

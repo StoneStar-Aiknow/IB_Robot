@@ -105,6 +105,7 @@ robot:
     # Orin: only compressed captures, target masks, grasp candidates, plans and
     # the watch's status cross between them.
     backend: "aimdk_grasp.remote_head:x2_remote_grasp_backends"
+    held_lease_s: 30.0
     # The GraspGen-X bundle the generate_grasps service serves: the executor
     # identity pins it together with model_deployment (each host deployment
     # sets the one its service runs), and its gripper description is what the
@@ -119,6 +120,10 @@ robot:
     backend_options:
       # Pick with the arm on the target's side; left/right force one arm.
       arm_side: auto
+      planning:
+        approach_over_height_m: 0.18
+        approach_order_m: [0.10, 0.15, 0.07, 0.05]
+        carry_lift_m: 0.15
       detect_service: /perception/grasp/grounding_detect
       generate_grasps_service: /perception/grasp/generate_grasps
       # Halt the approach when the target moves, and replan once it is back.
@@ -158,3 +163,16 @@ robot:
       # started with less goal time left, so a retry late in the goal cannot
       # be cancelled by the goal's timeout mid-motion.
       execute_reserve_s: 50.0
+
+  placement_execution:
+    enabled: true
+    executor: placement_pipeline
+    required_args: [target_name, container_name]
+    action_name: /manipulation/execute_place
+    backend: "aimdk_grasp.remote_head:x2_remote_place_backends"
+    perception:
+      # Candidate for container detection; validate recall on more saved scenes.
+      # The saved basket scored 0.900; false table detections scored 0.450/0.329.
+      box_threshold: 0.50
+    pipeline:
+      max_attempts: 2

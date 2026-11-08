@@ -29,6 +29,30 @@ _ACTIONS = {
     "MANUAL_CHECK": "本次任务未完成，请操作员检查机器人状态。",
     "NONE": "本次任务未完成，请查看执行记录。",
 }
+_PLACE_REASONS = {
+    "NOT_HOLDING": "当前没有已确认的持物，请先抓取目标。",
+    "HELD_OBJECT_MISMATCH": "持物与放置请求不匹配，请操作员检查。",
+    "CONTAINER_NOT_FOUND": "没有看到指定容器，请调整容器位置后重新下达指令。",
+    "CONTAINER_NOT_OPEN": "未确认容器开口，请使用开口可见的容器。",
+    "CONTAINER_TOO_SMALL": "容器开口无法容纳当前持物，请更换容器。",
+    "CONTAINER_OUT_OF_REACH": "指定容器超出持物手臂的范围，请把容器放近。",
+    "PLACE_PLAN_FAILED": "没有找到可执行的放置路径。",
+    "GRIP_LOST_IN_TRANSFER": "搬运中物体滑落了，请检查物体位置。",
+    "PLACED_OUTSIDE": "物体已释放，但观测结果未通过容器内放置检查。",
+    "PLACE_UNSEEN": "物体已释放，但当前视角无法确认放置结果。",
+}
+_PLACE_PHASES = {
+    "claim": "持物交接",
+    "observe_container": "容器观测",
+    "perceive_container": "容器识别",
+    "plan_place": "放置规划",
+    "transfer": "搬运",
+    "descend": "下降",
+    "release": "释放",
+    "retreat": "退离",
+    "home": "返回",
+    "verify_place": "放置验证",
+}
 _GRASP_PHASES = {
     "dispatch": "调度",
     "observe": "观测",
@@ -48,12 +72,16 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
     context = context or {}
     detail = ExecutionDetail.from_value(context.get("execution_detail"))
     state = str(state).upper()
+    placing = context.get("current_skill") == "place_in_container"
     phase = (
         _GRASP_PHASES.get(detail.failed_phase or detail.phase, "")
         if context.get("current_skill") == "pick_object" and detail.schema_version == 1
         else ""
     )
     failure_stage = f"抓取在{phase}阶段失败。" if phase else ""
+    if placing and detail.schema_version == 1:
+        phase = _PLACE_PHASES.get(detail.failed_phase or detail.phase, "")
+        failure_stage = f"放置在{phase}阶段失败。" if phase else ""
     if state == "UNKNOWN":
         last_stage = f"最后记录为{phase}阶段。" if phase else ""
         return (
@@ -64,6 +92,8 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
     if detail.schema_version == 1 and detail.recovery_state in {"FAILED", "UNKNOWN"} and state == "FAILED":
         return failure_stage + "恢复未完成或状态尚未确认，请操作员检查机器人。"
     if state == "SUCCEEDED":
+        if placing:
+            return "物体已放入指定容器并通过验证。"
         if (
             context.get("current_skill") == "pick_object"
             and detail.schema_version == 1
@@ -90,10 +120,19 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
             return failure_stage + _ACTIONS["MANUAL_CHECK"]
         if context.get("current_skill") == "pick_object":
             return _GRASP_REASONS.get(detail.reason_code, _ACTIONS[detail.suggested_action])
+        if placing:
+            return _PLACE_REASONS.get(detail.reason_code, _ACTIONS[detail.suggested_action])
         return _ACTIONS[detail.suggested_action]
     if state == "STOPPING":
         return "正在停止。"
     if detail.schema_version == 1 and detail.phase_state == "RUNNING":
+        if placing:
+            return {
+                "observe_container": "正在观察指定容器。",
+                "plan_place": "正在规划放置。",
+                "transfer": "正在搬运物体。",
+                "verify_place": "正在验证放置结果。",
+            }.get(detail.phase, "")
         if detail.recovery_state == "IN_PROGRESS":
             return "正在恢复，请等待。"
         if detail.retry_count and detail.phase == "observe":

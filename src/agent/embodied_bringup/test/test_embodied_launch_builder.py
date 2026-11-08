@@ -123,6 +123,27 @@ def test_launch_does_not_inject_legacy_skill_templates():
     assert "skill_templates_json" not in params
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_manipulation_pause_is_wired_only_for_opted_in_resident_streams(enabled):
+    from embodied_common.motion_imitation_contract import PAUSE_SERVICE
+
+    config = {
+        "embodied": {"enabled": True, "entry_mode": "hermes"},
+        "motion_imitation_stream": {"enabled": True, "pause_during_manipulation": enabled},
+    }
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+    assert _decode_launch_string(params["motion_imitation_pause_service"]) == (PAUSE_SERVICE if enabled else "")
+
+
+def test_manipulation_pause_rejects_a_disabled_stream():
+    config = {
+        "embodied": {"enabled": True, "entry_mode": "hermes"},
+        "motion_imitation_stream": {"enabled": False, "pause_during_manipulation": True},
+    }
+    with pytest.raises(ValueError, match="requires an enabled"):
+        generate_embodied_nodes(config, active_control_mode="moveit_planning")
+
+
 @pytest.mark.parametrize("portable", [True, False])
 def test_runtime_audio_clips_resolve_workspace_before_reaching_the_executor(tmp_path, monkeypatch, portable):
     monkeypatch.setenv("WORKSPACE", str(tmp_path))

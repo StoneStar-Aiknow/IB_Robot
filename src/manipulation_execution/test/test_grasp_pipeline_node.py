@@ -23,6 +23,8 @@ from manipulation_execution.grasp_pipeline.pipeline import PickOutcome
 from manipulation_execution.grasp_pipeline_node import (
     GraspPipelineNode,
     PreMotionTimer,
+    home_settled,
+    pick_result,
     pipeline_config,
     terminal_record,
     verification_status,
@@ -330,6 +332,24 @@ def test_terminal_record_without_watch_or_execution_is_empty_lists():
     assert record["watch"] == [] and record["grip"] == [] and record["arm_side"] == ""
 
 
+def test_terminal_and_action_result_keep_original_execution_failure_after_later_plan_failure():
+    outcome = PickOutcome(error_code="NO_EXECUTABLE_CANDIDATE", message="no path after recovery", attempts=2)
+    first = {
+        "attempt": 1,
+        "phase": "lift_carry",
+        "error_code": "GRASP_VERIFICATION_FAILED",
+        "reason_code": "GRIP_LOST",
+        "message": "contact lost",
+    }
+    outcome.report.update(first_execution_failure=first, execution_failures=[first])
+    record = json.loads(json.dumps(terminal_record(outcome)))
+    assert record["error_code"] == "NO_EXECUTABLE_CANDIDATE"
+    assert record["first_execution_failure"] == first and record["execution_failures"] == [first]
+    assert record["error_detail"] == "no path after recovery"
+    result = pick_result(outcome, identity({}))
+    assert json.loads(result.pipeline_timings_json)["first_execution_failure"] == first
+
+
 def test_pre_motion_timer_stops_at_the_first_arm_motion():
     now = [10.0]
     timer = PreMotionTimer(clock=lambda: now[0])
@@ -374,3 +394,30 @@ def test_pre_motion_keeps_the_accepted_attempts_stage_spans():
     assert record["perception_spans_s"] == [["grasp", 1.0, 1.6], ["scene", 1.0, 1.9]]
     assert record["scene_host_s"]["scene_s"] == 0.7
     assert record["plan_timings_s"] == {"plan_candidates": 0.8}
+
+
+def test_home_settled_needs_the_open_empty_hand_and_the_arm_back_at_the_picks_start():
+    from types import SimpleNamespace
+
+    held = SimpleNamespace(joint_names=("a", "b"), home_positions=(0.0, -0.45))
+    hand, arm = {"released": False}, {"a": 0.3, "b": -0.73}  # lifted, hand still closing
+    backends = SimpleNamespace(
+        effector=SimpleNamespace(released=lambda: hand["released"]),
+        executor=SimpleNamespace(measured=lambda names: [arm[name] for name in names]),
+    )
+    settled = home_settled(backends, held)
+    assert not settled()
+    hand["released"] = True
+    assert not settled()  # open, but still up where the drop happened
+    arm.update(a=0.05, b=-0.47)  # a recovery pose brought it back within 0.1 rad
+    assert settled()
+    hand["released"] = False
+    assert not settled()
+
+
+def test_home_settled_is_absent_without_a_way_to_tell_an_open_empty_hand():
+    from types import SimpleNamespace
+
+    held = SimpleNamespace(joint_names=("a",), home_positions=(0.0,))
+    backends = SimpleNamespace(effector=SimpleNamespace(), executor=SimpleNamespace(measured=lambda names: [0.0]))
+    assert home_settled(backends, held) is None

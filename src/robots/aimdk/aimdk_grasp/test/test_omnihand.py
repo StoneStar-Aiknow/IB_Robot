@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 from pathlib import Path
@@ -16,8 +17,11 @@ from aimdk_grasp.omnihand import (
     FINGERS,
     GRIP_LOST_S,
     HAND_HZ,
+    OPEN_PATHS,
     OmniHandEffector,
     left_touch_levels,
+    open_path,
+    open_paths,
     touch_levels,
 )
 from aimdk_grasp.robot_model import planning_model
@@ -53,6 +57,7 @@ class SimHand:
         self.blocks: dict[int, float] = {}  # joint index -> furthest native position reachable
         self.touching: set[str] = set()  # pads pressed against the object
         self.touch_sensor = touch_sensor
+        self.touch_configured = touch_sensor
         self.published, self.released, self.refused, self.stale = [], 0, None, False
         self.freeze_feedback_after_publish: int | None = None
         self.feedback_frozen = False
@@ -192,6 +197,64 @@ def test_a_grip_whose_fingers_close_onto_their_command_has_lost_the_object(mappi
     assert act(effector, EffectorAction.RELEASE).succeeded and effector.holding() is None
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_missing_touch_after_handover_is_unknown_until_fresh_contact_returns(mapping, right_mapping, side):
+    active = mapping if side == "left" else right_mapping
+    hand = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
+    pick = OmniHandEffector(hand, active)
+    for finger in ("thumb", "index"):
+        flex = FINGERS[finger][1]
+        hand.block(
+            finger, active.preset("open")[flex] + 0.4 * (active.preset("close")[flex] - active.preset("open")[flex])
+        )
+    assert act(pick, EffectorAction.CLOSE).held is True
+    state = pick.snapshot()
+    pick.suspend()
+    hand.blocks.clear()
+    hand.wait(0.1)
+    # Like the vendor mock, fresh touch alone certifies this frozen grip.
+    hand.touch = lambda: {"thumb": 100.0, "index_finger": 100.0}
+    place = OmniHandEffector(hand, active)
+    place.restore(state)
+    assert place.holding() == ""
+    sent = len(hand.full_published)
+
+    hand.touch = lambda: None
+    assert place.holding() is None
+    hand.wait(1.0)
+    assert place.holding() is None
+    hand.touch = lambda: {"thumb": 100.0, "index_finger": 100.0}
+    assert place.holding() == ""
+    assert len(hand.full_published) == sent
+
+    hand.touch = lambda: {"thumb": 0.0, "index_finger": 0.0}
+    assert place.holding() == ""
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert "no longer press" in place.holding()
+
+
+def test_unknown_joint_feedback_interrupts_the_grip_loss_debounce(mapping):
+    hand = SimHand(mapping.preset("open"))
+    effector = OmniHandEffector(hand, mapping)
+    for finger in ("thumb", "middle"):
+        flex = FINGERS[finger][1]
+        hand.block(
+            finger, mapping.preset("open")[flex] + 0.4 * (mapping.preset("close")[flex] - mapping.preset("open")[flex])
+        )
+    assert act(effector, EffectorAction.CLOSE).held is True
+    hand.blocks.clear()
+    hand.touching.clear()
+    hand.wait(0.1)
+    assert effector.holding() == ""
+    hand.stale = True
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert effector.holding() is None
+    hand.stale = False
+    assert effector.holding() == ""
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert "no longer press" in effector.holding()
+
+
 def test_a_close_that_touches_nothing_holds_nothing(mapping):
     hand = SimHand(mapping.preset("open"))
     outcome = act(OmniHandEffector(hand, mapping), EffectorAction.CLOSE)
@@ -199,15 +262,19 @@ def test_a_close_that_touches_nothing_holds_nothing(mapping):
     np.testing.assert_allclose(hand.command, mapping.preset("close"))
 
 
-def test_without_touch_a_finger_held_back_is_contact(mapping):
+@pytest.mark.parametrize("touch_configured", [True, False])
+def test_without_touch_a_finger_held_back_is_contact(mapping, touch_configured):
     hand = SimHand(mapping.preset("open"), touch_sensor=False)
+    hand.touch_configured = touch_configured
     close, open_hand = mapping.preset("close"), mapping.preset("open")
     for finger in ("thumb", "middle"):
         flex = FINGERS[finger][1]
         hand.block(finger, open_hand[flex] + 0.3 * (close[flex] - open_hand[flex]), touch=False)
-    outcome = act(OmniHandEffector(hand, mapping), EffectorAction.CLOSE)
+    effector = OmniHandEffector(hand, mapping)
+    outcome = act(effector, EffectorAction.CLOSE)
     assert outcome.held is True
     assert all(row["by"] == "lag" and row["lag_rad"] >= CONTACT_LAG_RAD for row in outcome.report["contacts"].values())
+    assert effector.holding() == ""
 
 
 def test_a_halt_during_the_close_holds_the_fingers_where_they_are(mapping):
@@ -232,15 +299,81 @@ def test_an_open_blocked_far_from_the_preset_fails_and_a_little_short_passes(map
     hand.block("index", close[flex] - 0.2, touch=False)  # 0.2 rad of the way, then stuck
     outcome = act(OmniHandEffector(hand, mapping), EffectorAction.RELEASE)
     assert not outcome.succeeded and "blocked" in outcome.reason
+    assert outcome.report["paths"] == ["together", "thumb_clear"]  # nothing held: one more way, then refuse
     hand = SimHand(close)
     open_flex = mapping.preset("open")[flex]
     hand.block("index", open_flex + 0.05 * np.sign(close[flex] - open_flex), touch=False)
     effector = OmniHandEffector(hand, mapping)
     outcome = act(effector, EffectorAction.RELEASE)
-    assert outcome.succeeded and outcome.report["open_short"]
+    assert outcome.succeeded and outcome.report["open_short"] and outcome.report["paths"] == ["together"]
     effector.io = SimHand(close)  # the next release is not blocked: it reports nothing short
     outcome = act(effector, EffectorAction.RELEASE)
     assert outcome.succeeded and "open_short" not in outcome.report
+
+
+def test_a_thumb_abduction_a_little_short_is_open(right_mapping):
+    # 2026-11-08: a release left the right thumb abduction 0.088 rad short of the preset.
+    close, open_hand = right_mapping.preset("close"), right_mapping.preset("open")
+    hand = RightSimHand(close)
+    hand.blocks[ABAD] = open_hand[ABAD] + 0.088 * np.sign(close[ABAD] - open_hand[ABAD])
+    outcome = act(OmniHandEffector(hand, right_mapping), EffectorAction.RELEASE)
+    assert outcome.succeeded and "open_short" not in outcome.report
+    assert outcome.report["short_of_target_rad"] == pytest.approx(0.088, abs=1e-6)
+
+
+HALF_CLOSED = np.array([0.3, -1.1, 0.5, 0.0, 0.76, 0.76, 0.0, 0.76, 0.0, 0.76])
+OPEN_RIGHT = np.array([0.129, -1.54, 0.255, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+THUMB = list(FINGERS["thumb"][0])
+FOUR_FINGERS = [index for index in range(10) if index not in THUMB]
+ABAD, MCP = 1, 2
+PIPS = [4, 5, 7, 9]
+
+
+def moving(frames, joints):
+    """Indices of the frames in which any of ``joints`` changes."""
+    return set(np.flatnonzero(np.any(np.diff(frames[:, joints], axis=0) != 0, axis=1)))
+
+
+def test_every_open_path_steps_from_the_start_to_the_target_in_its_own_order(right_mapping):
+    lower, upper = right_mapping.lower, right_mapping.upper
+    paths = dict(open_paths(HALF_CLOSED, OPEN_RIGHT, lower, upper))
+    assert tuple(paths) == OPEN_PATHS
+    for frames in paths.values():
+        np.testing.assert_array_equal(frames[0], HALF_CLOSED)
+        np.testing.assert_allclose(frames[-1], OPEN_RIGHT)
+        assert np.max(np.abs(np.diff(frames, axis=0))) <= 0.01 + 1e-12
+    line = paths["together"]
+    np.testing.assert_allclose(line, np.linspace(HALF_CLOSED, OPEN_RIGHT, len(line)))
+    fingers, thumb = paths["fingers_first"], paths["thumb_first"]
+    assert max(moving(fingers, FOUR_FINGERS)) < min(moving(fingers, THUMB))
+    assert max(moving(thumb, THUMB)) < min(moving(thumb, FOUR_FINGERS))
+    # thumb_clear: the thumb straightens (roll kept), the fingers open, the thumb comes in.
+    clear = paths["thumb_clear"]
+    out = int(np.argmax(clear[:, ABAD]))
+    assert clear[out, ABAD] == pytest.approx(np.clip(0.0, lower[ABAD] + 0.05, upper[ABAD] - 0.05))
+    assert clear[out, MCP] == pytest.approx(np.clip(0.0, lower[MCP] + 0.05, upper[MCP] - 0.05))
+    assert clear[out, 0] == HALF_CLOSED[0]
+    np.testing.assert_array_equal(clear[: out + 1][:, FOUR_FINGERS], np.tile(HALF_CLOSED[FOUR_FINGERS], (out + 1, 1)))
+    fingers_done = min(i for i, frame in enumerate(clear) if np.allclose(frame[FOUR_FINGERS], 0.0))
+    np.testing.assert_array_equal(
+        clear[out : fingers_done + 1][:, THUMB], np.tile(clear[out, THUMB], (fingers_done - out + 1, 1))
+    )
+
+
+def test_open_paths_leave_out_duplicates_and_reject_bad_input(right_mapping):
+    lower, upper = right_mapping.lower, right_mapping.upper
+    thumb_only = OPEN_RIGHT.copy()
+    thumb_only[THUMB] = HALF_CLOSED[THUMB]
+    # Nothing for the fingers to do: fingers first is the straight line, thumb first too.
+    assert [name for name, _ in open_paths(thumb_only, OPEN_RIGHT, lower, upper)] == ["together", "thumb_clear"]
+    assert [name for name, _ in open_paths(OPEN_RIGHT, OPEN_RIGHT, lower, upper)] == ["together", "thumb_clear"]
+    np.testing.assert_allclose(open_path("together", OPEN_RIGHT, OPEN_RIGHT, lower, upper), [OPEN_RIGHT, OPEN_RIGHT])
+    with pytest.raises(ValueError):
+        open_path("together", np.zeros(10), np.full(10, float("nan")), lower, upper)
+    with pytest.raises(ValueError):
+        open_path("together", np.zeros(10), np.zeros(10), lower, upper, step_rad=0.02)
+    with pytest.raises(ValueError, match="unknown"):
+        open_path("sideways", np.zeros(10), np.zeros(10), lower, upper)
 
 
 @pytest.mark.parametrize("problem", ["refused", "cancelled", "stale"])
@@ -475,3 +608,46 @@ def test_touch_levels_are_read_per_pad_of_either_hand():
         message.data.extend(float(value) for value in values)
     assert touch_levels(message, "right") == {"thumb": 99.0, "little_finger": 31.0}
     assert touch_levels(message, "left") == left_touch_levels(message) == {"thumb": 5.0}
+
+
+class InterlockedHand(RightSimHand):
+    """A thumb abduction folded under curled fingers: neither can pass the other.
+
+    While the fingers are curled (flexion >= 0.3 rad) the thumb abduction cannot
+    pass -1.10 rad toward the palm; while the thumb is folded in (below -1.0 rad)
+    curled fingers cannot open past 0.3 rad.
+    """
+
+    def wait(self, seconds):
+        before = self.measured.copy()
+        super().wait(seconds)
+        if before[PIPS].min() >= 0.3 - 1e-9 and before[ABAD] >= -1.10 - 1e-9:
+            self.measured[ABAD] = max(self.measured[ABAD], -1.10)
+        if before[ABAD] < -1.0:
+            curled = [joint for joint in PIPS if before[joint] >= 0.3 - 1e-9]
+            self.measured[curled] = np.maximum(self.measured[curled], 0.3)
+
+
+def test_a_hand_locked_by_its_thumb_opens_with_the_thumb_cleared(right_mapping):
+    hand = InterlockedHand(HALF_CLOSED)
+    outcome = act(OmniHandEffector(hand, right_mapping), EffectorAction.RELEASE)
+    assert outcome.succeeded, outcome.reason
+    assert outcome.report["paths"] == ["together", "thumb_clear"] and "open_short" not in outcome.report
+    np.testing.assert_allclose(hand.measured, OPEN_RIGHT, atol=0.025)
+    # Each way steps at most 0.01 rad; the second starts from where the hand stopped, not the old command.
+    jumps = np.flatnonzero(np.max(np.abs(np.diff(np.array(hand.published), axis=0)), axis=1) > 0.01 + 1e-9)
+    assert len(jumps) == 1
+
+
+def test_a_release_with_an_object_in_the_hand_lets_go_along_one_straight_line(right_mapping):
+    hand = InterlockedHand(HALF_CLOSED)
+    effector = OmniHandEffector(hand, right_mapping)
+    command = HALF_CLOSED.copy()
+    effector.restore(json.dumps(dict(contacts=["thumb", "index"], command=command.tolist(), direction=[1.0] * 10)))
+    sent = len(hand.published)
+    outcome = act(effector, EffectorAction.RELEASE)
+    # Held: no other way is tried, a straightening thumb could knock the object.
+    assert not outcome.succeeded and "blocked" in outcome.reason and outcome.report["paths"] == ["together"]
+    line = np.array(hand.published[sent:])
+    moved = line[np.any(line != line[-1], axis=1)]
+    np.testing.assert_allclose(moved, np.linspace(HALF_CLOSED, OPEN_RIGHT, len(moved) + 2)[1:-1], atol=1e-9)

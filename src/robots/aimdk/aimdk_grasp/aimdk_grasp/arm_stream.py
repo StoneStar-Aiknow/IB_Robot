@@ -15,16 +15,17 @@ from manipulation_execution.grasp_pipeline.streaming import StreamConfig, Stream
 from .arm_gravity import LIMIT_MARGIN_RAD, ArmGravity, GravityShaper
 from .joints import ARM_MIRROR_SIGNS, HEAD, LEFT_ARM, RIGHT_ARM, arm_joints, other_side
 
-# Where a sequence leaves the arm: this left-arm COMMAND, MC's own arm pose
-# on entering UPPERBODY_REMOTE_SPLIT (the board restore step 4 echoes,
-# boot20261014urscmd1). A home aimed at the plan's start -- the measured pose
-# the previous sequence ended at -- ratcheted: each landed a few mrad lower
-# (joint friction leaves the sag at kp 40 anywhere in 0.017-0.033 rad of
-# shoulder roll) and the next plan started there (live 2026-10-20 q1..o2:
-# roll -0.033 -> -0.067, past the -0.061 limit, o3 refused). A fixed command
-# gives the same sag every time, friction scatter included, nothing adds up.
+# The global HOME: this left-arm COMMAND, MC's own arm pose on entering
+# UPPERBODY_REMOTE_SPLIT (the board restore step 4 echoes, boot20261014urscmd1).
 HOME_COMMAND = dict(zip(LEFT_ARM, (0.4, 0.0, 0.0, -1.2, 0.0, 0.0, 0.0), strict=True))
-# The board is moved to HOME_COMMAND when any joint is further off than this,
+# Where a sequence leaves the arm: the controller's command it took over from,
+# i.e. the task start whatever moved the arm there. A home aimed at the plan's
+# start -- the measured pose the previous sequence ended at -- ratcheted: each
+# landed a few mrad lower (joint friction leaves the sag at kp 40 anywhere in
+# 0.017-0.033 rad of shoulder roll) and the next plan started there (live
+# 2026-10-20 q1..o2: roll -0.033 -> -0.067, past the -0.061 limit, o3 refused).
+# A fixed command gives the same sag every time, friction scatter included.
+# The board is moved back to it when any joint is further off than this,
 # and left alone beyond HOME_MAX_RAD (an operator's recovery, not a correction).
 HOME_COMMAND_TOL_RAD = 0.005
 HOME_MAX_RAD = 0.1
@@ -63,7 +64,7 @@ def x2_stream_config(limits=None, side: str = "left") -> StreamConfig:
         expected_damping=MC_DAMPING,
         target_speed_rad_s=HOME_SPEED_RAD_S,
         target_min_s=HOME_MIN_S,
-        home_command=home_command(side),
+        home_at_takeover=True,
         home_tolerance_rad=HOME_COMMAND_TOL_RAD,
         home_max_rad=HOME_MAX_RAD,
     )

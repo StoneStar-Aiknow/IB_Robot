@@ -19,6 +19,7 @@ from __future__ import annotations
 import enum
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 
 from embodied_common.execution_detail import ExecutionDetail
@@ -112,6 +113,7 @@ class GraspPipeline:
         cancelled: Flag,
         on_phase: PhaseCallback = lambda name, event, detail: None,
         release_after_success: bool = False,
+        on_held: Callable | None = None,
     ) -> PickOutcome:
         """``deadline`` is on this pipeline's clock; ``cancelled`` is the goal's own flag."""
         outcome = PickOutcome(mode=mode.value)
@@ -155,10 +157,25 @@ class GraspPipeline:
 
         backends = self._backends
         try:
-            return self._run(query, mode, deadline, cancelled, stop, phase, release_after_success, outcome)
+            result = self._run(query, mode, deadline, cancelled, stop, phase, release_after_success, outcome)
+            if result.success and result.held is True and not result.released_after_success and on_held is not None:
+                try:
+                    on_held(*self._held_context)
+                except Exception as exc:
+                    result.at_rest = False
+                    return self._fail(result, "CUSTODY_FAILED", f"could not retain held object: {exc}")
+            return result
         finally:
             # The goal is over: the robot keeps holding what it was last sent.
             for part in (backends.executor, backends.effector):
+                if (
+                    part is backends.effector
+                    and outcome.success
+                    and outcome.held is True
+                    and not outcome.released_after_success
+                    and on_held is not None
+                ):
+                    continue
                 finish = getattr(part, "finish", None)
                 if finish is not None:
                     try:
@@ -207,6 +224,8 @@ class GraspPipeline:
                 outcome.report["steps_s"] = dict(steps)
                 outcome.report["perceive"] = dict(proposals.report)
                 outcome.report["plan"] = dict(plan.report)
+                if not release_after_success and plan.carry_steps is not None:
+                    plan = replace(plan, steps=plan.carry_steps, carry_steps=None)
                 if mode is PickMode.PLAN_ONLY:
                     outcome.success = True
                     return outcome
@@ -258,6 +277,7 @@ class GraspPipeline:
                     outcome.error_code, outcome.message = code, result.message
                     self._fail(outcome, code, result.message, result.reason_code)
                 else:
+                    self._held_context = (observation, proposals, plan)
                     outcome.execution_detail = replace(
                         outcome.execution_detail, failed_phase="", reason_code="", suggested_action="NONE"
                     )
@@ -300,7 +320,37 @@ class GraspPipeline:
         outcome.held, outcome.held_confidence, outcome.at_rest = result.held, result.held_confidence, result.at_rest
         outcome.released_after_success = result.released_after_success
         outcome.execution_detail = replace(outcome.execution_detail, recovery_state=result.recovery_state)
-        outcome.report.setdefault("executions", []).append({"phases": result.phases, "retreated": result.retreated})
+        execution = {
+            "attempt": outcome.attempts,
+            "phases": result.phases,
+            "retreated": result.retreated,
+            "error_code": result.error_code,
+            "reason_code": result.reason_code,
+            "message": result.message,
+            "held": result.held,
+            "lost": result.lost,
+            "at_rest": result.at_rest,
+            "recovery_state": result.recovery_state,
+            "execution_report": deepcopy(result.execution_report),
+            "exception": result.exception,
+            "first_failure": dict(result.first_failure),
+        }
+        outcome.report.setdefault("executions", []).append(execution)
+        if not result.succeeded:
+            failure = {
+                "attempt": outcome.attempts,
+                **(
+                    result.first_failure
+                    or {
+                        "phase": outcome.execution_detail.failed_phase or outcome.execution_detail.phase,
+                        "error_code": result.error_code,
+                        "reason_code": result.reason_code,
+                        "message": result.message,
+                    }
+                ),
+            }
+            outcome.report.setdefault("execution_failures", []).append(failure)
+            outcome.report.setdefault("first_execution_failure", dict(failure))
         return result
 
     @staticmethod

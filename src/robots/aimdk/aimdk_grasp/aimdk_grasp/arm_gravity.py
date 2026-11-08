@@ -17,6 +17,7 @@ description's (aimdk_description, x2_ultra.urdf v1.3.0); only kp, the torso
 tilt and the wrist payload are fitted.
 """
 
+import copy
 import json
 import math
 from collections.abc import Mapping, Sequence
@@ -37,6 +38,14 @@ MAX_SAG_RAD = 0.24
 # planner runs wrist joints to within 0.001-0.002 rad of a limit, where the
 # raise could cross it).
 LIMIT_MARGIN_RAD = 0.005
+# The wrist roll link without a hand: aimdk_description x2_ultra_omnihand_v1.4.0.urdf
+# <side>_wrist_roll_link (mass kg, centre m in the link frame). The fitted model
+# (r25, left arm with its OmniHand) carries the hand in that link and its payload;
+# an arm without a hand was raised ~0.47 kg too far (left arm, 2026-11-07).
+BARE_WRIST_ROLL = {
+    "left": (0.081, (-0.00260566, -0.00028957, -0.02690918)),
+    "right": (0.081, (-0.00242778, 0.00027941, -0.02697696)),
+}
 
 
 def _rpy(roll, pitch, yaw):
@@ -116,6 +125,16 @@ class ArmGravity:
                 for i in range(len(self.chain))
             ]
         )
+
+    def without_hand(self) -> "ArmGravity":
+        """This arm's model with its hand removed: the bare wrist roll link and no payload."""
+        mass, centre = BARE_WRIST_ROLL[self.side]
+        bare = copy.copy(self)
+        bare.chain = [dict(link) for link in self.chain]
+        bare.chain[-1].update(mass=float(mass), centre=np.array(centre, dtype=float))
+        bare.payload, bare.payload_offset = 0.0, np.zeros(3)
+        bare.source = {**self.source, "hand": "removed (bare wrist roll link, no payload)"}
+        return bare
 
     def sag(self, q):
         return self.torques(q) / self.kp

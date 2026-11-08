@@ -212,3 +212,24 @@ def test_arm_side_right_switches_every_part_to_the_right_arm_and_hand():
     # One gripper description serves both hands: the same alias presets, the right hand's native values.
     for name in ("open", "close"):
         assert right.hand.presets[name] == left.hand.presets[name]
+
+
+@pytest.mark.skipif(not (BUNDLE / "assets" / "adapter.json").is_file(), reason="GraspGen-X bundle not installed")
+def test_place_options_reach_every_arm_and_refuse_unknown_keys():
+    from aimdk_grasp.backend import robot_for_side, x2_robot
+    from aimdk_grasp.place_config import PlaceTargetConfig
+
+    grasp_execution = {
+        "model_bundle_path": os.fspath(BUNDLE),
+        "model_deployment": "torch_cuda",
+        "command_interfaces": list(COMMAND_INTERFACES),
+    }
+    assert x2_robot(grasp_execution).place == PlaceTargetConfig()
+    given = {"bottom_clearance_m": 0.03, "transfer_clearance_m": 0.12, "extra_positions": 0, "edge_fraction": 0.4}
+    robot = x2_robot({**grasp_execution, "backend_options": {"place": given}})
+    assert robot.place == PlaceTargetConfig(**given)
+    assert robot_for_side(robot, "right").place == robot.place
+    with pytest.raises(ValueError, match="place has unknown keys \\['height'\\]"):
+        x2_robot({**grasp_execution, "backend_options": {"place": {"height": 0.1}}})
+    with pytest.raises(ValueError, match="backend_options.place.edge_fraction"):
+        x2_robot({**grasp_execution, "backend_options": {"place": {"edge_fraction": 2}}})

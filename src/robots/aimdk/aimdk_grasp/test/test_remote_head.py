@@ -18,12 +18,13 @@ from aimdk_grasp.head_interface import NO_SUPPORT, NOT_READY, head_endpoints  # 
 from aimdk_grasp.remote_head import (  # noqa: E402
     RemoteCapture,
     RemoteHeadCamera,
+    RemotePlacePlanner,
     RemotePlanner,
     RemoteWatch,
     X2GraspHeadClient,
 )
 from aimdk_grasp.scene_estimation import NoSupportError  # noqa: E402
-from aimdk_grasp_msgs.action import PlanGraspCandidates  # noqa: E402
+from aimdk_grasp_msgs.action import PlanGraspCandidates, PlanPlace  # noqa: E402
 from aimdk_grasp_msgs.msg import WatchStatus  # noqa: E402
 from aimdk_grasp_msgs.srv import (  # noqa: E402
     CaptureGraspObservation,
@@ -43,6 +44,7 @@ from manipulation_execution.grasp_pipeline.contracts import (  # noqa: E402
     EffectorAction,
     GraspFailure,
     GraspPlan,
+    HeldObject,
     Move,
     Proposals,
     SegmentKind,
@@ -97,7 +99,31 @@ class FakeHead(Node):
             names.status,
             QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE),
         )
+        #: The home plan's failure as (error_code, message), or None to answer.
+        self.home_failure = None
+        ActionServer(
+            self,
+            PlanPlace,
+            names.plan_place,
+            execute_callback=self._plan_place,
+            cancel_callback=lambda _goal: CancelResponse.ACCEPT,
+            callback_group=group,
+        )
         self.create_timer(0.05, self._pump, callback_group=group)
+
+    def _plan_place(self, handle):
+        request, result = handle.request, PlanPlace.Result()
+        held = request.held_object
+        self.requests.append(("plan_place", request.return_home, held.custody_id, list(held.home_positions)))
+        if self.home_failure is not None:
+            result.error_code, result.message = self.home_failure
+        else:
+            home = ArmSegment(
+                "home", SegmentKind.TRAJECTORY, JOINTS, np.array([[0.3, 0.2], [0.0, 0.0]]), np.array([0.0, 1.0])
+            )
+            result.retreat, result.success = [wire.step_to_msg(Move(home))], True
+        handle.succeed()
+        return result
 
     def _pump(self):
         if not (self.session and self.pumping):
@@ -337,6 +363,20 @@ def test_cancelling_a_plan_cancels_it_on_the_head(ros):
             observation, proposals, deadline=time.monotonic() + 10.0, cancelled=lambda: time.monotonic() > asked
         )
     assert raised.value.code == "CANCELED" and head.cancelled.wait(3.0)
+
+
+def test_the_way_home_after_a_drop_is_planned_on_the_head_for_the_held_custody(ros):
+    head, client = ros
+    held = HeldObject("custody-7", "an apple", "right", JOINTS, (0.3, 0.2), (0.0, 0.0), 0.04, (0.0,) * 3, "{}")
+    planner = RemotePlacePlanner(client)
+    home = planner.plan_home(held, deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    assert head.requests[-1] == ("plan_place", True, "custody-7", [0.0, 0.0])
+    assert isinstance(home, Move) and home.segment.name == "home"
+    np.testing.assert_allclose(home.segment.end, [0.0, 0.0])
+    head.home_failure = ("HOME_PLAN_FAILED", "start state in collision")
+    with pytest.raises(GraspFailure) as raised:
+        planner.plan_home(held, deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    assert raised.value.code == "HOME_PLAN_FAILED" and not raised.value.retryable
 
 
 QUICK = WatchTimeouts(frame_s=0.3, unknown_s=0.5)

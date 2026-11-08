@@ -11,6 +11,7 @@ from launch_ros.actions import Node
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common import pose_composer_contract as POSE_COMPOSER
+from embodied_common.motion_imitation_contract import manipulation_pause_service
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
@@ -389,6 +390,7 @@ def generate_embodied_nodes(
                 named_motion_config.get("interface", ""), "action", RUNTIME_NAMED_MOTION_ACTION_TYPE
             ),
         )
+    common_params["motion_imitation_pause_service"] = manipulation_pause_service(robot_config)
     mirror_session = robot_config.get("mirror_session", {})
     if isinstance(mirror_session, dict) and mirror_session.get("enabled") is True:
         # The X2 mirror session's start/stop switch; robot_config launches the session node.
@@ -861,7 +863,7 @@ def generate_embodied_nodes(
         nodes.append(
             Node(
                 package="manipulation_execution",
-                executable="place_executor_node",
+                executable="place_pipeline_node" if placement_execution.get("backend") else "place_executor_node",
                 name="placement_executor_node",
                 output="screen",
                 parameters=[
@@ -871,6 +873,8 @@ def generate_embodied_nodes(
                             "primitive_action_name", "/embodied/execute_primitive"
                         ),
                         "placement_execution_json": json.dumps(placement_execution),
+                        "grasp_execution_json": json.dumps(grasp_execution),
+                        "interface_description_json": json.dumps(description),
                         "gripper_joint_name": str(
                             next(iter(robot_config.get("joints", {}).get("gripper", ["6"])), "6")
                         ),

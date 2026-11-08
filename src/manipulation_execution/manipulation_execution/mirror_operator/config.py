@@ -25,6 +25,10 @@ being ignored. Times are seconds.
 ``max_session_s``      a session on (STANDBY or MIRRORING) this long is
                        stopped like a long cover; counted from the first
                        state that is not WAIT, cleared only by WAIT. 0: off
+``leave_stop_min_round_s``
+                       a round (MIRRORING) at least this long, cancelled
+                       because the person left, stops the session like a
+                       long cover once it is back in STANDBY. 0: off
 
 ``"on"`` and ``"off"`` must be quoted in YAML, which otherwise reads them as
 booleans.
@@ -92,6 +96,7 @@ class OperatorConfig:
     led: LedConfig = field(default_factory=LedConfig)
     session_silent_s: float = 3.0
     max_session_s: float = 0.0
+    leave_stop_min_round_s: float = 0.0
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any] | None) -> OperatorConfig:

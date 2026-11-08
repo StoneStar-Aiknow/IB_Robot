@@ -23,7 +23,8 @@ import yaml
 from embodied_common import internvl_voice_contract as contract
 from robot_config.loader import _load_robot_section
 
-BASELINE = "676fa608"
+# The summit this branch last merged: the entry without our block must be its file.
+BASELINE = "4442113e"
 PACKAGE = Path(__file__).resolve().parents[1]
 ROBOTS = PACKAGE / "config" / "robots"
 ENTRY = ROBOTS / "aimdk_x2_voice_mirror_all.yaml"

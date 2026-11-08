@@ -31,6 +31,7 @@ from manipulation_execution.grasp_pipeline.contracts import (
     GraspBackends,
     GraspFailure,
     GraspPlan,
+    Move,
     Observation,
     Proposals,
 )
@@ -76,7 +77,7 @@ class X2GraspHeadClient:
     """Calls into the grasp head; the node must be spun by another thread (the pipeline's executor)."""
 
     def __init__(self, node, namespace: str, *, callback_group=None):
-        from aimdk_grasp_msgs.action import PlanGraspCandidates
+        from aimdk_grasp_msgs.action import PlanGraspCandidates, PlanPlace
         from aimdk_grasp_msgs.msg import WatchStatus as WatchStatusMsg
         from aimdk_grasp_msgs.srv import CaptureGraspObservation, CompleteGraspScene, RefineGraspPlan, WatchGraspTarget
         from rclpy.action import ActionClient
@@ -92,6 +93,8 @@ class X2GraspHeadClient:
         self.watch_client = node.create_client(WatchGraspTarget, names.watch, callback_group=callback_group)
         self.plan_client = ActionClient(node, PlanGraspCandidates, names.plan, callback_group=callback_group)
         self.plan_type = PlanGraspCandidates
+        self.place_type = PlanPlace
+        self.place_client = ActionClient(node, PlanPlace, names.plan_place, callback_group=callback_group)
         self._received: list = []
         self._statuses = OnDemandSubscriptions(node.context, f"{node.get_name()}_head_watch")
         self._statuses.subscribe(
@@ -225,6 +228,7 @@ class RemotePlanner:
             plan.candidate_index,
             plan.release,
             {**dict(plan.report), _HEAD_PLAN_ID: plan_id},
+            plan.carry_steps,
         )
 
     @staticmethod
@@ -283,6 +287,50 @@ class RemotePlanner:
             plan_id,
         )
         return refined
+
+
+class RemotePlacePlanner:
+    def __init__(self, head):
+        self.head = head
+
+    def plan(self, observation, container, held, *, deadline, cancelled):
+        from manipulation_execution.held_custody import held_to_msg
+
+        goal = self.head.place_type.Goal(
+            capture_id=_remote_capture(observation).capture_id,
+            container_mask=wire.encode_mask(container.mask),
+            held_object=held_to_msg(held),
+            timeout_s=max(0, deadline - time.monotonic()),
+        )
+        return wire.place_from_result(self._request(goal, "place plan", deadline, cancelled))
+
+    def plan_home(self, held, *, deadline, cancelled):
+        from manipulation_execution.held_custody import held_to_msg
+
+        goal = self.head.place_type.Goal(
+            held_object=held_to_msg(held), timeout_s=max(0, deadline - time.monotonic()), return_home=True
+        )
+        steps = [wire.step_from_msg(step) for step in self._request(goal, "home plan", deadline, cancelled).retreat]
+        if len(steps) != 1 or not isinstance(steps[0], Move):
+            raise GraspFailure(RPC_FAILED, "home plan did not return exactly one move")
+        return steps[0]
+
+    def _request(self, goal, label, deadline, cancelled):
+        head, client = self.head, self.head.place_client
+        if not client.wait_for_server(timeout_sec=max(0, min(2, deadline - time.monotonic()))):
+            raise GraspFailure(RPC_FAILED, "place planner unavailable")
+        handle = head.wait(client.send_goal_async(goal), f"{label} goal", deadline, cancelled)
+        if handle is None or not handle.accepted:
+            raise GraspFailure(RPC_FAILED, f"{label} refused")
+        response = head.wait(handle.get_result_async(), label, deadline, cancelled, on_cancel=handle.cancel_goal_async)
+        if response is None or not response.result.success:
+            result = response.result if response is not None else None
+            raise GraspFailure(
+                getattr(result, "error_code", RPC_FAILED),
+                getattr(result, "message", f"no {label} result"),
+                retryable=bool(getattr(result, "retryable", False)),
+            )
+        return response.result
 
 
 class RemoteWatch:
@@ -539,4 +587,23 @@ def x2_remote_grasp_backends(
         for closer in reversed(closers):
             closer()
 
-    return GraspBackends(camera, proposer, planner, executor, effector, watch, close=close, prepare=prepare)
+    from .held_object import held_builder
+
+    return GraspBackends(
+        camera,
+        proposer,
+        planner,
+        executor,
+        effector,
+        watch,
+        close=close,
+        prepare=prepare,
+        held_object=held_builder(node, executor, effector),
+        plan_home=RemotePlacePlanner(head).plan_home,
+    )
+
+
+def x2_remote_place_backends(*, node, placement_execution, grasp_execution, description):
+    from .backend import _place_backends
+
+    return _place_backends(node, grasp_execution, description, placement_execution=placement_execution, remote=True)

@@ -12,6 +12,7 @@ import pytest
 from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.hand_restore import (
+    FEEDBACK_MAX_AGE_S,
     VENDOR_STIFFNESS,
     CommandBoard,
     GatewayState,
@@ -26,6 +27,7 @@ from aimdk_grasp.hand_restore import (
     sweep_frames,
 )
 from aimdk_grasp.joints import BODY_JOINTS, LEFT_ARM, RIGHT_ARM
+from aimdk_grasp.omnihand import OPEN_PATHS, THUMB
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS
 
@@ -157,7 +159,7 @@ def test_long_arm_check_refreshes_owner_and_detects_live_changes_before_dispatch
                 if fault == "owner":
                     ports.gateway = replace(ports.gateway, active_task_id="other")
                 elif fault == "stale":
-                    ports.frozen_at = ports.now - 0.2
+                    ports.frozen_at = ports.now - (FEEDBACK_MAX_AGE_S + 0.1)
                 elif fault == "head":
                     ports.body[HEAD[0]] += 0.02
             guard()
@@ -264,7 +266,7 @@ def test_preflight_refuses_before_output(restore, fault, code):
     elif fault == "nan_age":
         ports.gateway = replace(ports.gateway, age_s=float("nan"))
     elif fault == "stale":
-        ports.frozen_at = ports.now - 1
+        ports.frozen_at = ports.now - (FEEDBACK_MAX_AGE_S + 0.1)
     elif fault == "stop":
         ports.runtime = replace(ports.runtime, ok=False)
     elif fault == "mode":
@@ -286,6 +288,8 @@ def test_preflight_refuses_before_output(restore, fault, code):
     with pytest.raises(RestoreError) as error:
         prepare(restorer, ports, ctx, sides)
     assert error.value.code == code and not ports.sent
+    if fault == "collision":  # every way to open was tried
+        assert all(name in str(error.value) for name in OPEN_PATHS)
 
 
 @pytest.mark.parametrize(
@@ -313,7 +317,7 @@ def test_mid_open_failure_always_releases_and_never_opens_right(restore, fault, 
         elif fault == "timeout":
             ctx.deadline = ports.now
         elif fault == "stale":
-            ports.frozen_at = ports.now - 1
+            ports.frozen_at = ports.now - (FEEDBACK_MAX_AGE_S + 0.1)
         elif fault == "owner":
             ports.gateway = replace(ports.gateway, active_task_id="another")
         elif fault == "mode":
@@ -333,7 +337,9 @@ def test_mid_open_failure_always_releases_and_never_opens_right(restore, fault, 
     with pytest.raises(RestoreError) as error:
         restorer.open_hand(ctx, "left")
     assert error.value.code == code
-    assert ports.releases == 1 and {row[0] for row in ports.sent} == {"opening_left"}
+    # A hand that stops tracking gets one more try, released like the first.
+    assert ports.releases == (2 if fault == "tracking" else 1)
+    assert {row[0] for row in ports.sent} == {"opening_left"}
 
 
 @pytest.mark.parametrize(
@@ -439,3 +445,117 @@ def test_arm_guard_allows_finger_drift_within_covered_bound_and_reports_excess(r
     ports.hands[side][4] -= 0.002
     with pytest.raises(RestoreError, match="phase=trajectory_sent.*joint_index=4.*delta=0.101000.*limit=0.100000"):
         restorer.guard_arm_motion(ctx, initial, "trajectory_sent")
+
+
+@pytest.mark.parametrize("field", ["feedback", "command"])
+@pytest.mark.parametrize("age_s", [0.300888, 0.999999, 1.0, 1.000001, -0.001, float("nan"), float("inf")])
+def test_temporary_one_second_feedback_age_guard(restore, field, age_s):
+    restorer, ports, ctx, _ = restore
+    original_observe = ports.observe
+
+    def observe():
+        observation = original_observe()
+        if field == "feedback":
+            return replace(observation, feedback_age_s=age_s)
+        return replace(observation, command=replace(observation.command, age_s=age_s))
+
+    ports.observe = observe
+    if 0 <= age_s <= 1.0:
+        observation = restorer._observe(ctx)
+        assert (observation.feedback_age_s if field == "feedback" else observation.command.age_s) == age_s
+    else:
+        with pytest.raises(RestoreError) as error:
+            restorer._observe(ctx)
+        assert error.value.code == "HAND_FEEDBACK_STALE"
+    assert not ports.sent
+
+
+def test_temporary_age_override_still_rejects_unhealthy_feedback(restore):
+    restorer, ports, ctx, _ = restore
+    original_observe = ports.observe
+
+    def observe():
+        observation = original_observe()
+        return replace(observation, feedback=replace(observation.feedback, healthy=False), feedback_age_s=0.300888)
+
+    ports.observe = observe
+    with pytest.raises(RestoreError) as error:
+        restorer._observe(ctx)
+    assert error.value.code == "HAND_FEEDBACK_STALE"
+    assert not ports.sent
+
+
+FINGERS = np.flatnonzero(~THUMB)  # the four fingers' joints
+
+
+def left_opening(ports):
+    return np.array([row[1] for row in ports.sent if row[0] == "opening_left"])
+
+
+def test_the_first_collision_free_way_to_open_is_checked_and_driven(restore):
+    restorer, ports, ctx, _ = restore
+    start, target = ports.hands["left"].copy(), restorer.plans["left"].open_pose
+
+    def thumb_under_fingers(frames):
+        thumb_moved = np.any(np.abs(frames[:, THUMB] - start[THUMB]) > 1e-9, axis=1)
+        curled = np.any(np.abs(frames[:, FINGERS] - target[FINGERS]) > 1e-9, axis=1)
+        return thumb_moved & curled
+
+    def check(_feedback, frames, **_kw):
+        if thumb_under_fingers(np.asarray(frames)).any():
+            raise RestoreError("HAND_SWEEP_COLLISION", "thumb under the curled fingers")
+
+    for plan in restorer.plans.values():
+        plan.sweep = SimpleNamespace(check=check)
+    prepare(restorer, ports, ctx)
+    assert not restorer.open_hand(ctx, "left")
+    assert restorer.open_paths_taken["left"] == ["fingers_first"]
+    sent = left_opening(ports)
+    assert not thumb_under_fingers(sent).any()
+    np.testing.assert_allclose(ports.hands["left"], target)
+
+
+@pytest.mark.parametrize("frees", [True, False])
+def test_a_thumb_stuck_under_the_fingers_is_retried_once_with_the_fingers_first(restore, frees):
+    restorer, ports, ctx, _ = restore
+    prepare(restorer, ports, ctx)
+    start, target = ports.hands["left"].copy(), restorer.plans["left"].open_pose
+    publish = ports.publish
+
+    def interlocked(left, right):
+        publish(left, right)
+        hand = ports.hands["left"]
+        if not frees or np.max(np.abs(hand[FINGERS] - target[FINGERS])) > 0.05:
+            hand[THUMB] = start[THUMB]  # the thumb cannot pass the curled fingers
+
+    ports.publish = interlocked
+    if frees:
+        assert not restorer.open_hand(ctx, "left")
+        np.testing.assert_allclose(ports.hands["left"], target)
+    else:
+        with pytest.raises(RestoreError) as error:
+            restorer.open_hand(ctx, "left")
+        assert error.value.code == "HAND_NOT_TRACKING" and "thumb" in str(error.value)
+    assert restorer.open_paths_taken["left"] == ["together", "fingers_first"]
+    assert ports.releases == 2
+
+
+def test_fingers_stuck_under_the_thumb_are_retried_with_the_thumb_cleared(restore):
+    restorer, ports, ctx, _ = restore
+    prepare(restorer, ports, ctx)
+    plan = restorer.plans["left"]
+    abad, mcp = 1, 2
+    clear = np.clip(0.0, plan.mapping.lower + 0.05, plan.mapping.upper - 0.05)
+    publish = ports.publish
+
+    def interlocked(left, right):
+        held = ports.hands["left"][FINGERS].copy()
+        publish(left, right)
+        hand = ports.hands["left"]
+        if np.max(np.abs(hand[[abad, mcp]] - clear[[abad, mcp]])) > 0.06:
+            hand[FINGERS] = np.where(np.abs(hand[FINGERS] - plan.open_pose[FINGERS]) < 1e-9, hand[FINGERS], held)
+
+    ports.publish = interlocked
+    assert not restorer.open_hand(ctx, "left")
+    assert restorer.open_paths_taken["left"] == ["together", "thumb_clear"]
+    np.testing.assert_allclose(ports.hands["left"], plan.open_pose)

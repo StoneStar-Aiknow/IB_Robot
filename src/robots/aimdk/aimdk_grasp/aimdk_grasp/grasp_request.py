@@ -37,7 +37,8 @@ from manipulation_execution.grasp_pipeline.contracts import (
 )
 
 from .arm_gravity import ArmGravity, require_executable
-from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
+from .grasp_session import check_approach_order
+from .hand import OPEN_HAND_TOLERANCE_RAD, THUMB_ABAD_OPEN_TOLERANCE_RAD, HandMapping
 from .joints import arm_joints
 from .observation import AdmittedState, LiveState
 from .planner import PlannerFault, palm_goals_from_camera_grasps
@@ -62,6 +63,10 @@ class _SearchExhausted(Exception):
 class GraspRequestConfig:
     planning_profile: str = "latency"
     approach_seed_policy: str = "clear_path"
+    # Seed waypoint above the approach pose along lift_up, not the grasp standoff.
+    approach_over_height_m: float = 0.18
+    # None retains the historical profile/side-first order. Explicit order wins.
+    approach_order_m: tuple[float, ...] | None = None
     screen_check: bool = True
     # budget_s is the hard request deadline from admission (fail, return no
     # plan); it only guards against a hung solver. target_s is the latency
@@ -74,6 +79,7 @@ class GraspRequestConfig:
     # screened (two 100-problem screen batches).
     reach_prefilter: bool = True
     max_planning_candidates: int = 200
+    carry_lift_m: float = 0.0
     revalidation: RevalidationConfig = field(default_factory=RevalidationConfig)
 
     def __post_init__(self):
@@ -81,6 +87,14 @@ class GraspRequestConfig:
             raise ValueError("Unknown planning profile")
         if self.approach_seed_policy not in ("native", "clear_path"):
             raise ValueError("Unknown approach seed policy")
+        if (
+            isinstance(self.approach_over_height_m, bool)
+            or not isinstance(self.approach_over_height_m, int | float)
+            or not np.isfinite(self.approach_over_height_m)
+            or self.approach_over_height_m <= 0
+        ):
+            raise ValueError("Finite positive approach_over_height_m required")
+        object.__setattr__(self, "approach_order_m", check_approach_order(self.approach_order_m))
         if not np.isfinite(self.budget_s) or self.budget_s <= 0:
             raise ValueError("Finite positive request budget required")
         if not np.isfinite(self.target_s) or self.target_s <= 0:
@@ -91,6 +105,8 @@ class GraspRequestConfig:
                 raise ValueError(f"Positive integer {name} required")
         if not isinstance(self.screen_check, bool) or not isinstance(self.reach_prefilter, bool):
             raise ValueError("Boolean screening and prefilter settings required")
+        if not np.isfinite(self.carry_lift_m) or not 0 <= self.carry_lift_m <= 0.25:
+            raise ValueError("carry_lift_m must be in [0, 0.25]")
 
 
 def left_palm_reach():
@@ -140,7 +156,13 @@ def check_initial_hand(mapping: HandMapping, admitted: AdmittedState) -> dict:
             errors[name + "_max_error_rad"] = mapping.require_open(feedback.hand(mapping.side))
         except RuntimeError as exc:
             raise RuntimeError(f"{name.capitalize()} feedback: {exc}") from exc
-    return dict(preset="open", confirmed=True, tolerance_rad=OPEN_HAND_TOLERANCE_RAD, **errors)
+    return dict(
+        preset="open",
+        confirmed=True,
+        tolerance_rad=OPEN_HAND_TOLERANCE_RAD,
+        thumb_abad_tolerance_rad=THUMB_ABAD_OPEN_TOLERANCE_RAD,
+        **errors,
+    )
 
 
 def segment(name: str, trajectory, side: str = "left") -> ArmSegment:
@@ -334,7 +356,15 @@ class X2GraspPlanner:
             raise ValueError(f"gravity compensation refused the plan: {exc}") from exc
         report["full_plan_valid"] = True
         report["request_timings_s"]["complete_plan_ready"] = time.monotonic() - admitted.started
-        return GraspPlan(grasp_steps(plan, self.hand.side), report["generated_candidate_index"], None, report)
+        steps = grasp_steps(plan, self.hand.side)
+        carry_steps = None
+        if self.config.carry_lift_m:
+            with self.service.session(start, estimate) as planner:
+                lift, height = planner.carry_lift(plan.grasp, self.config.carry_lift_m, check_deadline)
+            require_executable({"carry": lift.positions}, self.limits, self.gravity)
+            carry_steps = (*steps[:5], Move(segment("lift_carry", lift, self.hand.side)))
+            report["carry_lift_m"] = height
+        return GraspPlan(steps, report["generated_candidate_index"], None, report, carry_steps)
 
     def _recheck_target(self, planned, start, mask) -> dict:
         limits = self.config.revalidation

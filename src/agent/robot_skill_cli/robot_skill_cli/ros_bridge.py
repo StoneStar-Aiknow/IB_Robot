@@ -105,6 +105,8 @@ class RosBridge:
         self._GetSkillGatewayStatus = None
         self._GetSkillSnapshot = None
         self._ReloadSkillCatalog = None
+        self._AuthorizeHeldReset = None
+        self._authorize_held_reset_client = None
         self._ValidateSkill = None
         self._SkillCommand = None
         self._PlanAgentCommand = None
@@ -136,6 +138,7 @@ class RosBridge:
             from ibrobot_msgs.action import ExecuteAgentPlan, ExecuteProgram, PrimitiveCommand, SkillCommand
             from ibrobot_msgs.msg import WorkflowStep
             from ibrobot_msgs.srv import (
+                AuthorizeHeldReset,
                 CancelExecution,
                 ConfirmAgentPlan,
                 GetExecution,
@@ -177,6 +180,10 @@ class RosBridge:
             )
             self._reload_client = self._node.create_client(
                 ReloadSkillCatalog, self._reload_service, callback_group=callback_group
+            )
+            self._AuthorizeHeldReset = AuthorizeHeldReset
+            self._authorize_held_reset_client = self._node.create_client(
+                AuthorizeHeldReset, "/embodied/authorize_held_reset", callback_group=callback_group
             )
             self._validate_client = self._node.create_client(
                 ValidateSkill,
@@ -522,6 +529,27 @@ class RosBridge:
             "snapshot_json": str(response.snapshot_json),
             "error_code": str(response.error_code),
             "message": str(response.message),
+        }
+
+    def authorize_held_reset(
+        self, *, request_id, custody_id, operator_confirmed_empty, operator_note, inspect_only, timeout_sec
+    ):
+        if self._AuthorizeHeldReset is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._AuthorizeHeldReset.Request()
+        request.schema_version = 1
+        request.request_id, request.custody_id = request_id, custody_id
+        request.operator_confirmed_empty, request.operator_note = operator_confirmed_empty, operator_note
+        request.inspect_only = inspect_only
+        response = self._call_service(
+            self._authorize_held_reset_client,
+            request,
+            service_name="/embodied/authorize_held_reset",
+            timeout_sec=timeout_sec,
+        )
+        return {
+            name: getattr(response, name)
+            for name in ("success", "error_code", "message", "custody_id", "remaining_sec", "state", "reason_code")
         }
 
     def reload_skill_catalog(self, *, request_id: str, force: bool, timeout_sec: float) -> dict[str, Any]:

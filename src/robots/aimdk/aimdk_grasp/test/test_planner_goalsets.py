@@ -487,12 +487,13 @@ def test_escape_seed_replaces_only_the_first_trajopt_seed_and_is_cached_per_star
 
 
 @pytest.mark.parametrize("raised", [True, False])
-def test_the_over_seed_comes_down_into_the_approach_pose_from_above(raised):
+@pytest.mark.parametrize("height", [0.12, 0.18])
+def test_the_over_seed_comes_down_into_the_approach_pose_from_above(raised, height):
     torch = pytest.importorskip("torch")
     from aimdk_grasp.planner import LeftArmPlanner
 
     planner = object.__new__(LeftArmPlanner)
-    planner._approach_graph_seed, planner._over_m, planner.lift_up = "over", 0.12, (0.0, 0.0, 2.0)
+    planner._approach_graph_seed, planner._over_m, planner.lift_up = "over", height, (0.0, 0.0, 2.0)
     calls, solves = [], []
 
     def cartesian(origins, offsets, steps, check):
@@ -514,10 +515,14 @@ def test_the_over_seed_comes_down_into_the_approach_pose_from_above(raised):
     assert planner._escape_seeded_solve("goal", state, ends, 25, trace, lambda: None) == "result"
     escape, over = calls
     np.testing.assert_allclose(over[0], np.ones(7))  # from the approach IK seed ...
-    np.testing.assert_allclose(over[1], [0.0, 0.0, 0.12])  # ... straight up along lift_up, _over_m
+    np.testing.assert_allclose(over[1], [0.0, 0.0, height])  # normalized lift_up, independent of its norm
     seed = solves[0]["seed_traj"][0, 0].numpy()
     torch.testing.assert_close(solves[0]["seed_traj"][0, 0, -1], torch.full((7,), 1.0))  # ends at the approach
     assert trace["over_ok"] is raised
+    assert trace["requested_over_height_m"] == height
+    assert trace["actual_seed"] == ("over" if raised else "escape")
+    assert trace["actual_over_height_m"] == (height if raised else None)
+    assert trace.get("fallback_reason") == (None if raised else "over_cartesian_ik_failed")
     # Raised, the path reaches the top of that chain (1.12) and comes back down to 1.0; otherwise the
     # joint line runs from the escape's end (0.1) straight into the approach and never passes it.
     assert bool(seed.max() > 1.1) is raised

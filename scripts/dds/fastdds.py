@@ -5,6 +5,12 @@ from xml.etree import ElementTree as ET
 VERSION = "2.6.11"
 NAMESPACE = "http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles"
 MAX_INITIAL_PEER_INDEX = 32
+# Socket buffers for the builtin UDP transport. Left unset, Fast DDS takes the
+# kernel default (often 208 KiB): a reliable sample larger than that, such as a
+# ~590 KB grasp-head capture reply, loses fragments on its first send and waits
+# for the 3 s heartbeat to be repaired (measured on the X2 Orin, 2026-11-07).
+# The kernel still caps each request at net.core.[wr]mem_max.
+SOCKET_BUFFER_BYTES = 2 * 1024 * 1024
 
 
 def render(network, binding, domain_id=0):
@@ -15,6 +21,8 @@ def render(network, binding, domain_id=0):
     name = {"local_only": "ibrobot_local", "lan_multicast": "ibrobot_lan", "static_peers": "ibrobot_static"}[mode]
     participant = ET.SubElement(root, "participant", {"profile_name": name, "is_default_profile": "true"})
     rtps = ET.SubElement(participant, "rtps")
+    ET.SubElement(rtps, "sendSocketBufferSize").text = str(SOCKET_BUFFER_BYTES)
+    ET.SubElement(rtps, "listenSocketBufferSize").text = str(SOCKET_BUFFER_BYTES)
 
     def locators(parent, name, addresses):
         group = ET.SubElement(parent, name)

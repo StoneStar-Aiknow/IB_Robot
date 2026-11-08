@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from threading import RLock
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -18,15 +19,33 @@ from .hand import HandMapping, hand_links
 from .joints import HEAD, arm_joints, check_side, other_side
 from .mesh_loading import use_gpu_validation_meshes
 from .robot_model import collision_robot_config, config_directory, planning_model
+from .robot_spheres import RobotSphereModel
 from .scene_estimation import LazyScene, SceneEstimate
 from .trajectory import TimedTrajectory
 
-#: How far a locked joint (right arm, head, left hand) may be from the snapshot
-#: the planner was built on before the snapshot has to be rebuilt. The rebuild
-#: is the service's most expensive operation (47.6-49.9 s on the Orin) and no
-#: request deadline can preempt it, so `planner_service` names which group
-#: crossed this when it happens.
-LOCKED_JOINT_ATOL = 0.025
+#: How far (m) any collision sphere of a locked group (other arm, head, the
+#: planning hand) may have moved since the snapshot the planner was built on
+#: before the snapshot has to be rebuilt. The rebuild is the service's most
+#: expensive operation (47.6-49.9 s on the Orin) and no request deadline can
+#: preempt it, so `planner_service` names which group crossed this when it
+#: happens. Judged in metres, not radians: one joint-angle tolerance moved the
+#: other arm's hand ~12 mm but a finger ~1 mm, and the OmniHand thumb comes to
+#: rest anywhere within ~0.05 rad of the open preset after every reopening
+#: (live 2026-11-06: hand=0.0319 rad rebuilt the planner inside a request, 39 s).
+#: 5 mm is a quarter of the optimizer's 0.02 m collision activation distance.
+LOCKED_SPHERE_SHIFT_M = 0.005
+#: How far (rad) past a model joint bound a measured planning-arm start may be
+#: and still plan, from just inside the bound (START_BOUND_INSET_RAD); see
+#: LeftArmPlanner._measured_start. Far below the 0.025 rad start tolerance the
+#: executor allows between the planned start and the measured arm.
+START_BOUND_SLACK_RAD = 0.01
+START_BOUND_INSET_RAD = 0.001
+#: Palm-fixed link whose reserved spheres carry a held object (and the closed
+#: fingers outside the open-hand model). cuRobo rewrites them in place, so a
+#: carry never rebuilds the planner. Disabled slots have radius -100.
+ATTACH_LINK = "attached_object"
+ATTACH_SLOTS = 16
+DISABLED_RADIUS = -100.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +75,10 @@ class GraspPlanningError(RuntimeError):
     def __init__(self, message, goalset_index=None):
         super().__init__(message)
         self.goalset_index = goalset_index
+
+
+class PlacementSearchExhausted(RuntimeError):
+    """No complete placement path in this snapshot; a fresh observation may help."""
 
 
 class PlannerFault(Exception):
@@ -173,7 +196,32 @@ def robot_config(
         raise ValueError(f"Robot must expose exactly the seven {side} arm joints")
     kin["lock_joints"] = {n: float(v) for n, v in locks.items()}
     kin["cspace"]["default_joint_position"] = feedback.vector(arm).tolist()
+    reserve_attachment(kin, directory, side)
     return config
+
+
+def reserve_attachment(kin, directory, side):
+    """Add ATTACH_LINK under R_palm with ATTACH_SLOTS disabled spheres.
+
+    The slots are listed explicitly so every model (and collision_sphere_links)
+    counts them; the hand and wrist never collide with what the hand holds.
+    """
+    extra = kin.get("extra_links") or {}
+    extra[ATTACH_LINK] = {
+        "link_name": ATTACH_LINK,
+        "parent_link_name": "R_palm",
+        "joint_name": f"{ATTACH_LINK}_joint",
+        "joint_type": "FIXED",
+        "fixed_transform": [0, 0, 0, 1, 0, 0, 0],
+    }
+    kin["extra_links"] = extra
+    near = [*hand_links(planning_model(directory)), *(n for n in kin["collision_link_names"] if f"{side}_wrist" in n)]
+    kin["collision_link_names"] = [*kin["collision_link_names"], ATTACH_LINK]
+    kin["collision_spheres"][ATTACH_LINK] = [
+        {"center": [0.0, 0.0, 0.0], "radius": DISABLED_RADIUS} for _ in range(ATTACH_SLOTS)
+    ]
+    kin["self_collision_ignore"] = {**(kin.get("self_collision_ignore") or {}), ATTACH_LINK: list(dict.fromkeys(near))}
+    kin["self_collision_buffer"] = {**(kin.get("self_collision_buffer") or {}), ATTACH_LINK: 0.0}
 
 
 def palm_goal_pose(transforms, *, batched=False):
@@ -497,6 +545,7 @@ class LeftArmPlanner:
         torso_merge_protected_spheres=None,
         planning_profile="default",
         approach_seed_policy="clear_path",
+        approach_over_height_m=0.18,
         side="left",
     ):
         import curobo.runtime as runtime
@@ -524,6 +573,13 @@ class LeftArmPlanner:
             raise ValueError("Unknown planning profile")
         if approach_seed_policy not in ("native", "clear_path"):
             raise ValueError("Unknown approach seed policy")
+        if (
+            isinstance(approach_over_height_m, bool)
+            or not isinstance(approach_over_height_m, int | float)
+            or not np.isfinite(approach_over_height_m)
+            or approach_over_height_m <= 0
+        ):
+            raise ValueError("Finite positive approach_over_height_m required")
         if planning_profile == "latency" and max_batch_size != 1:
             raise ValueError("The latency profile requires max_batch_size=1 (direct goalsets)")
         configure_runtime(runtime)
@@ -536,20 +592,30 @@ class LeftArmPlanner:
         self.hand_links = list(hand_links(model))
         self.grasp_to_palm = grasp_to_palm_transform(gripper)
         self.hand = self.hand_mapping.check(feedback.hand(side)).copy()
+        # CPU forward kinematics of the planning model's spheres, to judge how
+        # far the locked groups moved (locked_shift_m) without touching the GPU.
+        self._lock_spheres = RobotSphereModel(self.hand_mapping, config_directory(side))
         self.scene_received_at = scene_received_at
         self.max_scene_age_s = max_scene_age_s
         self.reference_hand_collisions = reference_hand_collisions
+        #: Spheres (palm frame, Nx4) attached to ATTACH_LINK; the last is the object.
+        self.attached = np.empty((0, 4))
         self.max_goalset = max_goalset
         self.max_batch_size = max_batch_size
         self.planning_profile = planning_profile
         self.approach_seed_policy = approach_seed_policy
+        self._over_m = float(approach_over_height_m)
         self._closed = False
         self._warmed = False
         self._checker_lock = RLock()
         self._checker_batch_size = None
         self._pending_validation_scene = validation_scene if isinstance(validation_scene, LazyScene) else None
         self._scene_capacity = scene_capacity(scene, validation_scene)
-        config = robot_config(feedback, side=side, reference_hand_collisions=reference_hand_collisions)
+        config = robot_config(
+            feedback,
+            side=side,
+            reference_hand_collisions=reference_hand_collisions,
+        )
         kin = config["robot_cfg"]["kinematics"]
         self.collision_sphere_links = [
             name for name in kin["collision_link_names"] for _ in kin["collision_spheres"][name]
@@ -568,6 +634,9 @@ class LeftArmPlanner:
             if torso_merge_radius_m is not None or self._motion_hand_merge_radius_m is not None
             else copy.deepcopy(config)
         )
+        # Preserve the defaults from construction, also after cached reuse.
+        self._diagnostic_models = copy.deepcopy({"fine": config, "planning": motion_robot})
+        self._diagnostic_scenes = (copy.deepcopy(scene), validation_scene)
         self.planning_sphere_count = sum(
             len(v) for v in motion_robot["robot_cfg"]["kinematics"]["collision_spheres"].values()
         )
@@ -604,6 +673,9 @@ class LeftArmPlanner:
         # batch wastes B times the work and breaks cuRobo's single-plan results.
         motion_config.ik_solver_config.max_batch_size = max_batch_size
         self.motion = MotionPlanner(motion_config)
+        limits = self.motion.kinematics.config.kinematics_config.joint_limits.position.detach().cpu().numpy()
+        #: Planning-arm position bounds (lower, upper) the solvers enforce, for _measured_start.
+        self._arm_bounds = (limits[0].astype(float), limits[1].astype(float))
         kinematics = self.motion.kinematics.config.kinematics_config
         static = torch.zeros_like(kinematics.link_sphere_idx_map, dtype=torch.bool)
         for link in self._static_scene_links:
@@ -745,7 +817,7 @@ class LeftArmPlanner:
         self._ik_validity_cache.clear()
         self._warmed = True
 
-    def update_scene(self, feedback, estimate):
+    def update_scene(self, feedback, estimate, *, carrying=None):
         """Replace coarse/fine meshes without rebuilding solvers or CUDA graphs.
 
         Serialized calls only. Receipt time comes from the new depth estimate,
@@ -755,7 +827,8 @@ class LeftArmPlanner:
         import torch
         from curobo._src.geom.types import SceneCfg
 
-        if self._closed or not self.locked_joints_match(feedback):
+        matches = self.locked_joints_match(feedback, carrying=True) if carrying else self.locked_joints_match(feedback)
+        if self._closed or not matches:
             raise RuntimeError("Planner closed or locked joints changed; rebuild planner")
         if not isinstance(estimate, SceneEstimate) or estimate.frame_id != "torso_link":
             raise ValueError("A torso-frame SceneEstimate with both resolutions is required")
@@ -804,6 +877,7 @@ class LeftArmPlanner:
             raise
         self._checker_stream.wait_stream(torch.cuda.current_stream())
         self._pending_validation_scene = pending
+        self._diagnostic_scenes = (copy.deepcopy(estimate.scene), estimate.validation_scene)
         self.scene_received_at = estimate.received_at
         if (
             feedback is not None
@@ -812,14 +886,70 @@ class LeftArmPlanner:
         ):
             self._escape_chain(feedback.vector(self.arm))  # scene-independent; ready for the first attempt
 
-    def locked_joints_match(self, feedback):
-        return bool(
-            np.allclose(feedback.vector(self.other_arm), self.other, atol=LOCKED_JOINT_ATOL, rtol=0)
-            and np.allclose(feedback.vector(HEAD), self.head, atol=LOCKED_JOINT_ATOL, rtol=0)
-            and np.allclose(
-                self.hand_mapping.check(feedback.hand(self.side)), self.hand, atol=LOCKED_JOINT_ATOL, rtol=0
-            )
-        )
+    def locked_shift_m(self, feedback, *, carrying=None):
+        """Per locked group, the largest collision-sphere displacement (m) from
+        the built snapshot when only that group takes its measured value.
+
+        While carrying, the hand is the open-hand model plus the attached cover,
+        so a closed hand is not a change (0.0). Hand spheres ride on the
+        planning arm; a rigid motion keeps distances, so the planning arm's own
+        pose does not change the result and its measured value is used.
+        """
+        carrying = self.carrying if carrying is None else carrying
+        other = np.asarray(feedback.vector(self.other_arm), float)
+        head = np.asarray(feedback.vector(HEAD), float)
+        hand = self.hand if carrying else self.hand_mapping.check(feedback.hand(self.side))
+        arm = np.asarray(feedback.vector(self.arm), float)
+        # Row 0 is the built snapshot; each later row changes one group.
+        others = np.array([self.other, other, self.other, self.other])
+        heads = np.array([self.head, self.head, head, self.head])
+        hands = np.array([self.hand, self.hand, self.hand, hand])
+        spheres, _ = self._lock_spheres.spheres(feedback, np.tile(arm, (4, 1)), other=others, head=heads, hand=hands)
+        moved = np.linalg.norm(spheres[1:, :, :3] - spheres[:1, :, :3], axis=2).max(axis=1)
+        return dict(zip(("other_arm", "head", "hand"), (float(value) for value in moved), strict=True))
+
+    def locked_joints_match(self, feedback, *, carrying=None):
+        """No locked group moved any collision sphere past LOCKED_SPHERE_SHIFT_M."""
+        return max(self.locked_shift_m(feedback, carrying=carrying).values()) <= LOCKED_SPHERE_SHIFT_M
+
+    @property
+    def carrying(self):
+        return len(self.attached) > 0
+
+    def _attachment_parameters(self):
+        """Every kinematics copy holding ATTACH_LINK spheres: the motion planner's
+        (shared by IK, TrajOpt and the graph planner) and the fine checker's own."""
+        found = []
+        for model in (self.motion.kinematics, self.checker.kinematics):
+            parameters = model.config.kinematics_config
+            index = parameters.get_sphere_index_from_link_name(ATTACH_LINK)
+            if len(index) != ATTACH_SLOTS:
+                raise RuntimeError(f"planner model lacks the {ATTACH_SLOTS} reserved {ATTACH_LINK} spheres")
+            found.append((parameters, index))
+        return found
+
+    def _write_attachment(self, spheres):
+        import torch
+
+        values = np.full((ATTACH_SLOTS, 4), [0.0, 0.0, 0.0, DISABLED_RADIUS])
+        values[: len(spheres)] = spheres
+        for parameters, index in self._attachment_parameters():
+            tensor = torch.as_tensor(values, device=parameters.link_spheres.device, dtype=parameters.link_spheres.dtype)
+            parameters.link_spheres[:, index, :] = tensor
+        torch.cuda.synchronize()
+        self._diagnostic_attachment = np.asarray(spheres).copy()
+
+    def attach_object(self, spheres):
+        """Attach palm-frame Nx4 spheres (N <= ATTACH_SLOTS, the object last); no rebuild."""
+        spheres = np.asarray(spheres, dtype=float).reshape(-1, 4)
+        if not 1 <= len(spheres) <= ATTACH_SLOTS or not np.isfinite(spheres).all() or (spheres[:, 3] <= 0).any():
+            raise ValueError(f"1..{ATTACH_SLOTS} finite positive palm-frame spheres required")
+        self._write_attachment(spheres)
+        self.attached = spheres.copy()
+
+    def detach_object(self):
+        self._write_attachment(np.empty((0, 4)))
+        self.attached = np.empty((0, 4))
 
     def _bound_mesh_query(self, model):
         if model is self.motion.scene_collision_checker and self._motion_mesh_query_margin is not None:
@@ -938,11 +1068,13 @@ class LeftArmPlanner:
                 & (scene_cost.reshape(len(q), -1) == 0).all(dim=1)
             )
             behind = torch.zeros_like(valid)
+            hand_min_x = None
             if self._hand_min_x_m is not None:
                 hand_x = state.robot_spheres.reshape(len(q), -1, 4)[:, self._hand_spheres, 0]
+                hand_min_x = hand_x.min(dim=1).values.cpu().numpy()
                 behind = (hand_x < self._hand_min_x_m).any(dim=1)
                 valid &= ~behind
-        return {
+        diagnostics = {
             "valid": valid.cpu().numpy().reshape(-1),
             "hand_behind_torso": behind.cpu().numpy().reshape(-1),
             "bound_cost": bound.cpu().numpy().reshape(len(q), -1),
@@ -950,14 +1082,21 @@ class LeftArmPlanner:
             "world_penetration_m": scene_cost.cpu().numpy().reshape(len(q), -1),
             "spheres": state.robot_spheres.cpu().numpy().reshape(len(q), -1, 4),
         }
+        if hand_min_x is not None:
+            diagnostics.update(hand_min_x_m=hand_min_x, required_hand_min_x_m=self._hand_min_x_m)
+        if (diagnostics["self_collision_cost"] > 0).any():
+            config = self.checker.self_collision_cost.config.self_collision_kin_config
+            diagnostics["self_collision_pairs"] = config.collision_pairs.cpu().numpy()
+            diagnostics["self_collision_padding"] = config.sphere_padding.cpu().numpy()
+        return diagnostics
 
-    def violations(self, positions) -> str:
+    def violations(self, positions, *, diagnostics=None, times=None) -> str:
         """What the fine check rejects along a path: where, which links, how deep, and the deepest sphere.
 
         The sphere centre is in the torso frame, so it tells the table (its
         height) from the target or a neighbour (their place) without the scene.
         """
-        diagnostics = self.constraint_diagnostics(positions)
+        diagnostics = self.constraint_diagnostics(positions) if diagnostics is None else diagnostics
         bad = np.flatnonzero(~diagnostics["valid"])
         if not len(bad):
             return "no violation"
@@ -980,6 +1119,12 @@ class LeftArmPlanner:
             parts.append(f"bound_joints={[n for n, v in zip(self.arm, bound, strict=False) if v > 0]}")
         if diagnostics["hand_behind_torso"][bad].any():
             parts.append("hand behind the torso")
+        from .path_diagnostics import summarize
+
+        detail = summarize(
+            positions, times, diagnostics, self.arm, self.collision_sphere_links, getattr(self, "_arm_bounds", None)
+        )
+        parts.append(f"constraint_details={detail['types']}")
         return "; ".join(parts)
 
     def valid_positions(self, positions):
@@ -1007,6 +1152,33 @@ class LeftArmPlanner:
             self._ik_validity_cache = {key: cache[key] for key in keys[-self._ik_validity_cache_capacity :]}
         return valid
 
+    def _measured_start(self, feedback):
+        """The measured planning arm as a start state, a hair past a model bound taken back to it.
+
+        The planning model's bounds sit inside the motion controller's (right
+        wrist pitch 0.5236 vs 0.558), and a loaded arm settles past its target:
+        live 2026-11-06 a grasp planned to the bound measured 0.5272 at contact
+        and 0.526 carrying. Planning from that rejected every start, the drop
+        recovery's path home included (DROP_RECOVERY_FAILED). A joint at most
+        START_BOUND_SLACK_RAD past a bound starts just inside it instead -- well
+        within the executor's start tolerance -- and is logged; one further
+        out is left as measured for _require_valid_start to reject. The bounds
+        themselves are unchanged: no plan is allowed to go there.
+        """
+        q = np.asarray(feedback.vector(self.arm), dtype=float)
+        bounds = getattr(self, "_arm_bounds", None)
+        if bounds is None:  # a planner assembled without solvers (offline tools, tests)
+            return q
+        lower, upper = bounds
+        past = np.maximum(lower - q, q - upper)
+        if past.max() <= 0.0 or past.max() > START_BOUND_SLACK_RAD:
+            return q
+        inside = np.clip(q, lower + START_BOUND_INSET_RAD, upper - START_BOUND_INSET_RAD)
+        start = np.where(past > 0.0, inside, q)
+        moved = {name: round(float(value), 4) for name, value in zip(self.arm, past, strict=True) if value > 0.0}
+        print(f"planning start taken back inside the model bounds (rad past): {moved}", file=sys.stderr, flush=True)
+        return start
+
     def _require_valid_start(self, positions):
         diagnostics = self.constraint_diagnostics(np.asarray(positions)[None])
         if diagnostics["valid"].all():
@@ -1024,6 +1196,13 @@ class LeftArmPlanner:
 
     def _solve_motion(self, goal_pose, state, *, deadline=None, seed_config=None, iters=25, graph_seed=None):
         """One bounded IK/TrajOpt pass in latency mode; native retries otherwise."""
+        self.graph_seed_trace = trace = dict(
+            mode=graph_seed,
+            requested_seed=graph_seed or "native",
+            actual_seed="native",
+            requested_over_height_m=self._over_m if graph_seed == "over" else None,
+            actual_over_height_m=None,
+        )
         if self.planning_profile != "latency":
             return self.motion.plan_pose(goal_pose, state)
 
@@ -1055,11 +1234,18 @@ class LeftArmPlanner:
             configs = torch.cat(configs, dim=1)
             index = torch.arange(count, device=configs.device) % configs.shape[1]
             seed_config = configs[:, index].contiguous()
-        self.graph_seed_trace = trace = dict(mode=graph_seed)
         if graph_seed in ("escape", "over") and count > 1:
             result = self._escape_seeded_solve(goal_pose, state, seed_config, iters, trace, check_deadline)
             if result is not None:
                 return result
+            if trace.get("escape_ok"):
+                trace.update(
+                    actual_seed="native",
+                    actual_over_height_m=None,
+                    fallback_reason="seeded_optimizer_returned_no_result",
+                )
+        elif graph_seed in ("escape", "over"):
+            trace["fallback_reason"] = "parallel_seeds_required"
         result = self.motion.trajopt_solver.solve_pose(
             goal_pose, state, seed_config=seed_config, use_implicit_goal=True, initial_iters=iters, finetune_attempts=0
         )
@@ -1155,15 +1341,21 @@ class LeftArmPlanner:
         chain = self._escape_chain(start, check_deadline)
         trace["escape_ok"] = chain is not None
         if chain is None:
+            trace.update(actual_seed="native", actual_over_height_m=None, fallback_reason="escape_cartesian_ik_failed")
             return None
+        trace.update(actual_seed="escape", actual_over_height_m=None)
         path = np.concatenate((chain, end[None]))
         if self._approach_graph_seed == "over":
+            trace["requested_over_height_m"] = self._over_m
             # The approach pose raised _over_m, walked back down into it.
             lift = self._over_m * np.asarray(self.lift_up, dtype=float) / np.linalg.norm(self.lift_up)
             above, ok = self._cartesian_paths(end[None], lift[None], self._over_cartesian_steps, check_deadline)
             trace["over_ok"] = bool(ok[0])
             if ok[0]:
                 path = np.concatenate((chain, above[0][::-1]))
+                trace.update(actual_seed="over", actual_over_height_m=self._over_m)
+            else:
+                trace["fallback_reason"] = "over_cartesian_ik_failed"
         solver = self.motion.trajopt_solver
         arc = np.concatenate(([0.0], np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))))
         s = np.linspace(0.0, arc[-1], solver.action_horizon)
@@ -1754,6 +1946,19 @@ class LeftArmPlanner:
         positions[0] = grasp.positions[-1]
         return TimedTrajectory(lift.times, positions, lift.joint_names), "vertical"
 
+    def carry_lift(self, grasp, requested_m, check_deadline):
+        previous = self.vertical_lift_m
+        try:
+            for height in dict.fromkeys([requested_m, min(requested_m, 0.10), min(requested_m, 0.05)]):
+                check_deadline()
+                self.vertical_lift_m = height
+                lift, method = self._vertical_lift(grasp, check_deadline)
+                if method == "vertical":
+                    return lift, height
+        finally:
+            self.vertical_lift_m = previous
+        raise RuntimeError("no straight carry lift at the requested or fallback heights")
+
     @contextmanager
     def _carried_target(self):
         """The fine checker without the target mesh, held exclusively until the block ends."""
@@ -1782,19 +1987,19 @@ class LeftArmPlanner:
         end = grasp.positions[-1]
         return TimedTrajectory(np.array([0.0, 0.1]), np.stack([end, end]), grasp.joint_names)
 
-    def plan_pose(self, feedback, torso_from_palm, now, *, deadline=None):
+    def plan_pose(self, feedback, torso_from_palm, now, *, deadline=None, seed_config=None):
         if deadline is not None and not np.isfinite(deadline):
             raise ValueError("Finite monotonic planning deadline required")
         if deadline is not None and time.perf_counter() >= deadline:
             raise TimeoutError("Planning deadline exceeded")
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
-        q = feedback.vector(self.arm)
+        q = self._measured_start(feedback)
         self._require_valid_start(q)
         goal = rigid(torso_from_palm)
         pose, state = self._goal_pose(goal[None]), self._state(q)
-        result = self._solve_motion(pose, state, deadline=deadline)
-        result = self._retry_approach(pose, state, result, deadline=deadline)
+        result = self._solve_motion(pose, state, deadline=deadline, seed_config=seed_config)
+        result = self._retry_approach(pose, state, result, deadline=deadline, seed_config=seed_config)
         if result is None or result.success is None or not bool(result.success.all()):
             raise RuntimeError(f"cuRobo pose planning failed: {self._motion_failure(result)}")
         trajectory = TimedTrajectory.from_curobo(
@@ -1803,11 +2008,281 @@ class LeftArmPlanner:
             locked_positions=self.locked_positions,
             arm=self.arm,
         )
-        if not self.valid_positions(trajectory.positions).all():
-            raise RuntimeError("Interpolated trajectory violates collision or joint constraints")
+        diagnostics = self.constraint_diagnostics(trajectory.positions)
+        if not diagnostics["valid"].all():
+            detail = self.violations(trajectory.positions, diagnostics=diagnostics, times=trajectory.times)
+            archive = self._save_pose_failure(feedback, q, goal, trajectory, diagnostics, result, seed_config)
+            raise RuntimeError(f"Interpolated trajectory violates collision or joint constraints: {detail}; {archive}")
         if deadline is not None and time.perf_counter() >= deadline:
             raise TimeoutError("Planning deadline exceeded")
         return trajectory
+
+    def _save_pose_failure(self, feedback, start, goal, trajectory, diagnostics, result, seed_config):
+        """A recording failure must preserve the original planning rejection."""
+        from .path_diagnostics import save_failure, summarize
+
+        try:
+            planning_scene, validation_scene = self._diagnostic_scenes
+            validation_scene = (
+                validation_scene.materialize() if isinstance(validation_scene, LazyScene) else validation_scene
+            )
+            optimized = getattr(result, "js_solution", None)
+            summary = summarize(
+                trajectory.positions,
+                trajectory.times,
+                diagnostics,
+                self.arm,
+                self.collision_sphere_links,
+                self._arm_bounds,
+            )
+            record = dict(
+                positions=trajectory.positions,
+                times=trajectory.times,
+                joint_names=tuple(self.arm),
+                diagnostics=diagnostics,
+                summary=summary,
+                sphere_links=self.collision_sphere_links,
+                measured_start=feedback.vector(self.arm),
+                planning_start=start,
+                feedback_received_at=feedback.received_at,
+                target_palm=goal,
+                attached_spheres=getattr(self, "_diagnostic_attachment", self.attached),
+                planning_scene=planning_scene,
+                validation_scene=dict(validation_scene),
+                scene_received_at=self.scene_received_at,
+                models=self._diagnostic_models,
+                bounds=self._arm_bounds,
+                optimized_positions=None if optimized is None else optimized.position.detach().cpu().numpy(),
+                optimized_joint_names=None if optimized is None else optimized.joint_names,
+                seed_config=None if seed_config is None else seed_config.detach().cpu().numpy(),
+                planning_profile=self.planning_profile,
+                approach_seed_policy=self.approach_seed_policy,
+                approach_over_height_m=self._over_m,
+                hand_min_x_m=self._hand_min_x_m,
+                mesh_query_distance=self.mesh_query_distance,
+            )
+            path = save_failure(record)
+            print(f"pose path rejected: {summary}; archive={path}", file=sys.stderr, flush=True)
+            return f"archive={path}"
+        except Exception as exc:  # noqa: BLE001 - evidence cannot change the safety decision
+            message = f"failure archive unavailable: {type(exc).__name__}: {exc}"
+            print(message, file=sys.stderr, flush=True)
+            return message
+
+    #: Peak joint speed (rad/s) and check spacing (rad) of a joint-space path home.
+    HOME_JOINT_SPEED = 0.5
+    HOME_CHECK_STEP = 0.02
+
+    def _checked_joint_path(self, start, goal):
+        """Straight joint-space path, every 2 cm-rad sample fine-checked; None if any collides.
+
+        Cosine time scaling (zero end velocities) at the TrajOpt interpolation dt.
+        """
+        start, goal = np.asarray(start, float), np.asarray(goal, float)
+        span = float(np.max(np.abs(goal - start)))
+        samples = np.linspace(start, goal, max(2, int(np.ceil(span / self.HOME_CHECK_STEP)) + 1))
+        if not np.asarray(self.valid_positions(samples), bool).all():
+            return None
+        dt = float(self.motion.trajopt_solver.config.interpolation_dt)
+        duration = max(dt, span * np.pi / (2 * self.HOME_JOINT_SPEED))
+        times = np.arange(0.0, duration + dt / 2, dt)
+        if len(times) < 2:
+            times = np.array([0.0, dt])
+        times[-1] = max(times[-1], duration)
+        fraction = (1 - np.cos(np.pi * np.clip(times / times[-1], 0, 1))) / 2
+        return TimedTrajectory(times - times[0], start + fraction[:, None] * (goal - start), tuple(self.arm))
+
+    @staticmethod
+    def _joined(*paths):
+        """Concatenate timed paths that meet end to start, keeping time increasing."""
+        times, positions = [paths[0].times], [paths[0].positions]
+        for path in paths[1:]:
+            if not np.allclose(positions[-1][-1], path.positions[0], atol=1e-6):
+                raise ValueError("paths do not meet")
+            step = path.times[1] - path.times[0]
+            times.append(times[-1][-1] + step + path.times[1:] - path.times[1])
+            positions.append(path.positions[1:])
+        return TimedTrajectory(np.concatenate(times), np.vstack(positions), paths[0].joint_names)
+
+    def _route(self, start, pieces, home):
+        """``pieces`` driven in order from ``start`` to ``home``, re-checked now; None if any part collides.
+
+        Pieces that do not meet are bridged by checked straight joint paths.
+        """
+        joined, at = [], np.asarray(start, float)
+        for piece in [*pieces, None]:
+            target = np.asarray(home, float) if piece is None else piece.positions[0]
+            if not np.allclose(at, target, atol=1e-6):
+                bridge = self._checked_joint_path(at, target)
+                if bridge is None:
+                    return None
+                joined.append(bridge)
+            if piece is None:
+                break
+            if not np.asarray(self.valid_positions(piece.positions), bool).all():
+                return None
+            joined.append(piece)
+            at = piece.positions[-1]
+        return self._joined(*joined) if joined else None
+
+    def _path_home(self, start, home, now, feedback, *, deadline, back=None, return_path=None):
+        """A checked path to the exact ``home`` joints without a joint-space TrajOpt goal.
+
+        The warmed solvers keep their captured pose-goal shape, so a cspace
+        solve cannot run on them. In order: straight; back the way it came
+        (``back``: a validated path ending near ``start``, reversed) and then
+        straight, or then along ``return_path`` (pick's own moves reversed,
+        from the handover to home); ``return_path`` from here; a pose plan to
+        home's palm pose, then straight to the exact joints. Every part is
+        fine-checked in the current scene.
+        """
+        direct = self._checked_joint_path(start, home)
+        if direct is not None:
+            return direct
+        routes = []
+        if back is not None:
+            reverse = TimedTrajectory(back.times[-1] - back.times[::-1], back.positions[::-1], back.joint_names)
+            routes.append([reverse])
+            if return_path is not None:
+                routes.append([reverse, return_path])
+        if return_path is not None:
+            routes.append([return_path])
+        for pieces in routes:
+            path = self._route(start, pieces, home)
+            if path is not None:
+                return path
+        goal = self._palm_poses(np.asarray(home, float)[None])[0]
+        moved = SimpleNamespace(
+            received_at=feedback.received_at,
+            healthy=feedback.healthy,
+            vector=lambda names: np.asarray(start, float) if list(names) == list(self.arm) else feedback.vector(names),
+            hand=feedback.hand,
+        )
+        reach = self.plan_pose(moved, goal, now, deadline=deadline)
+        finish = self._checked_joint_path(reach.positions[-1], home)
+        if finish is None:
+            raise RuntimeError("no checked path to home")
+        return self._joined(reach, finish)
+
+    def plan_place(
+        self, feedback, targets, home, now, *, check_deadline, deadline, opening=None, return_path=None, max_rounds=3
+    ):
+        """Transfer, descent, upward retreat and checked joint-space home for one of ``targets``.
+
+        ``targets`` are (above, release) palm poses in preference order. The
+        start is checked once; one goalset IK over the "above" poses picks a
+        reachable one (chunks of max_goalset), whose seed then drives a single
+        TrajOpt solve. A candidate whose descent, opening, retreat or home
+        fails is dropped and the goalset solved again, at most ``max_rounds``
+        times. ``opening`` (palm-frame spheres the opening fingers sweep) is
+        checked once at the release pose; the open, empty hand then retreats
+        and goes home with nothing attached.
+        """
+        if not self.snapshot_matches(feedback, now):
+            raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
+        if not self.carrying:
+            raise RuntimeError("placement planning needs the carried object attached")
+        q = self._measured_start(feedback)
+        self._require_valid_start(q)
+        aboves = np.stack([rigid(above) for above, _ in targets])
+        releases = np.stack([rigid(release) for _, release in targets])
+        remaining, failures, stages = list(range(len(targets))), [], {}
+        rounds = 0
+        while remaining and rounds < max_rounds:
+            check_deadline()
+            chunk = remaining[: self.max_goalset]
+            selection = self.motion.ik_solver.solve_pose(self._goal_pose(aboves[chunk]), self._state(q), return_seeds=1)
+            check_deadline()
+            if selection is None or selection.success is None or not bool(selection.success.any()):
+                failures.append(f"no reachable opening pose among {len(chunk)} candidates")
+                remaining = remaining[len(chunk) :]
+                continue
+            rounds += 1
+            index = chunk[self._input_goal_index(int(selection.goalset_index.reshape(-1)[0].item()), len(chunk))]
+            seed = selection.solution[:, 0:1].clone()
+            stage = "transfer"
+            try:
+                transfer = self.plan_pose(feedback, aboves[index], now, deadline=deadline, seed_config=seed)
+                stage = "descend"
+                descend, reason = self._linear_grasp_segment(transfer.positions[-1], releases[index], check_deadline)
+                if descend is None:
+                    raise RuntimeError(f"descent: {reason}")
+                stage = "opening"
+                if opening is not None and len(opening):
+                    with self._attachment(opening):
+                        if not self.valid_positions(descend.positions[-1:]).all():
+                            raise RuntimeError(f"opening hand: {self.violations(descend.positions[-1:])}")
+                with self._without_placed_object():
+                    stage = "retreat"
+                    retreat, reason = self._linear_grasp_segment(descend.positions[-1], aboves[index], check_deadline)
+                    if retreat is None:
+                        raise RuntimeError(f"retreat: {reason}")
+                    stage = "home"
+                    # The retreat ends where the transfer ended: the transfer,
+                    # checked with the closed hand and object, leads back.
+                    home_path = self._path_home(
+                        retreat.positions[-1],
+                        home,
+                        now,
+                        feedback,
+                        deadline=deadline,
+                        back=transfer,
+                        return_path=return_path,
+                    )
+                check_deadline()
+                self.place_report = {
+                    "candidate": index,
+                    "rounds": rounds,
+                    "candidates": len(targets),
+                    "failed_stages": dict(stages),
+                }
+                return transfer, descend, retreat, home_path
+            except (TimeoutError, PlannerFault):
+                raise
+            except RuntimeError as exc:
+                if device_fault(exc):
+                    raise PlannerFault(str(exc)) from exc
+                failures.append(f"candidate {index} at {stage}: {exc}")
+                stages[stage] = stages.get(stage, 0) + 1
+                remaining.remove(index)
+        self.place_report = {"rounds": rounds, "candidates": len(targets), "failed_stages": dict(stages)}
+        raise PlacementSearchExhausted(f"no complete placement path after {rounds} rounds {stages}: {failures[-3:]}")
+
+    def plan_home(self, feedback, home, *, check_deadline, deadline, return_path=None):
+        """Checked joint-space path from the measured arm to home, the hand empty.
+
+        For an object dropped while carried. A placement planner detaches its
+        object sphere first, as for its planned post-release paths.
+        """
+        check_deadline()
+        q = self._measured_start(feedback)
+        try:
+            with self._without_placed_object():
+                self._require_valid_start(q)
+                now = max(feedback.received_at, self.scene_received_at)
+                path = self._path_home(q, home, now, feedback, deadline=deadline, return_path=return_path)
+        except RuntimeError as exc:
+            if device_fault(exc):
+                raise PlannerFault(str(exc)) from exc
+            raise
+        check_deadline()
+        return path
+
+    @contextmanager
+    def _attachment(self, spheres):
+        """Temporarily attach ``spheres`` instead of the carried cover (empty: nothing)."""
+        if not self.carrying:
+            yield
+            return
+        self._write_attachment(np.asarray(spheres, dtype=float).reshape(-1, 4))
+        try:
+            yield
+        finally:
+            self._write_attachment(self.attached)
+
+    def _without_placed_object(self):
+        """After the release the hand is open and empty: exactly the warmed model."""
+        return self._attachment(np.empty((0, 4)))
 
     def screen_grasps(self, feedback, camera_from_grasps, base_from_camera, now, *, diagnostics=None, deadline=None):
         """Discover fine-valid contact candidates with the batched screen IK.
@@ -1842,7 +2317,7 @@ class LeftArmPlanner:
             raise RuntimeError("Planner has no screen IK (_screen_batch_size is 0)")
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
-        q = feedback.vector(self.arm)
+        q = self._measured_start(feedback)
         self._require_valid_start(q)
         transforms = palm_goals_from_camera_grasps(np.stack(grasps), base_from_camera, self.grasp_to_palm)
         return self._batch_screen(q, transforms, check_deadline, diagnostics)
@@ -1876,6 +2351,7 @@ class LeftArmPlanner:
         import torch
         from curobo._src.cost.tool_pose_criteria import ToolPoseCriteria
 
+        self.approach_seed_traces = []
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
         if not np.isfinite([approach_offset, lift_offset]).all():
@@ -1904,10 +2380,20 @@ class LeftArmPlanner:
             options = {} if iters == 25 else dict(iters=iters)
             if phase == "approach" and self._approach_graph_seed is not None:
                 options["graph_seed"] = self._approach_graph_seed
-            result = self._solve_motion(goal_pose, state, deadline=deadline, seed_config=seed_config, **options)
+            try:
+                result = self._solve_motion(goal_pose, state, deadline=deadline, seed_config=seed_config, **options)
+            finally:
+                if phase == "approach":
+                    self.approach_seed_traces.append(dict(getattr(self, "graph_seed_trace", {})))
             rescued = self._rescuable(result)
             if not rescued and phase == "approach" and (abs(approach_offset) > 0.05 or self._short_approach_retry):
-                result = self._retry_approach(goal_pose, state, result, deadline=deadline, seed_config=seed_config)
+                try:
+                    result = self._retry_approach(goal_pose, state, result, deadline=deadline, seed_config=seed_config)
+                finally:
+                    if phase == "approach":
+                        trace = dict(getattr(self, "graph_seed_trace", {}))
+                        if trace != self.approach_seed_traces[-1]:
+                            self.approach_seed_traces.append(trace)
                 rescued = self._rescuable(result)
             check_deadline()
             if rescued:
@@ -1931,7 +2417,7 @@ class LeftArmPlanner:
             selection_goals[:, :3, 3] += float(approach_offset) * goals[:, :3, 2]
         index = None
         try:
-            q = feedback.vector(self.arm)
+            q = self._measured_start(feedback)
             self._require_valid_start(q)
             key = (q.tobytes(), goals.tobytes(), selection_goals.tobytes())
             check_deadline()

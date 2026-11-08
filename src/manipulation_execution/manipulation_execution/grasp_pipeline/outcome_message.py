@@ -76,6 +76,9 @@ def outcome_message(outcome: PickOutcome) -> str:
             summary += " The requested release completed."
         return summary
     reason = outcome.execution_detail.reason_code
-    return short_message(
-        f"PICK FAILED [{outcome.error_code or 'UNKNOWN'}] {failure_spec(outcome.error_code, reason).summary}"
-    )
+    summary = f"PICK FAILED [{outcome.error_code or 'UNKNOWN'}] {failure_spec(outcome.error_code, reason).summary}"
+    first = outcome.report.get("first_execution_failure")
+    if first and first.get("reason_code") not in {reason, outcome.error_code}:
+        code = first.get("reason_code") or first.get("error_code", "UNKNOWN")
+        summary += f" Earlier execution [{code}]: {failure_spec(code).summary}"
+    return short_message(summary)

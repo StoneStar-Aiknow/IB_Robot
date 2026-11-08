@@ -57,6 +57,7 @@ from .feedback import FeedbackHistory
 from .grasp_request import GraspRequestConfig, X2GraspPlanner, check_initial_hand
 from .joints import installed_hands as parse_installed_hands
 from .joints import other_side
+from .place_config import PlaceTargetConfig
 from .proposer import PerceptionSettings, X2Proposer, measured_spheres
 from .split import head_options
 
@@ -81,6 +82,8 @@ DEFAULTS = {
     "head": {},
     "perception": {},
     "planning": {},
+    # Where placement releases the held object in the opening (place_config.PlaceTargetConfig).
+    "place": {},
 }
 WARMUP_BUDGET_S = 60.0
 #: The runtime streams the X2 backends command. grasp_execution.command_interfaces
@@ -233,6 +236,8 @@ class X2Robot:
     limits: Any
     #: The arm (and hand) everything plans and drives: ``backend_options.arm_side``.
     side: str = "left"
+    #: Where placement releases the held object: ``backend_options.place``.
+    place: PlaceTargetConfig = field(default_factory=PlaceTargetConfig)
 
 
 def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
@@ -249,6 +254,7 @@ def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     options = _options(grasp_execution)
     perception = _settings(PerceptionSettings, options["perception"], ("scene",), "perception")
     planning = _settings(GraspRequestConfig, options["planning"], ("revalidation",), "planning")
+    place = _settings(PlaceTargetConfig, options["place"], (), "place")
     side = "left" if options["arm_side"] == "auto" else options["arm_side"]
     # The scene is estimated for the planning arm (its reach crop and leg obstacle).
     perception = replace(perception, scene=replace(perception.scene, arm_side=side))
@@ -257,7 +263,15 @@ def x2_robot(grasp_execution: Mapping[str, Any]) -> X2Robot:
     gripper = load_gripper_description(gripper_directory(grasp_execution), model)
     hand = HandMapping(model, {name: dict(gripper[name]) for name in ("open", "close")}, side=side)
     return X2Robot(
-        options, perception, planning, gripper, hand, ArmGravity.load(side=side), arm_limits(directory), side
+        options,
+        perception,
+        planning,
+        gripper,
+        hand,
+        ArmGravity.load(side=side),
+        arm_limits(directory),
+        side,
+        place=place,
     )
 
 
@@ -342,6 +356,8 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
         side=robot.side,
         planning_profile=planning.planning_profile,
         approach_seed_policy=planning.approach_seed_policy,
+        approach_over_height_m=planning.approach_over_height_m,
+        approach_order_m=planning.approach_order_m,
         max_goalset=planning.max_goalset,
         gpu_lock=gpu,
     )
@@ -483,4 +499,94 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
         for closer in reversed(closers):
             closer()
 
-    return GraspBackends(source, proposer, planner, executor, effector, head.watch, close=close, prepare=prepare)
+    from .held_object import held_builder
+    from .place_request import X2PlacePlanner
+
+    robots = head.robots if hasattr(head, "arms") else {robot.side: robot}
+    return GraspBackends(
+        source,
+        proposer,
+        planner,
+        executor,
+        effector,
+        head.watch,
+        close=close,
+        prepare=prepare,
+        held_object=held_builder(node, executor, effector),
+        plan_home=X2PlacePlanner(head, robots).plan_home,
+    )
+
+
+def x2_place_backends(*, node, placement_execution, grasp_execution, description):
+    return _place_backends(node, grasp_execution, description, placement_execution=placement_execution, remote=False)
+
+
+def _place_backends(node, grasp_execution, description, *, placement_execution, remote):
+    import numpy as np
+    from rclpy.callback_groups import ReentrantCallbackGroup
+
+    from manipulation_execution.grasp_pipeline.contracts import PlaceBackends
+
+    from .container_proposer import ContainerProposer
+    from .dual_arm import ExecutionSelection, SelectedPart
+    from .place_request import X2PlacePlanner
+    from .place_verify import PlaceVerifier
+
+    robot = x2_robot(grasp_execution)
+    options, closers = robot.options, []
+    container_settings = replace(robot.perception, **placement_execution.get("perception", {}))
+    try:
+        robots = {side: robot_for_side(robot, side) for side in ("left", "right")}
+        group = ReentrantCallbackGroup()
+        services = PerceptionServices(
+            node,
+            detect=options["detect_service"],
+            segment=options["segment_service"] or None,
+            generate_grasps=options["generate_grasps_service"],
+            timeout_s=float(options["service_timeout_s"]),
+            callback_group=group,
+        )
+        if remote:
+            from .remote_head import RemoteHeadCamera, RemotePlacePlanner, X2GraspHeadClient
+
+            head = X2GraspHeadClient(node, head_options(options).namespace, callback_group=group)
+            closers.append(head.close)
+            camera, planner = RemoteHeadCamera(head), RemotePlacePlanner(head)
+            proposer = ContainerProposer(services, settings=container_settings)
+        else:
+            if options["head"]:
+                raise ValueError("local place backend cannot use a remote head")
+            head = head_parts(
+                node, replace(robot, options={**options, "arm_side": "auto", "watch": "off"}), description, closers
+            )
+            camera = head.camera
+            planner = X2PlacePlanner(head, robots)
+            closers.append(planner.close)
+            proposer = ContainerProposer(
+                services, models={side: arm.spheres for side, arm in head.arms.items()}, settings=container_settings
+            )
+        selection = ExecutionSelection()
+        pairs = {side: arm_and_hand(node, value, description, closers) for side, value in robots.items()}
+        executor = SelectedPart({side: pair[0] for side, pair in pairs.items()}, selection)
+        effector = SelectedPart({side: pair[1] for side, pair in pairs.items()}, selection)
+
+        def restore(held):
+            executor.finish()
+            effector.finish()
+            selection.side = held.arm_side
+            measured = executor.measured(held.joint_names)
+            if held.frame_id != "torso_link" or not np.allclose(measured, held.joint_positions, atol=0.02, rtol=0):
+                raise GraspFailure("HELD_OBJECT_MISMATCH", "holding arm differs from the retained handover pose")
+            effector.restore(held.effector_state_json)
+
+        def close():
+            for closer in reversed(closers):
+                closer()
+
+        # The pick's perception settings: find the placed object as the pick found it.
+        verifier = PlaceVerifier(services, settings=robot.perception)
+        return PlaceBackends(camera, proposer, planner, verifier, executor, effector, restore, close)
+    except BaseException:
+        for closer in reversed(closers):
+            closer()
+        raise

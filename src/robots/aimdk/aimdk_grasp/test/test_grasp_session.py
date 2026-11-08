@@ -8,6 +8,45 @@ from aimdk_grasp.grasp_session import STRATEGIES, select_plan
 from aimdk_grasp.planner import GraspPlanningError
 
 
+@pytest.mark.parametrize("profile", ["default", "latency"])
+@pytest.mark.parametrize("side_first", [False, True])
+def test_configured_ten_cm_first_keeps_every_candidate_and_strategy(profile, side_first):
+    calls = []
+
+    def refuse(feedback, grasps, matrix, now, **offsets):
+        calls.append((int(grasps[0, 0, 3]), offsets["approach_offset"], offsets["lift_offset"]))
+        raise RuntimeError("no solution")
+
+    grasps = np.repeat(np.eye(4)[None], 3, axis=0)
+    grasps[:, 0, 3] = np.arange(3)
+    report = {}
+    with pytest.raises(RuntimeError, match="No candidate"):
+        select_plan(
+            SimpleNamespace(max_goalset=1, planning_profile=profile, plan_grasp=refuse),
+            None,
+            SimpleNamespace(grasps=grasps, confidence=np.ones(3)),
+            np.eye(4),
+            None,
+            report,
+            strategy_quota=1,
+            first_tier_longest_first=side_first,
+            approach_order_m=[0.10, 0.15, 0.07, 0.05],
+        )
+    assert [call[1:] for call in calls[:4]] == [(-0.10, -0.06), (-0.15, -0.06), (-0.07, -0.06), (-0.05, -0.05)]
+    expected = {(i, approach, lift) for i in range(3) for approach, lift in STRATEGIES}
+    assert set(calls) == expected and len(calls) == len(expected)
+    assert set(map(tuple, report["strategies"])) == set(STRATEGIES)
+    assert report["first_tier_strategies"] == report["strategies"]
+
+
+@pytest.mark.parametrize("order", [[0.10], [0.10, 0.15, 0.07, 0.07], [0.10, 0.15, 0.07, float("nan")], "0.10"])
+def test_approach_order_cannot_silently_drop_or_invent_distances(order):
+    from aimdk_grasp.grasp_request import GraspRequestConfig
+
+    with pytest.raises(ValueError, match="approach_order_m"):
+        GraspRequestConfig(approach_order_m=order)
+
+
 def _grasps_with_approach(*approaches):
     grasps = np.repeat(np.eye(4)[None], len(approaches), axis=0)
     for grasp, approach in zip(grasps, approaches, strict=False):

@@ -401,6 +401,11 @@ class X2TargetWatch:
         reason = watch_failure(self.status(), self.timeouts)
         return reason if self.mode == "stop" else None
 
+    @property
+    def armed(self) -> bool:
+        """Between arm and disarm: an execution this watch belongs to is under way."""
+        return self._armed
+
     def disarm(self) -> Mapping:
         state = self.status().state.name.lower() if self._armed else None
         watcher, self._watcher, self._armed = self._watcher, None, False

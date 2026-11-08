@@ -20,9 +20,9 @@ from manipulation_execution.grasp_pipeline.candidates import (
     sweep_boxes,
 )
 
-from .grasp_session import SIDE_FIRST_LONGEST_APPROACH, select_plan
+from .grasp_session import SIDE_FIRST_LONGEST_APPROACH, check_approach_order, select_plan
 from .joints import check_side
-from .planner import LOCKED_JOINT_ATOL, LeftArmPlanner, PlannerFault, device_fault
+from .planner import LOCKED_SPHERE_SHIFT_M, LeftArmPlanner, PlannerFault, device_fault
 
 # A directory: every plan call's inputs and outcome are pickled there (plan_replay replays them).
 PLAN_INPUTS_DIR_ENV = "IBROBOT_X2_PLAN_INPUTS_DIR"
@@ -51,32 +51,23 @@ def _report_rebuild(planner, feedback) -> None:
     `_plan` cannot preempt it inside the request deadline, and the request it
     lands in reports whatever gave up first -- a plan timeout, or an RPC
     timeout on another head call. Live on the robot this one line named the
-    cause at once: ``hand=0.4623 <-- over`` after a failed release left the
-    hand half closed, with the right arm at 0.0017 and the head at 0.0000.
+    cause at once: ``hand=0.4623 <-- over`` (then in radians) after a failed
+    release left the hand half closed, with the right arm and the head still.
     """
-    from .joints import HEAD
-
     if planner is None:
         print("planner rebuild: first build", file=sys.stderr, flush=True)
         return
     try:
-        moved = {
-            "other_arm": np.max(np.abs(np.asarray(feedback.vector(planner.other_arm)) - np.asarray(planner.other))),
-            "head": np.max(np.abs(np.asarray(feedback.vector(HEAD)) - np.asarray(planner.head))),
-            "hand": np.max(
-                np.abs(
-                    np.asarray(planner.hand_mapping.check(feedback.hand(planner.hand_mapping.side)))
-                    - np.asarray(planner.hand)
-                )
-            ),
-        }
+        moved = planner.locked_shift_m(feedback)
     except BaseException as exc:  # noqa: BLE001 - a diagnostic must not change what the request does
         print(f"planner rebuild: cause unavailable: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return
+    limit_mm = LOCKED_SPHERE_SHIFT_M * 1000.0
     detail = ", ".join(
-        f"{group}={value:.4f}{'  <-- over' if value > LOCKED_JOINT_ATOL else ''}" for group, value in moved.items()
+        f"{group}={value * 1000.0:.1f}mm{'  <-- over' if value > LOCKED_SPHERE_SHIFT_M else ''}"
+        for group, value in moved.items()
     )
-    print(f"planner rebuild: locked joints moved (atol {LOCKED_JOINT_ATOL}): {detail}", file=sys.stderr, flush=True)
+    print(f"planner rebuild: locked spheres moved (limit {limit_mm:g} mm): {detail}", file=sys.stderr, flush=True)
 
 
 # Candidates per cuRobo goalset. Screening keeps its full capacity; only the
@@ -155,6 +146,8 @@ class GraspPlanningService:
         planner_factory: Callable = LeftArmPlanner,
         planning_profile="default",
         approach_seed_policy="clear_path",
+        approach_over_height_m=0.18,
+        approach_order_m=None,
         gpu_lock=None,
         **planner_options,
     ):
@@ -162,12 +155,20 @@ class GraspPlanningService:
             raise ValueError("Unknown planning profile")
         if approach_seed_policy not in ("native", "clear_path"):
             raise ValueError("Unknown approach seed policy")
+        if (
+            isinstance(approach_over_height_m, bool)
+            or not isinstance(approach_over_height_m, int | float)
+            or not np.isfinite(approach_over_height_m)
+            or approach_over_height_m <= 0
+        ):
+            raise ValueError("Finite positive approach_over_height_m required")
         if max_batch_size is None:
             max_batch_size = 1 if planning_profile == "latency" else 10
         if planning_profile == "latency" and max_batch_size != 1:
             raise ValueError("The latency profile requires max_batch_size=1 (direct goalsets)")
         self.planning_profile = planning_profile
         self.approach_seed_policy = approach_seed_policy
+        self.approach_order_m = check_approach_order(approach_order_m)
         #: The arm this service plans; its planner is built on that side's planning model.
         self.side = check_side(planner_options.get("side", "left"))
         self._sweep = sweep_boxes(gripper)
@@ -177,6 +178,7 @@ class GraspPlanningService:
             max_batch_size=max_batch_size,
             planning_profile=planning_profile,
             approach_seed_policy=approach_seed_policy,
+            approach_over_height_m=float(approach_over_height_m),
             **planner_options,
         )
         self._clock = clock
@@ -189,12 +191,16 @@ class GraspPlanningService:
         # synchronization elsewhere in the process during a capture fails.
         self._lock = RLock() if gpu_lock is None else gpu_lock
 
-    def prepare(self, feedback, estimate):
-        """Initialize/prewarm or replace scene buffers, preserving depth age."""
+    def prepare(self, feedback, estimate, *, carrying=False):
+        """Initialize/prewarm or replace scene buffers, preserving depth age.
+
+        ``carrying``: the hand holds an object that the caller attaches; its
+        closed fingers are then covered by the attachment, not a rebuild.
+        """
         with self._lock:
             if self._planner is not None and getattr(self._planner, "_closed", False):
                 self.close()  # it closed itself after a failed scene load: rebuild now
-            if self._planner is None or not self._planner.locked_joints_match(feedback):
+            if self._planner is None or not self._locked_match(feedback, carrying):
                 _report_rebuild(self._planner, feedback)
                 if self._planner is not None:
                     self.close()
@@ -206,7 +212,10 @@ class GraspPlanningService:
                     raise
             elif estimate is not self._estimate:
                 try:
-                    self._planner.update_scene(feedback, estimate)
+                    if carrying:
+                        self._planner.update_scene(feedback, estimate, carrying=True)
+                    else:
+                        self._planner.update_scene(feedback, estimate)
                 except BaseException:
                     self.close()
                     raise
@@ -224,17 +233,63 @@ class GraspPlanningService:
             if load is not None:
                 load()
 
+    def needs_rebuild(self, feedback):
+        """Whether the next empty-hand request would rebuild the planner; None while the service is busy.
+
+        Never waits for the lock: it is held through every plan, and an idle
+        check must not queue behind one.
+        """
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            planner = self._planner
+            return planner is None or getattr(planner, "_closed", False) or not planner.locked_joints_match(feedback)
+        finally:
+            self._lock.release()
+
+    def refresh(self, feedback, estimate):
+        """Rebuild between requests, so the rebuild does not land inside the next one.
+
+        Returns whether it rebuilt. Like ``needs_rebuild``, it gives up at once
+        (False) when a request holds the service.
+        """
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if not self.needs_rebuild(feedback):
+                return False
+            self.prepare(feedback, estimate)
+            return True
+        finally:
+            self._lock.release()
+
+    def _locked_match(self, feedback, carrying):
+        if not carrying:
+            return self._planner.locked_joints_match(feedback)
+        return self._planner.locked_joints_match(feedback, carrying=True)
+
     @contextmanager
-    def session(self, feedback, estimate):
+    def session(self, feedback, estimate, *, attached=None):
         """Hold exclusive access to one prepared snapshot through replay/checks.
 
         The yielded planner is borrowed only for the lifetime of this context;
         scene replacement and service shutdown wait until the caller exits.
+        ``attached`` (palm-frame Nx4, the object last) is attached for the
+        session and always detached at its end, so the next pick plans the
+        empty hand.
         """
         with self._lock:
-            self.prepare(feedback, estimate)
+            self.prepare(feedback, estimate, carrying=attached is not None)
             assert self._planner is not None
-            yield self._planner
+            if attached is None:
+                yield self._planner
+                return
+            planner = self._planner
+            planner.attach_object(attached)
+            try:
+                yield planner
+            finally:
+                planner.detach_object()
 
     def plan(self, feedback, estimate, camera_from_grasps, confidence, base_from_camera, **options):
         """_plan, its inputs and outcome kept under $IBROBOT_X2_PLAN_INPUTS_DIR when set (plan_replay)."""
@@ -252,6 +307,8 @@ class GraspPlanningService:
             service=dict(
                 planning_profile=self.planning_profile,
                 approach_seed_policy=self.approach_seed_policy,
+                approach_over_height_m=self._options["approach_over_height_m"],
+                approach_order_m=self.approach_order_m,
                 max_goalset=self._options["max_goalset"],
             ),
         )
@@ -503,6 +560,7 @@ class GraspPlanningService:
                     first_tier_longest_first=(
                         SIDE_FIRST_LONGEST_APPROACH and report["approach_priority"]["mode"] == "side_first"
                     ),
+                    approach_order_m=self.approach_order_m,
                     later=later,
                     later_alone=TARGET_CLEARANCE_ALONE,
                     mixed_retry=TARGET_CLEARANCE_MIXED_RETRY,

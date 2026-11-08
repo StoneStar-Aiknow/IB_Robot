@@ -1,0 +1,11 @@
+string custody_id
+string target_query
+string claimant
+string claim_token
+float64 lease_s
+DispatchBinding dispatch_binding
+---
+bool success
+string reason_code
+string claim_token
+HeldObject held_object

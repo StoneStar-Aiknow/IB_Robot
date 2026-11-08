@@ -17,6 +17,7 @@ from embodied_common.primitive_contracts import PRIMITIVE_DESCRIPTORS
 MOTION_NOT_AUTHORIZED = "MOTION_NOT_AUTHORIZED"
 CONTROL_MODE_MISMATCH = "CONTROL_MODE_MISMATCH"
 SKILL_BUSY = "SKILL_BUSY"
+HELD_OBJECT_RECOVERY_REQUIRED = "HELD_OBJECT_RECOVERY_REQUIRED"
 EXECUTION_QUARANTINED = "EXECUTION_QUARANTINED"
 TIMEOUT_EXCEEDS_POLICY = "TIMEOUT_EXCEEDS_POLICY"
 CAPABILITY_NOT_READY = "CAPABILITY_NOT_READY"
@@ -67,6 +68,7 @@ __all__ = [
     "GatewayDecision",
     "GatewayPolicy",
     "GatewayRequest",
+    "HELD_OBJECT_RECOVERY_REQUIRED",
     "INVALID_ARGUMENT",
     "LedgerQuery",
     "LedgerRecord",
@@ -129,6 +131,11 @@ class RuntimeSnapshot:
     ee_pose_fresh: bool = False
     navigation_ready: bool = False
     control_mode_switching_enabled: bool = False
+    # Root task whose pick still has custody of a carried object, and that custody's state.
+    held_object_task_id: str = ""
+    held_object_state: str = ""
+    held_object_reason: str = ""
+    held_object_manual_reset: bool = False
 
     @property
     def is_busy(self) -> bool:
@@ -712,6 +719,11 @@ class GatewayPolicy:
                 message="another root execution is active",
                 **decision_args,
             )
+        held = _held_object_rejection(owner, snapshot, skill_name)
+        if held:
+            return GatewayDecision(
+                admitted=False, error_code=_held_object_error(snapshot), message=held, **decision_args
+            )
         timeout_cap = self._skill_timeout_caps.get(str(prepared.payload["skill_name"]), self._task_budget_sec)
         if prepared.effective_timeout_sec > timeout_cap or prepared.effective_timeout_sec > self._task_budget_sec:
             return GatewayDecision(admitted=False, error_code=TIMEOUT_EXCEEDS_POLICY, **decision_args)
@@ -847,6 +859,8 @@ class GatewayPolicy:
                 return SKILL_BUSY, None
             if snapshot.is_busy:
                 return SKILL_BUSY, None
+            if _held_object_rejection(None, snapshot, ""):
+                return _held_object_error(snapshot), None
             duplicate = ledger.query(task_id, payload_hash)
             if duplicate.error_code:
                 return duplicate.error_code, None
@@ -881,8 +895,13 @@ class GatewayPolicy:
         snapshot: RuntimeSnapshot,
         *,
         timeout_sec: float,
+        skill_names=(),
     ) -> tuple[str, object | None]:
-        """Atomically acquire the root lease for a prevalidated typed Workflow."""
+        """Atomically acquire the root lease for a prevalidated typed Workflow.
+
+        ``skill_names`` are the workflow's steps; a workflow of recovery skills only
+        may start while a dropped object's custody waits for the arm to come home.
+        """
         _ledger, lease = self._atomic_resources()
         with self._transition_lock:
             if owner.kind != "workflow" or not owner.root_task_id:
@@ -898,6 +917,12 @@ class GatewayPolicy:
                 return CONTROL_MODE_MISMATCH, None
             if snapshot.is_busy and not _is_active_owner(owner, snapshot.active_task_id):
                 return SKILL_BUSY, None
+            if (
+                snapshot.held_object_state
+                and owner.root_task_id != snapshot.held_object_task_id
+                and not held_object_recovery_allowed(snapshot, skill_names)
+            ):
+                return _held_object_error(snapshot), None
             if timeout_sec > self._task_budget_sec:
                 return TIMEOUT_EXCEEDS_POLICY, None
             token = lease.acquire(owner)
@@ -1039,6 +1064,58 @@ def _capability_unavailable_message(readiness: ReadinessReason) -> str:
     if not readiness.unavailable:
         return ""
     return _CAPABILITY_UNAVAILABLE_MESSAGES[readiness.unavailable[0]]
+
+
+HELD_OBJECT_HANDOVER_SKILL = "place_in_container"
+# An uncertain custody whose hand already opened after a drop, so nothing is
+# left in it (manipulation_execution.held_custody.DROP_HOME_FAILED): only its
+# way home failed. The pick executor ends that custody itself once the hand is
+# open and the arm is back at the pick's start.
+RECOVERABLE_HELD_OBJECT_REASONS = frozenset({"DROP_HOME_FAILED"})
+# Recovery skills that bring an empty arm back to a configured pose; the only
+# motion admitted while such a custody waits.
+HELD_OBJECT_RECOVERY_SKILLS = frozenset({"return_to_task_pose"})
+
+
+def _held_object_error(snapshot: RuntimeSnapshot) -> str:
+    """A manual recovery gate is not an active Gateway execution lease."""
+    return HELD_OBJECT_RECOVERY_REQUIRED if snapshot.held_object_state == "uncertain" else SKILL_BUSY
+
+
+def held_object_recovery_allowed(snapshot: RuntimeSnapshot, skill_names) -> bool:
+    """Whether every skill is a recovery skill and the custody only waits for the arm to come home."""
+    names = tuple(skill_names)
+    return bool(
+        names
+        and snapshot.held_object_state == "uncertain"
+        and (snapshot.held_object_reason in RECOVERABLE_HELD_OBJECT_REASONS or snapshot.held_object_manual_reset)
+        and all(name in HELD_OBJECT_RECOVERY_SKILLS for name in names)
+    )
+
+
+def _held_object_rejection(owner: ExecutionOwner | None, snapshot: RuntimeSnapshot, skill_name: str) -> str:
+    """Why nothing but the same root's place may start while a pick holds custody of an object.
+
+    The arm is lifted with an object in hand, and an unclaimed carry is put back by
+    the pick executor when its lease ends, so any other motion would race that return.
+    A drop whose hand opened but whose way home failed admits a recovery skill only.
+    """
+    state = snapshot.held_object_state
+    if not state:
+        return ""
+    if (
+        skill_name == HELD_OBJECT_HANDOVER_SKILL
+        and owner is not None
+        and owner.root_task_id == snapshot.held_object_task_id
+    ):
+        return ""
+    if skill_name and held_object_recovery_allowed(snapshot, (skill_name,)):
+        return ""
+    if state == "uncertain" and snapshot.held_object_reason in RECOVERABLE_HELD_OBJECT_REASONS:
+        return "the hand dropped the object and opened; only a recovery pose can move the arm home"
+    if state == "uncertain":
+        return "a carried object needs a manual check: use authorize-held-reset, then return_to_task_pose"
+    return f"a carried object is {state}; wait until it is placed or put back"
 
 
 def _is_active_owner(owner: ExecutionOwner | None, active_task_id: str) -> bool:

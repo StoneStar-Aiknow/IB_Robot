@@ -1210,7 +1210,98 @@ def test_a_recorded_plan_call_keeps_its_inputs_built_fine_scene_and_outcome(monk
     assert planned["options"] == {"snapshot_now": 6.5} and 29 < planned["budget_s"] <= 30
     assert planned["estimate"].validation_scene == fine and planned["estimate"].received_at == 5.0
     assert np.array_equal(planned["camera_from_grasps"], grasps) and planned["feedback"] == {"locked": 0}
-    assert planned["service"] == dict(planning_profile="default", approach_seed_policy="clear_path", max_goalset=100)
+    assert planned["service"] == dict(
+        planning_profile="default",
+        approach_seed_policy="clear_path",
+        approach_over_height_m=0.18,
+        approach_order_m=None,
+        max_goalset=100,
+    )
     assert not refused["outcome"]["success"] and "three-segment" in refused["outcome"]["error"]
     assert refused["budget_s"] is None and refused["outcome"]["wall_s"] >= 0
     assert fine_builds == [True]
+
+
+def _locked_planner(feedback):
+    """A LeftArmPlanner snapshot without CUDA: only what locked_shift_m reads."""
+    from aimdk_grasp.robot_model import config_directory
+    from aimdk_grasp.robot_spheres import RobotSphereModel
+
+    planner = LeftArmPlanner.__new__(LeftArmPlanner)
+    planner.side, planner.arm, planner.other_arm = "left", LEFT_ARM, RIGHT_ARM
+    planner.hand_mapping = HandMapping(planning_model(), PRESETS)
+    planner.other, planner.head = feedback.vector(RIGHT_ARM), feedback.vector(HEAD)
+    planner.hand = planner.hand_mapping.check(feedback.hand("left")).copy()
+    planner.attached = np.empty((0, 4))
+    planner._lock_spheres = RobotSphereModel(planner.hand_mapping, config_directory("left"))
+    return planner
+
+
+def _home_feedback(*, hand=None, **changes):
+    body = dict.fromkeys(LEFT_ARM + RIGHT_ARM + HEAD, 0.0)
+    for side in ("left", "right"):
+        body[f"{side}_shoulder_pitch_joint"], body[f"{side}_elbow_joint"] = 0.4, -1.2
+    body.update(changes)
+    opened = HandMapping(planning_model(), PRESETS).preset("open")
+    return Feedback(0.0, body, opened if hand is None else hand)
+
+
+def test_a_thumb_resting_short_of_open_does_not_rebuild_the_planner():
+    planner = _locked_planner(_home_feedback())
+    hand = HandMapping(planning_model(), PRESETS).preset("open").copy()
+    hand[1] -= 0.0319  # thumb abduction short of open, as live 2026-11-06 (it rebuilt then)
+    shift = planner.locked_shift_m(_home_feedback(hand=hand))
+    assert 0.0 < shift["hand"] < 0.005 and shift["other_arm"] == shift["head"] == 0.0
+    assert planner.locked_joints_match(_home_feedback(hand=hand))
+    # Carrying: the hand is covered by the attachment, whatever it measures.
+    assert planner.locked_shift_m(_home_feedback(hand=hand), carrying=True)["hand"] == 0.0
+
+
+def test_the_other_arm_moving_the_same_angle_still_rebuilds_the_planner():
+    planner = _locked_planner(_home_feedback())
+    moved = _home_feedback(right_shoulder_pitch_joint=0.4 + 0.0319)
+    shift = planner.locked_shift_m(moved)
+    assert shift["other_arm"] > 0.005 and shift["hand"] == 0.0
+    assert not planner.locked_joints_match(moved)
+
+
+def test_idle_refresh_rebuilds_only_a_moved_snapshot_and_never_waits_for_a_busy_service():
+    built = []
+
+    class Planner:
+        def __init__(self, feedback, estimate, received_at, **options):
+            self.locked, self._closed = feedback, False
+            built.append(feedback)
+
+        def locked_joints_match(self, feedback):
+            return feedback == self.locked
+
+        def warmup(self):
+            pass
+
+        def update_scene(self, feedback, estimate):
+            pass
+
+        def close(self):
+            self._closed = True
+
+    service = GraspPlanningService(gripper=GRIPPER, planner_factory=Planner)
+    estimate = SimpleNamespace(received_at=1.0)
+    assert service.needs_rebuild("a") is True
+    assert service.refresh("a", estimate) and built == ["a"]
+    assert service.needs_rebuild("a") is False and not service.refresh("a", estimate)
+    holding, release = Event(), Event()
+
+    def busy():
+        with service._lock:
+            holding.set()
+            release.wait(5)
+
+    with ThreadPoolExecutor(1) as pool:
+        held = pool.submit(busy)
+        holding.wait(5)
+        assert service.needs_rebuild("b") is None
+        assert not service.refresh("b", estimate) and built == ["a"]
+        release.set()
+        held.result()
+    assert service.refresh("b", estimate) and built == ["a", "b"]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from typing import Any
 
 
@@ -39,6 +40,39 @@ def validate_placement_execution_config(value: Any) -> list[str]:
     if not isinstance(value, dict):
         return [f"{prefix} must be a mapping"]
     errors: list[str] = []
+    if "backend" in value:
+        allowed = {"enabled", "executor", "required_args", "action_name", "backend", "pipeline", "perception"}
+        if set(value) - allowed:
+            errors.append(f"{prefix} contains unsupported key(s): {sorted(set(value) - allowed)}")
+        if not isinstance(value.get("enabled"), bool):
+            errors.append(f"{prefix}.enabled must be a boolean")
+        if value.get("executor") != "placement_pipeline":
+            errors.append(f"{prefix}.executor must be placement_pipeline")
+        if value.get("required_args") != ["target_name", "container_name"]:
+            errors.append(f"{prefix}.required_args must equal [target_name, container_name]")
+        if not isinstance(value.get("action_name"), str) or not value["action_name"].strip():
+            errors.append(f"{prefix}.action_name must be a non-empty string")
+        if not isinstance(value["backend"], str) or not re.fullmatch(
+            r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", value["backend"]
+        ):
+            errors.append(f"{prefix}.backend must be package.module:callable")
+        pipeline = value.get("pipeline", {})
+        if not isinstance(pipeline, dict) or set(pipeline) - {"max_attempts", "execute_reserve_s"}:
+            errors.append(f"{prefix}.pipeline supports max_attempts and execute_reserve_s only")
+        elif type(pipeline.get("max_attempts", 2)) is not int or pipeline.get("max_attempts", 2) < 1:
+            errors.append(f"{prefix}.pipeline.max_attempts must be a positive integer")
+        if isinstance(pipeline, dict) and "execute_reserve_s" in pipeline:
+            reserve = pipeline["execute_reserve_s"]
+            if not isinstance(reserve, int | float) or not _finite_number(reserve) or reserve < 0:
+                errors.append(f"{prefix}.pipeline.execute_reserve_s must be finite and non-negative")
+        perception = value.get("perception", {})
+        if not isinstance(perception, dict) or set(perception) - {"box_threshold"}:
+            errors.append(f"{prefix}.perception supports box_threshold only")
+        elif "box_threshold" in perception:
+            threshold = perception["box_threshold"]
+            if not isinstance(threshold, int | float) or not _unit_interval(threshold):
+                errors.append(f"{prefix}.perception.box_threshold must be a number in [0, 1]")
+        return errors
     allowed_keys = {
         "enabled",
         "executor",

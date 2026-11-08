@@ -32,6 +32,7 @@ import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -52,6 +53,7 @@ from .head_interface import (
     head_endpoints,
     parse_session,
 )
+from .joints import HEAD, arm_joints
 from .proposer import prepare_capture_scene
 from .rgbd_to_cloud import mask_depth_to_points
 from .scene_estimation import NoSupportError, complete_scene
@@ -63,6 +65,15 @@ KEEP = 8
 #: Pipeline processes whose newest watch session is remembered (a restart is a new one).
 WATCH_CLIENTS = 16
 PREPARE_RETRY_S = 5.0
+#: Between requests, how often the head asks whether the next request would
+#: rebuild a planner, and for how long it must have served no call (and the
+#: locked joints stood still) before it rebuilds now instead. A rebuild takes
+#: ~50 s and holds the GPU: a request arriving meanwhile waits for it, as it
+#: would have inside its own budget, so it is started only on a quiet head.
+REFRESH_PERIOD_S = 5.0
+REFRESH_IDLE_S = 10.0
+#: Locked joints (rad) between two checks one period apart that count as still.
+REFRESH_STILL_RAD = 0.01
 
 
 @dataclass
@@ -83,7 +94,7 @@ def _remember(store: OrderedDict, key: str, value) -> None:
 
 class X2GraspHeadNode(Node):
     def __init__(self, **node_options) -> None:
-        from aimdk_grasp_msgs.action import PlanGraspCandidates
+        from aimdk_grasp_msgs.action import PlanGraspCandidates, PlanPlace
         from aimdk_grasp_msgs.msg import WatchStatus
         from aimdk_grasp_msgs.srv import CaptureGraspObservation, CompleteGraspScene, RefineGraspPlan, WatchGraspTarget
         from rclpy.action import ActionServer, CancelResponse
@@ -124,6 +135,14 @@ class X2GraspHeadNode(Node):
         self._ids = itertools.count(1)
         self._scene_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="grasp_head_scene")
         self._ready, self._closing = threading.Event(), threading.Event()
+        # Calls in flight and when the last one ended (monotonic): the planner
+        # refresh runs only on a head that has been quiet for REFRESH_IDLE_S.
+        # A call enters through _refresh_gate, which the refresh holds from its
+        # quiet check to its end, so the two never overlap: they share the
+        # camera's on-demand feedback drain and the GPU (live 2026-11-06: a
+        # refresh check drained the camera while a pick was capturing).
+        self._activity_lock, self._refresh_gate = threading.Lock(), threading.Lock()
+        self._active_calls, self._last_activity = 0, time.monotonic()
         group = ReentrantCallbackGroup()
         for kind, name, handler in (
             (CaptureGraspObservation, names.capture, self._on_capture),
@@ -141,8 +160,22 @@ class X2GraspHeadNode(Node):
             self,
             PlanGraspCandidates,
             names.plan,
-            execute_callback=self._on_plan,
+            execute_callback=self._tracked(self._on_plan),
             cancel_callback=lambda _goal: CancelResponse.ACCEPT,
+            callback_group=group,
+        )
+        from .backend import robot_for_side
+        from .place_request import X2PlacePlanner
+
+        robots = {side: robot_for_side(self._robot, side) for side in ("left", "right")}
+        self._place_planner = X2PlacePlanner(self._head, robots)
+        self._closers.append(self._place_planner.close)
+        self._place_server = ActionServer(
+            self,
+            PlanPlace,
+            names.plan_place,
+            execute_callback=self._tracked(self._on_place),
+            cancel_callback=lambda _: CancelResponse.ACCEPT,
             callback_group=group,
         )
         # Its own group: a long plan or capture must not delay the status the other host times.
@@ -178,7 +211,61 @@ class X2GraspHeadNode(Node):
                     head.imu.pause()  # idle until a request has a plan to execute
             self._ready.set()
             self.get_logger().info("grasp head prepared; accepting captures")
+            threading.Thread(target=self._refresh_loop, daemon=True, name="grasp_head_refresh").start()
             return
+
+    def _refresh_loop(self) -> None:
+        """Rebuild a planner between requests when its locked joints have moved.
+
+        Same steps as the warmup: a fresh image with both hands open, its
+        scene, then the rebuild. A hand that is not open (carrying, or still
+        reopening) is not a snapshot to plan the next pick on, so it waits.
+        A call arriving meanwhile waits at _refresh_gate: ~20 ms for a check,
+        the whole rebuild (~50 s) once one has started -- as long as it would
+        have waited for the GPU, but now only on a head that was quiet.
+        """
+        head, still_since = self._head, None
+        while not self._closing.wait(REFRESH_PERIOD_S):
+            with self._refresh_gate:
+                still_since = self._refresh_once(head, still_since)
+
+    def _refresh_once(self, head, still_since):
+        """One refresh check under _refresh_gate; returns the still-check baseline for the next."""
+        captured = False
+        try:
+            if not self._quiet():
+                return None
+            feedback = head.camera.capture_state(deadline=time.monotonic() + 1.0).feedback
+            if not head.service.needs_rebuild(feedback):
+                return None
+            locked = np.concatenate(
+                [feedback.vector(arm_joints(side)) for side in ("left", "right")]
+                + [feedback.vector(HEAD)]
+                + [feedback.hand(side) for side in ("left", "right")]
+            )
+            if still_since is None or np.max(np.abs(locked - still_since)) > REFRESH_STILL_RAD:
+                return locked  # moving, or first sight: look again next period
+            began, captured = time.monotonic(), True
+            observation = head.camera.capture(deadline=began + WARMUP_BUDGET_S, cancelled=self._closing.is_set)
+            admitted = observation.robot_state
+            if hasattr(head, "check_hands"):
+                head.check_hands(admitted)
+            else:
+                check_initial_hand(self._robot.hand, admitted)
+            prepared = self._prepare_scene(observation)
+            with head.gpu:
+                estimate = self._complete_scene(prepared, None, observation)
+            if head.service.refresh(admitted.live.feedback, estimate):
+                self.get_logger().info(f"planner rebuilt between requests in {time.monotonic() - began:.1f} s")
+            return None
+        except Exception as exc:  # noqa: BLE001 - the next request rebuilds as before
+            self.get_logger().warning(
+                f"planner refresh skipped: {type(exc).__name__}: {exc}", throttle_duration_sec=30.0
+            )
+            return None
+        finally:
+            if captured and head.imu is not None and not getattr(getattr(head, "watch", None), "armed", False):
+                head.imu.pause()  # as after the warmup: idle until a request has a plan to execute
 
     def _prepare_scene(self, observation: Observation):
         """The mask-independent scene stage of one capture."""
@@ -211,12 +298,41 @@ class X2GraspHeadNode(Node):
 
         def answered(request, response):
             try:
-                return handler(request, response)
+                with self._activity():
+                    return handler(request, response)
             except Exception as exc:  # noqa: BLE001 - see above
                 self.get_logger().error(f"{handler.__name__} failed: {type(exc).__name__}: {exc}")
                 return self._fail(response, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
 
         return answered
+
+    def _tracked(self, callback):
+        """``callback`` counted as head activity (see _activity)."""
+
+        def tracked(*args):
+            with self._activity():
+                return callback(*args)
+
+        return tracked
+
+    @contextmanager
+    def _activity(self):
+        with self._refresh_gate, self._activity_lock:
+            self._active_calls += 1
+        try:
+            yield
+        finally:
+            with self._activity_lock:
+                self._active_calls -= 1
+                self._last_activity = time.monotonic()
+
+    def _quiet(self) -> bool:
+        """No call in flight, none for REFRESH_IDLE_S, and no execution being watched."""
+        watch = getattr(self._head, "watch", None)
+        if watch is not None and getattr(watch, "armed", False):
+            return False
+        with self._activity_lock:
+            return self._active_calls == 0 and time.monotonic() - self._last_activity >= REFRESH_IDLE_S
 
     def _capture(self, capture_id: str) -> _Capture | None:
         with self._lock:
@@ -363,6 +479,59 @@ class X2GraspHeadNode(Node):
             self._plans[request.plan_id] = (capture_id, refined)
         response.success, response.plan = True, wire.plan_to_msg(refined)
         return response
+
+    def _on_place(self, handle):
+        from aimdk_grasp_msgs.action import PlanPlace
+
+        from manipulation_execution.held_custody import held_from_msg
+
+        from .container_perception import estimate_container
+
+        request, result = handle.request, PlanPlace.Result()
+        try:
+            held = held_from_msg(request.held_object)
+            deadline = time.monotonic() + max(0, request.timeout_s)
+            if request.return_home:
+                home = self._place_planner.plan_home(
+                    held,
+                    deadline=deadline,
+                    cancelled=lambda: handle.is_cancel_requested or self._closing.is_set(),
+                )
+                result.retreat, result.success = [wire.step_to_msg(home)], True
+                handle.canceled() if handle.is_cancel_requested else handle.succeed()
+                return result
+            capture = self._capture(request.capture_id)
+            if capture is None:
+                raise GraspFailure(UNKNOWN, "place capture is no longer kept")
+            head = self._head.arms[held.arm_side] if hasattr(self._head, "arms") else self._head
+            if head.spheres.side != held.arm_side:
+                raise GraspFailure("HELD_OBJECT_MISMATCH", "head does not plan the holding arm")
+            prepared = capture.prepared.result(timeout=max(0, deadline - time.monotonic()))
+            if isinstance(prepared, dict):
+                prepared = prepared[held.arm_side]
+            with head.gpu:
+                container = estimate_container(
+                    capture.observation,
+                    wire.decode_mask(request.container_mask),
+                    held,
+                    head.spheres,
+                    self._place_planner.robots[held.arm_side].perception,
+                    prepared=prepared,
+                )
+            plan = self._place_planner.plan(
+                capture.observation,
+                container,
+                held,
+                deadline=deadline,
+                cancelled=lambda: handle.is_cancel_requested or self._closing.is_set(),
+            )
+            wire.place_to_result(plan, result)
+        except GraspFailure as exc:
+            result.error_code, result.message, result.retryable = exc.code, str(exc), exc.retryable
+        except Exception as exc:
+            result.error_code, result.message = "PLACE_PLAN_FAILED", f"{type(exc).__name__}: {exc}"
+        handle.canceled() if handle.is_cancel_requested else handle.succeed()
+        return result
 
     def _on_watch(self, request, response):
         watch = self._head.watch

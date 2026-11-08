@@ -5,3 +5,6 @@ enabled_skills:
 - name: pick_object
   implementation: aimdk_x2_grasp
   planner_visible: true
+- name: place_in_container
+  implementation: aimdk_x2_grasp
+  planner_visible: true

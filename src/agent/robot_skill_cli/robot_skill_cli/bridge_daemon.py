@@ -159,6 +159,7 @@ REMOTE_METHODS = frozenset(
         "validate_skill",
         "get_skill_snapshot",
         "reload_skill_catalog",
+        "authorize_held_reset",
         "plan_agent_command",
         "prepare_agent_plan",
         "validate_agent_plan",

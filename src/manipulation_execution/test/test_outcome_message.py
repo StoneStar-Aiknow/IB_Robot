@@ -49,3 +49,11 @@ def test_specific_planning_reason_and_unknown_fallback():
     unknown = outcome_message(PickOutcome(error_code="NEW_ERROR", at_rest=True, held=True))
     assert "home" not in unknown and "stopped" not in unknown
     assert failure_action("NEW_ERROR", "", "NOT_NEEDED") == "MANUAL_CHECK"
+
+
+def test_later_plan_failure_summary_retains_earlier_grip_loss():
+    outcome = PickOutcome(error_code="NO_EXECUTABLE_CANDIDATE")
+    outcome.report["first_execution_failure"] = {"reason_code": "GRIP_LOST"}
+    message = outcome_message(outcome)
+    assert "NO_EXECUTABLE_CANDIDATE" in message and "GRIP_LOST" in message
+    assert "slipped" in message and len(message) <= 300

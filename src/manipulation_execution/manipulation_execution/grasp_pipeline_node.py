@@ -50,6 +50,30 @@ MODES = {
 PROGRESS = {"observe": 0.1, "perceive": 0.2, "plan": 0.3}
 #: Between attempts of a backend warmup that has not succeeded yet.
 PREPARE_RETRY_S = 1.0
+# A fresh capture, scene and home plan after a retained object drops. A cuRobo
+# rebuild (the hand off its open preset) cannot be preempted and overruns it.
+DROP_HOME_BUDGET_S = 20.0
+# After a drop whose way home failed, the arm counts as home again within this
+# of the pick's start on every joint: the task-pose arrival tolerance.
+HOME_SETTLED_RAD = 0.1
+
+
+def home_settled(backends, held):
+    """Read-only check for the custody: the hand open and empty, the arm back at the pick's start.
+
+    None when the end effector cannot tell an open, empty hand: such a custody
+    keeps waiting for a manual check.
+    """
+    released = getattr(backends.effector, "released", None)
+    if released is None:
+        return None
+    home = np.asarray(held.home_positions, dtype=float)
+
+    def settled():
+        measured = np.asarray(backends.executor.measured(held.joint_names), dtype=float)
+        return bool(released()) and float(np.max(np.abs(measured - home))) <= HOME_SETTLED_RAD
+
+    return settled
 
 
 def pipeline_config(grasp_execution: Mapping) -> PipelineConfig:
@@ -104,8 +128,9 @@ class PreMotionTimer:
     arm never moved. Phases on the way (re-observations included) are kept in order.
     """
 
-    def __init__(self, clock=time.monotonic):
+    def __init__(self, clock=time.monotonic, *, motion_phase=MOTION_PHASE):
         self._clock, self._started = clock, clock()
+        self._motion_phase = motion_phase
         self.to_motion_s: float | None = None
         self.phases: list[tuple[str, str, float]] = []
 
@@ -114,7 +139,7 @@ class PreMotionTimer:
             return
         at = round(self._clock() - self._started, 3)
         self.phases.append((name, event, at))
-        if name == MOTION_PHASE and event == "start":
+        if name == self._motion_phase and event == "start":
             self.to_motion_s = at
 
     def record(self) -> dict:
@@ -147,6 +172,12 @@ def terminal_record(outcome: PickOutcome, pre_motion: PreMotionTimer | None = No
         "released_after_success": outcome.released_after_success,
         "at_rest": outcome.at_rest,
         "error_code": outcome.error_code,
+        "reason_code": outcome.execution_detail.reason_code,
+        "error_detail": outcome.message,
+        "attempts": outcome.attempts,
+        "retries": outcome.retries,
+        "first_execution_failure": report.get("first_execution_failure"),
+        "execution_failures": report.get("execution_failures", []),
         "pre_motion": None if pre_motion is None else {**pre_motion.record(), **thinking_report(report)},
         "watch": [
             {key: watch[key] for key in WATCH_LOG_KEYS if key in watch}
@@ -206,6 +237,11 @@ class GraspPipelineNode(Node):
         )
         self._backends = load_backends(spec, node=self, grasp_execution=config, description=description)
         self._pipeline = GraspPipeline(self._backends, pipeline_config(config))
+        self._custody = None
+        if self._backends.held_object is not None:
+            from manipulation_execution.held_custody import HeldCustodyServer
+
+            self._custody = HeldCustodyServer(self, lease_s=float(config.get("held_lease_s", 30.0)))
         self._goal_lock = threading.Lock()
         self._goal_active = False
         self._closing = threading.Event()
@@ -250,8 +286,10 @@ class GraspPipelineNode(Node):
         if not self._ready.is_set():
             self.get_logger().warning("PickObject goal rejected: the grasp backends are still warming up")
             return GoalResponse.REJECT
+        if goal.retain_for_place and (self._custody is None or goal.release_after_success):
+            return GoalResponse.REJECT
         with self._goal_lock:
-            if self._goal_active:
+            if self._goal_active or (self._custody is not None and self._custody.custody.occupied):
                 self.get_logger().warning("PickObject goal rejected: another goal is running")
                 return GoalResponse.REJECT
             self._goal_active = True
@@ -326,11 +364,49 @@ class GraspPipelineNode(Node):
             cancelled=lambda: goal_handle.is_cancel_requested,
             on_phase=on_phase,
             release_after_success=self._releases(goal),
+            on_held=(lambda observation, proposals, plan: self._retain(goal, observation, proposals, plan))
+            if goal.retain_for_place
+            else None,
+        )
+
+    def _retain(self, goal, observation, proposals, plan):
+        from manipulation_execution.grasp_pipeline.sequence import GraspSequence
+
+        backends = self._backends
+        held = backends.held_object(str(goal.target_query).strip(), observation, proposals, plan)
+
+        def recover():
+            return GraspSequence(backends).take_back(plan, cancelled=self._closing.is_set)
+
+        def release():
+            backends.executor.finish()
+            backends.effector.suspend()
+
+        def drop():
+            deadline = time.monotonic() + DROP_HOME_BUDGET_S
+
+            def go_home():
+                return backends.plan_home(held, deadline=deadline, cancelled=self._closing.is_set)
+
+            return GraspSequence(backends).home_after_drop(go_home, cancelled=self._closing.is_set)
+
+        self._custody.custody.accept(
+            held,
+            recover=recover,
+            release=release,
+            holding=backends.effector.holding,
+            root_task_id=goal.dispatch_binding.root_task_id,
+            drop=drop if backends.plan_home is not None else None,
+            settled=home_settled(backends, held),
         )
 
     def _releases(self, goal) -> bool:
         """Whether this pick puts the object back: the goal asks, or the robot always does."""
-        return bool(goal.release_after_success) or self._pipeline.config.release_after_success
+        return (
+            False
+            if goal.retain_for_place
+            else bool(goal.release_after_success) or self._pipeline.config.release_after_success
+        )
 
     def destroy_node(self) -> None:
         closing = getattr(self, "_closing", None)

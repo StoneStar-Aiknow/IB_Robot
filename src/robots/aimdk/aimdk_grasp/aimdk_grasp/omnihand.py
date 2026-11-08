@@ -32,7 +32,7 @@ import numpy as np
 from manipulation_execution.grasp_pipeline.contracts import EffectorAction, EffectorOutcome, Flag
 from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
 
-from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
+from .hand import PRESERVED_HAND_DRIFT_RAD, HandMapping, is_open
 from .joints import ABSENT_HAND_COMMAND, HAND_PARTS, check_side, other_side
 
 HAND_HZ = 50.0
@@ -84,15 +84,91 @@ FINGERS = {
 HAND_OFFSETS = {"left": 0, "right": len(HAND_PARTS)}
 
 
+#: Native indices of the thumb's joints (either hand); the other seven are the four fingers.
+THUMB = np.zeros(len(HAND_PARTS), dtype=bool)
+THUMB[list(FINGERS["thumb"][0])] = True
+THUMB.setflags(write=False)
+#: Where the thumb waits while the fingers open in the ``thumb_clear`` path:
+#: abduction and flexion straightened (native 0), kept this far inside their limits.
+THUMB_CLEAR_MARGIN_RAD = 0.05
+#: The ways to open a hand, in order of preference. A straight line is the
+#: shortest motion; the staged ones exist because the thumb and the bent fingers
+#: can block each other (2026-11-08: a straight open from a half-closed right
+#: hand stalled the thumb abduction at -1.10 rad under the fingers; after the
+#: thumb had been straightened, the same open reached the preset).
+OPEN_PATHS = ("together", "fingers_first", "thumb_first", "thumb_clear")
+
+
+def chained_frames(start, waypoints, step_rad: float = HAND_STEP_RAD) -> np.ndarray:
+    """The measured start, then straight lines through ``waypoints``, at most ``step_rad`` per joint per frame."""
+    start = np.asarray(start, float)
+    points = [np.asarray(point, float) for point in waypoints]
+    if start.shape != (len(HAND_PARTS),) or any(point.shape != start.shape for point in points):
+        raise ValueError("Ten finite hand values required")
+    if not np.isfinite([start, *points]).all():
+        raise ValueError("Ten finite hand values required")
+    if not np.isfinite(step_rad) or not 0 < step_rad <= HAND_STEP_RAD:
+        raise ValueError(f"Hand step must be finite and in (0, {HAND_STEP_RAD}] rad")
+    frames, here = [start], start
+    for point in points:
+        span = float(np.max(np.abs(point - here)))
+        if span > 0.0:
+            frames.extend(np.linspace(here, point, int(np.ceil(span / step_rad)) + 1)[1:])
+            here = point
+    if len(frames) == 1:
+        frames.append(points[-1] if points else start)  # already there: one frame, as before
+    return np.asarray(frames)
+
+
+def open_path(name: str, start, target, lower, upper, step_rad: float = HAND_STEP_RAD) -> np.ndarray:
+    """Frames of one way (:data:`OPEN_PATHS`) to go from ``start`` to ``target``.
+
+    ``together``: every joint on one straight line. ``fingers_first``: the
+    thumb holds while the four fingers open, then the thumb opens.
+    ``thumb_first``: the reverse. ``thumb_clear``: the thumb straightens out of
+    the fingers' way (roll kept), the fingers open, then the thumb comes in to
+    its target. ``lower``/``upper`` are the native joint limits.
+    """
+    start, target = np.asarray(start, float), np.asarray(target, float)
+    if name == "together":
+        waypoints = [target]
+    elif name == "fingers_first":
+        waypoints = [np.where(THUMB, start, target), target]
+    elif name == "thumb_first":
+        waypoints = [np.where(THUMB, target, start), target]
+    elif name == "thumb_clear":
+        lower, upper = np.asarray(lower, float), np.asarray(upper, float)
+        straight = [HAND_PARTS.index("thumb_abad"), HAND_PARTS.index("thumb_mcp")]
+        clear = start.copy()
+        clear[straight] = np.clip(
+            0.0, lower[straight] + THUMB_CLEAR_MARGIN_RAD, upper[straight] - THUMB_CLEAR_MARGIN_RAD
+        )
+        waypoints = [clear, np.where(THUMB, clear, target), target]
+    else:
+        raise ValueError(f"unknown hand open path {name!r}")
+    return chained_frames(start, waypoints, step_rad)
+
+
+def open_paths(start, target, lower, upper, step_rad: float = HAND_STEP_RAD) -> list[tuple[str, np.ndarray]]:
+    """Every distinct :func:`open_path`, in :data:`OPEN_PATHS` order; a path equal to an earlier one is left out."""
+    paths = []
+    for name in OPEN_PATHS:
+        frames = open_path(name, start, target, lower, upper, step_rad)
+        if not any(frames.shape == other.shape and np.array_equal(frames, other) for _, other in paths):
+            paths.append((name, frames))
+    return paths
+
+
 class HandIO(Protocol):
     channel_joints: tuple[str, ...]
+    touch_configured: bool
 
     def feedback(self) -> JointSample:
         """Native positions under the stream's ``channel_joints`` names."""
         ...
 
     def touch(self) -> Mapping[str, float] | None:
-        """Max reading per touch pad of the grasping hand (FINGERS pad names), or None without a touch sensor."""
+        """Max per grasping-hand pad (FINGERS names), or None without a sensor or fresh data."""
         ...
 
     def publish(self, positions: Sequence[float]) -> None: ...
@@ -144,6 +220,54 @@ class OmniHandEffector:
         self._grip = None
         self._preserved_hand = None
 
+    def suspend(self) -> None:
+        """Stop keepalives for handover while retaining the grip observation."""
+        self.io.release()
+
+    def snapshot(self) -> str:
+        import json
+
+        if self._grip is None or self.command is None:
+            raise ValueError("no verified grip to hand over")
+        return json.dumps(
+            {
+                "contacts": list(self._grip["contacts"]),
+                "command": self._grip["command"].tolist(),
+                "direction": self._grip["direction"].tolist(),
+            }
+        )
+
+    def restore(self, state: str) -> None:
+        import json
+
+        grip = json.loads(state)
+        command = np.asarray(grip["command"], dtype=float)
+        direction = np.asarray(grip["direction"], dtype=float)
+        contacts = tuple(grip["contacts"])
+        if (
+            command.shape != (10,)
+            or direction.shape != (10,)
+            or not np.isfinite([command, direction]).all()
+            or "thumb" not in contacts
+            or len(contacts) < 2
+            or any(name not in FINGERS for name in contacts)
+        ):
+            raise ValueError("invalid frozen grip state")
+        self.mapping.check(command)
+        self._measured()  # Require healthy, fresh feedback before publishing.
+        self._grip = dict(contacts=contacts, command=command.copy(), direction=direction.copy())
+        self._lost_since = None
+        self._send(command)
+
+    def released(self) -> bool:
+        """Fresh open-hand feedback and no tactile contact are required."""
+        touch = self.io.touch()
+        return bool(
+            is_open(self._measured(), self.mapping.preset("open"))
+            and touch is not None
+            and all(value < CONTACT_TOUCH for value in touch.values())
+        )
+
     def holding(self) -> str | None:
         """While an object is carried: '' while the grip holds, the reason once it is lost, None if unknown.
 
@@ -157,6 +281,7 @@ class OmniHandEffector:
         try:
             measured = self._measured()
         except _Failed:
+            self._lost_since = None
             return None  # the arm's supervision reports stale feedback
         touch = self.io.touch()
         lags, pressing = {}, []
@@ -166,8 +291,16 @@ class OmniHandEffector:
             if lags[finger] >= HOLD_LAG_RAD or (touch is not None and touch.get(pad, 0.0) >= CONTACT_TOUCH):
                 pressing.append(finger)
         if "thumb" in pressing and len(pressing) >= 2:
+            self.report.setdefault("holding", []).append(dict(at=self.io.monotonic(), lags=lags, pressing=pressing))
+            if len(self.report["holding"]) > 3000:
+                del self.report["holding"][:1000]
             self._lost_since = None
             return ""
+        if touch is None and self.io.touch_configured:
+            # An unavailable sensor is not a fresh no-contact reading. Joint
+            # lag may still prove a grip above, but cannot disprove its touch.
+            self._lost_since = None
+            return None
         now = self.io.monotonic()
         self._lost_since = now if self._lost_since is None else self._lost_since
         if now - self._lost_since < GRIP_LOST_S:
@@ -177,31 +310,45 @@ class OmniHandEffector:
     # -- actions --------------------------------------------------------------------
 
     def _open(self, name: str, cancelled: Flag) -> EffectorOutcome:
+        holding = self._grip is not None
         self._grip = None  # whatever was held is let go
         target = self.mapping.preset("open")
-        start = self._measured()
-        row = self.report[name] = {}
+        row = self.report[name] = dict(paths=["together"], frames=0, settle_frames=0)
         if self.command is not None and np.array_equal(self.command, target):
             frames = []  # already commanded open: only wait for the fingers below
         else:
-            # Straight line from the measured hand, HAND_STEP_RAD per frame.
-            steps = max(1, int(np.ceil(np.max(np.abs(target - start)) / HAND_STEP_RAD)))
-            frames = [start + (target - start) * (i + 1) / steps for i in range(steps)]
+            # One straight line: an object in the hand is let go by every finger at once.
+            frames = chained_frames(self._measured(), [target])[1:]
+        self._open_along(frames, target, cancelled, name)
+        if float(np.max(np.abs(target - self._measured()))) > OPEN_SHORT_MAX_RAD and not holding:
+            # The thumb and the bent fingers may block each other: straighten the
+            # thumb out of the way, open the fingers, then bring the thumb in.
+            # Not with an object in the hand, which a straightening thumb could knock.
+            row["paths"].append("thumb_clear")
+            frames = open_path("thumb_clear", self._measured(), target, self.mapping.lower, self.mapping.upper)
+            self._open_along(frames[1:], target, cancelled, name)
+        measured = self._measured()
+        short = float(np.max(np.abs(target - measured)))
+        row.update(short_of_target_rad=short, measured=measured.tolist())
+        if short > OPEN_SHORT_MAX_RAD:
+            return EffectorOutcome(False, f"hand blocked {short:.3f} rad short of open", report=dict(row))
+        if not is_open(measured, target):
+            row["open_short"] = True
+        return EffectorOutcome(True, report=dict(row))
+
+    def _open_along(self, frames, target: np.ndarray, cancelled: Flag, name: str) -> None:
+        """Send ``frames`` and hold ``target`` briefly, then until the hand is open, up to :data:`OPEN_SETTLE_MAX_S`."""
+        row = self.report[name]
+        frames = list(frames)
+        if frames:
             frames += [target] * int(CLOSE_SETTLE_S * HAND_HZ)
         for frame in frames:
             self._frame(frame, cancelled, name)
-        waited, ended = 0, self.io.monotonic() + OPEN_SETTLE_MAX_S
-        while np.max(np.abs(self._measured() - target)) > OPEN_HAND_TOLERANCE_RAD and self.io.monotonic() < ended:
+        row["frames"] += len(frames)
+        ended = self.io.monotonic() + OPEN_SETTLE_MAX_S
+        while not is_open(self._measured(), target) and self.io.monotonic() < ended:
             self._frame(target, cancelled, name)
-            waited += 1
-        measured = self._measured()
-        short = float(np.max(np.abs(target - measured)))
-        row.update(frames=len(frames), settle_frames=waited, short_of_target_rad=short, measured=measured.tolist())
-        if short > OPEN_SHORT_MAX_RAD:
-            return EffectorOutcome(False, f"hand blocked {short:.3f} rad short of open", report=dict(row))
-        if short > OPEN_HAND_TOLERANCE_RAD:
-            row["open_short"] = True
-        return EffectorOutcome(True, report=dict(row))
+            row["settle_frames"] += 1
 
     def _close(self, halted: Flag, cancelled: Flag) -> EffectorOutcome:
         self._grip = None
@@ -320,7 +467,7 @@ class OmniHandEffector:
             if self._preserved_hand is None:
                 self._preserved_hand = other.copy()
                 self.report["preserved_hand"] = dict(side=preserved_side, positions=other.tolist())
-            if np.max(np.abs(other - self._preserved_hand)) > OPEN_HAND_TOLERANCE_RAD:
+            if np.max(np.abs(other - self._preserved_hand)) > PRESERVED_HAND_DRIFT_RAD:
                 raise _Failed("preserved hand moved during grasp")
         if self.mapping.side == "left":
             self.io.publish([*hand.tolist(), *self._preserved_hand.tolist()])
@@ -385,6 +532,7 @@ class RosHandIO:
         self._touch_received = float("-inf")
         self._touch_subscriptions = OnDemandSubscriptions(node.context, f"{node.get_name()}_touch")
         touch = interfaces.get("touch.hands")
+        self.touch_configured = touch is not None
         if touch is not None:
             self._touch_subscriptions.subscribe(
                 Float64MultiArray,

@@ -437,12 +437,26 @@ def test_a_grip_that_slips_while_held_is_not_a_pick_and_is_taken_back():
     outcome = run(backends, release_after_success=True)
     assert not outcome.success and outcome.error_code == "GRASP_VERIFICATION_FAILED" and outcome.held is False
     assert outcome.message.startswith("grip lost while held: the contact fingers") and outcome.at_rest
-    assert names(executor) == ["approach", "grasp", "lift", "hold", "retreat_lift", "retreat_grasp", "retreat_approach"]
+    # Grip loss is now checked before each lift frame. Here it halts at the
+    # grasp pose; only the halt-settle hold and the walked approach are undone.
+    assert names(executor) == ["approach", "grasp", "lift", "hold", "retreat_grasp", "retreat_approach"]
     assert effector.log[-1] is EffectorAction.RELEASE
-    hold = next(row for row in outcome.report["executions"][-1]["phases"] if row["name"] == "hold_lifted")
-    assert hold["state"] == "failed" and hold["reason_code"] == "GRIP_LOST" and "no longer press" in hold["reason"]
+    phases = outcome.report["executions"][-1]["phases"]
+    assert not any(row["name"] == "hold_lifted" for row in phases)
+    assert outcome.execution_detail.reason_code == "GRIP_LOST"
     backends, executor, effector, _, _ = streaming()  # a grip that holds changes nothing
     assert run(backends).success and names(executor) == ["approach", "grasp", "lift", "hold"]
+
+
+def test_unknown_grip_during_lift_stops_without_retrace_or_release():
+    backends, executor, effector, _, _ = streaming()
+    holding = effector.holding
+    effector.holding = lambda: None if effector.gripped else holding()
+    outcome = run(backends, release_after_success=True)
+    assert not outcome.success and not outcome.at_rest
+    assert outcome.execution_detail.reason_code == "GRASP_UNCERTAIN"
+    assert names(executor) == ["approach", "grasp", "lift"]
+    assert executor.stopped and effector.log[-1] is EffectorAction.CLOSE
 
 
 def test_nothing_held_skips_the_lift_and_takes_everything_back():
@@ -516,6 +530,10 @@ def test_a_retreat_that_raises_after_a_failed_refinement_stops_the_arm():
     outcome = run(backends)
     assert outcome.error_code == "INTERNAL_ERROR" and "motion server went away" in outcome.message
     assert not outcome.at_rest and len(executor.stopped) == 1
+    execution = outcome.report["executions"][0]
+    assert execution["exception"]["type"] == "GraspFailure"
+    assert "no realigned contact" in execution["exception"]["traceback"]
+    assert execution["first_failure"]["error_code"] == "IK_FAILED"
 
 
 def test_a_failed_refinement_takes_the_approach_back():
@@ -622,6 +640,67 @@ def test_without_regrasps_left_a_lost_grasp_ends_the_goal():
     effector.held = [False]
     outcome = run(backends)  # none by default
     assert outcome.error_code == "GRASP_VERIFICATION_FAILED" and planner.calls == 1 and not outcome.retries
+
+
+def test_lost_grip_is_retained_when_regrasp_planning_fails():
+    backends, executor, effector, planner, _ = streaming()
+    executor.report = {"stream": {"last_frame": 12}}
+    original = planner.plan
+
+    def plan(*args, **kwargs):
+        if planner.calls:
+            raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "no new path after recovery")
+        return original(*args, **kwargs)
+
+    planner.plan = plan
+    effector.on_act = lambda action: setattr(effector, "grip", "contact fingers lost the object")
+    outcome = run(backends, config=PipelineConfig(max_regrasps=1))
+    assert not outcome.success and outcome.error_code == "NO_EXECUTABLE_CANDIDATE"
+    first = outcome.report["first_execution_failure"]
+    assert first["reason_code"] == "GRIP_LOST" and "contact fingers" in first["message"]
+    assert first["attempt"] == 1 and first["phase"] == "lift"
+    assert outcome.report["executions"][0]["lost"] == "contact fingers lost the object"
+    assert outcome.report["execution_failures"] == [first]
+    assert outcome.at_rest and not executor.stopped
+    executor.report["stream"]["last_frame"] = 99
+    assert outcome.report["executions"][0]["execution_report"]["stream"]["last_frame"] == 12
+
+
+def test_recovery_failure_keeps_the_triggering_grip_loss():
+    backends, executor, effector, *_ = streaming()
+    effector.on_act = lambda action: setattr(effector, "grip", "contact lost during lift")
+    executor.fail_on = "retreat_approach"
+    outcome = run(backends)
+    assert not outcome.success and not outcome.at_rest
+    assert outcome.error_code == "MOTION_FAILED"
+    assert outcome.report["first_execution_failure"]["reason_code"] == "GRIP_LOST"
+    assert "contact lost during lift" in outcome.report["first_execution_failure"]["message"]
+    assert outcome.report["executions"][0]["recovery_state"] == "FAILED"
+
+
+def test_partial_lift_rollback_failure_keeps_the_original_grip_loss():
+    backends, executor, effector, *_ = streaming()
+    holding = effector.holding
+    effector.holding = lambda: "contact lost during partial lift" if executor.position[2] >= 0.1 else holding()
+    executor.fail_on = "retreat_lift_partial"
+    outcome = run(backends)
+    assert not outcome.success and outcome.error_code == "MOTION_FAILED"
+    first = outcome.report["first_execution_failure"]
+    assert first["phase"] == "lift" and first["reason_code"] == "GRIP_LOST"
+    assert first["message"] == "contact lost during partial lift"
+    assert "tracking error" in outcome.report["executions"][0]["message"]
+    assert executor.stopped and EffectorAction.RELEASE not in effector.log
+
+
+def test_partial_approach_rollback_failure_keeps_the_original_target_movement():
+    backends, executor, _, _, _ = streaming(fire_at=4)
+    executor.fail_on = "retreat_approach_partial"
+    outcome = run(backends)
+    assert not outcome.success and outcome.error_code == "MOTION_FAILED"
+    first = outcome.report["first_execution_failure"]
+    assert first["phase"] == "approach" and first["reason_code"] == "TARGET_MOVED"
+    assert first["message"] == "target moved: target shifted 3 cm"
+    assert "tracking error" in outcome.report["executions"][0]["message"]
 
 
 def test_a_plan_is_not_started_without_the_time_an_execution_needs():

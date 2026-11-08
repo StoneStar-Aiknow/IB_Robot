@@ -9,9 +9,27 @@ from pathlib import Path
 
 import numpy as np
 
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, check_side, hand_alias_signs
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_PARTS, check_side, hand_alias_signs
 
+#: How far (rad) a measured joint may be from the open preset and still count
+#: as open: before planning a grasp, after opening and on release.
 OPEN_HAND_TOLERANCE_RAD = 0.025
+#: Except the thumb abduction, which can stop short near the end of its travel
+#: toward the palm: 0.088 rad short after a release (2026-11-08) failed the
+#: following regrasp. Every other joint keeps the tight bound.
+THUMB_ABAD_OPEN_TOLERANCE_RAD = 0.1
+#: Per native joint (HAND_PARTS order, either hand).
+OPEN_TOLERANCES_RAD = np.full(len(HAND_PARTS), OPEN_HAND_TOLERANCE_RAD)
+OPEN_TOLERANCES_RAD[HAND_PARTS.index("thumb_abad")] = THUMB_ABAD_OPEN_TOLERANCE_RAD
+OPEN_TOLERANCES_RAD.setflags(write=False)
+#: How far (rad) the other, preserved hand may drift while one hand is driven.
+#: A drift check, not an "is open" check.
+PRESERVED_HAND_DRIFT_RAD = 0.025
+
+
+def is_open(native, open_pose) -> bool:
+    """Every joint within its open tolerance of ``open_pose`` (both native)."""
+    return bool(np.all(np.abs(np.asarray(native, float) - np.asarray(open_pose, float)) <= OPEN_TOLERANCES_RAD))
 
 
 def hand_links(model: ET.Element) -> tuple[str, ...]:
@@ -114,11 +132,12 @@ class HandMapping:
     def require_open(self, native) -> float:
         """Require the measured pregrasp pose; never replace it with a preset."""
         self.kinematic_alias(native)
-        error = float(np.max(np.abs(self.check(native) - self.preset("open"))))
-        if error > OPEN_HAND_TOLERANCE_RAD:
+        measured = self.check(native)
+        error = float(np.max(np.abs(measured - self.preset("open"))))
+        if not is_open(measured, self.preset("open")):
             raise RuntimeError(
                 f"Initial {self.side} hand is not open; open the hand and confirm fresh feedback "
-                f"before capturing/planning (max error {error:.4f} rad, "
-                f"tolerance {OPEN_HAND_TOLERANCE_RAD:.3f} rad)"
+                f"before capturing/planning (max error {error:.4f} rad, tolerance {OPEN_HAND_TOLERANCE_RAD:.3f} rad, "
+                f"thumb abduction {THUMB_ABAD_OPEN_TOLERANCE_RAD:.3f} rad)"
             )
         return error

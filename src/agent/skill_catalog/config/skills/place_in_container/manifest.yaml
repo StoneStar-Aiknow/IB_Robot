@@ -49,5 +49,40 @@ capability:
     - container_name
   recovery_policy: ask_user
 implementations:
+  aimdk_x2_grasp: implementations/aimdk_x2_grasp.yaml
   lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
   lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
+description_variants:
+  # The X2 finds the requested container with its head camera rather than
+  # moving to a configured one, and only a pick that immediately precedes this
+  # step in the same workflow hands its object over (a standalone pick puts the
+  # object back). The planner sees only the summary, so the pairing is stated there.
+  aimdk_x2_grasp:
+    summary: >-
+      Place the object held by the selected hand into the requested visible container, then verify it.
+      Only an object picked by pick_object in the immediately preceding step of the same workflow,
+      with the same target_name, can be placed: for "put the apple in the basket" plan
+      pick_object(target_name "an apple") then place_in_container(target_name "an apple",
+      container_name "a basket"). An object picked by an earlier request has already been put back.
+      Use short English phrases for target_name and container_name.
+    category: placement
+    when_to_use:
+    - place the object just picked into a visible container
+    do_not_use:
+    - condition: the object is not held and must first be detected and grasped
+      instead_use: pick_object
+    aliases_zh:
+    - 放进容器
+    - 放到盒子里
+    - 投入料框
+    aliases_en:
+    - place in container
+    - drop into bin
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 40.0
+    requires_motion_params: false
+    rule_entry: false

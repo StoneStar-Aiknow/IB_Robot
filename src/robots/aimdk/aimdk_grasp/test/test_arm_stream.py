@@ -76,7 +76,8 @@ def test_the_x2_settings_come_from_the_robot_configuration():
     assert config.locked_joints == RIGHT_ARM + HEAD
     assert (config.expected_stiffness, config.expected_damping) == (40.0, 2.0)
     assert (config.tracking_error_rad, config.arrival_error_rad) == (0.3, 0.2)
-    assert config.home_command == HOME_COMMAND and set(HOME_COMMAND) == set(LEFT_ARM)
+    # A sequence ends at the command it took over (the task start), not at the global HOME.
+    assert config.home_at_takeover and set(HOME_COMMAND) == set(LEFT_ARM)
     for name, value in HOME_COMMAND.items():
         lower, upper = config.limits[name]
         assert lower + config.limit_margin_rad <= value <= upper - config.limit_margin_rad
@@ -173,7 +174,7 @@ def test_the_right_arm_streams_with_its_own_gravity_limits_and_mirrored_home():
     config = x2_stream_config(side="right")
     assert config.limits == {name: arm_limits(config_directory("right"))[name] for name in RIGHT_ARM}
     assert config.locked_joints == LEFT_ARM + HEAD
-    assert config.home_command == home_command("right")
+    assert config.home_at_takeover
     np.testing.assert_allclose(
         [home_command("right")[name] for name in RIGHT_ARM], [HOME_COMMAND[n] for n in LEFT_ARM] * ARM_MIRROR_SIGNS
     )

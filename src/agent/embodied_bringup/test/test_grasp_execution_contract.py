@@ -8,6 +8,7 @@ import rclpy
 from std_msgs.msg import String
 
 from embodied_common.execution_detail import ExecutionDetail
+from ibrobot_agent.speech_policy import GraspSpeechPolicy
 
 from .grasp_contract_rig import ContractRig, wait_until
 
@@ -31,6 +32,13 @@ def rig(request, tmp_path, ros_context):
         yield instance
     finally:
         instance.close()
+
+
+def terminal_speech(terminal):
+    """Check TTS transport against the current policy; wording has Agent unit coverage."""
+    notices = GraspSpeechPolicy().observe(terminal, now=0.0)
+    assert len(notices) == 1 and notices[0].terminal
+    return notices[0].text
 
 
 def assert_ledger_matches(rig, request_id, terminal):
@@ -62,13 +70,13 @@ def test_text_reaches_real_skill_and_success_is_spoken(rig):
     assert rig.mock.queries == ["an apple"] and rig.mock.closes == 1
     query, events = assert_ledger_matches(rig, request_id, terminal)
     assert query["execution_detail"]["phase_state"] == "SUCCEEDED"
-    wait_until(lambda: "物体已经抓起并通过验证。" in rig.speech)
+    wait_until(lambda: terminal_speech(terminal) in rig.speech)
     wait_until(lambda: rig.played)
     # Same id is replayed, not dispatched twice; no new model call or grasp.
     rig.input.publish(String(data=json.dumps(envelope, ensure_ascii=False)))
     time.sleep(0.2)
     assert len(rig.requests) == 1 and rig.mock.closes == 1
-    assert rig.speech.count("物体已经抓起并通过验证。") == 1
+    assert rig.speech.count(terminal_speech(terminal)) == 1
 
 
 FAILURES = [
@@ -93,7 +101,8 @@ FAILURES = [
     ("WATCH_FAILED", "approach", "MANUAL_CHECK"),
     ("INTERNAL_ERROR", "observe", "MANUAL_CHECK"),
     ("EMPTY_GRASP", "close", "WAIT_USER"),
-    ("GRIP_LOST", "verify", "WAIT_USER"),
+    # Grip checks run during lift, before the terminal verification.
+    ("GRIP_LOST", "lift", "WAIT_USER"),
     ("GRASP_UNCERTAIN", "close", "MANUAL_CHECK"),
     ("TARGET_MOVED", "approach", "WAIT_USER"),
 ]
@@ -116,7 +125,7 @@ def test_each_failure_reaches_text_query_and_tts_without_agent_retry(rig, reason
     assert detail["retry_count"] <= 2
     if detail["recovery_state"] == "COMPLETED":
         assert detail["phase"] == "recover" and detail["phase_state"] == "SUCCEEDED"
-    wait_until(lambda: terminal["user_message"] in rig.speech)
+    wait_until(lambda: terminal_speech(terminal) in rig.speech)
     assert len(rig.requests) == 1
     captures = rig.mock.captures
     time.sleep(0.1)
@@ -180,7 +189,7 @@ def test_text_stop_preserves_cancellation_details(rig):
     query, _ = assert_ledger_matches(rig, request_id, terminal)
     assert query["execution_detail"]["failed_phase"] == "approach"
     assert rig.mock.stops and rig.mock.closes == 0 and rig.mock.captures == 1
-    wait_until(lambda: terminal["user_message"] in rig.speech)
+    wait_until(lambda: terminal_speech(terminal) in rig.speech)
 
 
 @pytest.mark.parametrize("rig", [{"scenario": "deadline"}], indirect=True)
@@ -219,7 +228,7 @@ def test_slow_tts_is_not_a_motion_gate_and_terminal_drops_queued_stages(rig):
     wait_until(lambda: rig.speech)
     wait_until(lambda: any(entry[1] for entry in rig.voice._core._feedback._seen.values()))
     rig.speech_gate.set()
-    wait_until(lambda: "物体已经抓起并通过验证。" in rig.speech)
+    wait_until(lambda: terminal_speech(terminal) in rig.speech)
     # Stale in-flight synthesis cannot revive a stage after the terminal.
     wait_until(lambda: rig.played)
     assert len(rig.played) == 1
@@ -231,7 +240,7 @@ def test_tts_failure_never_changes_execution_or_retries(rig):
     request_id, _ = rig.submit()
     terminal = rig.terminal(request_id)
     assert terminal["state"] == "SUCCEEDED", terminal
-    wait_until(lambda: "物体已经抓起并通过验证。" in rig.speech)
+    wait_until(lambda: terminal_speech(terminal) in rig.speech)
     assert not rig.played
     assert rig.query(request_id)["state"] == "SUCCEEDED" and rig.mock.closes == 1
 

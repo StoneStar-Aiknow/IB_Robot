@@ -305,11 +305,32 @@ ros2 run pose_composer pose_compile_library \
 
 The compiler exports joint targets, convex body geometry and mass data, and
 checks HOME-to-seed and seed-to-HOME paths with both backends. Seeds with
-keep-current semantics are refused. Unselected seeds remain disabled. Keep the
-artifact with deployment assets; it contains geometry derived from the vendor
-model and is not a new repository model asset. Configuration hashes the complete
-file, while its internal fingerprint binds the robot profile, limits and hand
-geometry. A changed artifact or mismatched model prevents startup.
+keep-current semantics are refused. Unselected seeds remain disabled. Artifacts
+are deployment assets and stay out of the repository, except the approved
+library of `aimdk_x2_voice_mirror_grasp`, committed as `commissioning/fixed_poses.json`
+together with the task poses it embeds
+(`robot_config/config/task_poses/x2_voice_mirror_grasp_approved.yaml`). Its body
+geometry derives from the AgiBot X2 model under the Mulan PSL v2 (see
+`aimdk_description`). Configuration hashes the complete
+file, while its internal fingerprint binds only what shapes a pose: the profile's
+arm joint order, `vendor.arm.limits`, `conformance.start_positions` and the range
+its recorded named motions sweep, the effective arm limits and the hand geometry.
+Audio, camera, topic and other interface changes in the profile keep the
+artifact valid, so a pulled tree reuses the deployed artifact while these inputs
+are unchanged. A changed artifact or mismatched model prevents startup.
+
+Artifacts compiled before this fingerprint carry one over the whole profile.
+Migrate each once, on the board and without MuJoCo; no pose changes:
+
+```bash
+source .shrc_local
+ros2 run pose_composer pose_migrate_library \
+  --robot-config src/robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml --in-place
+```
+
+It refuses an artifact whose stored fingerprint is not the old fingerprint of
+exactly the configured profile, limits and hand model; recompile that one. The
+original is kept as `*.legacy-fingerprint.json`.
 
 Board execution uses NumPy/SciPy, with no MuJoCo, IK or online pose generation.
 The X2 geometry and fixed path implementation live in `aimdk_grasp`; the Agent

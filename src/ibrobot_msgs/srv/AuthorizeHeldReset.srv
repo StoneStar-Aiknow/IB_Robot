@@ -1,0 +1,15 @@
+# Operator acknowledgement only. Does not move or clear custody.
+uint32 schema_version
+string request_id
+string custody_id
+bool operator_confirmed_empty
+string operator_note
+bool inspect_only
+---
+bool success
+string error_code
+string message
+string custody_id
+float64 remaining_sec
+string state
+string reason_code

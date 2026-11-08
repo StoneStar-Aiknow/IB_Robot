@@ -16,6 +16,7 @@ import json
 import math
 import queue
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -88,6 +89,8 @@ class _Publisher:
 
 
 class _StreamHarness:
+    _set_paused = MotionImitationStreamNode._set_paused
+    _subscribe_rgb = MotionImitationStreamNode._subscribe_rgb
     _invalidate_source_locked = MotionImitationStreamNode._invalidate_source_locked
     _refresh_source_health = MotionImitationStreamNode._refresh_source_health
     _frame_current_locked = MotionImitationStreamNode._frame_current_locked
@@ -143,9 +146,28 @@ def _pear_response(*, success=True, message="", empty_field=None, nonfinite_fiel
 def _harness(*, yolox=(), pear=(), yolox_ready=True, pear_ready=True, publish_fallback=True, max_pear_hz=0.0):
     harness = _StreamHarness()
     harness._logger = _Logger()
+    harness._pause_owners = set()
+    harness._retired_pause_owners = deque(maxlen=256)
+    harness._subscription_epoch = 0
+    harness._rgb_subscription = object()
+    harness.destroyed_subscriptions = []
+    harness.destroy_subscription = harness.destroyed_subscriptions.append
+    harness.subscription_callbacks = []
+
+    def subscribe(_type, _topic, callback, _qos):
+        harness.subscription_callbacks.append(callback)
+        return object()
+
+    harness.create_subscription = subscribe
+    harness.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: _image().header.stamp))
     harness._stats_lock = threading.RLock()
     harness._source_generation = 0
     harness._source_healthy = None
+    harness._source_rejected = 0
+    harness._received = 0
+    harness._window_received = 0
+    harness._compressed_dropped = 0
+    harness._out_of_order = 0
     harness._last_capture_stamp = None
     harness._last_encoded_at = 0.0
     harness._stop = threading.Event()
@@ -353,7 +375,7 @@ def test_source_fault_and_recovery_during_rpc_rejects_old_result(metric, publish
     harness._source_rejected = 0
     generation = harness._source_generation
 
-    def result_after_fault(_client, _request, *, metric):
+    def result_after_fault(_client, _request, *, metric, generation=None):
         publishers[0] = publisher_count
         # The health timer, not the frame path, notices the fault and retires
         # the generation; the frame callback then reads the cached verdict.
@@ -407,7 +429,7 @@ def test_geometry_change_and_return_to_same_size_rejects_old_rpc(metric):
     assert harness._process_yolox_frame(image)
     generation = harness._source_generation
 
-    def result_after_resize(_client, _request, *, metric):
+    def result_after_resize(_client, _request, *, metric, generation=None):
         harness._decode_frame(_image(width=320, height=240))
         harness._decode_frame(_image())
         return _yolox_response() if metric == "yolox" else _pear_response()
@@ -541,8 +563,8 @@ def test_publisher_conflict_during_pear_call_discards_the_inflight_result():
     harness.count_publishers = lambda _topic: publishers[0]
     call_vision = harness._call_vision
 
-    def conflicting_response(client, request, *, metric):
-        result = call_vision(client, request, metric=metric)
+    def conflicting_response(client, request, *, metric, generation=None):
+        result = call_vision(client, request, metric=metric, generation=generation)
         publishers[0] = 2
         # The timer probe records the conflict so the publish check that
         # follows the RPC reads the refreshed cache and discards the result.
@@ -851,3 +873,111 @@ def test_zone_selector_survives_a_camera_timestamp_restart(monkeypatch):
     assert harness._frame_publisher.published[-1].source == "center_fallback"
     assert harness._actor_publisher.published[-1].reason == "zone_hold"
     assert "stamp_backwards" in json.loads(harness._candidates[-1])["events"]
+
+
+def _pause(harness, paused=True, owner="pick-1"):
+    from ibrobot_msgs.srv import SetPerceptionPaused
+
+    return harness._set_paused(
+        SetPerceptionPaused.Request(owner_id=owner, paused=paused), SetPerceptionPaused.Response()
+    )
+
+
+def test_pause_drops_camera_reader_and_queued_work_then_resumes_on_fresh_frames():
+    harness = _harness(yolox=[_yolox_response()])
+    harness._decoder = SimpleNamespace(decode=lambda message: message)
+    harness._decode_frame(_image())
+    assert harness._process_yolox_frame(_image())
+    before = harness._source_generation
+    assert _pause(harness).success
+    assert harness._rgb_subscription is None
+    assert len(harness.destroyed_subscriptions) == 1
+    assert harness._source_generation == before + 1
+    assert all(slot.empty() for slot in (harness._decode_queue, harness._pear_queue, harness._yolox_queue))
+    assert not harness._yolox_result_ready and harness._yolox_detections is None
+    assert harness._actor_publisher.published[-1].reason == "perception_paused"
+    assert not harness._actor_publisher.published[-1].actor_present
+    response = _pause(harness, False)
+    assert response.success and not response.paused
+    assert harness._rgb_subscription is not None
+    harness._process_pear_frame(_image())
+    assert not harness._pear_client.requests  # Needs a new YOLOX result.
+
+
+def test_overlapping_pause_owners_and_duplicate_requests_do_not_resume_another_task():
+    harness = _harness()
+    assert _pause(harness).success
+    assert _pause(harness).success
+    assert _pause(harness, owner="place-2").success
+    assert _pause(harness, False).paused
+    assert _pause(harness, False).paused
+    assert harness._rgb_subscription is None
+    assert not _pause(harness).success  # A delayed acquire cannot undo its release.
+    assert not _pause(harness, False, owner="place-2").paused
+    assert len(harness.destroyed_subscriptions) == 1
+    assert len(harness.subscription_callbacks) == 1
+
+
+@pytest.mark.parametrize("owner", ["", "  ", "x" * 129])
+def test_pause_requires_an_explicit_bounded_owner(owner):
+    harness = _harness()
+    assert not _pause(harness, owner=owner).success
+    assert not harness.destroyed_subscriptions
+    assert not harness._pause_owners
+
+
+def test_paused_stream_admits_no_frames_decode_or_model_request():
+    harness = _harness()
+    decoded = []
+    harness._decoder = SimpleNamespace(decode=lambda message: decoded.append(message))
+    before = harness._source_generation
+    _pause(harness)
+    harness._on_compressed_frame(CompressedImage())
+    harness._decode_frame(CompressedImage(), before)
+    assert not harness._process_yolox_frame(_image())
+    harness._process_pear_frame(_image())
+    assert harness._call_vision(harness._pear_client, object()) is None
+    assert not decoded
+    assert not harness._pear_client.requests and not harness._yolox_client.requests
+    assert harness._decode_queue.empty()
+
+
+@pytest.mark.parametrize("metric", ["yolox", "pear"])
+def test_pause_and_resume_discard_inflight_model_results(metric):
+    harness = _harness(yolox=[_yolox_response()])
+    assert harness._process_yolox_frame(_image())
+    generation = harness._source_generation
+
+    def late_response(_client, _request, **_kwargs):
+        _pause(harness)
+        _pause(harness, False)
+        return _yolox_response() if metric == "yolox" else _pear_response()
+
+    harness._call_vision = late_response
+    if metric == "yolox":
+        assert not harness._process_yolox_frame(_image(), generation)
+    else:
+        harness._process_pear_frame(_image(), generation)
+    assert not harness._yolox_result_ready
+    assert harness._frame_publisher.published == []
+
+
+def test_an_old_subscription_callback_cannot_reenter_after_resume():
+    harness = _harness()
+    harness._rgb_subscription = harness._subscribe_rgb()
+    old = harness.subscription_callbacks[-1]
+    _pause(harness)
+    _pause(harness, False)
+    old(CompressedImage())
+    assert harness._decode_queue.empty()
+    harness.subscription_callbacks[-1](CompressedImage())
+    assert not harness._decode_queue.empty()
+
+
+def test_paused_status_reports_reason_without_a_stale_camera_alarm(monkeypatch):
+    harness = _status_harness(monkeypatch, publishers=1, frames=3, last_frame_at=1.0)
+    _pause(harness)
+    harness._publish_status()
+    status = json.loads(harness._status_publisher.published[-1].data)
+    assert status["paused"] and status["pause_owners"] == ["pick-1"]
+    assert not harness._logger.warnings

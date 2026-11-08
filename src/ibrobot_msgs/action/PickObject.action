@@ -27,6 +27,8 @@ DelegatedExecutorIdentity expected_executor
 bool supervised_direct
 uint8 mode
 bool release_after_success
+# Gateway-owned handover to the following place step; overrides put-back policy.
+bool retain_for_place
 ---
 # --- Result ---
 uint8 VERIFICATION_NOT_RUN=0

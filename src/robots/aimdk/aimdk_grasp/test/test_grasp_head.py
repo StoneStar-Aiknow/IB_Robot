@@ -143,6 +143,7 @@ def head(monkeypatch):
         options={"head": {"namespace": "/test_head"}, "watch": "stop"}, perception=PerceptionSettings(), hand="hand"
     )
     monkeypatch.setattr(grasp_head, "x2_robot", lambda config: robot)
+    monkeypatch.setattr("aimdk_grasp.backend.robot_for_side", lambda robot, side: robot)
     monkeypatch.setattr(grasp_head, "head_parts", lambda node, robot, description, closers, on_moved: parts)
     monkeypatch.setattr(grasp_head, "check_initial_hand", lambda hand, admitted: None)
     monkeypatch.setattr(grasp_head, "prepare_capture_scene", lambda observation, model, config: ("prepared", model))
@@ -425,3 +426,40 @@ def test_a_watch_that_does_not_start_is_refused_and_publishes_nothing(head):
     head.published.clear()
     node._publish_status()
     assert head.published == []
+
+
+def test_the_planner_refresh_never_overlaps_a_head_call():
+    import threading
+    import time
+    from types import SimpleNamespace
+
+    from aimdk_grasp import grasp_head
+
+    looked = []
+    camera = SimpleNamespace(capture_state=lambda deadline: looked.append(deadline) or SimpleNamespace(feedback="f"))
+    service = SimpleNamespace(needs_rebuild=lambda feedback: False)
+    node = grasp_head.X2GraspHeadNode.__new__(grasp_head.X2GraspHeadNode)
+    node._head = SimpleNamespace(camera=camera, service=service, watch=None, imu=None)
+    node._activity_lock, node._refresh_gate = threading.Lock(), threading.Lock()
+    node._active_calls, node._last_activity = 0, time.monotonic() - grasp_head.REFRESH_IDLE_S - 1
+    with node._activity():
+        assert node._refresh_once(node._head, None) is None and not looked  # a call in flight
+    assert node._refresh_once(node._head, None) is None and not looked  # one just ended
+    node._last_activity -= grasp_head.REFRESH_IDLE_S + 1
+    node._head.watch = SimpleNamespace(armed=True)
+    assert node._refresh_once(node._head, None) is None and not looked  # an execution is watched
+    node._head.watch = None
+    assert node._refresh_once(node._head, None) is None and len(looked) == 1
+    # A call arriving during a refresh waits for it to end.
+    entered = threading.Event()
+
+    def call():
+        with node._activity():
+            entered.set()
+
+    with node._refresh_gate:
+        caller = threading.Thread(target=call)
+        caller.start()
+        assert not entered.wait(0.2)
+    assert entered.wait(2.0)
+    caller.join(2.0)
