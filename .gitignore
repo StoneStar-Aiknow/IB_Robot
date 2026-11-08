@@ -63,3 +63,6 @@ third_party/vendor/**/*.so
 !third_party/vendor/rt-infer/2026.11.06/lib/libruntime.so
 !third_party/vendor/rt-infer/2026.11.06/lib/periodic_control_bridge.so
 !third_party/vendor/rt-infer/2026.11.06/lib/persistent_acl_bridge.so
+
+# Exhibition clips extracted by commissioning/make_summit_clips.py (not distributed)
+commissioning/audio/summit/

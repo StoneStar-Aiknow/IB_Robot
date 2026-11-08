@@ -89,7 +89,7 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
         )
     if state in {"CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}:
         return "已停止。" if state != "CANCELLED_BEFORE_EXECUTION" else "任务已取消，尚未开始执行。"
-    if detail.schema_version == 1 and detail.recovery_state in {"FAILED", "UNKNOWN"} and state == "FAILED":
+    if detail.schema_version == 1 and detail.recovery_state in {"FAILED", "UNKNOWN"} and state in _TERMINALS:
         return failure_stage + "恢复未完成或状态尚未确认，请操作员检查机器人。"
     if state == "SUCCEEDED":
         if placing:

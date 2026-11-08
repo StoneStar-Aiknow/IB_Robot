@@ -564,3 +564,48 @@ TEST(Plan, ParsesWhatTheRuntimeResolves)
   EXPECT_EQ(word.arm_owner, 9);
   EXPECT_EQ(word.envelope->first, 0.4);
 }
+
+TEST(Core, RecordedMotionOwnsBothArmsAndRadHandsAndMasksTheMissingHand)
+{
+  Core core(plan());
+  auto word = control();
+  word.arm_owner = 7;
+  core.on_control(word, 0.0);
+  measure(core, 0.0);
+  std::map<std::string, double> right;
+  JointEntries hand;
+  for (const auto & joint : aimdk_dataplane::kDexterousJointOrder) {
+    right["R_" + joint + "_joint"] = 0.1;
+    hand.emplace_back("R_" + joint + "_joint", 0.1, 0.0, 0.0);
+  }
+  core.on_hand_state({0x00, 0x01}, hand, {{{}, right}}, {}, 0, 0.0);
+  ASSERT_TRUE(core.measured_hand(0.01).has_value());
+  core.on_stream(find(core, "hand_stream"), values(20, 0.9), 0.01);
+  EXPECT_EQ(core.take_rejections(), (std::vector<std::string>{"hand_stream:NAMED_MOTION_ACTIVE"}));
+  auto recorded = values(14, 0.2);
+  recorded.insert(recorded.end(), 20, -1.5);
+  core.on_named_arm(8, recorded, 0.01);
+  EXPECT_EQ(core.tick(0.01).kind, Output::Kind::kNone);
+  core.on_named_arm(7, recorded, 0.02);
+  EXPECT_TRUE(core.candidate_arm_is_named());
+  EXPECT_FALSE(core.mirror_candidate("stream", 0.03));
+  const auto out = core.tick(0.03);
+  ASSERT_EQ(out.kind, Output::Kind::kUpperBody);
+  EXPECT_EQ(out.arm, values(14, 0.2));
+  auto expected = values(20, -1.5);
+  std::fill(expected.begin(), expected.begin() + 10, 0.0);
+  EXPECT_EQ(out.hand, expected);
+  EXPECT_FALSE(core.measured_hand(5.0).has_value());
+}
+
+TEST(Core, RecordedHandMotionWithoutMeasuredHandsDoesNotSendItsArmCommand)
+{
+  Core core(plan());
+  auto word = control();
+  word.arm_owner = 7;
+  core.on_control(word, 0.0);
+  measure(core, 0.0);
+  core.on_named_arm(7, values(34, 0.2), 0.01);
+  EXPECT_EQ(core.take_rejections(), (std::vector<std::string>{"named_motion:HAND_HOLD_UNAVAILABLE"}));
+  EXPECT_EQ(core.tick(0.02).kind, Output::Kind::kNone);
+}

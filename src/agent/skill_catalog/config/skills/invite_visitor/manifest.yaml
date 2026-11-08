@@ -1,0 +1,41 @@
+schema_version: 1
+name: invite_visitor
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Invite an undecided visitor to choose an activity with W04 and one invitation
+    gesture.
+  category: social_interaction
+  when_to_use:
+  - visitor says 随便 or 玩一下 without choosing an activity
+  do_not_use: []
+  aliases_zh:
+  - 邀请选择玩法
+  - 随便玩一下
+  - 我想体验一下
+  aliases_en:
+  - invite the visitor
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Play W04 and one invite gesture for 随便 or 玩一下, asking which activity the
+    visitor wants. Does not answer where to stand or start a game.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

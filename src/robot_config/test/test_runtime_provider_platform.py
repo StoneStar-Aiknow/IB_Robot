@@ -1065,3 +1065,17 @@ def test_scene_task_omitted_without_bound_trajectory_interfaces(caplog):
     with caplog.at_level(logging.WARNING, logger="robot_config.launch_builders.scene_task"):
         assert build_scene_task(context).actions == []
     assert "joint.trajectory_arm" in caplog.text
+
+
+def test_aimdk_cancel_return_selection_reaches_the_provider_only_when_enabled():
+    config = _provider_config()
+    config["runtime"] = {
+        "provider": "aimdk_robot",
+        "profile": "x2_ultra_omnihand",
+        "require_model": False,
+        "cancel_return_motions": "wave",
+    }
+    arguments = _include_arguments(config, use_sim=False)
+    assert arguments["cancel_return_motions"] == "wave"
+    del config["runtime"]["cancel_return_motions"]
+    assert "cancel_return_motions" not in _include_arguments(config, use_sim=False)

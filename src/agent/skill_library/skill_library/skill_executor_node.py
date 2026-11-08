@@ -31,7 +31,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
@@ -614,7 +614,8 @@ class _CompositeBranchGoal:
 
     @property
     def is_cancel_requested(self) -> bool:
-        return bool(self._goal_handle.is_cancel_requested) or bool(self._stop_requested())
+        stop_requested = bool(self._stop_requested())
+        return bool(self._goal_handle.is_cancel_requested) or stop_requested
 
     def publish_feedback(self, feedback) -> None:
         self._goal_handle.publish_feedback(feedback)
@@ -677,7 +678,8 @@ class SkillExecutorNode(Node):
         self.declare_parameter("runtime_play_audio_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("runtime_play_audio_service", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_play_audio_clips_json", "{}", descriptor=startup_descriptor)
-        # While a clip plays the ASR is muted through this topic (stop/start).
+        self.declare_parameter("runtime_play_audio_stop_service", "/voice_tts/stop", descriptor=startup_descriptor)
+        # Kept for existing deployments; interruptible clips must leave ASR listening.
         self.declare_parameter("asr_control_topic", "", descriptor=startup_descriptor)
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
@@ -813,6 +815,13 @@ class SkillExecutorNode(Node):
         )
         if self._play_audio_enabled and not self._play_audio_service:
             raise ValueError("runtime_play_audio_service must be set when runtime_play_audio_enabled is true")
+        self._play_audio_stop_service = (
+            self.get_parameter("runtime_play_audio_stop_service").get_parameter_value().string_value.strip()
+        )
+        if self._play_audio_enabled and not self._play_audio_stop_service:
+            raise ValueError("runtime_play_audio_stop_service must be set when runtime_play_audio_enabled is true")
+        self._play_audio_lock = threading.Lock()
+        self._play_audio_pending_cleanup = None
         self._play_audio_clips = load_json_mapping(self.get_parameter("runtime_play_audio_clips_json").value)
         if self._play_audio_enabled:
             for clip_name, clip_path in self._play_audio_clips.items():
@@ -1163,6 +1172,11 @@ class SkillExecutorNode(Node):
         )
         self._play_audio_client = (
             self.create_client(PlayAudioFile, self._play_audio_service, callback_group=callback_group)
+            if self._play_audio_enabled
+            else None
+        )
+        self._play_audio_stop_client = (
+            self.create_client(Trigger, self._play_audio_stop_service, callback_group=callback_group)
             if self._play_audio_enabled
             else None
         )
@@ -2883,7 +2897,7 @@ class SkillExecutorNode(Node):
         publisher.publish(message)
 
     def _execute_play_audio_skill(self, goal_handle, template, *, effective_timeout_sec: float | None = None):
-        """Play the clip the catalog binds for this skill, muting the ASR while it runs.
+        """Play the catalog-bound clip while leaving ASR available for interruption.
 
         A binding that also names a runtime motion plays the clip and runs the
         motion together (the self-introduction waves while it speaks). Every
@@ -2940,8 +2954,23 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(result, goal_handle, [], error_code, reason)
         executed = [f"runtime_play_audio:{clip}"]
         deadline = time.monotonic() + timeout_sec
-        self._publish_asr_control("stop")
+        # Trigger is a global stop: a previous stop must finish before another
+        # clip is sent, including when cleanup outlives the action's deadline.
+        if not self._play_audio_lock.acquire(blocking=False):
+            return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_BUSY", "another clip owns playback")
         try:
+            pending = self._play_audio_pending_cleanup
+            if pending is not None and not pending():
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "previous playback or stop is still unconfirmed",
+                )
+            self._play_audio_pending_cleanup = None
+            if goal_handle.is_cancel_requested:
+                return self._cancel_skill(result, goal_handle, [], skill_name)
             try:
                 future = client.call_async(PlayAudioFile.Request(file_path=path))
             except Exception as exc:
@@ -2949,35 +2978,157 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(
                     result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} playback request failed: {exc}"
                 )
-            if motion_client is not None:
-                return self._finish_play_audio_with_motion(
-                    goal_handle, future, motion_client, motion, deadline, executed
-                )
-            if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
-                if goal_handle.is_cancel_requested:
-                    return self._cancel_skill(result, goal_handle, [], skill_name)
-                return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out")
-            failure = _play_audio_failure(future, skill_name)
-            if failure is not None:
-                return self._abort_skill(result, goal_handle, [], *failure)
-        finally:
-            self._publish_asr_control("start")
-        return self._succeed_play_audio(result, goal_handle, executed, f"{skill_name}: played {clip}")
+            admission = self._active_skill_admission
+            nonce = uuid.uuid4().hex
+            key = self._register_delegated_dispatch(nonce, admission, goal_handle.request.dispatch_binding)
+            cleanup = _LateCleanupConfirmation()
+            cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, key))
+            stop_future = None
+            next_stop_at = 0.0
+            stop_error = ""
 
-    def _finish_play_audio_with_motion(self, goal_handle, future, client, motion: str, deadline: float, executed):
+            def cleaned_up(_done=None):
+                # A finished service response is evidence that that invocation
+                # has left its callback; never cancel the local future instead.
+                for pending_future in (future, stop_future):
+                    if pending_future is None:
+                        continue
+                    if not pending_future.done():
+                        return False
+                    try:
+                        if pending_future.result() is None:
+                            return False
+                    except Exception:
+                        return False
+                cleanup.confirm()
+                return True
+
+            def request_stop():
+                nonlocal stop_future, next_stop_at, stop_error
+                if future.done() or time.monotonic() < next_stop_at:
+                    return
+                if stop_future is not None and not stop_future.done():
+                    return
+                # Different service callback groups may accept stop before play.
+                # Retry serially while our old play is pending; no new playback
+                # can enter through this executor until both responses drain.
+                next_stop_at = time.monotonic() + 0.025
+                stop_client = self._play_audio_stop_client
+                try:
+                    if stop_client is None or not stop_client.wait_for_service(timeout_sec=self._rpc_timeout):
+                        stop_error = "audio stop service unavailable"
+                        return
+                    stop_future = stop_client.call_async(Trigger.Request())
+                    stop_error = ""
+                except Exception as exc:
+                    stop_error = f"audio stop request failed: {exc}"
+
+            self._play_audio_pending_cleanup = cleaned_up
+            branch = _CompositeBranchGoal(goal_handle, stop_requested=lambda: False)
+            if motion_client is not None:
+                result = self._finish_play_audio_with_motion(
+                    branch, future, motion_client, motion, deadline, executed, request_stop=request_stop
+                )
+            elif not self._wait_for_future(
+                future,
+                max(0.0, deadline - time.monotonic()),
+                cancel_requested=lambda: goal_handle.is_cancel_requested,
+                cancel_callback=request_stop,
+            ):
+                if goal_handle.is_cancel_requested:
+                    result = self._cancel_skill(result, branch, executed, skill_name)
+                else:
+                    result = self._abort_skill(
+                        result, branch, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out"
+                    )
+            elif goal_handle.is_cancel_requested:
+                result = self._cancel_skill(result, branch, executed, skill_name)
+            else:
+                failure = _play_audio_failure(future, skill_name)
+                result = (
+                    self._abort_skill(result, branch, executed, *failure)
+                    if failure is not None
+                    else self._succeed_play_audio(result, branch, executed, f"{skill_name}: played {clip}")
+                )
+            if not result.success:
+                request_stop()
+            cleanup_deadline = time.monotonic() + self._rpc_timeout
+            while rclpy.ok() and not cleaned_up() and time.monotonic() < cleanup_deadline:
+                if not result.success:
+                    request_stop()
+                time.sleep(_WAIT_POLL_SEC)
+            if not cleaned_up():
+                future.add_done_callback(cleaned_up)
+                if stop_future is not None:
+                    stop_future.add_done_callback(cleaned_up)
+                result = self._abort_skill(
+                    SkillCommand.Result(),
+                    goal_handle,
+                    result.executed_primitives,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    f"{skill_name}: playback/stop response unconfirmed; {stop_error or result.message}",
+                )
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "UNKNOWN", "cancel", result.error_code, "UNKNOWN", 0, "MANUAL_CHECK"),
+                )
+                return result
+            if result.error_code == PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "UNKNOWN", "cancel", result.error_code, "UNKNOWN", 0, "MANUAL_CHECK"),
+                )
+            if stop_future is not None and not stop_future.result().success:
+                stop_error = str(stop_future.result().message) or "audio stop was refused"
+            if stop_error and branch.terminal == "canceled":
+                result = self._abort_skill(
+                    SkillCommand.Result(),
+                    goal_handle,
+                    result.executed_primitives,
+                    "PLAY_AUDIO_STOP_FAILED",
+                    f"{skill_name}: {stop_error}; playback has ended",
+                )
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "FAILED", "cancel", result.error_code, "FAILED", 0, "MANUAL_CHECK"),
+                )
+                return result
+            if branch.terminal == "canceled":
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "CANCELED", "", "SKILL_CANCELLED", "NOT_NEEDED", 0, "NONE"),
+                )
+                result.message = short_message(
+                    f"{result.message}; audio publication ended; buffered hardware audio may still play"
+                )
+                goal_handle.canceled()
+            elif branch.terminal == "succeeded":
+                goal_handle.succeed()
+            else:
+                goal_handle.abort()
+            return result
+        finally:
+            self._play_audio_lock.release()
+
+    def _finish_play_audio_with_motion(
+        self, goal_handle, future, client, motion: str, deadline: float, executed, *, request_stop
+    ):
         """Run the bound motion while the clip plays, then end the skill once for both.
 
         The motion runs through the named-motion executor against a proxy that
         keeps its terminal call, so only this method ends ``goal_handle``. A
         playback failure while the motion runs cancels the motion and waits for
         its terminal state; a motion whose state is unknown is reported as
-        such. The playback service has no cancel: a skill cancel or timeout
-        stops waiting for it, and the clip may keep playing.
+        such. Stop audio promptly when cancellation is observed, even while the
+        motion is still waiting for its terminal response. The caller drains
+        both audio service responses before returning ownership.
         """
         result = SkillCommand.Result()
         skill_name = str(goal_handle.request.skill_name)
 
         def playback_failed() -> bool:
+            if goal_handle.is_cancel_requested:
+                request_stop()
             return future.done() and _play_audio_failure(future, skill_name) is not None
 
         branch = _CompositeBranchGoal(goal_handle, stop_requested=playback_failed)
@@ -2989,10 +3140,10 @@ class SkillExecutorNode(Node):
             if audio_failure is not None:
                 message = f"{message}; playback also failed: {audio_failure[1]}"
             return self._abort_skill(result, goal_handle, executed, motion_result.error_code, message)
+        if goal_handle.is_cancel_requested:
+            return self._cancel_skill(result, goal_handle, executed, skill_name)
         if audio_failure is not None:
             return self._abort_skill(result, goal_handle, executed, *audio_failure)
-        if goal_handle.is_cancel_requested:
-            return self._cancel_play_audio(result, goal_handle, executed, skill_name)
         if branch.terminal != "succeeded":
             return self._abort_skill(
                 result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} ended without a result"
@@ -3001,9 +3152,10 @@ class SkillExecutorNode(Node):
             future,
             max(0.0, deadline - time.monotonic()),
             cancel_requested=lambda: goal_handle.is_cancel_requested,
+            cancel_callback=request_stop,
         ):
             if goal_handle.is_cancel_requested:
-                return self._cancel_play_audio(result, goal_handle, executed, skill_name)
+                return self._cancel_skill(result, goal_handle, executed, skill_name)
             return self._abort_skill(
                 result, goal_handle, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out after {motion} ended"
             )
@@ -3014,12 +3166,6 @@ class SkillExecutorNode(Node):
         return self._succeed_play_audio(
             result, goal_handle, executed, f"{skill_name}: played {clip} and {motion_result.message}"
         )
-
-    def _cancel_play_audio(self, result, goal_handle, executed, skill_name: str):
-        self._cancel_skill(result, goal_handle, executed, skill_name)
-        # The playback service cannot be cancelled: say so instead of implying silence.
-        result.message = f"{result.message}; the motion has ended, the recorded clip may still be playing"
-        return result
 
     def _succeed_play_audio(self, result, goal_handle, executed, message: str):
         result.success = True

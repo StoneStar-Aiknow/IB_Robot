@@ -1,0 +1,48 @@
+schema_version: 1
+name: introduce_platform
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Answer what chip and operating system the robot runs with a recorded reply.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks which chip or operating system the robot uses
+  do_not_use:
+  - condition: the visitor asks who the robot is
+    instead_use: self_introduction
+  - condition: the visitor asks what the Agent does
+    instead_use: introduce_agent
+  aliases_zh:
+  - 用什么芯片
+  - 什么芯片
+  - 什么系统
+  - 你的系统是什么
+  - 你用的是什么系统
+  aliases_en:
+  - what chip do you use
+  - what system do you run
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Answer with a recorded reply which chip and system the robot runs (昇腾310P,
+    openEuler Embedded, IB-Robot). Use for 用什么芯片 or 什么系统.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

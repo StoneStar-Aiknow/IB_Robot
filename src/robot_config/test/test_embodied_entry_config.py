@@ -32,6 +32,7 @@ def test_agent_presentation_timeout_is_bounded(timeout):
     ("voice_bridge", "fragment"),
     [
         ({"confirm_mode": "maybe"}, "confirm_mode"),
+        ({"persistent_session": "yes"}, "persistent_session must be a boolean"),
         ({"input_topic": "voice_command"}, "input_topic"),
         ({"stop_phrases": []}, "stop_phrases must not be empty"),
         ({"text_corrections": {"夹爪": []}}, "text_corrections"),
@@ -895,3 +896,13 @@ def test_unset_voice_latency_knobs_are_not_an_error():
     from robot_config.loader import validate_voice_latency_options
 
     assert validate_voice_latency_options({"voice_asr": {"vad_post_roll_ms": 0}, "voice_tts": {"num_steps": 4}}) == []
+
+
+def test_summit_retains_dialogue_without_enabling_mirror_algorithm():
+    path = Path(__file__).parent.parent / "config/robots/aimdk_x2_summit.yaml"
+    from robot_config.loader import _load_robot_section
+
+    _, config = _load_robot_section(path)
+    assert config["embodied"]["agent"]["voice_bridge"]["persistent_session"] is True
+    assert config["mirror_session"]["enabled"] is False
+    assert config["motion_imitation_stream"]["enabled"] is False

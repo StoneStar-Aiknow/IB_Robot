@@ -1,4 +1,5 @@
 from glob import glob
+from pathlib import Path
 
 from setuptools import find_packages, setup
 
@@ -14,6 +15,10 @@ setup(
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
         ("share/" + package_name + "/profiles", glob("profiles/*.yaml")),
         ("share/" + package_name + "/profiles/trajectories", glob("profiles/trajectories/*.json")),
+        *[
+            ("share/" + package_name + "/" + str(Path(path).parent), [path])
+            for path in glob("profiles/trajectories/summit/*/*.json")
+        ],
     ],
     install_requires=["setuptools"],
     extras_require={"test": ["pytest"]},

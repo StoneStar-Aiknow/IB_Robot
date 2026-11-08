@@ -1,6 +1,6 @@
 """ROS-free, bounded single-synthesizer/single-player speech scheduling.
 
-A claimed playback is not preempted. ``then`` entries partition latest-ready
+Explicit higher-priority speech preempts claimed lower-priority playback. ``then`` entries partition latest-ready
 selection; terminals are protected too. Callbacks run outside the state lock.
 ``close`` linearizes against completion callbacks: a callback already admitted
 finishes before closing starts, otherwise it is suppressed. Consequently a
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -26,6 +27,10 @@ class _Entry:
     valid: bool = True
 
     @property
+    def priority(self) -> int:
+        return getattr(self.action, "priority", None) or 0
+
+    @property
     def barrier(self) -> bool:
         return bool(self.action.then)
 
@@ -33,6 +38,7 @@ class _Entry:
     def protected(self) -> bool:
         return (
             self.barrier
+            or self.priority >= 20
             or self.action.terminal
             or self.action.kind == "terminal"
             or getattr(self.action, "important", False)
@@ -58,6 +64,7 @@ class SpeechPipeline:
         completed: Callable[[Any], None] = lambda action: None,
         log: Callable[[str], None] = lambda message: None,
         capacity: int = 32,
+        stop: Callable[[], None] = lambda: None,
     ) -> None:
         if capacity < 1:
             raise ValueError("capacity must be positive")
@@ -67,10 +74,15 @@ class SpeechPipeline:
         self._completed = completed
         self._log = log
         self._capacity = capacity
+        self._stop = stop
+        self._seen: OrderedDict[tuple, None] = OrderedDict()
         self._condition = threading.Condition()
         self._completion_gate = threading.Lock()
+        self._cancel_gate = threading.RLock()
+        self._canceling = False
         self._entries: list[_Entry] = []
         self._synthesizing: _Entry | None = None
+        self._playing: _Entry | None = None
         self._closed = False
         self._sequence = 0
         self._workers = [
@@ -94,8 +106,44 @@ class SpeechPipeline:
         self._condition.notify_all()
 
     def submit(self, action: Any) -> bool:
+        if getattr(action, "priority", None) is None:
+            return self._submit(action)
+        if not self._is_current(action):
+            return False
+        # Keep playback gated from priority invalidation until admission completes.
+        with self._cancel_gate:
+            if not self._is_current(action):
+                return False
+            key = (
+                getattr(action, "request_id", ""),
+                action.execution_id,
+                getattr(action, "phase", ""),
+                getattr(action, "event_key", ""),
+            )
+            with self._condition:
+                if key[-1] and key in self._seen:
+                    return False
+                self._canceling = True
+            try:
+                return self._submit(action)
+            finally:
+                with self._condition:
+                    self._canceling = False
+                    self._condition.notify_all()
+
+    def _submit(self, action: Any) -> bool:
+        if getattr(action, "priority", None) is not None:
+            self.preempt(action, _validated=True)
         dropped: list[tuple[_Entry, str]] = []
         with self._condition:
+            key = (
+                getattr(action, "request_id", ""),
+                action.execution_id,
+                getattr(action, "phase", ""),
+                getattr(action, "event_key", ""),
+            )
+            if key[-1] and key in self._seen:
+                return False
             self._sequence += 1
             entry = _Entry(self._sequence, action)
             if self._closed:
@@ -111,7 +159,11 @@ class SpeechPipeline:
                         and action.execution_id
                         and (old.action.execution_id == action.execution_id and not old.protected)
                     ):
-                        victims.append((old, "terminal"))
+                        if getattr(action, "priority", None) is None or (
+                            getattr(action, "request_id", "") == getattr(old.action, "request_id", "")
+                            and old.priority < (getattr(action, "priority", None) or 0)
+                        ):
+                            victims.append((old, "terminal"))
                     elif old.state == "pending" and not old.protected:
                         kinds = ("busy", "receipt") if action.kind in ("busy", "receipt") else ("busy",)
                         if old.action.kind in kinds:
@@ -138,6 +190,10 @@ class SpeechPipeline:
                     for old, cause in victims:
                         self._drop_locked(old)
                         dropped.append((old, cause))
+                    if key[-1]:
+                        self._seen[key] = None
+                        while len(self._seen) > 2048:
+                            self._seen.popitem(last=False)
                     if action.kind == "terminal":
                         self._entries.insert(0, entry)
                     else:
@@ -175,7 +231,10 @@ class SpeechPipeline:
                 )
                 if self._closed:
                     return
-                entry = next(entry for entry in self._entries if entry.state == "pending")
+                entry = max(
+                    (entry for entry in self._entries if entry.state == "pending"),
+                    key=lambda e: (e.priority, -e.sequence),
+                )
                 entry.state = "synthesizing"
                 self._synthesizing = entry
             audio = None
@@ -205,7 +264,11 @@ class SpeechPipeline:
                     while end < len(self._entries) and not self._entries[end].protected:
                         end += 1
                     if not entry.protected:
-                        ready = [old for old in self._entries[start:end] if old.state == "ready" and not old.protected]
+                        ready = [
+                            old
+                            for old in self._entries[start:end]
+                            if old.state == "ready" and not old.protected and old.priority == entry.priority
+                        ]
                         newest = max(ready, key=lambda old: old.sequence)
                         for old in ready:
                             if old is not newest:
@@ -216,6 +279,17 @@ class SpeechPipeline:
                 self._emit("drop reason=replaced", old)
 
     def _candidate_locked(self) -> _Entry | None:
+        if self._canceling:
+            return None
+        explicit = [
+            e for e in self._entries if getattr(e.action, "priority", None) is not None and e.state != "playing"
+        ]
+        if explicit:
+            top = max(explicit, key=lambda e: (e.priority, -e.sequence))
+            if top.state == "ready":
+                return top
+            if top.priority >= 20:
+                return None
         for entry in self._entries:
             if entry.state == "ready":
                 return entry
@@ -236,6 +310,7 @@ class SpeechPipeline:
                 if self._closed or not entry.valid or self._candidate_locked() is not entry:
                     continue
                 entry.state = "playing"  # Atomic claim: later terminals cannot preempt it.
+                self._playing = entry
                 audio = entry.audio
             success = False
             try:
@@ -252,7 +327,92 @@ class SpeechPipeline:
                 self._emit(f"playback/completion failed: {error!r}", entry)
             finally:
                 with self._condition:
+                    self._playing = None
                     self._drop_locked(entry)
+
+    def preempt(self, action: Any, timeout: float = 5.0, *, _validated: bool = False) -> None:
+        """Stop lower-priority audio before admitting a higher-priority action.
+
+        The cancellation gate spans every stop and old playback completion: no
+        stale stop can hit a newly claimed audio. Equal priorities never interrupt.
+        Call on the transport worker, never an execution or ROS callback.
+        """
+        priority = getattr(action, "priority", None)
+        if priority is None:
+            return
+        if not _validated and not self._is_current(action):
+            return
+        deadline = time.monotonic() + timeout
+        with self._cancel_gate:
+            if not _validated and not self._is_current(action):
+                return
+            with self._completion_gate, self._condition:
+                was_canceling = self._canceling
+                old_play = self._playing
+                interrupt = old_play is not None and old_play.priority < priority
+
+                def same_request(entry):
+                    return getattr(entry.action, "request_id", "") == getattr(action, "request_id", "")
+
+                victims = [e for e in self._entries if e.priority < priority and (priority >= 30 or same_request(e))]
+                interrupt = interrupt and (priority >= 30 or same_request(old_play))
+                if interrupt:
+                    self._canceling = True
+                for entry in victims:
+                    self._drop_locked(entry)
+            try:
+                for entry in victims:
+                    self._emit("drop reason=priority", entry)
+                while interrupt:
+                    self._stop()
+                    with self._condition:
+                        if self._playing is not old_play:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("priority cancellation timed out")
+                        self._condition.wait(timeout=min(0.05, remaining))
+            finally:
+                with self._condition:
+                    self._canceling = was_canceling
+                    self._condition.notify_all()
+
+    def cancel(self, stop: Callable[[], None] = lambda: None, timeout: float = 5.0) -> None:
+        """Invalidate admitted speech and interrupt playback, keeping both workers alive.
+
+        Submissions after invalidation survive. New playback waits until stop has
+        returned and the old play callback has exited. Stop is retried while an
+        old callback is active, covering a play request sent just after the first
+        stop. Synthesis is invalidated, not forcibly interrupted. Stop must return
+        promptly; a stuck play callback raises TimeoutError. Do not call from a
+        speech worker or completion callback.
+        """
+        if threading.current_thread() in self._workers:
+            raise RuntimeError("cancel must be called outside speech workers")
+        deadline = time.monotonic() + max(0, timeout)
+        with self._cancel_gate:
+            with self._completion_gate, self._condition:
+                self._canceling = True
+                old_play = self._playing
+                dropped = list(self._entries)
+                for entry in dropped:
+                    self._drop_locked(entry)
+            try:
+                for entry in dropped:
+                    self._emit("drop reason=canceled", entry)
+                while True:
+                    stop()
+                    with self._condition:
+                        if old_play is None or self._playing is not old_play:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("speech cancellation timed out: speech-playback")
+                        self._condition.wait_for(lambda: self._playing is not old_play, timeout=min(0.05, remaining))
+            finally:
+                with self._condition:
+                    self._canceling = False
+                    self._condition.notify_all()
 
     def close(self, stop: Callable[[], None] = lambda: None, timeout: float = 5) -> None:
         """Stop admission, unblock adapter waits, join workers or raise TimeoutError.

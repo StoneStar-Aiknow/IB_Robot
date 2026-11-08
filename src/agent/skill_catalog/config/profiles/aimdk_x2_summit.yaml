@@ -1,0 +1,52 @@
+schema_version: 1
+name: aimdk_x2_summit
+robot_name: aimdk_x2_summit
+enabled_skills:
+- name: wave_hand
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: handshake
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: raise_hand
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: blow_kiss
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: clap_hands
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: greet_visitor
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: self_introduction
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: introduce_platform
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: introduce_agent
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: introduce_in_detail
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: explain_pick_scope
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: offer_fruit_menu
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: mimic_not_ready
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: pick_object
+  implementation: aimdk_x2_summit_fruit
+  planner_visible: true
+- name: return_to_task_pose
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: invite_visitor
+  implementation: aimdk_x2_summit
+  planner_visible: true

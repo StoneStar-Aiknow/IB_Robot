@@ -1,0 +1,9 @@
+schema_version: 1
+kind: delegated_executor
+robot: aimdk_x2_summit
+executor: runtime_play_audio
+binding:
+  clip: self_intro
+  motion: self_intro
+required_args: []
+timeout_sec: 90.0

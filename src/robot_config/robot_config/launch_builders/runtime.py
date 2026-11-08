@@ -255,6 +255,8 @@ def generate_runtime_provider_actions(
             else {}
         ),
     }
+    if provider == "aimdk_robot" and (robot_config.get("runtime") or {}).get("cancel_return_motions"):
+        include_arguments["cancel_return_motions"] = str(robot_config["runtime"]["cancel_return_motions"])
     include_arguments["use_sim"] = "true" if use_sim else "false"
     cbf_safety_json = _cbf_safety_json(robot_config)
     if cbf_safety_json:

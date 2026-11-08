@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
+import threading
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +26,7 @@ class AudioPlaybackConfig:
     """Configuration for one synchronous audio_common publication."""
 
     timeout_sec: float = 300.0
+    player: str = "aplay"
 
 
 class AudioFilePlayer:
@@ -29,6 +34,83 @@ class AudioFilePlayer:
 
     def __init__(self, config: AudioPlaybackConfig | None = None) -> None:
         self.config = config or AudioPlaybackConfig()
+        self._state_lock = threading.Lock()
+        self._play_lock = threading.Lock()
+        self._generation = 0
+        self._process: subprocess.Popen | None = None
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen) -> None:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    def stop(self) -> None:
+        """Cancel active/queued offline playback and reap the current child."""
+        with self._state_lock:
+            self._generation += 1
+            if self._process is not None:
+                self._terminate(self._process)
+
+    def play(self, file_path: str, cancel: threading.Event | None = None) -> Path:
+        """Play a validated WAV through the configured child, retaining the old API."""
+        with self._state_lock:
+            generation = self._generation
+
+        def check_cancel():
+            with self._state_lock:
+                canceled = generation != self._generation or (cancel is not None and cancel.is_set())
+            if canceled:
+                raise AudioPlaybackError("PLAYBACK_CANCELED", "audio file playback canceled")
+
+        with self._play_lock:
+            check_cancel()
+            path = self.validate_file(file_path)
+            player = shutil.which(self.config.player)
+            if player is None:
+                raise AudioPlaybackError("PLAYER_NOT_FOUND", f"audio player is unavailable: {self.config.player}")
+            if self.config.timeout_sec <= 0:
+                raise AudioPlaybackError("INVALID_TIMEOUT", "audio playback timeout must be positive")
+            process = None
+            deadline = time.monotonic() + self.config.timeout_sec
+            try:
+                with self._state_lock:
+                    if generation != self._generation or (cancel is not None and cancel.is_set()):
+                        raise AudioPlaybackError("PLAYBACK_CANCELED", "audio file playback canceled")
+                    process = subprocess.Popen(
+                        [player, "-q", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                    )
+                    self._process = process
+                while True:
+                    check_cancel()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise AudioPlaybackError(
+                            "PLAYBACK_TIMEOUT", f"audio playback exceeded {self.config.timeout_sec:g} seconds"
+                        )
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.05, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                check_cancel()
+                if process.returncode != 0:
+                    detail = (stderr or stdout).strip()
+                    message = f"audio player exited with status {process.returncode}"
+                    raise AudioPlaybackError("PLAYBACK_FAILED", f"{message}: {detail}" if detail else message)
+                return path
+            except OSError as exc:
+                raise AudioPlaybackError("PLAYBACK_FAILED", f"failed to start audio player: {exc}") from exc
+            finally:
+                if process is not None:
+                    with self._state_lock:
+                        self._terminate(process)
+                        self._process = None
+                    process.communicate()
 
     @staticmethod
     def validate_file(file_path: str) -> Path:

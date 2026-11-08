@@ -361,6 +361,10 @@ void Core::on_stream(const Channel & channel, const std::vector<double> & values
       head_cmd_ = head_payload(values, channel.joints, plan_.head_limits);
       head_stamp_ = now;
     } else if (!channel.hand_type.empty()) {
+      if (control_.arm_owner) {
+        rejections_.push_back(channel.name + ":NAMED_MOTION_ACTIVE");
+        return;
+      }
       hand_cmd_ = hand_payload(values, channel.hand_type, plan_.hand);
       public_hand_epoch_ = safety_epoch_;
       hand_held_ = hand_cmd_;
@@ -391,12 +395,57 @@ void Core::on_twist(const Channel & channel, double linear_x, double linear_y, d
 
 void Core::on_named_arm(int64_t owner, const std::vector<double> & positions, double now)
 {
-  if (!admitted(now) || control_.arm_owner != owner || positions.size() != kVendorArmOrder.size()) {
+  const size_t arm_size = kVendorArmOrder.size();
+  if (!admitted(now) || control_.arm_owner != owner ||
+    (positions.size() != arm_size && positions.size() != arm_size + 20)) {
     return;
   }
-  arm_cmd_ = positions;
+  if (positions.size() == arm_size + 20) {
+    auto measured = measured_hand(now);
+    if (!measured) {
+      rejections_.push_back("named_motion:HAND_HOLD_UNAVAILABLE");
+      return;
+    }
+    std::vector<double> hands(positions.begin() + arm_size, positions.end());
+    try {
+      auto payload = hand_payload(hands, "dexterous_joint", plan_.hand);
+      for (size_t side = 0; side < 2; ++side) {
+        if (hand_type_family(hand_types_[side]) != std::optional<std::string>("dexterous")) {
+          std::fill(payload.second.begin() + side * 10, payload.second.begin() + (side + 1) * 10, 0.0);
+        }
+      }
+      hand_cmd_ = payload;
+      hand_held_ = payload;
+      hand_stamp_ = now;
+    } catch (const CommandRejected & rejected) {
+      reject("named_motion", rejected);
+      return;
+    }
+  }
+  arm_cmd_ = std::vector<double>(positions.begin(), positions.begin() + arm_size);
   arm_cmd_named_ = true;
   arm_stamp_ = now;
+}
+
+std::optional<Measured> Core::measured_hand(double now) const
+{
+  const auto group = groups_.find("hand");
+  if (group == groups_.end() || !fresh(group->second, now) || hand_types_.size() != 2) {
+    return std::nullopt;
+  }
+  std::array<bool, 2> installed{};
+  for (size_t side = 0; side < 2; ++side) {
+    const auto family = hand_type_family(hand_types_[side]);
+    if (family && family != std::optional<std::string>("dexterous")) {
+      return std::nullopt;
+    }
+    installed[side] = family.has_value();
+  }
+  const auto payload = dexterous_hold_payload(installed, hand_measured_);
+  if (!payload) {
+    return std::nullopt;
+  }
+  return Measured{*payload, now - group->second.received};
 }
 
 // --- fixed-rate publication --------------------------------------------------------

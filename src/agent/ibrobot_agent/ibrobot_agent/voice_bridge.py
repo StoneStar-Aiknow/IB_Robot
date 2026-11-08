@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
+import queue
 import re
 import tempfile
 import threading
@@ -26,6 +28,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
+from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common.control_phrases import STOP_PHRASES
 from embodied_common.text_normalization import normalize_trigger_text
 from ibrobot_agent.addressee import (
@@ -38,10 +41,11 @@ from ibrobot_agent.addressee import (
 )
 from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE, TERMINAL_REQUEST_STATES
 from ibrobot_agent.execution_feedback import FeedbackTracker, execution_reply
+from ibrobot_agent.gift_workflow import GiftWorkflowSpeech
 from ibrobot_agent.presentation import presentation_digest
 from ibrobot_agent.semantic_gate import SEMANTIC_GATE_MODES, SemanticGate
 from ibrobot_agent.speech_pipeline import SpeechPipeline
-from ibrobot_agent.speech_policy import GraspSpeechPolicy
+from ibrobot_agent.speech_policy import GraspSpeechPolicy, MirrorSpeechPolicy
 
 CONFIRM_MODES = ("auto", "voice_confirm")
 _ACTIVE_ASR_STATES = {"listening", "recognizing"}
@@ -131,6 +135,8 @@ class VoiceBridgeConfig:
     cancel_phrases: tuple[str, ...] = ("取消", "算了", "不要")
     confirm_timeout_sec: float = 20.0
     session_idle_sec: float = 120.0
+    persistent_session: bool = False
+    mirror_session_enabled: bool = False
     min_text_chars: int = 2
     request_timeout_sec: float = 180.0
     speech_mode: str = "standard"
@@ -179,6 +185,9 @@ class VoiceBridgeConfig:
 
     def __post_init__(self) -> None:
         GraspSpeechPolicy(self.speech_mode, json.loads(self.speech_messages_json))
+        for name in ("persistent_session", "mirror_session_enabled"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
         if not str(self.robot_scope).strip():
             raise ValueError("robot_scope must be the Agent's robot scope")
         if self.confirm_mode not in CONFIRM_MODES:
@@ -283,6 +292,11 @@ class PublishControl:
 
 
 @dataclass(frozen=True)
+class CancelSpeech:
+    """Invalidate audio immediately; transport cancellation runs outside ROS callbacks."""
+
+
+@dataclass(frozen=True)
 class Speak:
     """Speak ``text``; run ``then`` only once the speech was rendered.
 
@@ -300,6 +314,11 @@ class Speak:
     expires_at: float = float("inf")
     notice: Any = None
     important: bool = False
+    generation: int = 0
+    session_id: str = ""
+    priority: int | None = None
+    phase: str = ""
+    event_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -307,7 +326,7 @@ class Log:
     message: str
 
 
-Action = PublishRequest | PublishControl | Speak | Log
+Action = PublishRequest | PublishControl | CancelSpeech | Speak | Log
 
 
 @dataclass
@@ -404,7 +423,30 @@ class VoiceBridgeCore:
         self.config = config
         self._state = _BridgeState()
         self._feedback = FeedbackTracker()
+        self._mirror_speech_policy = MirrorSpeechPolicy()
         self._speech_policy = GraspSpeechPolicy(config.speech_mode, json.loads(config.speech_messages_json))
+        self._gift = GiftWorkflowSpeech()
+        self._generation = 0
+        self._latest_request_id = ""
+        self._introduction_request_id = ""
+        self._unsafe_request_id = ""
+        self._stop_deadline = float("inf")
+        self._stop_warning_sent = False
+        self._ending_session = False
+        self._mirror_state: dict[str, Any] | None = None
+        self._mirror_start_request_id = ""
+        self._mirror_seen_holding = False
+        self._mirror_stop_request_id = ""
+        self._mirror_busy_spoken = False
+        self._mirror_stop_pending = False
+        self._mirror_stop_failed = False
+        self._mirror_interrupted_id = ""
+        self._mirror_owned_requests = _BoundedIdSet()
+        self._deferred_text = ""
+        self._deferred_after = float("inf")
+        self._request_sessions: dict[str, str] = {}
+        self._deferred_submission: tuple[str, str] | None = None
+        self._speech_suppressed: set[str] = set()
         self._receipt_due: dict[str, float] = {}
         self._announced_requests: set[str] = set()
         self._id_factory = id_factory or (lambda: f"voice-{uuid.uuid4().hex[:12]}")
@@ -424,6 +466,109 @@ class VoiceBridgeCore:
         self._speech_windows: deque[list[float]] = deque(maxlen=16)
         self._echo_segments: OrderedDict[Segment, None] = OrderedDict()
 
+    def on_mirror_state(self, payload: dict[str, Any], now: float, *, source_now: float) -> list[Action]:
+        """Convert ROS source age to monotonic expiry without comparing clock domains."""
+        try:
+            stamp = payload["stamp"]
+            age = source_now - float(stamp)
+            valid = (
+                payload.get("state") in MIRROR_SESSION.STATES
+                and type(payload.get("holding")) is bool
+                and type(payload.get("releasing")) is bool
+                and not isinstance(stamp, bool)
+                and math.isfinite(age)
+                and 0 <= age <= MIRROR_SESSION.STATE_STALE_SEC
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            valid = False
+        self._mirror_state = {**payload, "expires_at": now + MIRROR_SESSION.STATE_STALE_SEC - age} if valid else None
+        if valid and payload["holding"]:
+            self._mirror_seen_holding = True
+        if self._mirror_idle(now):
+            self._mirror_busy_spoken = False
+        return []
+
+    def _mirror_idle(self, now: float) -> bool:
+        if not self.config.mirror_session_enabled:
+            return True
+        state = self._mirror_state
+        if (
+            state is None
+            or now > state["expires_at"]
+            or state["state"] != MIRROR_SESSION.STATE_WAIT
+            or state["holding"]
+            or state["releasing"]
+            or self._mirror_stop_failed
+            or self._mirror_stop_pending
+            or self._mirror_stop_request_id
+        ):
+            return False
+        # A start result may overtake the holding heartbeat. Old WAIT is not a release.
+        if self._mirror_start_request_id:
+            if not self._mirror_seen_holding:
+                return False
+            self._mirror_start_request_id = ""
+        return True
+
+    def _submit_mirror_stop(self, now: float) -> list[Action]:
+        """Send the safety command through normal Agent and Gateway validation."""
+        state = self._state
+        if self._mirror_stop_request_id:
+            return [Log("mirror stop already awaiting terminal confirmation")]
+        self._mirror_stop_pending = False
+        request_id = self._id_factory()
+        self._mirror_stop_request_id = request_id
+        self._mirror_owned_requests.add(request_id)
+        self._latest_request_id = request_id
+        if not state.session_id:
+            state.session_id = _new_session_id()
+        self._request_sessions[request_id] = state.session_id
+        state.known_request_ids.add(request_id)
+        state.active_request_id = request_id
+        state.active_since = state.last_activity = now
+        state.task_label = "模仿退出"
+        state.last_busy_at = float("-inf")
+        state.receipt_spoken = False
+        return [
+            *self.cancel_speech(),
+            PublishRequest(
+                {
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "session_id": state.session_id,
+                    "text": "停止照镜子",
+                }
+            ),
+        ]
+
+    def _observe_mirror_terminal(self, payload: dict[str, Any], request_id: str) -> None:
+        if request_id == self._mirror_stop_request_id:
+            self._mirror_stop_request_id = ""
+            detail = payload.get("detail") or {}
+            facts = detail.get("execution_detail") or {}
+            self._mirror_stop_failed = payload.get("state") != "SUCCEEDED" or any(
+                item.get("recovery_state") in {"FAILED", "UNKNOWN"}
+                or item.get("phase_state") == "UNKNOWN"
+                or item.get("suggested_action") == "MANUAL_CHECK"
+                for item in (detail, facts)
+            )
+            if (
+                self._mirror_stop_failed
+                and payload.get("state") == "UNKNOWN"
+                and (not self._unsafe_request_id or self._unsafe_request_id == request_id)
+            ):
+                self._mirror_interrupted_id = request_id
+            if not self._mirror_stop_failed:
+                # Production stop confirms runtime idle before returning success.
+                self._mirror_start_request_id = ""
+                if self._unsafe_request_id == self._mirror_interrupted_id:
+                    self._unsafe_request_id = ""
+                    self._stop_deadline = float("inf")
+                    self._stop_warning_sent = False
+                self._mirror_interrupted_id = ""
+        elif request_id == self._mirror_start_request_id and payload.get("accepted") is False:
+            self._mirror_start_request_id = ""
+
     def note_speech(self, text: str, now: float, *, finished: bool = False) -> None:
         self._recent_speech.append((_normalize(text), now))
         if finished:
@@ -439,7 +584,11 @@ class VoiceBridgeCore:
                 self._echo_segments.popitem(last=False)
 
     def is_recent_echo(self, text: str, now: float) -> bool:
-        if self.is_stop_text(text):
+        if (
+            self.is_stop_text(text)
+            or self._speech_interrupt(text) is not None
+            or _normalize(text) in {"不玩了", "再见"}
+        ):
             return False
         value = _normalize(text)
         return len(value) >= 6 and any(
@@ -448,6 +597,20 @@ class VoiceBridgeCore:
         )
 
     def speech_is_current(self, action: Speak, now: float) -> bool:
+        if now >= action.expires_at:
+            return False
+        if action.request_id in self._speech_suppressed:
+            return False
+        if action.generation != self._generation or (action.session_id and action.session_id != self._state.session_id):
+            return False
+        if action.request_id and action.request_id != self._latest_request_id and not self.config.feedback_only:
+            return False
+        if action.kind == "busy_mirror":
+            return not self._mirror_idle(now) and not self._mirror_stop_pending and not self._mirror_stop_request_id
+        if action.notice is not None and action.event_key.startswith("MIRROR_"):
+            return self._mirror_speech_policy.is_current(action.notice, now)
+        if action.notice is not None and self._gift.owns(action.request_id):
+            return self._gift.is_current(action.notice, now)
         if action.notice is not None:
             if (
                 not action.terminal
@@ -501,7 +664,11 @@ class VoiceBridgeCore:
         """
         if self.config.feedback_only:
             return []
-        if self.is_stop_text(text):
+        if (
+            self.is_stop_text(text)
+            or self._speech_interrupt(text) is not None
+            or _normalize(text) in {"不玩了", "再见"}
+        ):
             cancelled = self._cancel_held(f"stop keyword in {str(text).strip()!r}")
             return [*cancelled, *self.on_transcript(text, now, segment=segment, cancels_held=bool(cancelled))]
         if self._held or self.should_hold(text, now, segment):
@@ -539,7 +706,7 @@ class VoiceBridgeCore:
         if self.config.feedback_only:
             return []
         heard_at = now if heard_at is None else heard_at
-        if not self.is_stop_text(text) and (segment in self._echo_segments or self.is_recent_echo(text, now)):
+        if self.is_recent_echo(text, now):
             return [Log(f"ignored recent playback echo: {text!r}")]
         stopped_by_partial, self._state.utterance_stopped = self._state.utterance_stopped, False
         heard = str(text).strip()
@@ -553,7 +720,7 @@ class VoiceBridgeCore:
         if not normalized:
             return []
         corrected = [Log(f"corrected transcript {heard!r} -> {raw!r}")] if raw != heard else []
-        if stopped_by_partial and self._contains_stop(normalized):
+        if stopped_by_partial and self._contains_stop(normalized) and not self._speech_interrupt(raw):
             # Once the stop has finished the request, this sentence would otherwise reach the
             # Agent as a new command and occupy the channel ("帮我停一下" -> busy for "继续").
             return [*corrected, Log(f"final transcript {raw!r} of a stop already sent from its partial")]
@@ -573,7 +740,7 @@ class VoiceBridgeCore:
         if self.config.feedback_only or not self._is_stop_partial(text) or self._state.utterance_stopped:
             return []
         cancelled = self._cancel_held(f"stop keyword in partial {text!r}")
-        if not self._stop_target():
+        if not self._stop_target() and self._mirror_idle(now):
             self._state.utterance_stopped = bool(cancelled)
             return cancelled
         self._state.utterance_stopped = True
@@ -658,9 +825,7 @@ class VoiceBridgeCore:
         # Accepted trade-off: an utterance like "不停地挥手" also stops the robot.
         return any(phrase in normalized for phrase in self.config.stop_phrases)
 
-    def _judge_semantics(
-        self, raw: str, normalized: str, now: float, *, session_opened: bool
-    ) -> list[Action] | None:
+    def _judge_semantics(self, raw: str, normalized: str, now: float, *, session_opened: bool) -> list[Action] | None:
         """Run the L3 gate; returns the actions that stop the utterance, or None to let it through.
 
         Shadow mode records the verdict and returns None, which is what makes the log a
@@ -707,11 +872,37 @@ class VoiceBridgeCore:
         cancels_held: bool = False,
     ) -> list[Action]:
         state = self._state
-        stops_something = cancels_held or self._stop_target() or normalized in self.config.stop_phrases
-        if self._contains_stop(normalized) and stops_something:
+        if normalized == "再见":
+            return [Log("farewell retained dialogue and business state")]
+        remainder = self._speech_interrupt(raw)
+        if remainder is not None:
+            actions = self.cancel_speech()
+            if self._introduction_request_id and self._stop_target() == self._introduction_request_id:
+                self._unsafe_request_id = self._introduction_request_id
+                self._speech_suppressed.add(self._introduction_request_id)
+                self._deferred_text = remainder
+                return [*self._stop(now, reason="introduction interrupted"), *actions]
+            if remainder:
+                return [
+                    *actions,
+                    *self._route_transcript(
+                        remainder, _normalize(remainder), now, heard_at, segment, session_opened=session_opened
+                    ),
+                ]
+            return actions
+        stops_something = (
+            cancels_held
+            or self._stop_target()
+            or not self._mirror_idle(now)
+            or normalized in self.config.stop_phrases
+            or normalized == "不玩了"
+        )
+        if (self._contains_stop(normalized) or normalized == "不玩了") and stops_something:
             # With nothing to interrupt, a sentence that merely contains a keyword is a command.
             # Checked before the wake gate on purpose: a stop must never need addressing.
             return self._stop(now, reason=f"stop keyword in {raw!r}")
+        if self._unsafe_request_id or state.timed_out_request_id or self._ending_session:
+            return [Log("previous request has no safe terminal; new intent held back")]
         if state.pending is not None:
             return self._answer_confirmation(normalized, raw, now)
         verdict = self._gate.judge(
@@ -720,32 +911,52 @@ class VoiceBridgeCore:
         if not verdict.addressed:
             return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
         raw, normalized = verdict.raw, verdict.normalized
-        semantic_block = self._judge_semantics(raw, normalized, now, session_opened=session_opened)
-        if semantic_block is not None:
-            return semantic_block
+        if normalized == "再见":
+            return [Log("farewell retained dialogue and business state")]
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
             return [Log(f"ignored bypass utterance {raw!r}")]
+        if not state.active_request_id and not self._mirror_idle(now):
+            actions = [Log(f"mirror ownership unresolved; dropped {raw!r}")]
+            if not self._mirror_busy_spoken:
+                self._mirror_busy_spoken = True
+                actions.append(
+                    self._speech(
+                        "模仿功能还在运行或状态待确认，请稍等。", kind="busy_mirror", priority=0, expires_at=now + 5.0
+                    )
+                )
+            return actions
         if state.active_request_id:
             actions = [Log(f"busy with {state.active_request_id}; dropped {raw!r}")]
-            if now - state.last_busy_at >= 10.0 and state.stopped_request_id != state.active_request_id:
+            if state.last_busy_at == float("-inf") and state.stopped_request_id != state.active_request_id:
                 state.last_busy_at = now
                 actions.append(
-                    Speak(
+                    self._speech(
                         f"正在做{state.task_label}，请稍等。",
                         request_id=state.active_request_id,
                         kind="busy",
+                        priority=0,
                         expires_at=now + 5.0,
                     )
                 )
             return actions
+        semantic_block = self._judge_semantics(raw, normalized, now, session_opened=session_opened)
+        if semantic_block is not None:
+            return semantic_block
         if len(normalized) < self.config.min_text_chars:
             return [Log(f"ignored short utterance {raw!r}")]
         self._gate.note_handled(heard_at)
 
-        if not state.session_id or now - state.last_activity > self.config.session_idle_sec:
+        if not state.session_id or (
+            not self.config.persistent_session and now - state.last_activity > self.config.session_idle_sec
+        ):
             state.session_id = _new_session_id()
             state.clarification_request_id = ""
+        invalidation = self.cancel_speech()
         request_id = self._id_factory()
+        self._latest_request_id = request_id
+        self._request_sessions[request_id] = state.session_id
+        while len(self._request_sessions) > _REMEMBERED_REQUEST_IDS:
+            del self._request_sessions[next(iter(self._request_sessions))]
         payload: dict[str, Any] = {
             "schema_version": 1,
             "request_id": request_id,
@@ -762,7 +973,7 @@ class VoiceBridgeCore:
         state.active_since = now
         state.last_activity = now
         state.known_request_ids.add(request_id)
-        return [Log(f"request {request_id}: {raw!r}"), PublishRequest(payload)]
+        return [*invalidation, Log(f"request {request_id}: {raw!r}"), PublishRequest(payload)]
 
     def on_response(self, payload: dict[str, Any], now: float) -> list[Action]:
         if self.config.feedback_only:
@@ -770,14 +981,20 @@ class VoiceBridgeCore:
         request_id = str(payload.get("request_id", ""))
         if request_id not in self._state.known_request_ids:
             return []
+        if self._request_sessions.get(request_id) != self._state.session_id:
+            return []
         self._state.last_activity = now
         if payload.get("accepted") is False or payload.get("state") in TERMINAL_REQUEST_STATES:
+            self._observe_mirror_terminal(payload, request_id)
             # A rejected admission is also emitted as a terminal event; speak only once.
             if not self._finish(request_id):
                 return []
             message = str(payload.get("message", "")).strip()
             reason = payload.get("reason_code", "")
             actions = [Log(f"request {request_id} not admitted: {reason} {message}")]
+            if reason == "BUSY" and self._deferred_submission and self._deferred_submission[0] == request_id:
+                self._deferred_text = self._deferred_submission[1]
+                self._deferred_after = now + 0.4
             if reason != "BUSY":
                 actions.extend(self._say(_spoken_reply(payload.get("state"), message)))
             return actions
@@ -799,9 +1016,18 @@ class VoiceBridgeCore:
         if not isinstance(key, dict) or not self._owns(key):
             return []
         request_id = str(key["request_id"])
+        if self._request_sessions.get(request_id, self._state.session_id) != self._state.session_id:
+            return []
         self._state.last_activity = now
         event_type = payload.get("event_type")
         state = payload.get("state")
+        if state not in TERMINAL_REQUEST_STATES and (
+            request_id != self.active_request_id
+            or request_id in self._state.finished_request_ids
+            or request_id in self._speech_suppressed
+            or request_id == self._state.stopped_request_id
+        ):
+            return []
         if event_type == "presentation":
             return self._on_presentation(payload, request_id, now)
         if event_type == "continuation":
@@ -816,16 +1042,24 @@ class VoiceBridgeCore:
         if event_type == "reply_preview":
             return self._on_reply_preview(payload, request_id)
         if state not in TERMINAL_REQUEST_STATES:
+            if request_id in self._state.finished_request_ids or request_id in self._speech_suppressed:
+                return []
             return self._execution_speech(payload, now)
-        silent = self._silent(request_id)
+        self._observe_mirror_terminal(payload, request_id)
+        if state == "UNKNOWN" and (not self._unsafe_request_id or self._unsafe_request_id == request_id):
+            self._unsafe_request_id = request_id
+        self._observe_terminal(payload, request_id, now)
+        silent = self._silent(request_id) or request_id in self._speech_suppressed
         previewed = self._take_preview(request_id)
         if not self._finish(request_id):
             return []
+        if request_id in self._speech_suppressed:
+            return [Log(f"suppressed terminal speech for {request_id}")]
         if event_type == "needs_clarification":
             self._state.clarification_request_id = request_id
         message = str(payload.get("user_message", "")).strip()
         if isinstance(payload.get("detail"), dict) and payload["detail"].get("execution_id"):
-            return self._execution_speech(payload, now)
+            return self._execution_speech(payload, now, silent=silent)
         spoken = "" if silent else _spoken_reply(state, message)
         detail = payload.get("detail") or {}
         if state == "SUCCEEDED" and isinstance(detail, dict) and detail.get("save_prompt"):
@@ -834,12 +1068,40 @@ class VoiceBridgeCore:
         if previewed and spoken == previewed:
             return [log, Log(f"request {request_id} reply was already said as its preview")]
 
-        return [log, *self._say(spoken, kind="terminal")]
+        actions = (
+            [
+                self._speech(
+                    spoken,
+                    request_id=request_id,
+                    terminal=state != "ANSWERED",
+                    kind="reply" if state == "ANSWERED" else "terminal",
+                    priority=10 if state == "ANSWERED" else 20,
+                )
+            ]
+            if spoken and self.config.speak_replies
+            else []
+        )
+        facts = detail.get("execution_detail") or {}
+        protected = (
+            state in {"UNKNOWN", "CANCELED", "CANCELLED"}
+            or facts.get("recovery_state") in {"FAILED", "UNKNOWN"}
+            or facts.get("suggested_action") == "MANUAL_CHECK"
+        )
+        if protected and spoken and self.config.speak_replies:
+            actions = [self._speech(spoken, request_id=request_id, terminal=True, kind="terminal", priority=40)]
+        return [log, *actions]
 
-    def _execution_speech(self, payload: dict[str, Any], now: float) -> list[Action]:
+    def _execution_speech(self, payload: dict[str, Any], now: float, *, silent: bool = False) -> list[Action]:
         if payload.get("event_type") not in {"execution_progress", "terminal", "quarantined", "failed", "cancelled"}:
             return []
         detail = payload.get("detail") or {}
+        request_id = str((payload.get("request_key") or {}).get("request_id", ""))
+        mirror = self._mirror_speech_policy.observe(payload, now)
+        if mirror is not None:
+            return self._notices(mirror) if self.config.speak_replies else []
+        if self._gift.owns(request_id):
+            notices = self._gift.accept(payload, now)
+            return self._notices(notices) if self.config.speak_replies else []
         if detail.get("current_skill") == "pick_object":
             # Accept every ordered fact, including silent stages, before selecting speech.
             self._feedback.accept(payload)
@@ -850,16 +1112,34 @@ class VoiceBridgeCore:
         if accepted is None or not self.config.speak_replies:
             return []
         execution_id, text, terminal = accepted
-        if self._silent(str(payload.get("request_id", ""))):
-            return [Log(f"request {payload.get('request_id')} speech suppressed: its output is speech itself")]
+        key = payload.get("request_key")
+        request_id = str(key.get("request_id", "")) if isinstance(key, dict) else ""
+        # Finishing a request clears its silent mark, so a terminal event passes it in. A clip
+        # that failed never played: only the failure can tell the visitor anything happened.
+        if (silent or self._silent(request_id)) and (not terminal or payload.get("state") == "SUCCEEDED"):
+            return [Log(f"request {request_id} speech suppressed: its output is speech itself")]
         detail = payload.get("detail") or {}
         if payload.get("state") == "SUCCEEDED" and detail.get("save_prompt"):
             text += str(detail["save_prompt"])
-        return [Speak(text, execution_id=execution_id, terminal=terminal, kind="terminal" if terminal else "reply")]
+        return [
+            self._speech(
+                text,
+                request_id=request_id,
+                execution_id=execution_id,
+                terminal=terminal,
+                kind="terminal" if terminal else "reply",
+                priority=40
+                if payload.get("state") in {"UNKNOWN", "CANCELED", "CANCELLED"}
+                or (detail.get("execution_detail") or {}).get("recovery_state") in {"FAILED", "UNKNOWN"}
+                else 20
+                if terminal
+                else 10,
+            )
+        ]
 
     def _notices(self, notices) -> list[Action]:
         return [
-            Speak(
+            self._speech(
                 n.text,
                 execution_id=n.execution_id,
                 terminal=n.terminal,
@@ -867,12 +1147,20 @@ class VoiceBridgeCore:
                 kind="terminal" if n.terminal else "reply",
                 notice=n,
                 important=n.important,
+                priority=40 if n.token.split(":", 1)[0] == "E06" else getattr(n, "priority", 20 if n.terminal else 10),
+                phase=getattr(n, "phase", ""),
+                event_key=getattr(n, "event_key", n.token),
+                expires_at=getattr(n, "expires_at", float("inf")),
             )
             for n in notices
         ]
 
     def note_playback(self, action: Speak, now: float) -> None:
-        if action.notice is not None:
+        if (
+            action.notice is not None
+            and not self._gift.owns(action.request_id)
+            and not action.event_key.startswith("MIRROR_")
+        ):
             self._speech_policy.played(action.notice, now)
 
     def _on_reply_preview(self, payload: dict[str, Any], request_id: str) -> list[Action]:
@@ -909,6 +1197,29 @@ class VoiceBridgeCore:
         state = self._state
         # A held transcript whose grace period ran out without a measurement.
         actions: list[Action] = self.release_held(now)
+        if self._mirror_stop_pending and not state.active_request_id and not state.timed_out_request_id:
+            actions += self._submit_mirror_stop(now)
+        if (
+            self._deferred_text
+            and not self._unsafe_request_id
+            and not state.active_request_id
+            and self._mirror_idle(now)
+            and now >= self._deferred_after
+        ):
+            text, self._deferred_text = self._deferred_text, ""
+            submitted = self._route_transcript(text, _normalize(text), now, now, None, session_opened=True)
+            actions += submitted
+            for action in submitted:
+                if isinstance(action, PublishRequest):
+                    self._deferred_submission = (action.payload["request_id"], text)
+        if (
+            self._ending_session
+            and not self._unsafe_request_id
+            and not state.active_request_id
+            and self._mirror_idle(now)
+        ):
+            self._ending_session = False
+            state.session_id = ""
         if self.config.speak_replies:
             actions += self._notices(self._speech_policy.tick(now))
         for request_id, due in list(self._receipt_due.items()):
@@ -916,7 +1227,7 @@ class VoiceBridgeCore:
                 self._receipt_due.pop(request_id, None)
                 if request_id == state.active_request_id and request_id not in self._announced_requests:
                     actions.append(
-                        Speak(
+                        self._speech(
                             "好呀，我在准备了，稍等一下。", request_id=request_id, kind="receipt", expires_at=now + 3.0
                         )
                     )
@@ -924,9 +1235,8 @@ class VoiceBridgeCore:
             request_id = state.pending.request_id
             state.pending = None
             actions += [
-                Log(f"confirmation for {request_id} timed out"),
-                PublishControl({"operation": "stop", "request_id": request_id}),
-                *self._say("确认超时，已取消。"),
+                *self._stop(now, reason=f"confirmation for {request_id} timed out"),
+                *self._say("确认超时，正在取消。"),
             ]
         if state.active_request_id and now - state.active_since > self.config.request_timeout_sec:
             # Events are best-effort topics; never let a lost terminal event wedge the channel.
@@ -937,11 +1247,22 @@ class VoiceBridgeCore:
             if state.pending is not None and state.pending.request_id == request_id:
                 state.pending = None
             state.timed_out_request_id = request_id
+            self._unsafe_request_id = request_id
+            if self._stop_deadline == float("inf"):
+                self._stop_deadline = now + 5.0
+                self._stop_warning_sent = False
+            actions += self.cancel_speech()
             actions += [
                 Log(f"request {request_id} produced no terminal event; stopping and releasing channel"),
                 PublishControl({"operation": "stop", "request_id": request_id}),
                 # Still a stop target while this plays: the reply must not contain a stop word.
                 *self._say("任务超时，正在中止。"),
+            ]
+        if self._unsafe_request_id and now >= self._stop_deadline and not self._stop_warning_sent:
+            self._stop_warning_sent = True
+            actions += [
+                Log(f"E06: stop confirmation timed out for {self._unsafe_request_id}"),
+                self._speech("停止状态尚未确认，请工作人员检查机器人和物体。", request_id="", important=True),
             ]
         return actions
 
@@ -954,7 +1275,7 @@ class VoiceBridgeCore:
         )
 
     def _on_presentation(self, payload: dict[str, Any], request_id: str, now: float) -> list[Action]:
-        if request_id != self._state.active_request_id:
+        if request_id != self._state.active_request_id or request_id in self._speech_suppressed:
             # A late presentation for a finished or timed-out request must not unlock execution
             # the channel no longer tracks.
             return [Log(f"presentation for inactive request {request_id}; not acknowledging")]
@@ -964,6 +1285,30 @@ class VoiceBridgeCore:
         presentation = detail.get("presentation")
         if not isinstance(presentation, dict) or presentation_digest(presentation) != detail.get("presentation_digest"):
             return [Log(f"presentation digest mismatch for {request_id}; not acknowledging")]
+        steps = presentation.get("steps", [])
+        if self.config.mirror_session_enabled and any(
+            isinstance(step, dict) and step.get("skill_name") == "mirror_start" for step in steps
+        ):
+            self._mirror_start_request_id = request_id
+            self._mirror_owned_requests.add(request_id)
+            self._mirror_seen_holding = False
+            self._mirror_busy_spoken = False
+        gift_owned = self._gift.register(request_id, self._state.session_id, steps)
+        if any(
+            isinstance(step, dict)
+            and step.get("skill_name")
+            in {
+                "greet_visitor",
+                "invite_visitor",
+                "introduce_in_detail",
+                "self_introduction",
+                "introduce_agent",
+                "introduce_platform",
+                "runtime_play_audio",
+            }
+            for step in steps
+        ):
+            self._introduction_request_id = request_id
         summary = _presentation_summary(presentation, payload.get("user_message", ""))
         self._state.task_label = _spoken_label(summary)
         self._receipt_due.pop(request_id, None)
@@ -977,6 +1322,9 @@ class VoiceBridgeCore:
             for step in presentation.get("steps", [])
             if isinstance(step, dict) and step.get("skill_name") == "pick_object"
         ]
+        if gift_owned:
+            self._announced_requests.add(request_id)
+            return [plan_log]
         if pick_steps and (
             detail.get("async_display") is True or presentation.get("execution_mode") == ASYNC_PRESENTATION_MODE
         ):
@@ -1015,13 +1363,13 @@ class VoiceBridgeCore:
             }
         )
         if self.config.confirm_mode == "auto":
-            return [plan_log, Speak(f"准备执行：{summary}。", then=(acknowledgement,))]
+            return [plan_log, self._speech(f"准备执行：{summary}。", then=(acknowledgement,))]
         self._state.pending = _PendingConfirmation(
             request_id=request_id,
             acknowledgement=acknowledgement,
             deadline=now + self.config.confirm_timeout_sec,
         )
-        return [plan_log, Speak(f"准备执行：{summary}。请说确认或取消。")]
+        return [plan_log, self._speech(f"准备执行：{summary}。请说确认或取消。")]
 
     def _answer_confirmation(self, normalized: str, raw: str, now: float) -> list[Action]:
         pending = self._state.pending
@@ -1047,10 +1395,26 @@ class VoiceBridgeCore:
         target = self._stop_target()
         state.pending = None
         state.last_activity = now
+        if self.config.mirror_session_enabled and (self._mirror_start_request_id or not self._mirror_idle(now)):
+            if target and target == self._mirror_stop_request_id:
+                return [Log("mirror stop already running"), *self.cancel_speech()]
+            if not target:
+                return self._submit_mirror_stop(now)
+            self._mirror_stop_pending = True
+            if target in self._mirror_owned_requests:
+                self._mirror_interrupted_id = target
         if not target:
             return [Log(f"{reason}: no active request")]
         state.stopped_request_id = target
-        return [Log(f"{reason}: stopping {target}"), PublishControl({"operation": "stop", "request_id": target})]
+        self._unsafe_request_id = target
+        if self._stop_deadline == float("inf"):
+            self._stop_deadline = now + 5.0
+            self._stop_warning_sent = False
+        return [
+            Log(f"{reason}: stopping {target}"),
+            PublishControl({"operation": "stop", "request_id": target}),
+            *self.cancel_speech(),
+        ]
 
     def _finish(self, request_id: str) -> bool:
         """Release ``request_id``; return False when it was already finished."""
@@ -1070,10 +1434,91 @@ class VoiceBridgeCore:
             self._state.pending = None
         return True
 
+    @staticmethod
+    def _speech_interrupt(text: str) -> str | None:
+        match = re.match(
+            r"^\s*(?:(?:好(?:的)?|嗯|那个|行)[，,。！!\s]*)*"
+            r"(?:不用说了|别讲了|别说了|停止播报|停止讲解|不用讲了|别介绍了|不用介绍了)[，,。！!\s]*(.*)$",
+            text,
+        )
+        return match.group(1).strip() if match else None
+
+    def cancel_speech(self) -> list[Action]:
+        self._generation += 1
+        self._receipt_due.clear()
+        self._state.preview_text = ""
+        self._state.preview_request_id = ""
+        return [CancelSpeech()]
+
+    def end_session(self, now: float) -> list[Action]:
+        """End dialogue without clearing unresolved robot safety state."""
+        self._gift.end_session(self._state.session_id)
+        # Retain configured checks, but end their wake window and speaker anchors.
+        self._gate = AddresseeGate(
+            trigger=self.config.addressee_trigger,
+            wake_phrases=self.config.wake_phrases,
+            wake_window_sec=self.config.wake_window_sec,
+            session_gap_sec=self.config.session_gap_sec,
+            checks=self._gate.checks,
+        )
+        self._held.clear()
+        self._deferred_text = ""
+        self._state.clarification_request_id = ""
+        self._speech_suppressed.update(self._request_sessions)
+        target = self._stop_target() or self._unsafe_request_id
+        mirror_unresolved = not self._mirror_idle(now)
+        self._ending_session = bool(target) or mirror_unresolved
+        if mirror_unresolved:
+            return [*self._stop(now, reason="staff session reset"), *self.cancel_speech()]
+        if target:
+            self._unsafe_request_id = target
+            return [*self._stop(now, reason="session ended"), *self.cancel_speech()]
+        self._state.session_id = ""
+        return self.cancel_speech()
+
+    def _observe_terminal(self, payload: dict[str, Any], request_id: str, now: float) -> None:
+        if self._unsafe_request_id != request_id:
+            return
+        if request_id in self._mirror_owned_requests and (
+            self._mirror_stop_failed or self._mirror_stop_pending or self._mirror_stop_request_id
+        ):
+            return
+        detail = payload.get("detail") or {}
+        facts = detail.get("execution_detail") or {}
+        if payload.get("state") == "UNKNOWN" or any(
+            item.get("recovery_state") in {"FAILED", "UNKNOWN"} for item in (detail, facts)
+        ):
+            return
+        if (
+            self._introduction_request_id == request_id
+            and payload.get("state") in {"CANCELLED", "CANCELED"}
+            and (
+                facts.get("phase_state") != "CANCELED"
+                or facts.get("reason_code") != "SKILL_CANCELLED"
+                or facts.get("recovery_state") != "NOT_NEEDED"
+            )
+        ):
+            return
+        if payload.get("state") not in {"SUCCEEDED", "CANCELLED", "CANCELED", "CANCELLED_BEFORE_EXECUTION"}:
+            return
+        self._unsafe_request_id = ""
+        self._stop_deadline = float("inf")
+        self._stop_warning_sent = False
+        self._introduction_request_id = ""
+        self._deferred_after = now + 0.4
+        if self._ending_session:
+            self._ending_session = False
+            self._state.session_id = ""
+
+    def _speech(self, text: str, **kwargs) -> Speak:
+        kwargs.setdefault("request_id", self._latest_request_id)
+        kwargs.setdefault("priority", 20 if kwargs.get("kind") == "terminal" else 10)
+        return Speak(text, generation=self._generation, session_id=self._state.session_id, **kwargs)
+
     def _say(self, text: str, *, kind: str = "reply") -> list[Action]:
         if not text or not self.config.speak_replies:
             return []
-        return [Speak(text, kind=kind)]
+        return [self._speech(text, kind=kind)]
 
 
 def _spoken_reply(state: Any, message: str) -> str:
@@ -1193,6 +1638,8 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         measurement_grace_sec=float(values["measurement_grace_sec"]),
         confirm_timeout_sec=float(values["confirm_timeout_sec"]),
         session_idle_sec=float(values["session_idle_sec"]),
+        persistent_session=bool(values["persistent_session"]),
+        mirror_session_enabled=bool(values["mirror_session_enabled"]),
         min_text_chars=int(values["min_text_chars"]),
         request_timeout_sec=float(values["request_timeout_sec"]),
         speech_mode=str(values["speech_mode"]),
@@ -1230,6 +1677,8 @@ class _Speaker:
     """Independent blocking adapters for synthesis and whole-utterance playback."""
 
     def __init__(self, node: Any, *, synthesis_service: str, playback_service: str, timeout_sec: float) -> None:
+        from std_srvs.srv import Trigger
+
         from ibrobot_msgs.srv import PlayAudioFile, SynthesizeSpeech
 
         self._node = node
@@ -1238,10 +1687,41 @@ class _Speaker:
         self._playback_type = PlayAudioFile
         self._synthesize = node.create_client(SynthesizeSpeech, synthesis_service)
         self._playback = node.create_client(PlayAudioFile, playback_service)
+        self._stop_type = Trigger
+        self._stop_client = node.create_client(Trigger, "/voice_tts/stop")
+        self._play_lock = threading.Lock()
+        self._play_generation = 0
+        self._pending_stop = None
+        self._pending_play = None
         self._closing = threading.Event()
+
+    def stop(self) -> None:
+        with self._play_lock:
+            self._play_generation += 1
+            # The executor owns recorded introductions. Never send a global stop
+            # without bridge playback to cancel, or a delayed command could stop it.
+            if self._pending_play is None and self._pending_stop is None:
+                return
+        if not self._stop_client.wait_for_service(timeout_sec=0.2):
+            raise TimeoutError("TTS stop service unavailable")
+        if self._pending_stop is None:
+            self._pending_stop = self._stop_client.call_async(self._stop_type.Request())
+        future = self._pending_stop
+        deadline = time.monotonic() + 0.5
+        while not future.done() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not future.done():
+            raise TimeoutError("TTS stop was not acknowledged")
+        self._pending_stop = None
+        if not future.result().success:
+            raise TimeoutError("TTS stop failed")
+        # A successful stop can precede the old play response. The pipeline
+        # waits for that callback and retries stop while it drains; do not turn
+        # this normal ordering into a cancellation failure.
 
     def close(self) -> None:
         self._closing.set()
+        self.stop()
 
     def synthesize(self, text: str) -> Any:
         if self._closing.is_set() or not self._synthesize.wait_for_service(timeout_sec=2.0):
@@ -1255,10 +1735,12 @@ class _Speaker:
         return result.audio_segments
 
     def play(self, segments: Any) -> bool:
+        with self._play_lock:
+            generation = self._play_generation
         if self._closing.is_set() or not self._playback.wait_for_service(timeout_sec=2.0):
             return False
         for segment in segments:
-            if self._closing.is_set():
+            if self._closing.is_set() or generation != self._play_generation:
                 return False
             descriptor, path = tempfile.mkstemp(prefix="ibrobot-voice-bridge-", suffix=".wav")
             try:
@@ -1266,7 +1748,16 @@ class _Speaker:
                     stream.write(bytes(segment.audio_data))
                 play = self._playback_type.Request()
                 play.file_path = path
-                played = self._call(self._playback, play)
+                with self._play_lock:
+                    if generation != self._play_generation or self._closing.is_set():
+                        return False
+                    if self._pending_stop is not None or self._pending_play is not None:
+                        return False
+                    future = self._playback.call_async(play)
+                    self._pending_play = future
+                played = self._wait(future)
+                if future.done():
+                    self._pending_play = None
                 if played is None or not played.success:
                     self._node.get_logger().error(f"TTS playback failed: {getattr(played, 'message', 'timeout')}")
                     return False
@@ -1278,6 +1769,9 @@ class _Speaker:
         if self._closing.is_set():
             return None
         future = client.call_async(request)
+        return self._wait(future)
+
+    def _wait(self, future: Any) -> Any:
         deadline = time.monotonic() + self._timeout_sec
         while not future.done() and time.monotonic() < deadline and not self._closing.is_set():
             time.sleep(0.02)
@@ -1287,6 +1781,7 @@ class _Speaker:
 def _build_node_class():
     from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
     from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
 
     class VoiceBridgeNode(Node):
@@ -1313,6 +1808,9 @@ def _build_node_class():
                 else None
             )
             self._speech_pipeline = None
+            self._speech_commands = queue.Queue()
+            self._speech_transport_failed = False
+            self._speech_transport = None
             # Muting ASR still lets it publish the utterance it had already started, and that text
             # would be routed as a new command (possibly re-triggering this very reply). Ignore
             # transcripts until the ASR resume has settled.
@@ -1360,6 +1858,16 @@ def _build_node_class():
                 String, str(values["response_topic"]), self._on_response, 10, callback_group=inbound
             )
             self.create_subscription(String, str(values["event_topic"]), self._on_event, 10, callback_group=inbound)
+            if self._core.config.mirror_session_enabled:
+                self.create_subscription(
+                    String,
+                    MIRROR_SESSION.STATE_TOPIC,
+                    self._on_mirror_state,
+                    QoSProfile(
+                        depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+                    ),
+                    callback_group=inbound,
+                )
             if values["partial_topic"] and not self._core.config.feedback_only:
                 self.create_subscription(
                     String, str(values["partial_topic"]), self._on_partial, 10, callback_group=inbound
@@ -1396,15 +1904,24 @@ def _build_node_class():
                 self.create_subscription(
                     SpeechWakeEvent, str(values["wake_event_topic"]), self._on_wake_event, 10, callback_group=inbound
                 )
+            self.create_subscription(
+                String, "/ibrobot_agent/voice_control", self._on_voice_control, 10, callback_group=inbound
+            )
             self.create_timer(0.2, self._on_tick, callback_group=inbound)
             if self._speaker is not None:
                 self._speech_pipeline = SpeechPipeline(
                     synthesize=lambda action: self._speaker.synthesize(_tts_text(action.text)),
                     play=self._render_speech,
+                    stop=self._speaker.stop,
                     is_current=self._speech_is_current,
                     completed=lambda action: self._execute(action.then),
                     log=lambda message: self.get_logger().info(message),
                 )
+            if self._speaker is not None:
+                self._speech_transport = threading.Thread(
+                    target=self._speech_commands_loop, daemon=True, name="voice-cancellation"
+                )
+                self._speech_transport.start()
             confirm_mode = self._core.config.confirm_mode
             self.get_logger().info(
                 f"voice bridge ready: {transcript_topic} -> {values['request_topic']} "
@@ -1442,17 +1959,17 @@ def _build_node_class():
         def _hear(self, text: str, segment: Segment | None) -> None:
             if self._core.config.feedback_only:
                 return
-            now = time.monotonic()
-            if now < self._deaf_until or (now < self._echo_until and not self._core.is_stop_text(text)):
-                self.get_logger().info(f"ignored transcript heard during playback: {text!r}")
-                return
             # The core holds a transcript that is still waiting for its measurement.
             self._run(lambda now: self._core.on_heard(text, now, segment))
 
         def _on_partial(self, message: String) -> None:
-            if time.monotonic() < self._deaf_until:
-                return
             self._run(lambda now: self._core.on_partial(message.data, now))
+
+        def _on_voice_control(self, message: String) -> None:
+            if message.data.strip() in {"end_session", "结束这轮", "下一位"}:
+                self._run(self._core.end_session)
+            elif message.data.strip() == "cancel_speech":
+                self._run(lambda now: self._core.cancel_speech())
 
         def _on_response(self, message: String) -> None:
             if self._core.config.feedback_only:
@@ -1465,6 +1982,11 @@ def _build_node_class():
             payload = self._decode(message.data, "event")
             if payload is not None:
                 self._run(lambda now: self._core.on_event(payload, now))
+
+        def _on_mirror_state(self, message: String) -> None:
+            payload = self._decode(message.data, "mirror state")
+            source_now = self.get_clock().now().nanoseconds / 1e9
+            self._run(lambda now: self._core.on_mirror_state(payload or {}, now, source_now=source_now))
 
         def _on_wake_event(self, message: Any) -> None:
             segment = (str(message.source_id), int(message.segment_sequence))
@@ -1506,21 +2028,63 @@ def _build_node_class():
                 if isinstance(action, Log):
                     self.get_logger().info(action.message)
                 elif isinstance(action, PublishRequest):
-                    self._request_publisher.publish(String(data=json.dumps(action.payload, ensure_ascii=False)))
+                    if self._speaker is None:
+                        self._request_publisher.publish(String(data=json.dumps(action.payload, ensure_ascii=False)))
+                    else:
+                        # A new recorded introduction shares the global player.
+                        # It must not overtake cancellation of old bridge speech.
+                        self._speech_commands.put(action)
                 elif isinstance(action, PublishControl):
                     self._control_publisher.publish(String(data=json.dumps(action.payload, ensure_ascii=False)))
+                elif isinstance(action, CancelSpeech):
+                    if self._speaker is not None:
+                        self._speech_commands.put(action)
                 elif isinstance(action, Speak):
                     if self._speaker is None:
                         self.get_logger().info(f"[say] {action.text}")
                         self._execute(action.then)
                     else:
+                        self._speech_commands.put(action)
+
+        def _speech_commands_loop(self) -> None:
+            while True:
+                action = self._speech_commands.get()
+                if action is None:
+                    return
+                try:
+                    if isinstance(action, CancelSpeech):
+                        self._speech_pipeline.cancel(stop=self._speaker.stop, timeout=5.0)
+                        self._speech_transport_failed = False
+                    elif isinstance(action, PublishRequest):
+                        with self._core_lock:
+                            current = (
+                                action.payload["request_id"] == self._core.active_request_id
+                                and action.payload["session_id"] == self._core._state.session_id
+                                and (
+                                    not self._core._unsafe_request_id
+                                    or (
+                                        self._core.config.mirror_session_enabled
+                                        and action.payload["request_id"] == self._core._mirror_stop_request_id
+                                        and action.payload["text"] == "停止照镜子"
+                                    )
+                                )
+                            )
+                        if not self._speech_transport_failed and current:
+                            self._request_publisher.publish(String(data=json.dumps(action.payload, ensure_ascii=False)))
+                    elif not self._speech_transport_failed and self._speech_is_current(action):
                         self._speech_pipeline.submit(action)
+                except Exception as error:
+                    self._speech_transport_failed = True
+                    self.get_logger().error(f"speech cancellation failed; speech held: {error}")
 
         def _speech_is_current(self, action: Speak) -> bool:
             with self._core_lock:
                 return self._core.speech_is_current(action, time.monotonic())
 
         def destroy_node(self):
+            if self._speech_transport is not None:
+                self._speech_commands.put(None)
+                self._speech_transport.join(timeout=6.0)
             if self._speech_pipeline is not None:
                 self._speech_pipeline.close(stop=self._speaker.close)
                 self._speech_pipeline = None
@@ -1532,31 +2096,13 @@ def _build_node_class():
                 if not self._core.speech_is_current(action, time.monotonic()):
                     return False
                 self._core.note_playback(action, time.monotonic())
-                interruptible = self._core.interruptible
                 self._core.note_speech(text, time.monotonic())
-            # Muting ASR would also drop the stop keyword, so it is only done while nothing can move.
-            # A reply that itself contains a stop word would stop the request it talks about, so it
-            # still mutes (and says so).
-            keep_listening = interruptible and not self._core.is_stop_text(action.text)
-            if interruptible and not keep_listening:
-                self.get_logger().warning(f"reply contains a stop word; ASR is muted while it plays: {action.text!r}")
-            muted = self._mute_asr and not keep_listening and self._asr_state in _ACTIVE_ASR_STATES
-            filter_echo = self._mute_asr and keep_listening
-            if muted:
-                self._asr_control_publisher.publish(String(data="stop"))
-                self._deaf_until = float("inf")
-            elif filter_echo:
-                self._echo_until = float("inf")
+            # Keep recognition live; the core filters actual text echoes, not all audio
+            # captured during playback. Cancellation runs on the transport worker.
             try:
                 self.get_logger().info(f"[say] {text}")
                 spoken = self._speaker.play(audio)
             finally:
-                settled = time.monotonic() + self._resume_settle_sec
-                if muted:
-                    self._asr_control_publisher.publish(String(data="start"))
-                    self._deaf_until = settled
-                elif filter_echo:
-                    self._echo_until = settled
                 with self._core_lock:
                     self._core.note_speech(text, time.monotonic(), finished=True)
             return spoken

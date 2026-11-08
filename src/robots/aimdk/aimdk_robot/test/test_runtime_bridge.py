@@ -72,6 +72,8 @@ class Harness:
         self.dataplane.terminate()
         self.dataplane.wait(timeout=5.0)
         self.executor.shutdown(timeout_sec=2.0)
+        self._thread.join(timeout=3.0)
+        assert not self._thread.is_alive(), "executor must exit before node destruction"
         for node in (self.node, self.runtime, self.mock):
             node.destroy_node()
 
@@ -2992,5 +2994,224 @@ def test_task_pose_trajectory_in_policy_stream_preserves_mode_and_can_stop(tmp_p
         assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL
         assert result.status == (GoalStatus.STATUS_CANCELED if cancel else GoalStatus.STATUS_SUCCEEDED)
         assert harness.status().active_mode == "policy_stream"
+    finally:
+        harness.shutdown()
+
+
+# --- opted-in social replay cancellation returns along the executed path ---
+
+
+def _returning_wave(tmp_path, **config):
+    return _replay_harness(
+        tmp_path,
+        duration_s=1.4,
+        named_motion={
+            "cancel_return_motions": ["wave"],
+            "trajectory_cancel_return_settle_s": 0.6,
+            **config,
+        },
+    )
+
+
+def _cancel_return_start(harness):
+    handle = _wave_goal(harness)
+    harness.wait_for(lambda: (_right_pitch(harness) or 0) < -0.2, "wave excursion")
+    future = handle.cancel_goal_async()
+    harness.wait_for(lambda: future.done(), "cancel accepted")
+    assert future.result().goals_canceling
+    return handle.get_result_async()
+
+
+def test_cancel_return_reaches_nonzero_measured_origin_and_owns_arm(tmp_path):
+    from action_msgs.msg import GoalStatus
+    from rclpy.action import ActionClient
+
+    harness = _returning_wave(tmp_path)
+    try:
+        # A real vendor feedback pose, neither recording start nor home.
+        from aimdk_robot.vendor_mock_node import ARM_JOINTS
+
+        with harness.mock._lock:
+            harness.mock._positions[ARM_JOINTS[_RIGHT_PITCH]] = 0.12
+        harness.wait_for(
+            lambda: (harness.runtime.measured_arm_positions() or [0] * 14)[_RIGHT_PITCH] > 0.1, "nonzero measured start"
+        )
+        result = _cancel_return_start(harness)
+        harness.wait_for(lambda: harness.runtime._named_motion._returning, "returning")
+        assert not result.done()
+        assert harness.runtime._arm_owner is not None
+        # Even interrupt=true must not take over a return in progress.
+        client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+        assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+        replacement = ExecuteNamedMotion.Goal(name="wave", interrupt=True)
+        decision = client.send_goal_async(replacement)
+        harness.wait_for(lambda: decision.done(), "replacement decision")
+        assert not decision.result().accepted
+        # Public trajectories remain excluded by the same arm owner.
+        before = harness.runtime._dataplane.public_arm_count
+        publisher = harness.node.create_publisher(Float64MultiArray, "/aimdk/arm/commands", 10)
+        publisher.publish(Float64MultiArray(data=[0.9] * len(projection.VENDOR_ARM_ORDER)))
+        harness.wait_for(lambda: result.done(), "returned cancellation", timeout_s=8)
+        terminal = result.result()
+        assert terminal.status == GoalStatus.STATUS_CANCELED
+        assert terminal.result.error_code == ExecuteNamedMotion.Result.CANCELLED
+        assert terminal.result.resume_token == ""
+        assert "returned to measured" in terminal.result.message
+        sample = harness.runtime.measured_arm_sample()
+        assert sample is not None
+        assert sample[0][_RIGHT_PITCH] == pytest.approx(0.12, abs=0.03)
+        assert harness.runtime._dataplane.public_arm_count == before
+        assert harness.runtime._arm_owner is None
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["not_following", "stale", "budget", "stop", "mode", "nan"])
+def test_cancel_return_failure_is_not_safe_cancel(tmp_path, failure):
+    from action_msgs.msg import GoalStatus
+
+    config = {"trajectory_cancel_return_timeout_s": 0.1} if failure == "budget" else {}
+    harness = _returning_wave(tmp_path, **config)
+    try:
+        handle = _wave_goal(harness)
+        harness.wait_for(lambda: (_right_pitch(harness) or 0) < -0.2, "wave excursion")
+        if failure == "not_following":
+            harness.mock.set_parameters([rclpy.parameter.Parameter("follow_commands", value=False)])
+        elif failure in {"stale", "nan"}:
+            harness.mock.set_parameters(
+                [rclpy.parameter.Parameter("publish_joint_groups", value=["head", "waist", "leg", "hand"])]
+            )
+            if failure == "nan":
+                original = harness.runtime.measured_arm_sample
+                harness.runtime.measured_arm_sample = lambda: ([float("nan")] * 14, time.monotonic())
+        cancel = handle.cancel_goal_async()
+        harness.wait_for(lambda: cancel.done(), "cancel accepted")
+        assert cancel.result().goals_canceling
+        result = handle.get_result_async()
+        if failure in {"stop", "mode"}:
+            harness.wait_for(lambda: harness.runtime._named_motion._returning, "returning")
+            if failure == "stop":
+                request = StopRuntime.Request(policy="HOLD")
+                assert harness.call(StopRuntime, "/runtime/stop", request).success
+            else:
+                assert harness.set_mode("idle").success
+        harness.wait_for(lambda: result.done(), "failed return result", timeout_s=8)
+        terminal = result.result()
+        assert terminal.status == GoalStatus.STATUS_ABORTED
+        assert terminal.result.error_code != ExecuteNamedMotion.Result.CANCELLED
+        assert terminal.result.resume_token == ""
+        assert not terminal.result.success
+        assert harness.runtime._arm_owner is None
+        assert not harness.runtime.output_admitted()
+        if failure == "nan":
+            harness.runtime.measured_arm_sample = original
+    finally:
+        harness.shutdown()
+
+
+def test_cancel_return_production_wave_covers_actual_path_and_budget(tmp_path):
+    import shutil
+
+    import yaml
+    from action_msgs.msg import GoalStatus
+    from aimdk_robot.vendor_mock_node import ARM_JOINTS
+
+    profile = yaml.safe_load(OMNIHAND_PROFILE.read_text())
+    profile["vendor"]["named_motion"]["trajectories"] = {"wave": "wave.json"}
+    profile["vendor"]["named_motion"]["cancel_return_motions"] = ["wave"]
+    shutil.copyfile(OMNIHAND_PROFILE.parent / "trajectories" / "wave.json", tmp_path / "wave.json")
+    (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
+    harness = Harness(tmp_path / "profile.yaml", hand_type="dexterous", right_hand_type="none")
+    try:
+        harness.wait_active(timeout_s=2 * TIMEOUT_S)
+        assert harness.set_mode("stream").success
+        server = harness.runtime._named_motion
+        recording = server._trajectories["wave"]
+        start = list(recording.positions[0])
+        start[_RIGHT_PITCH] += 0.12
+        with harness.mock._lock:
+            harness.mock._positions.update(dict(zip(ARM_JOINTS, start, strict=True)))
+        harness.wait_for(
+            lambda: (
+                max(
+                    abs(a - b)
+                    for a, b in zip(harness.runtime.measured_arm_positions() or [99] * len(start), start, strict=True)
+                )
+                < 0.01
+            ),
+            "actual nonzero production start",
+        )
+        handle = _wave_goal(harness)
+        harness.wait_for(lambda: harness.runtime._arm_owner is not None, "production wave ownership")
+        # Cancel close to the recording's end, exercising almost its entire path.
+        time.sleep(4.7)
+        cancel = handle.cancel_goal_async()
+        harness.wait_for(lambda: cancel.done(), "production cancellation")
+        assert cancel.result().goals_canceling
+        result = handle.get_result_async()
+        began = time.monotonic()
+        harness.wait_for(lambda: result.done(), "production wave return", timeout_s=30)
+        terminal = result.result()
+        assert terminal.status == GoalStatus.STATUS_CANCELED, terminal.result.message
+        assert not terminal.result.resume_token
+        assert time.monotonic() - began > 8, "the real production path must actually be retraced"
+        assert max(abs(a - b) for a, b in zip(harness.runtime.measured_arm_positions(), start, strict=True)) <= 0.03
+        assert harness.runtime.output_admitted()
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["missing_hand", "unconfirmed_final"])
+def test_summit_recording_requires_measured_hands_and_confirmed_final_pose(tmp_path, failure):
+    import yaml
+    from action_msgs.msg import GoalStatus
+    from rclpy.action import ActionClient
+
+    profile_path = OMNIHAND_PROFILE.parent / "x2_ultra_omnihand_summit.yaml"
+    profile = yaml.safe_load(profile_path.read_text())
+    config = profile["vendor"]["named_motion"]
+    config["trajectories"] = {name: str(profile_path.parent / path) for name, path in config["trajectories"].items()}
+    config["trajectory_cancel_return_settle_s"] = 0.3
+    (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile))
+    harness = Harness(tmp_path / "profile.yaml", hand_type="none", right_hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        harness.wait_for(lambda: harness.runtime.measured_hand_sample(), "measured right hand")
+        server = harness.runtime._named_motion
+        if failure == "missing_hand":
+            harness.runtime.measured_hand_sample = lambda: None
+        else:
+            # Real commands and feedback continue; the final measurement alone
+            # stays outside tolerance, so a sent target cannot mean success.
+            original = harness.runtime.measured_hand_sample
+
+            def final_not_reached():
+                sample = original()
+                if sample and server._running and harness.mock.upper_body_count > 200:
+                    return ([value + 0.2 for value in sample[0]], sample[1])
+                return sample
+
+            harness.runtime.measured_hand_sample = final_not_reached
+        before = harness.mock.upper_body_count
+        client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+        assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+        pending = client.send_goal_async(ExecuteNamedMotion.Goal(name="short_wave"))
+        harness.wait_for(pending.done, "recorded goal decision")
+        handle = pending.result()
+        assert handle.accepted
+        result = handle.get_result_async()
+        harness.wait_for(result.done, "recorded failure result", timeout_s=20)
+        terminal = result.result()
+        assert terminal.status == GoalStatus.STATUS_ABORTED
+        assert not terminal.result.success
+        if failure == "missing_hand":
+            assert harness.mock.upper_body_count == before
+            assert "hand" in terminal.result.message.lower()
+        else:
+            assert harness.mock.upper_body_count > before + 200
+            assert "FINAL_POSE_UNCONFIRMED" in terminal.result.message
+            assert not harness.runtime.output_admitted()
+            assert harness.runtime._arm_owner is None
     finally:
         harness.shutdown()

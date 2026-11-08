@@ -9,6 +9,7 @@ from ibrobot_agent.addressee import Voiceprint
 from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE
 from ibrobot_agent.presentation import presentation_digest
 from ibrobot_agent.voice_bridge import (
+    CancelSpeech,
     Log,
     PublishControl,
     PublishRequest,
@@ -65,7 +66,7 @@ def test_busy_channel_drops_new_utterance_and_briefly_names_current_task():
     assert core.active_request_id == "voice-0"
 
 
-def test_busy_speech_is_rate_limited_and_expires_without_controlling_execution():
+def test_busy_speech_is_once_per_request_and_expires_without_controlling_execution():
     core = _core()
     core.on_transcript("双手交叉放在胸前", now=0.0)
     first = core.on_transcript("你好", now=1.0)
@@ -74,9 +75,10 @@ def test_busy_speech_is_rate_limited_and_expires_without_controlling_execution()
     assert not _of(core.on_transcript("你好", now=2.0), Speak)
     assert not core.speech_is_current(_of(first, Speak)[0], now=7.0)
     later = core.on_transcript("你好", now=12.0)
-    assert len(_of(later, Speak)) == 1
+    assert not _of(later, Speak)
+    assert _of(first, Speak)[0].priority == 0
     core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=13.0)
-    assert not core.speech_is_current(_of(later, Speak)[0], now=13.1)
+    assert not core.speech_is_current(_of(first, Speak)[0], now=13.1)
 
 
 def test_acceptance_gets_one_async_receipt_and_never_waits_for_playback():
@@ -101,7 +103,8 @@ def test_delayed_playback_text_and_captured_audio_cannot_trigger_busy_loop():
     actions = core.on_transcript("这个任务还没有完成任何步骤现在重新执行", now=6.24)
     assert not _of(actions, Speak) and not _of(actions, PublishRequest)
     actions = core.on_transcript("识别完全错误的内容", now=25.0, segment=("mic", 10))
-    assert not _of(actions, Speak) and not _of(actions, PublishRequest)
+    # Capture overlap alone cannot discard a real new intent during playback.
+    assert _of(actions, Speak) and not _of(actions, PublishRequest)
     stop = core.on_transcript("停", now=25.1, segment=("mic", 10))
     assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
 
@@ -567,6 +570,7 @@ def test_default_stop_words_are_the_shared_control_vocabulary():
 def _speaking_node(core, heard_during_playback):
     """A bridge node whose speaker feeds ``heard_during_playback`` back as ASR finals while it speaks."""
     import logging
+    import queue
     import threading
 
     from ibrobot_agent.voice_bridge import _build_node_class
@@ -600,6 +604,7 @@ def _speaking_node(core, heard_during_playback):
     node._echo_until = 0.0
     node._resume_settle_sec = 30.0
     node._speaker = _Speaker()
+    node._speech_commands = queue.Queue()
     node._request_publisher = _Publisher()
     node._control_publisher = _Publisher()
     node._asr_control_publisher = _Publisher()
@@ -614,7 +619,7 @@ def test_stop_word_is_heard_while_the_bridge_speaks_during_motion():
     # The robot hears its own busy reply and then the user's stop word.
     node = _speaking_node(core, [VoiceBridgeConfig.busy_message, "停"])
 
-    node._render_speech(Speak(VoiceBridgeConfig.busy_message), [])
+    node._render_speech(core._speech(VoiceBridgeConfig.busy_message), [])
 
     assert node._asr_control_publisher.messages == []  # ASR was never muted
     assert [json.loads(data) for data in node._control_publisher.messages] == [
@@ -640,19 +645,22 @@ def test_terminal_feedback_does_not_delay_stop_control():
     node._execute(core.on_partial("停", now=1.0))
     assert node._control_publisher.messages
     node._execute(core.on_event(_event("voice-0", "terminal", "CANCELLED"), now=2.0))
-    assert submitted[-1].text == "已停止。"
-    assert submitted[-1].kind == "terminal"
+    queued = list(node._speech_commands.queue)
+    assert any(isinstance(action, CancelSpeech) for action in queued)
+    assert queued[-1].text == "已停止。"
+    assert queued[-1].kind == "terminal"
 
 
-def test_reply_with_a_stop_word_still_mutes_asr():
+def test_reply_with_a_stop_word_keeps_asr_live_and_filters_its_echo():
     core = _core()
     core.on_transcript("挥挥手", now=0.0)
     node = _speaking_node(core, ["已停止"])
 
-    node._render_speech(Speak("已停止。"), [])
+    node._render_speech(core._speech("正在执行当前任务，请稍等。"), [])
 
-    assert node._asr_control_publisher.messages == ["stop", "start"]
-    assert node._control_publisher.messages == []
+    assert node._asr_control_publisher.messages == []
+    # Explicit stop words remain a safety control even during speech.
+    assert node._control_publisher.messages
 
 
 def test_reply_preview_is_spoken_once_and_not_repeated_by_the_answer():
@@ -700,6 +708,45 @@ def _async_presentation_event(request_id):
     return _event(
         request_id, "presentation", "MAY_EXECUTE", detail={**detail, "receipt_token": "", "async_display": True}
     )
+
+
+def _clip_presentation_event(request_id):
+    presentation = {
+        "summary": "self_introduction",
+        "execution_mode": ASYNC_PRESENTATION_MODE,
+        "steps": [{"index": 1, "skill_name": "self_introduction"}],
+    }
+    detail = {"presentation": presentation, "presentation_digest": presentation_digest(presentation)}
+    return _event(
+        request_id, "presentation", "MAY_EXECUTE", detail={**detail, "receipt_token": "", "async_display": True}
+    )
+
+
+def _clip_event(request_id, event_type, state, sequence):
+    detail = {"execution_id": "e1", "gateway_sequence": sequence, "current_skill": "self_introduction"}
+    return _event(request_id, event_type, state, detail=detail)
+
+
+def test_a_clip_skill_is_its_own_reply_through_a_typed_program():
+    core = _core(silent_skills=("self_introduction",))
+    core.on_transcript("自我介绍", now=0.0)
+
+    presented = core.on_event(_clip_presentation_event("voice-0"), now=1.0)
+    progress = core.on_event(_clip_event("voice-0", "execution_progress", "RUNNING", 1), now=2.0)
+    done = core.on_event(_clip_event("voice-0", "terminal", "SUCCEEDED", 2), now=15.0)
+
+    assert _of(presented, Speak) == [] and _of(progress, Speak) == [] and _of(done, Speak) == []
+    assert core.active_request_id == ""
+
+
+def test_a_clip_that_failed_is_reported_because_nothing_was_played():
+    core = _core(silent_skills=("self_introduction",))
+    core.on_transcript("自我介绍", now=0.0)
+    core.on_event(_clip_presentation_event("voice-0"), now=1.0)
+
+    failed = core.on_event(_clip_event("voice-0", "failed", "FAILED", 1), now=2.0)
+
+    assert [action.text for action in _of(failed, Speak)] == ["执行失败，请查看执行记录或联系操作员。"]
 
 
 def test_a_previewed_typed_program_is_not_announced_a_second_time():
@@ -1829,6 +1876,7 @@ def test_the_node_routes_a_held_follow_up_the_moment_its_voiceprint_lands():
     node._deaf_until = node._echo_until = 0.0
     node._request_publisher = _Publisher()
     node._control_publisher = _Publisher()
+    node._speaker = None
     node._speech_queue = []
     node._speech_wakeup = threading.Condition()
     requests = lambda: [json.loads(data)["text"] for data in node._request_publisher.messages]  # noqa: E731
@@ -1854,3 +1902,275 @@ def test_the_node_routes_a_held_follow_up_the_moment_its_voiceprint_lands():
     node._on_segment_transcript(_Transcript("鼓个掌", 3))
     node._on_speaker_embedding(_Embedding((), 3))
     assert requests() == ["挥个手", "握个手", "鼓个掌"], "a known-missing voiceprint releases at once"
+
+
+def _mirror_state(core, now, state="WAIT", *, holding=False, releasing=False, stamp=None, source_now=None):
+    source_now = 2_000_000_000.0 + now if source_now is None else source_now
+    core.on_mirror_state(
+        {"state": state, "holding": holding, "releasing": releasing, "stamp": source_now if stamp is None else stamp},
+        now,
+        source_now=source_now,
+    )
+
+
+def _start_mirror(core):
+    _mirror_state(core, 0)
+    core.on_heard("照镜子", 0.1)
+    presentation = {"steps": [{"skill_name": "mirror_start"}], "execution_mode": ASYNC_PRESENTATION_MODE}
+    core.on_event(
+        _event(
+            "voice-0",
+            "presentation",
+            "MAY_EXECUTE",
+            detail={
+                "presentation": presentation,
+                "presentation_digest": presentation_digest(presentation),
+            },
+        ),
+        0.2,
+    )
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), 0.3)
+
+
+def test_persistent_session_survives_idle_but_still_requires_fresh_addressing():
+    core = _core(persistent_session=True, wake_phrases=("欧拉欧拉",), wake_window_sec=1)
+    first = _of(core.on_heard("欧拉欧拉，挥手", 0), PublishRequest)[0].payload
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), 0.1)
+    assert not _of(core.on_heard("点点头", 121), PublishRequest)
+    second = _of(core.on_heard("欧拉欧拉，点点头", 122), PublishRequest)[0].payload
+    assert second["session_id"] == first["session_id"]
+
+
+def test_default_idle_still_changes_session_for_other_deployments():
+    core = _core()
+    first = _of(core.on_heard("挥手", 0), PublishRequest)[0].payload
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), 0.1)
+    second = _of(core.on_heard("点头", 122), PublishRequest)[0].payload
+    assert second["session_id"] != first["session_id"]
+
+
+def test_business_stop_and_farewell_preserve_session_and_speech_only_cancel_preserves_task():
+    core = _core(persistent_session=True)
+    first = _of(core.on_heard("拿柠檬", 0), PublishRequest)[0].payload
+    assert _of(core.on_heard("别说了", 0.2), CancelSpeech)
+    assert core.active_request_id == "voice-0"
+    goodbye = core.on_heard("再见", 1)
+    assert not _of(goodbye, PublishControl) and not _of(goodbye, PublishRequest) and not _of(goodbye, Speak)
+    for text in ("下一位", "结束会话"):
+        assert not _of(core.on_heard(text, 1.1), PublishControl)
+        assert core._state.session_id == first["session_id"]
+    stopped = core.on_heard("不玩了", 2)
+    assert _of(stopped, PublishControl)[0].payload == {"operation": "stop", "request_id": "voice-0"}
+    core.on_event(_event("voice-0", "terminal", "CANCELLED"), 2.1)
+    second = _of(core.on_heard("请问天空为什么是蓝色", 3), PublishRequest)[0].payload
+    assert second["session_id"] == first["session_id"]
+
+
+def test_mirror_start_terminal_before_holding_heartbeat_never_admits_question():
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    assert not core.active_request_id
+    assert not _of(core.on_heard("天空为什么蓝", 0.4), PublishRequest)
+    _mirror_state(core, 0.5)  # Old/early WAIT cannot prove the start has released.
+    assert not _of(core.on_heard("点点头", 0.6), PublishRequest)
+    _mirror_state(core, 0.7, "MIRRORING", holding=True)
+    assert not _of(core.on_heard("天空为什么蓝", 0.8), PublishRequest)
+    _mirror_state(core, 0.9)
+    assert _of(core.on_heard("点点头", 1), PublishRequest)
+
+
+@pytest.mark.parametrize(
+    "state,holding,releasing",
+    [("STANDBY", True, False), ("WAIT", True, False), ("WAIT", False, True), ("MIRRORING", True, False)],
+)
+def test_mirror_ownership_blocks_even_without_active_request(state, holding, releasing):
+    core = _core(mirror_session_enabled=True)
+    _mirror_state(core, 0, state, holding=holding, releasing=releasing)
+    first = core.on_heard("天空为什么蓝", 0.1)
+    assert not _of(first, PublishRequest)
+    busy = _of(first, Speak)[0]
+    assert busy.priority == 0 and core.speech_is_current(busy, 0.1)
+    assert not _of(core.on_heard("天气如何", 0.2), Speak)
+    assert not _of(core.on_heard("再见", 0.3), PublishControl)
+    _mirror_state(core, 0.4)
+    assert not core.speech_is_current(busy, 0.4)
+    assert _of(core.on_heard("挥手", 0.5), PublishRequest)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        {},
+        {"state": "UNKNOWN"},
+        {"state": "WAIT", "holding": False, "releasing": False, "stamp": 1},
+        {"state": "WAIT", "holding": False, "releasing": False, "stamp": float("nan")},
+        {"state": "WAIT", "holding": False, "releasing": False, "stamp": 2000000100},
+    ],
+)
+def test_unknown_or_old_source_state_never_admits_but_stop_has_valid_agent_path(payload):
+    core = _core(mirror_session_enabled=True)
+    if payload is not None:
+        core.on_mirror_state(payload, 0, source_now=2000000000)
+    assert not _of(core.on_heard("拿柠檬", 0.1), PublishRequest)
+    stop = core.on_heard("不玩了", 0.2)
+    assert not _of(stop, PublishControl)
+    assert _of(stop, PublishRequest)[0].payload["text"] == "停止照镜子"
+
+
+def test_mirror_state_uses_source_age_then_monotonic_expiry_and_recovers_on_fresh_wait():
+    core = _core(mirror_session_enabled=True)
+    _mirror_state(core, 5, stamp=1999999999, source_now=2000000000)
+    assert core._mirror_idle(5.9)
+    assert not core._mirror_idle(6.1)
+    _mirror_state(core, 7)
+    assert core._mirror_idle(7)
+
+
+@pytest.mark.parametrize("result", ["FAILED", "UNKNOWN", "CANCELLED"])
+def test_failed_mirror_stop_does_not_release_on_wait_and_can_retry(result):
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    stop = core.on_heard("停止", 0.5)
+    assert not _of(stop, PublishControl)  # start already finished
+    req = _of(stop, PublishRequest)[0].payload
+    core.on_event(_event(req["request_id"], "terminal", result), 0.6)
+    _mirror_state(core, 0.7)
+    assert not _of(core.on_heard("挥手", 0.8), PublishRequest)
+    retry = _of(core.on_heard("停止", 0.9), PublishRequest)[0].payload
+    core.on_event(_event(retry["request_id"], "terminal", "SUCCEEDED"), 1)
+    _mirror_state(core, 1.1)
+    assert _of(core.on_heard("挥手", 1.2), PublishRequest)
+
+
+def test_stop_during_active_mirror_start_cancels_then_submits_guarded_stop():
+    core = _core(mirror_session_enabled=True)
+    _mirror_state(core, 0)
+    core.on_heard("照镜子", 0.1)
+    presentation = {"steps": [{"skill_name": "mirror_start"}], "execution_mode": ASYNC_PRESENTATION_MODE}
+    core.on_event(
+        _event(
+            "voice-0",
+            "presentation",
+            "MAY_EXECUTE",
+            detail={
+                "presentation": presentation,
+                "presentation_digest": presentation_digest(presentation),
+            },
+        ),
+        0.15,
+    )
+    _mirror_state(core, 0.2, "STANDBY", holding=True)
+    stopped = core.on_heard("停止", 0.3)
+    assert _of(stopped, PublishControl)[0].payload["request_id"] == "voice-0"
+    core.on_event(_event("voice-0", "terminal", "CANCELLED"), 0.4)
+    stop = _of(core.tick(0.5), PublishRequest)[0].payload
+    assert stop["text"] == "停止照镜子" and stop["request_id"] != "voice-0"
+    core.on_event(_event(stop["request_id"], "terminal", "SUCCEEDED"), 0.6)
+    _mirror_state(core, 0.7)
+    assert _of(core.on_heard("点点头", 0.8), PublishRequest)
+
+
+@pytest.mark.parametrize(
+    "facts", [{"recovery_state": "FAILED"}, {"recovery_state": "UNKNOWN"}, {"phase_state": "UNKNOWN"}]
+)
+def test_contradictory_mirror_stop_success_does_not_release(facts):
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    req = _of(core.on_heard("停止", 0.5), PublishRequest)[0].payload
+    core.on_event(_event(req["request_id"], "terminal", "SUCCEEDED", detail={"execution_detail": facts}), 0.6)
+    _mirror_state(core, 0.7)
+    assert not _of(core.on_heard("拿柠檬", 0.8), PublishRequest)
+    core.end_session(0.9)
+    assert core._ending_session
+    assert not _of(core.on_heard("拿柠檬", 1), PublishRequest)
+
+
+def test_staff_reset_stops_independent_mirror_and_clears_session_only_after_confirmed_idle():
+    core = _core(mirror_session_enabled=True)
+    _start_mirror(core)
+    original = core._state.session_id
+    _mirror_state(core, 0.4, "MIRRORING", holding=True)
+    actions = core.end_session(0.5)
+    assert not _of(actions, PublishControl)
+    req = _of(actions, PublishRequest)[0].payload
+    assert req["text"] == "停止照镜子"
+    assert core._state.session_id == original
+    core.on_event(_event(req["request_id"], "terminal", "SUCCEEDED"), 0.6)
+    _mirror_state(core, 0.7)
+    core.tick(0.8)
+    assert not core._state.session_id and not core._ending_session
+
+
+def test_mirror_idle_cannot_clear_unrelated_grasp_unknown_lock():
+    core = _core(mirror_session_enabled=True)
+    _mirror_state(core, 0)
+    core.on_heard("拿柠檬", 0.1)
+    core.on_heard("停止", 3)
+    core.on_event(_event("voice-0", "terminal", "UNKNOWN"), 3.1)
+    req = _of(core.tick(3.2), PublishRequest)[0].payload
+    core.on_event(_event(req["request_id"], "terminal", "SUCCEEDED"), 3.3)
+    _mirror_state(core, 3.4)
+    assert core._unsafe_request_id == "voice-0"
+    assert not _of(core.on_heard("拿苹果", 3.5), PublishRequest)
+    core.end_session(3.6)
+    assert core._unsafe_request_id == "voice-0"
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_wake_prefixed_farewell_preserves_session_without_model_or_stop(running):
+    core = _core(persistent_session=True, wake_phrases=("欧拉欧拉",))
+    core.on_heard("欧拉欧拉，挥手", 0)
+    session = core._state.session_id
+    if not running:
+        core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), 0.1)
+    actions = core.on_heard("欧拉欧拉，再见", 1)
+    assert not _of(actions, PublishRequest)
+    assert not _of(actions, PublishControl)
+    assert not _of(actions, CancelSpeech)
+    assert not _of(actions, Speak)
+    assert core._state.session_id == session
+    assert bool(core.active_request_id) == running
+
+
+@pytest.mark.parametrize(
+    "skill",
+    [
+        "greet_visitor",
+        "invite_visitor",
+        "self_introduction",
+        "introduce_platform",
+        "introduce_agent",
+        "introduce_in_detail",
+    ],
+)
+def test_recorded_social_gesture_waits_for_safe_cancel_before_next_request(skill):
+    core = _core(silent_skills=(skill,), persistent_session=True)
+    core.on_transcript("介绍一下", now=0.0)
+    presentation = {"summary": skill, "execution_mode": ASYNC_PRESENTATION_MODE, "steps": [{"skill_name": skill}]}
+    actions = core.on_event(
+        _event(
+            "voice-0",
+            "presentation",
+            "MAY_EXECUTE",
+            detail={"presentation": presentation, "presentation_digest": presentation_digest(presentation)},
+        ),
+        now=1.0,
+    )
+    assert not _of(actions, Speak)
+    stopped = core.on_transcript("别说了", now=2.0)
+    assert [action.payload for action in _of(stopped, PublishControl)] == [
+        {"operation": "stop", "request_id": "voice-0"}
+    ]
+    assert not _of(core.on_transcript("你好", now=2.1), PublishRequest)
+    facts = {
+        "schema_version": 1,
+        "phase_state": "CANCELED",
+        "reason_code": "SKILL_CANCELLED",
+        "recovery_state": "NOT_NEEDED",
+    }
+    core.on_event(_event("voice-0", "terminal", "CANCELLED", detail={"execution_detail": facts}), now=3.0)
+    assert not core._unsafe_request_id
+    assert _of(core.on_transcript("你好", now=3.5), PublishRequest)

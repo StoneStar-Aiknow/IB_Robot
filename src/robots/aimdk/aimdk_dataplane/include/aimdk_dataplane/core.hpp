@@ -165,6 +165,7 @@ public:
   void on_stream(const Channel & channel, const std::vector<double> & values, double now);
   void on_twist(const Channel & channel, double linear_x, double linear_y, double angular_z, double now);
   void on_named_arm(int64_t owner, const std::vector<double> & positions, double now);
+  std::optional<Measured> measured_hand(double now) const;
   // The command to send this tick, if any (runtime_node._publish_commands).
   Output tick(double now, bool remember_arm = true);
   // Optional mirror filter: prepare without committing an unverified target.

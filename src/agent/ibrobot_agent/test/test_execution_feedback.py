@@ -86,7 +86,6 @@ def test_legacy_and_non_grasp_success_do_not_claim_a_grasp():
     "detail",
     [
         {"schema_version": 1},
-        ExecutionDetail(schema_version=1).to_dict(),
         ExecutionDetail(1, "verify", "RUNNING", "", "", "NOT_NEEDED", 0, "NONE").to_dict(),
     ],
 )
@@ -107,3 +106,8 @@ def test_pose_arrival_failure_reports_motion_end_without_claiming_verified_succe
     assert execution_reply("CANCELLED", context) == "已停止。"
     context["current_skill"] = "pick_object"
     assert "操作员" in execution_reply("FAILED", context)
+
+
+def test_explicit_unknown_recovery_overrides_success():
+    detail = ExecutionDetail(schema_version=1).to_dict()
+    assert "检查" in execution_reply("SUCCEEDED", {"current_skill": "pick_object", "execution_detail": detail})

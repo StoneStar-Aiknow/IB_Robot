@@ -1728,3 +1728,41 @@ def test_agent_pose_lookup_and_writable_feedback_are_independent(memory, lookup)
         "pose_lookup_service": "",
         "pose_feedback_service": "",
     }
+
+
+def test_voice_bridge_forwards_persistent_session_without_changing_other_deployments():
+    configured = _voice_bridge_nodes(enabled=True, persistent_session=True)
+    params = _normalize_launch_param_mapping(vars(configured["agent_voice_bridge"])["_Node__parameters"][0])
+    assert params["persistent_session"] is True
+    ordinary = _voice_bridge_nodes(enabled=True)
+    params = _normalize_launch_param_mapping(vars(ordinary["agent_voice_bridge"])["_Node__parameters"][0])
+    assert "persistent_session" not in params
+    assert params["mirror_session_enabled"] is False
+
+
+def test_mirror_monitoring_and_stop_shortcut_follow_actual_session_enablement():
+    from embodied_bringup.launch_builders.embodied import _agent_voice_bridge_node
+
+    robot = {"name": "aimdk_x2", "mirror_session": {"enabled": True}}
+    bridge = _agent_voice_bridge_node(robot, {}, {})
+    params = _normalize_launch_param_mapping(vars(bridge)["_Node__parameters"][0])
+    assert params["mirror_session_enabled"] is True
+    robot["embodied"] = {
+        "enabled": True,
+        "entry_mode": "agent",
+        "agent": {
+            "enabled": True,
+            "incubation": True,
+            "execution_enabled": True,
+            "ledger_path": "/tmp/mirror-ledger.sqlite",
+            "conversation_path": "/tmp/mirror-conversation.sqlite",
+            "deployment_lock_path": "/tmp/mirror.lock",
+            "test_allowlist": ["mirror_start", "mirror_stop", "nod_yes"],
+            "planner": {"mode": "rule", "direct_commands": {"点头": "nod_yes"}},
+        },
+    }
+    nodes = generate_embodied_nodes(robot, active_control_mode="moveit_planning", use_sim=False)
+    agent = next(node for node in nodes if vars(node)["_Node__node_name"] == "ibrobot_agent_node")
+    params = _normalize_launch_param_mapping(vars(agent)["_Node__parameters"][0])
+    planner = json.loads(_decode_launch_string(params["planner_config_json"]))
+    assert planner["direct_commands"] == {"点头": "nod_yes", "停止照镜子": "mirror_stop"}

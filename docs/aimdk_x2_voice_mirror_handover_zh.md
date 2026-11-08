@@ -442,6 +442,20 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 - 播放服务没有取消接口。技能取消或超时后，录音可能继续播放，结果消息会说明这一点。
 - 挥手复用 `wave_hand` 的 URS 录制轨迹，不含灵巧手动作。
 
+### 14.5 展会配置（`aimdk_x2_summit`，2026-11-07）
+
+`aimdk_x2_summit` 叠加在 `aimdk_x2_voice_mirror_grasp` 上，提供问候、录音问答、预设手势和水果礼物。
+
+- 本版不启用照镜子，也不启动 YOLOX 和 PEAR。说“动作模仿”时播放 `mimic_not_ready`。
+- 本版没有领取盒。`pick_object` 抓起水果后放回原处。成功语请观众找工作人员领取礼物。
+- 固定问答用录音技能。抓取进度、结果和追问用 ZipVoice 实时合成。
+- 录音不入库。在每个检出目录执行 `python3 commissioning/make_summit_clips.py <录音 zip>`，然后把
+  `commissioning/audio/summit/` 复制到板上同一路径。
+- 播放录音时 ASR 静音，观众不能用语音打断。最长的录音是 `introduce_in_detail`（21.9 s）。
+- 现场配置要叠加到 `aimdk_x2_summit.yaml` 上。覆盖 `test_allowlist` 或 `silent_skills` 时，要保留
+  该文件列出的技能。
+- 改抓取播报时，改 `voice_bridge.speech_messages`，然后重启 voice bridge。
+
 ## 15. 镜子“卡顿”的实测结论（2026-10-23 下午）
 
 现象：照镜子过程中机械臂会“僵住—猛地跟上”，说话时更明显。排查方法与会话内工具：

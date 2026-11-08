@@ -1,0 +1,13 @@
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: runtime_play_audio
+binding:
+  # Logical clip name; embodied.runtime_play_audio.clips resolves the file path.
+  clip: greeting
+  # Runtime motion name (motion.named.names) run while the clip plays.
+  motion: wave
+required_args: []
+# The clip runs 5.3 s. The total budget also covers the opted-in recorded
+# wave's reverse path and measured arrival confirmation after cancellation.
+timeout_sec: 90.0

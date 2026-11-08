@@ -1,6 +1,8 @@
 import math
 import struct
 import sys
+import threading
+import time
 import types
 import wave
 
@@ -113,6 +115,7 @@ def _make_playback_node(
     prebuffer_ms=0,
 ):
     node = AudioPlaybackNode.__new__(AudioPlaybackNode)
+    node._publication_lock = threading.RLock()
     node._player = AudioFilePlayer(AudioPlaybackConfig(timeout_sec=timeout_sec))
     node._audio_pub = publisher
     node._playback_sample_rate = sample_rate
@@ -123,6 +126,7 @@ def _make_playback_node(
     node._audio_message_type = message_type
     node._audio_message_class = _FakeAudioDataStamped if message_type == AUDIO_DATA_STAMPED_TYPE else _FakeAudioData
     node.get_clock = _FakeClock
+    node._wait_cancel = lambda cancel, delay: time.sleep(delay)
     return node
 
 
@@ -414,3 +418,189 @@ def test_an_undeclared_speaker_qos_keeps_the_rclpy_default():
 def test_malformed_qos_json_is_rejected_instead_of_falling_back():
     with pytest.raises(ValueError, match="audio_qos_json"):
         _publisher_qos("{not json")
+
+
+@pytest.mark.parametrize("stage", ["subscriber", "pacing", "ack"])
+def test_publication_cancel_is_prompt_and_stops_all_future_chunks(tmp_path, stage):
+    path = tmp_path / "long.wav"
+    _write_wav(path, sample_rate=24000, frames=24000 * 4)
+    entered = threading.Event()
+    cancel = threading.Event()
+    errors = []
+
+    class Publisher(_FakeAudioPublisher):
+        def get_subscription_count(self):
+            entered.set()
+            return 0 if stage == "subscriber" else 1
+
+        def publish(self, message):
+            super().publish(message)
+            if stage == "pacing":
+                entered.set()
+
+        def wait_for_all_acked(self, timeout=None):
+            entered.set()
+            cancel.wait(timeout.nanoseconds / 1e9)
+            return False
+
+    publisher = Publisher()
+    node = _make_playback_node(publisher, timeout_sec=10, prebuffer_ms=2000)
+    node._wait_cancel = AudioPlaybackNode._wait_cancel
+    if stage == "ack":
+        _write_wav(path, sample_rate=24000, frames=240)
+    original_wait = node._wait_cancel
+
+    def wait(event, delay):
+        if stage == "pacing":
+            entered.set()
+        original_wait(event, delay)
+
+    node._wait_cancel = wait
+    if stage != "subscriber":
+        entered.clear()
+        node._audio_pub.get_subscription_count = lambda: 1
+
+    def run():
+        try:
+            node._publish_audio(str(path), cancel)
+        except AudioPlaybackError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert entered.wait(2)
+        with node._publication_lock:
+            cancel.set()
+            count = len(publisher.messages)
+        worker.join(1)
+        assert not worker.is_alive()
+        assert len(publisher.messages) == count
+        assert [error.code for error in errors] == ["PLAYBACK_CANCELED"]
+    finally:
+        cancel.set()
+        worker.join(2)
+
+
+def test_stop_service_cancels_current_and_queued_requests_then_plays_next(monkeypatch, tmp_path):
+    import rclpy
+    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.node import Node
+    from std_srvs.srv import Trigger
+
+    from ibrobot_msgs.srv import PlayAudioFile
+
+    path = tmp_path / "queued.wav"
+    _write_wav(path, sample_rate=24000, frames=24000 * 4)
+    next_path = tmp_path / "next.wav"
+    _write_wav(next_path, sample_rate=24000, frames=240)
+    published = threading.Event()
+
+    class Publisher(_FakeAudioPublisher):
+        def publish(self, message):
+            super().publish(message)
+            published.set()
+
+    publisher = Publisher()
+    monkeypatch.setattr("voice_tts_service.audio_playback_node._audio_message_class", lambda _: _FakeAudioData)
+    monkeypatch.setattr(AudioPlaybackNode, "create_publisher", lambda *args, **kwargs: publisher)
+    rclpy.init()
+    node = AudioPlaybackNode()
+    client = Node("cancel_playback_test")
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
+    executor.add_node(client)
+    spinner = threading.Thread(target=executor.spin)
+    spinner.start()
+    play = client.create_client(PlayAudioFile, "/voice_tts/play")
+    stop = client.create_client(Trigger, "/voice_tts/stop")
+
+    def result(future):
+        done = threading.Event()
+        future.add_done_callback(lambda _: done.set())
+        assert done.wait(4)
+        return future.result()
+
+    try:
+        assert play.wait_for_service(timeout_sec=2)
+        assert stop.wait_for_service(timeout_sec=2)
+        old = [play.call_async(PlayAudioFile.Request(file_path=str(path))) for _ in range(5)]
+        assert published.wait(2)
+        deadline = time.monotonic() + 2
+        while len(node._requests) < 5 and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        assert len(node._requests) == 5
+        stopped = result(stop.call_async(Trigger.Request()))
+        assert stopped.success
+        assert "buffered hardware" in stopped.message
+        count = len(publisher.messages)
+        replies = [result(future) for future in old]
+        assert all(not reply.success and reply.error_code == "PLAYBACK_CANCELED" for reply in replies)
+        assert len(publisher.messages) == count
+        reply = result(play.call_async(PlayAudioFile.Request(file_path=str(next_path))))
+        assert reply.success
+        assert len(publisher.messages) == count + 1
+    finally:
+        executor.shutdown(timeout_sec=3)
+        spinner.join(3)
+        node.destroy_node()
+        client.destroy_node()
+        rclpy.try_shutdown()
+
+
+def test_offline_player_stop_reaps_child_and_accepts_next(monkeypatch, tmp_path):
+    path = tmp_path / "offline.wav"
+    _write_wav(path)
+    started = threading.Event()
+    processes = []
+    errors = []
+
+    class Child:
+        def __init__(self, command, **kwargs):
+            self.returncode = None
+            self.finished = threading.Event()
+            self.command = command
+            processes.append(self)
+            if len(processes) > 1:
+                self.returncode = 0
+                self.finished.set()
+            started.set()
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = -15
+            self.finished.set()
+
+        def wait(self, timeout=None):
+            assert self.finished.wait(timeout or 1)
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            import subprocess
+
+            if not self.finished.wait(timeout or 1):
+                raise subprocess.TimeoutExpired(self.command, timeout)
+            return "", ""
+
+    monkeypatch.setattr("voice_tts_service.audio_playback.shutil.which", lambda _: "/usr/bin/aplay")
+    monkeypatch.setattr("voice_tts_service.audio_playback.subprocess.Popen", Child)
+    player = AudioFilePlayer()
+
+    def run():
+        try:
+            player.play(str(path))
+        except AudioPlaybackError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(2)
+    player.stop()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert [error.code for error in errors] == ["PLAYBACK_CANCELED"]
+    assert processes[0].poll() == -15
+    assert player.play(str(path)) == path
+    assert processes[1].command == ["/usr/bin/aplay", "-q", str(path)]

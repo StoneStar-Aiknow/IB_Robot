@@ -1,0 +1,144 @@
+robot:
+  base_config: aimdk_x2_voice_mirror_grasp.yaml
+  name: aimdk_x2_summit
+  runtime:
+    cancel_return_motions: wave,short_wave,invite,self_intro,explain
+    profile: x2_ultra_omnihand_summit
+  default_control_mode: moveit_planning
+  skill_required_control_mode: moveit_planning
+  skill_supported_control_modes:
+  - moveit_planning
+  - named_motion
+  mirror_session:
+    enabled: false
+  motion_imitation_stream:
+    enabled: false
+  perception_services:
+    services:
+    - id: grasp_grounding
+      enabled: true
+      required: true
+      bundle_path: models/grounding_dino_swint_seq8_1280x720
+      deployment: ascend_310p
+      adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
+      service_type: ibrobot_msgs/srv/GroundingDetect
+      endpoint: /perception/grasp/grounding_detect
+      node_name: grasp_grounding_detect
+      runtime_options:
+        device_id: 0
+    - id: grasp_segmentation
+      enabled: true
+      required: true
+      bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
+      deployment: ascend_310p
+      adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
+      service_type: ibrobot_msgs/srv/SegmentDetections
+      endpoint: /perception/grasp/segment_detections
+      node_name: grasp_segment_detections
+      runtime_options:
+        device_id: 0
+    - id: grasp_generation
+      enabled: true
+      required: true
+      bundle_path: models/graspgenx_omnihand_left_x2
+      deployment: torch_npu
+      adapter_class: perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin
+      service_type: ibrobot_msgs/srv/GenerateGrasps
+      endpoint: /perception/grasp/generate_grasps
+      node_name: grasp_generate_grasps
+  embodied:
+    skill_catalog_profile: aimdk_x2_summit
+    agent:
+      test_allowlist:
+      - wave_hand
+      - handshake
+      - raise_hand
+      - blow_kiss
+      - clap_hands
+      - greet_visitor
+      - self_introduction
+      - introduce_platform
+      - introduce_agent
+      - introduce_in_detail
+      - explain_pick_scope
+      - offer_fruit_menu
+      - mimic_not_ready
+      - pick_object
+      - return_to_task_pose
+      - invite_visitor
+      planner:
+        direct_commands:
+          你好: greet_visitor
+          你好呀: greet_visitor
+          自我介绍: self_introduction
+          介绍一下你自己: self_introduction
+          你是谁: self_introduction
+          欢迎: greet_visitor
+          介绍一下芯片和系统: introduce_platform
+          你的Agent有什么用: introduce_agent
+          随便玩一下: invite_visitor
+      voice_bridge:
+        persistent_session: true
+        silent_skills:
+        - greet_visitor
+        - self_introduction
+        - introduce_platform
+        - introduce_agent
+        - introduce_in_detail
+        - explain_pick_scope
+        - offer_fruit_menu
+        - mimic_not_ready
+        - invite_visitor
+        stop_phrases:
+        - 别动了
+        - 别动
+        - 停止
+        - 停下
+        - 停
+        - stop
+        - halt
+        - 不玩了
+        - 不拿了
+        speech_mode: concise
+        speech_messages:
+          start: 好，我这就去拿，请稍等。
+          waiting: 我正在确认水果的位置，请先别移动桌上的物品。
+          recover: ''
+          recovered: ''
+          retry: 哎呀，这次没成功，我再试一下。
+          retry_recovered: 哎呀，这次没成功，我再试一下。
+          retry_EMPTY_GRASP: 哎呀，这次没成功，我再试一下。
+          retry_TARGET_NOT_VISIBLE: 哎呀，这次没成功，我再试一下。
+          retry_TARGET_MOVED: 水果的位置变了，我重新确认一下。
+          success: 成功拿到啦！小礼物请找旁边的工作人员领取。
+          completed: 成功拿到啦！小礼物请找旁边的工作人员领取。
+          canceled: 已经停下了。
+          not_started: 好的，这次先不拿。
+          unknown: 动作状态还需要确认，请先别靠近，工作人员正在处理。
+          recovery_failed: 动作状态还需要确认，请先别靠近，工作人员正在处理。
+          manual_check: 这次没有完成，请工作人员帮我看看。
+          failed: 还是没成功，请工作人员帮我一下。
+          reason_INVALID_TARGET: 请说一下水果名称：柠檬、苹果，还是橙子？
+          reason_TARGET_NOT_VISIBLE: 我没看到这个水果，请工作人员帮我看看。
+          reason_OUT_OF_REACH: 还是没成功，请工作人员帮我一下。
+          reason_NO_COMPLETE_PATH: 还是没成功，请工作人员帮我一下。
+          reason_NO_EXECUTABLE_CANDIDATE: 还是没成功，请工作人员帮我一下。
+          reason_PLAN_TIMEOUT: 还是没成功，请工作人员帮我一下。
+          reason_OBSERVATION_UNAVAILABLE: 还是没成功，请工作人员帮我一下。
+          reason_REOBSERVE_REQUIRED: 还是没成功，请工作人员帮我一下。
+          reason_TARGET_MOVED: 还是没成功，请工作人员帮我一下。
+          reason_EMPTY_GRASP: 还是没成功，请工作人员帮我一下。
+          reason_GRIP_LOST: 还是没成功，请工作人员帮我一下。
+          reason_GRASP_VERIFICATION_FAILED: 还是没成功，请工作人员帮我一下。
+          reason_EXECUTION_BUDGET_INSUFFICIENT: 还是没成功，请工作人员帮我一下。
+    runtime_play_audio:
+      clips:
+        greeting: $(env WORKSPACE)/commissioning/audio/summit/greeting.wav
+        self_intro: $(env WORKSPACE)/commissioning/audio/summit/self_intro.wav
+        intro_platform: $(env WORKSPACE)/commissioning/audio/summit/intro_platform.wav
+        intro_agent: $(env WORKSPACE)/commissioning/audio/summit/intro_agent.wav
+        intro_detail: $(env WORKSPACE)/commissioning/audio/summit/intro_detail.wav
+        pick_scope: $(env WORKSPACE)/commissioning/audio/summit/pick_scope.wav
+        fruit_menu: $(env WORKSPACE)/commissioning/audio/summit/fruit_menu.wav
+        mimic_unavailable: $(env WORKSPACE)/commissioning/audio/summit/mimic_unavailable.wav
+        invitation: $(env WORKSPACE)/commissioning/audio/summit/invitation.wav

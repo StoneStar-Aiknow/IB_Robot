@@ -67,6 +67,11 @@ _PHASES = {
 }
 _IMPORTANT_KEYS = {"canceled", "not_started", "unknown", "recovery_failed", "manual_check", "failed"}
 _IMPORTANT_KEYS.update(key for key in _MESSAGES if key.startswith("reason_"))
+#: Lines a deployment may switch off with an empty template: recovery runs before a retry and
+#: before a final failure alike, so a deployment that announces only the outcome needs them gone.
+_SILENCEABLE = {"recover", "recovered"}
+#: A retry line outlives the attempt's phase changes (its synthesis alone takes about 2 s) but not this long.
+_RETRY_NOTICE_SEC = 15.0
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,10 @@ class Notice:
     terminal: bool
     important: bool
     request_id: str = ""
+    priority: int = 10
+    phase: str = ""
+    event_key: str = ""
+    expires_at: float = float("inf")
 
 
 @dataclass
@@ -100,6 +109,8 @@ class GraspSpeechPolicy:
 
     ``now`` is monotonic seconds. Terminal notices ignore phase and throttling;
     ordinary notices follow the current phase generation and playback interval.
+    A retry notice stays current through its attempt's phase changes, for a bounded
+    time. An empty template switches the recovery lines off.
     Retention is bounded to 256 executions/targets and the latest 2048 notices.
     ``played`` means playback STARTED, not completed; it updates ``last_played``.
     """
@@ -136,6 +147,8 @@ class GraspSpeechPolicy:
 
     @staticmethod
     def _validate(key: str, text: str) -> None:
+        if text == "" and key in _SILENCEABLE:
+            return
         if not isinstance(text, str) or not text.strip() or len(text) > 180:
             raise ValueError(f"invalid message: {key}")
         if not any("一" <= char <= "鿿" for char in text):
@@ -178,8 +191,13 @@ class GraspSpeechPolicy:
         text = self.messages[key].format(target=self._targets.get(request_id, "这个东西"), stage=stage)
         if len(text) > 180:
             raise ValueError("rendered message exceeds 180 characters")
-        notice = Notice(text, execution_id, token, terminal, important, request_id)
-        self._remember(notice, now, item.generation if item else 0)
+        priority = 40 if key in {"unknown", "recovery_failed", "manual_check", "canceled"} else 20 if terminal else 10
+        phase = item.phase if item else ""
+        event_key = f"{key}:{item.retry_count if item else 0}:{item.generation if item else 0}"
+        notice = Notice(text, execution_id, token, terminal, important, request_id, priority, phase, event_key)
+        # A retry line belongs to its attempt, not to the phase it was created in.
+        scope = ("retry", item.retry_count) if item and key.startswith("retry") else item.generation if item else 0
+        self._remember(notice, now, scope)
         return notice
 
     def start(self, request_id: str, target: object, now: float) -> Notice:
@@ -266,6 +284,8 @@ class GraspSpeechPolicy:
             key = "recovered"
         if key:
             item.emitted = now
+            if not self.messages[key]:
+                return []
             return [self._notice(key, execution_id, now, important=True, request_id=item.request_id)]
         return self._progress(execution_id, item, now)
 
@@ -273,6 +293,8 @@ class GraspSpeechPolicy:
     def _terminal_key(item: _Execution, detail: ExecutionDetail) -> str:
         if item.state == "UNKNOWN":
             return "unknown"
+        if item.recovery in {"FAILED", "UNKNOWN"}:
+            return "recovery_failed"
         if item.state == "CANCELLED_BEFORE_EXECUTION":
             return "not_started"
         if item.state in {"CANCELED", "CANCELLED"}:
@@ -286,8 +308,6 @@ class GraspSpeechPolicy:
                 if item.phase in {"lift", "verify", "close", "approach"}:
                     return "success"
             return "completed"
-        if detail.recovery_state in {"FAILED", "UNKNOWN"}:
-            return "recovery_failed"
         if detail.suggested_action == "MANUAL_CHECK":
             return "manual_check"
         key = "reason_" + detail.reason_code
@@ -327,7 +347,11 @@ class GraspSpeechPolicy:
         if notice.token.startswith("start:"):
             return 0 <= now - record[1] < 10.0
         item = self._executions.get(notice.execution_id)
-        if item is None or item.terminal or item.generation != record[2]:
+        if item is None or item.terminal:
+            return False
+        if isinstance(record[2], tuple):
+            return record[2] == ("retry", item.retry_count) and now - record[1] <= _RETRY_NOTICE_SEC
+        if item.generation != record[2]:
             return False
         if item.phase_state != "RUNNING" or item.state not in {"ACTIVE", "EXECUTING", "RUNNING"}:
             return False
@@ -338,3 +362,69 @@ class GraspSpeechPolicy:
             return
         self._played.add(notice.token)
         self.last_played = now
+
+
+class MirrorSpeechPolicy:
+    """Local narration mapping over existing ExecutionDetail facts.
+
+    MIRROR_* reason codes below are an explicit Agent adapter convention, not
+    fields published by mirror_session_contract. Producers report them through
+    Agent execution_progress. retry_count identifies a round within an execution.
+    No voice notice drives or delays robot execution.
+    """
+
+    EVENTS = {
+        "MIRROR_READY": ("准备好了，请站到我面前，我们开始模仿吧。", 30, 10.0),
+        "MIRROR_LAST_TEN_SECONDS": ("还有十秒，这一轮就结束啦。", 30, 10.0),
+        "MIRROR_TIME_UP": ("时间到了，这轮结束啦。", 30, float("inf")),
+        "MIRROR_UNSAFE_MOTION": ("动作再小一点，动作太危险了，我怕疼", 40, 10.0),
+        "MIRROR_PROTECTION": ("请先退到等候线外，工作人员需要检查一下。", 40, float("inf")),
+    }
+
+    def __init__(self):
+        self._seen = OrderedDict()
+        self._rounds = OrderedDict()
+
+    def observe(self, payload, now):
+        context = payload.get("detail") or {}
+        if context.get("current_skill") not in {"imitate_human_motion", "mirror_start", "mirror_stop"}:
+            return None
+        facts = context.get("execution_detail") or {}
+        code = facts.get("reason_code", "")
+        if code not in self.EVENTS:
+            return None
+        execution = str(context.get("execution_id", ""))
+        request = str((payload.get("request_key") or {}).get("request_id", ""))
+        sequence = context.get("gateway_sequence", payload.get("sequence", 0))
+        round_id = facts.get("retry_count", 0)
+        scope = (request, execution)
+        previous = self._rounds.get(scope, (0, -1, False))
+        if not execution or type(sequence) is not int or sequence <= previous[0] or type(round_id) is not int:
+            return []
+        if round_id < previous[1] or (round_id == previous[1] and previous[2] and code != "MIRROR_PROTECTION"):
+            return []
+        ended = code in {"MIRROR_TIME_UP", "MIRROR_PROTECTION"}
+        self._rounds[scope] = (sequence, round_id, ended)
+        self._rounds.move_to_end(scope)
+        while len(self._rounds) > 256:
+            self._rounds.popitem(last=False)
+        key = (request, execution, round_id, str(facts.get("phase", "")), code)
+        if key in self._seen:
+            return []
+        self._seen[key] = None
+        while len(self._seen) > 2048:
+            self._seen.popitem(last=False)
+        text, priority, ttl = self.EVENTS[code]
+        return [
+            Notice(text, execution, str(key), ended, priority >= 30, request, priority, str(round_id), code, now + ttl)
+        ]
+
+    def is_current(self, notice, now):
+        scope = (notice.request_id, notice.execution_id)
+        current = self._rounds.get(scope)
+        return bool(
+            current
+            and str(current[1]) == notice.phase
+            and now < notice.expires_at
+            and (notice.terminal or not current[2])
+        )

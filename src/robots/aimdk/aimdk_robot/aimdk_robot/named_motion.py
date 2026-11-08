@@ -38,6 +38,7 @@ moved the arm since; otherwise it plays from the start and says why.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
@@ -156,6 +157,16 @@ class NamedMotionServer:
             str(name): traj.load_trajectory(profile_dir / str(path), max_speed_radps=max_speed)
             for name, path in (config.get("trajectories") or {}).items()
         }
+        return_names = config.get("cancel_return_motions", [])
+        if not isinstance(return_names, list) or any(not isinstance(name, str) or not name for name in return_names):
+            raise ValueError("cancel_return_motions must be a list of non-empty recorded motion names")
+        self._return_motions = set(return_names)
+        if self._return_motions - set(self._trajectories):
+            raise ValueError("cancel_return_motions must name recorded trajectories")
+        self._return_timeout_s = float(config.get("trajectory_cancel_return_timeout_s", 60.0))
+        self._return_settle_s = float(config.get("trajectory_cancel_return_settle_s", 2.0))
+        self._return_tolerance = float(config.get("trajectory_cancel_return_tolerance_rad", 0.03))
+        self._returning = False
         self._lock = threading.Lock()
         # (name, generation) of the goal currently executing; a later goal
         # with interrupt=true replaces it and the earlier wait loop notices.
@@ -180,6 +191,19 @@ class NamedMotionServer:
         self._max_speed = max_speed
         arm = vendor.get("arm") or {}
         self._arm_limits = {str(k): (float(v[0]), float(v[1])) for k, v in (arm.get("limits") or {}).items()}
+        if self._return_motions:
+            values = [
+                self._return_timeout_s,
+                self._return_settle_s,
+                self._return_tolerance,
+                self._blend_speed,
+                max_speed,
+                self._rate_hz,
+            ]
+            if any(not math.isfinite(v) or v <= 0 for v in values):
+                raise ValueError("cancel return budgets, tolerance, speeds and rate must be finite and positive")
+            if set(projection.VENDOR_ARM_ORDER) - set(self._arm_limits):
+                raise ValueError("cancel return requires existing limits for every arm joint")
         self._trajectory_server = None
         endpoints = [str(e) for e in (node.profile.get("trajectory_actions") or [])]
         if endpoints:
@@ -210,7 +234,7 @@ class NamedMotionServer:
         # Early answer only: two goals can both pass here before either has
         # started executing. _execute makes the check that holds.
         with self._lock:
-            if self._executing and not bool(goal.interrupt):
+            if self._returning or (self._executing and not bool(goal.interrupt)):
                 return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
@@ -268,7 +292,7 @@ class NamedMotionServer:
         """
         request = goal_handle.request
         with self._lock:
-            busy = self._executing > 0 and not bool(request.interrupt)
+            busy = self._returning or (self._executing > 0 and not bool(request.interrupt))
             if not busy:
                 self._executing += 1
         if busy:
@@ -466,6 +490,8 @@ class NamedMotionServer:
     def _take_over(self, name: str, generation: int) -> None:
         """Transfer ownership to this goal; the platform has accepted its request."""
         with self._lock:
+            if self._returning and self._running != (name, generation):
+                raise _Superseded(ExecuteNamedMotion.Result.BUSY, "cancel return owns the arm channel")
             self._running = (name, generation)
 
     def _still_current(self, generation: int, epoch: int) -> None:
@@ -668,6 +694,107 @@ class NamedMotionServer:
             return 0.0, f"; resume checkpoint not usable ({reason}), played from the start"
         return checkpoint.offset_s, f"; resumed from {checkpoint.offset_s:.1f}s"
 
+    def _return_cancelled(self, name, mode, start, history, goal_handle, generation, epoch, progress):
+        """Reverse this execution's sent path, including its ease-in, with ownership held."""
+        with self._lock:
+            if self._running != (name, generation):
+                raise _Superseded(ExecuteNamedMotion.Result.BUSY, "motion superseded before cancel return")
+            self._returning = True
+            self._checkpoint = None
+        period = 1.0 / self._rate_hz
+        speed = min(self._blend_speed, self._max_speed)
+        required = str((self._node.vendor_config.get("mc_actions") or {}).get(mode, ""))
+
+        def check():
+            self._still_current(generation, epoch)
+            if self._node.current_mode() != mode or (required and self._node.platform_action() != required):
+                raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "mode changed during cancel return")
+            if not self._node.output_admitted():
+                raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "output disabled during cancel return")
+            sample = self._node.measured_arm_sample()
+            if len(start) == 34:
+                hand = self._node.measured_hand_sample()
+                if sample is None or hand is None:
+                    sample = None
+                else:
+                    sample = (sample[0] + hand[0], min(sample[1], hand[1]))
+            if (
+                sample is None
+                or len(sample[0]) != len(start)
+                or not math.isfinite(sample[1])
+                or any(not math.isfinite(value) for value in sample[0])
+            ):
+                raise _Superseded(
+                    ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "stale arm feedback during cancel return"
+                )
+            return sample
+
+        check()
+        # Begin at the last commanded point; reverse every point actually sent,
+        # rather than sampling the unexecuted remainder of the recording.
+        knots = [*reversed(history), list(start)]
+        for point in knots:
+            for joint, value in zip(projection.VENDOR_ARM_ORDER, point[:14], strict=True):
+                low, high = self._arm_limits[joint]
+                if not math.isfinite(value) or not low <= value <= high:
+                    raise _Superseded(
+                        ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, f"cancel return outside {joint} limits"
+                    )
+        durations = [
+            max(period, max(abs(b - a) for a, b in zip(left, right, strict=True)) / speed)
+            for left, right in zip(knots, knots[1:], strict=False)
+        ]
+        budget = sum(durations) + self._return_settle_s
+        if budget > self._return_timeout_s:
+            raise _Superseded(
+                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+                f"cancel return needs {budget:.2f}s, exceeds {self._return_timeout_s:.2f}s budget",
+            )
+        feedback = ExecuteNamedMotion.Feedback()
+        feedback.state, feedback.progress = "returning", progress
+        goal_handle.publish_feedback(feedback)
+        deadline = time.monotonic() + self._return_timeout_s
+
+        def send(point):
+            check()
+            if time.monotonic() >= deadline:
+                raise _Superseded(ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, "cancel return timed out")
+            accepted = (
+                self._node.command_recorded(point[:14], point[14:], owner=generation, epoch=epoch)
+                if len(point) == 34
+                else self._node.command_arm(point, owner=generation, epoch=epoch)
+            )
+            if not accepted:
+                self._still_current(generation, epoch)
+                raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "cancel return command refused")
+
+        for left, right, duration in zip(knots, knots[1:], durations, strict=False):
+            steps = max(1, math.ceil(duration / period))
+            began = time.monotonic()
+            for tick in range(1, steps + 1):
+                point = [a + (b - a) * tick / steps for a, b in zip(left, right, strict=True)]
+                time.sleep(max(0.0, began + tick * duration / steps - time.monotonic()))
+                send(point)
+        final_at = time.monotonic()
+        send(start)
+        settle_deadline = min(deadline, final_at + self._return_settle_s)
+        while time.monotonic() < settle_deadline:
+            measured, sampled_at = check()
+            if (
+                sampled_at >= final_at
+                and max(abs(a - b) for a, b in zip(measured, start, strict=True)) <= self._return_tolerance
+            ):
+                check()
+                raise _Cancelled(
+                    f"{name} cancelled; returned to measured pre-replay pose ({budget:.2f}s budget)", "", progress
+                )
+            send(start)
+            time.sleep(period)
+        raise _Superseded(
+            ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+            "cancel return did not reach measured pre-replay pose before settle timeout",
+        )
+
     def _run_trajectory(
         self,
         name: str,
@@ -730,11 +857,32 @@ class NamedMotionServer:
                 ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
                 "no fresh arm measurement to start the motion from",
             )
+        if not planned and name in self._return_motions:
+            for point in [start, *recorded.positions]:
+                for joint, value in zip(projection.VENDOR_ARM_ORDER, point, strict=True):
+                    low, high = self._arm_limits[joint]
+                    if not math.isfinite(value) or not low <= value <= high:
+                        raise CommandRejected("INVALID_TARGET", f"{joint} outside limits for cancel-return motion")
         offset, resume_note = self._resume_offset(resume_token, name, mode, epoch)
-        if goal_handle.is_cancel_requested:
+        return_on_cancel = not planned and name in self._return_motions
+        if goal_handle.is_cancel_requested and not return_on_cancel:
             raise self._cancel_replay(name, mode, recorded, offset, epoch)
+        hand_start = None
+        if recorded.hands:
+            sample = self._node.measured_hand_sample()
+            if sample is None:
+                raise CommandRejected("HAND_HOLD_UNAVAILABLE", "no fresh hand measurement for recorded entry")
+            hand_start = sample[0]
         first = recorded.sample(offset)
         ease = traj.blend_duration(start, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
+        if recorded.hands:
+            ease = max(
+                ease,
+                1.5,
+                traj.blend_duration(
+                    hand_start, recorded.sample_hands(offset), speed_radps=self._blend_speed, minimum_s=1.5
+                ),
+            )
         total = ease + recorded.duration - offset
         period = 1.0 / self._rate_hz
         self._take_over(name, generation)
@@ -748,6 +896,7 @@ class NamedMotionServer:
         measured_peak = [0.0] * len(start)
         # (t, target) sent within the last hold lag, oldest first.
         sent: deque[tuple[float, list[float]]] = deque()
+        history = [list(start) + (hand_start or [])]
         try:
             started = time.monotonic()
             tick = 0
@@ -763,19 +912,59 @@ class NamedMotionServer:
                     # measured pose either: the platform holds a pose only with
                     # an error against gravity, so the arm would sag by it. The
                     # target sent one tracking lag ago is the one being realized.
+                    if return_on_cancel:
+                        joint = max(range(len(start)), key=commanded_peak.__getitem__)
+                        if (
+                            commanded_peak[joint] >= FOLLOW_CHECK_MIN_RAD
+                            and measured_peak[joint] < self._follow_min_ratio * commanded_peak[joint]
+                        ):
+                            raise _Superseded(
+                                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+                                "platform did not follow motion before cancel return",
+                            )
+                        self._return_cancelled(
+                            name,
+                            mode,
+                            start + (hand_start or []),
+                            history,
+                            goal_handle,
+                            generation,
+                            epoch,
+                            min(reached / recorded.duration, 1.0),
+                        )
                     self._node.command_arm(sent[0][1] if sent else start, owner=generation, epoch=epoch)
                     raise self._cancel_replay(name, mode, recorded, reached, epoch)
                 point = traj.blend(start, first, t / ease) if t < ease else recorded.sample(reached)
                 sent.append((t, point))
                 while len(sent) > 1 and sent[1][0] <= t - self._hold_lag_s:
                     sent.popleft()
-                if not self._node.command_arm(point, owner=generation, epoch=epoch):
+                hands = (
+                    (
+                        traj.blend(hand_start, recorded.sample_hands(offset), t / ease)
+                        if t < ease
+                        else recorded.sample_hands(reached)
+                    )
+                    if recorded.hands
+                    else []
+                )
+                accepted = (
+                    self._node.command_recorded(point, hands, owner=generation, epoch=epoch)
+                    if recorded.hands
+                    else self._node.command_arm(point, owner=generation, epoch=epoch)
+                )
+                if not accepted:
                     self._still_current(generation, epoch)
                     return (
                         False,
                         ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
                         f"runtime stopped admitting arm commands during {name}",
                     )
+                if return_on_cancel:
+                    types = self._node._dataplane.hand_types if hands else []
+                    sent_hands = [
+                        v if vg.hand_type_family(types[k // 10]) == "dexterous" else 0.0 for k, v in enumerate(hands)
+                    ]
+                    history.append(list(point) + sent_hands)
                 measured = self._node.measured_arm_positions() or start
                 for k, (origin, target, actual) in enumerate(zip(start, point, measured, strict=True)):
                     commanded_peak[k] = max(commanded_peak[k], abs(target - origin))
@@ -786,8 +975,54 @@ class NamedMotionServer:
                     on_progress(min(reached / recorded.duration, 1.0), point)
                 tick += 1
                 time.sleep(max(0.0, started + tick * period - time.monotonic()))
+            if recorded.hands:
+                # Success requires new feedback acquired after the final target was sent.
+                final_at = time.monotonic()
+                deadline = final_at + self._return_settle_s
+                while True:
+                    self._still_current(generation, epoch)
+                    arm_sample, hand_sample = self._node.measured_arm_sample(), self._node.measured_hand_sample()
+                    types = self._node._dataplane.hand_types
+                    desired_hands = [
+                        v if vg.hand_type_family(types[k // 10]) == "dexterous" else 0.0 for k, v in enumerate(hands)
+                    ]
+                    if (
+                        arm_sample
+                        and hand_sample
+                        and min(arm_sample[1], hand_sample[1]) >= final_at
+                        and max(abs(a - b) for a, b in zip(arm_sample[0], point, strict=True)) <= self._return_tolerance
+                        and max(abs(a - b) for a, b in zip(hand_sample[0], desired_hands, strict=True))
+                        <= self._return_tolerance
+                    ):
+                        break
+                    if time.monotonic() >= deadline:
+                        raise CommandRejected("FINAL_POSE_UNCONFIRMED", "recorded arm/hand final pose not measured")
+                    if goal_handle.is_cancel_requested:
+                        self._return_cancelled(
+                            name, mode, start + hand_start, history, goal_handle, generation, epoch, 1.0
+                        )
+                    if not self._node.command_recorded(point, hands, owner=generation, epoch=epoch):
+                        raise CommandRejected("FINAL_POSE_UNCONFIRMED", "final target refused")
+                    time.sleep(period)
+        except _Cancelled:
+            raise
+        except Exception as exc:
+            if (return_on_cancel and self._returning) or (
+                recorded.hands and isinstance(exc, CommandRejected) and exc.reason == "FINAL_POSE_UNCONFIRMED"
+            ):
+                # Unconfirmed return must not admit fresh work after releasing ownership.
+                self._node._set_fault("cancel_return", f"cancel return unconfirmed: {exc}")
+                self._node._push_control()
+                if not isinstance(exc, _Superseded):
+                    raise _Superseded(
+                        ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, f"cancel return failed: {exc}"
+                    ) from exc
+            raise
         finally:
             self._node.release_arm(generation)
+            with self._lock:
+                if self._running == (name, generation):
+                    self._returning = False
         joint = max(range(len(start)), key=commanded_peak.__getitem__)
         if (
             commanded_peak[joint] >= FOLLOW_CHECK_MIN_RAD

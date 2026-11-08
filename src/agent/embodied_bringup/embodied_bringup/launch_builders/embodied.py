@@ -630,6 +630,12 @@ def generate_embodied_nodes(
         agent_config = embodied_config.get("agent", {})
         if not isinstance(agent_config, dict) or agent_config.get("enabled", True) is not True:
             raise ValueError("embodied.agent.enabled must be true for entry_mode=agent")
+        planner_config = dict(agent_config.get("planner", {"mode": "rule"}))
+        if (robot_config.get("mirror_session") or {}).get("enabled") is True:
+            planner_config["direct_commands"] = {
+                **planner_config.get("direct_commands", {}),
+                "停止照镜子": "mirror_stop",
+            }
         nodes.append(
             Node(
                 package="ibrobot_agent",
@@ -657,7 +663,7 @@ def generate_embodied_nodes(
                         "simulation_mode": bool(use_sim),
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                         "task_budget_sec": timeout_policy["task_budget_sec"],
-                        "planner_config_json": json.dumps(agent_config.get("planner", {"mode": "rule"})),
+                        "planner_config_json": json.dumps(planner_config),
                         "gateway_status_service": common_params["skill_gateway_status_service"],
                         "gateway_validate_skill_service": common_params["validate_skill_service"],
                         "gateway_skill_action": common_params["skill_action_name"],
@@ -939,6 +945,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     # Only forward what the robot YAML actually sets: every default lives once, in
     # ibrobot_agent.voice_bridge.VoiceBridgeConfig / the node's declare_parameter calls.
     params: dict[str, object] = {
+        "mirror_session_enabled": (robot_config.get("mirror_session") or {}).get("enabled") is True,
         # The bridge listens wherever the ASR node publishes; one source of truth.
         "input_topic": voice_bridge.get("input_topic", voice_asr.get("output_topic", "/voice_command")),
         "request_topic": agent_config.get("request_topic", "/agent/request"),
@@ -1014,6 +1021,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "speak_replies",
         "speak_reply_previews",
         "feedback_only",
+        "persistent_session",
         "mute_asr_during_tts",
         "speaker_check_enabled",
         "speaker_reject_short",

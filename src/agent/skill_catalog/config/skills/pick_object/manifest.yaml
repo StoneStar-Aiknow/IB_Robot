@@ -42,9 +42,41 @@ capability:
 implementations:
   aimdk_x2_grasp: implementations/aimdk_x2_grasp.yaml
   aimdk_x2_grasp_task_poses: implementations/aimdk_x2_grasp_task_poses.yaml
+  aimdk_x2_summit_fruit: implementations/aimdk_x2_summit_fruit.yaml
   lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
   lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
 description_variants:
+  # The fixed fruit menu of the X2 exhibition deployment. Only the planner's
+  # choice narrows; the executor still takes any target_name.
+  aimdk_x2_summit_fruit:
+    summary: >-
+      Pick the fruit gift the visitor chose. Today only 柠檬, 苹果 and 橙子 are available:
+      target_name must be exactly "a lemon", "an apple" or "an orange".
+      The X2 detects and grasps the fruit, lifts and holds it, then puts it back.
+      For any other fruit reply 今天可以选柠檬、苹果和橙子，你想要哪一种？ without using this skill.
+      For a personal belonging or a request to hand something over reply 今天只抓取展台上的水果礼物。你想选哪一种？
+      If the choice is ambiguous reply 请说一下水果名称：柠檬、苹果，还是橙子？
+    category: manipulation
+    when_to_use:
+    - the visitor names lemon, apple or orange
+    do_not_use:
+    - condition: the visitor wants a fruit gift without naming one
+      instead_use: offer_fruit_menu
+    aliases_zh:
+    - 柠檬
+    - 苹果
+    - 橙子
+    aliases_en:
+    - lemon
+    - apple
+    - orange
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 70.0
+    requires_motion_params: false
   # The X2 puts the object back where it was after holding it lifted; it has
   # no container to transport it to.
   aimdk_x2_grasp:

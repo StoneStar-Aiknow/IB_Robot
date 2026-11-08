@@ -3209,6 +3209,7 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
     for field_name in (
         "speak_replies",
         "feedback_only",
+        "persistent_session",
         "tts_enabled",
         "mute_asr_during_tts",
         "speaker_check_enabled",

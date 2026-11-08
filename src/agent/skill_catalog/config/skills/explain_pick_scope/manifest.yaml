@@ -1,0 +1,39 @@
+schema_version: 1
+name: explain_pick_scope
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Tell the visitor with a recorded reply that only the prepared fruit gifts can be picked today.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks whether the robot can pick up anything
+  do_not_use:
+  - condition: the visitor names a fruit to pick
+    instead_use: pick_object
+  aliases_zh:
+  - 能抓任何东西吗
+  - 什么都能抓吗
+  - 你能拿什么
+  aliases_en:
+  - can you pick anything
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  # Playback of the recorded clip (5.4 s).
+  duration_sec_estimate: 6.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that today only the prepared fruit gifts can be picked. Use for 能抓任何东西吗.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # Playing the clip again is the caller's decision; nothing is retried here.
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
