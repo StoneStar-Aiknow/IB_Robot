@@ -275,6 +275,12 @@ bool Core::on_control(const Control & control, double now)
     rejections_.push_back("arm_claim:PUBLIC_ARM_STREAM_ACTIVE");
     warnings_.push_back("refused a named motion's arm claim: the public arm stream is live");
   }
+  if (first || applied.mode != control_.mode || applied.arm_owner != control_.arm_owner ||
+    applied.admitted != control_.admitted || applied.allows_stream != control_.allows_stream ||
+    applied.clear != control_.clear || applied.safe != control_.safe)
+  {
+    ++safety_epoch_;
+  }
   control_ = applied;
   control_received_ = now;
   control_lapsed_ = false;
@@ -313,6 +319,9 @@ bool Core::channel_active(const Channel & channel, double now) const
 
 void Core::clear()
 {
+  ++safety_epoch_;
+  public_arm_epoch_ = public_hand_epoch_ = 0;
+  arm_cmd_named_ = false;
   arm_cmd_.reset();
   hand_cmd_.reset();
   hand_held_.reset();
@@ -343,6 +352,8 @@ void Core::on_stream(const Channel & channel, const std::vector<double> & values
         return;
       }
       arm_cmd_ = std::move(payload);
+      arm_cmd_named_ = false;
+      public_arm_epoch_ = safety_epoch_;
       arm_stamp_ = now;
       public_arm_stamp_ = now;
       ++public_arm_count_;
@@ -351,6 +362,7 @@ void Core::on_stream(const Channel & channel, const std::vector<double> & values
       head_stamp_ = now;
     } else if (!channel.hand_type.empty()) {
       hand_cmd_ = hand_payload(values, channel.hand_type, plan_.hand);
+      public_hand_epoch_ = safety_epoch_;
       hand_held_ = hand_cmd_;
       hand_stamp_ = now;
     } else {
@@ -383,6 +395,7 @@ void Core::on_named_arm(int64_t owner, const std::vector<double> & positions, do
     return;
   }
   arm_cmd_ = positions;
+  arm_cmd_named_ = true;
   arm_stamp_ = now;
 }
 
@@ -441,7 +454,29 @@ std::optional<std::pair<int, std::vector<double>>> Core::hand_hold(double now) c
   return std::make_pair(plan_.default_hand_sub_mode, std::move(*payload));
 }
 
-Output Core::tick(double now)
+bool Core::mirror_candidate(const std::string & mode, double now) const
+{
+  if (!mirror_context(mode, now)) {
+    return false;
+  }
+  return (public_arm_epoch_ == safety_epoch_ && public_arm_stamp_ &&
+         now - *public_arm_stamp_ <= plan_.stream_staleness_s) ||
+         (public_hand_epoch_ == safety_epoch_ && now - hand_stamp_ <= plan_.stream_staleness_s);
+}
+
+bool Core::mirror_context(const std::string & mode, double now) const
+{
+  return control_.mode == mode && !control_.arm_owner && control_.allows_stream && admitted(now);
+}
+
+void Core::remember_arm_output(const Output & output)
+{
+  if (output.kind == Output::Kind::kUpperBody) {
+    arm_sent_ = output.arm;
+  }
+}
+
+Output Core::tick(double now, bool remember_arm)
 {
   Output out;
   if (!control_.allows_stream || !admitted(now)) {
@@ -500,7 +535,9 @@ Output Core::tick(double now)
     return out;
   }
   hand_hold_missing_ = false;
-  arm_sent_ = arm;
+  if (remember_arm) {
+    arm_sent_ = arm;
+  }
   out.kind = Output::Kind::kUpperBody;
   out.arm = *arm;
   out.head = *head;

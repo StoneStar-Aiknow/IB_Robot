@@ -324,3 +324,27 @@ robot:
   # internvl settings from aimdk_x2_magicmirror_board.yaml when it is wanted.
   visual_interaction:
     enabled: false
+
+  # feat/x2-cbf-safety
+  # Operator-authorized development trial, not a calibrated deployment default.
+  cbf_safety:
+    enabled: true
+    mode: enforce
+    # User-confirmed hardware: left OmniHand only; both arms remain protected.
+    hands_installed: [true, false]
+    deadline_us: 10000
+    deadline_guard_us: 500
+    # Observation-only allowance (1 degree); outgoing limits and raw FK are unchanged.
+    feedback_limit_tolerance_rad: 0.017453292519943295
+    # Encoder feedback is raw geometry, not a goal to be admitted by travel limits.
+    check_arm_feedback_goal_range: false
+    thumb_mapping:
+      # Historical candidate only. The operator requested a live trial before calibration.
+      verified: false
+      command_scale: [-1.0, 1.0, 1.0, -1.0]
+      command_offset: [0.0, -1.6424, -0.576, -1.6424]
+      feedback_scale: [-1.0, 1.0, 1.0, -1.0]
+      feedback_offset: [0.0, -1.6424, -0.576, -1.6424]
+      native_lower: [-1.117, -0.05, -0.03, -1.64]
+      native_upper: [0.03, 1.64, 0.87, 0.05]
+  # /feat/x2-cbf-safety

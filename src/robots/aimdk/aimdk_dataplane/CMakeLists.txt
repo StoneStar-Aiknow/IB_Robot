@@ -13,12 +13,27 @@ find_package(ament_cmake REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 # The rules (no ROS, no vendor types): what the node applies and the tests check.
-add_library(aimdk_dataplane_core STATIC src/projection.cpp src/core.cpp)
+add_library(x2_cbf_core STATIC
+  cbf/src/command_adapter.cpp cbf/src/distance_gradient.cpp cbf/src/proxy_model.cpp
+  cbf/src/kinematics.cpp cbf/src/safety_filter.cpp)
+target_include_directories(x2_cbf_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/cbf/include)
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  # The real-time kernel must not inherit the workspace's default -O0 dev build.
+  # Deliberately no fast-math: preserve finite checks and distance tolerances.
+  target_compile_options(x2_cbf_core PRIVATE -O3)
+endif()
+
+add_library(aimdk_dataplane_core STATIC src/projection.cpp src/core.cpp src/cbf_safety.cpp)
 target_include_directories(aimdk_dataplane_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(aimdk_dataplane_core nlohmann_json::nlohmann_json)
+target_link_libraries(aimdk_dataplane_core nlohmann_json::nlohmann_json x2_cbf_core)
 set_target_properties(aimdk_dataplane_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# One-shot offline diagnostics only: no ROS node or actuator connection.
+add_executable(cbf_pose_probe tools/cbf_pose_probe.cpp)
+target_link_libraries(cbf_pose_probe aimdk_dataplane_core)
+install(TARGETS cbf_pose_probe DESTINATION lib/${PROJECT_NAME})
 
 # aimdk_msgs comes from the AimDK vendor overlay, not from this repository. A
 # workspace built without it (CI, hosts that never drive an X2) builds and tests
@@ -44,6 +59,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_projection aimdk_dataplane_core)
   ament_add_gtest(test_core test/test_core.cpp)
   target_link_libraries(test_core aimdk_dataplane_core)
+  ament_add_gtest(test_cbf_kernel test/test_cbf_kernel.cpp)
+  target_link_libraries(test_cbf_kernel x2_cbf_core)
+  ament_add_gtest(test_cbf_safety test/test_cbf_safety.cpp)
+  target_link_libraries(test_cbf_safety aimdk_dataplane_core)
 endif()
 
 ament_package()

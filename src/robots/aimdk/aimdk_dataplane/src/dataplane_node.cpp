@@ -18,7 +18,9 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cmath>
 #include <map>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,6 +29,8 @@
 #include <vector>
 
 #include "aimdk_dataplane/core.hpp"
+#include "aimdk_dataplane/cbf_safety.hpp"
+#include "cbf/proxy_model.hpp"
 #include "aimdk_msgs/msg/hand_state_array.hpp"
 #include "aimdk_msgs/msg/joint_command_array.hpp"
 #include "aimdk_msgs/msg/joint_state_array.hpp"
@@ -100,6 +104,22 @@ public:
     core_(plan_from_json(declare_parameter<std::string>("plan_json", "")))
   {
     const Plan & plan = core_.plan();
+    const auto cbf_text = declare_parameter<std::string>("cbf_safety_json", "");
+    if (!cbf_text.empty()) {
+      auto config = CbfSafetyConfig::from_json(cbf_text, plan.command_rate_hz);
+      if (config.enabled) {
+        cbf_.emplace(std::move(config));
+        RCLCPP_INFO(
+          get_logger(), "CBF enabled: mode=%s mirror_mode=%s mapping_verified=%s budget_us=%.0f",
+          cbf_->config().enforce ? "enforce" : "shadow", cbf_->config().mirror_mode.c_str(),
+          cbf_->config().mapping_verified ? "true" : "false", cbf_->config().deadline_us);
+        if (cbf_->config().enforce && cbf_->config().mapping_available && !cbf_->config().mapping_verified)
+        {
+          RCLCPP_WARN(get_logger(),
+            "CBF enforcing with the configured candidate thumb mapping; mapping_verified=false");
+        }
+      }
+    }
     // Each vendor input is taken on a thread of its own (see intake_groups): the
     // 500 Hz groups alone are more than one rclcpp thread keeps up with on the
     // loaded 310P.
@@ -315,7 +335,12 @@ private:
       RCLCPP_ERROR(get_logger(), "ignoring a malformed control word: %s", error.what());
       return;
     }
-    if (core_.on_control(control, monotonic_s())) {
+    const auto old_epoch = core_.safety_epoch();
+    const bool safe_due = core_.on_control(control, monotonic_s());
+    if (cbf_ && old_epoch != core_.safety_epoch()) {
+      cbf_->inactive(core_.safety_epoch());
+    }
+    if (safe_due) {
       publish_safe_command();
     }
     publish_status();  // the acknowledgement the runtime waits for
@@ -407,12 +432,111 @@ private:
 
   void publish_commands()
   {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    const double now_s = monotonic_s();
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
+    const auto tick_started = std::chrono::steady_clock::now();
+    const double now_s = std::chrono::duration<double>(tick_started.time_since_epoch()).count();
     if (core_.control_lapsed(now_s)) {
       publish_safe_command();
     }
-    publish(core_.tick(now_s));
+    const bool mirror_context = cbf_ && core_.mirror_context(cbf_->config().mirror_mode, now_s);
+    const bool source_ready = cbf_ && core_.mirror_candidate(cbf_->config().mirror_mode, now_s);
+    const bool named_only = core_.candidate_arm_is_named() && !source_ready;
+    if (!cbf_ || !mirror_context || named_only) {
+      if (cbf_) {cbf_->inactive(core_.safety_epoch());}
+      publish(core_.tick(now_s));
+      flush_notes();
+      return;
+    }
+    CbfSnapshot snapshot;
+    snapshot.publication_deadline = tick_started + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double, std::micro>(cbf_->config().deadline_us));
+    snapshot.requested = core_.tick(now_s, false);
+    // A missing uncommanded-channel measurement can suppress the Core
+    // candidate. Enforce may still retransmit its committed complete pair;
+    // context/hardware exits remain checked before publication below; source
+    // freshness loss can use that same committed-pair fallback.
+    if (snapshot.requested.kind != Output::Kind::kUpperBody &&
+      (!cbf_->config().enforce || snapshot.requested.kind != Output::Kind::kNone))
+    {
+      flush_notes();
+      return;
+    }
+    snapshot.epoch = core_.safety_epoch();
+    snapshot.named_arm_cache = core_.candidate_arm_is_named();
+    snapshot.source_ready = source_ready;
+    const auto hands_match = [this]() {
+        const auto & installed = cbf_->config().hands_installed;
+        return hand_ && cbf_->config().matches_hand_types(core_.hand_types()) &&
+          (installed[0] || hand_->left_hands.empty()) && (installed[1] || hand_->right_hands.empty());
+      };
+    snapshot.hand_configuration_matches = hands_match();
+    static const std::array<std::string, 4> all_thumb_names{
+      "L_thumb_roll_joint", "L_thumb_abad_joint", "R_thumb_roll_joint", "R_thumb_abad_joint"};
+    std::vector<std::string> thumb_order;
+    thumb_order.reserve(4);
+    for (size_t axis = 0; axis < all_thumb_names.size(); ++axis) {
+      if (cbf_->config().hands_installed[axis / 2]) {thumb_order.push_back(all_thumb_names[axis]);}
+    }
+    const auto state = [&](const std::vector<std::string> & order, double at) {
+        auto measured = core_.measured_with_age(order, at);
+        const auto view = core_.view(order, at);
+        if (measured && view && view->stamp_ns > 0) {
+          const double stamp_age = static_cast<double>(now().nanoseconds() - view->stamp_ns) * 1e-9;
+          measured->age_s = stamp_age < -0.005 ? std::numeric_limits<double>::infinity() :
+            std::max(measured->age_s, stamp_age);
+        }
+        return measured;
+      };
+    snapshot.arm = state(kVendorArmOrder, now_s);
+    snapshot.thumb = state(thumb_order, now_s);
+    lock.unlock();  // Vendor feedback intake continues on its existing threads.
+    CbfDecision decision;
+    try {
+      decision = cbf_->filter(snapshot, now_s);
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "CBF rejected frame: %s", error.what());
+      if (!cbf_->config().enforce) {decision.output = snapshot.requested;}
+    }
+    lock.lock();
+    double finished = monotonic_s();
+    std::string latest_feedback_problem;
+    if (cbf_->config().enforce) {
+      // Recheck data validity after callbacks ran during the solve. An ordinary
+      // new sample is allowed; a new NaN, missing joint or stale stamp is not.
+      CbfSnapshot latest;
+      latest.arm = state(kVendorArmOrder, finished);
+      latest.thumb = state(thumb_order, finished);
+      latest_feedback_problem = cbf_->config().feedback_error(latest);
+      finished = monotonic_s();
+    }
+    const double oldest_age = snapshot.arm && snapshot.thumb ?
+      std::max(snapshot.arm->age_s, snapshot.thumb->age_s) + finished - now_s :
+      std::numeric_limits<double>::infinity();
+    if (core_.safety_epoch() != snapshot.epoch ||
+      !core_.mirror_context(cbf_->config().mirror_mode, finished) ||
+      (cbf_->config().enforce && !hands_match()))
+    {
+      cbf_->discarded();
+      cbf_->tick_finished((finished - now_s) * 1e6);
+      flush_notes();
+      return;
+    }
+    if (cbf_->config().enforce && !core_.mirror_candidate(cbf_->config().mirror_mode, finished)) {
+      decision = cbf_->feedback_fallback(decision, "mirror_input_stale");
+    } else if (cbf_->config().enforce &&
+      (!latest_feedback_problem.empty() || oldest_age > cbf_->config().feedback_max_age_s))
+    {
+      decision = cbf_->feedback_fallback(decision, latest_feedback_problem.empty() ?
+        "snapshot_feedback_expired" : latest_feedback_problem);
+    } else if (cbf_->config().enforce &&
+      (finished - now_s) * 1e6 >= cbf_->config().deadline_us - cbf_->config().guard_us)
+    {
+      decision = cbf_->deadline_fallback(decision);
+    }
+    publish(decision.output);
+    core_.remember_arm_output(decision.output);
+    cbf_->committed(decision, monotonic_s());
+    cbf_->tick_finished((monotonic_s() - now_s) * 1e6);
     flush_notes();
   }
 
@@ -487,6 +611,134 @@ private:
     status["rejected"] = std::exchange(pending_rejections_, {});
     status["public_arm_count"] = core_.public_arm_count();
     status["intake_lag_ms"] = std::exchange(intake_lag_ms_, {});
+    if (cbf_) {
+      const auto & d = cbf_->diagnostics();
+      status["cbf"] = {
+        {"enabled", true}, {"mode", cbf_->config().enforce ? "enforce" : "shadow"},
+        {"mapping_verified", cbf_->config().mapping_verified}, {"mirror_active", d.active},
+        {"mapping_available", cbf_->config().mapping_available},
+        {"hands_installed", cbf_->config().hands_installed},
+        {"check_arm_feedback_goal_range", cbf_->config().check_arm_feedback_goal_range},
+        {"arm_age_s", std::isfinite(d.arm_age_s) && d.arm_age_s >= 0.0 ? nlohmann::json(d.arm_age_s) : nlohmann::json(nullptr)},
+        {"thumb_age_s", std::isfinite(d.thumb_age_s) && d.thumb_age_s >= 0.0 ? nlohmann::json(d.thumb_age_s) : nlohmann::json(nullptr)},
+        {"calls", d.calls}, {"accepted", d.accepted}, {"published", d.published},
+        {"modified", d.modified}, {"held", d.held}, {"withheld", d.withheld},
+        {"geometry_modified", d.geometry_modified},
+        {"recovery_verified", d.recovery_verified}, {"hand_held", d.hand_held},
+        {"deadlines", d.deadlines}, {"reason", d.reason},
+        {"node_deadlines", d.node_deadlines}, {"tick_us", d.tick_us}, {"max_tick_us", d.max_tick_us},
+        {"publish_overruns", d.publish_overruns},
+        {"available_budget_us", d.available_budget_us},
+        {"hand_check_us", d.hand_check_us}, {"verification_us", d.verification_us},
+        {"projection_us", d.projection_us},
+        {"max_hand_check_us", d.max_hand_check_us}, {"max_verification_us", d.max_verification_us},
+        {"max_projection_us", d.max_projection_us},
+        {"verification_reuses", d.verification_reuses}, {"hand_budget_holds", d.hand_budget_holds},
+        {"elapsed_us", d.elapsed_us}, {"max_elapsed_us", d.max_elapsed_us},
+        {"minimum_distance_m", d.distance_valid ? nlohmann::json(d.minimum_distance_m) : nlohmann::json(nullptr)}
+      };
+      status["cbf"]["invalid_input_frames"] = d.invalid_input_frames;
+      if (d.last_input_fault) {
+        status["cbf"]["last_input_fault_event"] = d.last_input_fault->event;
+        status["cbf"]["last_input_fault_issue"] = d.last_input_fault->issue;
+      }
+      if (d.thumb_angles_valid) {
+        status["cbf"]["thumb_current_urdf"] = d.thumb_current_urdf;
+        status["cbf"]["thumb_target_urdf"] = d.thumb_target_urdf;
+        for (size_t axis = 0; axis < 4; ++axis) {
+          if (!cbf_->config().hands_installed[axis / 2]) {
+            status["cbf"]["thumb_current_urdf"][axis] = nullptr;
+            status["cbf"]["thumb_target_urdf"][axis] = nullptr;
+          }
+        }
+      }
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 2000,
+        "CBF status: mode=%s mirror_active=%s calls=%llu published=%llu geometry_modified=%llu "
+        "held=%llu withheld=%llu recovery_verified=%s hand_held=%s "
+        "budget_us=%.0f hand_us=%.0f verify_us=%.0f project_us=%.0f reuses=%llu "
+        "max_tick_us=%.0f reason=%s",
+        cbf_->config().enforce ? "enforce" : "shadow", d.active ? "true" : "false",
+        static_cast<unsigned long long>(d.calls), static_cast<unsigned long long>(d.published),
+        static_cast<unsigned long long>(d.geometry_modified), static_cast<unsigned long long>(d.held),
+        static_cast<unsigned long long>(d.withheld), d.recovery_verified ? "true" : "false",
+        d.hand_held ? "true" : "false", d.available_budget_us, d.hand_check_us,
+        d.verification_us, d.projection_us, static_cast<unsigned long long>(d.verification_reuses),
+        d.max_tick_us, d.reason.c_str());
+      if (d.last_input_fault && d.last_input_fault->event != logged_input_fault_event_ &&
+        (logged_input_fault_event_ == 0 || now_s - last_input_fault_log_s_ >= 2.0))
+      {
+        const auto & fault = *d.last_input_fault;
+        const auto number = [](double value) {
+            return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
+          };
+        const auto numbers = [&](const auto & values) {
+            auto array = nlohmann::json::array();
+            for (double value : values) {array.push_back(number(value));}
+            return array;
+          };
+        nlohmann::json detail = {
+          {"event", fault.event}, {"call", fault.call}, {"epoch", fault.epoch},
+          {"command_sequence", fault.command_sequence}, {"stage", fault.stage},
+          {"at_monotonic_s", number(fault.at_s)},
+          {"issue", fault.issue}, {"index", fault.index}, {"joint", nullptr},
+          {"arm_current14", numbers(fault.arm_current)}, {"arm_target14", numbers(fault.arm_target)},
+          {"arm_requested14", numbers(fault.arm_requested)},
+          {"kernel_thumb_current6", numbers(fault.thumb_current_urdf)},
+          {"kernel_thumb_target6", numbers(fault.thumb_target_urdf)},
+          {"thumb_native_feedback_compact", numbers(fault.thumb_native_current)},
+          {"thumb_native_target_slots_0_1_10_11", numbers(fault.thumb_native_target)},
+          {"hands_installed", cbf_->config().hands_installed},
+          {"mapping_verified", cbf_->config().mapping_verified},
+          {"feedback_limit_tolerance_rad", cbf_->config().feedback_limit_tolerance_rad},
+          {"check_arm_feedback_goal_range", cbf_->config().check_arm_feedback_goal_range},
+          {"arm_age_s", number(fault.arm_age_s)}, {"thumb_age_s", number(fault.thumb_age_s)},
+          {"angle_units", "rad"}
+        };
+        auto bounds = nlohmann::json::array();
+        for (const auto & band : fault.thumb_limits_urdf) {
+          bounds.push_back({number(band[0]), number(band[1])});
+        }
+        detail["kernel_thumb_limits4"] = std::move(bounds);
+        auto current_thumb_bounds = nlohmann::json::array();
+        for (const auto & band : fault.thumb_current_limits_urdf) {
+          current_thumb_bounds.push_back({number(band[0]), number(band[1])});
+        }
+        detail["kernel_thumb_feedback_limits4"] = std::move(current_thumb_bounds);
+        auto arm_bounds = nlohmann::json::array();
+        for (const auto & band : fault.arm_feedback_limits) {
+          arm_bounds.push_back({number(band[0]), number(band[1])});
+        }
+        detail["kernel_arm_feedback_limits14"] = std::move(arm_bounds);
+        const bool arm_issue = fault.issue.find("_arm_") != std::string::npos;
+        const bool thumb_pose_issue = fault.issue.find("current_thumb_") == 0 ||
+          fault.issue.find("target_thumb_") == 0;
+        if (arm_issue && fault.index >= 0 && static_cast<size_t>(fault.index) < kVendorArmOrder.size()) {
+          detail["joint"] = kVendorArmOrder[static_cast<size_t>(fault.index)];
+        } else if (thumb_pose_issue && fault.index >= 0 && fault.index < 6) {
+          static constexpr std::array<const char *, 6> names{
+            "L_thumb_roll", "L_thumb_abad", "ignored_L_thumb_mcp",
+            "R_thumb_roll", "R_thumb_abad", "ignored_R_thumb_mcp"};
+          detail["joint"] = names[static_cast<size_t>(fault.index)];
+        }
+        if (fault.index >= 0 && (arm_issue || thumb_pose_issue || fault.issue == "thumb_limits_invalid")) {
+          detail["value"] = number(fault.value);
+          detail["lower"] = number(fault.lower);
+          detail["upper"] = number(fault.upper);
+        }
+        if (fault.issue == "distance_gradient_invalid") {
+          detail["pair_index"] = fault.index;
+          if (fault.index >= 0 && static_cast<size_t>(fault.index) < x2::cbf::kPrimitivePairs.size()) {
+            const auto pair = x2::cbf::kPrimitivePairs[static_cast<size_t>(fault.index)];
+            detail["pair_first"] = x2::cbf::primitive_name(pair.first);
+            detail["pair_second"] = x2::cbf::primitive_name(pair.second);
+          }
+        }
+        RCLCPP_WARN(get_logger(), "CBF_INPUT_FAULT %s", detail.dump().c_str());
+        logged_input_fault_event_ = fault.event;
+        last_input_fault_log_s_ = now_s;
+      }
+    }
     const auto age = core_.public_arm_age(now_s);
     status["public_arm_age_s"] = age ? nlohmann::json(*age) : nlohmann::json(nullptr);
     std_msgs::msg::String message;
@@ -499,6 +751,9 @@ private:
   // publishes the safe command and the status itself).
   std::recursive_mutex mutex_;
   Core core_;
+  std::optional<CbfSafety> cbf_;
+  uint64_t logged_input_fault_event_ = 0;
+  double last_input_fault_log_s_ = 0.0;
   std::vector<rclcpp::CallbackGroup::SharedPtr> intake_groups_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   std::vector<std::pair<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr, std::vector<std::string>>> views_;

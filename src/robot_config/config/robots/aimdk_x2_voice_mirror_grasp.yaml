@@ -255,3 +255,10 @@ robot:
 #
 # Stop the mirror session before a pick. Both skills use policy_stream, so
 # mode switching alone does not arbitrate concurrent arm commands.
+
+  # feat/x2-cbf-safety
+  # Grasp and mirror share policy_stream + joint.arm_stream without arm_owner.
+  # The data plane cannot distinguish them, so this profile must not inherit CBF.
+  cbf_safety:
+    enabled: false
+  # /feat/x2-cbf-safety

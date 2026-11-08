@@ -136,3 +136,76 @@ def test_launch_declares_the_peripherals_argument():
         if isinstance(action, DeclareLaunchArgument)
     }
     assert "peripherals" in names
+
+
+def _cbf_render(simulated, cbf_json=None, *, profile=_PROFILE):
+    context = launch.LaunchContext()
+    context.launch_configurations.update(
+        {
+            "profile": str(profile),
+            "simulated": simulated,
+            "use_sim": "",
+            "sim_platform": "",
+            "instance_id": "",
+            "initial_mode": "",
+            "peripherals": "",
+        }
+    )
+    if cbf_json is not None:
+        context.launch_configurations["cbf_safety_json"] = cbf_json
+    from launch_ros.utilities import evaluate_parameters
+
+    return {
+        node._Node__node_name: evaluate_parameters(context, node._Node__parameters)
+        for node in _nodes(_runtime_launch_module()._launch_setup(context))
+    }
+
+
+@pytest.mark.parametrize("simulated", ["false", "true"])
+@pytest.mark.parametrize(
+    "cbf_json",
+    ["", '{"enabled":false,"mode":"invalid","deadline_us":"invalid","thumb_mapping":null}', '{"mode":"invalid"}'],
+)
+def test_cbf_off_matches_direct_launch_default_node_parameters(simulated, cbf_json):
+    baseline = _cbf_render(simulated)
+    assert _cbf_render(simulated, cbf_json) == baseline
+    assert all("cbf_safety_json" not in group for groups in baseline.values() for group in groups)
+
+
+@pytest.mark.parametrize("simulated", ["false", "true"])
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_cbf_enabled_changes_only_the_dataplane_parameter(simulated, mode):
+    from robot_runtime.profile import load_profile
+
+    profile = _PROFILE.with_name("x2_ultra_omnihand.yaml")
+    selected = load_profile(profile)
+    baseline = _cbf_render(simulated, profile=profile)
+    original = {
+        "enabled": True,
+        "mode": mode,
+        "deadline_us": 10000,
+        "deadline_guard_us": 500,
+        "protected_mirror_mode": "policy_stream",
+    }
+    enabled = _cbf_render(simulated, json.dumps(original), profile=profile)
+    payload = json.loads(enabled["aimdk_dataplane"][0].pop("cbf_safety_json"))
+    joints = selected["arm_joints"]
+    limits = selected["vendor"]["arm"]["limits"]
+    assert payload == {
+        **original,
+        "arm_feedback_lower_limits": [float(limits[joint][0]) for joint in joints],
+        "arm_feedback_upper_limits": [float(limits[joint][1]) for joint in joints],
+    }
+    assert enabled == baseline, "plan_json, aimdk_runtime and all other node parameters must remain identical"
+
+
+def test_cbf_launch_argument_has_an_empty_default():
+    from launch.actions import DeclareLaunchArgument
+
+    declarations = [
+        action
+        for action in _runtime_launch_module().generate_launch_description().entities
+        if isinstance(action, DeclareLaunchArgument) and action.name == "cbf_safety_json"
+    ]
+    assert len(declarations) == 1
+    assert launch.utilities.perform_substitutions(launch.LaunchContext(), declarations[0].default_value) == ""

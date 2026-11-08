@@ -9,6 +9,7 @@ provider (with the world name and the full spawn pose).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -382,6 +383,199 @@ def _include_arguments(robot_config, **kwargs):
 
     include = next(action for action in actions if isinstance(action, IncludeLaunchDescription))
     return {text(key): text(value) for key, value in include.launch_arguments}
+
+
+@pytest.fixture
+def cbf_provider_config(monkeypatch, tmp_path):
+    import robot_config.launch_builders.runtime as runtime_module
+
+    provider_launch = tmp_path / "runtime.launch.py"
+    provider_launch.write_text("# construction only\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "resolve_runtime_launch", lambda _provider: str(provider_launch))
+    return {
+        "runtime": {"provider": "aimdk_robot", "profile": "unused_while_disabled"},
+        "mirror_session": {"control_mode": "mirror"},
+        "control_modes": {"mirror": {"runtime_mode": "configured_mirror_stream"}},
+    }
+
+
+@pytest.mark.parametrize("enabled", [None, False])
+def test_cbf_default_and_off_keep_include_arguments_identical(cbf_provider_config, monkeypatch, enabled):
+    from robot_runtime import profile
+
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+
+    def unexpected_load(*_args, **_kwargs):
+        pytest.fail("disabled CBF must not load a profile or calibration mapping")
+
+    monkeypatch.setattr(profile, "load_profile", unexpected_load)
+    cbf_provider_config["cbf_safety"] = {
+        **({"enabled": enabled} if enabled is not None else {}),
+        "mode": "invalid_but_disabled",
+        "deadline_us": "invalid_but_disabled",
+        "deadline_guard_us": -1,
+        "thumb_mapping": {"verified": False, "command_scale": object()},
+    }
+    cbf_provider_config["mirror_session"] = {}
+    cbf_provider_config["motion_imitation_stream"] = {"mock_playback": "invalid_but_disabled"}
+    assert _include_arguments(cbf_provider_config, use_sim=False) == baseline
+    assert "cbf_safety_json" not in baseline
+
+
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+def test_cbf_enabled_passes_one_json_argument_with_derived_mode(cbf_provider_config, mode):
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    mapping = {
+        "verified": False,
+        "command_scale": [None] * 4,
+        "command_offset": [None] * 4,
+        "feedback_scale": [None] * 4,
+        "feedback_offset": [None] * 4,
+    }
+    cbf_provider_config["cbf_safety"] = {
+        "enabled": True,
+        "mode": mode,
+        "thumb_mapping": mapping,
+        "feedback_max_age_s": 0.08,
+        "protected_mirror_mode": "must_not_override_the_configured_mode",
+    }
+    arguments = _include_arguments(cbf_provider_config, use_sim=False)
+    payload = json.loads(arguments.pop("cbf_safety_json"))
+    assert arguments == baseline
+    assert payload == {
+        "enabled": True,
+        "mode": mode,
+        "deadline_us": 10000,
+        "deadline_guard_us": 500,
+        "protected_mirror_mode": "configured_mirror_stream",
+        "thumb_mapping": mapping,
+        "feedback_max_age_s": 0.08,
+    }
+
+
+def test_cbf_defaults_do_not_fabricate_thumb_calibration(cbf_provider_config):
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    payload = json.loads(_include_arguments(cbf_provider_config, use_sim=False)["cbf_safety_json"])
+    assert payload["mode"] == "shadow"
+    assert "thumb_mapping" not in payload
+
+
+def test_cbf_feature_profile_enforces_with_explicit_candidate_mapping():
+    import yaml
+
+    config = yaml.safe_load((ROBOTS / "aimdk_x2_voice_mirror_all.yaml").read_text(encoding="utf-8"))["robot"]
+    assert config["cbf_safety"] == {
+        "enabled": True,
+        "mode": "enforce",
+        "hands_installed": [True, False],
+        "deadline_us": 10000,
+        "deadline_guard_us": 500,
+        "feedback_limit_tolerance_rad": 0.017453292519943295,
+        "check_arm_feedback_goal_range": False,
+        "thumb_mapping": {
+            "verified": False,
+            "command_scale": [-1.0, 1.0, 1.0, -1.0],
+            "command_offset": [0.0, -1.6424, -0.576, -1.6424],
+            "feedback_scale": [-1.0, 1.0, 1.0, -1.0],
+            "feedback_offset": [0.0, -1.6424, -0.576, -1.6424],
+            "native_lower": [-1.117, -0.05, -0.03, -1.64],
+            "native_upper": [0.03, 1.64, 0.87, 0.05],
+        },
+    }
+
+
+@pytest.mark.parametrize("config_path", sorted(ROBOTS.glob("*.yaml")), ids=lambda path: path.stem)
+def test_cbf_only_voice_mirror_all_emits_configuration_across_robot_profiles(config_path):
+    from robot_config.launch_builders.runtime import _cbf_safety_json
+    from robot_config.loader import _load_robot_section
+
+    # Use launch's inheritance loader without materializing unrelated model or
+    # hardware interfaces. Checking raw YAML would miss an inherited enable.
+    _, config = _load_robot_section(config_path)
+    payload = _cbf_safety_json(config)
+    if config_path.stem == "aimdk_x2_voice_mirror_all":
+        assert json.loads(payload)["enabled"] is True
+    else:
+        assert payload == "", f"{config_path.name} unexpectedly enables the mirror-only CBF"
+
+
+@pytest.mark.usefixtures("cbf_provider_config")
+def test_cbf_grasp_profile_omits_the_provider_launch_argument():
+    from robot_config.loader import _load_robot_section
+
+    _, config = _load_robot_section(ROBOTS / "aimdk_x2_voice_mirror_grasp.yaml")
+    assert config["cbf_safety"]["enabled"] is False
+    assert "cbf_safety_json" not in _include_arguments(config, use_sim=False)
+
+
+def test_cbf_enabled_requires_the_aimdk_provider(cbf_provider_config):
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    cbf_provider_config["runtime"]["provider"] = "so101_robot"
+    with pytest.raises(ValueError, match="runtime.provider=aimdk_robot"):
+        _include_arguments(cbf_provider_config, use_sim=False)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error"),
+    [
+        ({"enabled": "false"}, "enabled"),
+        ({"mode": "invalid"}, "mode"),
+        ({"deadline_us": 0}, "deadline_us"),
+        ({"deadline_us": True}, "deadline_us"),
+        ({"deadline_us": 10000.5}, "deadline_us"),
+        ({"deadline_guard_us": -1}, "deadline_guard_us"),
+        ({"deadline_guard_us": 10000}, "deadline_guard_us"),
+        ({"deadline_guard_us": False}, "deadline_guard_us"),
+    ],
+)
+def test_cbf_enabled_rejects_invalid_mode_or_budget(cbf_provider_config, overrides, error):
+    cbf_provider_config["cbf_safety"] = {"enabled": True, **overrides}
+    with pytest.raises(ValueError, match=error):
+        _include_arguments(cbf_provider_config, use_sim=False)
+
+
+def test_cbf_enabled_requires_a_derived_protected_mode(cbf_provider_config):
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    cbf_provider_config["mirror_session"]["control_mode"] = "missing"
+    with pytest.raises(ValueError, match="mirror_session.control_mode"):
+        _include_arguments(cbf_provider_config, use_sim=False)
+
+
+def test_cbf_limits_use_profile_arm_order_and_preserve_raw_bands(cbf_provider_config, tmp_path):
+    import yaml
+
+    # Use an intentionally non-sorted profile and reverse the input mappings;
+    # JSON must follow the existing arm channel order, never mapping order.
+    joints = [f"arm_{index}" for index in range(14)]
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        yaml.safe_dump(
+            {
+                "runtime": {"name": "aimdk_robot", "version": "0.1.0"},
+                "modes": {"idle": {"controllers": []}},
+                "capabilities": {"joint.state": {}},
+                "joints": joints,
+                "arm_joints": joints,
+            }
+        ),
+        encoding="utf-8",
+    )
+    cbf_provider_config["runtime"]["profile"] = str(profile)
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    mock = {
+        "arm_velocity_limits": {joint: float(index + 1) for index, joint in reversed(list(enumerate(joints)))},
+        "arm_limits": {joint: [-index - 0.5, index + 0.5] for index, joint in reversed(list(enumerate(joints)))},
+    }
+    cbf_provider_config["motion_imitation_stream"] = {"mock_playback": mock}
+    payload = json.loads(_include_arguments(cbf_provider_config, use_sim=False)["cbf_safety_json"])
+    assert payload["arm_velocity_limits"] == [float(index + 1) for index in range(14)]
+    assert payload["arm_lower_limits"] == [-index - 0.5 for index in range(14)]
+    assert payload["arm_upper_limits"] == [index + 0.5 for index in range(14)]
+    assert "arm_lower_limits" not in mock
+    mock["retarget"] = {"vel_scale": 0.125}
+    scaled = json.loads(_include_arguments(cbf_provider_config, use_sim=False)["cbf_safety_json"])
+    assert scaled["arm_velocity_limits"] == [0.125 * (index + 1) for index in range(14)]
+    assert mock["arm_velocity_limits"][joints[0]] == 1.0
 
 
 def test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias():

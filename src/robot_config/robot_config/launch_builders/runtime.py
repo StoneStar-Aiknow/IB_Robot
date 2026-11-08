@@ -25,6 +25,7 @@ the runtime owns the driver composition.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import tempfile
@@ -127,6 +128,86 @@ def _write_peripherals_fragment(robot_config: dict[str, Any]) -> str:
     return handle.name
 
 
+def _cbf_safety_json(robot_config: dict[str, Any]) -> str:
+    """Optional X2 data-plane configuration; disabled ancillary fields are inert."""
+    config = robot_config.get("cbf_safety")
+    if config is None:
+        return ""
+    if not isinstance(config, dict):
+        raise ValueError("robot.cbf_safety must be a mapping")
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("robot.cbf_safety.enabled must be a boolean")
+    if not enabled:
+        return ""
+    if runtime_provider(robot_config) != "aimdk_robot":
+        raise ValueError("robot.cbf_safety requires runtime.provider=aimdk_robot")
+    mode = config.get("mode", "shadow")
+    if mode not in ("shadow", "enforce"):
+        raise ValueError("robot.cbf_safety.mode must be shadow or enforce")
+    deadline = config.get("deadline_us", 10000)
+    guard = config.get("deadline_guard_us", 500)
+    if type(deadline) is not int or deadline <= 0:
+        raise ValueError("robot.cbf_safety.deadline_us must be a positive integer")
+    if type(guard) is not int or not 0 <= guard < deadline:
+        raise ValueError("robot.cbf_safety.deadline_guard_us must be an integer in [0, deadline_us)")
+    mirror_mode = (robot_config.get("mirror_session") or {}).get("control_mode", "")
+    protected = ((robot_config.get("control_modes") or {}).get(mirror_mode) or {}).get("runtime_mode")
+    if not isinstance(protected, str) or not protected.strip():
+        raise ValueError("robot.cbf_safety requires mirror_session.control_mode to name a control_modes runtime_mode")
+    payload = {
+        # thumb_mapping and feedback_max_age_s are deployment data: preserve
+        # them verbatim, never infer a thumb calibration from joint aliases.
+        **config,
+        "enabled": True,
+        "mode": mode,
+        "deadline_us": deadline,
+        "deadline_guard_us": guard,
+        "protected_mirror_mode": protected.strip(),
+    }
+    mock = (robot_config.get("motion_imitation_stream") or {}).get("mock_playback") or {}
+    velocity, limits = mock.get("arm_velocity_limits"), mock.get("arm_limits")
+    if velocity is not None or limits is not None:
+        # Reuse the selected profile's arm_pos order without importing the
+        # provider package or duplicating its vendor joint layout here.
+        from robot_runtime.launch_support import resolve_profile_argument
+        from robot_runtime.profile import load_profile
+
+        profile = load_profile(resolve_profile_argument("aimdk_robot", runtime_profile(robot_config)))
+        joints = profile.get("arm_joints") or []
+        if len(joints) != 14 or len(set(joints)) != 14:
+            raise ValueError("robot.cbf_safety requires 14 distinct runtime profile arm_joints")
+
+        def number(value, field):
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+                raise ValueError(f"motion_imitation_stream.mock_playback.{field} must contain finite numbers")
+            return float(value)
+
+        for field, values in (("arm_velocity_limits", velocity), ("arm_limits", limits)):
+            if values is not None and (not isinstance(values, dict) or set(values) != set(joints)):
+                raise ValueError(f"motion_imitation_stream.mock_playback.{field} must name exactly the 14 arm_joints")
+        if velocity is not None:
+            ordered = [number(velocity[joint], "arm_velocity_limits") for joint in joints]
+            if any(value <= 0 for value in ordered):
+                raise ValueError("motion_imitation_stream.mock_playback.arm_velocity_limits must be positive")
+            scale = number((mock.get("retarget") or {}).get("vel_scale", 1.0), "retarget.vel_scale")
+            if scale <= 0:
+                raise ValueError("motion_imitation_stream.mock_playback.retarget.vel_scale must be positive")
+            payload["arm_velocity_limits"] = [speed * scale for speed in ordered]
+        if limits is not None:
+            if any(not isinstance(limits[joint], list | tuple) or len(limits[joint]) != 2 for joint in joints):
+                raise ValueError("motion_imitation_stream.mock_playback.arm_limits must contain [lower, upper] pairs")
+            lower = [number(limits[joint][0], "arm_limits") for joint in joints]
+            upper = [number(limits[joint][1], "arm_limits") for joint in joints]
+            if any(lo >= hi for lo, hi in zip(lower, upper, strict=True)):
+                raise ValueError("motion_imitation_stream.mock_playback.arm_limits must have lower < upper")
+            # These are the raw URDF bands. The data plane intersects them
+            # with its frozen measured bands and applies the safety margin
+            # once; duplicating that policy here would add a package dependency.
+            payload["arm_lower_limits"], payload["arm_upper_limits"] = lower, upper
+    return json.dumps(payload, allow_nan=False)
+
+
 def generate_runtime_provider_actions(
     robot_config: dict[str, Any],
     *,
@@ -175,6 +256,9 @@ def generate_runtime_provider_actions(
         ),
     }
     include_arguments["use_sim"] = "true" if use_sim else "false"
+    cbf_safety_json = _cbf_safety_json(robot_config)
+    if cbf_safety_json:
+        include_arguments["cbf_safety_json"] = cbf_safety_json
     if use_sim:
         include_arguments["sim_platform"] = str(sim_platform).lower()
     platform = str(sim_platform).lower() if use_sim else ""

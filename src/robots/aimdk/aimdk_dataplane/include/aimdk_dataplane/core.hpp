@@ -166,7 +166,13 @@ public:
   void on_twist(const Channel & channel, double linear_x, double linear_y, double angular_z, double now);
   void on_named_arm(int64_t owner, const std::vector<double> & positions, double now);
   // The command to send this tick, if any (runtime_node._publish_commands).
-  Output tick(double now);
+  Output tick(double now, bool remember_arm = true);
+  // Optional mirror filter: prepare without committing an unverified target.
+  void remember_arm_output(const Output & output);
+  bool mirror_candidate(const std::string & mode, double now) const;
+  bool mirror_context(const std::string & mode, double now) const;
+  bool candidate_arm_is_named() const {return arm_cmd_.has_value() && arm_cmd_named_;}
+  uint64_t safety_epoch() const {return safety_epoch_;}
   // An explicit zero velocity, whatever is admitted.
   Output safe_command();
   // True once, when the runtime's control went quiet: its commands are dropped and a zero is due.
@@ -233,6 +239,12 @@ private:
   uint64_t public_arm_count_ = 0;
   bool hold_target_missing_ = false;
   bool hand_hold_missing_ = false;
+
+  // Internal provenance only; no command-format or arbitration changes.
+  uint64_t safety_epoch_ = 1;
+  uint64_t public_arm_epoch_ = 0;
+  uint64_t public_hand_epoch_ = 0;
+  bool arm_cmd_named_ = false;
 
   std::vector<std::string> rejections_;
   std::vector<std::string> warnings_;

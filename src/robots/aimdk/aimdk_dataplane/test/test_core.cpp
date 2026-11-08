@@ -99,6 +99,97 @@ const Channel & find(const Core & core, const std::string & name)
 
 }  // namespace
 
+TEST(CoreCbfBoundary, DisabledPreparationMatchesTheOriginalTick)
+{
+  Core original(plan());
+  Core prepared(plan());
+  for (Core * core : {&original, &prepared}) {
+    core->on_control(control(), 0.0);
+    measure(*core, 0.0);
+    core->on_stream(find(*core, "arm_stream"), values(14, 0.5), 0.0);
+  }
+  const auto a = original.tick(0.02);
+  const auto b = prepared.tick(0.02, false);
+  EXPECT_EQ(a.kind, b.kind);
+  EXPECT_EQ(a.sequence, b.sequence);
+  EXPECT_EQ(a.arm, b.arm);
+  EXPECT_EQ(a.head, b.head);
+  EXPECT_EQ(a.hand, b.hand);
+  EXPECT_EQ(a.hand_sub_mode, b.hand_sub_mode);
+  prepared.remember_arm_output(b);
+  for (Core * core : {&original, &prepared}) {
+    measure(*core, 0.6);
+    core->on_stream(find(*core, "head_stream"), {0.1, 0.1}, 0.6);
+  }
+  EXPECT_EQ(original.tick(0.61).arm, prepared.tick(0.61).arm);
+}
+
+TEST(CoreCbfBoundary, UnpublishedCandidateDoesNotBecomeHoldHistory)
+{
+  Core core(plan(true));
+  core.on_control(control(), 0.0);
+  measure(core, 0.0);
+  core.on_stream(find(core, "arm_stream"), values(14, 0.5), 0.0);
+  ASSERT_EQ(core.tick(0.02, false).kind, Output::Kind::kUpperBody);
+  measure(core, 0.6);
+  core.on_stream(find(core, "head_stream"), {0.1, 0.1}, 0.6);
+  EXPECT_EQ(core.tick(0.61).kind, Output::Kind::kNone);
+}
+
+TEST(CoreCbfBoundary, HeartbeatDoesNotInvalidateTheMirrorEpoch)
+{
+  Core core(plan());
+  auto word = control();
+  core.on_control(word, 0.0);
+  core.on_stream(find(core, "arm_stream"), values(14, 0.5), 0.0);
+  const auto epoch = core.safety_epoch();
+  EXPECT_TRUE(core.mirror_candidate("stream", 0.01));
+  EXPECT_FALSE(core.mirror_candidate("policy_stream", 0.01));
+  ++word.seq;
+  core.on_control(word, 0.02);
+  EXPECT_EQ(core.safety_epoch(), epoch);
+  EXPECT_TRUE(core.mirror_candidate("stream", 0.03));
+  ++word.clear;
+  core.on_control(word, 0.04);
+  EXPECT_NE(core.safety_epoch(), epoch);
+  EXPECT_FALSE(core.mirror_candidate("stream", 0.05));
+}
+
+TEST(CoreCbfBoundary, NamedOwnershipAndItsCachedTargetAreNotMistakenForMirror)
+{
+  Core core(plan());
+  auto word = control();
+  word.arm_owner = 7;
+  core.on_control(word, 0.0);
+  core.on_named_arm(7, values(14, 0.5), 0.01);
+  EXPECT_TRUE(core.candidate_arm_is_named());
+  EXPECT_FALSE(core.mirror_candidate("stream", 0.02));
+  word.arm_owner.reset();
+  ++word.seq;
+  core.on_control(word, 0.03);
+  EXPECT_FALSE(core.mirror_candidate("stream", 0.04));
+  core.on_stream(find(core, "hand_stream"), values(20, 0.2), 0.05);
+  EXPECT_TRUE(core.mirror_candidate("stream", 0.06));
+  EXPECT_TRUE(core.candidate_arm_is_named());  // The adapter must reject this mixed transition.
+  core.on_stream(find(core, "arm_stream"), values(14, 0.4), 0.07);
+  EXPECT_FALSE(core.candidate_arm_is_named());
+}
+
+TEST(CoreCbfBoundary, ARefusedClaimDoesNotClearTheAcceptedStreamEpoch)
+{
+  Core core(plan());
+  auto word = control();
+  core.on_control(word, 0.0);
+  core.on_stream(find(core, "arm_stream"), values(14, 0.5), 0.0);
+  const auto epoch = core.safety_epoch();
+  word.arm_owner = 8;
+  ++word.seq;
+  core.on_control(word, 0.01);
+  EXPECT_FALSE(core.arm_owner());
+  EXPECT_EQ(core.safety_epoch(), epoch);
+  EXPECT_TRUE(core.mirror_candidate("stream", 0.02));
+}
+
 TEST(Core, SendsNothingUntilTheRuntimeAdmitsAStreamMode)
 {
   Core core(plan());

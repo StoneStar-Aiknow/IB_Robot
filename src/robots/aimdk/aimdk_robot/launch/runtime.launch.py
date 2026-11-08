@@ -18,6 +18,7 @@ launches disturb motion control (no more than ~2 nodes per second).
 from __future__ import annotations
 
 import json
+import math
 
 from aimdk_robot import dataplane
 from launch import LaunchDescription
@@ -63,6 +64,7 @@ def _launch_setup(context, *_args, **_kwargs):
     simulated = use_sim
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
+    cbf_safety_json = LaunchConfiguration("cbf_safety_json", default="").perform(context).strip()
 
     def runtime_node(description_json: str = "") -> Node:
         return Node(
@@ -84,12 +86,57 @@ def _launch_setup(context, *_args, **_kwargs):
 
     # The data plane comes up one stagger ahead of the runtime, so the runtime's
     # first control word and feedback check find it.
+    data_plane_parameters = {"plan_json": json.dumps(dataplane.plan(profile))}
+    if cbf_safety_json:
+        cbf_config = json.loads(cbf_safety_json)
+        if not isinstance(cbf_config, dict) or not isinstance(cbf_config.get("enabled", False), bool):
+            raise ValueError("cbf_safety_json must contain a mapping with a boolean enabled flag")
+        if cbf_config.get("enabled", False):
+            # The provider owns native feedback bounds. Keep them separate from
+            # the consumer's tighter command envelope and reuse this loaded profile.
+            vendor = profile.get("vendor", {})
+            if not isinstance(vendor, dict):
+                raise ValueError("runtime profile vendor must be a mapping")
+            arm = vendor.get("arm", {})
+            if not isinstance(arm, dict):
+                raise ValueError("runtime profile vendor.arm must be a mapping")
+            if "limits" in arm:
+                joints = profile.get("arm_joints")
+                limits = arm["limits"]
+                if (
+                    not isinstance(joints, list)
+                    or len(joints) != 14
+                    or any(not isinstance(joint, str) or not joint for joint in joints)
+                    or len(set(joints)) != 14
+                    or not isinstance(limits, dict)
+                    or set(limits) != set(joints)
+                ):
+                    raise ValueError("runtime profile vendor.arm.limits must name exactly the 14 distinct arm_joints")
+                lower, upper = [], []
+                for joint in joints:
+                    band = limits[joint]
+                    if (
+                        not isinstance(band, list | tuple)
+                        or len(band) != 2
+                        or any(
+                            isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v) for v in band
+                        )
+                        or band[0] >= band[1]
+                    ):
+                        raise ValueError(
+                            "runtime profile vendor.arm.limits requires finite [lower, upper] with lower < upper"
+                        )
+                    lower.append(float(band[0]))
+                    upper.append(float(band[1]))
+                cbf_config["arm_feedback_lower_limits"] = lower
+                cbf_config["arm_feedback_upper_limits"] = upper
+            data_plane_parameters["cbf_safety_json"] = json.dumps(cbf_config, allow_nan=False)
     data_plane = Node(
         package="aimdk_dataplane",
         executable="aimdk_dataplane",
         name="aimdk_dataplane",
         output="screen",
-        parameters=[{"plan_json": json.dumps(dataplane.plan(profile))}],
+        parameters=[data_plane_parameters],
     )
 
     if not simulated:
@@ -159,6 +206,9 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),
+            DeclareLaunchArgument(
+                "cbf_safety_json", default_value="", description="Optional CBF configuration for aimdk_dataplane only"
+            ),
             DeclareLaunchArgument(
                 "physics_mjcf",
                 # Robot-config launches (robot.launch.py) pass no provider-specific argument;
