@@ -166,3 +166,63 @@ def test_isolated_depth_noise_does_not_set_the_held_radius():
     # Clean, small or uniform clouds lose (almost) nothing and are never emptied.
     assert len(without_outliers(apple)) >= 0.95 * len(apple)
     np.testing.assert_array_equal(without_outliers(apple[:10]), apple[:10])
+
+
+def lopsided_bowl(radius=0.09, centre=(0.4, -0.05), near=150, far=12):
+    """A round rim seen from one side: many points on the near half, few on the far half."""
+    angles = np.concatenate([np.linspace(-np.pi / 2, np.pi / 2, near), np.linspace(np.pi / 2, 3 * np.pi / 2, far)])
+    rim = np.column_stack(
+        [centre[0] + radius * np.cos(angles), centre[1] + radius * np.sin(angles), np.full(len(angles), 0.1)]
+    )
+    x, y = np.meshgrid(np.linspace(-0.6, 0.6, 15) * radius, np.linspace(-0.6, 0.6, 15) * radius)
+    bottom = np.column_stack([centre[0] + x.ravel(), centre[1] + y.ravel(), np.zeros(x.size)])
+    return np.vstack([rim, bottom])
+
+
+def test_opening_centre_is_the_largest_inscribed_circle_not_the_vertex_mean():
+    from aimdk_grasp.place_targets import opening_centre
+    from scipy.spatial import ConvexHull
+
+    points = lopsided_bowl()[:, :2]
+    hull = ConvexHull(points)
+    centre, radius = opening_centre(hull.equations)
+    np.testing.assert_allclose(centre, (0.4, -0.05), atol=0.004)
+    assert radius == pytest.approx(0.09, abs=0.006)
+    # The vertex mean leans to the densely seen near rim and understates the opening.
+    mean = points[hull.vertices].mean(axis=0)
+    understated = float(np.min(-(mean @ hull.equations[:, :2].T + hull.equations[:, 2])))
+    assert understated < radius - 0.02
+
+
+def test_a_one_sided_rim_view_is_not_refused_as_too_small():
+    # Needs 0.068 + 0.015 = 0.083 m of the 0.09 m opening: the vertex mean read about 0.06 m here.
+    container = opening_from_points(lopsided_bowl(), [0, 0, 1], radius_m=0.068)
+    assert container.report["clearance_m"] == pytest.approx(0.09, abs=0.006)
+    with pytest.raises(GraspFailure) as error:
+        opening_from_points(lopsided_bowl(radius=0.07), [0, 0, 1], radius_m=0.068)
+    assert error.value.code == "CONTAINER_TOO_SMALL"
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_cover_reach_keeps_exactly_what_the_full_loop_kept(seed):
+    from aimdk_grasp.container_perception import cover_reach
+    from scipy.spatial.transform import Rotation
+
+    rng = np.random.default_rng(seed)
+    base_from_camera = np.eye(4)
+    base_from_camera[:3, :3] = Rotation.from_rotvec(rng.normal(size=3)).as_matrix()
+    base_from_camera[:3, 3] = rng.normal(size=3)
+    points = rng.uniform(-1.0, 1.0, size=(20000, 3))
+    base = points @ base_from_camera[:3, :3].T + base_from_camera[:3, 3]
+    # A palm-sized cluster of spheres sitting among the points.
+    centers = base[rng.integers(len(base))] + rng.normal(scale=0.04, size=(13, 3))
+    radii = rng.uniform(0.01, 0.05, size=13)
+    full = np.full(len(base), np.inf)
+    for center, radius in zip(centers, radii, strict=True):
+        full = np.minimum(full, np.linalg.norm(base - center, axis=1) - radius)
+    reach = cover_reach(points, base_from_camera, centers, radii, 0.02)
+    for margin in (0.005, 0.01, 0.02):
+        np.testing.assert_array_equal(reach > margin, full > margin)
+    near = np.isfinite(reach)
+    assert 0 < near.sum() < len(points)  # the box did skip far points
+    np.testing.assert_array_equal(reach[near], full[near])

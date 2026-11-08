@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -90,6 +91,11 @@ def _remember(store: OrderedDict, key: str, value) -> None:
     store[key] = value
     while len(store) > KEEP:
         store.popitem(last=False)
+
+
+#: A place may reuse the table plane of a pick scene at most this old (s);
+#: complete_scene still checks it against the place's own frame.
+SUPPORT_HINT_MAX_AGE_S = 300.0
 
 
 class X2GraspHeadNode(Node):
@@ -407,8 +413,15 @@ class X2GraspHeadNode(Node):
             report["scene_load_s"] = time.perf_counter() - began
         except Exception as exc:  # noqa: BLE001 - plan repeats the load and reports its own error
             report["scene_preload_error"] = f"{type(exc).__name__}: {exc}"
+        scenes = estimate.estimates if hasattr(estimate, "estimates") else {"*": estimate}
+        supports = {
+            side: scene.support for side, scene in scenes.items() if getattr(scene, "support", None) is not None
+        }
         with self._lock:
             capture.mask, capture.points, capture.estimate, capture.report = mask, points, estimate, report
+            if supports:
+                # The table the pick found: a place on the same table may reuse it (complete_scene support_hint).
+                self._last_supports = (time.monotonic(), supports)
         response.success, response.report_json = True, wire.to_json(report)
         return response
 
@@ -488,6 +501,18 @@ class X2GraspHeadNode(Node):
         from .container_perception import estimate_container
 
         request, result = handle.request, PlanPlace.Result()
+        # Where the head's part of a place request goes (the host's plan_place
+        # stage minus "total" is the action round trip): one stderr JSON line.
+        started = time.perf_counter()
+        timings: dict = {}
+        tick = started
+
+        def lap(name):
+            nonlocal tick
+            now = time.perf_counter()
+            timings[name] = round(now - tick, 4)
+            tick = now
+
         try:
             held = held_from_msg(request.held_object)
             deadline = time.monotonic() + max(0, request.timeout_s)
@@ -506,10 +531,18 @@ class X2GraspHeadNode(Node):
             head = self._head.arms[held.arm_side] if hasattr(self._head, "arms") else self._head
             if head.spheres.side != held.arm_side:
                 raise GraspFailure("HELD_OBJECT_MISMATCH", "head does not plan the holding arm")
+            lap("request")
             prepared = capture.prepared.result(timeout=max(0, deadline - time.monotonic()))
             if isinstance(prepared, dict):
                 prepared = prepared[held.arm_side]
+            lap("prepared_wait")
+            stored = getattr(self, "_last_supports", None)
+            hint = None
+            if stored is not None and time.monotonic() - stored[0] <= SUPPORT_HINT_MAX_AGE_S:
+                hint = stored[1].get(held.arm_side, stored[1].get("*"))
+                timings["support_hint_age"] = round(time.monotonic() - stored[0], 1)
             with head.gpu:
+                lap("gpu_wait")
                 container = estimate_container(
                     capture.observation,
                     wire.decode_mask(request.container_mask),
@@ -517,7 +550,9 @@ class X2GraspHeadNode(Node):
                     head.spheres,
                     self._place_planner.robots[held.arm_side].perception,
                     prepared=prepared,
+                    support_hint=hint,
                 )
+            lap("container")
             plan = self._place_planner.plan(
                 capture.observation,
                 container,
@@ -525,11 +560,17 @@ class X2GraspHeadNode(Node):
                 deadline=deadline,
                 cancelled=lambda: handle.is_cancel_requested or self._closing.is_set(),
             )
+            lap("plan")
             wire.place_to_result(plan, result)
+            lap("encode")
         except GraspFailure as exc:
             result.error_code, result.message, result.retryable = exc.code, str(exc), exc.retryable
         except Exception as exc:
             result.error_code, result.message = "PLACE_PLAN_FAILED", f"{type(exc).__name__}: {exc}"
+        if not request.return_home:
+            timings["total"] = round(time.perf_counter() - started, 4)
+            line = {"place_request": {"outcome": result.error_code or "ok", "timings_s": timings}}
+            print(json.dumps(line), file=sys.stderr, flush=True)
         handle.canceled() if handle.is_cancel_requested else handle.succeed()
         return result
 
