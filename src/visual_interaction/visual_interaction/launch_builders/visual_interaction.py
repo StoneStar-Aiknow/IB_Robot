@@ -22,11 +22,19 @@ The builder checks what the node cannot see from inside one process:
 
 There is no release node and no exit handler, unlike the mirror session: this
 feature takes over no runtime mode, so there is nothing to hand back.
+
+``internvl_voice.look`` (a top-level ``robot`` key, feat/x2-internvl-voice)
+starts the same node in its look mode (``session.look_say``) when this section
+itself is not enabled: InternVL, never the fake, with the camera and topics of
+this section and a ``nice`` prefix so the mirror's data plane comes first. With
+both on, only this section's node runs. Without the block, or with it off,
+nothing here changes.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Mapping
 
 from launch_ros.actions import Node
@@ -168,8 +176,39 @@ def _categories(section: Mapping[str, object]) -> list[str]:
     return list(raw)
 
 
+# robot_config's installed clips table, the fallback of internvl_voice.clips_table.
+_DEFAULT_CLIPS_TABLE = ("config", "mirror_voice", "x2_clips_v1.yaml")
+# The look reads one picture and asks short questions; chatter's budget.
+_LOOK_MAX_NEW_TOKENS = 16
+
+
 def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> list:
-    """Return the launch actions for the visual interaction session, or none."""
+    """Return the launch actions for the visual interaction session, or none.
+
+    This section's own node when it is enabled; otherwise the look node of
+    ``internvl_voice`` when that is on; otherwise nothing.
+    """
+    actions = _section_nodes(robot_config)
+    look = _look_bundle(robot_config)
+    if look is None:
+        return actions
+    if actions:
+        _logger().warning(
+            "internvl_voice.look is on but visual_interaction.enabled is true: only the visual_interaction "
+            "node runs, without the look"
+        )
+        return actions
+    # The look is an extra: a section it cannot use costs the look only,
+    # never the launch the mirror and its voice are part of (plan §2.2).
+    try:
+        return _look_nodes(robot_config, *look)
+    except (TypeError, ValueError) as exc:
+        _logger().warning(f"internvl_voice.look is on but cannot start, so no look: {exc}")
+        return []
+
+
+def _section_nodes(robot_config: Mapping[str, object]) -> list:
+    """The 676fa608 builder, unchanged: this section's node, or none."""
     from embodied_common.mirror_session_contract import STATE_STALE_SEC
     from embodied_common.visual_interaction_contract import (
         DEFAULT_ABSENT_RESET_SEC,
@@ -178,7 +217,6 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
         DEFAULT_MAX_SESSION_SEC,
         DEFAULT_MIN_GAP_SEC,
     )
-    from visual_interaction.session.endpoints import CAMERA_COMPRESSED
 
     section = robot_config.get("visual_interaction")
     if section is None:
@@ -194,45 +232,7 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
 
     _assert_observation_only(robot_config)
 
-    frame_source = _mapping(section.get("frame_source", {}), "visual_interaction.frame_source")
-    _unknown(frame_source, _FRAME_SOURCE_KEYS, "visual_interaction.frame_source")
-    # At most one of the two, with the same meaning motion_imitation_stream
-    # gives them: ``interface`` names a camera the runtime description carries
-    # and is the normal form; ``topic`` is the escape hatch for a stream the
-    # description does not carry. The robot's half-resolution relay
-    # (hri_halfres_relay) is one of those — it republishes a resized JPEG and
-    # is not part of the HAL interface contract, so naming it needs the hatch
-    # rather than a new profile entry. Neither set keeps the default camera.
-    if "interface" in frame_source and "topic" in frame_source:
-        raise ValueError("visual_interaction.frame_source takes at most one of interface or topic")
-    camera_topic = ""
-    interface = ""
-    camera_qos_json = ""
-    if "topic" in frame_source:
-        camera_topic = frame_source["topic"]
-        if not isinstance(camera_topic, str) or not camera_topic.startswith("/"):
-            raise ValueError("visual_interaction.frame_source.topic must be an absolute ROS name")
-        # A named topic has no description to take QoS from, so the config has
-        # to state it. Without this key the node fell back to a hardcoded
-        # default that happened to match the live relay — frames flowed, and a
-        # publisher with different QoS would have delivered nothing, silently.
-        qos = _mapping(frame_source.get("qos", {}), "visual_interaction.frame_source.qos")
-        _unknown(qos, _QOS_KEYS, "visual_interaction.frame_source.qos")
-        if not qos:
-            raise ValueError(
-                "visual_interaction.frame_source.qos is required with topic: a mismatched "
-                "subscription receives nothing and reports nothing"
-            )
-        camera_qos_json = json.dumps(dict(qos))
-    else:
-        interface = frame_source.get("interface", CAMERA_COMPRESSED)
-        if not isinstance(interface, str) or not interface:
-            raise ValueError("visual_interaction.frame_source.interface must be an interface ID")
-        if "qos" in frame_source:
-            raise ValueError(
-                "visual_interaction.frame_source.qos belongs with topic; an interface takes "
-                "its QoS from the bound runtime description"
-            )
+    interface, camera_topic, camera_qos_json = _frame_source(section)
 
     vl = _mapping(section.get("vl", {}), "visual_interaction.vl")
     _unknown(vl, _VL_KEYS, "visual_interaction.vl")
@@ -320,7 +320,183 @@ def generate_visual_interaction_nodes(robot_config: Mapping[str, object]) -> lis
     return [_visual_interaction_node(robot_config, vl_implementation=implementation, parameters=parameters)]
 
 
-def _visual_interaction_node(robot_config: Mapping[str, object], *, vl_implementation: str, parameters: dict) -> Node:
+def _logger():
+    from robot_config.logger_utils import get_colored_logger
+
+    return get_colored_logger("robot_config.visual_interaction")
+
+
+def _find_share(package: str) -> str:
+    """A package's installed share directory (``$(find package)``)."""
+    from ament_index_python.packages import get_package_share_directory
+
+    return get_package_share_directory(package)
+
+
+def _look_bundle(robot_config: Mapping[str, object]):
+    """``(look settings, look_json)`` when ``internvl_voice.look`` is on, else None (baseline).
+
+    Like the voice node's clips (mirror_session's builder): a bad item warns
+    and keeps its default, and an unreadable table falls back to the installed one.
+    """
+    from embodied_common.internvl_voice_contract import SECTION_PATH, build_bundle, look_json, normalize
+
+    raw = robot_config.get(SECTION_PATH)
+    if raw is None:
+        return None
+    try:
+        settings, _ = normalize(raw)
+    except Exception as exc:  # noqa: BLE001 - a broken section must not take the launch down
+        _logger().warning(f"{SECTION_PATH}: {type(exc).__name__}: {exc}; no look")
+        return None
+    if settings is None or settings.look is None:
+        return None
+    workspace = os.environ.get("WORKSPACE", "")
+    try:
+        default_table = os.path.join(_find_share("robot_config"), *_DEFAULT_CLIPS_TABLE)
+    except Exception as exc:  # noqa: BLE001 - only the fallback table is lost
+        _logger().warning(f"{SECTION_PATH}: robot_config share not found ({exc}); no installed clips table")
+        default_table = os.path.join(*_DEFAULT_CLIPS_TABLE)
+    try:
+        bundle = build_bundle(raw, workspace, default_table, _find_share)
+    except Exception as exc:  # noqa: BLE001 - as above
+        _logger().warning(f"{SECTION_PATH}: {type(exc).__name__}: {exc}; no look")
+        return None
+    if bundle.settings is None or bundle.settings.look is None:
+        return None
+    for warning in bundle.warnings:
+        _logger().warning(warning)
+    return bundle.settings.look, look_json(bundle.settings, bundle.table)
+
+
+def _look_nodes(robot_config: Mapping[str, object], look, look_json: str) -> list:
+    """The look node: this section's camera and topics, InternVL, a nice prefix.
+
+    The section's ``enabled`` is false here by construction and is not asked
+    for: the look is what replaces it. The observation-only check applies as
+    for the section's node. Raises ValueError for what the look cannot use;
+    the caller drops the look node and warns.
+    """
+    from embodied_common.internvl_voice_contract import SECTION_PATH
+    from embodied_common.mirror_session_contract import STATE_STALE_SEC
+    from embodied_common.mirror_voice_contract import NODE_NAME as VOICE_NODE_NAME
+
+    raw = robot_config.get("visual_interaction")
+    if raw is None:
+        _logger().warning(
+            f"{SECTION_PATH}.look is on but there is no visual_interaction section to take the camera from; no look"
+        )
+        return []
+    section = _mapping(raw, "visual_interaction")
+    _unknown(section, _KEYS, "visual_interaction")
+    _assert_observation_only(robot_config)
+    interface, camera_topic, camera_qos_json = _frame_source(section)
+
+    topics = {}
+    for key in ("actor_state_topic", "mirror_state_topic", "voice_status_topic"):
+        value = section.get(key, "")
+        if not isinstance(value, str) or (value and not value.startswith("/")):
+            raise ValueError(f"visual_interaction.{key} must be empty or an absolute ROS name")
+        topics[key] = value
+    mirror_state_stale_sec = section.get("mirror_state_stale_sec", STATE_STALE_SEC)
+    if isinstance(mirror_state_stale_sec, bool) or not isinstance(mirror_state_stale_sec, int | float):
+        raise ValueError("visual_interaction.mirror_state_stale_sec must be a positive number of seconds")
+    if mirror_state_stale_sec <= 0:
+        raise ValueError("visual_interaction.mirror_state_stale_sec must be a positive number of seconds")
+    if not look.demo_root.startswith("/"):
+        _logger().warning(
+            f"{SECTION_PATH}.look.demo_root {look.demo_root!r} is not absolute (is WORKSPACE set?); "
+            "the look will find no model"
+        )
+
+    parameters = {
+        "runtime_description_json": _runtime_description(robot_config),
+        "camera_interface": interface,
+        "camera_topic": camera_topic,
+        "actor_state_topic": topics["actor_state_topic"],
+        "mirror_state_topic": topics["mirror_state_topic"],
+        "mirror_state_stale_sec": float(mirror_state_stale_sec),
+        "vl_implementation": "internvl",
+        "vl_demo_root": look.demo_root,
+        "vl_max_new_tokens": _LOOK_MAX_NEW_TOKENS,
+        "frames_per_window": 1,
+        "buffer_sec": float(section.get("buffer_sec", 6.0)),
+        "stale_stream_sec": float(section.get("stale_stream_sec", 2.0)),
+        "status_period_sec": float(section.get("status_period_sec", 5.0)),
+        # The voice is the mirror voice in this deployment, and a look line
+        # waits for its status to say it is quiet.
+        "voice_status_topic": topics["voice_status_topic"] or f"/{VOICE_NODE_NAME}/status",
+        "look_json": look_json,
+    }
+    if camera_qos_json:
+        parameters["camera_topic_qos_json"] = camera_qos_json
+    _logger().info(
+        f"{SECTION_PATH}.look: visual_interaction node in look mode, InternVL at {look.demo_root}, "
+        f"nice {look.nice}, period {look.round_period_sec:g} s, window {look.window_sec:g} s"
+    )
+    return [
+        _visual_interaction_node(
+            robot_config,
+            vl_implementation="internvl",
+            parameters=parameters,
+            prefix=f"nice -n {look.nice}",
+        )
+    ]
+
+
+def _frame_source(section: Mapping[str, object]) -> tuple[str, str, str]:
+    """``(interface, camera_topic, camera_qos_json)`` from ``frame_source``; one of the first two is empty."""
+    frame_source = _mapping(section.get("frame_source", {}), "visual_interaction.frame_source")
+    _unknown(frame_source, _FRAME_SOURCE_KEYS, "visual_interaction.frame_source")
+    # At most one of the two, with the same meaning motion_imitation_stream
+    # gives them: ``interface`` names a camera the runtime description carries
+    # and is the normal form; ``topic`` is the escape hatch for a stream the
+    # description does not carry. The robot's half-resolution relay
+    # (hri_halfres_relay) is one of those — it republishes a resized JPEG and
+    # is not part of the HAL interface contract, so naming it needs the hatch
+    # rather than a new profile entry. Neither set keeps the default camera.
+    if "interface" in frame_source and "topic" in frame_source:
+        raise ValueError("visual_interaction.frame_source takes at most one of interface or topic")
+    camera_topic = ""
+    interface = ""
+    camera_qos_json = ""
+    if "topic" in frame_source:
+        camera_topic = frame_source["topic"]
+        if not isinstance(camera_topic, str) or not camera_topic.startswith("/"):
+            raise ValueError("visual_interaction.frame_source.topic must be an absolute ROS name")
+        # A named topic has no description to take QoS from, so the config has
+        # to state it. Without this key the node fell back to a hardcoded
+        # default that happened to match the live relay — frames flowed, and a
+        # publisher with different QoS would have delivered nothing, silently.
+        qos = _mapping(frame_source.get("qos", {}), "visual_interaction.frame_source.qos")
+        _unknown(qos, _QOS_KEYS, "visual_interaction.frame_source.qos")
+        if not qos:
+            raise ValueError(
+                "visual_interaction.frame_source.qos is required with topic: a mismatched "
+                "subscription receives nothing and reports nothing"
+            )
+        camera_qos_json = json.dumps(dict(qos))
+    else:
+        from visual_interaction.session.endpoints import CAMERA_COMPRESSED
+
+        interface = frame_source.get("interface", CAMERA_COMPRESSED)
+        if not isinstance(interface, str) or not interface:
+            raise ValueError("visual_interaction.frame_source.interface must be an interface ID")
+        if "qos" in frame_source:
+            raise ValueError(
+                "visual_interaction.frame_source.qos belongs with topic; an interface takes "
+                "its QoS from the bound runtime description"
+            )
+    return interface, camera_topic, camera_qos_json
+
+
+def _visual_interaction_node(
+    robot_config: Mapping[str, object],
+    *,
+    vl_implementation: str,
+    parameters: dict,
+    prefix: str | None = None,
+) -> Node:
     """The session node, attached to RT-Infer when the robot enables it.
 
     The InternVL chain (vision + prefill + decode) runs inside this node
@@ -328,7 +504,8 @@ def _visual_interaction_node(robot_config: Mapping[str, object], *, vl_implement
     (``visual_interaction.session.internvl_vision``), so under RT-Infer the
     whole node becomes the vendor's ``vl``-role client -- one priority for the
     whole chain, matching how the candidate10 validation measured it. The
-    ``fake`` implementation touches no NPU and never wraps.
+    ``fake`` implementation touches no NPU and never wraps. ``prefix`` goes in
+    front of the process (the look's ``nice``); None is none.
     """
     from embodied_common.visual_interaction_contract import NODE_NAME
 
@@ -339,6 +516,7 @@ def _visual_interaction_node(robot_config: Mapping[str, object], *, vl_implement
             name=NODE_NAME,
             parameters=[parameters],
             output="screen",
+            prefix=prefix,
         )
     from robot_config.rt_infer_config import RtInferConfigError, parse_rt_infer_config
 
@@ -353,6 +531,7 @@ def _visual_interaction_node(robot_config: Mapping[str, object], *, vl_implement
             name=NODE_NAME,
             parameters=[parameters],
             output="screen",
+            prefix=prefix,
         )
     from inference_service.launch_builders.perception_models import write_rt_infer_snapshot
 
@@ -363,6 +542,7 @@ def _visual_interaction_node(robot_config: Mapping[str, object], *, vl_implement
         name=NODE_NAME,
         output="screen",
         parameters=[parameters],
+        prefix=prefix,
         arguments=[
             "--role",
             "vl",

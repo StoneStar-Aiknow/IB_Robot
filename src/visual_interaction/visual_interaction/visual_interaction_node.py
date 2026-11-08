@@ -18,6 +18,7 @@ What this node does NOT do, by construction:
 from __future__ import annotations
 
 import json
+import os
 import threading
 from collections import deque
 from collections.abc import Mapping
@@ -37,6 +38,7 @@ from embodied_common.visual_interaction_contract import (
     DEFAULT_MAX_EVIDENCE_AGE_SEC,
     DEFAULT_MAX_SESSION_SEC,
     DEFAULT_MIN_GAP_SEC,
+    KIND_CHATTER,
     NODE_NAME,
     SET_ENABLED_SERVICE,
     STATUS_TOPIC,
@@ -50,6 +52,17 @@ from visual_interaction.session.core import SessionConfig, VisualInteractionSess
 from visual_interaction.session.endpoints import CAMERA_COMPRESSED, Endpoint, resolve_camera
 from visual_interaction.session.fake_vl import ScriptedVision
 from visual_interaction.session.hooks import ActorSignal, RoundInputs, SessionHooks, Window
+from visual_interaction.session.look_say import (
+    DEFAULT_SLOW_LOOK_SEC,
+    Q1,
+    Q2,
+    QUESTIONS,
+    LookConfig,
+    LookSay,
+    classify,
+    parse_yes,
+    refine,
+)
 
 # Declared names and their types. Launch may pass no other name and no other
 # type: rclpy drops an override it has no declaration for without a warning,
@@ -119,7 +132,18 @@ PARAMETERS: dict[str, object] = {
     # line waits. Empty or stale falls back to a length estimate.
     "voice_status_topic": "",
     "voice_status_stale_sec": 3.0,
+    # internvl_voice's look (visual_interaction.session.look_say), as the
+    # contract's look_json: its settings and the look pools' clips. Empty, the
+    # default, is no look and the node is what it was; set, it replaces mode
+    # and round_period_sec with the look's own loop.
+    "look_json": "",
 }
+
+# How often the look's loop runs. A look blocks the executor for its ~1-2 s;
+# between looks this short yield is what lets the subscriptions in.
+LOOK_TICK_SEC = 0.05
+# A failed look is logged at most this often; the status topic counts them all.
+LOOK_ERROR_LOG_SEC = 30.0
 
 
 def camera_qos(declared: Mapping[str, object]) -> QoSProfile:
@@ -233,6 +257,13 @@ class VisualInteractionNode(Node):
         self._mode = str(self._value("mode"))
         if self._mode not in ("observe", "chatter"):
             raise ValueError(f"mode {self._mode!r} is not one of 'observe', 'chatter'")
+        self._look_settings: dict | None = None
+        # Why the look's vision could not even be built (no deployment at
+        # demo_root): the look is then off, the node itself still runs.
+        self._look_build_error: str | None = None
+        if str(self._value("look_json")).strip():
+            self._look_settings = self._parse_look()
+            self._mode = "look"
         # Config-only checks first, so a typo is reported as itself rather than
         # as whatever the runtime description happens to be missing.
         session_hooks = hooks or self._build_hooks()
@@ -286,6 +317,7 @@ class VisualInteractionNode(Node):
         self._last_model_error: str | None = None
 
         self._chatter: Chatter | None = None
+        self._look: LookSay | None = None
         self._voice_busy_now = False
         self._voice_synthesizing_now = False
         self._voice_status_at: float | None = None
@@ -300,6 +332,9 @@ class VisualInteractionNode(Node):
                     object_cooldown_sec=float(self._value("chatter_object_cooldown_sec")),
                 )
             )
+        if self._look_settings is not None:
+            self._init_look(self._look_settings)
+        if self._mode in ("chatter", "look"):
             voice_topic = str(self._value("voice_status_topic")).strip()
             if voice_topic:
                 self.create_subscription(String, voice_topic, self._on_voice_status, 10)
@@ -335,9 +370,12 @@ class VisualInteractionNode(Node):
         # not an optional extra: without it there is no way to ask for quiet.
         self.create_service(SetBool, f"~/{SET_ENABLED_SERVICE}", self._on_set_enabled)
 
-        self.create_timer(float(self._value("round_period_sec")), self._on_round)
+        if self._look is not None:
+            self.create_timer(LOOK_TICK_SEC, self._look_round)
+        else:
+            self.create_timer(float(self._value("round_period_sec")), self._on_round)
         self.create_timer(float(self._value("status_period_sec")), self._publish_status)
-        if self._mode == "chatter":
+        if self._mode in ("chatter", "look"):
             # Pay the ~20 s model load while the mirror still waits, not in
             # the first mirroring round, where it ate the visitor's turn.
             self._preload_timer = self.create_timer(1.0, self._preload)
@@ -400,6 +438,8 @@ class VisualInteractionNode(Node):
     def _build_hooks(self) -> SessionHooks:
         implementation = str(self._value("vl_implementation"))
         if implementation == "fake":
+            if self._mode == "look":
+                raise ValueError("look_json needs vl_implementation 'internvl'; the scripted vision cannot look")
             return SessionHooks(vision=ScriptedVision.of())
         if implementation == "internvl":
             # Imported here, not at module scope: it loads the board's InternVL
@@ -410,6 +450,20 @@ class VisualInteractionNode(Node):
             demo_root = str(self._value("vl_demo_root")).strip()
             if not demo_root:
                 raise ValueError("vl_implementation 'internvl' needs vl.demo_root")
+            if self._mode == "look":
+                # One picture per look, and chatter's prompt for the base one
+                # load() builds; the look's own questions are registered on top.
+                try:
+                    vision = InternVlVision(
+                        demo_root=demo_root,
+                        frames=1,
+                        max_new_tokens=int(self._value("vl_max_new_tokens")),
+                        prompt_mode="chatter",
+                    )
+                except ValueError as error:
+                    self._look_build_error = str(error)
+                    return SessionHooks(vision=ScriptedVision.of())
+                return SessionHooks(vision=vision)
             return SessionHooks(
                 vision=InternVlVision(
                     demo_root=demo_root,
@@ -532,6 +586,9 @@ class VisualInteractionNode(Node):
 
     def _preload(self) -> None:
         self._preload_timer.cancel()
+        if self._look is not None:
+            self._look_preload()
+            return
         load = getattr(self._session.hooks.vision, "load", None)
         if load is None:
             return
@@ -632,6 +689,247 @@ class VisualInteractionNode(Node):
             f'say: "{line.text}"  [{line.kind}/{line.subject}] next in {chatter.next_due - after:.1f}s'
         )
 
+    # -- look (internvl_voice) -------------------------------------------
+
+    def _parse_look(self) -> dict:
+        from embodied_common.internvl_voice_contract import parse_look_json
+
+        settings, warnings = parse_look_json(str(self._value("look_json")))
+        for warning in warnings:
+            self.get_logger().warning(f"look: {warning}")
+        return settings
+
+    def _init_look(self, settings: dict) -> None:
+        """The look's state: its decisions, its loop's bookkeeping and the model's questions."""
+        self._look = LookSay(LookConfig.from_look(settings), settings["pools"])
+        self._look_period = float(settings["round_period_sec"])
+        # Looks back to back have no period to overrun; the plan's 2.5 s is the limit then.
+        self._look_slow_sec = max(self._look_period, DEFAULT_SLOW_LOOK_SEC)
+        self._look_crop = bool(settings["crop_actor"])
+        self._look_latest_start_sec = float(settings["latest_start_sec"])
+        self._look_dump_dir = str(settings["dump_dir"]).strip()
+        self._look_ready = False
+        # Set when the look is off for good (model or Q1 refused): no line at all.
+        self._look_dead: str | None = None
+        self._look_last_end = float("-inf")
+        self._look_ticks = 0
+        self._look_frame_stamp: float | None = None
+        self._look_error_logged_at = float("-inf")
+        self._look_mirroring = False
+        # What one tick did, for dump_dir; reset at the start of every tick.
+        self._look_record: dict = {}
+        if self._look_build_error is not None:
+            self._look_off(f"no model: {self._look_build_error}")
+            return
+        vision = self._session.hooks.vision
+        missing = [
+            name for name in ("register_questions", "prepare", "ask") if not callable(getattr(vision, name, None))
+        ]
+        if missing:
+            self._look_off(f"the vision has no {', '.join(missing)}")
+            return
+        vision.register_questions(QUESTIONS)
+        if not any(settings["pools"].values()):
+            self.get_logger().warning("look: look_json carries no pools; the look has nothing to say")
+        self.get_logger().info(
+            f"look: period {self._look_period:g} s, window {self._look.config.window_sec:g} s, "
+            f"verify {self._look.config.verify}, refine {self._look.config.refine_hand}, "
+            f"crop {self._look_crop}, {sum(len(v) for v in settings['pools'].values())} clips"
+        )
+
+    def _look_off(self, why: str) -> None:
+        self._look_dead = why
+        self._look_ready = False
+        self.get_logger().warning(f"look off: {why}")
+
+    def _look_preload(self) -> None:
+        if self._look_dead is not None:
+            return
+        vision = self._session.hooks.vision
+        try:
+            vision.load()
+        except Exception as error:  # noqa: BLE001 - plan §4.6: a model that cannot load turns the look off
+            self._look_off(f"model load failed: {error}")
+            return
+        failures = dict(getattr(vision, "question_failures", {}) or {})
+        if Q1 in failures:
+            self._look_off(f"{Q1} refused: {failures[Q1]}")
+            return
+        for key, why in sorted(failures.items()):
+            self.get_logger().warning(f"look: question {key} refused, skipped: {why}")
+        self._look_ready = True
+        self.get_logger().info("look: model preloaded")
+
+    def _on_look_mirror(self, now: float) -> None:
+        """Follow MIRRORING by its value, not its freshness.
+
+        A look blocks the executor for a second or two, so after one the last
+        heartbeat is often older than mirror_state_stale_sec; resetting the
+        round on that would start it over after every look. Staleness only
+        holds the look and its lines (in _look_round).
+        """
+        mirroring = self._mirror_topic is None or self._mirror_state == STATE_MIRRORING
+        if mirroring and not self._look_mirroring:
+            self._look.enter(now)
+            self._look_last_end = float("-inf")
+            self.get_logger().info("look: mirroring; a new round")
+        elif not mirroring and self._look_mirroring:
+            self._look.leave()
+        self._look_mirroring = mirroring
+
+    def _look_round(self) -> None:
+        """One tick of the look's loop: look if it is time, say a line if one is due.
+
+        Single-threaded, never re-entered: the look runs inside this callback,
+        and the next tick only comes once it has returned.
+        """
+        look = self._look
+        now = self._now()
+        self._on_look_mirror(now)
+        # ~/set_enabled false mutes the look as well: no looking, no lines.
+        if self._look_dead is not None or not look.active or self._session.muted:
+            return
+        if not self._mirror_active(now):
+            self._count(SUPPRESS_MIRROR_INACTIVE)
+            return
+        look.voice(now, self._voice_busy_now, self._voice_heard(now), self._voice_status_at)
+        self._look_record = {}
+        if self._look_ready and look.wants_look(now) and now - self._look_last_end >= self._look_period:
+            self._look_once(now)
+            now = self._now()
+            look.voice(now, self._voice_busy_now, self._voice_heard(now), self._voice_status_at)
+        pick = look.decide(now, self._look_verify if self._look_ready else None)
+        if pick is not None:
+            self._look_say(pick, now)
+        if self._look_record:
+            self._look_record.setdefault("t", round(now, 3))
+            self._look_dump()
+
+    def _look_once(self, now: float) -> None:
+        """Look at the newest frame: Q1, and Q2 when it named a gesture it could not name."""
+        look = self._look
+        window = self._buffer.window(0.0, 1)
+        if window is None or now - window.received_at > self._stale_stream_sec:
+            self._count("look_no_stream")
+            return
+        if self._actor_received_at is None or now - self._actor_received_at > self._stale_actor_sec:
+            self._count("look_no_actor")
+            return
+        # Looking while the voice is synthesizing put two models on the NPU at
+        # once and the mirror's pose model fell behind (see _chatter_round).
+        # Clips are not synthesized, so in the clip mode this never holds.
+        if self._voice_synthesizing(now):
+            self._count("skip_voice_synthesis")
+            return
+        frame = _decode(window.frames[-1])
+        if frame is None:
+            self._count("look_bad_frame")
+            return
+        actor = self._actor
+        bbox = actor.bbox if actor.present else None
+        vision = self._session.hooks.vision
+        record = self._look_record
+        self._look_ticks += 1
+        record.update(tick=self._look_ticks, t=round(now, 3), bbox=list(bbox) if bbox else None)
+        started = self._now()
+        try:
+            seen = vision.prepare(frame, bbox, crop=self._look_crop)
+            q1 = vision.ask(seen, Q1)
+            record.update(q1=q1.text, crop_fallback=bool(seen.crop_fallback), image=seen.image)
+            label = classify(q1.text)
+            if look.wants_refine(label) and Q2 not in getattr(vision, "question_failures", {}):
+                q2 = vision.ask(seen, Q2)
+                record["q2"] = q2.text
+                label = refine(label, q2.text)
+        except Exception as error:  # noqa: BLE001 - plan §4.6: a failed look is a silent tick
+            self._look_last_end = self._now()
+            self._count("look_error")
+            record["error"] = f"{type(error).__name__}: {error}"
+            if now - self._look_error_logged_at >= LOOK_ERROR_LOG_SEC:
+                self._look_error_logged_at = now
+                self.get_logger().warning(f"look failed: {record['error']}")
+            return
+        after = self._now()
+        self._look_last_end = after
+        seconds = after - started
+        record.update(seconds=round(seconds, 3), label=label.tag if label else None)
+        self._rounds += 1
+        if seconds > self._look_slow_sec:
+            look.slow()
+            record["slow"] = True
+            self._count("look_slow")
+            if look.stopped:
+                self.get_logger().warning(f"look: {seconds:.1f} s looks; no more looking this round")
+            return
+        self._count("look")
+        self._look_frame_stamp = window.newest_stamp
+        look.looked(after, label, ref=seen)
+
+    def _look_verify(self, key: str, seen) -> bool | None:
+        """Q3 on the picture the named gesture was seen in; None when asking it failed.
+
+        A question refused at load is skipped, not failed: it can never be
+        asked, so that gesture goes on Q1 alone, as with ``verify: false``.
+        """
+        vision = self._session.hooks.vision
+        if key in getattr(vision, "question_failures", {}):
+            self._count("q3_skipped")
+            self._look_record["q3_skipped"] = key
+            return True
+        try:
+            answer = vision.ask(seen, key)
+        except Exception as error:  # noqa: BLE001 - an unanswered Q3 is a "no": the line downgrades
+            self._count("look_error")
+            self._look_record["q3_error"] = f"{type(error).__name__}: {error}"
+            return None
+        yes = parse_yes(answer.text)
+        self._look_record.update(q3=key, q3_answer=answer.text, q3_yes=yes)
+        self._count("q3_yes" if yes else "q3_no")
+        return yes
+
+    def _look_say(self, pick, now: float) -> None:
+        self._count(f"look_said_{pick.reason}")
+        stamp = self._look_frame_stamp if self._look_frame_stamp is not None else now
+        message = VisualInteractionUtterance()
+        message.header.stamp = _as_time(stamp)
+        message.evidence_start_stamp = _as_time(stamp)
+        message.session_id = "look"
+        message.event_id = f"look-{pick.total}-{pick.clip_id}"
+        message.episode_seq = pick.total
+        message.text = pick.text
+        message.kind = KIND_CHATTER
+        message.category = pick.pool
+        message.suppress_reason = ""
+        message.latest_start_at = _as_time(now + self._look_latest_start_sec)
+        self._utterances.publish(message)
+        self._look_record.update(pool=pick.pool, clip=pick.clip_id, reason=pick.reason, quick=pick.quick)
+        self.get_logger().info(
+            f'say: "{pick.text}"  [{pick.pool} {pick.clip_id}, {pick.reason}{", quick" if pick.quick else ""}] '
+            f"{pick.seq}/{self._look.config.max_per_round}"
+        )
+
+    def _look_dump(self) -> None:
+        """dump_dir: the crop each look saw, and one answers.jsonl line per tick that did something."""
+        if not self._look_dump_dir:
+            return
+        record = dict(self._look_record)
+        image = record.pop("image", None)
+        try:
+            os.makedirs(self._look_dump_dir, exist_ok=True)
+            if image is not None and "tick" in record:
+                import cv2
+
+                name = f"look-{record['tick']:06d}.jpg"
+                cv2.imwrite(os.path.join(self._look_dump_dir, name), image)
+                record["image"] = name
+            with open(os.path.join(self._look_dump_dir, "answers.jsonl"), "a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as error:  # noqa: BLE001 - a dump is a debugging aid, never a reason to stop
+            self._count("look_dump_error")
+            if self._now() - self._look_error_logged_at >= LOOK_ERROR_LOG_SEC:
+                self._look_error_logged_at = self._now()
+                self.get_logger().warning(f"look: dump failed: {error}")
+
     # -- publishing -------------------------------------------------------
 
     def _publish(self, result, window: Window) -> None:
@@ -715,6 +1013,16 @@ class VisualInteractionNode(Node):
         if self._chatter is not None:
             payload["chatter_spoken"] = self._chatter.spoken
             payload["voice_busy"] = self._voice_busy(self._now())
+        if self._look is not None:
+            payload["look"] = {
+                "ready": self._look_ready,
+                "off": self._look_dead or "",
+                "round_spoken": self._look.spoken,
+                "spoken": self._look.total,
+                "stopped": self._look.stopped,
+                "looks": self._look_ticks,
+            }
+            payload["voice_busy"] = self._look.busy(self._now())
         self._status.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
     def _count(self, key: str) -> None:
@@ -722,6 +1030,15 @@ class VisualInteractionNode(Node):
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+
+def _decode(data: bytes):
+    """A JPEG as an H×W×3 BGR array, or None when it does not decode."""
+    import cv2
+    import numpy as np
+
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    return frame if frame is not None and frame.ndim == 3 else None
 
 
 def _as_time(seconds: float) -> Time:
