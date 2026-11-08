@@ -101,5 +101,14 @@ def test_the_right_hand_is_mounted_natively_with_the_same_alias_presets():
         right.check(native + np.r_[0.0, 4.0, np.zeros(8)])
     with pytest.raises(RuntimeError, match="Initial right hand is not open"):
         right.require_open(right.preset("close"))
+    # A thumb abduction 0.088 rad short of the open preset counts as open; 0.12 does not.
+    open_pose = right.preset("open")
+    inward = 1.0 if open_pose[1] + 0.12 <= right.upper[1] else -1.0
+    short = open_pose.copy()
+    short[1] += 0.088 * inward
+    assert right.require_open(short) == pytest.approx(0.088)
+    short[1] = open_pose[1] + 0.12 * inward
+    with pytest.raises(RuntimeError, match="Initial right hand is not open"):
+        right.require_open(short)
     with pytest.raises(ValueError, match="side must be"):
         HandMapping(planning_model(), PRESETS, side="middle")

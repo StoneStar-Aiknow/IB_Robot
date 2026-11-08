@@ -11,7 +11,14 @@ import numpy as np
 
 from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, check_side, hand_alias_signs
 
-OPEN_HAND_TOLERANCE_RAD = 0.025
+#: How far (rad, per joint) a measured hand may be from the open preset and
+#: still count as open: before planning a grasp, after opening and on release.
+#: 0.025 rejected a right thumb abduction that stopped 0.088 rad short of the
+#: preset after a release (2026-11-08), which failed the following regrasp.
+OPEN_HAND_TOLERANCE_RAD = 0.1
+#: How far (rad) the other, preserved hand may drift while one hand is driven.
+#: A drift check, not an "is open" check: it keeps the original tight bound.
+PRESERVED_HAND_DRIFT_RAD = 0.025
 
 
 def hand_links(model: ET.Element) -> tuple[str, ...]:

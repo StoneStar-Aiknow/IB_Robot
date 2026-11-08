@@ -27,6 +27,7 @@ from aimdk_grasp.hand_restore import (
     sweep_frames,
 )
 from aimdk_grasp.joints import BODY_JOINTS, LEFT_ARM, RIGHT_ARM
+from aimdk_grasp.omnihand import staged_open_frames
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS
 
@@ -233,7 +234,7 @@ def test_long_hand_preflight_refreshes_owner_and_checks_every_sample(restore):
         plan.sweep.check = slow_check
     expected = np.concatenate(
         [
-            sweep_frames(ports.hands[side], restorer.plans[side].open_pose, restorer.step_rad)
+            staged_open_frames(ports.hands[side], restorer.plans[side].open_pose, restorer.step_rad)
             for side in ("left", "right")
         ]
     )
@@ -355,7 +356,7 @@ def test_release_observation_rejects_rebound_or_loss_of_control(restore, fault, 
 
     def fail():
         if fault == "rebound":
-            ports.hands["left"][4] = 0.1
+            ports.hands["left"][4] = 0.15  # past the 0.1 rad open tolerance
         elif fault == "gains":
             ports.board = replace(ports.board, damping=np.zeros(14))
         elif fault == "board":

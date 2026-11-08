@@ -34,7 +34,7 @@ from .feedback import Feedback
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping, hand_links
 from .joints import ABSENT_HAND_COMMAND, BODY_JOINTS, LEFT_ARM, RIGHT_ARM, arm_joints, other_side
 from .joints import installed_hands as parse_installed_hands
-from .omnihand import HAND_HZ, HAND_STEP_RAD
+from .omnihand import HAND_HZ, HAND_STEP_RAD, staged_open_frames
 
 SIDES = ("left", "right")
 #: Why ``build_hand_plans`` has no plan for a hand the configuration declares absent.
@@ -570,7 +570,7 @@ class HandRestorer:
         projected = obs.feedback
         for side in sides:
             plan = self.plans[side]
-            frames = sweep_frames(self._hand(obs, side), plan.open_pose, self.step_rad)
+            frames = staged_open_frames(self._hand(obs, side), plan.open_pose, self.step_rad)
             self._check_hand_sweep(ctx, plan, projected, frames, obs, left_arm=left_arm, right_arm=right_arm)
             projected = replace(projected, **{f"{side}_hand": plan.open_pose})
             seconds += len(frames) / HAND_HZ + SETTLE_S
@@ -614,7 +614,7 @@ class HandRestorer:
             raise RestoreError("HAND_PRESERVED_MOVED", "the left hand must be open before the right hand opens")
 
     def open_hand(self, ctx: RestoreContext, side: str) -> bool:
-        """Open one hand along a collision-checked straight line, holding the other where it is."""
+        """Open one hand, fingers then thumb, along a collision-checked path; hold the other where it is."""
         self.require_capabilities([side])
         if self._baseline is None:
             raise RestoreError("HAND_NOT_SETTLED", "begin the hand phase before opening a hand")
@@ -628,7 +628,8 @@ class HandRestorer:
                 raise RestoreError("HAND_PRESERVED_MOVED", f"{other} hand moved between preparation stages")
         if side == "right" and "left" in self.installed:
             self._require_left_open(obs)
-        frames = sweep_frames(start, plan.open_pose, self.step_rad)
+        # The same staged path preflight checked: fingers first, then the thumb.
+        frames = staged_open_frames(start, plan.open_pose, self.step_rad)
         self._check_hand_sweep(ctx, plan, obs.feedback, frames, obs)
         ctx.progress(f"opening_{side}", 0.0)
         skipped = float(np.max(np.abs(start - plan.open_pose))) <= OPEN_HAND_TOLERANCE_RAD

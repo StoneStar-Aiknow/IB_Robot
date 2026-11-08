@@ -32,7 +32,7 @@ import numpy as np
 from manipulation_execution.grasp_pipeline.contracts import EffectorAction, EffectorOutcome, Flag
 from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
 
-from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
+from .hand import OPEN_HAND_TOLERANCE_RAD, PRESERVED_HAND_DRIFT_RAD, HandMapping
 from .joints import ABSENT_HAND_COMMAND, HAND_PARTS, check_side, other_side
 
 HAND_HZ = 50.0
@@ -82,6 +82,33 @@ FINGERS = {
 }
 #: Each hand's offset in the 20-value stream and the hand state view.
 HAND_OFFSETS = {"left": 0, "right": len(HAND_PARTS)}
+
+
+def staged_open_frames(start, target, step_rad: float = HAND_STEP_RAD) -> np.ndarray:
+    """The measured start, then the four fingers alone, then the thumb alone.
+
+    Each stage is a straight line no more than ``step_rad`` per joint per frame.
+    Opening the fingers first frees a thumb folded under them: on 2026-11-08 a
+    straight-line open from a half-closed hand stalled the right thumb abduction
+    at -1.10 rad under the bent fingers until tracking failed, while the same
+    open from an extended hand reached the preset.
+    """
+    start, target = np.asarray(start, float), np.asarray(target, float)
+    if start.shape != (len(HAND_PARTS),) or target.shape != start.shape or not np.isfinite([start, target]).all():
+        raise ValueError("Ten finite hand values required")
+    if not np.isfinite(step_rad) or not 0 < step_rad <= HAND_STEP_RAD:
+        raise ValueError(f"Hand step must be finite and in (0, {HAND_STEP_RAD}] rad")
+    thumb = np.zeros(len(HAND_PARTS), dtype=bool)
+    thumb[list(FINGERS["thumb"][0])] = True
+    fingers_open = np.where(thumb, start, target)
+    frames = [start]
+    for begin, end in ((start, fingers_open), (fingers_open, target)):
+        span = float(np.max(np.abs(end - begin)))
+        if span > 0.0:
+            frames.extend(np.linspace(begin, end, int(np.ceil(span / step_rad)) + 1)[1:])
+    if len(frames) == 1:
+        frames.append(target)  # already there: one frame, as a straight line would send
+    return np.asarray(frames)
 
 
 class HandIO(Protocol):
@@ -242,9 +269,8 @@ class OmniHandEffector:
         if self.command is not None and np.array_equal(self.command, target):
             frames = []  # already commanded open: only wait for the fingers below
         else:
-            # Straight line from the measured hand, HAND_STEP_RAD per frame.
-            steps = max(1, int(np.ceil(np.max(np.abs(target - start)) / HAND_STEP_RAD)))
-            frames = [start + (target - start) * (i + 1) / steps for i in range(steps)]
+            # Fingers first, then the thumb, HAND_STEP_RAD per frame (staged_open_frames).
+            frames = list(staged_open_frames(start, target)[1:])
             frames += [target] * int(CLOSE_SETTLE_S * HAND_HZ)
         for frame in frames:
             self._frame(frame, cancelled, name)
@@ -378,7 +404,7 @@ class OmniHandEffector:
             if self._preserved_hand is None:
                 self._preserved_hand = other.copy()
                 self.report["preserved_hand"] = dict(side=preserved_side, positions=other.tolist())
-            if np.max(np.abs(other - self._preserved_hand)) > OPEN_HAND_TOLERANCE_RAD:
+            if np.max(np.abs(other - self._preserved_hand)) > PRESERVED_HAND_DRIFT_RAD:
                 raise _Failed("preserved hand moved during grasp")
         if self.mapping.side == "left":
             self.io.publish([*hand.tolist(), *self._preserved_hand.tolist()])

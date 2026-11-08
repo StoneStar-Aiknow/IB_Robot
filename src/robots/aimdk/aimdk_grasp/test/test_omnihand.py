@@ -18,6 +18,7 @@ from aimdk_grasp.omnihand import (
     HAND_HZ,
     OmniHandEffector,
     left_touch_levels,
+    staged_open_frames,
     touch_levels,
 )
 from aimdk_grasp.robot_model import planning_model
@@ -288,22 +289,71 @@ def test_a_halt_during_the_close_holds_the_fingers_where_they_are(mapping):
     assert act(effector, EffectorAction.RELEASE).succeeded
 
 
-def test_an_open_blocked_far_from_the_preset_fails_and_a_little_short_passes(mapping):
+def test_an_open_blocked_far_from_the_preset_fails_and_one_within_the_open_tolerance_passes(mapping):
     close = mapping.preset("close")
     hand = SimHand(close)
     flex = FINGERS["index"][1]
     hand.block("index", close[flex] - 0.2, touch=False)  # 0.2 rad of the way, then stuck
     outcome = act(OmniHandEffector(hand, mapping), EffectorAction.RELEASE)
     assert not outcome.succeeded and "blocked" in outcome.reason
-    hand = SimHand(close)
     open_flex = mapping.preset("open")[flex]
-    hand.block("index", open_flex + 0.05 * np.sign(close[flex] - open_flex), touch=False)
-    effector = OmniHandEffector(hand, mapping)
-    outcome = act(effector, EffectorAction.RELEASE)
-    assert outcome.succeeded and outcome.report["open_short"]
-    effector.io = SimHand(close)  # the next release is not blocked: it reports nothing short
-    outcome = act(effector, EffectorAction.RELEASE)
+    toward_close = np.sign(close[flex] - open_flex)
+    hand = SimHand(close)
+    hand.block("index", open_flex + 0.15 * toward_close, touch=False)
+    outcome = act(OmniHandEffector(hand, mapping), EffectorAction.RELEASE)
+    assert not outcome.succeeded and "blocked" in outcome.reason
+    # 2026-11-08: a release left the thumb abduction 0.088 rad short; that is open.
+    hand = SimHand(close)
+    hand.block("index", open_flex + 0.088 * toward_close, touch=False)
+    outcome = act(OmniHandEffector(hand, mapping), EffectorAction.RELEASE)
     assert outcome.succeeded and "open_short" not in outcome.report
+    assert outcome.report["short_of_target_rad"] == pytest.approx(0.088, abs=1e-6)
+
+
+HALF_CLOSED = np.array([0.3, -1.1, 0.5, 0.0, 0.76, 0.76, 0.0, 0.76, 0.0, 0.76])
+OPEN_RIGHT = np.array([0.129, -1.54, 0.255, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+THUMB = list(FINGERS["thumb"][0])
+FOUR_FINGERS = [index for index in range(10) if index not in THUMB]
+
+
+def test_staged_open_moves_the_fingers_first_then_the_thumb():
+    frames = staged_open_frames(HALF_CLOSED, OPEN_RIGHT)
+    np.testing.assert_array_equal(frames[0], HALF_CLOSED)
+    np.testing.assert_allclose(frames[-1], OPEN_RIGHT)
+    assert np.max(np.abs(np.diff(frames, axis=0))) <= 0.01 + 1e-12
+    fingers_open = next(i for i, frame in enumerate(frames) if np.allclose(frame[FOUR_FINGERS], 0.0))
+    assert 0 < fingers_open < len(frames) - 1
+    # The thumb holds its start until every finger is open; the fingers then hold open.
+    np.testing.assert_array_equal(
+        frames[: fingers_open + 1][:, THUMB], np.tile(HALF_CLOSED[THUMB], (fingers_open + 1, 1))
+    )
+    np.testing.assert_allclose(frames[fingers_open:][:, FOUR_FINGERS], 0.0)
+
+
+def test_staged_open_skips_a_stage_with_nothing_to_move_and_rejects_bad_input():
+    thumb_only = OPEN_RIGHT.copy()
+    thumb_only[THUMB] = HALF_CLOSED[THUMB]
+    frames = staged_open_frames(thumb_only, OPEN_RIGHT)
+    np.testing.assert_allclose(frames[:, FOUR_FINGERS], 0.0)  # no finger stage
+    assert np.any(frames[1][THUMB] != thumb_only[THUMB])
+    np.testing.assert_allclose(staged_open_frames(OPEN_RIGHT, OPEN_RIGHT), [OPEN_RIGHT, OPEN_RIGHT])
+    with pytest.raises(ValueError):
+        staged_open_frames(np.zeros(10), np.full(10, float("nan")))
+    with pytest.raises(ValueError):
+        staged_open_frames(np.zeros(10), np.zeros(10), step_rad=0.02)
+
+
+def test_release_from_a_half_closed_hand_opens_the_fingers_before_the_thumb(mapping):
+    start = mapping.preset("close")
+    hand = SimHand(start)
+    assert act(OmniHandEffector(hand, mapping), EffectorAction.RELEASE).succeeded
+    sent = np.array(hand.published)
+    target = mapping.preset("open")
+    moving_thumb = [i for i in THUMB if not np.isclose(start[i], target[i])]
+    moving_fingers = [i for i in FOUR_FINGERS if not np.isclose(start[i], target[i])]
+    assert moving_thumb and moving_fingers
+    thumb_starts = next(i for i, frame in enumerate(sent) if not np.allclose(frame[moving_thumb], start[moving_thumb]))
+    np.testing.assert_allclose(sent[thumb_starts - 1][FOUR_FINGERS], target[FOUR_FINGERS])
 
 
 @pytest.mark.parametrize("problem", ["refused", "cancelled", "stale"])
