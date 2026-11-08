@@ -114,7 +114,29 @@ MuJoCo 是工作站使用的物理仿真软件。
 
 2. 核对候选姿态库与两端配置。
 3. 停止两端旧 pipeline。
-4. 将候选库部署为两端的 `commissioning/fixed_poses.json`。
+4. 用候选库替换仓库中的 `commissioning/fixed_poses.json` 并提交。
+   该库与 `task_poses/x2_voice_mirror_grasp_approved.yaml` 中的已批准姿态绑定。
+   修改已批准姿态时，必须重新编译该库。
+
+姿态库指纹只绑定影响姿态的输入。
+第一类输入来自 runtime profile：机械臂关节顺序、`vendor.arm.limits`、
+`conformance.start_positions` 和录制手势轨迹的关节范围。
+第二类输入是生效的机械臂限位和手部模型。
+修改 profile 中的音频、相机或话题配置，不会使已部署的姿态库失效。
+拉取新代码后，只要这些输入不变，就可以直接复用已部署的姿态库，无需重新编译。
+
+指纹规则变更前编译的姿态库，需要在板端迁移一次。
+迁移不需要 MuJoCo，也不修改任何姿态：
+
+```bash
+source .shrc_local
+ros2 run pose_composer pose_migrate_library \
+  --robot-config src/robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml --in-place
+```
+
+如果姿态库不是按当前 profile、限位和手部模型编译的，迁移工具会拒绝迁移。
+此时需要重新编译。
+原文件保留为 `*.legacy-fingerprint.json`。
 
 `--hand-path-check off` 只限定离线编译的证明范围。
 编译器仍校验手部参考入口、身体路径和关节限制。

@@ -26,9 +26,10 @@ robot:
     - model_inference
     - moveit_planning
 
-  # Table-side grasp_ready: hardware approval remains false in the example file.
+  # Table-side grasp_ready and arms_rest, approved on this robot. The committed
+  # commissioning/fixed_poses.json is compiled against exactly these poses.
   task_poses:
-    file: ../task_poses/x2_example.yaml
+    file: ../task_poses/x2_voice_mirror_grasp_approved.yaml
     # Resolve open-hand requests from the explicit mounting declaration below.
     # The same source poses support one or both hands without editing their angles.
     hands: installed

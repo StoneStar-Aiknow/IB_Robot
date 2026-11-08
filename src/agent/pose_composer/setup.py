@@ -26,6 +26,7 @@ setup(
             "pose_memory = pose_composer.memory_cli:main",
             "pose_compile_library = pose_composer.compile_library:main",
             "pose_compile_validation = pose_composer.compile_validation:main",
+            "pose_migrate_library = pose_composer.migrate_library:main",
         ],
         "ibrobot.launch_builders": [
             "pose_composer = pose_composer.launch_builder:POSE_COMPOSER_BUILDER",

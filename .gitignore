@@ -10,6 +10,9 @@ tmp/
 
 # Offline X2 geometry/targets are deployment assets, not source model files.
 /commissioning/fixed_poses*.json
+# Except the approved library of aimdk_x2_voice_mirror_grasp, shared so a
+# pulled tree reuses it while its motion fingerprint matches (no MuJoCo).
+!/commissioning/fixed_poses.json
 
 # Vendor SDK reference trees (never vendored: see
 # src/robots/aimdk/aimdk_robot/README.md). AimDK is ~490 MB and its message
