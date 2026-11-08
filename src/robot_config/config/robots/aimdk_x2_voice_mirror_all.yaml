@@ -348,3 +348,38 @@ robot:
       native_lower: [-1.117, -0.05, -0.03, -1.64]
       native_upper: [0.03, 1.64, 0.87, 0.05]
   # /feat/x2-cbf-safety
+
+  # feat/x2-internvl-voice
+  # The mirror speaks prerecorded clips only: transitions, standby words and a
+  # line matched to what InternVL sees. Never synthesis. Remove this block (or
+  # set enabled: false) and the mirror voice is the 676fa608 one again.
+  # Deployment: src/robot_config/config/mirror_voice/README.md
+  internvl_voice:
+    enabled: true
+    clips_table: $(find robot_config)/config/mirror_voice/x2_clips_v1.yaml
+    clip_dir: assets/audio/x2_mirror_clips_v1   # relative to $WORKSPACE
+    asr: mute                    # mute | off | keep
+    asr_resume_delay_sec: 0.8
+    asr_control_topic: /voice_control
+    standby:
+      first_after_sec: [1.0, 3.0]
+      gap_sec: [2.0, 5.0]
+    look:
+      enabled: true
+      demo_root: /root/vlx_internvl_310p
+      round_period_sec: 0.0      # 0 = start the next look as soon as the last one ends
+      window_sec: 0.0            # 0 = look all through MIRRORING; >0 = only this long before a line is due
+      quick_gap_sec: 2.0         # a verified named gesture may be answered this soon after the last line
+      nice: 10                   # CPU niceness of the look node; the data plane comes first
+      crop_actor: true
+      refine_hand: true          # second question when the answer is a vague hand gesture
+      verify: true               # yes/no check before a line that names a gesture
+      first_after_sec: [2.0, 4.0]
+      gap_sec: [3.0, 6.0]
+      max_per_round: 5
+      fresh_sec: 5.0
+      pool_cooldown_sec: 15.0
+      fallback_after_sec: 2.5
+      latest_start_sec: 2.0
+      dump_dir: ""
+  # /feat/x2-internvl-voice
