@@ -7,7 +7,9 @@ Modules:
           when the missing TTS service is reported.
 ``speaker``  the order of a phrase: queue, WAV cache or synthesis, playback
              segment by segment; precaching, call timeouts, failures and
-             ``~/status``.
+             ``~/status``. With prerecorded clips: no synthesis, event and
+             standby choice, queue priority.
+``asr_mute``  when ASR is stopped before a clip and started again after it.
 
 The ``voice`` section of the config, its defaults and its checks are in
 ``embodied_common.mirror_voice_contract``, which the session's launch builder

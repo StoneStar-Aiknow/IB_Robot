@@ -15,6 +15,9 @@ Parameters (filled by launch, see ``VOICE_PARAMETERS``):
 ``tts_timeout_sec``       per synthesis call
 ``playback_timeout_sec``  per played segment
 ``status_period_sec``     ``~/status`` period (default 1 s)
+``clips_json``            empty (the default): the behaviour above. Otherwise
+                          ``internvl_voice_contract.playback_json``: the
+                          prerecorded mode below
 
 Interfaces:
 
@@ -34,11 +37,22 @@ Interfaces:
 
 Nothing else: no session service. Every call is asynchronous on one thread;
 ``speaker`` times calls out and ignores a late answer.
+
+Prerecorded mode (``clips_json`` set; ``internvl_voice`` on): the clips are
+checked once at startup (24 kHz mono 16 bit) in the first ``clip_dirs``
+entry that has any, logged as 「用 <dir>，找到 n / N」; only the usable ones
+are ever played. No synthesis client is made and nothing is synthesized: an
+utterance whose text has no clip is refused as ``noclip``. Around every
+playback the ASR is muted through ``asr_mute.AsrMute`` on the ``asr.topic``
+(``/voice_control``, as the self introduction does), reading its state from
+``/voice_status``; and ``~/status`` is also published the moment
+``speaking`` changes.
 """
 
 from __future__ import annotations
 
 import json
+import signal
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -47,20 +61,36 @@ import rclpy
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.signals import uninstall_signal_handlers
 from std_msgs.msg import String
 
+from embodied_common.internvl_voice_contract import parse_playback_json
 from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STALE_SEC, STATE_TOPIC
 from embodied_common.mirror_voice_contract import NODE_NAME, VoiceSection, from_json, has_ascii_letters
 from embodied_common.visual_interaction_contract import UTTERANCE_KINDS
 from ibrobot_msgs.msg import VisualInteractionUtterance
 from ibrobot_msgs.srv import PlayAudioFile, SynthesizeSpeech
-from manipulation_execution.mirror_voice.speaker import Done, Speaker, SynthesisDone, WavDirectory
+from manipulation_execution.mirror_voice.asr_mute import AsrMute
+from manipulation_execution.mirror_voice.speaker import (
+    ClipFiles,
+    ClipReport,
+    Done,
+    Speaker,
+    SynthesisDone,
+    WavDirectory,
+    load_clips,
+)
 
 TICK_PERIOD_S = 0.1
 
 # Why an utterance can be refused at the door, counted in ``~/status`` as
 # ``utterance_refused``. The order is the order the checks run in.
 UTTERANCE_REFUSALS = ("kind", "suppressed", "empty", "ascii", "mirror", "late")
+# Prerecorded mode adds one: no clip has the utterance's text.
+CLIPS_REFUSALS = (*UTTERANCE_REFUSALS, "noclip")
+
+# Fixed by voice_asr_node, as the voice bridge reads it.
+ASR_STATUS_TOPIC = "/voice_status"
 
 # Every parameter the node declares, with its default. Launch may pass no other
 # name and no other type: rclpy drops an override it has no declaration for
@@ -72,6 +102,7 @@ VOICE_PARAMETERS = {
     "tts_timeout_sec": 15.0,
     "playback_timeout_sec": 300.0,
     "status_period_sec": 1.0,
+    "clips_json": "",
 }
 _ROS_NAMES = ("tts_service", "playback_service")
 _PERIODS = ("tts_timeout_sec", "playback_timeout_sec", "status_period_sec")
@@ -87,6 +118,8 @@ class VoiceSettings:
     tts_timeout_sec: float
     playback_timeout_sec: float
     status_period_sec: float
+    # Empty: the synthesized phrases; else the prerecorded mode's playback_json.
+    clips_json: str = ""
 
     @classmethod
     def from_parameters(cls, values: Mapping[str, Any]) -> VoiceSettings:
@@ -101,11 +134,13 @@ class VoiceSettings:
             value = values[name]
             if isinstance(value, bool) or not isinstance(value, int | float) or not value > 0.0:
                 raise ValueError(f"{name} must be positive")
+        clips_json = values.get("clips_json", "")
         return cls(
             section=section,
             tts_service=values["tts_service"],
             playback_service=values["playback_service"],
             **{name: float(values[name]) for name in _PERIODS},
+            clips_json=clips_json.strip() if isinstance(clips_json, str) else "",
         )
 
 
@@ -113,7 +148,8 @@ class RosVoiceCalls:
     """``SpeakerCalls`` over two ROS service clients.
 
     Nothing here waits: each call is sent and its answer comes back through
-    ``done``.
+    ``done``. Without a synthesis client (prerecorded mode) the synthesis
+    service is never ready and a synthesis call fails.
     """
 
     def __init__(self, *, tts, playback):
@@ -121,12 +157,14 @@ class RosVoiceCalls:
         self._playback = playback
 
     def tts_ready(self) -> bool:
-        return self._tts.service_is_ready()
+        return self._tts is not None and self._tts.service_is_ready()
 
     def playback_ready(self) -> bool:
         return self._playback.service_is_ready()
 
     def synthesize(self, text: str, done: SynthesisDone) -> None:
+        if self._tts is None:
+            raise RuntimeError("prerecorded mode: no synthesis")
         request = SynthesizeSpeech.Request()
         request.text = text
         request.prompt_audio = []
@@ -180,7 +218,8 @@ class MirrorVoiceNode(Node):
         for name, default in VOICE_PARAMETERS.items():
             self.declare_parameter(name, default)
         self.speaker: Speaker | None = None
-        self.files: WavDirectory | None = None
+        self.files: WavDirectory | ClipFiles | None = None
+        self.mute: AsrMute | None = None
         try:
             settings = VoiceSettings.from_parameters(
                 {name: self.get_parameter(name).value for name in VOICE_PARAMETERS}
@@ -189,12 +228,16 @@ class MirrorVoiceNode(Node):
             self.get_logger().error(f"mirror voice off, the mirror goes on without it: {exc}")
             return
         self._settings = settings
-        self.files = WavDirectory()
         # The current session state and when its message arrived, for the
         # utterance gate. The transition filter inside the speaker keeps its
         # own view; this one answers "is the mirror following someone now".
         self._state = ""
         self._state_at: float | None = None
+        self._clip_report: ClipReport | None = None
+        if settings.clips_json:
+            self._start_clips(settings)
+            return
+        self.files = WavDirectory()
         self._utterance_refused = dict.fromkeys(UTTERANCE_REFUSALS, 0)
         calls = RosVoiceCalls(
             tts=self.create_client(SynthesizeSpeech, settings.tts_service),
@@ -243,6 +286,94 @@ class MirrorVoiceNode(Node):
         else:
             self.get_logger().info(message)
 
+    def _start_clips(self, settings: VoiceSettings) -> None:
+        """Prerecorded mode: check the clips, mute the ASR around them, never synthesize."""
+        playback, warnings = parse_playback_json(settings.clips_json)
+        for warning in warnings:
+            self._log("warning", f"mirror voice: {warning}")
+        clips, report = load_clips(playback)
+        self._clip_report = report
+        if report.directory is None:
+            self._log(
+                "error",
+                f"mirror voice clips: 找到 0 / {report.total}, no clip WAV in {list(report.tried)}; "
+                "the mirror goes on without voice (nothing is synthesized)",
+            )
+        else:
+            self._log(
+                "info" if report.found == report.total else "warning",
+                f"mirror voice clips: 用 {report.directory}，找到 {report.found} / {report.total}",
+            )
+            for clip_id, reason in report.problems.items():
+                self._log("warning", f"mirror voice clips: {clip_id}: {reason}; it is never said")
+        for event in report.silent_events:
+            self._log("error", f"mirror voice clips: no usable clip for {event}; that event is silent")
+
+        asr = playback["asr"]
+        publisher = None if asr["mode"] == "keep" else self.create_publisher(String, asr["topic"], 10)
+        self.mute = AsrMute(
+            asr["mode"],
+            asr["resume_delay_sec"],
+            lambda command: publisher.publish(String(data=command)),
+            log=self._log,
+        )
+        if publisher is not None:
+            self.create_subscription(String, ASR_STATUS_TOPIC, self._on_asr_status, 10)
+
+        self.files = ClipFiles()
+        self._utterance_refused = dict.fromkeys(CLIPS_REFUSALS, 0)
+        # No synthesis client at all: nothing here can reach the synthesis service.
+        calls = RosVoiceCalls(tts=None, playback=self.create_client(PlayAudioFile, settings.playback_service))
+        self.speaker = Speaker(
+            settings.section,
+            calls,
+            self.files,
+            tts_timeout_s=settings.tts_timeout_sec,
+            playback_timeout_s=settings.playback_timeout_sec,
+            log=self._log,
+            utterance_gate=self._mirroring_now,
+            clips=clips,
+            on_playback_start=self.mute.playback_started,
+            on_playback_end=self.mute.playback_ended,
+            on_speaking=self._on_speaking,
+        )
+        self.create_subscription(
+            String,
+            STATE_TOPIC,
+            self._on_state,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
+        if settings.section.utterance_topic:
+            self.create_subscription(
+                VisualInteractionUtterance,
+                settings.section.utterance_topic,
+                self._on_utterance,
+                10,
+            )
+        self._status_publisher = self.create_publisher(String, "~/status", 10)
+        self.create_timer(TICK_PERIOD_S, self._clips_tick)
+        self.create_timer(settings.status_period_sec, self._publish_status)
+        self.mute.activate()
+        self.get_logger().info(
+            f"mirror voice: {STATE_TOPIC} -> prerecorded clips, playback {settings.playback_service} "
+            f"(timeout {settings.playback_timeout_sec:g} s), no synthesis; queue_max {settings.section.queue_max}; "
+            f"ASR {asr['mode']} on {asr['topic']} (resume {asr['resume_delay_sec']:g} s after a clip)"
+        )
+        if settings.section.utterance_topic:
+            self.get_logger().info(f"mirror voice: utterances from {settings.section.utterance_topic}, clips only")
+
+    def _clips_tick(self) -> None:
+        self.speaker.tick()
+        self.mute.tick()
+
+    def _on_asr_status(self, message: String) -> None:
+        self.mute.on_asr_status(message.data)
+
+    def _on_speaking(self, text: str | None) -> None:
+        # Readers of ~/status (the look) learn at once that the voice is busy or free.
+        if getattr(self, "_status_publisher", None) is not None:
+            self._publish_status()
+
     def _on_state(self, message: String) -> None:
         # The current state and its arrival are recorded beside the transition
         # the speaker reads. A message that is not JSON leaves both alone: the
@@ -288,6 +419,10 @@ class MirrorVoiceNode(Node):
         if latest != 0.0 and self._now() > latest:
             self._refuse("late", text)
             return
+        if self._clip_report is not None and not self.speaker.has_clip(text):
+            # Prerecorded mode says only what it has a clip of; never synthesized.
+            self._refuse("noclip", text)
+            return
         self.speaker.on_utterance(text)
 
     def _refuse(self, reason: str, text: str = "") -> None:
@@ -319,7 +454,28 @@ class MirrorVoiceNode(Node):
         status["playback_service"] = self._settings.playback_service
         status["mirror_state"] = self._state
         status["utterance_refused"] = dict(self._utterance_refused)
+        report = self._clip_report
+        if report is not None:
+            status["clips"] = {"dir": report.directory, "found": report.found, "total": report.total}
+            status["noclip"] = self._utterance_refused["noclip"]
+            status["asr"] = self.mute.status()
         self._status_publisher.publish(String(data=json.dumps(status, ensure_ascii=False, sort_keys=True)))
+
+
+def _interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
+def _keep_context_past_signals() -> None:
+    """SIGINT and SIGTERM end the spin but leave the context up, as in mirror_session_node.
+
+    rclpy's own handlers shut the context down inside the signal, before
+    ``main`` can publish, and without calling ``Context.on_shutdown`` callbacks
+    (which on Humble run after the context is gone anyway). The ASR's last
+    ``start`` needs a working publisher.
+    """
+    uninstall_signal_handlers()
+    signal.signal(signal.SIGTERM, _interrupt)
 
 
 def main(args=None) -> None:
@@ -328,6 +484,8 @@ def main(args=None) -> None:
     node = None
     try:
         node = MirrorVoiceNode()
+        if node.mute is not None:  # prerecorded mode only: the baseline keeps rclpy's handlers
+            _keep_context_past_signals()
         if node.speaker is not None:
             executor.add_node(node)
             executor.spin()
@@ -335,6 +493,9 @@ def main(args=None) -> None:
         pass
     finally:
         if node is not None:
+            if node.mute is not None:
+                # Best effort: another node's rclpy.shutdown() can still beat it.
+                node.mute.shutdown()
             if node.files is not None:
                 node.files.remove()
             executor.remove_node(node)

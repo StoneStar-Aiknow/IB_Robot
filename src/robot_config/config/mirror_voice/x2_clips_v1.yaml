@@ -1,0 +1,66 @@
+# X2 mirror prerecorded clips, version 1. A clip id is <group>_<sub>_<NN>; its
+# pool is <group>.<sub>; its WAV is <clip_dir>/<id>_v1.wav (24 kHz mono s16).
+version: 1
+wav_suffix: _v1.wav
+clips:
+  big_any_01: 哇，这个动作很有精神！
+  big_any_02: 嘿，这一伸展，气势就出来了。
+  big_any_03: 看起来活力满满，我跟上。
+  big_open_01: 双臂展开，像在迎接大家！
+  big_wave_01: 收到你的招呼啦！
+  big_wave_02: 嗨，这个招手，很有亲切感。
+  big_wave_03: 你是在和我打招呼吗？
+  big_wave_04: 招呼收到，我们继续。
+  dance_any_01: 这节奏感，可以啊！
+  dance_any_02: 跟着你一起摆起来，好开心。
+  dance_any_03: 你是不是学过跳舞呀？
+  evt_goodbye_01: 下次再见吧！
+  evt_goodbye_02: 谢谢你陪我玩，下次再见吧。
+  evt_goodbye_03: 玩得真开心，下次再来哦。
+  evt_mirroring_01: 开始模仿咯！
+  evt_mirroring_02: 看好咯，我要跟着你动啦。
+  evt_mirroring_03: 来吧，你动我就动。
+  evt_ready_01: 我准备好咯！
+  evt_ready_02: 热身完毕，随时可以来玩。
+  evt_starting_01: 启动中，稍等一下。
+  hand_any_01: 这个手势我看到啦！
+  hand_any_02: 嗯，你的小手势很可爱。
+  hand_heart_01: 哇，收到你的爱心啦！
+  hand_heart_02: 这颗心比得真好看，暖暖的。
+  hand_heart_03: 嘿嘿，被你的爱心击中了。
+  hand_thumb_01: 谢谢你的点赞，我更有劲儿了！
+  hand_thumb_02: 被你夸了，有点小骄傲呢。
+  hand_thumb_03: 收到点赞，我会继续努力的。
+  hand_yeah_01: 耶！这个手势很有活力。
+  hand_yeah_02: 比个耶，拍照就差这一下了。
+  hand_yeah_03: 好嘞，胜利的手势收到。
+  other_any_01: 你展示的这个动作很有创意。
+  other_any_02: 哎呀，这个组合，我还真没想到。
+  other_any_03: 有想法，这一招挺特别。
+  other_any_04: 原来还能这样组合，学到了。
+  other_any_05: 你的这个动作很有意思。
+  other_any_06: 嗯，这个动作不错。
+  other_any_07: 咦，这个动作有点意思。
+  other_any_08: 你这一招，我得好好学学。
+  pose_any_01: 哟，这个造型，挺有范儿。
+  pose_any_02: 你这是摆了个出场姿势呀。
+  pose_any_03: 这个姿势，很有主角登场的感觉。
+  pose_any_04: 定格得不错，像个展示造型。
+  seq_invite_01: 你看，这一下我学得像吗？
+  seq_invite_02: 我认真学了，你来当评委。
+  seq_invite_03: 嘿嘿，我们这样一来一回，还挺有默契。
+  seq_repeat_01: 这招我又练了一遍，换个花样怎么样？
+  seq_repeat_02: 这个动作我记住啦，还有别的吗？
+  seq_repeat_03: 再来一遍，咱俩越来越有默契了。
+  seq_still_01: 怎么不动啦？我还等着你的下一招呢。
+  seq_still_02: 是在想新动作吗？我准备好啦。
+  seq_still_03: 你不动，我也快站成雕像了。
+  seq_switch_01: 哎，你又换新招了。
+  seq_switch_02: 这一换招，有点出其不意。
+  seq_switch_03: 呀，你的动作变化真丰富。
+  seq_switch_04: 新动作来了，我认真跟着呢。
+  standby_any_01: 你好呀！
+  standby_any_02: 来咯！
+  standby_any_03: 嘿呀！
+  standby_any_04: 来玩呀！
+  standby_any_05: 看这里！

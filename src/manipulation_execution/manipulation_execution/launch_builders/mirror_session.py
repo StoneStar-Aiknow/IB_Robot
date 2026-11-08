@@ -74,6 +74,15 @@ fill them in. Its parameter names are held against the node's declaration
 the same way as the operator's. The ``embodied_common`` contract imports are
 function-local: the module stays within the registry import budget (design
 decision 6 of ``migrate-business-launch-builders``).
+
+``internvl_voice`` (a top-level ``robot`` key, feat/x2-internvl-voice) adds
+one parameter to the voice node, ``clips_json``: the prerecorded clips it
+speaks instead of synthesizing (``internvl_voice_contract.build_bundle`` and
+``playback_json``; ``$(find …)`` from the installed share dirs, relative
+paths under ``$WORKSPACE``, robot_config's ``config/mirror_voice/x2_clips_v1.yaml``
+when the configured table is unusable). Left out or ``enabled: false``, the
+parameters are exactly the 676fa608 ones. It needs the voice node: without
+``mirror_session.voice.enabled`` a WARNING says so and nothing more starts.
 """
 
 import json
@@ -123,6 +132,8 @@ _GATEWAY_NAMES = (
 )
 _IDLE = "idle"
 _VOICE_OFF = "no voice node, the mirror starts without voice"
+# robot_config's installed clips table, the fallback of internvl_voice.clips_table.
+_DEFAULT_CLIPS_TABLE = ("config", "mirror_voice", "x2_clips_v1.yaml")
 
 logger = get_colored_logger("robot_config.mirror_session")
 
@@ -293,6 +304,7 @@ def _voice_parameters(robot_config: Mapping, config: Mapping) -> dict | None:
 
     section = config.get("voice")
     if section is None:
+        _warn_clips_need_voice(robot_config, "there is no mirror_session.voice section")
         return None
     try:
         voice = parse_voice_section(section)
@@ -300,6 +312,7 @@ def _voice_parameters(robot_config: Mapping, config: Mapping) -> dict | None:
         logger.warning(f"{exc}; {_VOICE_OFF}")
         return None
     if not voice.enabled:
+        _warn_clips_need_voice(robot_config, f"{VOICE_PATH}.enabled is false")
         return None
     given = robot_config.get("voice_tts")
     given = given if isinstance(given, Mapping) else {}
@@ -320,7 +333,7 @@ def _voice_parameters(robot_config: Mapping, config: Mapping) -> dict | None:
     if unmet:
         logger.warning(f"{VOICE_PATH}.enabled is true but voice_tts cannot run: {'; '.join(unmet)}; {_VOICE_OFF}")
         return None
-    return {
+    parameters = {
         "voice_json": to_json(voice),
         "tts_service": str(voice_tts["service_name"]),
         "playback_service": str(voice_tts["playback_service_name"]),
@@ -328,6 +341,61 @@ def _voice_parameters(robot_config: Mapping, config: Mapping) -> dict | None:
         "playback_timeout_sec": float(voice_tts["playback_timeout_sec"]),
         "status_period_sec": _number(config, "status_period_sec", 1.0, 0.0),
     }
+    clips_json = _clips_json(robot_config)
+    if clips_json is not None:
+        parameters["clips_json"] = clips_json
+    return parameters
+
+
+def _warn_clips_need_voice(robot_config: Mapping, why: str) -> None:
+    """``internvl_voice`` is on but the voice node will not start: say so; the mirror stays silent as before."""
+    from embodied_common.internvl_voice_contract import SECTION_PATH, normalize
+
+    try:
+        on = normalize(robot_config.get(SECTION_PATH))[0] is not None
+    except Exception:  # noqa: BLE001 - only a warning is at stake
+        on = True
+    if on:
+        logger.warning(f"{SECTION_PATH} is on but {why}: the prerecorded clips need the voice node; {_VOICE_OFF}")
+
+
+def _find_share(package: str) -> str:
+    """A package's installed share directory (``$(find package)``)."""
+    from ament_index_python.packages import get_package_share_directory
+
+    return get_package_share_directory(package)
+
+
+def _clips_json(robot_config: Mapping) -> str | None:
+    """The voice node's ``clips_json`` from ``internvl_voice``; None when the section is off (baseline).
+
+    Never fails and never turns synthesis back on: every bad item warns and
+    keeps its default (``internvl_voice_contract.build_bundle``), and a table
+    that cannot be read is replaced by the one installed with robot_config.
+    """
+    from embodied_common.internvl_voice_contract import SECTION_PATH, build_bundle, normalize, playback_json
+
+    raw = robot_config.get(SECTION_PATH)
+    if normalize(raw)[0] is None:
+        return None
+    workspace = os.environ.get("WORKSPACE", "")
+    try:
+        default_table = os.path.join(_find_share("robot_config"), *_DEFAULT_CLIPS_TABLE)
+    except Exception as exc:  # noqa: BLE001 - only the fallback table is lost
+        logger.warning(f"{SECTION_PATH}: robot_config share not found ({exc}); no installed clips table")
+        default_table = os.path.join(*_DEFAULT_CLIPS_TABLE)
+    try:
+        bundle = build_bundle(raw, workspace, default_table, _find_share)
+    except Exception as exc:  # noqa: BLE001 - a broken section still speaks the default clips
+        logger.warning(f"{SECTION_PATH}: {type(exc).__name__}: {exc}; every item at its default")
+        bundle = build_bundle({"enabled": True}, workspace, default_table, _find_share)
+    for warning in bundle.warnings:
+        logger.warning(warning)
+    logger.info(
+        f"{SECTION_PATH}: prerecorded clips only ({len(bundle.table.clips)} in {bundle.settings.clips_table}), "
+        f"WAVs from the first of {list(bundle.clip_dirs)}; asr {bundle.settings.asr}"
+    )
+    return playback_json(bundle.settings, bundle.table, bundle.clip_dirs)
 
 
 def generate_mirror_session_nodes(robot_config: dict) -> list:
