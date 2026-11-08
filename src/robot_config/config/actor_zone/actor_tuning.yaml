@@ -1,0 +1,14 @@
+version: 1
+# 第一轮真机用默认值（设计第 6、7、9 节）。改这里不用构建，重启 start.sh 生效。
+acquire_updates: 2        # 候选连续几次刷新最高分才锁（1 次刷新约 1 s）
+release_updates: 3        # 连续几次坏刷新才放手
+release_hold_s: 3.0       # 放手后多久不选人（相机时间；mirror_session 的 cancel_confirm 是 2.0）
+track_keep_updates: 2     # 别人的轨迹漏检几次后删
+foot_half_width: 0.12     # 脚点半宽，× 框高
+center_weight: 0.6        # 选人：居中
+front_weight: 0.4         # 选人：靠前
+occlude_overlap: 0.3      # 规则 O：身体芯水平重叠比例；null = 关
+occlude_dy: 0.05          # 规则 O：挡人者脚低出多少（× 被挡者框高）
+gate_dx: null             # 关联门限，第一轮关
+gate_dy: null
+gate_h_ratio: null

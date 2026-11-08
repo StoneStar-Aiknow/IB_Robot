@@ -38,6 +38,7 @@ from launch_ros.actions import Node
 
 from robot_config.interface_binding import InterfaceBindingError
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
+from robot_config.utils import resolve_ros_path
 
 _COMPRESSED_TYPE = "sensor_msgs/msg/CompressedImage"
 # The runtime publishes the camera; the stream subscribes it.
@@ -285,11 +286,13 @@ def _actor_zone_parameters(config: Mapping, other_topics: list[str]) -> dict:
 
 
 def _absolute_file(value: object, key: str) -> str:
+    """The path with ``$(find pkg)`` / ``$(env VAR)`` resolved; it must then be absolute."""
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"motion_imitation_stream.{key} must be a non-empty string")
-    if not Path(value).is_absolute():
+    resolved = str(resolve_ros_path(value))
+    if not Path(resolved).is_absolute():
         raise ValueError(f"motion_imitation_stream.{key} must be an absolute path, got {value!r}")
-    return value
+    return resolved
 
 
 def _described_interfaces(robot_config: Mapping, consumer: str) -> Mapping:
