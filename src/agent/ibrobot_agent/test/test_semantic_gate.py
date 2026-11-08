@@ -284,6 +284,59 @@ def test_enforce_never_swallows_a_stop(tmp_path):
     assert not any("not addressed to me" in action.message for action in actions if isinstance(action, Log))
 
 
+def test_a_sentence_woken_by_the_bridge_wake_phrase_passes_and_its_session_still_vetoes_chatter(tmp_path):
+    # The wake phrase is only configured for the bridge, not as a gate prefix, and the
+    # addressee gate strips it: the intent gate must still see that the sentence was woken.
+    core = _core(tmp_path, "enforce", addressee_trigger="wake_phrase", wake_phrases=("欧拉欧拉",))
+    woken = core.on_transcript("欧拉欧拉今天开会", now=1.0)
+    assert [request.payload["text"] for request in _requests(woken)] == ["今天开会"]
+    core.on_response({"request_id": "voice-0", "accepted": True, "state": "RECEIVED"}, now=1.1)
+    core.on_event(
+        {
+            "request_key": {"request_id": "voice-0", **SCOPE},
+            "event_type": "conversation",
+            "state": "ANSWERED",
+            "user_message": "好的。",
+        },
+        now=1.2,
+    )
+    follow_up = core.on_transcript("今天开会", now=2.0)
+    assert not _requests(follow_up)
+    assert any("not addressed to me (semantic" in action.message for action in follow_up if isinstance(action, Log))
+
+
+def test_chatter_vetoed_by_the_intent_gate_still_keeps_the_wake_window_open(tmp_path):
+    core = _core(tmp_path, "enforce", addressee_trigger="wake_phrase", wake_phrases=("欧拉欧拉",), wake_window_sec=12.0)
+    assert _requests(core.on_transcript("欧拉欧拉今天开会", now=1.0))
+    core.on_event(
+        {
+            "request_key": {"request_id": "voice-0", **SCOPE},
+            "event_type": "conversation",
+            "state": "ANSWERED",
+            "user_message": "好的。",
+        },
+        now=1.2,
+    )
+    # Vetoed, but from the woken speaker: the window is renewed from 13.0 to 22.0.
+    vetoed = core.on_transcript("今天开会", now=10.0)
+    assert not _requests(vetoed)
+    assert any("not addressed to me (semantic" in action.message for action in vetoed if isinstance(action, Log))
+    assert [request.payload["text"] for request in _requests(core.on_transcript("挥挥手", now=20.0))] == ["挥挥手"]
+    # Without further speech the renewed window still closes.
+    core.on_event(
+        {
+            "request_key": {"request_id": "voice-1", **SCOPE},
+            "event_type": "conversation",
+            "state": "ANSWERED",
+            "user_message": "好的。",
+        },
+        now=20.5,
+    )
+    late = core.on_transcript("挥挥手", now=40.0)
+    assert not _requests(late)
+    assert any("no wake phrase" in action.message for action in late if isinstance(action, Log))
+
+
 @pytest.mark.skipif(not REPO_MODEL.exists(), reason="trained model not present")
 def test_the_shipped_model_scores_field_sentences_as_trained():
     gate = SemanticGate.load(str(REPO_MODEL), threshold=0.10)

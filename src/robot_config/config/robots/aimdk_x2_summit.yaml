@@ -9,6 +9,11 @@ robot:
   skill_supported_control_modes:
   - moveit_planning
   - named_motion
+  # Voiceprint for the speaker check below (CAMPPlus on the CPU). The bundle ships in the
+  # deployment's models/ directory, next to the ASR bundle.
+  voice_asr:
+    speaker_embedding:
+      enabled: true
   mirror_session:
     enabled: false
   motion_imitation_stream:
@@ -83,6 +88,69 @@ robot:
           随便玩一下: invite_visitor
       voice_bridge:
         persistent_session: true
+        # After "欧拉欧拉" only the voice that woke the robot is followed; stop words still
+        # work from any voice.
+        speaker_check_enabled: true
+        # Intent (semantic) gate: the model ships with the deployment, and a missing or stale
+        # model stops the bridge at launch instead of silently turning the gate off.
+        semantic_gate_model_path: $(env WORKSPACE)/models/addressee/addressee_zh_v1.json
+        semantic_gate_fail_open: false
+        # The inherited lexicon predates the summit skills: add their catalog aliases
+        # (tools/addressee/emit_lexicon.py) and the three fruits, or "我想要一个橘子" and
+        # "介绍一下芯片和系统" would rest on a model that never saw them.
+        # The planner's direct commands (above) are questions to the robot; the gate must
+        # never veto them, whatever their length ("你的Agent有什么用" is 11 characters).
+        semantic_gate_dialogue_requests:
+          __append__:
+          - 自我介绍
+          - 介绍一下你自己
+          - 你是谁
+          - 介绍一下芯片和系统
+          - 你的Agent有什么用
+          - 随便玩一下
+        semantic_gate_lexicon:
+          __append__:
+          - 能抓任何东西吗
+          - 什么都能抓吗
+          - 你能拿什么
+          - 摆个姿势
+          - 手伸直
+          - 双手举起来
+          - 双臂放下
+          - 手放下
+          - 弯曲手臂
+          - 叉腰
+          - 你好
+          - 你好呀
+          - 打个招呼
+          - 跟大家打招呼
+          - 欢迎一下
+          - Agent有什么用
+          - 你聪明在哪
+          - 你的智能体是干什么的
+          - 详细介绍一下
+          - 详细介绍一下你自己
+          - 详细讲一下原理
+          - 用什么芯片
+          - 什么芯片
+          - 什么系统
+          - 你的系统是什么
+          - 你用的是什么系统
+          - 邀请选择玩法
+          - 随便玩一下
+          - 我想体验一下
+          - 动作模仿
+          - 跟着我做
+          - 学我的动作
+          - 选水果
+          - 水果礼物
+          - 我要水果
+          - 有什么水果
+          - 柠檬
+          - 苹果
+          - 橙子
+          - 橘子
+          - 水果
         silent_skills:
         - greet_visitor
         - self_introduction

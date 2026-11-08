@@ -81,14 +81,12 @@ def test_busy_speech_is_once_per_request_and_expires_without_controlling_executi
     assert not core.speech_is_current(_of(first, Speak)[0], now=13.1)
 
 
-def test_acceptance_gets_one_async_receipt_and_never_waits_for_playback():
+def test_acceptance_is_not_spoken_before_the_plan_decides_what_follows():
     core = _core()
     core.on_transcript("双手侧平举", now=0.0)
     response = {"request_id": "voice-0", "accepted": True, "state": "RECEIVED"}
-    actions = core.on_response(response, now=0.01)
-    assert [a.text for a in _of(actions, Speak)] == ["收到，正在准备。"]
-    assert not _of(actions, Speak)[0].then
-    assert not core.on_response(response, now=0.02)
+    assert not _of(core.on_response(response, now=0.01), Speak)
+    assert not _of(core.on_response(response, now=0.02), Speak)
     stop = core.on_partial("停", now=0.03)
     assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
 
@@ -148,6 +146,22 @@ def test_deployed_chinese_tts_never_receives_internal_english(text):
     spoken = _tts_text(text)
     assert re.search(r"[\u4e00-\u9fff]", spoken)
     assert not re.search("[A-Za-z_]", spoken)
+
+
+def test_english_words_reach_a_tts_that_reads_english_but_internal_ids_never_do():
+    from ibrobot_agent.voice_bridge import _tts_text
+
+    text = "你是想问我的Agent有什么用吗？我在openEuler上运行，正在执行wave_hand和aimdk_x2_skills。"
+    assert _tts_text(text, keep_english=True) == "你是想问我的Agent有什么用吗？我在openEuler上运行，正在执行和。"
+    assert _tts_text(text) == "你是想问我的有什么用吗？我在上运行，正在执行和。"
+    assert _tts_text("OK", keep_english=True) == "OK"
+    assert _tts_text("wave_hand", keep_english=True) == "正在处理。"
+
+
+def test_english_speech_is_opt_in_for_deployments_with_the_english_frontend():
+    from ibrobot_agent.voice_bridge import node_parameter_defaults
+
+    assert node_parameter_defaults()["tts_keep_english"] is False
 
 
 @pytest.mark.parametrize("structured", [False, True])
@@ -2146,7 +2160,7 @@ def test_wake_prefixed_farewell_preserves_session_without_model_or_stop(running)
         "introduce_in_detail",
     ],
 )
-def test_recorded_social_gesture_waits_for_safe_cancel_before_next_request(skill):
+def test_stop_talking_silences_a_recorded_introduction_without_stopping_the_robot(skill):
     core = _core(silent_skills=(skill,), persistent_session=True)
     core.on_transcript("介绍一下", now=0.0)
     presentation = {"summary": skill, "execution_mode": ASYNC_PRESENTATION_MODE, "steps": [{"skill_name": skill}]}
@@ -2160,17 +2174,74 @@ def test_recorded_social_gesture_waits_for_safe_cancel_before_next_request(skill
         now=1.0,
     )
     assert not _of(actions, Speak)
-    stopped = core.on_transcript("别说了", now=2.0)
+    silenced = core.on_transcript("别说了，挥挥手", now=2.0)
+    # Only the clip stops: no Agent stop, no safety lock, so no cancel-return and no E06.
+    assert _of(silenced, CancelSpeech) == [CancelSpeech(recorded=True)]
+    assert not _of(silenced, PublishControl)
+    assert not core._unsafe_request_id
+    # Past the 5 s stop-confirmation window: nothing to confirm, so no E06 warning.
+    assert not _of(core.tick(7.5), Speak)
+    # The gesture is still running; the rest of the sentence waits for it.
+    assert not _of(core.tick(7.6), PublishRequest)
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=8.0)
+    deferred = core.tick(8.1)
+    assert [action.payload["text"] for action in _of(deferred, PublishRequest)] == ["挥挥手"]
+
+
+def _introducing(core, skill="introduce_in_detail"):
+    core.on_transcript("详细介绍一下你自己", now=0.0)
+    presentation = {"summary": skill, "execution_mode": ASYNC_PRESENTATION_MODE, "steps": [{"skill_name": skill}]}
+    core.on_event(
+        _event(
+            "voice-0",
+            "presentation",
+            "MAY_EXECUTE",
+            detail={"presentation": presentation, "presentation_digest": presentation_digest(presentation)},
+        ),
+        now=1.0,
+    )
+
+
+def test_partials_on_the_way_to_stop_talking_do_not_stop_an_introduction():
+    # Streaming ASR says "别" before "别说了"; "别" is also a prefix of the stop word "别动".
+    core = _core(silent_skills=("introduce_in_detail",), persistent_session=True)
+    _introducing(core)
+    for partial in ("别", "别说", "好的别", "停"):
+        assert not _of(core.on_partial(partial, now=2.0), PublishControl), partial
+    final = core.on_transcript("别说了", now=2.5)
+    assert _of(final, CancelSpeech) == [CancelSpeech(recorded=True)]
+    assert not _of(final, PublishControl)
+    assert not core._unsafe_request_id
+
+
+@pytest.mark.parametrize("partial", ["别动", "停下"])
+def test_a_stop_word_partial_still_stops_an_introduction_at_once(partial):
+    core = _core(silent_skills=("introduce_in_detail",), persistent_session=True)
+    _introducing(core)
+    assert [a.payload for a in _of(core.on_partial(partial, now=2.0), PublishControl)] == [
+        {"operation": "stop", "request_id": "voice-0"}
+    ]
+
+
+def test_a_stop_word_still_stops_a_recorded_introduction():
+    core = _core(silent_skills=("self_introduction",), persistent_session=True)
+    core.on_transcript("介绍一下", now=0.0)
+    presentation = {
+        "summary": "self_introduction",
+        "execution_mode": ASYNC_PRESENTATION_MODE,
+        "steps": [{"skill_name": "self_introduction"}],
+    }
+    core.on_event(
+        _event(
+            "voice-0",
+            "presentation",
+            "MAY_EXECUTE",
+            detail={"presentation": presentation, "presentation_digest": presentation_digest(presentation)},
+        ),
+        now=1.0,
+    )
+    stopped = core.on_transcript("停", now=2.0)
     assert [action.payload for action in _of(stopped, PublishControl)] == [
         {"operation": "stop", "request_id": "voice-0"}
     ]
-    assert not _of(core.on_transcript("你好", now=2.1), PublishRequest)
-    facts = {
-        "schema_version": 1,
-        "phase_state": "CANCELED",
-        "reason_code": "SKILL_CANCELLED",
-        "recovery_state": "NOT_NEEDED",
-    }
-    core.on_event(_event("voice-0", "terminal", "CANCELLED", detail={"execution_detail": facts}), now=3.0)
-    assert not core._unsafe_request_id
-    assert _of(core.on_transcript("你好", now=3.5), PublishRequest)
+    assert core._unsafe_request_id == "voice-0"

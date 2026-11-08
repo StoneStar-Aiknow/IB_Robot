@@ -594,6 +594,19 @@ def _play_audio_failure(future, skill_name: str) -> tuple[str, str] | None:
     return None
 
 
+#: The player's answer when its global stop ended the clip. Without a cancel of this
+#: skill that stop came from the listener ("别说了"): the speech is over, not failed.
+PLAY_AUDIO_STOPPED = "PLAYBACK_CANCELED"
+
+
+def _play_audio_outcome(future, skill_name: str, goal_handle) -> tuple[tuple[str, str] | None, bool]:
+    """``(failure, cut_short)`` for a finished playback call; a listener's stop is not a failure."""
+    failure = _play_audio_failure(future, skill_name)
+    if failure is not None and failure[0] == PLAY_AUDIO_STOPPED and not goal_handle.is_cancel_requested:
+        return None, True
+    return failure, False
+
+
 class _CompositeBranchGoal:
     """A skill goal handle for one branch of a composite skill.
 
@@ -3045,11 +3058,12 @@ class SkillExecutorNode(Node):
             elif goal_handle.is_cancel_requested:
                 result = self._cancel_skill(result, branch, executed, skill_name)
             else:
-                failure = _play_audio_failure(future, skill_name)
+                failure, cut_short = _play_audio_outcome(future, skill_name, goal_handle)
+                played = f"{skill_name}: {'stopped by the listener during' if cut_short else 'played'} {clip}"
                 result = (
                     self._abort_skill(result, branch, executed, *failure)
                     if failure is not None
-                    else self._succeed_play_audio(result, branch, executed, f"{skill_name}: played {clip}")
+                    else self._succeed_play_audio(result, branch, executed, played)
                 )
             if not result.success:
                 request_stop()
@@ -3130,12 +3144,13 @@ class SkillExecutorNode(Node):
         def playback_failed() -> bool:
             if goal_handle.is_cancel_requested:
                 request_stop()
-            return future.done() and _play_audio_failure(future, skill_name) is not None
+            # A listener's stop ends only the speech; the gesture finishes on its own.
+            return future.done() and _play_audio_outcome(future, skill_name, goal_handle)[0] is not None
 
         branch = _CompositeBranchGoal(goal_handle, stop_requested=playback_failed)
         motion_result = self._run_runtime_named_motion(branch, client, motion, max(0.0, deadline - time.monotonic()))
         executed = [*executed, *motion_result.executed_primitives]
-        audio_failure = _play_audio_failure(future, skill_name) if future.done() else None
+        audio_failure = _play_audio_outcome(future, skill_name, goal_handle)[0] if future.done() else None
         if branch.terminal not in {"succeeded", "canceled"}:
             message = motion_result.message
             if audio_failure is not None:
@@ -3160,12 +3175,13 @@ class SkillExecutorNode(Node):
             return self._abort_skill(
                 result, goal_handle, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out after {motion} ended"
             )
-        failure = _play_audio_failure(future, skill_name)
+        failure, cut_short = _play_audio_outcome(future, skill_name, goal_handle)
         if failure is not None:
             return self._abort_skill(result, goal_handle, executed, *failure)
         clip = executed[0].partition(":")[2]
+        spoken = "speech stopped by the listener during" if cut_short else "played"
         return self._succeed_play_audio(
-            result, goal_handle, executed, f"{skill_name}: played {clip} and {motion_result.message}"
+            result, goal_handle, executed, f"{skill_name}: {spoken} {clip} and {motion_result.message}"
         )
 
     def _succeed_play_audio(self, result, goal_handle, executed, message: str):

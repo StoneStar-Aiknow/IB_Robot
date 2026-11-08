@@ -978,6 +978,11 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     ):
         if field_name in voice_bridge:
             params[field_name] = str(voice_bridge[field_name])
+    if params.get("semantic_gate_model_path"):
+        # Same substitutions as the recorded clips, so a deployment can ship the model in its checkout.
+        params["semantic_gate_model_path"] = str(
+            Path(resolve_ros_path(params["semantic_gate_model_path"])).expanduser()
+        )
     for field_name in (
         "confirm_timeout_sec",
         "session_idle_sec",
@@ -1028,6 +1033,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "feedback_only",
         "persistent_session",
         "mute_asr_during_tts",
+        "tts_keep_english",
         "speaker_check_enabled",
         "speaker_reject_short",
         "semantic_gate_fail_open",

@@ -134,7 +134,7 @@ def strip_wake_words(text: str, wake_words: tuple[str, ...]) -> str:
             # ``>=`` on purpose: a transcript that is only the wake word strips to
             # nothing, which the gate reads as "nothing to judge" and lets through.
             if wake and text.startswith(wake) and len(text) >= len(wake):
-                text = text[len(wake):]
+                text = text[len(wake) :]
                 break
         else:
             break
@@ -198,9 +198,7 @@ class SemanticGate:
         self.dialogue_requests = tuple(
             item for item in (normalize_text(str(entry)) for entry in dialogue_requests) if item
         )
-        self.wake_prefixes = tuple(
-            item for item in (normalize_text(str(entry)) for entry in wake_prefixes) if item
-        )
+        self.wake_prefixes = tuple(item for item in (normalize_text(str(entry)) for entry in wake_prefixes) if item)
         self.source = source
         self.created_at = str(payload.get("created_at", ""))
         self.training = dict(payload.get("training", {}))
@@ -233,7 +231,9 @@ class SemanticGate:
                 threshold=float(config.semantic_gate_threshold),
                 lexicon=tuple(config.semantic_gate_lexicon),
                 dialogue_requests=tuple(config.semantic_gate_dialogue_requests),
-                wake_prefixes=tuple(config.semantic_gate_wake_prefixes),
+                # The bridge's own wake phrases are wake prefixes too: a deployment that renames
+                # its wake word ("欧拉欧拉") must not need a second, drifting copy for this gate.
+                wake_prefixes=tuple(config.semantic_gate_wake_prefixes) + tuple(getattr(config, "wake_phrases", ())),
                 model_only_threshold=float(config.semantic_gate_model_only_threshold),
             )
         except (OSError, ValueError) as error:
@@ -254,7 +254,7 @@ class SemanticGate:
         counts: Counter[int] = Counter()
         for size in self._ngrams:
             for start in range(len(padded) - size + 1):
-                counts[_fnv1a32(padded[start:start + size]) % self._dim] += 1
+                counts[_fnv1a32(padded[start : start + size]) % self._dim] += 1
         return counts
 
     def score(self, text: str) -> float:

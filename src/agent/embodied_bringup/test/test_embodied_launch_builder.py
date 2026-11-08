@@ -1596,6 +1596,31 @@ def test_voice_bridge_can_consume_text_feedback_without_voice_commands():
     assert params["mute_asr_during_tts"] is False
 
 
+def test_voice_bridge_reads_english_only_where_the_config_says_the_tts_can():
+    params = _normalize_launch_param_mapping(
+        vars(_voice_bridge_nodes(enabled=True, tts_keep_english=True)["agent_voice_bridge"])["_Node__parameters"][0]
+    )
+    assert params["tts_keep_english"] is True
+    default = _normalize_launch_param_mapping(
+        vars(_voice_bridge_nodes(enabled=True)["agent_voice_bridge"])["_Node__parameters"][0]
+    )
+    assert "tts_keep_english" not in default
+
+
+def test_voice_bridge_resolves_the_intent_model_shipped_in_the_workspace(monkeypatch):
+    monkeypatch.setenv("WORKSPACE", "/opt/ibrobot")
+    params = _normalize_launch_param_mapping(
+        vars(
+            _voice_bridge_nodes(
+                enabled=True,
+                semantic_gate_mode="enforce",
+                semantic_gate_model_path="$(env WORKSPACE)/models/addressee/addressee_zh_v1.json",
+            )["agent_voice_bridge"]
+        )["_Node__parameters"][0]
+    )
+    assert params["semantic_gate_model_path"].splitlines()[0] == "/opt/ibrobot/models/addressee/addressee_zh_v1.json"
+
+
 def test_voice_bridge_forwards_the_addressee_gate_when_configured():
     """The gate is opt-in, so launch forwards it only when the YAML sets it."""
     nodes = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀", "灵犀"], wake_window_sec=12.0)

@@ -58,3 +58,18 @@ def test_only_summit_opts_in_to_social_wave_cancel_return(config):
     }
     base = _load_robot_section(CONFIG.parent / "aimdk_x2_voice_mirror_grasp.yaml")[1]
     assert not base["runtime"].get("cancel_return_motions")
+
+
+def test_the_summit_follows_only_the_waking_voice_and_vetoes_unaddressed_speech(config):
+    """Voiceprint and intent gate are on for the exhibition, and a missing model fails loudly."""
+    assert config["voice_asr"]["speaker_embedding"]["enabled"] is True
+    bridge = config["embodied"]["agent"]["voice_bridge"]
+    assert bridge["speaker_check_enabled"] is True
+    assert bridge["addressee_trigger"] == "wake_phrase" and bridge["wake_phrases"]
+    assert bridge["semantic_gate_mode"] == "enforce"
+    assert bridge["semantic_gate_model_path"] == "$(env WORKSPACE)/models/addressee/addressee_zh_v1.json"
+    assert bridge["semantic_gate_fail_open"] is False
+    # The shared mirror/grasp base keeps both checks opt-in.
+    base = _load_robot_section(CONFIG.parent / "aimdk_x2_voice_mirror_grasp.yaml")[1]
+    assert base["embodied"]["agent"]["voice_bridge"]["speaker_check_enabled"] is False
+    assert base["voice_asr"]["speaker_embedding"]["enabled"] is False

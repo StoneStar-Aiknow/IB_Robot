@@ -402,6 +402,34 @@ def test_a_wave_still_running_at_the_deadline_is_reported_unknown_and_keeps_its_
     assert node.asr == []
 
 
+def test_a_listener_stop_ends_the_speech_and_the_gesture_finishes_without_cancel_return(tmp_path):
+    # "别说了": the player's global stop answers PLAYBACK_CANCELED while nobody cancelled the skill.
+    playback = _Playback(_played(False, "PLAYBACK_CANCELED", "audio file playback canceled"), done_after_polls=2)
+    wave = _MotionHandle(_Future(_motion_result(), done_after_polls=6))
+    _events, _audio, _motion, node = _setup(tmp_path, playback, wave)
+    goal_handle = _CountingGoalHandle()
+
+    result = _run(node, goal_handle)
+
+    assert wave.cancel_calls == 0
+    assert (result.success, goal_handle.terminal, goal_handle.terminal_calls) == (True, "succeeded", 1)
+    assert result.message.startswith("self_introduction: speech stopped by the listener during self_intro")
+    assert node._play_audio_stop_client.calls == 0
+    assert set(node.confirmed) == set(node.registered)
+
+
+def test_a_listener_stop_of_a_clip_alone_is_not_a_failure(tmp_path):
+    events = []
+    audio = _AudioClient(events, _Playback(_played(False, "PLAYBACK_CANCELED"), done_after_polls=1))
+    node = _audio_node(tmp_path, audio, None)
+    goal_handle = _CountingGoalHandle()
+
+    result = _run(node, goal_handle, template=CLIP_TEMPLATE)
+
+    assert (result.success, goal_handle.terminal) == (True, "succeeded")
+    assert result.message == "self_introduction: stopped by the listener during self_intro"
+
+
 def test_a_clip_without_a_motion_plays_as_before(tmp_path):
     events = []
     audio = _AudioClient(events, _Playback(_played(), done_after_polls=2))

@@ -295,7 +295,13 @@ class PublishControl:
 
 @dataclass(frozen=True)
 class CancelSpeech:
-    """Invalidate audio immediately; transport cancellation runs outside ROS callbacks."""
+    """Invalidate audio immediately; transport cancellation runs outside ROS callbacks.
+
+    ``recorded`` also stops the executor-owned recorded clip (a global player stop),
+    which plain cancellation never touches.
+    """
+
+    recorded: bool = False
 
 
 @dataclass(frozen=True)
@@ -401,7 +407,6 @@ class _BridgeState:
     stopped_request_id: str = ""
     task_label: str = "当前任务"
     last_busy_at: float = float("-inf")
-    receipt_spoken: bool = False
 
 
 def _normalize(text: str) -> str:
@@ -532,7 +537,6 @@ class VoiceBridgeCore:
         state.active_since = state.last_activity = now
         state.task_label = "模仿退出"
         state.last_busy_at = float("-inf")
-        state.receipt_spoken = False
         return [
             *self.cancel_speech(),
             PublishRequest(
@@ -743,6 +747,8 @@ class VoiceBridgeCore:
         """
         if self.config.feedback_only or not self._is_stop_partial(text) or self._state.utterance_stopped:
             return []
+        if self._may_become_speech_interrupt(text):
+            return [Log(f"partial {text!r} may still be a request to stop talking; waiting for the final")]
         cancelled = self._cancel_held(f"stop keyword in partial {text!r}")
         if not self._stop_target() and self._mirror_idle(now):
             self._state.utterance_stopped = bool(cancelled)
@@ -880,12 +886,17 @@ class VoiceBridgeCore:
             return [Log("farewell retained dialogue and business state")]
         remainder = self._speech_interrupt(raw)
         if remainder is not None:
-            actions = self.cancel_speech()
             if self._introduction_request_id and self._stop_target() == self._introduction_request_id:
-                self._unsafe_request_id = self._introduction_request_id
-                self._speech_suppressed.add(self._introduction_request_id)
+                # "别说了" silences the introduction; it does not stop the robot. The clip
+                # executor ends the skill normally once its gesture finishes, so there is no
+                # stop, no safety lock and no slow cancel-return of the gesture.
                 self._deferred_text = remainder
-                return [*self._stop(now, reason="introduction interrupted"), *actions]
+                self._deferred_after = now
+                return [
+                    Log(f"introduction speech stopped; {self._introduction_request_id} finishes its gesture"),
+                    *self.cancel_speech(recorded=True),
+                ]
+            actions = self.cancel_speech()
             if remainder:
                 return [
                     *actions,
@@ -914,6 +925,9 @@ class VoiceBridgeCore:
         )
         if not verdict.addressed:
             return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
+        # The intent gate judges the sentence as heard: the addressee gate strips the wake
+        # phrase, and a woken sentence must keep the gate's wake-prefix exemption.
+        heard_raw = raw
         raw, normalized = verdict.raw, verdict.normalized
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
@@ -943,8 +957,11 @@ class VoiceBridgeCore:
                     )
                 )
             return actions
-        semantic_block = self._judge_semantics(raw, normalized, now, session_opened=session_opened)
+        semantic_block = self._judge_semantics(heard_raw, normalized, now, session_opened=session_opened)
         if semantic_block is not None:
+            # Vetoed as not meant for the robot, yet it passed the wake and voiceprint checks:
+            # the woken speaker is still talking, so the window stays open as for a request.
+            self._gate.note_handled(heard_at)
             return semantic_block
         if len(normalized) < self.config.min_text_chars:
             return [Log(f"ignored short utterance {raw!r}")]
@@ -973,7 +990,6 @@ class VoiceBridgeCore:
         state.active_request_id = request_id
         state.task_label = _spoken_label(raw)
         state.last_busy_at = float("-inf")
-        state.receipt_spoken = False
         state.active_since = now
         state.last_activity = now
         state.known_request_ids.add(request_id)
@@ -1002,11 +1018,11 @@ class VoiceBridgeCore:
             if reason != "BUSY":
                 actions.extend(self._say(_spoken_reply(payload.get("state"), message)))
             return actions
-        if payload.get("accepted") is True and request_id == self.active_request_id and not self._state.receipt_spoken:
-            # Say it now: the plan may arrive in well under a second, and a receipt scheduled for
-            # three seconds later would either speak over the answer or arrive after it.
-            self._state.receipt_spoken = True
-            return [Log(f"request {request_id} accepted"), *self._say("收到，正在准备。")]
+        if payload.get("accepted") is True and request_id == self.active_request_id:
+            # No spoken receipt: admission precedes the plan, so a receipt cannot know whether a
+            # recorded clip, an answer or execution speech follows, and it lands out of order
+            # before the clip or answer that already acknowledges the request.
+            return [Log(f"request {request_id} accepted")]
         return []
 
     def on_event(self, payload: dict[str, Any], now: float) -> list[Action]:
@@ -1441,18 +1457,31 @@ class VoiceBridgeCore:
     @staticmethod
     def _speech_interrupt(text: str) -> str | None:
         match = re.match(
-            r"^\s*(?:(?:好(?:的)?|嗯|那个|行)[，,。！!\s]*)*"
-            r"(?:不用说了|别讲了|别说了|停止播报|停止讲解|不用讲了|别介绍了|不用介绍了)[，,。！!\s]*(.*)$",
+            _SPEECH_INTERRUPT_LEAD + r"(?:" + "|".join(_SPEECH_INTERRUPT_PHRASES) + r")[，,。！!\s]*(.*)$",
             text,
         )
         return match.group(1).strip() if match else None
 
-    def cancel_speech(self) -> list[Action]:
+    def _may_become_speech_interrupt(self, partial: str) -> bool:
+        """During an introduction, a partial that is or may still grow into "别说了" is not a stop.
+
+        "别" is a prefix of both "别动" and "别说了"; stopping on it would turn
+        "silence the clip" into a full stop of the gesture. A real stop word that
+        cannot become one ("别动", "停下") still stops from its partial.
+        """
+        if not (self._introduction_request_id and self._stop_target() == self._introduction_request_id):
+            return False
+        text = re.sub(_SPEECH_INTERRUPT_LEAD, "", _normalize(self.config.correct(str(partial).strip())))
+        return bool(text) and any(
+            phrase.startswith(text) or text.startswith(phrase) for phrase in _SPEECH_INTERRUPT_PHRASES
+        )
+
+    def cancel_speech(self, *, recorded: bool = False) -> list[Action]:
         self._generation += 1
         self._receipt_due.clear()
         self._state.preview_text = ""
         self._state.preview_request_id = ""
-        return [CancelSpeech()]
+        return [CancelSpeech(recorded=recorded)]
 
     def end_session(self, now: float) -> list[Action]:
         """End dialogue without clearing unresolved robot safety state."""
@@ -1525,6 +1554,21 @@ class VoiceBridgeCore:
         return [self._speech(text, kind=kind)]
 
 
+#: Phrases that silence a recorded introduction without stopping the robot, and the fillers
+#: allowed before them ("好的，别说了").
+_SPEECH_INTERRUPT_PHRASES = (
+    "不用说了",
+    "别讲了",
+    "别说了",
+    "停止播报",
+    "停止讲解",
+    "不用讲了",
+    "别介绍了",
+    "不用介绍了",
+)
+_SPEECH_INTERRUPT_LEAD = r"^\s*(?:(?:好(?:的)?|嗯|那个|行)[，,。！!\s]*)*"
+
+
 def _spoken_reply(state: Any, message: str) -> str:
     """Execution terminals carry technical text; answers are already user-facing."""
     return execution_reply(str(state), fallback=message)
@@ -1536,9 +1580,18 @@ def _spoken_label(text: str) -> str:
     return value[:18] if re.search(r"[\u4e00-\u9fff]", value) else "当前动作"
 
 
-def _tts_text(text: str) -> str:
-    """The deployed Chinese frontend rejects English words and internal IDs."""
+def _tts_text(text: str, *, keep_english: bool = False) -> str:
+    """Text the TTS can say: internal IDs never reach it, English words only when it reads English.
+
+    ``keep_english`` is for a TTS whose English frontend is installed (ZipVoice with
+    piper_phonemize); without it a sentence containing English fails to synthesize at all,
+    so the default keeps dropping every Latin word.
+    """
     text = str(text).replace("free_pose", "自由姿态").replace("(remembered)", "").replace("V字", "胜利手势")
+    if keep_english:
+        # snake_case skill names and robot IDs are not words anyone should hear.
+        text = re.sub(r"[A-Za-z0-9-]*_[A-Za-z0-9_-]*", "", text).strip()
+        return text if re.search(r"[\u4e00-\u9fffA-Za-z]", text) else "正在处理。"
     text = re.sub(r"[A-Za-z_][A-Za-z_0-9-]*", "", text).strip()
     return text if re.search(r"[\u4e00-\u9fff]", text) else "正在处理。"
 
@@ -1604,6 +1657,8 @@ def node_parameter_defaults() -> dict[str, Any]:
         # the bridge then reads the segment-tagged transcripts there instead.
         "transcript_topic": "",
         "mute_asr_during_tts": True,
+        # True only where the TTS has its English frontend; otherwise English words are dropped.
+        "tts_keep_english": False,
         "resume_settle_sec": 1.0,
     }
     for item in dataclasses.fields(VoiceBridgeConfig):
@@ -1701,12 +1756,13 @@ class _Speaker:
         self._pending_play = None
         self._closing = threading.Event()
 
-    def stop(self) -> None:
+    def stop(self, *, force: bool = False) -> None:
         with self._play_lock:
             self._play_generation += 1
             # The executor owns recorded introductions. Never send a global stop
-            # without bridge playback to cancel, or a delayed command could stop it.
-            if self._pending_play is None and self._pending_stop is None:
+            # without bridge playback to cancel, or a delayed command could stop it;
+            # ``force`` is the deliberate "别说了" that silences such a clip.
+            if not force and self._pending_play is None and self._pending_stop is None:
                 return
         if not self._stop_client.wait_for_service(timeout_sec=0.2):
             raise TimeoutError("TTS stop service unavailable")
@@ -1793,6 +1849,8 @@ def _build_node_class():
     class VoiceBridgeNode(Node):
         """ROS transport for :class:`VoiceBridgeCore`."""
 
+        _tts_keep_english = False  # set from the tts_keep_english parameter
+
         def __init__(self, **node_options) -> None:
             super().__init__("agent_voice_bridge", **node_options)
             defaults = node_parameter_defaults()
@@ -1803,6 +1861,7 @@ def _build_node_class():
             self._core_lock = threading.Lock()
             self._asr_state = ""
             self._mute_asr = bool(values["mute_asr_during_tts"])
+            self._tts_keep_english = bool(values["tts_keep_english"])
             self._speaker = (
                 _Speaker(
                     self,
@@ -1916,7 +1975,9 @@ def _build_node_class():
             self.create_timer(0.2, self._on_tick, callback_group=inbound)
             if self._speaker is not None:
                 self._speech_pipeline = SpeechPipeline(
-                    synthesize=lambda action: self._speaker.synthesize(_tts_text(action.text)),
+                    synthesize=lambda action: self._speaker.synthesize(
+                        _tts_text(action.text, keep_english=self._tts_keep_english)
+                    ),
                     play=self._render_speech,
                     stop=self._speaker.stop,
                     is_current=self._speech_is_current,
@@ -2059,7 +2120,9 @@ def _build_node_class():
                     return
                 try:
                     if isinstance(action, CancelSpeech):
-                        self._speech_pipeline.cancel(stop=self._speaker.stop, timeout=5.0)
+                        # Queued in order with new requests, so this stop can never reach a later clip.
+                        stop = (lambda: self._speaker.stop(force=True)) if action.recorded else self._speaker.stop
+                        self._speech_pipeline.cancel(stop=stop, timeout=5.0)
                         self._speech_transport_failed = False
                     elif isinstance(action, PublishRequest):
                         with self._core_lock:
@@ -2097,7 +2160,7 @@ def _build_node_class():
             return super().destroy_node()
 
         def _render_speech(self, action: Speak, audio: Any) -> bool:
-            text = _tts_text(action.text)
+            text = _tts_text(action.text, keep_english=self._tts_keep_english)
             with self._core_lock:
                 if not self._core.speech_is_current(action, time.monotonic()):
                     return False
