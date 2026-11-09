@@ -2336,3 +2336,32 @@ def test_a_stop_word_still_stops_a_recorded_introduction():
         {"operation": "stop", "request_id": "voice-0"}
     ]
     assert core._unsafe_request_id == "voice-0"
+
+
+def test_ending_the_interaction_stops_while_skill_words_keep_their_route():
+    # The vocabulary the deployed profile ships with (see aimdk_x2_voice_mirror_all.yaml).
+    closing = (
+        "别动了",
+        "别动",
+        "停止",
+        "停下",
+        "停",
+        "stop",
+        "halt",
+        "不玩了",
+        "别玩了",
+        "我结束了",
+        "好了我结束了",
+        "不聊了",
+        "退下吧",
+    )
+    core = _core(stop_phrases=closing)
+    (request,) = _of(core.on_transcript("做个自我介绍", now=0.0), PublishRequest)
+
+    (stop,) = _of(core.on_transcript("好了我结束了不玩了", now=1.0), PublishControl)
+
+    assert stop.payload == {"operation": "stop", "request_id": request.payload["request_id"]}
+    # "结束" and "不玩" are deliberately absent from the stop vocabulary: as substrings they
+    # would shadow the very skills that end a round, and a goodbye must not stop the wrong thing.
+    for skill in ("结束照镜子", "不玩照镜子了"):
+        assert _of(_core(stop_phrases=closing).on_transcript(skill, now=0.0), PublishRequest)

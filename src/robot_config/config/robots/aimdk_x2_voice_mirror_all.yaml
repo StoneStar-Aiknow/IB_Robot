@@ -60,6 +60,25 @@ robot:
         - mirror_stop
         - self_introduction
       voice_bridge:
+        # Ending the interaction is a stop, not a request: the field corpus shows the
+        # model cannot learn it (a session ends on "不玩了", "我结束了"), and a chat reply
+        # to a goodbye is worse than simply stopping. Stop matching is a substring test,
+        # so a bare "结束" is deliberately absent: it would shadow the "结束照镜子" skill,
+        # and "不玩" would shadow "不玩照镜子了".
+        stop_phrases:
+          - 别动了
+          - 别动
+          - 停止
+          - 停下
+          - 停
+          - stop
+          - halt
+          - 不玩了
+          - 别玩了
+          - 我结束了
+          - 好了我结束了
+          - 不聊了
+          - 退下吧
         # Known mishearings of the command vocabulary, mapped to the canonical form
         # (the planner matches aliases, so canonical text is enough).
         text_corrections:
