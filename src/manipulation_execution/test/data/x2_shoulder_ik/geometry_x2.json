@@ -1,0 +1,76 @@
+{
+ "frame": "robot torso (fwd, left, up) = world at BASE_QPOS",
+ "model_file": "/home/granger/X2/test1/aimdk/extra/mc-rl/x2_urdf/X2_URDF-v1.3.0/x2_ultra.xml",
+ "model_md5": "6992648cd65ddbfb81deda0f1f1b4b8c",
+ "fk_selfcheck_max_deg": 1.2074182697257333e-06,
+ "sides": {
+  "left": {
+   "pitch_axis": [
+    0.0,
+    0.978147796863451,
+    0.20791076809818462
+   ],
+   "roll_axis": [
+    1.0,
+    0.0,
+    0.0
+   ],
+   "rest_dir": [
+    0.07680698775863817,
+    0.20825228378907432,
+    -0.9750547025311346
+   ],
+   "pitch_limit_rad": [
+    -3.08,
+    2.04
+   ],
+   "roll_limit_rad": [
+    -0.061,
+    2.993
+   ],
+   "yaw_limit_rad": [
+    -2.556,
+    2.556
+   ],
+   "arm_pos_index": {
+    "pitch": 0,
+    "roll": 1,
+    "yaw": 2
+   }
+  },
+  "right": {
+   "pitch_axis": [
+    0.0,
+    0.9781469697686446,
+    -0.20791465925330602
+   ],
+   "roll_axis": [
+    0.9999999881415381,
+    -3.2019481079135986e-05,
+    -0.00015063756689211562
+   ],
+   "rest_dir": [
+    0.07069407688202728,
+    -0.20835022094949213,
+    -0.975496044545592
+   ],
+   "pitch_limit_rad": [
+    -3.08,
+    2.04
+   ],
+   "roll_limit_rad": [
+    -2.993,
+    0.061
+   ],
+   "yaw_limit_rad": [
+    -2.556,
+    2.556
+   ],
+   "arm_pos_index": {
+    "pitch": 7,
+    "roll": 8,
+    "yaw": 9
+   }
+  }
+ }
+}

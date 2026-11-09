@@ -66,3 +66,24 @@ Patches (`hand_core.py`):
 Not copied: `data/dexhand_calib_wilor.json` (WiLoR, not used) and
 `thumb_safety.py` (imported by `hand_core` only when `thumb_3d` is set, which
 this package never does).
+
+## Shoulder solver (hri_runtime shoulder_ik_20261108)
+
+Copied byte for byte from granger's hri_runtime
+`output/shoulder_ik_20261108/port/` (2026-11-08). `x2.followme` solves the
+mirror shoulders with it; the acceptance test and its data sit in `test/`.
+
+| here | upstream | sha256 of the upstream file |
+| --- | --- | --- |
+| `shoulder_ik.py` | `port/shoulder_ik.py` | `7a6a338e6560878c63ce4ba7ed8ff0ee3216bf85d584a78374fec9ec9da8670b` |
+| `test/test_x2_shoulder_ik.py` (PATCHED) | `port/test_shoulder_ik.py` | `4cb2b6dba5646468809937c15b96e2eaa36d94a3fff6031fdc112631df01e8fc` |
+| `test/data/x2_shoulder_ik/geometry_x2.json` | `port/geometry_x2.json` | `d8b46596369f49f68fcd50df46db970ed24d174dff3c06b2da2abef14442c7f5` |
+| `test/data/x2_shoulder_ik/golden_shoulder_ik.npz` | `port/golden_shoulder_ik.npz` | `3fda1cee539f169bb701a6fc7e0aaf073ae76d0de38cd43533768d08dc9a58bb` |
+
+Patches (`test_x2_shoulder_ik.py`): the import and the data directory, plus a
+docstring line saying so.
+
+Not copied: `reference/` (geometry export, yaw-need reference, offline
+comparison). `x2.followme.shoulder_geometry` derives the geometry from the
+package's own model at startup and checks it against the model FK;
+`test_x2_followme.py` checks it equals `geometry_x2.json`.
