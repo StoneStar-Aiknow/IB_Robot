@@ -48,6 +48,79 @@ def test_status_reports_how_far_the_output_runs_behind_the_camera():
     assert status["age_ms"] == 200.0 and status["offset_ms"] == 600.0
 
 
+def _wave(t):
+    return np.array(NEUTRAL) + 0.3 * np.sin(t) * np.array([1, 0, 1, 1, 0, 0, 0] * 2)
+
+
+def _follow(stream, age, until, start=0.0, frame_dt=0.1):
+    """Frames every ``frame_dt`` of camera time, each arriving ``age(t)`` later (None: lost),
+    polled at 50 Hz from ``start`` to ``until``. One (now, samples, status) per poll."""
+    frames = [(t + age(t), t) for t in np.arange(0.0, until, frame_dt) if age(t) is not None]
+    frames.sort()
+    out, i = [], 0
+    for now in np.arange(start, until, 0.02):
+        while i < len(frames) and frames[i][0] <= now:
+            stream.push_pose(frames[i][1], _wave(frames[i][1]))
+            i += 1
+        out.append((now, stream.poll(now), stream.status()))
+    return out
+
+
+def _stalled_until(t_end):
+    # PEAR at ~3 Hz and 0.8 s old while the buffer fills, then 10 Hz and 0.15 s old.
+    return lambda t: (0.8 if round(t * 10) % 3 == 0 else None) if t < t_end else 0.15
+
+
+def test_a_stall_while_filling_is_caught_up_within_five_seconds():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    polls = _follow(stream, _stalled_until(2.0), 20.0)
+    offsets = [s["offset_ms"] for _, _, s in polls if s["offset_ms"] is not None]
+    assert offsets[0] > 1100.0                      # calibrated in the stall
+    caught = [now for now, _, s in polls if s["catchup_rate"] > 0.0]
+    assert caught and caught[-1] - caught[0] < 5.0
+    final = polls[-1][2]
+    assert final["catchups"] == 1 and final["catchup_rate"] == 0.0
+    assert abs(final["offset_ms"] - final["offset_target_ms"]) < 1.0
+    assert final["offset_ms"] < 700.0
+    assert (np.diff(offsets) <= 0.0).all()                 # only ever down
+    live = [samples for now, samples, s in polls if s["phase"] == "live"]
+    assert all(len(samples) == 1 for samples in live)          # still one sample per tick
+    steps = np.abs(np.diff(np.array([p for samples in live for p in samples]), axis=0)).max()
+    assert steps < 0.3 * 0.02 * 1.5, steps                     # the wave at most 1.2x fast, no jump
+    assert final["starved_frames"] == polls[len(polls) // 2][2]["starved_frames"]
+
+
+def test_without_a_stall_the_offset_never_moves():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    rng = np.random.default_rng(0)
+    ages = {round(t, 1): a for t, a in zip(np.arange(0.0, 30.0, 0.1), rng.uniform(0.12, 0.3, 300))}
+    polls = _follow(stream, lambda t: ages[round(t, 1)], 30.0)
+    offsets = {s["offset_ms"] for _, _, s in polls if s["offset_ms"] is not None}
+    assert len(offsets) == 1
+    assert polls[-1][2]["catchups"] == 0 and polls[-1][2]["caught_up_ms"] == 0.0
+
+
+def test_a_second_stall_or_a_reentry_while_catching_up_stops_it():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    polls = _follow(stream, _stalled_until(2.0), 7.0)
+    assert polls[-1][2]["catchup_rate"] > 0.0
+    # PEAR stalls again: the ages climb back over the offset and the catch-up stops.
+    again = _follow(stream, lambda t: 0.15 if t < 6.9 or t > 10.0 else (1.2 if t > 9.0 else None), 10.5, start=7.0)
+    stopped = [s for _, _, s in again if s["catchup_rate"] == 0.0]
+    assert stopped and stopped[0]["offset_ms"] <= stopped[0]["offset_target_ms"] + 0.1
+    offsets = [s["offset_ms"] for _, _, s in polls + again if s["offset_ms"] is not None]
+    assert (np.diff(offsets) <= 0.0).all()
+    # A re-entry recalibrates from scratch and drops the catch-up; the counts carry on.
+    caught = again[-1][2]["caught_up_ms"]
+    stream.start_round(from_pose=again[-1][1][-1] if again[-1][1] else NEUTRAL)
+    status = stream.status()
+    assert status["catchup_rate"] == 0.0 and status["offset_ms"] is None and status["offset_target_ms"] is None
+    assert status["catchups"] >= 1 and status["caught_up_ms"] == caught
+
+
 def test_a_round_from_a_pose_parks_on_it_then_blends_into_the_person():
     stream = create_stream("x2_followme", base_pose=NEUTRAL)
     inside = np.array([1, 0, 1, 1, 1, 0, 0] * 2)  # joints with room either way of neutral

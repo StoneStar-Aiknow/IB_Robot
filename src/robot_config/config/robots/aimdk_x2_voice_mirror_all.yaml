@@ -365,7 +365,11 @@ robot:
     enabled: true
     clips_table: $(find robot_config)/config/mirror_voice/x2_clips_v1.yaml
     clip_dir: assets/audio/x2_mirror_clips_v1   # relative to $WORKSPACE
-    asr: mute                    # mute | off | keep
+    # feat/x2-retarget-tune: ASR off all session (was mute). Suspected: the ASR resuming
+    # after a clip stalls the board mid-mirroring. WAIT no longer listens either: enter
+    # mirroring by mirror.sh or the two-palm gesture.
+    asr: "off"                   # mute | off | keep (quoted: bare off is YAML false)
+    # feat/x2-retarget-tune end
     asr_resume_delay_sec: 0.8
     asr_control_topic: /voice_control
     standby:

@@ -35,6 +35,11 @@ Patches:
   crossing ±π stepped by 2π (`test_x2_followme.py` pins this). When the window
   hits `max_anchor_frames` it also drops the frames before it, which no later
   window reaches; upstream kept every frame while the guard stayed tripped.
+  `FollowMeStream` also catches up a stale output offset (`_catch_up`): upstream
+  calibrates `_offset` once per round, so a round that starts in a stall keeps
+  the stall's lag. When the offset sits more than 0.1 s above the last 3 s of
+  ages + `latency_s` for 2 s of live output, the output clock runs up to 1.2x
+  fast until it is there (within about 4 s); it never raises the offset.
 
 Not copied: the rest of `smplx2robot` (cli, export, delivery, safety, preview,
 compare, verify), which the streaming path does not import.

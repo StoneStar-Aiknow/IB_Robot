@@ -406,6 +406,12 @@ class X2FollowMe:
             # against the camera's, so a clock offset between them lands in age_ms.
             "offset_ms": round(stream._offset * 1e3, 1) if stream._t0 is not None else None,
             "age_ms": round((stream._offset - stream.latency_s) * 1e3, 1) if stream._t0 is not None else None,
+            # The offset the last few seconds of ages would calibrate, which a stale
+            # offset catches up to (core._catch_up); counts and time caught up all session.
+            "offset_target_ms": round(stream.offset_target * 1e3, 1) if stream.offset_target is not None else None,
+            "catchup_rate": round(stream._catchup_rate, 3),
+            "catchups": stream.catchups,
+            "caught_up_ms": round(stream.caught_up_s * 1e3, 1),
             "despike_flagged": int(stream.despiker.flagged.sum()),
             "branch_guard_trips": self._guard_trips + guard.trips,
             "branch_guard_worst": max(self._guard_worst, guard.worst_branch),
