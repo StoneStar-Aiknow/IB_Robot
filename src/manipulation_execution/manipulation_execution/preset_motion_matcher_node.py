@@ -19,13 +19,14 @@ from std_msgs.msg import String
 from ibrobot_msgs.msg import ActorState, PearFrame
 from manipulation_execution.preset_motions import HeartBounds, HeartRuleConfig, MatcherConfig, PoseMatcher
 from manipulation_execution.preset_motions.config import (
+    MATCH_STATE_TOPIC,
     MATCH_TOPIC,
     STATE_TOPIC,
     STATUS_TOPIC,
     matcher_settings,
     topic,
 )
-from manipulation_execution.preset_motions.events import match_event
+from manipulation_execution.preset_motions.events import match_event, match_state
 from manipulation_execution.preset_motions.session_gate import SessionGate
 
 
@@ -47,6 +48,7 @@ class PresetMotionMatcherNode(Node):
             "session_state_topic": STATE_TOPIC,
             "match_topic": MATCH_TOPIC,
             "status_topic": STATUS_TOPIC,
+            "match_state_topic": MATCH_STATE_TOPIC,
             "matcher_json": "{}",
             "motion_enabled": False,
         }
@@ -58,9 +60,11 @@ class PresetMotionMatcherNode(Node):
         self._gate = SessionGate()
         self._result = None
         self._events = 0
+        self._session_active = False
         group = MutuallyExclusiveCallbackGroup()
         self._events_pub = self.create_publisher(String, self._topic("match_topic"), 10)
         self._status_pub = self.create_publisher(String, self._topic("status_topic"), 10)
+        self._match_state_pub = self.create_publisher(String, self._topic("match_state_topic"), 10)
         self.create_subscription(
             PearFrame, self._topic("pear_frame_topic"), self._pear, qos_profile_sensor_data, callback_group=group
         )
@@ -80,6 +84,7 @@ class PresetMotionMatcherNode(Node):
 
     def _permit(self, ros, mono):
         epoch, active = self._gate.permit(now_ros_s=ros, now_mono_s=mono)
+        self._session_active = active
         self._accept(self._matcher.set_session(epoch=epoch, active=active))
         self._accept(self._matcher.tick(now_ros_s=ros, now_mono_s=mono))
 
@@ -95,20 +100,30 @@ class PresetMotionMatcherNode(Node):
         ros, mono = self._times()
         self._gate.observe(message.data, now_ros_s=ros, now_mono_s=mono)
         self._permit(ros, mono)
+        self._publish_match_state()
 
     def _actor(self, message):
         ros, mono = self._times()
         self._permit(ros, mono)
         self._matcher.observe_actor(message, now_mono_s=mono)
+        self._accept(self._matcher.tick(now_ros_s=ros, now_mono_s=mono))
+        self._publish_match_state()
 
     def _pear(self, message):
         ros, mono = self._times()
         self._permit(ros, mono)
         self._accept(self._matcher.observe_pear(message, now_ros_s=ros, now_mono_s=mono))
+        self._publish_match_state()
 
     def _tick(self):
         ros, mono = self._times()
         self._permit(ros, mono)
+        self._publish_match_state()
+
+    def _publish_match_state(self):
+        if self._result is not None:
+            payload = match_state(self._result, self.get_clock().now().nanoseconds, session_active=self._session_active)
+            self._match_state_pub.publish(String(data=json.dumps(payload, sort_keys=True, allow_nan=False)))
 
     def _status(self):
         result = asdict(self._result) if self._result is not None else {}

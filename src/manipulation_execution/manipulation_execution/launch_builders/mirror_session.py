@@ -458,6 +458,11 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         **(mock_hand_endpoints(robot_config) or {}),
     }
     operator = _operator_parameters(robot_config, config, parameters, business)
+    from manipulation_execution.preset_motions.config import motion_parameters
+
+    preset_motion = motion_parameters(robot_config, resolve_ros_path)
+    if preset_motion is not None:
+        parameters["preset_motion_json"] = json.dumps(preset_motion, sort_keys=True)
     session = Node(
         package="manipulation_execution",
         executable="mirror_session_node",

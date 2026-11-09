@@ -38,6 +38,7 @@ moved the arm since; otherwise it plays from the start and says why.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
@@ -249,6 +250,7 @@ class NamedMotionServer:
         self._hold_lease_lock = threading.Lock()
         self._hold_active: tuple[str, str] | None = None
         self._hold_subscription = None
+        self._hold_lease_ack = None
         if not names:
             return
         if self._hold_names - self._trajectories.keys() or self._hold_names & self._return_motions:
@@ -304,9 +306,18 @@ class NamedMotionServer:
         topic = config.get("hold_lease_topic", "/runtime/named_motion_hold_lease")
         if not isinstance(topic, str) or not topic.startswith("/") or any(char.isspace() for char in topic):
             raise ValueError("hold_lease_topic must be an absolute ROS topic")
+        ack_topic = config.get("hold_lease_ack_topic", "/runtime/named_motion_hold_lease_ack")
+        if (
+            not isinstance(ack_topic, str)
+            or not ack_topic.startswith("/")
+            or any(char.isspace() for char in ack_topic)
+            or ack_topic == topic
+        ):
+            raise ValueError("hold_lease_ack_topic must be a distinct absolute ROS topic")
         configure = getattr(self._node, "configure_named_hold_guard", None)
         if configure is not None:
             configure(config)
+        self._hold_lease_ack = self._node.create_publisher(String, ack_topic, 10)
         self._hold_subscription = self._node.create_subscription(
             String, topic, self._on_hold_lease, 10, callback_group=self._node.action_callback_group
         )
@@ -367,6 +378,9 @@ class NamedMotionServer:
             }
             if exit_target is not None:
                 self._hold_exit_targets[key] = tuple(float(item) for item in exit_target)
+        acknowledgement = getattr(self, "_hold_lease_ack", None)
+        if acknowledgement is not None:
+            acknowledgement.publish(String(data=json.dumps({"goal_id": goal_id, "motion": motion})))
 
     def _hold_lease_fresh(self, key: tuple[str, str], now: float) -> bool:
         with self._hold_lease_lock:
@@ -479,14 +493,19 @@ class NamedMotionServer:
                 return True, "named hold bridge completed", list(target)
             time.sleep(min(1.0 / self._rate_hz, max(0.0, duration - elapsed)))
 
-    def _hold_wait_arrival(self, name, mode, point, goal_handle, key, generation, epoch, started):
+    def _hold_wait_arrival(self, name, mode, point, goal_handle, key, generation, epoch, started, state="entering"):
         issued_at = time.monotonic()
         deadline = issued_at + self._return_settle_s
+        last_feedback = -math.inf
         while time.monotonic() < deadline:
             if goal_handle.is_cancel_requested:
                 self._hold_cancel(name, point, goal_handle, generation, epoch)
             self._hold_check(key, mode, generation, epoch, started)
             self._hold_command(point, generation, epoch)
+            now = time.monotonic()
+            if now - last_feedback >= 0.1:
+                self._hold_feedback(goal_handle, state, 1.0)
+                last_feedback = now
             sample = self._node.measured_named_hold_sample(max_skew_s=self._hold_feedback_skew_s)
             if (
                 sample is not None
@@ -557,14 +576,25 @@ class NamedMotionServer:
                         name, mode, actual, list(exit_target), goal_handle, key, generation, epoch, started, "exiting"
                     )
                     if ok:
-                        if not self._hold_wait_arrival(name, mode, final, goal_handle, key, generation, epoch, started):
+                        if not self._hold_wait_arrival(
+                            name, mode, final, goal_handle, key, generation, epoch, started, state="exiting"
+                        ):
                             return (
                                 False,
                                 ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
                                 "named hold exit arrival unconfirmed",
                             )
                         normal_exit = True
-                        return True, ExecuteNamedMotion.Result.NONE, "named hold exit completed"
+                        identity = hashlib.sha256(
+                            json.dumps(
+                                [float(value) for value in final], separators=(",", ":"), allow_nan=False
+                            ).encode()
+                        ).hexdigest()
+                        return (
+                            True,
+                            ExecuteNamedMotion.Result.NONE,
+                            json.dumps({"motion": name, "exit_target_sha256": identity}, separators=(",", ":")),
+                        )
                     self._hold_feedback(goal_handle, "exit_blocked", 1.0)
                     # Reject this request without losing the safe holding pose.
                     with self._hold_lease_lock:

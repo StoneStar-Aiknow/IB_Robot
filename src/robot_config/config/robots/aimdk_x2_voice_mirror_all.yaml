@@ -399,6 +399,10 @@ robot:
     motion_enabled: false
     match_topic: /preset_motions/matched
     status_topic: /preset_motions/status
+    state_topic: /preset_motions/state
+    motion_name: overhead_heart
+    template_file: $(find robot_config)/config/preset_motions/overhead_heart.yaml
+    geometry_file: ""  # A certified runtime artifact is required before enabling motion.
     matcher:
       enter_confirm_s: 0.5
       exit_confirm_s: 0.4

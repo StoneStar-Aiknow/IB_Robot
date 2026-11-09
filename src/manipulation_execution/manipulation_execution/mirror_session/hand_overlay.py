@@ -124,6 +124,29 @@ class HandOverlay:
             self._command_at = now
 
     # -- output (the gate's publish, under the session lock) --------------------
+    def follow_target(self, now: float) -> tuple[float, ...] | None:
+        """Read a fresh, bounded normal-mirror target without advancing output."""
+        with self._lock:
+            if self._follow is None or not 0 <= now - self._follow_at <= FOLLOW_FRESH_S:
+                return None
+            return tuple(float(value) for value in np.clip(self._follow, HAND_LOW, HAND_HIGH))
+
+    def reseed(self, values, now: float) -> None:
+        """Resume from the same verified native target the named owner completed."""
+        array = np.asarray(values, dtype=float)
+        if (
+            array.shape != (HAND_COUNT,)
+            or not np.isfinite(array).all()
+            or np.any(array < HAND_LOW - 1e-8)
+            or np.any(array > HAND_HIGH + 1e-8)
+            or not math.isfinite(now)
+        ):
+            raise ValueError("resume seed must contain 20 finite in-range native hand values")
+        with self._lock:
+            self._prev = array.copy()
+            self._last_apply = now
+            self._unjam = [False, False]
+
     def apply(self, following: bool, now: float) -> tuple[float, ...]:
         with self._lock:
             if self._prev is None or now - self._last_apply > RESTART_GAP_S:

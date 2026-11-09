@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import threading
@@ -39,6 +40,10 @@ class HoldNode:
         self.action_callback_group = None
         self.runtime_state = SimpleNamespace(stop_epoch=1)
         self.vendor_config = {"mc_actions": {"policy_stream": "UPPERBODY"}}
+        self.acks = []
+
+    def create_publisher(self, *args, **kwargs):
+        return SimpleNamespace(publish=lambda message: self.acks.append(json.loads(message.data)))
 
     def platform_action(self):
         return "UPPERBODY"
@@ -208,10 +213,51 @@ def test_valid_exit_is_executed_under_same_owner(monkeypatch):
             )
         )
     )
-    assert run(value, goal)[0]
+    ok, code, message = run(value, goal)
+    assert ok and code == motion.ExecuteNamedMotion.Result.NONE
+    identity = hashlib.sha256(json.dumps([0.1] * 34, separators=(",", ":")).encode()).hexdigest()
+    assert json.loads(message) == {"motion": "overhead_heart", "exit_target_sha256": identity}
     assert node.claims == [1] and node.releases == [1]
     assert node.commands[-1] == pytest.approx([0.1] * 34)
     assert "exiting" in goal.feedback
+
+
+def test_uuid_lease_acknowledgement_precedes_any_goal_claim(monkeypatch):
+    value, node, _goal, key = server(monkeypatch)
+    value._on_hold_lease(SimpleNamespace(data=json.dumps({"goal_id": key[0], "motion": key[1]})))
+    assert node.acks == [{"goal_id": key[0], "motion": key[1]}]
+    assert node.claims == node.commands == []
+
+
+def test_invalid_lease_never_gets_an_acknowledgement(monkeypatch):
+    value, node, _goal, key = server(monkeypatch)
+    for payload in (
+        {"goal_id": key[0], "motion": "unknown"},
+        {"goal_id": "not-a-uuid", "motion": key[1]},
+        {"goal_id": key[0], "motion": key[1], "exit_target": [True] * 34},
+    ):
+        value._on_hold_lease(SimpleNamespace(data=json.dumps(payload)))
+    assert node.acks == []
+
+
+def test_arrival_wait_keeps_exiting_feedback_alive_while_tracking_converges(monkeypatch):
+    value, node, goal, key = server(monkeypatch)
+    value._return_settle_s = 2.0
+    value._running = ("overhead_heart", 1)
+    started = node.clock.now
+    feedback = []
+    goal.publish_feedback = lambda message: feedback.append((node.clock.now, message.state))
+    node.measured_named_hold_sample = lambda **kwargs: (
+        [0.1 if node.clock.now - started < 1.2 else 0.0] * 34,
+        node.clock.now,
+    )
+    assert value._hold_wait_arrival(
+        "overhead_heart", "policy_stream", [0.0] * 34, goal, key, 1, 1, started, state="exiting"
+    )
+    assert feedback[-1][0] - started >= 1.1
+    assert all(state == "exiting" for _, state in feedback)
+    assert max(b[0] - a[0] for a, b in zip(feedback, feedback[1:], strict=False)) <= 0.15
+    assert node.faults == []
 
 
 def test_unsafe_exit_keeps_the_admitted_pose_until_cancel(monkeypatch):

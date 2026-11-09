@@ -73,6 +73,7 @@ from manipulation_execution.mirror_session.hooks import (
     WrapUpPurpose,
     WrapUpStep,
 )
+from manipulation_execution.mirror_session.preset import PresetCoordinator, PresetPhase
 from manipulation_execution.mirror_session.runtime import (
     IDLE,
     STATUS_MAX_AGE_S,
@@ -88,6 +89,7 @@ from manipulation_execution.mirror_session.runtime import (
 TAKEOVER_RPC_TIMEOUT_S = 2.0
 SHORT_ROUND_S = 10.0  # rounds shorter than this count towards short_rounds; WAIT clears it
 TRANSITION_BUFFER = 64  # transitions kept until drained; the oldest are dropped beyond it
+PRESET_STATE_MAX_AGE_S = 0.35
 
 
 class SessionState(str, Enum):
@@ -206,6 +208,8 @@ class MirrorSession:
         cover: CoverDetector | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        preset: PresetCoordinator | None = None,
+        preset_target: Callable[[UpperBodyCommand | None], UpperBodyCommand | None] | None = None,
     ):
         self._config = config
         self._port = port
@@ -249,6 +253,19 @@ class MirrorSession:
         self._transitions: deque[dict] = deque(maxlen=TRANSITION_BUFFER)
         self._transitions_dropped = 0
         self._last_transition: dict | None = None
+        self._preset = preset if preset is not None and preset.enabled else None
+        self._preset_target = preset_target
+        self._preset_generation = 0
+        self._preset_active = False
+        self._preset_valid = False
+        self._preset_received_at: float | None = None
+        self._preset_suspended = False
+        self._preset_had_owner = False
+        self._preset_stop_without_wrap = False
+        self._preset_hold_required = False
+        self._preset_hold_sent = False
+        self._preset_failure = ""
+        self._preset_seed_emitting = False
 
     # ------------------------------------------------------------------
     # observations
@@ -258,6 +275,12 @@ class MirrorSession:
     def holding(self) -> bool:
         with self._lock:
             return self._holding
+
+    @property
+    def preset_seed_emitting(self) -> bool:
+        """True only inside the publication callback for a verified full-body resume seed."""
+        with self._lock:
+            return self._preset_seed_emitting
 
     def observe_status(self, observation: RuntimeObservation) -> None:
         with self._lock:
@@ -269,6 +292,15 @@ class MirrorSession:
             with self._lock:
                 self._measured_arm = values
                 self._measured_arm_at = self._clock()
+
+    def observe_preset(self, active: bool, *, valid: bool = True) -> None:
+        """Receive the current round's matcher state; the node enforces its source-time barrier."""
+        with self._lock:
+            if self._preset is None or (self.state, self.phase) != (SessionState.MIRRORING, Phase.RUNNING):
+                return
+            self._preset_active = active is True
+            self._preset_valid = isinstance(active, bool) and valid is True
+            self._preset_received_at = self._clock()
 
     def _observe_locked(self, observation: RuntimeObservation) -> None:
         self._last_status = observation
@@ -303,6 +335,8 @@ class MirrorSession:
                 return True, "round ending; cooldown follows the wrap-up"
             if self.state != SessionState.WAIT:
                 return True, "already on"
+            if self._preset_suspended and not self._preset_release_locked():
+                return False, "named preset owner release is not confirmed"
             generation = self._generation
 
         # WAIT: the Gateway switched the runtime before this call. Read, then take over.
@@ -319,6 +353,9 @@ class MirrorSession:
                 self.detail = f"start refused: {refusal}"
                 return False, refusal
             self._holding = True
+            self._preset_hold_required = self._preset_hold_sent = False
+            self._preset_failure = ""
+            self._preset_suspended = self._preset_had_owner = self._preset_stop_without_wrap = False
             self._gate.open()
             self._arm_at_takeover = self._measured_arm
             self._phase_started = self._clock()
@@ -354,11 +391,14 @@ class MirrorSession:
                 finally:
                     self._stop_waiters -= 1
                 if not finished:
+                    if self._preset_suspended:
+                        self._preset_hold_required = True
+                        self._preset_failure = "preset owner release exceeded the stop budget"
                     self._enter_wait_locked(WaitReason.STOPPED, "wrap-up overran its budget", "wrap_up_overrun")
             elif self.state == SessionState.STANDBY:
                 # cooldown / ready: the arm is at the reset pose already.
                 self._enter_wait_locked(WaitReason.STOPPED, "mirror_stop")
-            self.stop_final_gap_deg = self._final_gap_deg_locked()
+            self.stop_final_gap_deg = None if self._preset_stop_without_wrap else self._final_gap_deg_locked()
         # WAIT included: the Gateway switched to policy_stream before this call.
         outcome = self._release()
         return outcome.idle, outcome.message
@@ -419,6 +459,24 @@ class MirrorSession:
                 self._releasing = True
             outcome = None
             try:
+                with self._lock:
+                    preset_blocked = self._preset_suspended and not self._preset_release_locked()
+                    hold_required = self._preset_hold_required or preset_blocked
+                    hold_sent = self._preset_hold_sent
+                    failure = self._preset_failure or "named preset owner release is not confirmed"
+                if hold_required:
+                    if not hold_sent:
+                        try:
+                            success, message = self._port.stop("HOLD", RELEASE_RESERVE_S)
+                        except Exception as exc:
+                            success, message = False, f"{type(exc).__name__}: {exc}"
+                        with self._lock:
+                            self._preset_hold_sent = True
+                        detail = f"HOLD {'accepted' if success else 'refused'}: {message}"
+                    else:
+                        detail = "HOLD already requested"
+                    outcome = ReleaseOutcome(False, False, f"{failure[:140]}; {detail[:100]}; idle not requested")
+                    return outcome
                 outcome = release_to_idle(
                     self._port,
                     self._config.policy_mode,
@@ -450,11 +508,13 @@ class MirrorSession:
 
     def _tick_locked(self, now: float, inputs: SessionInputs) -> bool:
         """One step; True when the caller must release (an internal stop nobody waits on)."""
+        if self.state == SessionState.WAIT and self._preset_hold_required and not self._preset_hold_sent:
+            return True
         if self._holding:
             age = None if self._last_valid_at is None else now - self._last_valid_at
             if age is None or age > self._config.status_max_age_s:
                 self._enter_wait_locked(WaitReason.RUNTIME_LOST, "no fresh runtime status")
-                return False
+                return self._preset_hold_required and self._stop_waiters == 0
         if self.state == SessionState.STANDBY:
             return self._tick_standby_locked(now, inputs)
         if self.state == SessionState.MIRRORING:
@@ -501,6 +561,8 @@ class MirrorSession:
                 self._check_cancel_locked(now, inputs)
             if self.phase == Phase.RUNNING:
                 command = self._hook("retarget", self._hooks.retarget, inputs)
+                if self._preset is not None and self._tick_preset_locked(now, command):
+                    return self.state == SessionState.WAIT and self._stop_waiters == 0
                 if command is not None:
                     command = self._hook("post_process", self._hooks.post_process, command)
                 self._emit(command, target)
@@ -517,6 +579,87 @@ class MirrorSession:
         self._wrap_purpose, self._phase_started = None, now
         self._transition_locked(SessionState.STANDBY, Phase.COOLDOWN, ending)
         return False
+
+    def _tick_preset_locked(self, now: float, raw: UpperBodyCommand | None) -> bool:
+        """True when the preset consumed this tick, including a failed round."""
+        age = now - (self._round_started if self._preset_received_at is None else self._preset_received_at)
+        invalid = self._preset_received_at is not None and not self._preset_valid
+        fresh = self._preset_received_at is not None and not invalid and 0.0 <= age <= PRESET_STATE_MAX_AGE_S
+        if not fresh:
+            if not self._preset_suspended:
+                return False  # unavailable recognition must not disturb ordinary mirroring
+            self._preset_failure = "preset matcher state invalid" if invalid else "preset matcher state stale"
+            self._preset_hold_required = True
+            self._enter_wait_locked(WaitReason.FAULT, self._preset_failure)
+            return True
+        if not self._preset_suspended:
+            if not self._preset_active or not self._preset.request(self._preset_generation):
+                return False
+            self._gate.close()  # one gate closes both arm and hand publication before drain starts
+            self._preset_suspended = True
+            self._preset_had_owner = self._preset_stop_without_wrap = False
+        target = None
+        if self._preset_target is not None:
+            target = self._hook("preset_target", self._preset_target, raw)
+        result = self._preset.step(
+            self._preset_generation,
+            self._preset_active,
+            exit_target=target,
+            exit_target_fresh=target is not None,
+            public_quiet=not self._gate.is_open,
+        )
+        self._preset_had_owner |= not result.release_confirmed
+        if result.fault:
+            self._preset_failure = result.fault
+            self._preset_hold_required = True
+            self._enter_wait_locked(WaitReason.FAULT, result.fault)
+            return True
+        if result.resume_seed is not None:
+            self._gate.open()
+            self._gate.last = result.resume_seed
+            self._preset_seed_emitting = True
+            try:
+                self._gate.emit(result.resume_seed)
+            except Exception as exc:
+                self._preset_failure = f"preset resume seed publication failed: {type(exc).__name__}"
+                self._preset_hold_required = True
+                self._enter_wait_locked(WaitReason.HOOK_ERROR, self._preset_failure)
+                return True
+            finally:
+                self._preset_seed_emitting = False
+            self._preset_suspended = self._preset_had_owner = False
+            return True
+        if result.block_public:
+            return True
+        if result.phase == PresetPhase.IDLE and not self._preset_had_owner:
+            last = self._gate.last
+            self._gate.open()
+            self._gate.last = last
+            self._preset_suspended = False
+            return False
+        self._preset_failure = "preset stopped without a normal resume seed"
+        self._preset_hold_required = True
+        self._enter_wait_locked(WaitReason.FAULT, self._preset_failure)
+        return True
+
+    def _stop_preset_locked(self, reason: str) -> None:
+        if self._preset is None or (not self._preset_suspended and self._preset.phase == PresetPhase.IDLE):
+            return
+        self._gate.close()
+        self._preset_suspended = True
+        result = self._preset.stop(reason)
+        self._preset_had_owner |= not result.release_confirmed
+        self._preset_stop_without_wrap |= self._preset_had_owner
+        if self._preset_had_owner:
+            self._preset_hold_required = True
+            self._preset_failure = "named preset stop has no certified reset bridge"
+
+    def _preset_release_locked(self) -> bool:
+        if self._preset is None or not self._preset_suspended:
+            return True
+        result = self._preset.step(self._preset_generation, False, public_quiet=not self._gate.is_open)
+        self._preset_had_owner |= not result.release_confirmed
+        return result.release_confirmed
 
     def _check_cancel_locked(self, now: float, inputs: SessionInputs) -> None:
         if not self._hook("cancel_criteria", self._hooks.cancel_criteria, inputs, now - self._round_started):
@@ -575,11 +718,30 @@ class MirrorSession:
             return None
         if last is None or target is None or len(last.arm) != len(target.arm):
             return None
-        return math.degrees(max(abs(a - b) for a, b in zip(last.arm, target.arm)))
+        return math.degrees(max(abs(a - b) for a, b in zip(last.arm, target.arm, strict=True)))
 
     def _wrap_tick_locked(self, now: float, target) -> str | None:
         """One wrap-up step; ``wrap_up_done`` / ``wrap_up_overrun`` once it ends, else None."""
         elapsed = now - self._phase_started
+        if self._preset_suspended:
+            released = self._preset_release_locked()
+            if not released:
+                if elapsed >= self._config.wrap_up_budget_s:
+                    self._preset_hold_required = True
+                    self._preset_failure = "named preset owner release was not confirmed"
+                    self._wrap_purpose = WrapUpPurpose.STOP
+                    self._stop_reason = (WaitReason.FAULT, self._preset_failure)
+                    return "wrap_up_overrun"
+                return None
+            if self._preset_stop_without_wrap:
+                if self._wrap_purpose == WrapUpPurpose.CANCEL:
+                    self._wrap_purpose = WrapUpPurpose.STOP
+                    self._stop_reason = (WaitReason.STOPPED, self._cancel_reason or "preset round cancelled")
+                return "wrap_up_done"
+            last = self._gate.last
+            self._gate.open()
+            self._gate.last = last  # drain ended before named dispatch: this public seed is still current
+            self._preset_suspended = False
         step = self._wrap_step(self._wrap_purpose, target, elapsed)
         self._emit(step.command, target)
         if step.done:
@@ -612,6 +774,7 @@ class MirrorSession:
         return release
 
     def _begin_wrap_locked(self, purpose: WrapUpPurpose, reason: str, stop_reason=None) -> None:
+        self._stop_preset_locked(reason)
         self._phase_started = self._clock()
         self._wrap_purpose = purpose
         if purpose == WrapUpPurpose.STOP:
@@ -620,6 +783,9 @@ class MirrorSession:
         self._transition_locked(self.state, Phase.WRAP_UP, reason)
 
     def _enter_mirroring_locked(self, now: float, reason: str) -> None:
+        self._preset_generation += 1
+        self._preset_active = self._preset_valid = False
+        self._preset_received_at = None
         self._round_started = self._phase_started = now
         self._wrap_purpose = None
         self._round_open, self._round_error = True, ""
@@ -641,11 +807,17 @@ class MirrorSession:
             self._round_error = self.detail = f"end_round raised {exc!r}"
 
     def _enter_wait_locked(self, reason: WaitReason, detail: str, transition: str | None = None) -> None:
+        self._stop_preset_locked(detail)
+        if self._preset_suspended and reason not in (WaitReason.STOPPED, WaitReason.COVERED, WaitReason.SHUTDOWN):
+            self._preset_hold_required = True
+            self._preset_failure = detail
         self._gate.close()
         self._holding = False
         self._close_round_locked()
         error, self._round_error = self._round_error, ""
         self.wait_reason, self.detail = reason, f"{detail}; {error}" if error else detail
+        if self._preset_hold_required and self._preset_failure and self._preset_failure not in self.detail:
+            self.detail += f"; {self._preset_failure}"
         self._wrap_purpose, self._stop_reason = None, None
         self._short_rounds = 0  # every WAIT is a fresh start
         if transition is None:
@@ -694,7 +866,7 @@ class MirrorSession:
     def snapshot(self) -> dict:
         with self._lock:
             status = self._last_status
-            return {
+            snapshot = {
                 "state": self.state.value,
                 "phase": self.phase.value,
                 "wrap_purpose": "" if self._wrap_purpose is None else self._wrap_purpose.value,
@@ -712,3 +884,10 @@ class MirrorSession:
                 "last_transition": None if self._last_transition is None else dict(self._last_transition),
                 "transitions_dropped": self._transitions_dropped,
             }
+            if self._preset is not None:
+                snapshot.update(
+                    preset_phase=self._preset.phase.value,
+                    preset_generation=self._preset_generation,
+                    preset_failure=self._preset_failure,
+                )
+            return snapshot
