@@ -38,7 +38,6 @@ def test_the_session_trigger_needs_a_wake_event_because_nothing_else_opens_a_ses
 @pytest.mark.parametrize(
     "voice_bridge",
     [
-        pytest.param({"wake_phrases": ["灵犀灵犀"], "speaker_check_enabled": True}, id="voiceprint check"),
         pytest.param({"addressee_trigger": "vendor_session", "wake_event": WAKE_EVENT}, id="session trigger"),
     ],
 )
@@ -47,6 +46,11 @@ def test_pairing_by_segment_needs_a_segmenting_source(voice_bridge):
     errors = validate_voice_bridge_segment_inputs(_config(voice_bridge, input_mode="shared_audio"))
 
     assert any("voice_asr.input_mode=external_vad" in error for error in errors)
+
+
+def test_shared_audio_local_vad_can_pair_voiceprints_and_transcripts():
+    voice_bridge = {"wake_phrases": ["欧拉欧拉"], "speaker_check_enabled": True}
+    assert validate_voice_bridge_segment_inputs(_config(voice_bridge, input_mode="shared_audio")) == []
 
 
 def test_the_plain_text_topic_is_not_configurable_once_the_gate_pairs_by_segment():

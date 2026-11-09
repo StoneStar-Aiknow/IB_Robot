@@ -8,8 +8,10 @@ VoiceASRNode - 语音识别 ROS2 节点
 
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 
+import numpy as np
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import SingleThreadedExecutor
@@ -18,6 +20,7 @@ from std_msgs.msg import Float32, String
 from std_srvs.srv import Empty
 
 from ibrobot_msgs.srv import RecognizeFile, SetHotwords
+from robot_config.voice_contract import SHARED_SPEECH_CHUNK_TOPIC
 
 from .asr_inference_module import ASRInferenceModule, ASRResult
 from .audio_capture_module import AudioCaptureModule, AudioConfig
@@ -367,14 +370,20 @@ class VoiceASRNode(Node):
     def _end_streaming(self, trigger: str) -> ASRResult:
         """End the active recognition; a failed final decode drops the utterance, not the node."""
         try:
-            return self._asr.end_streaming()
+            result = self._asr.end_streaming()
         except Exception as e:
             # Every caller runs inside an executor callback, so a propagated
             # error would end spin() and take the whole ASR node down.
             self.get_logger().error(f"Final ASR decode failed ({trigger}); utterance dropped: {e}")
-            return ASRResult(text="", is_final=True)
+            result = ASRResult(text="", is_final=True)
+        segment = getattr(self, "_shared_segment", None)
+        self._publish_shared_chunk(3)
+        if segment is not None and result.text:
+            self._publish_segment_transcript(result.text, segment)
+        return result
 
     def _reset_recognition_runtime(self, clear_audio: bool = False):
+        self._publish_shared_chunk(3)
         self._recording_start_time = None
         self._last_partial_text = ""
         if self._vad is not None:
@@ -387,11 +396,19 @@ class VoiceASRNode(Node):
         """初始化 ROS 接口"""
         self._pub_command = self.create_publisher(String, self._output_topic, 10)
         self._pub_transcript = None
-        if self._external_mode and self._transcript_topic:
+        self._pub_speech_chunk = None
+        self._shared_source = "voice_asr-" + uuid.uuid4().hex
+        self._shared_sequence = 0
+        self._shared_segment = None
+        if self._transcript_topic:
             from ibrobot_msgs.msg import SpeechTranscript
 
             # Only an external source names its segments; see SpeechTranscript.msg.
             self._pub_transcript = self.create_publisher(SpeechTranscript, self._transcript_topic, 10)
+        if not self._external_mode:
+            from ibrobot_msgs.msg import SpeechAudioChunk
+
+            self._pub_speech_chunk = self.create_publisher(SpeechAudioChunk, SHARED_SPEECH_CHUNK_TOPIC, 50)
         self._pub_partial = self.create_publisher(String, "/voice_partial", 10)
         self._pub_status = self.create_publisher(String, "/voice_status", 10)
         self._pub_confidence = self.create_publisher(Float32, "/voice_confidence", 10)
@@ -548,7 +565,9 @@ class VoiceASRNode(Node):
 
                 if len(pre_roll) > 0:
                     self._asr.accept_waveform(pre_roll)
+                self._publish_shared_chunk(1, pre_roll)
 
+            self._publish_shared_chunk(2, asr_chunk)
             result = self._asr.accept_waveform(asr_chunk)
 
             if result and self._publish_partial and result.text != self._last_partial_text:
@@ -860,6 +879,27 @@ class VoiceASRNode(Node):
         self._pub_confidence.publish(conf_msg)
 
         self.get_logger().info(f"Command: {text}")
+
+    def _publish_shared_chunk(self, state: int, audio=None) -> None:
+        """Publish the exact local-VAD/ASR segment for paired speaker checks."""
+        if getattr(self, "_pub_speech_chunk", None) is None:
+            return
+        if state != 1 and self._shared_segment is None:
+            return
+        from ibrobot_msgs.msg import SpeechAudioChunk
+
+        self._shared_sequence += 1
+        if state == 1:
+            self._shared_segment = (self._shared_source, self._shared_sequence)
+        msg = SpeechAudioChunk()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.source_id, msg.sequence, msg.state = self._shared_source, self._shared_sequence, state
+        if audio is not None:
+            pcm = (np.clip(np.asarray(audio), -1.0, 32767 / 32768) * 32768).astype("<i2")
+            msg.audio_data = pcm.tobytes()
+        self._pub_speech_chunk.publish(msg)
+        if state == 3:
+            self._shared_segment = None
 
     def _publish_segment_transcript(self, text: str, segment: tuple[str, int]) -> None:
         """Publish the same final text tagged with the segment it came from."""

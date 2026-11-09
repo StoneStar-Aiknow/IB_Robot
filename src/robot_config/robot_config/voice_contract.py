@@ -10,6 +10,9 @@ else. Kept free of imports so a node can read it without loading the loader.
 #: speech segment (``ibrobot_msgs/SpeechTranscript``), under external_vad input.
 VOICE_TRANSCRIPT_TOPIC = "/voice/transcript"
 
+#: Shared audio's local VAD output; distinct from the runtime's speech input.
+SHARED_SPEECH_CHUNK_TOPIC = "/voice_asr/speech_chunk"
+
 #: Where ``speaker_id_node`` publishes its voiceprints
 #: (``voice_asr.speaker_embedding.output_topic``).
 SPEAKER_EMBEDDING_OUTPUT_TOPIC = "/voice/speaker_embedding"

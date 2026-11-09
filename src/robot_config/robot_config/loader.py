@@ -2332,7 +2332,7 @@ def validate_voice_bridge_segment_inputs(robot_config: dict[str, Any]) -> list[s
     errors: list[str] = []
     voice_asr = robot_config.get("voice_asr", {})
     voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
-    if voice_asr.get("input_mode", VoiceASRConfig.input_mode) != "external_vad":
+    if session and voice_asr.get("input_mode", VoiceASRConfig.input_mode) != "external_vad":
         errors.append(
             f"{prefix}.speaker_check_enabled and addressee_trigger=vendor_session pair transcripts by speech "
             "segment and need voice_asr.input_mode=external_vad; only a segmenting source names its segments"
@@ -3245,6 +3245,7 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         "tts_enabled",
         "mute_asr_during_tts",
         "speaker_check_enabled",
+        "require_verified_speech",
         "speaker_reject_short",
     ):
         if field_name in voice_bridge and not isinstance(voice_bridge[field_name], bool):
@@ -3292,6 +3293,8 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         # consumes its wake word, so a phrase list rejects every utterance.
         errors.append(f"{prefix}.addressee_trigger=vendor_session must not set wake_phrases")
     gate_is_on = trigger == "vendor_session" or bool(voice_bridge.get("wake_phrases"))
+    if voice_bridge.get("require_verified_speech") is True and voice_bridge.get("speaker_check_enabled") is not True:
+        errors.append(f"{prefix}.require_verified_speech requires speaker_check_enabled=true")
     if voice_bridge.get("speaker_check_enabled") is True and not gate_is_on:
         # The anchor is only ever captured from the utterance that proves
         # itself. With the gate off nothing captures one and the check would

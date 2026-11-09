@@ -29,7 +29,7 @@ VOICE_ASR_DEFAULTS = {
     "publish_partial": True,
     "output_topic": "/voice_command",
     # Same final text tagged with its speech segment (ibrobot_msgs/SpeechTranscript);
-    # external_vad input only.
+    # External or local-VAD input.
     "transcript_topic": VOICE_TRANSCRIPT_TOPIC,
     "sample_rate": 16000,
     "chunk_size": 512,

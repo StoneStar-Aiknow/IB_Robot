@@ -1668,6 +1668,7 @@ def test_voice_bridge_forwards_the_voiceprint_check_when_configured():
         wake_phrases=["灵犀灵犀"],
         speaker_check_enabled=True,
         speaker_min_similarity=0.62,
+        require_verified_speech=True,
         speaker_max_age_sec=2.0,
         speaker_merge_margin=0.15,
         speaker_reject_short=True,
@@ -1675,6 +1676,7 @@ def test_voice_bridge_forwards_the_voiceprint_check_when_configured():
     params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
 
     assert params["speaker_check_enabled"] is True
+    assert params["require_verified_speech"] is True
     assert float(params["speaker_min_similarity"]) == 0.62
     assert float(params["speaker_max_age_sec"]) == 2.0
     assert float(params["speaker_merge_margin"]) == 0.15

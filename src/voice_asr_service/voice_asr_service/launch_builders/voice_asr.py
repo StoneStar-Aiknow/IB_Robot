@@ -161,9 +161,9 @@ def _speaker_embedding_nodes(
     if unknown:
         raise ValueError(f"voice_asr.speaker_embedding has unknown keys: {', '.join(unknown)}")
     if not external_mode:
-        # The node reads SpeechAudioChunk, which only the external path has;
-        # in shared_audio mode there is no utterance boundary to embed between.
-        raise ValueError("voice_asr.speaker_embedding requires voice_asr.input_mode=external_vad")
+        from robot_config.voice_contract import SHARED_SPEECH_CHUNK_TOPIC
+
+        chunk_topic = SHARED_SPEECH_CHUNK_TOPIC
 
     from voice_asr_service.speaker_id.defaults import SPEAKER_ID_DEFAULTS
 

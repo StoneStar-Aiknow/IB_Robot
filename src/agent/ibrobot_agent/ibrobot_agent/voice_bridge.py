@@ -100,6 +100,8 @@ class VoiceBridgeConfig:
     #: ``wake_phrases``: the anchor is the utterance that said one. Requires
     #: ``voice_asr.speaker_embedding.enabled`` to be publishing measurements.
     speaker_check_enabled: bool = False
+    # Require a paired voiceprint for every utterance, including stop/confirmation.
+    require_verified_speech: bool = False
     #: Cosine below which a follow-up is treated as somebody else's. The
     #: default is the value the X2 was tested at (2026-10-24, campplus, >=2 s
     #: segments): other speakers against the anchor scored 0.28-0.56, the
@@ -228,6 +230,8 @@ class VoiceBridgeConfig:
             # itself. With the gate off nothing ever captures one, and the check
             # would silently do nothing.
             raise ValueError("speaker_check_enabled requires an enabled gate: set wake_phrases or addressee_trigger")
+        if self.require_verified_speech and not self.speaker_check_enabled:
+            raise ValueError("require_verified_speech requires speaker_check_enabled")
         if any(phrase in _normalize(self.busy_message) for phrase in self.stop_phrases):
             raise ValueError("busy_message must not contain a stop phrase: the bridge would stop its own request")
         corrections = []
@@ -460,6 +464,7 @@ class VoiceBridgeCore:
         self._announced_requests: set[str] = set()
         self._id_factory = id_factory or (lambda: f"voice-{uuid.uuid4().hex[:12]}")
         self._gate = AddresseeGate(
+            require_measurements=config.require_verified_speech,
             trigger=config.addressee_trigger,
             wake_phrases=config.wake_phrases,
             wake_window_sec=config.wake_window_sec,
@@ -677,7 +682,7 @@ class VoiceBridgeCore:
         """
         if self.config.feedback_only:
             return []
-        if (
+        if not self.config.require_verified_speech and (
             self.is_stop_text(text)
             or self._speech_interrupt(text) is not None
             or _normalize(text) in {"不玩了", "再见"}
@@ -750,6 +755,10 @@ class VoiceBridgeCore:
         every transcript still held for its measurement (see ``on_heard``); when
         that is all it stopped, its final transcript belongs to it as well.
         """
+        # Plain partials have no segment identity or final voiceprint. They cannot
+        # authorize a stop when every voice command requires a verified speaker.
+        if self.config.require_verified_speech:
+            return []
         if self.config.feedback_only or not self._is_stop_partial(text) or self._state.utterance_stopped:
             return []
         if self._may_become_speech_interrupt(text):
@@ -792,7 +801,10 @@ class VoiceBridgeCore:
         (see ``AddresseeGate.needs_wait``).
         """
         normalized = _normalize(self.config.correct(str(text).strip()))
-        if not normalized or self._contains_stop(normalized) or self._state.pending is not None:
+        if not normalized or (
+            not self.config.require_verified_speech
+            and (self._contains_stop(normalized) or self._state.pending is not None)
+        ):
             return False
         return self._gate.needs_wait(normalized, now, segment)
 
@@ -801,19 +813,16 @@ class VoiceBridgeCore:
         return [Log(f"{reason}: cancelled {held.text!r}, held for its measurement") for held in cancelled]
 
     def _is_stop_partial(self, text: str) -> bool:
-        """A partial that is itself a stop keyword, or a prefix on its way to one.
+        """A partial that is itself a complete configured stop keyword.
 
         Partial matching must not be "contains": "停止照镜子" grows through the
         partial "停止", and stopping on that cancels the very request that stops
         the mirror. Keyword matching still applies to the final transcript,
-        after tail padding.
+        after tail padding. Do not match unfinished prefixes either: "好" can
+        precede "好了我结束了" or an ordinary acknowledgement during a pick.
         """
         normalized = _normalize(self.config.correct(str(text).strip()))
-        if not normalized:
-            return False
-        if normalized in self.config.stop_phrases:
-            return True
-        return any(phrase.startswith(normalized) for phrase in self.config.stop_phrases)
+        return bool(normalized) and normalized in self.config.stop_phrases
 
     def _silent(self, request_id: str) -> bool:
         return bool(request_id) and request_id == self._state.silent_request_id
@@ -885,8 +894,24 @@ class VoiceBridgeCore:
         *,
         session_opened: bool,
         cancels_held: bool = False,
+        admitted: bool = False,
     ) -> list[Action]:
         state = self._state
+        heard_raw = raw
+        verdict = None
+        if self.config.require_verified_speech and not admitted:
+            verdict = self._gate.judge(
+                raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
+            )
+            if not verdict.addressed:
+                return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
+            raw, normalized = verdict.raw, verdict.normalized
+            # An exact stop is an explicit control intent. A longer sentence
+            # merely mentioning STOP must also pass the enabled intent gate.
+            if self._contains_stop(normalized) and normalized not in self.config.stop_phrases:
+                semantic_block = self._judge_semantics(heard_raw, normalized, now, session_opened=session_opened)
+                if semantic_block is not None:
+                    return semantic_block
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
         remainder = self._speech_interrupt(raw)
@@ -906,7 +931,13 @@ class VoiceBridgeCore:
                 return [
                     *actions,
                     *self._route_transcript(
-                        remainder, _normalize(remainder), now, heard_at, segment, session_opened=session_opened
+                        remainder,
+                        _normalize(remainder),
+                        now,
+                        heard_at,
+                        segment,
+                        session_opened=session_opened,
+                        admitted=self.config.require_verified_speech,
                     ),
                 ]
             return actions
@@ -920,20 +951,22 @@ class VoiceBridgeCore:
         if (self._contains_stop(normalized) or normalized == "不玩了") and stops_something:
             # With nothing to interrupt, a sentence that merely contains a keyword is a command.
             # Checked before the wake gate on purpose: a stop must never need addressing.
-            return self._stop(now, reason=f"stop keyword in {raw!r}")
+            held = self._cancel_held(f"verified stop keyword in {raw!r}") if self.config.require_verified_speech else []
+            return [*held, *self._stop(now, reason=f"stop keyword in {raw!r}")]
         if self._unsafe_request_id or state.timed_out_request_id or self._ending_session:
             return [Log("previous request has no safe terminal; new intent held back")]
         if state.pending is not None:
             return self._answer_confirmation(normalized, raw, now)
-        verdict = self._gate.judge(
-            raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
-        )
-        if not verdict.addressed:
+        if verdict is None and not admitted:
+            verdict = self._gate.judge(
+                raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
+            )
+        if verdict is not None and not verdict.addressed:
             return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
         # The intent gate judges the sentence as heard: the addressee gate strips the wake
         # phrase, and a woken sentence must keep the gate's wake-prefix exemption.
-        heard_raw = raw
-        raw, normalized = verdict.raw, verdict.normalized
+        if verdict is not None:
+            raw, normalized = verdict.raw, verdict.normalized
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
@@ -1705,6 +1738,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         session_gap_sec=float(values["session_gap_sec"]),
         wake_window_sec=float(values["wake_window_sec"]),
         speaker_check_enabled=bool(values["speaker_check_enabled"]),
+        require_verified_speech=bool(values["require_verified_speech"]),
         speaker_min_similarity=float(values["speaker_min_similarity"]),
         speaker_max_age_sec=float(values["speaker_max_age_sec"]),
         speaker_merge_margin=float(values["speaker_merge_margin"]),

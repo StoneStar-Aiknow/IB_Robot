@@ -282,6 +282,11 @@ voice_asr_node --/voice_command(String)--> agent_voice_bridge --/agent/request(J
   `resume_settle_sec` 内只放行含停止关键词的识别结果（partial 实时中断照常），其余当作回声丢弃。因此桥接在
   这段时间说的话（忙碌提示、超时提示、「继续」播报）都不含停止词，`busy_message` 含停止词会被配置校验拒绝；
   万一某句播报含停止词，该句仍按旧方式暂停 ASR 并打 warning，以免机器人听到自己说“停”而中断请求。
+- **严格语音门控（`require_verified_speech: true`）**：同时启用 `speaker_check_enabled` 和声纹节点。
+  唤醒语句必须有有效声纹，后续语句必须在窗口内且匹配该声纹。STOP、确认和打断播报也经过同一门控；
+  声纹缺失、过短、不可比或超时均拒绝。纯文本 partial 没有段号，不能提前发出 STOP，需等待最终语句及其声纹。
+  `shared_audio` 使用 ASR 本地 VAD 生成的 `/voice_asr/speech_chunk`，转写与声纹使用相同的 source/segment ID。
+  未启用本选项时，下文所述的停止词绕过及声纹 fail-open 行为保持兼容。
 - **寻址门控（`wake_phrases`，默认关闭）**：平台自身的唤醒词只在**首次**武装 VAD，`only_voice` 模式此后
   保持常开，因此房间里的每一句话都会到达桥接，无论是否对机器人说的。配置 `wake_phrases` 后，一句话必须以
   其中之一**开头**才被转发；命中后唤醒词从文本中剥离（ASR 会丢掉逗号，「灵犀灵犀，挥个手」实际到达的是

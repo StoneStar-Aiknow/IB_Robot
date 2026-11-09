@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass
 
@@ -451,6 +452,28 @@ def test_partial_transcript_stops_once_before_the_utterance_ends():
     # A new utterance may stop again, e.g. when the first stop has not taken effect yet.
     retry = core.on_partial("停", now=3.0)
     assert [action.payload for action in _of(retry, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
+
+
+_PARTIAL_STOP_PHRASES = ("停", "停止", "停下", "别动", "stop", "halt", "我结束了", "好了我结束了")
+
+
+@pytest.mark.parametrize("partial", ["好", "好了", "我", "sto", "ha"])
+def test_incomplete_stop_prefix_does_not_cancel_an_active_pick(partial):
+    core = _core(stop_phrases=_PARTIAL_STOP_PHRASES)
+    core.on_transcript("抓取苹果", now=0.0)
+
+    assert not _of(core.on_partial(partial, now=1.0), PublishControl)
+    assert core.active_request_id == "voice-0"
+
+
+@pytest.mark.parametrize("partial", _PARTIAL_STOP_PHRASES)
+def test_complete_stop_keyword_still_cancels_from_a_partial(partial):
+    core = _core(stop_phrases=_PARTIAL_STOP_PHRASES)
+    core.on_transcript("抓取苹果", now=0.0)
+
+    assert [a.payload for a in _of(core.on_partial(partial, now=1.0), PublishControl)] == [
+        {"operation": "stop", "request_id": "voice-0"}
+    ]
 
 
 def test_a_growing_partial_is_not_mistaken_for_a_stop_growing_out_of_a_keyword():
@@ -1057,6 +1080,110 @@ MODEL = "campplus@test"
 ALICE = Voiceprint((1.0, 0.0, 0.0), MODEL)
 BOB = Voiceprint((0.0, 1.0, 0.0), MODEL)
 SPEAKER = {**WAKE, "speaker_check_enabled": True, "speaker_min_similarity": 0.5, "speaker_max_age_sec": 2.5}
+
+
+def _strict_voice_core(**overrides):
+    core = _core(**{**SPEAKER, "require_verified_speech": True, **overrides})
+    core.on_measurement("speaker", ALICE, now=1.0, segment=_seg(1))
+    core.on_heard("灵犀灵犀抓取橙子", now=1.0, segment=_seg(1))
+    return core
+
+
+@pytest.mark.parametrize("text", ["停止", "别说了", "确认", "再见", "挥手"])
+def test_verified_speech_policy_rejects_every_kind_of_bystander_utterance(text):
+    core = _strict_voice_core()
+    core.on_measurement("speaker", BOB, now=2.0, segment=_seg(2))
+    actions = core.on_heard(text, now=2.0, segment=_seg(2))
+    assert not _of(actions, PublishControl)
+    assert not _of(actions, PublishRequest)
+    assert not _of(actions, CancelSpeech)
+    assert any("not addressed" in a.message for a in _of(actions, Log))
+    assert core.active_request_id == "voice-0"
+
+
+def test_verified_stop_waits_for_its_own_voiceprint_and_then_cancels():
+    core = _strict_voice_core()
+    assert not _of(core.on_partial("停止", now=1.5), PublishControl)
+    assert not _of(core.on_heard("停止", now=2.0, segment=_seg(2)), PublishControl)
+    actions = core.on_measurement("speaker", ALICE, now=2.1, segment=_seg(2))
+    assert [a.payload for a in _of(actions, PublishControl)] == [{"operation": "stop", "request_id": "voice-0"}]
+
+
+@pytest.mark.parametrize("voice", [None, Voiceprint((0.0, 0.0, 0.0), MODEL), Voiceprint(ALICE.vector, "other")])
+def test_verified_stop_rejects_missing_short_or_incomparable_voiceprints(voice):
+    core = _strict_voice_core()
+    core.on_measurement("speaker", voice, now=2.0, segment=_seg(2))
+    assert not _of(core.on_heard("停止", now=2.0, segment=_seg(2)), PublishControl)
+
+
+def test_verified_stop_rejects_voiceprint_timeout_and_expired_wake_window():
+    core = _strict_voice_core()
+    core.on_heard("停止", now=2.0, segment=_seg(2))
+    assert not _of(core.release_held(now=3.0), PublishControl)
+    core.on_measurement("speaker", ALICE, now=20.0, segment=_seg(3))
+    assert not _of(core.on_heard("停止", now=20.0, segment=_seg(3)), PublishControl)
+
+
+def test_verified_wake_requires_its_own_valid_voiceprint_before_dispatch():
+    core = _core(**SPEAKER, require_verified_speech=True)
+    assert not _of(core.on_heard("灵犀灵犀挥手", now=1.0, segment=_seg(1)), PublishRequest)
+    actions = core.on_measurement("speaker", ALICE, now=1.1, segment=_seg(1))
+    assert len(_of(actions, PublishRequest)) == 1
+
+
+def test_verified_wake_without_voiceprint_does_not_open_the_window():
+    core = _core(**SPEAKER, require_verified_speech=True)
+    core.on_heard("灵犀灵犀挥手", now=1.0, segment=_seg(1))
+    assert not _of(core.release_held(now=2.0), PublishRequest)
+    core.on_measurement("speaker", ALICE, now=3.0, segment=_seg(2))
+    assert not _of(core.on_heard("挥手", now=3.0, segment=_seg(2)), PublishRequest)
+
+
+def test_verified_confirmation_cannot_be_sent_by_a_different_speaker():
+    core = _strict_voice_core(confirm_mode="voice_confirm")
+    core.on_event(_presentation_event("voice-0"), now=1.1)
+    core.on_measurement("speaker", BOB, now=2.0, segment=_seg(2))
+    assert not _of(core.on_heard("确认执行", now=2.0, segment=_seg(2)), PublishControl)
+    assert core.awaiting_confirmation
+    core.on_measurement("speaker", ALICE, now=3.0, segment=_seg(3))
+    actions = core.on_heard("确认执行", now=3.0, segment=_seg(3))
+    assert [a.payload["operation"] for a in _of(actions, PublishControl)] == ["presentation_rendered"]
+
+
+def test_unverified_stop_cannot_discard_a_wake_request_waiting_for_its_voiceprint():
+    core = _core(**SPEAKER, require_verified_speech=True)
+    core.on_heard("灵犀灵犀抓取橙子", now=1.0, segment=_seg(1))
+    core.on_measurement("speaker", BOB, now=1.1, segment=_seg(2))
+    core.on_heard("停止", now=1.1, segment=_seg(2))
+    actions = core.on_measurement("speaker", ALICE, now=1.2, segment=_seg(1))
+    assert len(_of(actions, PublishRequest)) == 1
+    assert not _of(actions, PublishControl)
+    assert core.active_request_id == "voice-0"
+
+
+def test_stop_mentioned_in_a_remark_is_vetoed_by_the_enabled_intent_gate(tmp_path):
+    model = tmp_path / "intent.json"
+    model.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "feature": {"hash": "fnv1a32", "ngrams": [1], "dim": 128},
+                "bias": -10.0,
+                "weights": [],
+            }
+        )
+    )
+    core = _strict_voice_core(
+        semantic_gate_mode="enforce",
+        semantic_gate_model_path=str(model),
+        semantic_gate_lexicon=("抓取", "停止", "stop"),
+    )
+    core.on_measurement("speaker", ALICE, now=2.0, segment=_seg(2))
+    actions = core.on_heard("那我要不要做那个STOP的那个", now=2.0, segment=_seg(2))
+    assert not _of(actions, PublishControl)
+    assert any("semantic" in a.message for a in _of(actions, Log))
+    core.on_measurement("speaker", ALICE, now=3.0, segment=_seg(3))
+    assert _of(core.on_heard("STOP", now=3.0, segment=_seg(3)), PublishControl)
 
 
 def test_verified_speech_renews_the_window_even_while_the_robot_is_busy():

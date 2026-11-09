@@ -70,6 +70,9 @@ OUTPUT_READY_S = 3.0
 #: The arm command board after the stream took over, and the vendor's own before.
 TAKEOVER_STIFFNESS, TAKEOVER_DAMPING = 40.0, 2.0
 VENDOR_STIFFNESS = np.array([30, 20, 20, 50, 50, 20, 20] * 2, dtype=float)
+# JOINT_DEFAULT uses idle.yaml above; STAND_DEFAULT uses animation_player.yaml.
+# Both are pre-takeover holds. Opening hands and arm motion still require 40/2.
+VENDOR_STAND_STIFFNESS = np.array([100, 100, 50, 50, 30, 30, 30] * 2, dtype=float)
 VENDOR_DAMPING = 1.0
 
 
@@ -182,7 +185,9 @@ def gains_class(board: CommandBoard) -> str:
         return "other"
     if np.allclose(stiffness, TAKEOVER_STIFFNESS) and np.allclose(damping, TAKEOVER_DAMPING):
         return "ready"
-    if np.allclose(stiffness, VENDOR_STIFFNESS) and np.allclose(damping, VENDOR_DAMPING):
+    if np.allclose(damping, VENDOR_DAMPING) and any(
+        np.allclose(stiffness, expected) for expected in (VENDOR_STIFFNESS, VENDOR_STAND_STIFFNESS)
+    ):
         return "vendor_default"
     return "other"
 

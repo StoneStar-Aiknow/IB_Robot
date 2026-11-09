@@ -168,6 +168,13 @@ def _similarity(anchor: Voiceprint, measurement: Voiceprint) -> float | None:
     return cosine_similarity(anchor.vector, measurement.vector)
 
 
+def _usable_voiceprint(value: Any) -> bool:
+    if not isinstance(value, Voiceprint) or not value.model_id:
+        return False
+    similarity = _similarity(value, value)
+    return similarity is not None and math.isfinite(similarity)
+
+
 def _unit_vector(vector: Any) -> tuple[float, ...]:
     values = [float(item) for item in vector]
     norm = math.sqrt(sum(item * item for item in values))
@@ -231,6 +238,7 @@ class AddresseeGate:
         wake_window_sec: float,
         session_gap_sec: float,
         checks: Iterable[AnchorCheck] = (),
+        require_measurements: bool = False,
     ) -> None:
         if trigger not in ADDRESSEE_TRIGGERS:
             raise ValueError(f"addressee_trigger must be one of {ADDRESSEE_TRIGGERS}")
@@ -239,6 +247,7 @@ class AddresseeGate:
         self.wake_window_sec = float(wake_window_sec)
         self.session_gap_sec = float(session_gap_sec)
         self.checks: tuple[AnchorCheck, ...] = tuple(checks)
+        self.require_measurements = require_measurements
         self._max_age = {check.name: float(check.max_age_sec) for check in self.checks}
         #: ``wake_phrase``: monotonic deadline until which a follow-up needs no wake phrase.
         self.wake_until = 0.0
@@ -331,6 +340,10 @@ class AddresseeGate:
         """
         if segment is None:
             return False
+        if self.require_measurements and any(
+            segment not in self.measurements.get(check.name, {}) for check in self.checks
+        ):
+            return True
         if self.trigger == "vendor_session":
             if self._wakes(segment, heard_at):
                 return False
@@ -369,6 +382,11 @@ class AddresseeGate:
             self.transcribed[segment[0]] = max(segment[1], self.transcribed.get(segment[0], -1))
         if segment is not None and self._wakes(segment, heard_at):
             self.pending_wake = None
+            if self.require_measurements:
+                measurement = self.measurements.get("speaker", {}).get(segment)
+                if measurement is None or not _usable_voiceprint(measurement.value):
+                    self.session_open = False
+                    return False
             self.session_open = True
             self.last_utterance_at = heard_at
             self._capture_anchors(now, segment)
@@ -465,12 +483,19 @@ class AddresseeGate:
             anchor = self.anchors.get(check.name)
             measurement = self._take(check, segment)
             if anchor is None or measurement is None:
+                if self.require_measurements:
+                    rejections.append(f"{check.name}: missing anchor or measurement")
                 continue
             if measurement.value is None:
                 # The producer saw this utterance and had nothing to compare.
-                if getattr(check, "reject_short", False):
+                if self.require_measurements or getattr(check, "reject_short", False):
                     rejections.append(f"{check.name}: too short to compare")
                 continue
+            if self.require_measurements and isinstance(check, SpeakerCheck):
+                similarity = _similarity(anchor, measurement.value)
+                if similarity is None or not math.isfinite(similarity):
+                    rejections.append(f"{check.name}: not comparable")
+                    continue
             agrees, detail = check.verdict(anchor, measurement.value)
             if not agrees:
                 rejections.append(f"{check.name}: {detail}")
@@ -499,6 +524,8 @@ class AddresseeGate:
         session is the window, and only a wake event opens one.
         """
         if session_opened:
+            if self.require_measurements and not _usable_voiceprint(self.anchors.get("speaker")):
+                return GateVerdict(False, raw, normalized, reason="speaker: missing wake voiceprint")
             return GateVerdict(True, raw, normalized)
         if not self.session_open:
             return GateVerdict(False, raw, normalized, reason="no wake event opened a session")
@@ -527,6 +554,11 @@ class AddresseeGate:
         for phrase in self.wake_phrases:
             if not normalized.startswith(phrase):
                 continue
+            if self.require_measurements:
+                measurement = self.measurements.get("speaker", {}).get(segment)
+                value = measurement.value if measurement is not None else None
+                if not _usable_voiceprint(value):
+                    return GateVerdict(False, raw, normalized, reason="speaker: missing wake voiceprint")
             # The ASR drops the comma, so the wake phrase arrives glued to the
             # command ("灵犀灵犀挥个手"); the planner must not see it.
             cut = next((at for at in range(1, len(raw) + 1) if normalize_trigger_text(raw[:at]) == phrase), 0)

@@ -27,7 +27,11 @@ from robot_config.loader import (
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
-from robot_config.voice_contract import SPEAKER_EMBEDDING_OUTPUT_TOPIC, VOICE_TRANSCRIPT_TOPIC
+from robot_config.voice_contract import (
+    SHARED_SPEECH_CHUNK_TOPIC,
+    SPEAKER_EMBEDDING_OUTPUT_TOPIC,
+    VOICE_TRANSCRIPT_TOPIC,
+)
 from robot_runtime import contract as RUNTIME
 from skill_catalog.source import resolve_development_source_root
 
@@ -1034,6 +1038,8 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     chunk_topic = str(audio_input.get("topic", ""))
     if voice_asr.get("input_mode") == "external_vad" and chunk_topic:
         params["speech_chunk_topic"] = chunk_topic
+    elif pairs_by_segment:
+        params["speech_chunk_topic"] = SHARED_SPEECH_CHUNK_TOPIC
     if pairs_by_segment or params.get("speech_chunk_topic"):
         # The gate pairs each transcript with its segment's voiceprint and wake
         # event, so the bridge reads the segment-tagged copy the ASR publishes;
@@ -1060,6 +1066,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "mute_asr_during_tts",
         "tts_keep_english",
         "speaker_check_enabled",
+        "require_verified_speech",
         "speaker_reject_short",
         "semantic_gate_fail_open",
     ):
