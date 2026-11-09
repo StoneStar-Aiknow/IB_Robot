@@ -23,6 +23,50 @@ from .hand_restore import GATEWAY_STATUS_MAX_AGE_S, CommandBoard, GatewayState, 
 GATEWAY_REQUEST_PERIOD_S = 0.2
 
 
+def create_hand_restorer(node, config, *, callback_group=None):
+    """Shared deployment binding for grasp-ready and gesture hand preparation."""
+    from .backend import grasp_installed_hands
+    from .hand_restore import HandRestorer, build_hand_plans
+
+    plans, missing = build_hand_plans(config["grasp_execution"])
+    installed = grasp_installed_hands(config["grasp_execution"])
+    ports = RuntimeRestorePorts(
+        node,
+        config["interface_description"],
+        gateway_service=config["gateway_status_service"],
+        callback_group=callback_group,
+        installed_hands=installed,
+    )
+    return HandRestorer(ports, plans, missing, installed_hands=installed)
+
+
+class NamedMotionHandPreparer:
+    def __init__(self, restorer):
+        self.restorer = restorer
+
+    def prepare(self, task_id, deadline, cancelled, progress):
+        from .hand_restore import RestoreContext
+
+        return self.restorer.prepare_open_hands(RestoreContext(task_id, deadline, cancelled, progress))
+
+    def close(self):
+        self.restorer.ports.close()
+
+
+def create_named_motion_hand_preparer(node, config, *, callback_group=None):
+    restorer = create_hand_restorer(node, config, callback_group=callback_group)
+    try:
+        restorer.require_capabilities(restorer.installed)
+    except Exception:
+        restorer.ports.close()
+        raise
+    node.get_logger().info(
+        f"named-motion hand preparation ready: installed={list(restorer.installed)}; "
+        f"modeled={sorted(restorer.plans)}; motions={config['motions']}"
+    )
+    return NamedMotionHandPreparer(restorer)
+
+
 class RuntimeRestorePorts:
     """Call :meth:`close` before ``node`` is destroyed."""
 

@@ -317,3 +317,112 @@ def test_external_callbacks_do_not_hold_scheduler_lock():
         h.wait(lambda: "nested" in h.completed)
     finally:
         h.close()
+
+
+def test_cancel_discards_play_ready_inflight_and_pending_then_accepts_next(harness):
+    h = harness
+    h.play_blocks["playing"] = threading.Event()
+    h.synth_blocks["inflight"] = threading.Event()
+    h.submit("playing")
+    h.wait(lambda: "playing" in h.played)
+    h.submit("ready", then=("must not run",))
+    h.submit("inflight")
+    h.wait(lambda: "inflight" in h.synthesized)
+    h.submit("pending", terminal=True)
+    h.pipeline.cancel(stop=lambda: h.play_blocks["playing"].set())
+    h.submit("next", then=("run",))
+    h.synth_blocks["inflight"].set()
+    h.wait(lambda: h.completed == ["next"])
+    assert h.played == ["playing", "next"]
+    assert "pending" not in h.synthesized
+    assert all(worker.is_alive() for worker in h.pipeline._workers)
+
+
+def test_cancel_does_not_stop_a_new_reply_submitted_during_stop(harness):
+    h = harness
+    stop_entered = threading.Event()
+    stop_release = threading.Event()
+    errors = []
+
+    def stop():
+        stop_entered.set()
+        assert stop_release.wait(3)
+
+    def cancel():
+        try:
+            h.pipeline.cancel(stop=stop)
+        except Exception as error:
+            errors.append(error)
+
+    canceler = threading.Thread(target=cancel)
+    canceler.start()
+    try:
+        assert stop_entered.wait(3)
+        h.submit("next")
+        h.wait(lambda: "next" in h.synthesized)
+        assert h.played == []
+    finally:
+        stop_release.set()
+        canceler.join(3)
+    assert not errors
+    assert not canceler.is_alive()
+    h.wait(lambda: h.completed == ["next"])
+
+
+def test_cancel_retries_stop_if_claimed_play_request_arrives_late(harness):
+    h = harness
+    claimed = threading.Event()
+    send = threading.Event()
+    sent = threading.Event()
+    stopped = threading.Event()
+    canceled = threading.Event()
+    stop_calls = []
+
+    def play(action, audio):
+        claimed.set()
+        assert send.wait(3)
+        sent.set()
+        assert stopped.wait(3)
+        return True
+
+    def stop():
+        stop_calls.append(True)
+        if sent.is_set():
+            stopped.set()
+        send.set()
+
+    h.pipeline._play = play
+    h.submit("old", then=("must not run",))
+    assert claimed.wait(3)
+    canceler = threading.Thread(target=lambda: (h.pipeline.cancel(stop=stop), canceled.set()))
+    canceler.start()
+    canceler.join(3)
+    assert canceled.is_set()
+    assert len(stop_calls) >= 2
+    assert h.completed == []
+    h.pipeline._play = h.play
+    h.submit("next")
+    h.wait(lambda: h.completed == ["next"])
+
+
+def test_cancel_timeout_preserves_workers_and_subsequent_reply(harness):
+    h = harness
+    h.play_blocks["old"] = threading.Event()
+    h.submit("old")
+    h.wait(lambda: "old" in h.played)
+    with pytest.raises(TimeoutError, match="speech-playback"):
+        h.pipeline.cancel(timeout=0)
+    h.submit("next")
+    h.play_blocks["old"].set()
+    h.wait(lambda: h.completed == ["next"])
+    assert h.played == ["old", "next"]
+
+
+def test_cancel_stop_failure_is_visible_and_next_reply_is_retained(harness):
+    def stop():
+        harness.submit("next")
+        raise RuntimeError("stop failed")
+
+    with pytest.raises(RuntimeError, match="stop failed"):
+        harness.pipeline.cancel(stop=stop)
+    harness.wait(lambda: harness.completed == ["next"])

@@ -31,7 +31,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
 from std_msgs.msg import String
-from std_srvs.srv import SetBool
+from std_srvs.srv import SetBool, Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
@@ -51,6 +51,7 @@ from embodied_common.execution_detail import (
     ExecutionDetail,
     fill_execution_context,
     fill_execution_detail,
+    place_result_execution_detail,
     short_message,
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
@@ -593,6 +594,19 @@ def _play_audio_failure(future, skill_name: str) -> tuple[str, str] | None:
     return None
 
 
+#: The player's answer when its global stop ended the clip. Without a cancel of this
+#: skill that stop came from the listener ("别说了"): the speech is over, not failed.
+PLAY_AUDIO_STOPPED = "PLAYBACK_CANCELED"
+
+
+def _play_audio_outcome(future, skill_name: str, goal_handle) -> tuple[tuple[str, str] | None, bool]:
+    """``(failure, cut_short)`` for a finished playback call; a listener's stop is not a failure."""
+    failure = _play_audio_failure(future, skill_name)
+    if failure is not None and failure[0] == PLAY_AUDIO_STOPPED and not goal_handle.is_cancel_requested:
+        return None, True
+    return failure, False
+
+
 class _CompositeBranchGoal:
     """A skill goal handle for one branch of a composite skill.
 
@@ -614,7 +628,8 @@ class _CompositeBranchGoal:
 
     @property
     def is_cancel_requested(self) -> bool:
-        return bool(self._goal_handle.is_cancel_requested) or bool(self._stop_requested())
+        stop_requested = bool(self._stop_requested())
+        return bool(self._goal_handle.is_cancel_requested) or stop_requested
 
     def publish_feedback(self, feedback) -> None:
         self._goal_handle.publish_feedback(feedback)
@@ -677,11 +692,13 @@ class SkillExecutorNode(Node):
         self.declare_parameter("runtime_play_audio_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("runtime_play_audio_service", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_play_audio_clips_json", "{}", descriptor=startup_descriptor)
-        # While a clip plays the ASR is muted through this topic (stop/start).
+        self.declare_parameter("runtime_play_audio_stop_service", "/voice_tts/stop", descriptor=startup_descriptor)
+        # Kept for existing deployments; interruptible clips must leave ASR listening.
         self.declare_parameter("asr_control_topic", "", descriptor=startup_descriptor)
         # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
         self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
         self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("named_motion_hand_preparation_json", "{}", descriptor=startup_descriptor)
         # Arm poses composed from a description (ibrobot_msgs/action/ExecuteArmPose).
         self.declare_parameter("pose_composer_action", "", descriptor=startup_descriptor)
         self.declare_parameter("pose_composer_enabled", False, descriptor=startup_descriptor)
@@ -813,6 +830,13 @@ class SkillExecutorNode(Node):
         )
         if self._play_audio_enabled and not self._play_audio_service:
             raise ValueError("runtime_play_audio_service must be set when runtime_play_audio_enabled is true")
+        self._play_audio_stop_service = (
+            self.get_parameter("runtime_play_audio_stop_service").get_parameter_value().string_value.strip()
+        )
+        if self._play_audio_enabled and not self._play_audio_stop_service:
+            raise ValueError("runtime_play_audio_stop_service must be set when runtime_play_audio_enabled is true")
+        self._play_audio_lock = threading.Lock()
+        self._play_audio_pending_cleanup = None
         self._play_audio_clips = load_json_mapping(self.get_parameter("runtime_play_audio_clips_json").value)
         if self._play_audio_enabled:
             for clip_name, clip_path in self._play_audio_clips.items():
@@ -824,6 +848,9 @@ class SkillExecutorNode(Node):
         self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
         self._runtime_named_motion_action = (
             self.get_parameter("runtime_named_motion_action").get_parameter_value().string_value.strip()
+        )
+        self._named_motion_hand_preparation_config = json.loads(
+            self.get_parameter("named_motion_hand_preparation_json").value
         )
         if self._runtime_named_motion_enabled and not self._runtime_named_motion_action:
             raise ValueError("runtime_named_motion_action must be set when runtime_named_motion_enabled is true")
@@ -1134,6 +1161,19 @@ class SkillExecutorNode(Node):
             if self._runtime_named_motion_enabled
             else None
         )
+        self._named_motion_hand_preparer = None
+        self._hand_preparation_motions = ()
+        preparation = self._named_motion_hand_preparation_config
+        if preparation:
+            from importlib import import_module
+
+            if not self._runtime_named_motion_enabled:
+                raise ValueError("hand preparation requires runtime_named_motion")
+            module, factory = preparation["factory"].split(":")
+            self._hand_preparation_motions = tuple(preparation["motions"])
+            self._named_motion_hand_preparer = getattr(import_module(module), factory)(
+                self, preparation, callback_group=callback_group
+            )
         self._pose_composer_client = (
             ActionClient(self, ExecuteArmPose, self._pose_composer_action, callback_group=callback_group)
             if self._pose_composer_enabled
@@ -1163,6 +1203,11 @@ class SkillExecutorNode(Node):
         )
         self._play_audio_client = (
             self.create_client(PlayAudioFile, self._play_audio_service, callback_group=callback_group)
+            if self._play_audio_enabled
+            else None
+        )
+        self._play_audio_stop_client = (
+            self.create_client(Trigger, self._play_audio_stop_service, callback_group=callback_group)
             if self._play_audio_enabled
             else None
         )
@@ -1309,6 +1354,10 @@ class SkillExecutorNode(Node):
         )
 
     def destroy_node(self):
+        preparer = getattr(self, "_named_motion_hand_preparer", None)
+        if preparer is not None:
+            preparer.close()
+            self._named_motion_hand_preparer = None
         store = getattr(self, "_execution_store", None)
         if store is not None:
             store.close()
@@ -2192,7 +2241,14 @@ class SkillExecutorNode(Node):
                         endpoint_name=endpoint_name,
                         endpoint_kind="ros_action",
                         # The serving runtime is part of the identity the catalog binds.
-                        configuration={"runtime_name": getattr(self, "_runtime_name", "")},
+                        configuration={
+                            "runtime_name": getattr(self, "_runtime_name", ""),
+                            **(
+                                {"hand_preparation": self._named_motion_hand_preparation_config}
+                                if getattr(self, "_named_motion_hand_preparation_config", {})
+                                else {}
+                            ),
+                        },
                     )
                 )
                 descriptors[descriptor.name] = descriptor
@@ -2339,6 +2395,40 @@ class SkillExecutorNode(Node):
         goal = goal_handle.request
         result = SkillCommand.Result()
         executed = [f"{named_motion.EXECUTOR_NAME}:{motion}"]
+        deadline = time.monotonic() + timeout_sec
+        preparer = getattr(self, "_named_motion_hand_preparer", None)
+        if preparer is not None and motion in self._hand_preparation_motions:
+            lease = getattr(self, "_gateway_lease", None)
+            owner = lease.owner if lease is not None else None
+            task_id = owner.root_task_id if owner is not None else str(goal.dispatch_binding.root_task_id)
+
+            def preparation_feedback(state, fraction):
+                feedback = SkillCommand.Feedback()
+                feedback.state = "preparing"
+                feedback.detail = f"hand_preparation:{state}:{fraction:.2f}"
+                goal_handle.publish_feedback(feedback)
+
+            try:
+                sides = preparer.prepare(
+                    task_id, deadline, lambda: goal_handle.is_cancel_requested, preparation_feedback
+                )
+                executed[:0] = [f"hand_preparation:open_{side}" for side in sides]
+                if goal_handle.is_cancel_requested or time.monotonic() >= deadline:
+                    raise RuntimeError("gesture canceled or timed out after hand preparation")
+            except Exception as exc:
+                if goal_handle.is_cancel_requested or getattr(exc, "code", "") == "POSE_CANCELLED":
+                    self._set_result_catalog_identity(result)
+                    goal_handle.canceled()
+                    result.success = False
+                    result.message = f"hand preparation canceled; arm gesture not sent: {exc}"
+                    return result
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    getattr(exc, "code", named_motion.FAILED),
+                    f"hand preparation failed; arm gesture not sent: {exc}",
+                )
         motion_goal = ExecuteNamedMotion.Goal()
         motion_goal.name = motion
         # The runtime applies the side its profile declares for this name.
@@ -2387,7 +2477,6 @@ class SkillExecutorNode(Node):
                     f"runtime refused named motion {motion} (another motion is playing or the name is unknown)",
                 )
             result_future = motion_handle.get_result_async()
-            deadline = time.monotonic() + timeout_sec
             while rclpy.ok() and not result_future.done():
                 if goal_handle.is_cancel_requested and cancel_future is None:
                     cancel_future = motion_handle.cancel_goal_async()
@@ -2765,7 +2854,9 @@ class SkillExecutorNode(Node):
         """Start or stop the persistent mirror session.
 
         The session answers start once it holds the runtime mode, and stop once
-        it has observed the runtime back in idle. ``left_idle`` says admission
+        it has observed the runtime back in idle. Stop also waits for fresh
+        released ownership in the Gateway, using the same budget as discovery
+        and the service reply. ``left_idle`` says admission
         switched the runtime out of idle for this start: if the start then
         fails, that mode is the Gateway's to give back. So is the mode when no
         session is there to answer, for start and stop alike.
@@ -2786,6 +2877,8 @@ class SkillExecutorNode(Node):
         start = command == "start"
         client = getattr(self, "_mirror_session_client", None)
         timeout_sec = float(effective_timeout_sec or request.timeout_sec or self._rpc_timeout)
+        deadline = time.monotonic() + timeout_sec
+        stop_stamp = self.get_clock().now().nanoseconds / 1e9 if not start else 0.0
         if client is None or not client.wait_for_service(timeout_sec=min(timeout_sec, self._rpc_timeout)):
             return self._fail_mirror_session(
                 result,
@@ -2795,14 +2888,38 @@ class SkillExecutorNode(Node):
                 give_back=True,
             )
 
-        if start and getattr(self, "_mirror_session_enabled", False):
-            # Latch before dispatch: the service reply can beat the state-topic
-            # callback, and a timeout does not prove that takeover never happened.
+        if getattr(goal_handle, "is_cancel_requested", False):
+            # Admission may already have moved idle -> policy_stream. No session
+            # request has been sent, so return only the mode this start acquired
+            # and preserve any pre-existing ownership latch.
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "SKILL_CANCELLED",
+                "canceled before mirror dispatch",
+                give_back=start and left_idle,
+                canceled=True,
+            )
+        if time.monotonic() >= deadline:
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "MIRROR_SESSION_TIMEOUT",
+                f"{skill_name} timed out",
+                give_back=start and left_idle,
+            )
+        if getattr(self, "_mirror_session_enabled", False):
+            # Latch only when dispatch is about to happen. A canceled or expired
+            # undispatched start must not create new takeover uncertainty.
             with self._mirror_session_state_lock:
                 self._mirror_session_start_latched = True
                 self._mirror_session_seen_holding = False
         future = client.call_async(SetBool.Request(data=MIRROR_SESSION_COMMANDS[command]))
-        if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
+        if not self._wait_for_future(
+            future,
+            max(0.0, deadline - time.monotonic()),
+            cancel_requested=lambda: goal_handle.is_cancel_requested,
+        ):
             return self._fail_mirror_session(
                 result,
                 goal_handle,
@@ -2830,10 +2947,64 @@ class SkillExecutorNode(Node):
                 message or f"{skill_name} failed",
                 give_back=start and left_idle,
             )
-        if not start and getattr(self, "_mirror_session_enabled", False) and self._runtime_idle_for_admission():
+        if not start and getattr(self, "_mirror_session_enabled", False):
+            # Service completion and state-topic callbacks can arrive in either order.
+            # Only this stop waits; ordinary skills keep rejecting immediately.
+            while True:
+                if getattr(goal_handle, "is_cancel_requested", False):
+                    return self._cancel_skill(result, goal_handle, [], skill_name)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    fill_execution_detail(
+                        result.execution_detail,
+                        ExecutionDetail(
+                            1,
+                            "release",
+                            "FAILED",
+                            "release",
+                            "MIRROR_SESSION_RELEASE_UNCONFIRMED",
+                            "NOT_NEEDED",
+                            0,
+                            "MANUAL_CHECK",
+                        ),
+                    )
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        [],
+                        "MIRROR_SESSION_TIMEOUT",
+                        "mirror stop release was not confirmed; subsequent steps were not executed",
+                    )
+                if self._mirror_release_confirmed(not_before=stop_stamp):
+                    break
+                time.sleep(min(remaining, 0.02))
             with self._mirror_session_state_lock:
                 self._mirror_session_start_latched = False
+        if getattr(goal_handle, "is_cancel_requested", False):
+            return self._fail_mirror_session(
+                result,
+                goal_handle,
+                "SKILL_CANCELLED",
+                "canceled after mirror response",
+                give_back=start and left_idle,
+                canceled=True,
+            )
         return self._succeed_mirror_session(result, goal_handle, skill_name, response.message)
+
+    def _mirror_release_confirmed(self, *, not_before: float = 0.0) -> bool:
+        """Require the same fresh ownership evidence the following skill will use."""
+        with self._mirror_session_state_lock:
+            state = self._mirror_session_state
+            now = self.get_clock().now().nanoseconds / 1e9
+            released = (
+                state is not None
+                and not_before <= float(state["stamp"]) <= now
+                and now - float(state["stamp"]) <= MIRROR_SESSION.STATE_STALE_SEC
+                and state["state"] == MIRROR_SESSION.STATE_WAIT
+                and not state["holding"]
+                and not state["releasing"]
+            )
+        return released and self._runtime_idle_for_admission()
 
     def _on_mirror_session_state(self, message: String) -> None:
         try:
@@ -2855,23 +3026,39 @@ class SkillExecutorNode(Node):
                 self._mirror_session_seen_holding = True
 
     def _mirror_session_allows_skill(self, skill_name: str) -> tuple[bool, str]:
-        """Mode equality alone cannot arbitrate a session that outlives its start action."""
+        allowed, message, _reason = SkillExecutorNode._mirror_session_admission(self, skill_name)
+        return allowed, message
+
+    def _mirror_session_admission(self, skill_name: str) -> tuple[bool, str, str]:
+        """Keep ownership reasons structured without changing shared mode admission."""
         if not getattr(self, "_mirror_session_enabled", False):
-            return True, ""
+            return True, "", ""
         if self._active_mirror_session_command(skill_name):
-            return True, ""
+            return True, "", ""
         with self._mirror_session_state_lock:
             state = self._mirror_session_state
             now = self.get_clock().now().nanoseconds / 1e9
             if state is None or not 0 <= now - float(state["stamp"]) <= MIRROR_SESSION.STATE_STALE_SEC:
-                return False, "mirror session state is unknown or stale; stop mirror before other skills"
+                return (
+                    False,
+                    "mirror session state is unknown or stale; stop mirror before other skills",
+                    "MIRROR_SESSION_STATE_UNKNOWN",
+                )
             if state["state"] != MIRROR_SESSION.STATE_WAIT or state["holding"] or state["releasing"]:
-                return False, "mirror session owns the arms; execute mirror_stop before other skills"
+                return (
+                    False,
+                    "mirror session owns the arms; execute mirror_stop before other skills",
+                    "MIRROR_SESSION_BUSY",
+                )
             if self._mirror_session_start_latched:
                 if not self._mirror_session_seen_holding or not self._runtime_idle_for_admission():
-                    return False, "mirror takeover or release is unconfirmed; execute mirror_stop first"
+                    return (
+                        False,
+                        "mirror takeover or release is unconfirmed; execute mirror_stop first",
+                        "MIRROR_SESSION_RELEASE_UNCONFIRMED",
+                    )
                 self._mirror_session_start_latched = False
-        return True, ""
+        return True, "", ""
 
     def _publish_asr_control(self, command: str) -> None:
         """Mute (stop) or restore (start) the ASR while a recorded clip plays."""
@@ -2883,7 +3070,7 @@ class SkillExecutorNode(Node):
         publisher.publish(message)
 
     def _execute_play_audio_skill(self, goal_handle, template, *, effective_timeout_sec: float | None = None):
-        """Play the clip the catalog binds for this skill, muting the ASR while it runs.
+        """Play the catalog-bound clip while leaving ASR available for interruption.
 
         A binding that also names a runtime motion plays the clip and runs the
         motion together (the self-introduction waves while it speaks). Every
@@ -2940,8 +3127,23 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(result, goal_handle, [], error_code, reason)
         executed = [f"runtime_play_audio:{clip}"]
         deadline = time.monotonic() + timeout_sec
-        self._publish_asr_control("stop")
+        # Trigger is a global stop: a previous stop must finish before another
+        # clip is sent, including when cleanup outlives the action's deadline.
+        if not self._play_audio_lock.acquire(blocking=False):
+            return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_BUSY", "another clip owns playback")
         try:
+            pending = self._play_audio_pending_cleanup
+            if pending is not None and not pending():
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "previous playback or stop is still unconfirmed",
+                )
+            self._play_audio_pending_cleanup = None
+            if goal_handle.is_cancel_requested:
+                return self._cancel_skill(result, goal_handle, [], skill_name)
             try:
                 future = client.call_async(PlayAudioFile.Request(file_path=path))
             except Exception as exc:
@@ -2949,50 +3151,174 @@ class SkillExecutorNode(Node):
                 return self._abort_skill(
                     result, goal_handle, [], "PLAY_AUDIO_FAILED", f"{skill_name} playback request failed: {exc}"
                 )
-            if motion_client is not None:
-                return self._finish_play_audio_with_motion(
-                    goal_handle, future, motion_client, motion, deadline, executed
-                )
-            if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
-                if goal_handle.is_cancel_requested:
-                    return self._cancel_skill(result, goal_handle, [], skill_name)
-                return self._abort_skill(result, goal_handle, [], "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out")
-            failure = _play_audio_failure(future, skill_name)
-            if failure is not None:
-                return self._abort_skill(result, goal_handle, [], *failure)
-        finally:
-            self._publish_asr_control("start")
-        return self._succeed_play_audio(result, goal_handle, executed, f"{skill_name}: played {clip}")
+            admission = self._active_skill_admission
+            nonce = uuid.uuid4().hex
+            key = self._register_delegated_dispatch(nonce, admission, goal_handle.request.dispatch_binding)
+            cleanup = _LateCleanupConfirmation()
+            cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, key))
+            stop_future = None
+            next_stop_at = 0.0
+            stop_error = ""
 
-    def _finish_play_audio_with_motion(self, goal_handle, future, client, motion: str, deadline: float, executed):
+            def cleaned_up(_done=None):
+                # A finished service response is evidence that that invocation
+                # has left its callback; never cancel the local future instead.
+                for pending_future in (future, stop_future):
+                    if pending_future is None:
+                        continue
+                    if not pending_future.done():
+                        return False
+                    try:
+                        if pending_future.result() is None:
+                            return False
+                    except Exception:
+                        return False
+                cleanup.confirm()
+                return True
+
+            def request_stop():
+                nonlocal stop_future, next_stop_at, stop_error
+                if future.done() or time.monotonic() < next_stop_at:
+                    return
+                if stop_future is not None and not stop_future.done():
+                    return
+                # Different service callback groups may accept stop before play.
+                # Retry serially while our old play is pending; no new playback
+                # can enter through this executor until both responses drain.
+                next_stop_at = time.monotonic() + 0.025
+                stop_client = self._play_audio_stop_client
+                try:
+                    if stop_client is None or not stop_client.wait_for_service(timeout_sec=self._rpc_timeout):
+                        stop_error = "audio stop service unavailable"
+                        return
+                    stop_future = stop_client.call_async(Trigger.Request())
+                    stop_error = ""
+                except Exception as exc:
+                    stop_error = f"audio stop request failed: {exc}"
+
+            self._play_audio_pending_cleanup = cleaned_up
+            branch = _CompositeBranchGoal(goal_handle, stop_requested=lambda: False)
+            if motion_client is not None:
+                result = self._finish_play_audio_with_motion(
+                    branch, future, motion_client, motion, deadline, executed, request_stop=request_stop
+                )
+            elif not self._wait_for_future(
+                future,
+                max(0.0, deadline - time.monotonic()),
+                cancel_requested=lambda: goal_handle.is_cancel_requested,
+                cancel_callback=request_stop,
+            ):
+                if goal_handle.is_cancel_requested:
+                    result = self._cancel_skill(result, branch, executed, skill_name)
+                else:
+                    result = self._abort_skill(
+                        result, branch, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out"
+                    )
+            elif goal_handle.is_cancel_requested:
+                result = self._cancel_skill(result, branch, executed, skill_name)
+            else:
+                failure, cut_short = _play_audio_outcome(future, skill_name, goal_handle)
+                played = f"{skill_name}: {'stopped by the listener during' if cut_short else 'played'} {clip}"
+                result = (
+                    self._abort_skill(result, branch, executed, *failure)
+                    if failure is not None
+                    else self._succeed_play_audio(result, branch, executed, played)
+                )
+            if not result.success:
+                request_stop()
+            cleanup_deadline = time.monotonic() + self._rpc_timeout
+            while rclpy.ok() and not cleaned_up() and time.monotonic() < cleanup_deadline:
+                if not result.success:
+                    request_stop()
+                time.sleep(_WAIT_POLL_SEC)
+            if not cleaned_up():
+                future.add_done_callback(cleaned_up)
+                if stop_future is not None:
+                    stop_future.add_done_callback(cleaned_up)
+                result = self._abort_skill(
+                    SkillCommand.Result(),
+                    goal_handle,
+                    result.executed_primitives,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    f"{skill_name}: playback/stop response unconfirmed; {stop_error or result.message}",
+                )
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "UNKNOWN", "cancel", result.error_code, "UNKNOWN", 0, "MANUAL_CHECK"),
+                )
+                return result
+            if result.error_code == PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "UNKNOWN", "cancel", result.error_code, "UNKNOWN", 0, "MANUAL_CHECK"),
+                )
+            if stop_future is not None and not stop_future.result().success:
+                stop_error = str(stop_future.result().message) or "audio stop was refused"
+            if stop_error and branch.terminal == "canceled":
+                result = self._abort_skill(
+                    SkillCommand.Result(),
+                    goal_handle,
+                    result.executed_primitives,
+                    "PLAY_AUDIO_STOP_FAILED",
+                    f"{skill_name}: {stop_error}; playback has ended",
+                )
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "FAILED", "cancel", result.error_code, "FAILED", 0, "MANUAL_CHECK"),
+                )
+                return result
+            if branch.terminal == "canceled":
+                fill_execution_detail(
+                    result.execution_detail,
+                    ExecutionDetail(1, "cancel", "CANCELED", "", "SKILL_CANCELLED", "NOT_NEEDED", 0, "NONE"),
+                )
+                result.message = short_message(
+                    f"{result.message}; audio publication ended; buffered hardware audio may still play"
+                )
+                goal_handle.canceled()
+            elif branch.terminal == "succeeded":
+                goal_handle.succeed()
+            else:
+                goal_handle.abort()
+            return result
+        finally:
+            self._play_audio_lock.release()
+
+    def _finish_play_audio_with_motion(
+        self, goal_handle, future, client, motion: str, deadline: float, executed, *, request_stop
+    ):
         """Run the bound motion while the clip plays, then end the skill once for both.
 
         The motion runs through the named-motion executor against a proxy that
         keeps its terminal call, so only this method ends ``goal_handle``. A
         playback failure while the motion runs cancels the motion and waits for
         its terminal state; a motion whose state is unknown is reported as
-        such. The playback service has no cancel: a skill cancel or timeout
-        stops waiting for it, and the clip may keep playing.
+        such. Stop audio promptly when cancellation is observed, even while the
+        motion is still waiting for its terminal response. The caller drains
+        both audio service responses before returning ownership.
         """
         result = SkillCommand.Result()
         skill_name = str(goal_handle.request.skill_name)
 
         def playback_failed() -> bool:
-            return future.done() and _play_audio_failure(future, skill_name) is not None
+            if goal_handle.is_cancel_requested:
+                request_stop()
+            # A listener's stop ends only the speech; the gesture finishes on its own.
+            return future.done() and _play_audio_outcome(future, skill_name, goal_handle)[0] is not None
 
         branch = _CompositeBranchGoal(goal_handle, stop_requested=playback_failed)
         motion_result = self._run_runtime_named_motion(branch, client, motion, max(0.0, deadline - time.monotonic()))
         executed = [*executed, *motion_result.executed_primitives]
-        audio_failure = _play_audio_failure(future, skill_name) if future.done() else None
+        audio_failure = _play_audio_outcome(future, skill_name, goal_handle)[0] if future.done() else None
         if branch.terminal not in {"succeeded", "canceled"}:
             message = motion_result.message
             if audio_failure is not None:
                 message = f"{message}; playback also failed: {audio_failure[1]}"
             return self._abort_skill(result, goal_handle, executed, motion_result.error_code, message)
+        if goal_handle.is_cancel_requested:
+            return self._cancel_skill(result, goal_handle, executed, skill_name)
         if audio_failure is not None:
             return self._abort_skill(result, goal_handle, executed, *audio_failure)
-        if goal_handle.is_cancel_requested:
-            return self._cancel_play_audio(result, goal_handle, executed, skill_name)
         if branch.terminal != "succeeded":
             return self._abort_skill(
                 result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} ended without a result"
@@ -3001,25 +3327,21 @@ class SkillExecutorNode(Node):
             future,
             max(0.0, deadline - time.monotonic()),
             cancel_requested=lambda: goal_handle.is_cancel_requested,
+            cancel_callback=request_stop,
         ):
             if goal_handle.is_cancel_requested:
-                return self._cancel_play_audio(result, goal_handle, executed, skill_name)
+                return self._cancel_skill(result, goal_handle, executed, skill_name)
             return self._abort_skill(
                 result, goal_handle, executed, "PLAY_AUDIO_TIMEOUT", f"{skill_name} timed out after {motion} ended"
             )
-        failure = _play_audio_failure(future, skill_name)
+        failure, cut_short = _play_audio_outcome(future, skill_name, goal_handle)
         if failure is not None:
             return self._abort_skill(result, goal_handle, executed, *failure)
         clip = executed[0].partition(":")[2]
+        spoken = "speech stopped by the listener during" if cut_short else "played"
         return self._succeed_play_audio(
-            result, goal_handle, executed, f"{skill_name}: played {clip} and {motion_result.message}"
+            result, goal_handle, executed, f"{skill_name}: {spoken} {clip} and {motion_result.message}"
         )
-
-    def _cancel_play_audio(self, result, goal_handle, executed, skill_name: str):
-        self._cancel_skill(result, goal_handle, executed, skill_name)
-        # The playback service cannot be cancelled: say so instead of implying silence.
-        result.message = f"{result.message}; the motion has ended, the recorded clip may still be playing"
-        return result
 
     def _succeed_play_audio(self, result, goal_handle, executed, message: str):
         result.success = True
@@ -6701,6 +7023,7 @@ class SkillExecutorNode(Node):
                 return "PLACE_RELEASED_VERIFICATION_UNCERTAIN"
             if int(place_result.verification_status) == PlaceObject.Result.VERIFICATION_NOT_RUN:
                 return "PLACE_RELEASED_VERIFICATION_NOT_RUN"
+            return str(place_result.error_code or "PLACE_RELEASED_EXECUTION_FAILED")
         return "PLACE_NOT_RELEASED"
 
     def _execute_place_skill(
@@ -6883,7 +7206,7 @@ class SkillExecutorNode(Node):
                 "placement executor identity does not match the registry snapshot",
             )
         result.debug_output_dir = str(getattr(place_result, "debug_output_dir", ""))
-        fill_execution_detail(result.execution_detail, place_result.execution_detail)
+        fill_execution_detail(result.execution_detail, place_result_execution_detail(place_result))
         result.executed_primitives = [f"placement_pipeline:{phase}" for phase in place_result.completed_phases]
         if goal_handle.is_cancel_requested and place_result.error_code in {"PLACE_CANCELLED", "CANCELED"}:
             return self._cancel_skill(result, goal_handle, result.executed_primitives, goal.skill_name)
@@ -7475,15 +7798,42 @@ class SkillExecutorNode(Node):
         # what takes the runtime out of idle, so a failed start knows the mode
         # is the Gateway's to give back.
         mirror_command = self._active_mirror_session_command(goal.skill_name)
-        if (
-            mirror_command == "stop"
-            and not getattr(self, "_mirror_session_start_latched", False)
-            and self._runtime_idle_for_admission()
-        ):
-            return self._succeed_mirror_session(
-                result, goal_handle, goal.skill_name, "runtime already idle", called=False
+        if mirror_command == "stop":
+            if goal_handle.is_cancel_requested:
+                return self._cancel_skill(result, goal_handle, [], goal.skill_name)
+            # An unconfirmed start RPC can still be pending while WAIT/idle is
+            # fresh. Send stop to serialize behind that request before allowing
+            # another producer to enter the shared runtime mode.
+            if not getattr(self, "_mirror_session_start_latched", False) and self._mirror_release_confirmed():
+                with self._mirror_session_state_lock:
+                    self._mirror_session_start_latched = False
+                return self._succeed_mirror_session(
+                    result, goal_handle, goal.skill_name, "runtime already idle", called=False
+                )
+            # Stop releases a producer: never take over policy_stream to stop it.
+            status, reason = self._runtime_status_for_admission()
+            if status is None:
+                return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", reason)
+            active_bundle = getattr(self, "_active_runtime_bundle", None)
+            templates = (
+                self._mutable_templates(active_bundle.snapshot.templates)
+                if active_bundle is not None
+                else self._skill_templates
+            )
+            return self._execute_mirror_session_skill(
+                goal_handle,
+                templates[goal.skill_name],
+                effective_timeout_sec=effective_timeout_sec,
             )
         mirror_left_idle = mirror_command == "start" and self._runtime_idle_for_admission()
+
+        mirror_ready, mirror_message, mirror_reason = self._mirror_session_admission(goal.skill_name)
+        if not mirror_ready:
+            fill_execution_detail(
+                result.execution_detail,
+                ExecutionDetail(1, "admission", "FAILED", "admission", mirror_reason, "NOT_NEEDED", 0, "WAIT_USER"),
+            )
+            return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", mirror_message)
 
         control_mode_ready, control_mode_reason = self._ensure_skill_control_mode(goal.skill_name, goal_handle)
         if not control_mode_ready:

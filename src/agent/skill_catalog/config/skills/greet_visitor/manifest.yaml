@@ -1,0 +1,50 @@
+schema_version: 1
+name: greet_visitor
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Greet a new visitor with the recorded opening line while waving one hand,
+    offering the two activities.
+  category: social_interaction
+  when_to_use:
+  - the visitor says hello or asks the robot to greet them
+  - open a new visit
+  do_not_use:
+  - condition: wave without saying anything
+    instead_use: wave_hand
+  - condition: the visitor asks who the robot is
+    instead_use: self_introduction
+  aliases_zh:
+  - 你好
+  - 你好呀
+  - 打个招呼
+  - 跟大家打招呼
+  - 欢迎一下
+  aliases_en:
+  - hello
+  - greet the visitor
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say the recorded opening line (你好，我是灵犀！想和我做动作，还是选一份水果小礼物？) and wave one
+    hand. Use for 你好 or a request to greet.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

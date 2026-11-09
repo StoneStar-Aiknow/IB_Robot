@@ -434,6 +434,28 @@ def test_linear_grasp_follows_the_palm_line_within_limits(linear_grasp_planner):
     )
 
 
+def test_linear_grasp_extra_seeds_replace_only_the_last_start_copies(linear_grasp_planner):
+    stub = linear_grasp_planner
+    seen = []
+    native = stub.planner.motion.ik_solver.solve_pose
+
+    def solve(goal, state, *, seed_config):
+        seen.append(seed_config.detach().cpu().numpy().copy())
+        return native(goal, state, seed_config=seed_config)
+
+    stub.planner.motion.ik_solver.solve_pose = solve
+    connected = np.stack([stub.end, stub.end + 0.5])
+    trajectory, reason = stub.planner._linear_grasp_segment(stub.start, stub.goal, lambda: None, extra_seeds=connected)
+    assert reason is None
+    # Two seeds: the first stays the start, only the last becomes the first connected state.
+    np.testing.assert_allclose(seen[0][0, 0], stub.start)
+    np.testing.assert_allclose(seen[0][0, 1], stub.end, atol=1e-6)
+    # The native nearest-to-start choice and checks are unchanged.
+    np.testing.assert_allclose(trajectory.positions[-1], stub.end, atol=1e-6)
+    stub.planner._linear_grasp_segment(stub.start, stub.goal, lambda: None)
+    np.testing.assert_allclose(seen[1][0], np.stack([stub.start, stub.start]))
+
+
 @pytest.mark.parametrize("failure", ["ik", "fine", "line"])
 def test_linear_grasp_reports_why_trajopt_must_plan_the_grasp(linear_grasp_planner, failure):
     torch = pytest.importorskip("torch")

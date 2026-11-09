@@ -212,6 +212,8 @@ class Status:
     at: float = float("-inf")
     group_ages: dict[str, float] = field(default_factory=dict)
     hand_types: list[int] = field(default_factory=list)
+    hand_measured: list[float] | None = None
+    hand_measured_age_s: float | None = None
     arm_measured: list[float] | None = None
     #: How old the arm measurement's stalest contributing group was at ``at``.
     arm_measured_age_s: float | None = None
@@ -231,6 +233,8 @@ class Status:
             at=float(data["at"]),
             group_ages={str(group): float(age) for group, age in (data.get("groups") or {}).items()},
             hand_types=[int(value) for value in data.get("hand_types") or []],
+            hand_measured=data.get("hand_measured"),
+            hand_measured_age_s=data.get("hand_measured_age_s"),
             arm_measured=[float(value) for value in data["arm_measured"]] if data.get("arm_measured") else None,
             arm_measured_age_s=(None if data.get("arm_measured_age_s") is None else float(data["arm_measured_age_s"])),
             faults={

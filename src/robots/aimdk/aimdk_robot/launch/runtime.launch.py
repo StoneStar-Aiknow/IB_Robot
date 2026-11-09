@@ -78,6 +78,7 @@ def _launch_setup(context, *_args, **_kwargs):
                     "use_sim": simulated,
                     **({"sim_platform": sim_platform} if sim_platform else {}),
                     "initial_mode": initial_mode,
+                    "cancel_return_motions": LaunchConfiguration("cancel_return_motions", default="").perform(context),
                     "instance_id": instance_id,
                     "interface_description_json": description_json,
                 }
@@ -208,6 +209,11 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),
             DeclareLaunchArgument(
                 "cbf_safety_json", default_value="", description="Optional CBF configuration for aimdk_dataplane only"
+            ),
+            DeclareLaunchArgument(
+                "cancel_return_motions",
+                default_value="",
+                description="Comma-separated recorded named motions that return on ordinary cancel",
             ),
             DeclareLaunchArgument(
                 "physics_mjcf",

@@ -89,3 +89,69 @@ def test_place_claims_and_returns_custody_through_the_action():
         node.destroy_node()
         owner.destroy_node()
         rclpy.shutdown()
+
+
+def test_custody_return_failure_preserves_typed_release_and_verification():
+    from types import SimpleNamespace
+
+    from rclpy.serialization import deserialize_message, serialize_message
+
+    from embodied_common.dispatch_binding import delegated_executor_identity
+    from embodied_common.execution_detail import ExecutionDetail
+    from manipulation_execution.grasp_pipeline.contracts import GraspFailure
+    from manipulation_execution.grasp_pipeline.place_pipeline import PlaceOutcome
+
+    held, _ = fixture()
+
+    def failed_return(*_args):
+        raise GraspFailure("CUSTODY_UNAVAILABLE", "custody service unavailable")
+
+    node = object.__new__(PlacePipelineNode)
+    node.custody = SimpleNamespace(claim=lambda *_args, **_kwargs: held, returned=failed_return)
+    node.pipeline = SimpleNamespace(
+        run=lambda *_args, **_kwargs: PlaceOutcome(
+            success=True,
+            release_status="released",
+            custody_outcome="released",
+            verification="success",
+            execution_detail=ExecutionDetail(
+                2,
+                "verify_place",
+                "SUCCEEDED",
+                "",
+                "",
+                "NOT_NEEDED",
+                0,
+                "NONE",
+                "RELEASED",
+                "SUCCESS",
+                True,
+            ),
+        )
+    )
+    node.identity = delegated_executor_identity(
+        name="placement_pipeline",
+        endpoint_name="/test/place",
+        configuration={},
+    )
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
+    node.get_logger = lambda: SimpleNamespace(info=lambda _message: None)
+    request = PlaceObject.Goal(target_query="apple", container_query="bowl", timeout_sec=30.0)
+    request.dispatch_binding.task_budget.deadline.sec = 31
+    handle = SimpleNamespace(
+        request=request,
+        is_cancel_requested=False,
+        publish_feedback=lambda _feedback: None,
+        abort=lambda: None,
+        succeed=lambda: None,
+        canceled=lambda: None,
+    )
+    result = node._execute(handle)
+    restored = deserialize_message(serialize_message(result), PlaceObject.Result)
+    assert not restored.success and not restored.place_succeeded
+    assert restored.release_status == PlaceObject.Result.RELEASE_RELEASED
+    assert restored.verification_status == PlaceObject.Result.VERIFICATION_SUCCESS
+    assert restored.execution_detail.release_status == "RELEASED"
+    assert restored.execution_detail.verification_status == "SUCCESS"
+    assert restored.execution_detail.failed_phase == "return_custody"
+    assert not restored.execution_detail.place_succeeded

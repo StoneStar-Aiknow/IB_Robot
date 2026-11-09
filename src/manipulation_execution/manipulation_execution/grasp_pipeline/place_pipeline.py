@@ -6,7 +6,7 @@ from math import isfinite
 
 import numpy as np
 
-from embodied_common.execution_detail import ExecutionDetail
+from embodied_common.execution_detail import ExecutionDetail, place_execution_detail
 
 from .contracts import GraspFailure
 from .place_sequence import PlaceSequence
@@ -23,7 +23,13 @@ class PlaceOutcome:
     completed_phases: list[str] = field(default_factory=list)
     report: dict = field(default_factory=dict)
     execution_detail: ExecutionDetail = field(
-        default_factory=lambda: ExecutionDetail(schema_version=1, recovery_state="NOT_NEEDED", suggested_action="NONE")
+        default_factory=lambda: ExecutionDetail(
+            schema_version=2,
+            recovery_state="NOT_NEEDED",
+            suggested_action="NONE",
+            release_status="NOT_RELEASED",
+            verification_status="NOT_RUN",
+        )
     )
 
 
@@ -43,6 +49,7 @@ class PlacePipeline:
 
     def run(self, held, query, *, deadline, cancelled, on_phase=lambda *_: None):
         result, starts = PlaceOutcome(), {}
+        execution_started = False
         planning_deadline = deadline - self.execute_reserve_s
 
         def phase(name, event, detail):
@@ -51,7 +58,14 @@ class PlacePipeline:
             elif name in starts:
                 result.report.setdefault("stages_s", {}).setdefault(name, []).append(self.clock() - starts.pop(name))
             failed = event == "end" and detail.get("state", "succeeded") != "succeeded"
-            previous = result.execution_detail
+            if "release_status" in detail:
+                result.release_status = detail["release_status"].lower()
+            previous = place_execution_detail(
+                result.execution_detail,
+                release_status=result.release_status.upper(),
+                verification_status=result.verification.upper(),
+                place_succeeded=False,
+            )
             result.execution_detail = replace(
                 previous,
                 phase=name,
@@ -185,6 +199,7 @@ class PlacePipeline:
                     result.report.setdefault("retries", []).append(dict(record))
             result.report["plan"] = dict(plan.report)
             plan_home = getattr(backends.planner, "plan_home", None)
+            execution_started = True
             execution = PlaceSequence(backends, on_phase=phase).run(
                 plan,
                 cancelled=lambda: cancelled() or self.clock() >= deadline,
@@ -221,10 +236,33 @@ class PlacePipeline:
                     raise GraspFailure(verdict.reason_code or "PLACE_UNSEEN", "placement could not be verified")
 
             call("verify_place", verify)
-            result.success = True
         except GraspFailure as failure:
             remember_failure(failure.reason_code, str(failure))
             result.reason_code, result.message = failure.reason_code, str(failure)
+            if not execution_started and failure.reason_code == "GRIP_LOST_IN_TRANSFER":
+                # A fresh, affirmative lost-grip report is different from
+                # unavailable feedback. Reuse the controlled drop cleanup;
+                # never clear custody merely because placement failed.
+                failed_phase = result.execution_detail.failed_phase or result.execution_detail.phase
+                plan_home = getattr(backends.planner, "plan_home", None)
+                recovery = PlaceSequence(backends, on_phase=phase).recover_before_transfer(
+                    go_home=None
+                    if plan_home is None
+                    else lambda: plan_home(held, deadline=deadline, cancelled=cancelled),
+                    cancelled=lambda: cancelled() or self.clock() >= deadline,
+                )
+                result.custody_outcome, result.release_status = recovery.custody_outcome, recovery.release_status
+                result.report["drop_recovery"] = {
+                    "state": recovery.recovery_state,
+                    "reason_code": recovery.reason_code,
+                    "message": recovery.message,
+                    "custody_outcome": recovery.custody_outcome,
+                }
+                result.execution_detail = replace(
+                    result.execution_detail, failed_phase=failed_phase, recovery_state=recovery.recovery_state
+                )
+                if recovery.message:
+                    result.message += f"; recovery: {recovery.message}"
         except Exception as exc:
             result.reason_code, result.message = "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}"
             remember_failure(result.reason_code, result.message)
@@ -248,8 +286,20 @@ class PlacePipeline:
                     except Exception as exc:
                         remember_failure("CLEANUP_FAILED", str(exc), phase_name="cleanup")
                         result.success, result.reason_code = False, "CLEANUP_FAILED"
+                        result.execution_detail = replace(
+                            result.execution_detail,
+                            phase="cleanup",
+                            failed_phase=result.execution_detail.failed_phase or "cleanup",
+                        )
                         result.message = str(exc)
                         result.custody_outcome = "uncertain"
+        result.success = not result.reason_code and result.verification == "success"
+        result.execution_detail = place_execution_detail(
+            result.execution_detail,
+            release_status=result.release_status.upper(),
+            verification_status=result.verification.upper(),
+            place_succeeded=result.success,
+        )
         if not result.success:
             previous = result.execution_detail
             result.execution_detail = replace(

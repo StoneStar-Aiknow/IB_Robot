@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import json
+import queue
+import threading
 import time
 
 import rclpy
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
+from rclpy.task import Future
+from std_srvs.srv import Trigger
 
 from ibrobot_msgs.srv import PlayAudioFile
 from robot_config.qos_profiles import qos_profile_from_dict
@@ -67,6 +71,7 @@ class AudioPlaybackNode(Node):
     def __init__(self) -> None:
         super().__init__("voice_tts_audio_player")
         self.declare_parameter("service_name", "/voice_tts/play")
+        self.declare_parameter("stop_service_name", "/voice_tts/stop")
         self.declare_parameter("timeout_sec", 300.0)
         self.declare_parameter("audio_topic", "/audio/play")
         self.declare_parameter("playback_sample_rate", 24000)
@@ -107,17 +112,70 @@ class AudioPlaybackNode(Node):
 
         self._audio_pub = self.create_publisher(self._audio_message_class, self._audio_topic, self._audio_qos)
         service_name = str(self.get_parameter("service_name").value)
+        self._init_playback_queue()
         self._service = self.create_service(
             PlayAudioFile,
             service_name,
             self._play,
+            callback_group=ReentrantCallbackGroup(),
+        )
+        self._stop_service = self.create_service(
+            Trigger,
+            str(self.get_parameter("stop_service_name").value),
+            self._stop,
             callback_group=MutuallyExclusiveCallbackGroup(),
         )
         self.get_logger().info(f"Audio playback service ready at {service_name!r}")
 
-    def _play(self, request, response):
+    def _init_playback_queue(self) -> None:
+        # Async service callbacks suspend on futures instead of occupying all executor
+        # threads with queued WAVs. The worker alone serializes file publication.
+        self._publication_lock = threading.RLock()
+        self._requests: dict[threading.Event, Future] = {}
+        self._jobs = queue.Queue()
+        self._playback_worker = threading.Thread(target=self._playback_loop, name="audio-playback", daemon=True)
+        self._playback_worker.start()
+
+    async def _play(self, request, response):
+        future = Future()
+        cancel = threading.Event()
+        with self._publication_lock:
+            self._requests[cancel] = future
+            self._jobs.put((request.file_path, response, cancel, future))
+        return await future
+
+    def _stop(self, request, response):
+        # Publish and cancellation share a lock: no canceled request can publish
+        # another chunk once this callback returns. Hardware buffers cannot be flushed.
+        with self._publication_lock:
+            for cancel in self._requests:
+                cancel.set()
+        response.success = True
+        response.message = "Audio publication stopped; already buffered hardware audio may still play."
+        return response
+
+    def _playback_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            file_path, response, cancel, future = job
+            result = self._play_response(file_path, response, cancel)
+            with self._publication_lock:
+                self._requests.pop(cancel, None)
+            future.set_result(result)
+
+    def destroy_node(self):
+        with self._publication_lock:
+            for cancel in self._requests:
+                cancel.set()
+            self._jobs.put(None)
+        self._playback_worker.join(timeout=2.0)
+        return super().destroy_node()
+
+    def _play_response(self, file_path, response, cancel):
         try:
-            path = self._publish_audio(request.file_path)
+            path = self._publish_audio(file_path, cancel)
             response.success = True
             response.error_code = ""
             response.message = f"played audio file: {path}"
@@ -133,8 +191,10 @@ class AudioPlaybackNode(Node):
             self.get_logger().error(f"Unexpected audio playback failure: {exc}")
         return response
 
-    def _publish_audio(self, file_path: str) -> str:
+    def _publish_audio(self, file_path: str, cancel: threading.Event | None = None) -> str:
         """Publish PCM chunks for audio_play instead of opening ALSA here."""
+        cancel = cancel or threading.Event()
+        self._check_cancel(cancel)
         timeout_sec = self._player.config.timeout_sec
         if timeout_sec <= 0:
             raise AudioPlaybackError("INVALID_TIMEOUT", "audio playback timeout must be positive")
@@ -147,7 +207,8 @@ class AudioPlaybackNode(Node):
                     "PLAYER_NOT_READY",
                     f"audio playback subscriber did not become ready within {timeout_sec:g} seconds",
                 )
-            time.sleep(min(0.01, remaining))
+            self._wait_cancel(cancel, min(0.01, remaining))
+            self._check_cancel(cancel)
 
         pcm = self._player.load_pcm_for_playback(
             file_path,
@@ -171,7 +232,9 @@ class AudioPlaybackNode(Node):
                     "PLAYBACK_TIMEOUT",
                     f"audio playback exceeded {timeout_sec:g} seconds",
                 )
-            self._audio_pub.publish(self._make_message(data))
+            with self._publication_lock:
+                self._check_cancel(cancel)
+                self._audio_pub.publish(self._make_message(data))
             # A player that has to wait for each write can report a PLAYING/STOPPED pair around
             # it (the X2's hal_audio did, once per chunk, audible as stutter), so the stream keeps
             # prebuffer_ms ahead of the sample clock for its whole length, not only at the start.
@@ -179,30 +242,47 @@ class AudioPlaybackNode(Node):
             # starve the player between chunks: measured against the real GStreamer sink,
             # a 2.6 s clip did not finish in 90 s. Absolute sample-clock deadlines also avoid
             # accumulating serialization and publish overhead into the sound duration.
-            self._sleep_until(playback_start + max(0, published_frames - lead_frames) / rate, deadline, timeout_sec)
+            self._sleep_until(
+                playback_start + max(0, published_frames - lead_frames) / rate, deadline, timeout_sec, cancel
+            )
         # Return once the last sample's playback time is reached, not when it was written: callers
         # take the return as "spoken" (the voice bridge resumes listening on it), and with a lead
         # the last chunk is written up to prebuffer_ms early.
-        self._sleep_until(playback_start + published_frames / rate, deadline, timeout_sec)
+        self._sleep_until(playback_start + published_frames / rate, deadline, timeout_sec, cancel)
         # Retain reliable-delivery confirmation without putting ACK latency
         # between PCM chunks. This is not a hardware playback-complete event, and a
         # best_effort speaker (the X2 runtime) returns here immediately by definition.
         wait_for_all_acked = getattr(self._audio_pub, "wait_for_all_acked", None)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0 or (wait_for_all_acked is not None and not wait_for_all_acked(Duration(seconds=remaining))):
-            raise AudioPlaybackError(
-                "PLAYBACK_TIMEOUT",
-                f"audio playback acknowledgement exceeded {timeout_sec:g} seconds",
-            )
+        while wait_for_all_acked is not None:
+            self._check_cancel(cancel)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AudioPlaybackError(
+                    "PLAYBACK_TIMEOUT", f"audio playback acknowledgement exceeded {timeout_sec:g} seconds"
+                )
+            if wait_for_all_acked(Duration(seconds=min(0.05, remaining))):
+                break
+        self._check_cancel(cancel)
         return file_path.strip()
 
     @staticmethod
-    def _sleep_until(when: float, deadline: float, timeout_sec: float) -> None:
-        if deadline - time.monotonic() <= 0:
+    def _check_cancel(cancel: threading.Event) -> None:
+        if cancel.is_set():
+            raise AudioPlaybackError("PLAYBACK_CANCELED", "audio publication canceled; hardware buffers may still play")
+
+    @staticmethod
+    def _wait_cancel(cancel: threading.Event, delay: float) -> None:
+        cancel.wait(delay)
+
+    def _sleep_until(self, when: float, deadline: float, timeout_sec: float, cancel: threading.Event) -> None:
+        self._check_cancel(cancel)
+        now = time.monotonic()
+        if deadline - now <= 0:
             raise AudioPlaybackError("PLAYBACK_TIMEOUT", f"audio playback exceeded {timeout_sec:g} seconds")
-        delay = when - time.monotonic()
+        delay = min(when, deadline) - now
         if delay > 0:
-            time.sleep(delay)
+            self._wait_cancel(cancel, delay)
+        self._check_cancel(cancel)
 
     def _make_message(self, chunk: bytes):
         message = self._audio_message_class()

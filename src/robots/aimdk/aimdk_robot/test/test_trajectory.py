@@ -100,3 +100,44 @@ def test_waypoints_are_eased_so_the_motion_starts_and_ends_at_rest():
 def test_a_goal_that_would_execute_an_unplanned_motion_is_refused(names, times, points, reason):
     with pytest.raises(TrajectoryError, match=reason):
         _plan(names, times, points)
+
+
+def _delivery(tmp_path, **hand_overrides):
+    from aimdk_robot.projection import DEXTEROUS_JOINT_ORDER
+
+    hands = {
+        "units": "rad",
+        "joints": [f"{side}_{joint}" for side in ("left", "right") for joint in DEXTEROUS_JOINT_ORDER],
+        "positions": [[0.0] * 20, [-1.5] * 20],
+        **hand_overrides,
+    }
+    return _write(
+        tmp_path,
+        format="ibrobot.fixed_motion.delivery",
+        schema_version=1,
+        arms={"units": "rad", "joints": JOINTS, "positions_rad": [[0.0] * 14, [0.5] * 14]},
+        hands=hands,
+    )
+
+
+def test_delivery_replays_both_arms_and_interpolates_unclipped_rad_hands(tmp_path):
+    trajectory = load_trajectory(_delivery(tmp_path), max_speed_radps=6.0)
+    assert trajectory.target == "both"
+    assert trajectory.sample(0.5) == pytest.approx([0.25] * 14)
+    assert trajectory.sample_hands(0.5) == pytest.approx([-0.75] * 20)
+    assert trajectory.sample_hands(2.0) == pytest.approx([-1.5] * 20)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"units": "normalized"}, "rad"),
+        ({"joints": []}, "joint order"),
+        ({"positions": [[0.0] * 20]}, "one sample per time"),
+        ({"positions": [[0.0] * 19] * 2}, "20 finite"),
+        ({"positions": [[float("nan")] * 20] * 2}, "20 finite"),
+    ],
+)
+def test_invalid_hand_delivery_is_refused_before_motion(tmp_path, overrides, reason):
+    with pytest.raises(TrajectoryError, match=reason):
+        load_trajectory(_delivery(tmp_path, **overrides), max_speed_radps=6.0)

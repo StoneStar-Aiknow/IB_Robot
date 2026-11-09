@@ -10,6 +10,7 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
+  <depend>std_srvs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>inference_manifest</depend>
   <depend>audio_common_msgs</depend>

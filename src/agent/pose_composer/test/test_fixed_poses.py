@@ -267,16 +267,29 @@ def test_fixed_preview_builds_candidate_but_offline_compiler_stays_strict(fixed_
 
 
 @pytest.mark.parametrize(
-    "budget,offset,success", [(150.0, 0.0, True), (90.0, 0.0, False), (150.0, 0.09, True), (150.0, 0.11, False)]
+    "budget,offset,success,display,pose_id",
+    [
+        (150.0, 0.0, True, False, "arms_up"),
+        (90.0, 0.0, False, False, "arms_up"),
+        (150.0, 0.09, True, False, "arms_up"),
+        (150.0, 0.11, False, False, "arms_up"),
+        (150.0, 0.12, True, True, "arms_up"),
+        (150.0, 0.5, True, True, "arms_up"),
+        (150.0, 0.12, False, True, "salute"),
+    ],
 )
-def test_fixed_seed_respects_gateway_budget_and_arrival_tolerance(monkeypatch, budget, offset, success):
+def test_fixed_seed_respects_gateway_budget_and_arrival_tolerance(
+    monkeypatch, budget, offset, success, display, pose_id
+):
     from pose_composer import node as node_module
     from robot_runtime.pose_backend import Plan, Report, Trajectory
 
     joints = LEFT_ARM + RIGHT_ARM
     state = SimpleNamespace(now=10.0, cancelled=False)
     server = object.__new__(PoseComposerNode)
-    server.get_logger = lambda: SimpleNamespace(info=lambda _: None)
+    warnings = []
+    server.get_logger = lambda: SimpleNamespace(info=lambda _: None, warning=warnings.append)
+    server._display_pose_completion = {"pose_ids": ["arms_up"], "mode": "playback_only"} if display else {}
     server._joint_lock = Lock()
     server._positions = dict.fromkeys(joints, 0.0)
     server._motion_limits = (0.0, 0.0)
@@ -310,10 +323,13 @@ def test_fixed_seed_respects_gateway_budget_and_arrival_tolerance(monkeypatch, b
     monkeypatch.setattr(node_module.time, "monotonic", lambda: state.now)
     monkeypatch.setattr(node_module.time, "sleep", advance)
     goal = Goal(ExecuteArmPose.Goal(timeout_sec=budget, gateway_task_id="mock_task"), state)
-    prepared = SimpleNamespace(pose_id="arms_up", composition=SimpleNamespace(frames=[target]))
+    prepared = SimpleNamespace(pose_id=pose_id, composition=SimpleNamespace(frames=[target]))
     result = server._execute_fixed_target(goal, ExecuteArmPose.Result(), prepared)
     assert result.success is success
     assert bool(moved) is (budget >= 101.0)
+    assert not warnings
+    if success and display:
+        assert "final pose not verified" in result.message
     if not success:
         assert result.error_code == ("TASK_POSE_TIMEOUT" if budget < 101.0 else "TASK_POSE_NOT_REACHED")
 

@@ -14,7 +14,7 @@ def motion_stop_is_unknown(result):
     }:
         return True
     detail = getattr(result, "execution_detail", None)
-    return getattr(detail, "schema_version", 0) == 1 and detail.recovery_state == "UNKNOWN"
+    return getattr(detail, "schema_version", 0) in {1, 2} and detail.recovery_state == "UNKNOWN"
 
 
 def retains_for_place(steps, index):

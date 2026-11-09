@@ -12,12 +12,22 @@ from robot_runtime.task_poses import normalize_task_poses, pose_hand_sides, task
 
 
 class TaskPoseRunner:
-    def __init__(self, snapshot, *, simulation=False, clock=time.monotonic, pause=time.sleep, backend=None):
+    def __init__(
+        self,
+        snapshot,
+        *,
+        simulation=False,
+        clock=time.monotonic,
+        pause=time.sleep,
+        backend=None,
+        verify_arrival=True,
+    ):
         self.backend = backend or GeneratedBackend()
         self.snapshot = normalize_task_poses(snapshot) if snapshot else {}
         self.simulation = simulation
         self.clock, self.pause = clock, pause
         self.report = {}
+        self.verify_arrival = verify_arrival
         if self.snapshot and tuple(self.snapshot["joint_names"]) != tuple(self.backend.model.ARM_JOINTS):
             raise ValueError("task-pose joint order does not match X2 backend")
         for pose in self.snapshot.get("poses", {}).values():
@@ -100,6 +110,9 @@ class TaskPoseRunner:
             raise ComposeError("TASK_POSE_BAD_TIMEOUT", "invalid task-pose timeout")
         deadline = self.clock() + min(pose["timeout_sec"], timeout_sec or pose["timeout_sec"])
         target = pose["joint_positions"]
+        arrival_tolerance = pose["position_tolerance_rad"]
+        if not self.verify_arrival and sides:
+            raise ComposeError("TASK_POSE_CONFIG_MISMATCH", "hand preparation requires verified functional arrival")
         observed_stamp = 0.0
 
         def check():
@@ -125,12 +138,11 @@ class TaskPoseRunner:
 
         def at_target(q):
             return (
-                max(abs(q[j] - target[j]) for j in target) <= pose["position_tolerance_rad"]
-                and self.backend.safety.check_pose(q).ok
+                max(abs(q[j] - target[j]) for j in target) <= arrival_tolerance and self.backend.safety.check_pose(q).ok
             )
 
         start = check()
-        skipped = at_target(start)
+        skipped = self.verify_arrival and at_target(start)
         restorer = None
         context = hand_seconds = None
         if sides:
@@ -148,7 +160,7 @@ class TaskPoseRunner:
                 self._hand_call(lambda: restorer.begin(context))
             # Takeover may have taken time. Always plan from a new measured arm pose.
             start = check()
-            skipped = at_target(start)
+            skipped = self.verify_arrival and at_target(start)
             if not skipped:
                 with self._stage("hand_preflight_after_takeover", progress):
                     self._hand_call(lambda: restorer.preflight(context, sides, arm_target=target, arm_must_move=True))
@@ -178,9 +190,14 @@ class TaskPoseRunner:
                 ok, code, message = move(plan, deadline)
             if not ok:
                 raise ComposeError(code or "TASK_POSE_MOVE_FAILED", message)
-        # Temporary commissioning policy shared by fixed free_pose and task poses:
-        # do not wait for a continuous stability window after trajectory terminal.
-        # This is still a measured arrival check, not unconditional success.
+        if not self.verify_arrival:
+            if cancelled():
+                raise ComposeError("POSE_CANCELLED", "display canceled at playback end")
+            if self.clock() >= deadline:
+                raise ComposeError("TASK_POSE_TIMEOUT", "display playback exceeded its budget")
+            self.report["arrival_check"] = {"policy": "playback_only", "arrival_verified": False}
+            self.report["stages"]["arm_settling"]["reason"] = "display final pose not verified"
+            return skipped
         with self._stage("arm_settling", progress):
             q = check()
             worst_joint = max(target, key=lambda joint: abs(q[joint] - target[joint]))
@@ -190,13 +207,13 @@ class TaskPoseRunner:
                 "stable_window_verified": False,
                 "worst_joint": worst_joint,
                 "max_error_rad": error,
-                "tolerance_rad": pose["position_tolerance_rad"],
+                "tolerance_rad": arrival_tolerance,
             }
-            if error > pose["position_tolerance_rad"]:
+            if error > arrival_tolerance:
                 raise ComposeError(
                     "TASK_POSE_NOT_REACHED",
                     f"trajectory finished but arrival not confirmed: {worst_joint} error={error:.6f} rad "
-                    f"exceeds {pose['position_tolerance_rad']:.6f} rad",
+                    f"exceeds {arrival_tolerance:.6f} rad",
                 )
             safe = self.backend.safety.check_pose(q).ok
             check()  # Observe cancellation/deadline and feedback age after the synchronous check.

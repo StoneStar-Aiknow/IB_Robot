@@ -63,6 +63,7 @@ class PoseComposerNode(Node):
         p("lookup_enabled", True, descriptor=startup_only)
         p("task_poses_json", "{}", descriptor=startup_only)
         p("path_validation_json", "{}", descriptor=startup_only)
+        p("display_completion_json", "{}", descriptor=startup_only)
         p("task_pose_simulation", False, descriptor=startup_only)
         # Runtime description, grasp_execution and Gateway status service for poses that open hands; "{}" disables.
         p("hand_restore_json", "{}", descriptor=startup_only)
@@ -92,7 +93,7 @@ class PoseComposerNode(Node):
             from pathlib import Path
 
             from pose_composer.fixed_backend import FixedBackend
-            from pose_composer.fixed_library import FixedComposer
+            from pose_composer.fixed_library import FixedComposer, display_pose_policy
 
             if hashlib.sha256(Path(param("fixed_library")).read_bytes()).hexdigest() != param("fixed_library_sha256"):
                 raise ValueError("fixed pose artifact changed after launch configuration binding")
@@ -105,6 +106,9 @@ class PoseComposerNode(Node):
                 task_poses=json.loads(param("task_poses_json")),
             )
             self._composer = FixedComposer(self._selected_backend.library)
+            self._display_pose_completion = display_pose_policy(
+                json.loads(param("display_completion_json")), self._selected_backend.library
+            )
             from aimdk_grasp.path_validation import ValidationGate
 
             self._validation_policy = json.loads(param("path_validation_json"))
@@ -245,21 +249,10 @@ class PoseComposerNode(Node):
                 config = self._hand_config
                 if not config:
                     raise RuntimeError("hand_restore_json is not configured for this deployment")
-                from aimdk_grasp.backend import grasp_installed_hands
-                from aimdk_grasp.hand_restore import HandRestorer, build_hand_plans
-                from aimdk_grasp.hand_restore_ros import RuntimeRestorePorts
+                from aimdk_grasp.hand_restore_ros import create_hand_restorer
 
-                plans, missing = build_hand_plans(config["grasp_execution"])
-                installed = grasp_installed_hands(config["grasp_execution"])
-                ports = RuntimeRestorePorts(
-                    self,
-                    config["interface_description"],
-                    gateway_service=config["gateway_status_service"],
-                    callback_group=self._callback_group,
-                    installed_hands=installed,
-                )
-                self._hand_restorer_cache = HandRestorer(ports, plans, missing, installed_hands=installed)
-                self.get_logger().info(f"hand restore ready: hands {sorted(plans)}, unavailable {missing}")
+                self._hand_restorer_cache = create_hand_restorer(self, config, callback_group=self._callback_group)
+                self.get_logger().info("hand restore ready")
             return self._hand_restorer_cache
 
     # --- inputs -------------------------------------------------------------
@@ -524,6 +517,8 @@ class PoseComposerNode(Node):
         from pose_composer.task_poses import TaskPoseRunner
 
         backend = backend_for(self)
+        display = getattr(self, "_display_pose_completion", {})
+        display = display if prepared.pose_id in display.get("pose_ids", ()) else {}
         runner = TaskPoseRunner(
             {
                 "schema_version": 1,
@@ -541,6 +536,7 @@ class PoseComposerNode(Node):
                 },
             },
             backend=backend,
+            verify_arrival=not bool(display),
             clock=lambda: time.monotonic(),
             pause=lambda seconds: time.sleep(seconds),
         )
@@ -557,7 +553,9 @@ class PoseComposerNode(Node):
                 prepared.pose_id,
                 runner.snapshot["digest"],
                 read_state=read_state,
-                move=lambda plan, deadline: self._run_trajectory(goal_handle, plan, deadline=deadline),
+                move=lambda plan, deadline: self._run_trajectory(
+                    goal_handle, plan, deadline=deadline, verify_completion=not bool(display)
+                ),
                 cancelled=lambda: goal_handle.is_cancel_requested,
                 timeout_sec=goal_handle.request.timeout_sec,
                 motion_limits=self._motion_limits,
@@ -573,9 +571,12 @@ class PoseComposerNode(Node):
             return self._fail(goal_handle, result, exc.code, message)
         goal_handle.succeed()
         result.success = True
-        result.message = self._preparation_message(
-            f"fixed pose {prepared.pose_id} arrival checked once; continuous stability not verified", runner.report
+        message = (
+            f"display playback finished: {prepared.pose_id}; final pose not verified"
+            if display
+            else f"fixed pose {prepared.pose_id} arrival checked once; continuous stability not verified"
         )
+        result.message = self._preparation_message(message, runner.report)
         return result
 
     def _fail(self, goal_handle, result, code: str, message: str):
@@ -597,7 +598,9 @@ class PoseComposerNode(Node):
             raise ComposeError("POSE_RUNTIME_UNAVAILABLE", "runtime is not active or has a latched stop")
         return str(status.active_mode)
 
-    def _run_trajectory(self, goal_handle, plan, *, deadline=None, commands=None) -> tuple[bool, str, str]:
+    def _run_trajectory(
+        self, goal_handle, plan, *, deadline=None, commands=None, verify_completion=True
+    ) -> tuple[bool, str, str]:
         def named_refusal():
             if deadline is None:
                 return None
@@ -617,6 +620,13 @@ class PoseComposerNode(Node):
         if refusal:
             return refusal
         goal = FollowJointTrajectory.Goal()
+        if not verify_completion:
+            from control_msgs.msg import JointTolerance
+
+            goal.goal_tolerance = [
+                JointTolerance(name=name, position=-1.0, velocity=-1.0, acceleration=-1.0)
+                for name in backend_for(self).ARM_JOINTS
+            ]
         goal.trajectory.joint_names = list(backend_for(self).model.ARM_JOINTS)
         if getattr(backend_for(self), "library", None) is None:
             plan = backend_for(self).prepare_execution(plan, POINT_RATE_HZ)

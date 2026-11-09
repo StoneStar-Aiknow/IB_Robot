@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "format": "ibrobot.fixed_motion.delivery",
+  "skill_name": "short_wave",
+  "display_name_zh": "短挥手",
+  "description": "右臂从身体侧面抬到头部右侧，短暂挥手后从侧面放回站立默认姿态；右手抬起时张开、放下前收回。",
+  "aliases_zh": [
+    "短挥手",
+    "挥挥手",
+    "挥一下手"
+  ],
+  "status": "draft",
+  "motion_file": "motion.json",
+  "robot": {
+    "model": "X2",
+    "runtime_profile": "x2_ultra_omnihand",
+    "left_hand_model": "OmniHand",
+    "right_hand_model": "OmniHand",
+    "firmware_version": "aimdk v0.0.0-g14fe2e8（机上 SDK 版本，系统固件版本未读取）",
+    "hand_firmware_version": ""
+  },
+  "resources": [
+    "left_arm",
+    "right_arm",
+    "left_hand",
+    "right_hand"
+  ],
+  "preconditions": {
+    "runtime_mode": "stream",
+    "platform_action": "UPPERBODY_REMOTE_SPLIT",
+    "required_start_pose_description": "站立，双臂在身体两侧（站立默认姿态，首帧），右手四指伸直、拇指横在掌心前，手中无物体",
+    "objects_in_hands": "must_be_empty",
+    "minimum_clearance_m": null
+  },
+  "entry": {
+    "policy": "blend_from_measured_state",
+    "minimum_duration_s": 1.5
+  },
+  "exit": {
+    "policy": "hold_last_target",
+    "final_pose_description": "回到身体两侧的站立默认姿态，手回到初始姿态（末帧与首帧相同）"
+  },
+  "cancel": {
+    "arms": "stop_and_hold_safe_target",
+    "hands": "hold_safe_target_do_not_auto_open",
+    "review_required": true
+  },
+  "safety": {
+    "arm_max_speed_radps": 3.67,
+    "hand_max_speed_normalized_per_s": null,
+    "hand_max_speed_radps": 3.43,
+    "collision_review": "operator_approved_on_site",
+    "notes": "路径按前方有桌子的现场设计，手低于 torso_link z=-0.025 m 时不超过站姿最前点 +2 cm（按模型计算）；换场地要重新确认净空。录制机只装了右手，左手轨迹未验证。腰不在格式内，回放时由 mc 自动调整。"
+  },
+  "provenance": {
+    "source": "中段（约 0.96~2.66 s）来自 Quest 遥操录制 rec_20261107_195624，经平滑；抬臂、落臂由站立默认姿态生成，接缝处做过揉圆。双手为生成数据。手部单位是 rad（按 2026-11-07 与同事的约定），直接下发。详见 README.md。",
+    "permission_basis": "",
+    "license": ""
+  },
+  "validation": {
+    "data_check": "passed",
+    "simulation": "not_tested",
+    "real_robot": "passed_right_hand_only",
+    "tested_date": "2026-11-07",
+    "tested_firmware_version": "aimdk v0.0.0-g14fe2e8（机上 SDK 版本，系统固件版本未读取）",
+    "evidence_files": [
+      "evidence/build_report.json",
+      "evidence/raw_short_wave.jsonl",
+      "evidence/refined_short_wave_ms03.json",
+      "evidence/side_short_wave.json",
+      "evidence/replay_short_wave_205612.jsonl"
+    ],
+    "review_notes": "2026-11-07 在 UPPERBODY_REMOTE_SPLIT 下用独立回放脚本（不是 IB_Robot 运行时）原速回放 1 遍，均完成未中止，操作者现场认可。手臂实测峰值 3.89 rad/s，播放段最大跟踪误差 0.41 rad；右手除拇指 abad 外最大误差 0.10 rad，拇指 abad 张合过程中滞后较大。未验证：左手、IB_Robot 运行时接入、真机上的取消行为。"
+  }
+}

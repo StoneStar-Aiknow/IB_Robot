@@ -43,6 +43,12 @@ class ArmTrajectory:
     target: str
     times: tuple[float, ...]
     positions: tuple[tuple[float, ...], ...]
+    hands: tuple[tuple[float, ...], ...] = ()
+
+    def sample_hands(self, t: float) -> list[float]:
+        if not self.hands:
+            return []
+        return ArmTrajectory(self.name, self.target, self.times, self.hands).sample(t)
 
     @property
     def duration(self) -> float:
@@ -71,6 +77,23 @@ def load_trajectory(path: Path, *, max_speed_radps: float) -> ArmTrajectory:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise TrajectoryError(f"{path}: {exc}") from exc
+    hand_rows = ()
+    if data.get("format") == "ibrobot.fixed_motion.delivery":
+        arms, hands = data.get("arms", {}), data.get("hands", {})
+        if data.get("schema_version") != 1 or arms.get("units") != "rad" or hands.get("units") != "rad":
+            raise TrajectoryError(f"{path}: delivery requires schema 1 and rad arms/hands")
+        hand_rows = hands.get("positions", [])
+        if len(hand_rows) != len(data.get("time_from_start_s", [])) or not hand_rows:
+            raise TrajectoryError(f"{path}: hands require one sample per time")
+        if any(len(row) != 20 or any(not math.isfinite(float(v)) for v in row) for row in hand_rows):
+            raise TrajectoryError(f"{path}: hands require 20 finite rad values")
+        from aimdk_robot.projection import DEXTEROUS_JOINT_ORDER
+
+        expected = [f"{side}_{joint}" for side in ("left", "right") for joint in DEXTEROUS_JOINT_ORDER]
+        if hands.get("joints") != expected:
+            raise TrajectoryError(f"{path}: hands must be left then right in vendor joint order")
+        hand_rows = tuple(tuple(float(v) for v in row) for row in hand_rows)
+        data = {**data, "target": "both", "joints": arms.get("joints", []), "positions": arms.get("positions_rad", [])}
     target = str(data.get("target", ""))
     if target not in TARGETS:
         # An unknown side cannot be checked against a request, so it would
@@ -103,6 +126,7 @@ def load_trajectory(path: Path, *, max_speed_radps: float) -> ArmTrajectory:
         target=target,
         times=tuple(times),
         positions=tuple(positions),
+        hands=hand_rows,
     )
 
 

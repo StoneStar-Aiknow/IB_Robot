@@ -858,3 +858,23 @@ def make_backends(tag):
     planner = StreamingPlanner()
     planner.tag = tag
     return GraspBackends(Source(), Proposer(), planner, Executor(), Effector())
+
+
+def test_a_retained_pick_hears_the_close_before_the_lift_and_a_failing_hook_changes_nothing():
+    backends, executor, _, _, _ = streaming()
+    calls = []
+
+    def on_closed(observation, proposals, plan):
+        # The arm has not lifted yet when the hand has closed.
+        calls.append((names(executor)[-1], observation is not None, proposals is not None, plan is not None))
+
+    outcome = run(backends, on_held=lambda *context: None, on_closed=on_closed)
+    assert outcome.success and calls == [("grasp", True, True, True)]
+
+    def broken(*context):
+        raise RuntimeError("worker gone")
+
+    backends, executor, _, _, _ = streaming()
+    outcome = run(backends, on_held=lambda *context: None, on_closed=broken)
+    assert outcome.success and names(executor) == ["approach", "grasp", "lift", "hold"]
+    assert outcome.report["on_closed_errors"] == ["RuntimeError: worker gone"]

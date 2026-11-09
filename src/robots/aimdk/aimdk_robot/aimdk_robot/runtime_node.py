@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import sys
 import threading
 import time
@@ -146,6 +147,7 @@ class AimdkRuntimeNode(Node):
         self.declare_parameter("initial_mode", "")
         self.declare_parameter("instance_id", "")
         self.declare_parameter("startup_timeout_s", 20.0)
+        self.declare_parameter("cancel_return_motions", "")
         # In simulated transport the launch entry supplies the description it
         # also feeds to the synthetic sensor publishers, so what the runtime
         # advertises and what it produces cannot drift apart.
@@ -167,6 +169,11 @@ class AimdkRuntimeNode(Node):
             self._profile["modes"]["initial"] = initial_mode
 
         self._vendor = self._profile.get("vendor") or {}
+        return_motions = str(self.get_parameter("cancel_return_motions").value).strip()
+        if return_motions:
+            self._vendor.setdefault("named_motion", {})["cancel_return_motions"] = [
+                name.strip() for name in return_motions.split(",") if name.strip()
+            ]
         self._source = str((self._vendor.get("input_source") or {}).get("name", "ibrobot.aimdk_robot"))
         self._source_priority = int((self._vendor.get("input_source") or {}).get("priority", 30))
         self._stamp_window_s = float((self._vendor.get("command") or {}).get("stamp_window_s", 0.2))
@@ -1954,13 +1961,50 @@ class AimdkRuntimeNode(Node):
         Fresh by the end-to-end age: how old the measurement was when the data
         plane reported it, plus how long that report took to arrive here.
         """
+        sample = self.measured_arm_sample()
+        return sample[0] if sample is not None else None
+
+    def measured_arm_sample(self) -> tuple[list[float], float] | None:
+        """Fresh arm values and their conservative monotonic acquisition time."""
         with self._lock:
             arm = self._dataplane.arm_measured
             age = self._dataplane.arm_measured_age_s
-            if arm is None or age is None:
+            if (
+                arm is None
+                or age is None
+                or not math.isfinite(age)
+                or age < 0
+                or len(arm) != len(projection.VENDOR_ARM_ORDER)
+                or any(not math.isfinite(value) for value in arm)
+            ):
                 return None
             since = time.monotonic() - self._dataplane_at
-            return list(arm) if age + since <= self._feedback_window_s else None
+            return (list(arm), self._dataplane_at - age) if age + since <= self._feedback_window_s else None
+
+    def measured_hand_sample(self) -> tuple[list[float], float] | None:
+        """Fresh dexterous radians, left then right; absent hands are zero."""
+        with self._lock:
+            values, age = self._dataplane.hand_measured, self._dataplane.hand_measured_age_s
+            if values is None or age is None or not math.isfinite(age) or age < 0:
+                return None
+            if len(values) != 20 or any(not math.isfinite(v) for v in values):
+                return None
+            if age + time.monotonic() - self._dataplane_at > self._feedback_window_s:
+                return None
+            return list(values), self._dataplane_at - age
+
+    def command_recorded(self, positions, hands, *, owner, epoch):
+        with self._lock:
+            if self._arm_owner != owner or self._state.stop_epoch != epoch or not self.output_admitted():
+                return False
+            types = self._dataplane.hand_types
+            if len(types) != 2 or self.measured_hand_sample() is None:
+                return False
+            hands = [
+                value if vg.hand_type_family(types[k // 10]) == "dexterous" else 0.0 for k, value in enumerate(hands)
+            ]
+            self._named_arm_pub.publish(Float64MultiArray(data=[float(owner), *positions, *hands]))
+            return True
 
     def claim_arm(self, owner: int) -> bool:
         """Give the arm channel to a named motion; the public arm stream is refused meanwhile.

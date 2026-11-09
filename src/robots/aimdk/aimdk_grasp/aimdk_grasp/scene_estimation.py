@@ -12,7 +12,7 @@ from threading import RLock
 import numpy as np
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
-from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 from scipy.spatial.transform import Rotation
 
 from aimdk_grasp.frames import ImageTransform, rigid
@@ -840,8 +840,74 @@ def prepare_scene(
     )
 
 
-def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation=True):
-    """The mask-dependent half of estimate_scene; see prepare_scene."""
+#: Reusing an earlier support plane (``complete_scene(support_hint=...)``):
+#: the current frame must still show the table there. Table points within this
+#: horizontal radius of the target and this band around the plane are the
+#: evidence; their median offset and inlier share decide.
+SUPPORT_REUSE_RADIUS_M = 0.25
+SUPPORT_REUSE_BAND_M = 0.03
+SUPPORT_REUSE_MAX_OFFSET_M = 0.005
+SUPPORT_REUSE_MIN_INLIER_SHARE = 0.8
+
+
+def _reuse_support(hint, torso_from_camera, near_points, target_points, config):
+    """``hint`` (a torso-frame SupportPlane) in the camera frame if this frame confirms it, else None.
+
+    Returns (plane or None, report). The target checks are select_support_plane's
+    own (not below the plane, not too far above it, its centre over the patch);
+    on top, the current frame's table points around the target must lie on the
+    plane: the robot sways a few mm between captures and a moved table is not a
+    support. Any doubt falls back to the full search.
+    """
+    rotation, translation = torso_from_camera[:3, :3], torso_from_camera[:3, 3]
+    point = rotation.T @ (np.asarray(hint.point, float) - translation)
+    normal = rotation.T @ np.asarray(hint.normal, float)
+    normal /= np.linalg.norm(normal)
+    inliers = (np.asarray(hint.inliers, float) - translation) @ rotation
+    target, near = _points(target_points), _points(near_points)
+    report = {"accepted": False}
+    if not len(target) or len(inliers) < config.min_plane_points:
+        return None, dict(report, reason="no target or no hint patch")
+    values = (target - point) @ normal
+    quantiles = np.quantile(values, [0, 0.05, 0.5, 0.95, 1])
+    heights = dict(zip(("min", "p05", "median", "p95", "max"), quantiles.tolist(), strict=True))
+    report.update(p05_m=round(heights["p05"], 4), median_m=round(heights["median"], 4))
+    if heights["p05"] < -config.plane_threshold_m or not heights["median"] >= 0:
+        return None, dict(report, reason="target below the plane")
+    if heights["p05"] > config.max_support_gap_m:
+        return None, dict(report, reason="target too far above the plane")
+    basis = plane_basis(normal)
+    try:
+        hull = ConvexHull((inliers - point) @ basis[:, :2])
+    except QhullError:
+        return None, dict(report, reason="degenerate hint patch")
+    centre = np.median(target, axis=0)
+    outside = float(np.max(hull.equations[:, :2] @ ((centre - point) @ basis[:, :2]) + hull.equations[:, 2]))
+    report["outside_m"] = round(outside, 4)
+    if outside > config.table_margin_m:
+        return None, dict(report, reason="target centre outside the patch")
+    residual = (near - point) @ normal
+    lateral = (near - centre) - np.outer((near - centre) @ normal, normal)
+    ring = (np.linalg.norm(lateral, axis=1) <= SUPPORT_REUSE_RADIUS_M) & (np.abs(residual) <= SUPPORT_REUSE_BAND_M)
+    report["table_points"] = int(ring.sum())
+    if ring.sum() < config.min_plane_points:
+        return None, dict(report, reason="too few table points near the target")
+    offset = float(np.median(residual[ring]))
+    share = float(np.mean(np.abs(residual[ring] - offset) <= config.plane_threshold_m))
+    report.update(offset_m=round(offset, 4), inlier_share=round(share, 3))
+    if abs(offset) > SUPPORT_REUSE_MAX_OFFSET_M or share < SUPPORT_REUSE_MIN_INLIER_SHARE:
+        return None, dict(report, reason="the table moved or is not flat here")
+    return SupportPlane(point, normal, inliers, heights), dict(report, accepted=True)
+
+
+def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation=True, support_hint=None):
+    """The mask-dependent half of estimate_scene; see prepare_scene.
+
+    ``support_hint`` (a torso-frame SupportPlane from an earlier capture of the
+    same table) replaces the support search when this frame confirms it
+    (_reuse_support); otherwise the search runs as without it. The diagnostics
+    report the decision under ``support_reuse``.
+    """
     config = prepared.config
     started = time.perf_counter()
     if target_mask is None:
@@ -886,7 +952,14 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
     near = near & ~target
     torso_from_camera = prepared.torso_from_camera
     up_camera = torso_from_camera[:3, :3].T @ np.array([0.0, 0.0, 1.0])
-    plane_camera = select_support_plane(points[near], points[target], up_camera, config)
+    plane_camera, support_reuse = None, None
+    if support_hint is not None:
+        plane_camera, support_reuse = _reuse_support(
+            support_hint, torso_from_camera, points[near], points[target], config
+        )
+    if plane_camera is None:
+        plane_camera = select_support_plane(points[near], points[target], up_camera, config)
+    support_fitted = time.perf_counter()
     rotation, translation = torso_from_camera[:3, :3], torso_from_camera[:3, 3]
     support = SupportPlane(
         rotation @ plane_camera.point + translation,
@@ -931,6 +1004,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         meshes[name], mesh_counts[name] = mesh, counts
     finished = time.perf_counter()
     diagnostics = {
+        "support_reuse": support_reuse,
         "depth_points": prepared.depth_points,
         "reach_cropped_points": prepared.depth_points - input_count,
         "unreachable_near_points": int((~reachable & ~target).sum()),
@@ -957,6 +1031,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         "timings_s": {
             "unproject": prepared.unproject_s,
             "self_filter": prepared.self_filter_s + (filtered - started),
+            "support_fit": support_fitted - filtered,
             "support_plane": fitted - filtered,
             "mesh": finished - fitted,
             "total": prepared.unproject_s + prepared.self_filter_s + (finished - started),

@@ -20,7 +20,34 @@ from .scene_estimation import plane_basis
 PLACE_YAWS_DEG = tuple(range(0, 360, 30))
 PLACE_TILTS_DEG = (0.0, 20.0, 40.0)
 PLACE_TILT_DIRECTIONS = 4
-__all__ = ["PLACE_EXTRA_POSITIONS", "PlaceTargetConfig", "place_orientations", "place_targets"]
+__all__ = ["PLACE_EXTRA_POSITIONS", "PlaceTargetConfig", "opening_centre", "place_orientations", "place_targets"]
+
+
+def opening_centre(equations):
+    """Centre and radius of the largest circle inside a 2D convex hull (its Chebyshev centre).
+
+    ``equations`` are Qhull's facet rows (a, b, c): a*x + b*y + c <= 0 inside.
+    The mean of the hull's vertices is not a centre: a camera sees the near
+    rim densely and the far rim sparsely, so the vertex mean sits toward the
+    near side and its distance to the nearest edge understates the opening.
+    Live 2026-11-08 the same bowl measured 0.082-0.09 m from frame to frame and
+    was refused by 1 mm; a black bowl of ~0.09 m read 0.065 m. The largest
+    inscribed circle does not depend on how the rim points are spread.
+    """
+    from scipy.optimize import linprog
+
+    equations = np.asarray(equations, dtype=float)
+    norms = np.linalg.norm(equations[:, :2], axis=1)
+    result = linprog(
+        c=[0.0, 0.0, -1.0],
+        A_ub=np.column_stack([equations[:, :2], norms]),
+        b_ub=-equations[:, 2],
+        bounds=[(None, None), (None, None), (0.0, None)],
+        method="highs",
+    )
+    if not result.success:
+        raise ValueError(f"no inscribed circle in the opening: {result.message}")
+    return np.asarray(result.x[:2], dtype=float), float(result.x[2])
 
 
 def place_orientations(normal):
@@ -50,7 +77,7 @@ def place_targets(container, held, current_palm, config: PlaceTargetConfig = Pla
     local = container.opening @ basis
     hull = ConvexHull(local[:, :2])
     polygon = local[hull.vertices, :2]
-    center = polygon.mean(axis=0)
+    center = opening_centre(hull.equations)[0]
     fraction = config.edge_fraction
     samples = np.vstack([center, (1.0 - fraction) * center + fraction * polygon])
     clearance = held.radius_m + float(container.report.get("wall_margin_m", 0.015))

@@ -20,7 +20,13 @@ class PlaceSequenceResult:
 class PlaceSequence:
     def __init__(self, backends, *, on_phase=lambda *_: None):
         self.backends, self.phase = backends, on_phase
-        self.sequence = GraspSequence(backends, on_phase=on_phase)
+
+        def sequence_phase(name, event, detail):
+            if name == EffectorAction.RELEASE.value and event == "start":
+                detail = {**detail, "release_status": "UNKNOWN"}
+            on_phase(name, event, detail)
+
+        self.sequence = GraspSequence(backends, on_phase=sequence_phase)
 
     def _remember_failure(self, result, code, message):
         if not result.first_failure:
@@ -44,8 +50,46 @@ class PlaceSequence:
             # The planning or motion failure is the one to report.
             result.message = f"{result.message}; then could not return home: {exc}"
             self._stop(result, str(exc))
+            if result.recovery_state == "UNKNOWN":
+                result.custody_outcome = "uncertain"
             self.phase("recover", "end", {"state": "failed", "recovery_state": result.recovery_state})
             return False
+
+    def _release_after_drop(self, cancelled, record, result):
+        result.release_status, result.custody_outcome = "unknown", "uncertain"
+        self.sequence._expect_effect(self.sequence._act(EffectorAction.RELEASE, lambda: False, cancelled, record))
+        released = getattr(self.backends.effector, "released", None)
+        if released is None or not released():
+            raise _Stopped("RELEASE_UNCERTAIN", "open, empty hand could not be confirmed after a drop")
+        result.release_status, result.custody_outcome = "released", "lost"
+        self.phase("release_confirmed", "end", {"release_status": "RELEASED"})
+
+    def recover_before_transfer(self, *, go_home, cancelled):
+        """Close a known preparation-stage drop with fresh release and home feedback.
+
+        No placement segment has started. Keep the placement failure, but do
+        not leave an empty, recovered hand in a permanent uncertain custody.
+        """
+        result = PlaceSequenceResult(custody_outcome="uncertain")
+        record = SequenceResult()
+        self.phase("recover", "start", {"recovery_state": "IN_PROGRESS"})
+        try:
+            if cancelled():
+                raise _Stopped("CANCELED", "drop recovery canceled or out of time")
+            if go_home is None:
+                raise _Stopped("RECOVERY_UNAVAILABLE", "no fresh home planner is available")
+            self._release_after_drop(cancelled, record, result)
+            if not self._return_home(go_home, cancelled, record, result):
+                return result
+            result.recovery_state = "COMPLETED"
+            self.phase("recover", "end", {"recovery_state": "COMPLETED"})
+        except Exception as exc:
+            result.reason_code = getattr(exc, "code", "MOTION_FAILED")
+            result.message = str(exc)
+            result.custody_outcome = "uncertain"
+            self._stop(result, result.message)
+            self.phase("recover", "end", {"state": "failed", "recovery_state": result.recovery_state})
+        return result
 
     def run(self, plan, *, cancelled, go_home=None):
         """``go_home`` plans the empty hand's way home (a ``Move``) after a drop in transfer."""
@@ -85,10 +129,7 @@ class PlaceSequence:
                             self.sequence._expect(
                                 self.sequence._move(previous.reversed(), False, lambda: False, cancelled, record)
                             )
-                        self.sequence._expect_effect(
-                            self.sequence._act(EffectorAction.RELEASE, lambda: False, cancelled, record)
-                        )
-                        result.custody_outcome = "lost"
+                        self._release_after_drop(cancelled, record, result)
                         # The planned post-release retreat starts at the release pose,
                         # so it cannot be reused from the handover pose: plan home afresh.
                         if go_home is not None and not self._return_home(go_home, cancelled, record, result):
@@ -107,6 +148,7 @@ class PlaceSequence:
                         raise _Stopped("RELEASE_UNCERTAIN", "open hand and release could not be confirmed")
                     carrying = False
                     result.release_status, result.custody_outcome = "released", "released"
+                    self.phase("release_confirmed", "end", {"release_status": "RELEASED"})
                 elif isinstance(step, Hold):
                     self.sequence._expect(self.sequence._hold(step, carrying, cancelled, record))
             result.success = True

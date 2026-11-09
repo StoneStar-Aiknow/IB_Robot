@@ -348,6 +348,9 @@ def test_program_terminal_records_gateway_progress_and_exposes_the_ledger():
             "recovery_state": "UNKNOWN",
             "retry_count": 0,
             "suggested_action": "MANUAL_CHECK",
+            "release_status": "UNKNOWN",
+            "verification_status": "UNKNOWN",
+            "place_succeeded": False,
         },
     }
     assert adapter.lookup_execution("request-wave")["completed_step_count"] == 2
@@ -1084,3 +1087,27 @@ def test_gateway_catalog_names_every_x2_skill_by_its_chinese_alias():
     # Every gesture the X2 planner can pick has one, so no X2 plan summary falls back to a skill id.
     assert {skill["name"] for skill in catalog["skills"] if skill["planner_visible"]} <= set(names)
     assert names["wave_hand"] == "挥手"
+
+
+@pytest.mark.parametrize("catalog_view", ["full", "planner"])
+def test_planner_config_routes_container_to_actual_model_prompt(monkeypatch, catalog_view):
+    import embodied_common.vlm_api_client as client_module
+    from ibrobot_agent.node import _planner_from_config
+
+    delivery = {"container_name": "configured bowl", "container_label": "配置的碗"}
+    monkeypatch.setattr(client_module, "VLMAPIClient", lambda **kwargs: object())
+    planner = _planner_from_config(
+        json.dumps(
+            {
+                "mode": "vlm",
+                "provider": "openai",
+                "base_url": "http://unused.invalid",
+                "model": "test",
+                "catalog_view": catalog_view,
+                "fruit_delivery": delivery,
+            }
+        )
+    )
+    request = type("Request", (), {"text": "我要苹果", "reply_to_request_id": ""})()
+    messages = planner._prompt_builder(request=request, context={}, catalog={"skills": []})
+    assert json.loads(messages[1]["content"])["deployment"]["fruit_delivery"] == delivery

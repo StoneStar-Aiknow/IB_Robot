@@ -1,0 +1,10 @@
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: runtime_play_audio
+binding:
+  # Logical clip name; embodied.runtime_play_audio.clips resolves the file path.
+  clip: pick_scope
+required_args: []
+# The clip runs 5.4 s; the timeout covers playback plus service startup.
+timeout_sec: 15.0

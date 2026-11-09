@@ -125,6 +125,19 @@ class PerceptionServices:
         self.timeout_s = timeout_s
         self.calls: list[dict] = []
 
+    def wait_ready(self, *, deadline: float, cancelled: Flag) -> None:
+        """Check configured service availability without inventing an object query."""
+        for client in (self._detect, self._segment, self._grasps):
+            if client is None:
+                continue
+            if cancelled():
+                raise GraspFailure("CANCELED", "perception readiness canceled")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise GraspFailure("SKILL_TIMEOUT", "perception readiness deadline passed")
+            if not client.service_is_ready() and not client.wait_for_service(timeout_sec=min(2.0, remaining)):
+                raise GraspFailure(RPC_FAILED, f"{client.srv_name} is not available")
+
     def detect(
         self,
         rgb,

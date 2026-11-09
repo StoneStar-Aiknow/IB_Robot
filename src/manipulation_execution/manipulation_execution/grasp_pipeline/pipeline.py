@@ -114,9 +114,16 @@ class GraspPipeline:
         on_phase: PhaseCallback = lambda name, event, detail: None,
         release_after_success: bool = False,
         on_held: Callable | None = None,
+        on_closed: Callable | None = None,
     ) -> PickOutcome:
-        """``deadline`` is on this pipeline's clock; ``cancelled`` is the goal's own flag."""
+        """``deadline`` is on this pipeline's clock; ``cancelled`` is the goal's own flag.
+
+        ``on_closed(observation, proposals, plan)`` runs when the hand has closed on
+        a plan's target, before the lift: a retained pick starts describing the held
+        object there (it must not block; an exception is only reported).
+        """
         outcome = PickOutcome(mode=mode.value)
+        self._on_closed = on_closed
         outcome.execution_detail = replace(outcome.execution_detail, phase="validate", phase_state="RUNNING")
         if not str(query).strip():
             return self._fail(outcome, "INVALID_TARGET", "empty target query")
@@ -159,11 +166,14 @@ class GraspPipeline:
         try:
             result = self._run(query, mode, deadline, cancelled, stop, phase, release_after_success, outcome)
             if result.success and result.held is True and not result.released_after_success and on_held is not None:
+                began = time.monotonic()
                 try:
                     on_held(*self._held_context)
                 except Exception as exc:
                     result.at_rest = False
                     return self._fail(result, "CUSTODY_FAILED", f"could not retain held object: {exc}")
+                finally:
+                    result.report.setdefault("handover_s", {})["retain"] = round(time.monotonic() - began, 4)
             return result
         finally:
             # The goal is over: the robot keeps holding what it was last sent.
@@ -302,6 +312,17 @@ class GraspPipeline:
             phase(name, event, detail)
             if watched is not None:
                 watched(name, event)
+            closed = getattr(self, "_on_closed", None)
+            if (
+                closed is not None
+                and name == "close"
+                and event == "end"
+                and detail.get("state", "succeeded") == "succeeded"
+            ):
+                try:
+                    closed(observation, proposals, plan)
+                except Exception as exc:  # noqa: BLE001 - the pick goes on; the handover computes inline
+                    outcome.report.setdefault("on_closed_errors", []).append(f"{type(exc).__name__}: {exc}")
 
         sequence = GraspSequence(self._backends, home_tolerance_rad=self._config.home_tolerance_rad, on_phase=on_phase)
         if watch is not None:
@@ -311,12 +332,17 @@ class GraspPipeline:
         try:
             result = sequence.run(plan, deadline=deadline, cancelled=stop, release_after_success=release)
         finally:
+            # From the arm's last step to the terminal record (the handover to a place).
+            sequence_done = time.monotonic()
+            handover = outcome.report.setdefault("handover_s", {})
+            handover["_sequence_done"] = sequence_done
             if watch is not None:
                 try:
                     report = dict(watch.disarm())
                 except Exception as exc:
                     report = {"error": f"{type(exc).__name__}: {exc}"}
                 outcome.report.setdefault("watch", []).append(report)
+            handover["watch_disarm"] = round(time.monotonic() - sequence_done, 4)
         outcome.held, outcome.held_confidence, outcome.at_rest = result.held, result.held_confidence, result.at_rest
         outcome.released_after_success = result.released_after_success
         outcome.execution_detail = replace(outcome.execution_detail, recovery_state=result.recovery_state)

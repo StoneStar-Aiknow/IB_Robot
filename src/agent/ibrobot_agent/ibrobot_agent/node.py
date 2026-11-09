@@ -1078,6 +1078,7 @@ class IncubationAgentNode(Node):
             ),
             robot_scope=str(self.get_parameter("robot_scope").value),
             direct_commands=_direct_commands_from_config(str(self.get_parameter("planner_config_json").value)),
+            fruit_delivery=json.loads(str(self.get_parameter("planner_config_json").value)).get("fruit_delivery"),
             pose_preview=self._pose_preview,
             pose_memory=self._pose_preview
             if self._pose_preview is not None and self._pose_preview.has_pose_services
@@ -1327,6 +1328,9 @@ def _planner_from_config(raw: str):
         raise ValueError("planner_config_json must contain a JSON object") from exc
     if not isinstance(config, dict):
         raise ValueError("planner_config_json must contain a JSON object")
+    from ibrobot_agent.planner import fruit_delivery_from_config
+
+    fruit_delivery = fruit_delivery_from_config(config)
     mode = config.get("mode", "rule")
     if mode == "rule":
         return RulePlanner()
@@ -1369,9 +1373,16 @@ def _planner_from_config(raw: str):
     if stream and str(config.get("api_protocol", "chat_completions")) == "responses":
         raise ValueError("Agent planner stream requires api_protocol chat_completions")
 
+    def prompt_builder(*, request, context, catalog):
+        if catalog_view != "full":
+            from robot_skill_cli.catalog import planner_catalog_view
+
+            catalog = planner_catalog_view(catalog)
+        return build_planner_messages(request=request, context=context, catalog=catalog, fruit_delivery=fruit_delivery)
+
     return PlannerAdapter(
         client,
-        prompt_builder=build_planner_messages if catalog_view == "full" else planner_prompt_builder,
+        prompt_builder=prompt_builder,
         enable_thinking=enable_thinking,
         max_tokens=max_tokens,
         extra_body=extra_body,

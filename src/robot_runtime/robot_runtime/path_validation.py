@@ -46,4 +46,7 @@ def path_validation_identity(composer):
     policy = normalize_path_validation(composer.get("path_validation"))
     # Deployment paths are not execution semantics; exact file content is.
     policy.pop("certificate_file", None)
-    return {"path_validation_digest": policy_digest(policy)}
+    result = {"path_validation_digest": policy_digest(policy)}
+    if composer.get("display_completion"):
+        result["pose_completion_digest"] = policy_digest(composer["display_completion"])
+    return result

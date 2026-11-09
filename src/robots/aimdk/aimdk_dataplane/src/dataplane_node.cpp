@@ -593,6 +593,9 @@ private:
     status["control_seq"] = core_.control_seq();
     status["groups"] = core_.group_ages(now_s);
     status["hand_types"] = core_.hand_types();
+    const auto hand = core_.measured_hand(now_s);
+    status["hand_measured"] = hand ? nlohmann::json(hand->position) : nlohmann::json(nullptr);
+    status["hand_measured_age_s"] = hand ? nlohmann::json(hand->age_s) : nlohmann::json(nullptr);
     const auto arm = core_.measured_with_age(kVendorArmOrder, now_s);
     status["arm_measured"] = arm ? nlohmann::json(arm->position) : nlohmann::json(nullptr);
     status["arm_measured_age_s"] = arm ? nlohmann::json(arm->age_s) : nlohmann::json(nullptr);

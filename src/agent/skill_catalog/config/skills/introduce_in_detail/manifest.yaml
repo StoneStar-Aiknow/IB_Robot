@@ -1,0 +1,44 @@
+schema_version: 1
+name: introduce_in_detail
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Give the longer recorded introduction of the platform and the Agent.
+  category: social_interaction
+  when_to_use:
+  - the visitor explicitly asks for a detailed introduction or the principle
+  do_not_use:
+  - condition: the visitor only asks who the robot is
+    instead_use: self_introduction
+  aliases_zh:
+  - 详细介绍一下
+  - 详细介绍一下你自己
+  - 详细讲一下原理
+  aliases_en:
+  - introduce yourself in detail
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 22.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Play the 22 s recorded introduction of the platform and the Agent. Use
+    only when the visitor explicitly asks for detail, such as 详细介绍一下 or 详细讲一下原理. Playback
+    can be cancelled through the Agent.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

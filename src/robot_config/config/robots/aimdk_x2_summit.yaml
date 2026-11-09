@@ -1,0 +1,207 @@
+robot:
+  base_config: aimdk_x2_voice_mirror_grasp.yaml
+  name: aimdk_x2_summit
+  runtime:
+    cancel_return_motions: wave,short_wave,invite,self_intro,explain
+    profile: x2_ultra_omnihand_summit
+  # One deployment for mirror, presentation and fruit delivery. Mirror takes
+  # over model_inference; the Gateway still selects each skill's own mode.
+  default_control_mode: model_inference
+  skill_required_control_mode: model_inference
+  skill_supported_control_modes:
+  - model_inference
+  - moveit_planning
+  - named_motion
+  pose_composer:
+    display_completion:
+      pose_ids: [arms_forward, arms_up, arms_out, arms_v, flex, surrender, right_forward, left_forward]
+      mode: playback_only
+  # Voiceprint for the speaker check below (CAMPPlus on the CPU). The bundle ships in the
+  # deployment's models/ directory, next to the ASR bundle.
+  voice_asr:
+    speaker_embedding:
+      enabled: true
+  mirror_session:
+    enabled: true
+  motion_imitation_stream:
+    enabled: true
+    pause_during_manipulation: true
+  # Inherit both HRI services and all three grasp services from the combined
+  # base instead of replacing its model list. CBF stays disabled as in that
+  # base: both executors share policy_stream without an arm-owner identity.
+  cbf_safety:
+    hands_installed: [true, true]
+  embodied:
+    runtime_named_motion:
+      hand_preparation:
+        factory: aimdk_grasp.hand_restore_ros:create_named_motion_hand_preparer
+        motions: [wave, raise_hand, blow_kiss, clap, handshake]
+    skill_catalog_profile: aimdk_x2_summit
+    agent:
+      test_allowlist:
+      - wave_hand
+      - handshake
+      - raise_hand
+      - blow_kiss
+      - clap_hands
+      - greet_visitor
+      - self_introduction
+      - introduce_platform
+      - introduce_agent
+      - introduce_in_detail
+      - explain_pick_scope
+      - offer_fruit_menu
+      - mirror_start
+      - mirror_stop
+      - pick_object
+      - place_in_container
+      - return_to_task_pose
+      - invite_visitor
+      - free_pose
+      planner:
+        fruit_delivery:
+          container_name: an orange bowl
+          container_label: 橙色的碗
+        direct_commands:
+          你好: greet_visitor
+          你好呀: greet_visitor
+          自我介绍: self_introduction
+          介绍一下你自己: self_introduction
+          你是谁: self_introduction
+          欢迎: greet_visitor
+          介绍一下芯片和系统: introduce_platform
+          你的Agent有什么用: introduce_agent
+          随便玩一下: invite_visitor
+          开始照镜子: mirror_start
+          停止照镜子: mirror_stop
+          动作模仿: mirror_start
+          跟着我做: mirror_start
+          学我的动作: mirror_start
+      voice_bridge:
+        persistent_session: true
+        # After "欧拉欧拉" only the voice that woke the robot is followed; stop words still
+        # work from any voice.
+        speaker_check_enabled: true
+        speaker_min_similarity: 0.45
+        # Intent (semantic) gate: the model ships with the deployment, and a missing or stale
+        # model stops the bridge at launch instead of silently turning the gate off.
+        semantic_gate_model_path: $(env WORKSPACE)/models/addressee/addressee_zh_v1.json
+        semantic_gate_fail_open: false
+        # The inherited lexicon predates the summit skills: add their catalog aliases
+        # (tools/addressee/emit_lexicon.py) and the three fruits, or "我想要一个橘子" and
+        # "介绍一下芯片和系统" would rest on a model that never saw them.
+        # The planner's direct commands (above) are questions to the robot; the gate must
+        # never veto them, whatever their length ("你的Agent有什么用" is 11 characters).
+        semantic_gate_dialogue_requests:
+          __append__:
+          - 自我介绍
+          - 介绍一下你自己
+          - 你是谁
+          - 介绍一下芯片和系统
+          - 你的Agent有什么用
+          - 随便玩一下
+        semantic_gate_lexicon:
+          __append__:
+          - 能抓任何东西吗
+          - 什么都能抓吗
+          - 你能拿什么
+          - 摆个姿势
+          - 手伸直
+          - 双手举起来
+          - 双臂放下
+          - 手放下
+          - 弯曲手臂
+          - 叉腰
+          - 你好
+          - 你好呀
+          - 打个招呼
+          - 跟大家打招呼
+          - 欢迎一下
+          - Agent有什么用
+          - 你聪明在哪
+          - 你的智能体是干什么的
+          - 详细介绍一下
+          - 详细介绍一下你自己
+          - 详细讲一下原理
+          - 用什么芯片
+          - 什么芯片
+          - 什么系统
+          - 你的系统是什么
+          - 你用的是什么系统
+          - 邀请选择玩法
+          - 随便玩一下
+          - 我想体验一下
+          - 动作模仿
+          - 照镜子
+          - 跟着我做
+          - 学我的动作
+          - 选水果
+          - 水果礼物
+          - 我要水果
+          - 有什么水果
+          - 柠檬
+          - 苹果
+          - 橙子
+          - 橘子
+          - 水果
+        silent_skills:
+        - greet_visitor
+        - self_introduction
+        - introduce_platform
+        - introduce_agent
+        - introduce_in_detail
+        - explain_pick_scope
+        - offer_fruit_menu
+        - invite_visitor
+        stop_phrases:
+        - 别动了
+        - 别动
+        - 停止
+        - 停下
+        - 停
+        - stop
+        - halt
+        - 不玩了
+        - 不拿了
+        speech_mode: concise
+        speech_messages:
+          start: 好，我这就去拿，请稍等。
+          waiting: 我正在确认水果的位置，请先别移动桌上的物品。
+          recover: ''
+          recovered: ''
+          retry: 哎呀，这次没成功，我再试一下。
+          retry_recovered: 哎呀，这次没成功，我再试一下。
+          retry_EMPTY_GRASP: 哎呀，这次没成功，我再试一下。
+          retry_TARGET_NOT_VISIBLE: 哎呀，这次没成功，我再试一下。
+          retry_TARGET_MOVED: 水果的位置变了，我重新确认一下。
+          success: 成功拿到啦！小礼物请找旁边的工作人员领取。
+          completed: 成功拿到啦！小礼物请找旁边的工作人员领取。
+          canceled: 已经停下了。
+          not_started: 好的，这次先不拿。
+          unknown: 动作状态还需要确认，请先别靠近，工作人员正在处理。
+          recovery_failed: 动作状态还需要确认，请先别靠近，工作人员正在处理。
+          manual_check: 这次没有完成，请工作人员帮我看看。
+          failed: 还是没成功，请工作人员帮我一下。
+          reason_INVALID_TARGET: 请说一下水果名称：柠檬、苹果，还是橙子？
+          reason_TARGET_NOT_VISIBLE: 我没看到这个水果，请工作人员帮我看看。
+          reason_OUT_OF_REACH: 还是没成功，请工作人员帮我一下。
+          reason_NO_COMPLETE_PATH: 还是没成功，请工作人员帮我一下。
+          reason_NO_EXECUTABLE_CANDIDATE: 还是没成功，请工作人员帮我一下。
+          reason_PLAN_TIMEOUT: 还是没成功，请工作人员帮我一下。
+          reason_OBSERVATION_UNAVAILABLE: 还是没成功，请工作人员帮我一下。
+          reason_REOBSERVE_REQUIRED: 还是没成功，请工作人员帮我一下。
+          reason_TARGET_MOVED: 还是没成功，请工作人员帮我一下。
+          reason_EMPTY_GRASP: 还是没成功，请工作人员帮我一下。
+          reason_GRIP_LOST: 还是没成功，请工作人员帮我一下。
+          reason_GRASP_VERIFICATION_FAILED: 还是没成功，请工作人员帮我一下。
+          reason_EXECUTION_BUDGET_INSUFFICIENT: 还是没成功，请工作人员帮我一下。
+    runtime_play_audio:
+      clips:
+        greeting: $(env WORKSPACE)/commissioning/audio/summit/greeting.wav
+        self_intro: $(env WORKSPACE)/commissioning/audio/summit/self_intro.wav
+        intro_platform: $(env WORKSPACE)/commissioning/audio/summit/intro_platform.wav
+        intro_agent: $(env WORKSPACE)/commissioning/audio/summit/intro_agent.wav
+        intro_detail: $(env WORKSPACE)/commissioning/audio/summit/intro_detail.wav
+        pick_scope: $(env WORKSPACE)/commissioning/audio/summit/pick_scope.wav
+        fruit_menu: $(env WORKSPACE)/commissioning/audio/summit/fruit_menu.wav
+        invitation: $(env WORKSPACE)/commissioning/audio/summit/invitation.wav

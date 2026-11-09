@@ -1,5 +1,7 @@
 """Held-hand placement planning; independent of pick's open-hand admission."""
 
+import json
+import sys
 import time
 
 import numpy as np
@@ -125,29 +127,48 @@ class X2PlacePlanner:
             feedback.vector(held.joint_names), held.joint_positions, atol=0.02, rtol=0
         ):
             raise GraspFailure("HELD_OBJECT_MISMATCH", "holding arm moved from the handover pose")
+        # Where a place plan's seconds go, for successes and failures alike:
+        # one JSON line on stderr (the head log) and, on success, the report.
+        started = time.perf_counter()
+        timings: dict = {}
+        trace = {"outcome": "error", "planner": {}}
+
+        def lap(name, since):
+            now = time.perf_counter()
+            timings[name] = round(now - since, 4)
+            return now
+
         try:
+            tick = time.perf_counter()
             measured_spheres(parts.spheres, feedback)
             palm = np.eye(4)
             palm[:3] = parts.spheres.last_link_frames[0, parts.spheres.link_indices["R_palm"]]
             targets = place_targets(container, held, palm, robot.place)
             attached = placement_cover(parts.spheres, feedback, held)
             opening = opening_cover(parts.spheres, feedback, held)
+            tick = lap("targets", tick)
             with parts.gpu:
+                tick = lap("gpu_wait", tick)
                 # The arm's own warmed grasp planner, the held object attached
                 # in place: a carry neither rebuilds nor re-warms the planner.
                 with parts.service.session(feedback, container.scene, attached=attached) as planner:
+                    tick = lap("session", tick)
                     check()
-                    paths = planner.plan_place(
-                        feedback,
-                        targets,
-                        held.home_positions,
-                        admitted.admitted_at,
-                        check_deadline=check,
-                        deadline=time.perf_counter() + max(0, deadline - time.monotonic()),
-                        opening=opening,
-                        return_path=held_return_path(held),
-                    )
-                    selected = dict(getattr(planner, "place_report", {}))
+                    try:
+                        paths = planner.plan_place(
+                            feedback,
+                            targets,
+                            held.home_positions,
+                            admitted.admitted_at,
+                            check_deadline=check,
+                            deadline=time.perf_counter() + max(0, deadline - time.monotonic()),
+                            opening=opening,
+                            return_path=held_return_path(held),
+                        )
+                    finally:
+                        tick = lap("plan_place", tick)
+                        selected = dict(getattr(planner, "place_report", {}))
+                        trace["planner"] = selected
                 report = {
                     "arm_side": side,
                     "attachment": ATTACH_LINK,
@@ -159,12 +180,17 @@ class X2PlacePlanner:
                 report["max_sag_rad"] = require_executable(
                     {str(i): path.positions for i, path in enumerate(paths)}, robot.limits, robot.gravity
                 )
+                tick = lap("executable", tick)
             # A plan may take seconds: recapture and recheck the locked posture
             # before returning it. Grip is checked by the pipeline throughout.
             current = parts.camera.capture_state()
             require_fresh(current, parts.camera.clock(), robot.planning.revalidation)
             require_posture(feedback, current.feedback, robot.planning.revalidation, side=side)
             check()
+            lap("recheck", tick)
+            timings["total"] = round(time.perf_counter() - started, 4)
+            report["plan_timings_s"] = dict(timings)
+            trace["outcome"] = "ok"
             transfer, descent, retreat, home = paths
             return PlacePlan(
                 (Move(segment("transfer", transfer, side)), Move(segment("descend", descent, side))),
@@ -173,12 +199,22 @@ class X2PlacePlanner:
                 container,
                 report,
             )
-        except GraspFailure:
+        except GraspFailure as exc:
+            trace["outcome"] = exc.code
             raise
         except (PlacementSearchExhausted, TimeoutError, ReobserveRequired) as exc:
+            trace["outcome"] = type(exc).__name__
             raise GraspFailure("PLACE_PLAN_FAILED", str(exc), retryable=True) from exc
         except (RuntimeError, ValueError, PlannerFault) as exc:
+            trace["outcome"] = type(exc).__name__
             raise GraspFailure("PLACE_PLAN_FAILED", str(exc)) from exc
+        finally:
+            timings.setdefault("total", round(time.perf_counter() - started, 4))
+            print(
+                json.dumps({"place_plan": {"arm_side": side, **trace, "timings_s": timings}}, default=str),
+                file=sys.stderr,
+                flush=True,
+            )
 
     def plan_home(self, held, *, deadline, cancelled):
         """The empty, open hand's way home after a drop, planned on a fresh capture.

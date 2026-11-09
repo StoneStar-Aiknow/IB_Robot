@@ -178,6 +178,7 @@ def terminal_record(outcome: PickOutcome, pre_motion: PreMotionTimer | None = No
         "retries": outcome.retries,
         "first_execution_failure": report.get("first_execution_failure"),
         "execution_failures": report.get("execution_failures", []),
+        "handover_s": report.get("handover_s"),
         "pre_motion": None if pre_motion is None else {**pre_motion.record(), **thinking_report(report)},
         "watch": [
             {key: watch[key] for key in WATCH_LOG_KEYS if key in watch}
@@ -315,6 +316,13 @@ class GraspPipelineNode(Node):
             result = pick_result(outcome, self._identity)
             result.last_feedback_sequence = goal_handle.phase_sequence
             result.execution_history = list(goal_handle.phase_history)
+            handover = outcome.report.get("handover_s")
+            if isinstance(handover, dict):
+                handover.update(getattr(self, "_retain_timings", {}))
+                self._retain_timings = {}
+                done = handover.pop("_sequence_done", None)
+                if done is not None:
+                    handover["to_terminal"] = round(time.monotonic() - done, 4)
             self.get_logger().info(json.dumps(terminal_record(outcome, timer), default=_json_value))
             if not outcome.at_rest:
                 self.get_logger().error(f"arm stopped in place: {outcome.error_code}: {outcome.message}")
@@ -367,13 +375,18 @@ class GraspPipelineNode(Node):
             on_held=(lambda observation, proposals, plan: self._retain(goal, observation, proposals, plan))
             if goal.retain_for_place
             else None,
+            # Describe the held object while the arm lifts (held_builder.prepare).
+            on_closed=getattr(self._backends.held_object, "prepare", None) if goal.retain_for_place else None,
         )
 
     def _retain(self, goal, observation, proposals, plan):
         from manipulation_execution.grasp_pipeline.sequence import GraspSequence
 
         backends = self._backends
+        began = time.monotonic()
         held = backends.held_object(str(goal.target_query).strip(), observation, proposals, plan)
+        self._retain_timings = {"held_object": round(time.monotonic() - began, 4)}
+        accepting = time.monotonic()
 
         def recover():
             return GraspSequence(backends).take_back(plan, cancelled=self._closing.is_set)
@@ -399,6 +412,7 @@ class GraspPipelineNode(Node):
             drop=drop if backends.plan_home is not None else None,
             settled=home_settled(backends, held),
         )
+        self._retain_timings["custody_accept"] = round(time.monotonic() - accepting, 4)
 
     def _releases(self, goal) -> bool:
         """Whether this pick puts the object back: the goal asks, or the robot always does."""

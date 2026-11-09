@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
@@ -13,7 +14,14 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity
-from embodied_common.execution_detail import ExecutionDetail, fill_execution_detail, short_message
+from embodied_common.execution_detail import (
+    PLACE_RELEASE_STATES,
+    PLACE_VERIFICATION_STATES,
+    ExecutionDetail,
+    fill_execution_detail,
+    place_execution_detail,
+    short_message,
+)
 from ibrobot_msgs.action import PickObject, PlaceObject
 
 from .grasp_pipeline.contracts import GraspFailure, PlaceBackends
@@ -144,8 +152,10 @@ class PlacePipelineNode(Node):
                 self.custody.returned(outcome.custody_outcome, outcome.reason_code)
             except GraspFailure as failure:
                 outcome.success, outcome.reason_code = False, failure.code
-                outcome.execution_detail = ExecutionDetail(
-                    schema_version=1,
+                outcome.execution_detail = replace(
+                    outcome.execution_detail,
+                    schema_version=2,
+                    place_succeeded=False,
                     phase="return_custody",
                     phase_state="FAILED",
                     failed_phase="return_custody",
@@ -187,17 +197,18 @@ class PlacePipelineNode(Node):
             last_feedback_sequence=sequence,
             execution_history=list(history),
         )
-        result.release_status = {
-            "not_released": result.RELEASE_NOT_RELEASED,
-            "released": result.RELEASE_RELEASED,
-            "unknown": result.RELEASE_UNKNOWN,
-        }[outcome.release_status]
-        result.verification_status = {
-            "not_run": result.VERIFICATION_NOT_RUN,
-            "success": result.VERIFICATION_SUCCESS,
-            "failed": result.VERIFICATION_FAILED,
-            "uncertain": result.VERIFICATION_UNCERTAIN,
-        }[outcome.verification]
+        result.release_status = next(
+            number for number, state in PLACE_RELEASE_STATES.items() if state == outcome.release_status.upper()
+        )
+        result.verification_status = next(
+            number for number, state in PLACE_VERIFICATION_STATES.items() if state == outcome.verification.upper()
+        )
+        outcome.execution_detail = place_execution_detail(
+            outcome.execution_detail,
+            release_status=outcome.release_status.upper(),
+            verification_status=outcome.verification.upper(),
+            place_succeeded=outcome.success,
+        )
         fill_execution_detail(result.execution_detail, outcome.execution_detail)
         fill_delegated_executor_identity(result.actual_executor, self.identity)
         if outcome.success:

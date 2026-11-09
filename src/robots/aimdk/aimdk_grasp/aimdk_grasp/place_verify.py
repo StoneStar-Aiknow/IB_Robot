@@ -8,6 +8,7 @@ from scipy.spatial import ConvexHull
 from manipulation_execution.grasp_pipeline.contracts import GraspFailure, PlaceVerdict
 
 from .container_proposer import detect_masks
+from .place_targets import opening_centre
 from .proposer import PerceptionSettings
 from .scene_estimation import plane_basis
 
@@ -33,7 +34,7 @@ class PlaceVerifier:
         basis = plane_basis(container.normal)
         polygon = container.opening @ basis
         hull = ConvexHull(polygon[:, :2])
-        centre = polygon[:, :2].mean(axis=0)
+        centre = opening_centre(hull.equations)[0]
         intrinsics = observation.intrinsics
         candidates = []
         masks = detect_masks(self.services, observation, held.target_query, cancelled=cancelled, settings=self.settings)

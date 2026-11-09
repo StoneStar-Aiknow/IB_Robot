@@ -48,3 +48,35 @@ capability:
   - motion.named
 implementations:
   x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml
+description_variants:
+  aimdk_x2_summit:
+    summary: Wave one hand in greeting or farewell. Open installed hands before arm
+      playback.
+    category: social_greeting
+    when_to_use:
+    - greet someone casually
+    - say hi or bye
+    - wave to a person
+    do_not_use:
+    - condition: greet someone formally
+      instead_use: handshake
+    - condition: volunteer or ask for attention
+      instead_use: raise_hand
+    aliases_zh:
+    - 挥手
+    - 挥挥手
+    - 打招呼
+    - 招手
+    - 再见
+    aliases_en:
+    - wave
+    - wave hello
+    - say goodbye
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 45.0
+    requires_motion_params: false

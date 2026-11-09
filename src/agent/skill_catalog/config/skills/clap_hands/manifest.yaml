@@ -45,3 +45,32 @@ capability:
   - motion.named
 implementations:
   x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml
+description_variants:
+  aimdk_x2_summit:
+    summary: Clap both hands to applaud or celebrate. Open installed hands before
+      arm playback.
+    category: social_emotion
+    when_to_use:
+    - applaud someone
+    - celebrate a result
+    - cheer a performance
+    do_not_use:
+    - condition: show affection
+      instead_use: blow_kiss
+    - condition: ask for attention
+      instead_use: raise_hand
+    aliases_zh:
+    - 鼓掌
+    - 拍手
+    - 拍拍手
+    aliases_en:
+    - clap
+    - applaud
+    motion_scope:
+    - arm
+    - gripper
+    anchor_pose: none
+    intensity: moderate
+    duration_sec_estimate: 45.0
+    requires_motion_params: false

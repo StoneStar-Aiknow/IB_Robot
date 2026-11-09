@@ -100,6 +100,8 @@ def direct_command_outcome(text: str, commands: Mapping[str, str], catalog: Mapp
         ),
         None,
     )
+    if skill_name in {"pick_object", "place_in_container"}:
+        return None  # Manipulation needs parameters and possibly a paired workflow.
     if entry is None:
         return None
     schema_version = entry.get("schema_version", 1)
@@ -221,6 +223,42 @@ def _repair_untrusted_reply(payload: Mapping[str, Any]) -> tuple[dict[str, Any],
             repairs.append(PlannerRepair("reason_code", "defaulted", original))
             data["reason_code"] = _REASON_CODE_FALLBACK
     return data, tuple(repairs)
+
+
+def fruit_delivery_from_config(config: Mapping[str, Any]) -> dict[str, str]:
+    """Validate the deployment target; an absent target never supplies a default."""
+    value = config.get("fruit_delivery")
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or set(value) != {"container_name", "container_label"}:
+        raise ValueError("fruit_delivery requires container_name and container_label")
+    if any(not isinstance(item, str) or not item.strip() for item in value.values()):
+        raise ValueError("fruit_delivery container fields must be non-empty strings")
+    return {key: item.strip() for key, item in value.items()}
+
+
+def validate_fruit_delivery(outcome: PlannerOutcome, config: Mapping[str, str], *, required: bool) -> None:
+    """Reject incomplete gift plans before proposal; never silently append a place step."""
+    if not required and not config:
+        return
+    for index, step in enumerate(outcome.steps):
+        if step.skill_name not in {"pick_object", "place_in_container"}:
+            continue
+        if not config:
+            raise ValueError("fruit_delivery container configuration is missing")
+        pick_index = index if step.skill_name == "pick_object" else index - 1
+        if pick_index < 0 or pick_index + 1 >= len(outcome.steps):
+            raise ValueError("fruit delivery requires adjacent pick_object and place_in_container")
+        pick, place = outcome.steps[pick_index : pick_index + 2]
+        if (
+            pick.skill_name != "pick_object"
+            or place.skill_name != "place_in_container"
+            or pick.target_name not in {"a lemon", "an apple", "an orange"}
+            or pick.target_name != place.target_name
+            or pick.arm_side != place.arm_side
+            or place.container_name != config["container_name"]
+        ):
+            raise ValueError("fruit delivery requires the same fruit and configured container in an adjacent pair")
 
 
 class PlannerAdapter:
@@ -366,7 +404,11 @@ def _preview_watcher(cancel_token: Any, on_preview: Callable[[str], None]) -> Ca
 
 
 def build_planner_messages(
-    *, request: Any, context: Mapping[str, Any], catalog: Mapping[str, Any]
+    *,
+    request: Any,
+    context: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+    fruit_delivery: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a channel-neutral prompt whose output is still locally validated.
 
@@ -433,7 +475,15 @@ def build_planner_messages(
         "plan only its unfinished part, never repeating conversation.continuation.completed_steps and planning "
         "conversation.continuation.interrupted_step again, because it may have stopped half way."
     )
+    if fruit_delivery:
+        system += (
+            " Deployment fruit_delivery is authoritative: every supported fruit choice requires a single "
+            "workflow with adjacent pick_object then place_in_container, identical canonical target_name "
+            "and arm_side, and container_name copied verbatim from deployment.fruit_delivery. "
+            "Never confuse a container color with a fruit target. If it is missing, do not pick a gift. "
+        )
     payload = {
+        "deployment": {"fruit_delivery": dict(fruit_delivery or {})},
         "request": {"text": request.text, "reply_to_request_id": request.reply_to_request_id},
         "conversation": context,
         "catalog": catalog,

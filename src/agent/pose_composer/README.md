@@ -83,6 +83,18 @@ is enabled. Fixed mode queries only its compiled, read-only library. A hit skips
 the Agent model; a miss follows normal planning and the fixed executor still
 rejects unknown actions. Lookup never creates a memory database or saves a pose.
 
+Summit exposes `free_pose` from its fixed, read-only library. Its
+`pose_composer.display_completion` opts in `arms_forward`, `arms_up`, `arms_out`,
+`arms_v`, `flex`, `surrender`, `right_forward` and `left_forward` with
+`mode: playback_only`. Normal success means that the validated trajectory
+finished streaming; final arrival, settling, measured excursion and finger
+precision are not verified. The runtime receives explicit standard
+`JointTolerance(-1)` goal tolerances for these displays only. Command limits,
+preflight path checks, ownership, live runtime faults, cancellation and timeout
+still apply. Near-head poses, functional `arms_rest`/`grasp_ready` and their
+hand confirmation keep measured arrival. Unknown descriptions still fail.
+The completion policy never changes compiled targets or their fingerprint.
+
 With `pose_composer.memory.enabled`, poses the robot has done are kept in one
 SQLite file per robot (default `~/.local/share/ibrobot/pose_memory/<robot>.sqlite3`),
 shared by every conversation and kept across restarts. Only the composer

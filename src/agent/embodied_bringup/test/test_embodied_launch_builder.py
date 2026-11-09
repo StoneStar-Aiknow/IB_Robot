@@ -1596,6 +1596,31 @@ def test_voice_bridge_can_consume_text_feedback_without_voice_commands():
     assert params["mute_asr_during_tts"] is False
 
 
+def test_voice_bridge_reads_english_only_where_the_config_says_the_tts_can():
+    params = _normalize_launch_param_mapping(
+        vars(_voice_bridge_nodes(enabled=True, tts_keep_english=True)["agent_voice_bridge"])["_Node__parameters"][0]
+    )
+    assert params["tts_keep_english"] is True
+    default = _normalize_launch_param_mapping(
+        vars(_voice_bridge_nodes(enabled=True)["agent_voice_bridge"])["_Node__parameters"][0]
+    )
+    assert "tts_keep_english" not in default
+
+
+def test_voice_bridge_resolves_the_intent_model_shipped_in_the_workspace(monkeypatch):
+    monkeypatch.setenv("WORKSPACE", "/opt/ibrobot")
+    params = _normalize_launch_param_mapping(
+        vars(
+            _voice_bridge_nodes(
+                enabled=True,
+                semantic_gate_mode="enforce",
+                semantic_gate_model_path="$(env WORKSPACE)/models/addressee/addressee_zh_v1.json",
+            )["agent_voice_bridge"]
+        )["_Node__parameters"][0]
+    )
+    assert params["semantic_gate_model_path"].splitlines()[0] == "/opt/ibrobot/models/addressee/addressee_zh_v1.json"
+
+
 def test_voice_bridge_forwards_the_addressee_gate_when_configured():
     """The gate is opt-in, so launch forwards it only when the YAML sets it."""
     nodes = _voice_bridge_nodes(enabled=True, wake_phrases=["灵犀灵犀", "灵犀"], wake_window_sec=12.0)
@@ -1728,3 +1753,67 @@ def test_agent_pose_lookup_and_writable_feedback_are_independent(memory, lookup)
         "pose_lookup_service": "",
         "pose_feedback_service": "",
     }
+
+
+def test_voice_bridge_forwards_persistent_session_without_changing_other_deployments():
+    configured = _voice_bridge_nodes(enabled=True, persistent_session=True)
+    params = _normalize_launch_param_mapping(vars(configured["agent_voice_bridge"])["_Node__parameters"][0])
+    assert params["persistent_session"] is True
+    ordinary = _voice_bridge_nodes(enabled=True)
+    params = _normalize_launch_param_mapping(vars(ordinary["agent_voice_bridge"])["_Node__parameters"][0])
+    assert "persistent_session" not in params
+    assert params["mirror_session_enabled"] is False
+
+
+def test_mirror_monitoring_and_stop_shortcut_follow_actual_session_enablement():
+    from embodied_bringup.launch_builders.embodied import _agent_voice_bridge_node
+
+    robot = {"name": "aimdk_x2", "mirror_session": {"enabled": True}}
+    bridge = _agent_voice_bridge_node(robot, {}, {})
+    params = _normalize_launch_param_mapping(vars(bridge)["_Node__parameters"][0])
+    assert params["mirror_session_enabled"] is True
+    robot["embodied"] = {
+        "enabled": True,
+        "entry_mode": "agent",
+        "agent": {
+            "enabled": True,
+            "incubation": True,
+            "execution_enabled": True,
+            "ledger_path": "/tmp/mirror-ledger.sqlite",
+            "conversation_path": "/tmp/mirror-conversation.sqlite",
+            "deployment_lock_path": "/tmp/mirror.lock",
+            "test_allowlist": ["mirror_start", "mirror_stop", "nod_yes"],
+            "planner": {"mode": "rule", "direct_commands": {"点头": "nod_yes"}},
+        },
+    }
+    nodes = generate_embodied_nodes(robot, active_control_mode="moveit_planning", use_sim=False)
+    agent = next(node for node in nodes if vars(node)["_Node__node_name"] == "ibrobot_agent_node")
+    params = _normalize_launch_param_mapping(vars(agent)["_Node__parameters"][0])
+    planner = json.loads(_decode_launch_string(params["planner_config_json"]))
+    assert planner["direct_commands"] == {"点头": "nod_yes", "停止照镜子": "mirror_stop"}
+
+
+def test_voice_bridge_uses_planner_container_ssot():
+    from embodied_bringup.launch_builders.embodied import _agent_voice_bridge_node
+
+    delivery = {"container_name": "configured bowl", "container_label": "配置的碗"}
+    bridge = _agent_voice_bridge_node({}, {"planner": {"fruit_delivery": delivery}}, {})
+    params = _normalize_launch_param_mapping(bridge._Node__parameters[0])
+    assert _decode_launch_string(params["gift_container_name"]) == delivery["container_name"]
+    assert __import__("yaml").safe_load(params["gift_container_label"]) == delivery["container_label"]
+
+
+def test_display_named_motion_hand_preparation_binds_public_runtime_and_model(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+    preparation = {
+        "factory": "aimdk_grasp.hand_restore_ros:create_named_motion_hand_preparer",
+        "motions": ["wave", "blow_kiss"],
+    }
+    config["embodied"]["runtime_named_motion"] = {**_NAMED_MOTION_BINDING, "hand_preparation": preparation}
+    config["grasp_execution"] = {"backend_options": {"installed_hands": ["right"]}}
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+    binding = json.loads(_decode_launch_string(params["named_motion_hand_preparation_json"]))
+    assert binding["motions"] == preparation["motions"]
+    assert binding["interface_description"] == config["runtime"]["interface_description"]
+    assert binding["grasp_execution"] == config["grasp_execution"]
+    assert binding["gateway_status_service"] == "/embodied/get_skill_gateway_status"
