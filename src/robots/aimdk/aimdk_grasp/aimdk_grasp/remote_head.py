@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import json
+import sys
 import time
 import uuid
 from collections.abc import Mapping
@@ -57,14 +59,119 @@ WATCH_DISARM_S = 3.0
 _HEAD_PLAN_ID = "x2_grasp_head_plan_id"
 
 
-def _prepare_remote_models(camera, services):
-    """Require configured services and fresh registered feedback, without a target query."""
+#: What the startup warmup asks the detector for, only to run the model: the 310P detector takes at most 8 tokens.
+WARMUP_PROMPT = "an apple ."
+#: Per-call budget (s) of a warmup inference: a model's first call on the 310P compiles and loads, far past
+#: the goals' service_timeout_s (11-09: generate_grasps answered ~8 s after a restart, after its 4 s timeout).
+WARMUP_CALL_S = 60.0
+#: Synthetic object for generate_grasps when the capture gives no masked depth: points on a 4 cm sphere.
+WARMUP_POINTS = 2000
+#: generate_grasps stays slow past its first call (live 2026-11-09: 7.5 s, then ~4 s, then 0.6 s): at most
+#: this many warmup calls, until one takes at most half of the goals' budget.
+WARMUP_GRASP_CALLS = 4
+
+
+def _warmup_points(observation, mask, settings):
+    """Camera-frame points of ``mask`` (valid depth), or a synthetic 4 cm sphere 0.6 m ahead; and whether synthetic."""
+    depth = np.asarray(observation.depth_m, dtype=float)
+    if mask is not None:
+        valid = np.asarray(mask, bool) & np.isfinite(depth) & (depth > settings.min_depth_m)
+        valid &= depth < settings.max_depth_m
+        y, x = np.nonzero(valid)
+        if len(y) >= settings.min_points:
+            k, z = np.asarray(observation.intrinsics, dtype=float), depth[y, x]
+            return np.column_stack([(x - k[0, 2]) * z / k[0, 0], (y - k[1, 2]) * z / k[1, 1], z]), False
+    rng = np.random.default_rng(0)
+    direction = rng.normal(size=(WARMUP_POINTS, 3))
+    direction /= np.linalg.norm(direction, axis=1, keepdims=True)
+    return direction * 0.04 + np.array([0.0, 0.0, 0.6]), True
+
+
+def _warm_models(services, observation, settings):
+    """One real call of each model service on a startup capture; a report, never a refusal.
+
+    The goals' first inference otherwise pays each model's cold start (11-09:
+    four of five generate_grasps timeouts were each a stack's first pick). An
+    empty detection, a mask without depth or a failed call is logged and the
+    startup continues: the goal's own calls stay the authority.
+    """
+    from manipulation_execution.grasp_pipeline.perception import Detection
+
+    report: dict = {}
+    started = time.monotonic()
+    rgb, frame_id, stamp_ns = observation.rgb, observation.frame_id, observation.stamp_ns
+    timeout_s, services.timeout_s = services.timeout_s, max(services.timeout_s, WARMUP_CALL_S)
+    mask, detections = None, []
+    try:
+        for name in ("detect", "segment", "generate_grasps"):
+            calls = len(services.calls)
+            try:
+                if name == "detect":
+                    detections = services.detect(
+                        rgb,
+                        frame_id,
+                        stamp_ns,
+                        WARMUP_PROMPT,
+                        box_threshold=settings.box_threshold,
+                        text_threshold=settings.text_threshold,
+                    )
+                    report[name] = {"detections": len(detections)}
+                elif name == "segment":
+                    if getattr(services, "_segment", None) is None:
+                        report[name] = {"skipped": "not bound"}
+                        continue
+                    height, width = np.shape(rgb)[:2]
+                    # Always a box without a mask, so the segmenter itself runs: the best detection's, else the
+                    # image centre's.
+                    box = (
+                        detections[0].box_xyxy
+                        if detections
+                        else np.array([0.4 * width, 0.4 * height, 0.6 * width, 0.6 * height], dtype=np.float32)
+                    )
+                    (mask,) = services.masks(rgb, frame_id, stamp_ns, [Detection("warmup", 1.0, box, None)])
+                    report[name] = {"mask_pixels": int(np.count_nonzero(mask))}
+                else:
+                    points, synthetic = _warmup_points(observation, mask, settings)
+                    series = []
+                    report[name] = {"points": len(points), "synthetic": synthetic, "rpc_series_s": series}
+                    for _ in range(WARMUP_GRASP_CALLS):
+                        poses, _ = services.generate_grasps(
+                            points,
+                            frame_id,
+                            stamp_ns,
+                            max_grasps=settings.max_grasps,
+                            min_confidence=settings.min_confidence,
+                        )
+                        series.append(round(float(services.calls[-1]["rpc_s"]), 4))
+                        report[name]["grasps"] = len(poses)
+                        if series[-1] <= timeout_s / 2:
+                            break
+            except GraspFailure as failure:
+                report[name] = {**report.get(name, {}), "error": f"{failure.code}: {failure}"[:300]}
+            for call in services.calls[calls:]:
+                report[name].update(
+                    {key: round(float(call[key]), 4) for key in ("rpc_s", "inference_s", "transport_s")}
+                )
+    finally:
+        services.timeout_s = timeout_s
+    report["total_s"] = round(time.monotonic() - started, 4)
+    return report
+
+
+def _prepare_remote_models(camera, services, settings=None):
+    """Require configured services and fresh registered feedback; then warm each model once (_warm_models).
+
+    No target is required: the warmup's result never decides readiness.
+    """
     deadline = time.monotonic() + WARMUP_BUDGET_S
     try:
         services.wait_ready(deadline=deadline, cancelled=lambda: False)
-        camera.capture(deadline=deadline, cancelled=lambda: False)
+        observation = camera.capture(deadline=deadline, cancelled=lambda: False)
     except GraspFailure as failure:
         raise RuntimeError(f"grasp startup readiness: {failure}") from failure
+    if settings is not None:
+        report = _warm_models(services, observation, settings)
+        print(json.dumps({"grasp_warmup": report}, default=str), file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True)
@@ -586,7 +693,7 @@ def x2_remote_grasp_backends(
 
     def prepare() -> None:
         """Wait for configured services and a fresh head capture; targets belong to goals."""
-        _prepare_remote_models(camera, services)
+        _prepare_remote_models(camera, services, robot.perception)
 
     def close() -> None:
         for closer in reversed(closers):

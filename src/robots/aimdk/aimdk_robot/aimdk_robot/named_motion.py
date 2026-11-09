@@ -356,12 +356,14 @@ class NamedMotionServer:
         start = self._node.measured_arm_positions()
         if start is None:
             return self._fail_trajectory(goal_handle, result, "no fresh arm measurement to start the motion from")
+        # Start from what the platform is driving: see arm_takeover_start.
+        origin = self._node.arm_takeover_start(start)
         goal = goal_handle.request.trajectory
         times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in goal.points]
         try:
             plan = traj.planned_trajectory(
                 "trajectory",
-                start,
+                origin,
                 list(goal.joint_names),
                 times,
                 [list(p.positions) for p in goal.points],
@@ -392,6 +394,7 @@ class NamedMotionServer:
                 generation,
                 epoch,
                 recorded=plan,
+                origin=origin,
                 on_progress=on_progress,
                 verify_completion=not (
                     self._node.vendor_config.get("named_motion", {}).get("allow_unverified_trajectories") is True
@@ -826,6 +829,7 @@ class NamedMotionServer:
         epoch: int,
         *,
         recorded: traj.ArmTrajectory | None = None,
+        origin: list[float] | None = None,
         on_progress=None,
         verify_completion=True,
     ) -> tuple[bool, int, str]:
@@ -898,7 +902,9 @@ class NamedMotionServer:
                 raise CommandRejected("HAND_HOLD_UNAVAILABLE", "no fresh hand measurement for recorded entry")
             hand_start = sample[0]
         first = recorded.sample(offset)
-        ease = traj.blend_duration(start, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
+        # Where the command eases from: the measured pose unless the caller knows the platform's target.
+        ease_from = start if origin is None else origin
+        ease = traj.blend_duration(ease_from, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
         if recorded.hands:
             ease = max(
                 ease,
@@ -958,7 +964,7 @@ class NamedMotionServer:
                         )
                     self._node.command_arm(sent[0][1] if sent else start, owner=generation, epoch=epoch)
                     raise self._cancel_replay(name, mode, recorded, reached, epoch)
-                point = traj.blend(start, first, t / ease) if t < ease else recorded.sample(reached)
+                point = traj.blend(ease_from, first, t / ease) if t < ease else recorded.sample(reached)
                 sent.append((t, point))
                 while len(sent) > 1 and sent[1][0] <= t - self._hold_lag_s:
                     sent.popleft()

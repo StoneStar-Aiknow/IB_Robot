@@ -103,8 +103,16 @@ class GraspSequence:
         self._current_phase = ""
 
     def run(
-        self, plan: GraspPlan, *, deadline: float, cancelled: Flag, release_after_success: bool = False
+        self,
+        plan: GraspPlan,
+        *,
+        deadline: float,
+        cancelled: Flag,
+        release_after_success: bool = False,
+        preshaped: EffectorOutcome | None = None,
     ) -> SequenceResult:
+        """``preshaped``: a successful PRESHAPE the caller already ran (while planning); the
+        plan's first PRESHAPE step is recorded from it instead of acting again."""
         result = SequenceResult()
         done: list[Step] = []
         state = {"carrying": False, "moved": None, "failed": None}
@@ -185,7 +193,11 @@ class GraspSequence:
                         plan = self._refine(plan, index, deadline, cancelled)
                 elif isinstance(step, Effect):
                     watched = halted if step.action is EffectorAction.CLOSE else _never
-                    outcome = self._act(step.action, watched, cancelled, result)
+                    if step.action is EffectorAction.PRESHAPE and preshaped is not None and preshaped.succeeded:
+                        outcome = self._prefetched(step.action, preshaped, result)
+                        preshaped = None  # only the first preshape; a later one acts
+                    else:
+                        outcome = self._act(step.action, watched, cancelled, result)
                     if step.action is EffectorAction.CLOSE:
                         done.append(step)
                         if outcome.halted:
@@ -397,6 +409,13 @@ class GraspSequence:
             raise _Stopped("MOTION_FAILED", f"arm during {action.value}: {fault[0]}")
         if not outcome.succeeded and cancelled():
             raise _Stopped("CANCELED", outcome.reason or f"cancelled during {action.value}")
+        return outcome
+
+    def _prefetched(self, action: EffectorAction, outcome: EffectorOutcome, result) -> EffectorOutcome:
+        """Record an action the caller ran before the sequence (supervised the same way) as this step."""
+        self._current_phase = action.value
+        self._on_phase(action.value, "start", {"prefetched": True})
+        self._phase(result, action.value, outcome, held=outcome.held, halted=outcome.halted, prefetched=True)
         return outcome
 
     def _refine(self, plan: GraspPlan, index: int, deadline: float, cancelled: Flag) -> GraspPlan:

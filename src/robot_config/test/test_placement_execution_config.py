@@ -148,6 +148,20 @@ def test_backend_placement_rejects_invalid_retry_budget(attempts):
     assert any("max_attempts" in error for error in validate_placement_execution_config(config))
 
 
+@pytest.mark.parametrize("value,valid", [(False, True), (True, True), (0, False), ("false", False), (None, False)])
+def test_backend_placement_checks_verify_placement(value, valid):
+    config = {
+        "enabled": True,
+        "executor": "placement_pipeline",
+        "required_args": ["target_name", "container_name"],
+        "action_name": "/manipulation/execute_place",
+        "backend": "aimdk_grasp.remote_head:x2_remote_place_backends",
+        "pipeline": {"max_attempts": 2, "verify_placement": value},
+    }
+    errors = validate_placement_execution_config(config)
+    assert errors == [] if valid else any("verify_placement" in error for error in errors)
+
+
 @pytest.mark.parametrize("reserve", [0.0, 15.0, -1.0, True, "15", float("nan"), float("inf")])
 def test_backend_placement_checks_execution_reserve(reserve):
     config = {

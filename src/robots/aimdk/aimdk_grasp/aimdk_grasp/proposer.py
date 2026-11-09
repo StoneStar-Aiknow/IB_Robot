@@ -189,23 +189,85 @@ def measured_spheres(model: RobotSphereModel, feedback) -> np.ndarray:
     return spheres[0].copy()
 
 
+def within_spheres(points_camera, base_from_camera, centers, radii, margin):
+    """Whether each camera-frame point lies within ``margin`` of any sphere's surface (|p - c| <= r + margin).
+
+    The same test as ``cover_reach(...) <= margin``, but fast for the holding
+    hand's ~450 overlapping spheres (the per-sphere distance loop took 2.8 s
+    for 130k points on a workstation). A k-d tree over the sphere centres gives
+    each point its nearest centre at distance d: d - r(nearest) <= margin is
+    inside, d - max(r) > margin is outside (no sphere can be nearer), and only
+    the points between are measured against every sphere.
+    """
+    from scipy.spatial import cKDTree
+
+    points_camera = np.asarray(points_camera, dtype=float)
+    centers, radii = np.asarray(centers, dtype=float).reshape(-1, 3), np.asarray(radii, dtype=float).reshape(-1)
+    inside = np.zeros(len(points_camera), dtype=bool)
+    if not len(centers) or not len(points_camera):
+        return inside
+    rotation, translation = base_from_camera[:3, :3], base_from_camera[:3, 3]
+    local = (centers - translation) @ rotation  # sphere centres in the camera frame (rigid: same distances)
+    margin, largest = float(margin), float(np.max(radii))
+    pad = largest + margin + 1e-6
+    low, high = local.min(axis=0) - pad, local.max(axis=0) + pad
+    near = np.flatnonzero(((points_camera >= low) & (points_camera <= high)).all(axis=1))
+    if not len(near):
+        return inside
+    distance, nearest = cKDTree(local).query(points_camera[near], k=1)
+    sure = distance - radii[nearest] <= margin
+    unsure = ~sure & (distance - largest <= margin)
+    if unsure.any():
+        candidates = points_camera[near[unsure]]
+        gap = np.full(len(candidates), np.inf)
+        for center, radius in zip(local, radii, strict=True):
+            gap = np.minimum(gap, np.linalg.norm(candidates - center, axis=1) - radius)
+        sure[unsure] = gap <= margin
+    inside[near] = sure
+    return inside
+
+
+def holding_hand_spheres(model, spheres, side):
+    """Torso-frame Nx4 spheres of the holding hand and wrist (``R_*`` and ``<side>_wrist*``), positive radii only."""
+    links = np.asarray(model.sphere_links)
+    hand = np.char.startswith(links, "R_") | np.char.startswith(links, f"{side}_wrist")
+    spheres = np.asarray(spheres, float)
+    return spheres[hand & (spheres[:, 3] > 0)]
+
+
 def prepare_capture_scene(observation, model: RobotSphereModel, config):
-    """The mask-independent scene stage of one registered capture, with ``model``'s arm at its image-time pose."""
+    """The mask-independent scene stage of one registered capture, with ``model``'s arm at its image-time pose.
+
+    Marks the points within the coarse self-filter margin of that arm's hand
+    and wrist: complete_scene drops them from the fine set too, except the
+    target's. Live (BK3, 2026-11-09) a 3 cm patch of the real right hand at
+    grasp_ready, 0.4-2.3 cm off its model, survived the fine set's 1 cm filter
+    while the coarse set dropped it: the planner routed through it and the fine
+    check refused all 22 approach paths at the start of the motion.
+    """
     from .scene_estimation import prepare_scene
 
     registered = observation.robot_state.live.observation
     frame, transform = registered.frame, registered.transform
-    return prepare_scene(
+    spheres = measured_spheres(model, registered.image_feedback)
+    prepared = prepare_scene(
         frame.depth,
         frame.intrinsics,
         transform,
         stamp_ns=transform.stamp_ns,
         camera_frame=frame.frame_id,
         received_at=registered.received_at,
-        robot_spheres_torso=measured_spheres(model, registered.image_feedback),
+        robot_spheres_torso=spheres,
         depth_scale=frame.depth_scale,
         config=config,
     )
+    if not hasattr(model, "sphere_links"):
+        return prepared
+    hand = holding_hand_spheres(model, spheres, model.side)
+    near = within_spheres(
+        prepared.points, prepared.torso_from_camera, hand[:, :3], hand[:, 3], config.self_filter_margin_m
+    )
+    return replace(prepared, moving_hand_near=near)
 
 
 class X2Proposer:

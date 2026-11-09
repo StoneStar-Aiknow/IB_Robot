@@ -2,7 +2,9 @@
 
 import json
 import sys
+import threading
 import time
+from pathlib import Path
 
 import numpy as np
 
@@ -12,12 +14,38 @@ from .arm_gravity import require_executable
 from .collision_spheres import merge_sphere_cover
 from .grasp_request import segment
 from .held_object import held_center
+from .inputs_record import INPUTS_DIR_ENV, inputs_directory, save_record
 from .place_targets import place_targets
 from .planner import ATTACH_LINK, ATTACH_SLOTS, PlacementSearchExhausted, PlannerFault
 from .proposer import measured_spheres, prepare_capture_scene
 from .revalidation import ReobserveRequired, require_fresh, require_posture
 from .scene_estimation import NoSupportError, complete_scene
 from .trajectory import TimedTrajectory
+
+#: The grasp head's plan-input directory (inputs_record): each place plan's
+#: inputs and outcome are pickled there as place_<ns>.pkl.
+PLACE_INPUTS_DIR_ENV = INPUTS_DIR_ENV
+#: The camera's own profile of the recheck capture (HeadCamera.calls), as logged.
+RECHECK_CAPTURE_FIELDS = (
+    "rounds",
+    "wait_s",
+    "side_drain_s",
+    "match_s",
+    "gpu_wait_s",
+    "registration_s",
+    "feedback_wait_s",
+    "total_s",
+    "image_age_s",
+)
+
+
+def save_place_inputs(directory: Path, recorded: dict) -> threading.Thread:
+    """One place plan's inputs and outcome as place_<ns>.pkl (inputs_record.save_record).
+
+    Everything recorded is already built and no longer changed by the planner;
+    the place scene is never lazy (estimate_container, lazy_validation=False).
+    """
+    return save_record(directory, "place", recorded)
 
 
 def _hand_cover(model, feedback, side, hands, slots, *, margin_m=0.01, voxel_m=0.02):
@@ -132,6 +160,22 @@ class X2PlacePlanner:
         started = time.perf_counter()
         timings: dict = {}
         trace = {"outcome": "error", "planner": {}}
+        # Inputs for an offline replay of this plan (place_replay), when the head records plan inputs.
+        directory = inputs_directory()
+        recorded = (
+            dict(
+                kind="place",
+                arm_side=side,
+                feedback=feedback,
+                container=container,
+                held=held,
+                place_config=robot.place,
+                admitted_at=admitted.admitted_at,
+                budget_s=deadline - time.monotonic(),
+            )
+            if directory
+            else None
+        )
 
         def lap(name, since):
             now = time.perf_counter()
@@ -140,12 +184,28 @@ class X2PlacePlanner:
 
         try:
             tick = time.perf_counter()
+            parts_s = timings["targets_parts"] = {}
+            clock = [tick]
+
+            def part(name):
+                now = time.perf_counter()
+                parts_s[name] = round(now - clock[0], 4)
+                clock[0] = now
+
             measured_spheres(parts.spheres, feedback)
             palm = np.eye(4)
             palm[:3] = parts.spheres.last_link_frames[0, parts.spheres.link_indices["R_palm"]]
+            if recorded is not None:
+                recorded["palm"] = palm.copy()  # place_targets' input, also when it refuses the container
+            part("spheres")
             targets = place_targets(container, held, palm, robot.place)
+            part("place_targets")
             attached = placement_cover(parts.spheres, feedback, held)
+            part("placement_cover")
             opening = opening_cover(parts.spheres, feedback, held)
+            part("opening_cover")
+            if recorded is not None:
+                recorded.update(targets=targets, attached=attached, opening=opening)
             tick = lap("targets", tick)
             with parts.gpu:
                 tick = lap("gpu_wait", tick)
@@ -158,7 +218,7 @@ class X2PlacePlanner:
                         paths = planner.plan_place(
                             feedback,
                             targets,
-                            held.home_positions,
+                            held.home_positions if getattr(robot.place, "plan_return_home", True) else None,
                             admitted.admitted_at,
                             check_deadline=check,
                             deadline=time.perf_counter() + max(0, deadline - time.monotonic()),
@@ -183,19 +243,27 @@ class X2PlacePlanner:
                 tick = lap("executable", tick)
             # A plan may take seconds: recapture and recheck the locked posture
             # before returning it. Grip is checked by the pipeline throughout.
+            recheck = timings["recheck_parts"] = {}
             current = parts.camera.capture_state()
+            began = time.perf_counter()
+            recheck["capture"] = round(began - tick, 4)
+            stamp = current.observation.transform.stamp_ns
+            # This capture's own entry: the watch captures on another thread meanwhile.
+            own = next((call for call in reversed(parts.camera.calls) if call.get("stamp_ns") == stamp), {})
+            recheck["camera"] = {key: round(own[key], 4) for key in RECHECK_CAPTURE_FIELDS if key in own}
             require_fresh(current, parts.camera.clock(), robot.planning.revalidation)
             require_posture(feedback, current.feedback, robot.planning.revalidation, side=side)
             check()
+            recheck["checks"] = round(time.perf_counter() - began, 4)
             lap("recheck", tick)
             timings["total"] = round(time.perf_counter() - started, 4)
             report["plan_timings_s"] = dict(timings)
             trace["outcome"] = "ok"
-            transfer, descent, retreat, home = paths
+            transfer, descent, retreat, *home = paths
             return PlacePlan(
                 (Move(segment("transfer", transfer, side)), Move(segment("descend", descent, side))),
                 (Effect(EffectorAction.RELEASE),),
-                (Move(segment("retreat", retreat, side)), Move(segment("home", home, side))),
+                (Move(segment("retreat", retreat, side)), *(Move(segment("home", path, side)) for path in home)),
                 container,
                 report,
             )
@@ -215,6 +283,10 @@ class X2PlacePlanner:
                 file=sys.stderr,
                 flush=True,
             )
+            if recorded is not None:
+                # Also a refusal before planning (CONTAINER_TOO_SMALL / OUT_OF_REACH from place_targets).
+                recorded["outcome"] = dict(trace, timings_s=timings)
+                save_place_inputs(directory, recorded)
 
     def plan_home(self, held, *, deadline, cancelled):
         """The empty, open hand's way home after a drop, planned on a fresh capture.

@@ -12,7 +12,7 @@ from manipulation_execution.grasp_pipeline.contracts import ContainerEstimate, G
 
 from .place_request import placement_cover
 from .place_targets import opening_centre
-from .proposer import prepare_capture_scene
+from .proposer import holding_hand_spheres, prepare_capture_scene, within_spheres
 from .scene_estimation import NoSupportError, complete_scene, plane_basis
 
 
@@ -104,6 +104,7 @@ def estimate_container(observation, mask, held, model, settings, *, prepared=Non
     timings: dict = {}
     tick = [started]
     scene = cover = None
+    hand_dropped = None
 
     def lap(name):
         now = time.perf_counter()
@@ -115,7 +116,7 @@ def estimate_container(observation, mask, held, model, settings, *, prepared=Non
             prepared = prepare_capture_scene(observation, model, settings.scene)
             lap("prepare")
         feedback = observation.robot_state.live.observation.image_feedback
-        model.spheres(feedback, feedback.vector(model.arm)[None])
+        robot_spheres, _ = model.spheres(feedback, feedback.vector(model.arm)[None])
         palm = model.last_link_frames[0, model.link_indices["R_palm"]]
         # The planner starts with exactly these palm-frame spheres attached: the
         # closed fingers beyond the open-hand model, then the object. Whatever the
@@ -136,13 +137,25 @@ def estimate_container(observation, mask, held, model, settings, *, prepared=Non
             cover[:, 3],
             max(validation_margin, planning_margin),
         )
-        # Filtered like the robot's own spheres (_self_filter_masks): the fine
-        # validation set with the validation margin, the coarse planning set with
-        # the coarse margin its 3 cm voxels need.
+        # The holding hand and wrist with the cover, at the coarse margin in BOTH
+        # sets. Live (CR6 2026-11-08, L02 2026-11-09, 7 rejected home paths) a
+        # 1-2 cm patch of the real hand, 22.7 cm above the table at the handover
+        # pose, survived the fine set's 1 cm self filter (the real hand sits ~3 cm
+        # off its model) while the coarse set dropped it: every planned way home
+        # passes the handover pose and the fine check rejected it there (R_palm,
+        # 31-43 mm). Only points this close to the hand that is held still in the
+        # air for the capture go; the container, table and other arm are untouched.
+        hand = holding_hand_spheres(model, robot_spheres[0], model.side)
+        held_far = (reach > planning_margin) & ~within_spheres(
+            prepared.points, observation.base_from_camera, hand[:, :3], hand[:, 3], planning_margin
+        )
+        hand_dropped = int((prepared.keep & (reach > validation_margin) & ~held_far).sum())
+        # Filtered like the robot's own spheres (_self_filter_masks): the coarse
+        # planning set with the coarse margin its 3 cm voxels need.
         prepared = replace(
             prepared,
-            keep=prepared.keep & (reach > validation_margin),
-            planning_all=prepared.planning_all & (reach > planning_margin),
+            keep=prepared.keep & (reach > validation_margin) & held_far,
+            planning_all=prepared.planning_all & (reach > planning_margin) & held_far,
             spheres=np.vstack([prepared.spheres, np.column_stack([centers, cover[:, 3]])]),
         )
         selected = np.asarray(mask, bool).reshape(-1)[prepared.pixel] & prepared.keep
@@ -162,6 +175,8 @@ def estimate_container(observation, mask, held, model, settings, *, prepared=Non
         line = {
             "points": int(len(prepared.points)) if prepared is not None else None,
             "cover_spheres": int(len(cover)) if cover is not None else None,
+            # Fine points the holding hand's coarse-margin filter removed beyond the old fine filter.
+            "holding_hand_dropped": hand_dropped,
             "timings_s": timings,
             "scene_timings_s": dict((scene.diagnostics or {}).get("timings_s", {})) if scene is not None else None,
             "support_reuse": (scene.diagnostics or {}).get("support_reuse") if scene is not None else None,

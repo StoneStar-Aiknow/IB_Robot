@@ -19,6 +19,11 @@ mode      what is sent
           clip is playing); ``start`` at shutdown if it is still stopped by us
 ``off``   ``stop`` at activation, before every clip and whenever the ASR
           reports it is running again; ``start`` at shutdown
+``session`` as ``mute``, and also ``stop`` on entering STANDBY or MIRRORING
+          and whenever the ASR reports it is running again there; back in
+          WAIT, ``start`` if it is stopped by us (feat/x2-retarget-tune: the
+          ASR resuming mid-mirroring is suspected of stalling the board, and
+          WAIT must still hear the voice that starts mirroring)
 ``keep``  nothing
 ========  ================================================================
 
@@ -30,8 +35,8 @@ that was idle before a clip (someone else stopped it) is left alone, and is
 not started afterwards either: only what this class stopped is restarted.
 
 The owner calls ``playback_started`` / ``playback_ended`` from the speaker's
-playback callbacks, ``tick`` from a timer and ``shutdown`` on exit, while the
-publisher still works. ``shutdown`` may be called again: it sends nothing once
+playback callbacks, ``on_session_state`` with each mirror session state,
+``tick`` from a timer and ``shutdown`` on exit, while the publisher still works. ``shutdown`` may be called again: it sends nothing once
 the ``start`` went out, and after it the other inputs do nothing.
 """
 
@@ -41,7 +46,13 @@ import math
 import time
 from collections.abc import Callable
 
-MODES = ("mute", "off", "keep")
+from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STANDBY
+
+MODES = ("mute", "off", "session", "keep")
+# The modes that start the ASR again once nothing holds it stopped.
+RESUMING_MODES = frozenset({"mute", "session"})
+# The mirror session states ``session`` keeps the ASR stopped in.
+HELD_SESSION_STATES = frozenset({STATE_STANDBY, STATE_MIRRORING})
 STOP = "stop"
 START = "start"
 # The ASR states (``voice_asr_node`` ``NodeState`` values) it hears in.
@@ -78,6 +89,7 @@ class AsrMute:
         self._playing = False
         self._resume_at: float | None = None
         self._closed = False  # shutdown was called
+        self._held = False  # ``session``: the mirror session is in a held state
         self._send_failing = False  # one warning per run of failures, not one per tick
         self.stops = 0
         self.starts = 0
@@ -95,9 +107,25 @@ class AsrMute:
     def on_asr_status(self, state: str) -> None:
         """One ``/voice_status`` message (``idle``, ``listening``, ...)."""
         self._asr_state = str(state).strip().lower()
-        if self.mode == "off" and not self._closed and self._asr_state in ACTIVE_ASR_STATES:
+        if (self.mode == "off" or self._held) and not self._closed and self._asr_state in ACTIVE_ASR_STATES:
             # Someone else (the voice agent, the self introduction) started it.
             self._stop()
+
+    def on_session_state(self, state: str) -> None:
+        """The mirror session's state (WAIT, STANDBY, MIRRORING); ``session`` only."""
+        if self.mode != "session" or self._closed:
+            return
+        held = state in HELD_SESSION_STATES
+        if held == self._held:
+            return
+        self._held = held
+        if held:
+            self._resume_at = None
+            if not self._muted and self._may_be_running():
+                self._stop()
+        elif self._muted and not self._playing:
+            self._resume_at = self._clock()
+            self.tick()
 
     def playback_started(self) -> None:
         if self.mode == "keep" or self._closed:
@@ -111,7 +139,7 @@ class AsrMute:
         if self.mode == "keep" or self._closed:
             return
         self._playing = False
-        if self.mode == "mute" and self._muted:
+        if self.mode in RESUMING_MODES and self._muted and not self._held:
             self._resume_at = self._clock() + self._delay
             self.tick()
 
@@ -135,6 +163,7 @@ class AsrMute:
         return {
             "mode": self.mode,
             "muted": self._muted,
+            "held": self._held,
             "asr_state": self._asr_state,
             "stops": self.stops,
             "starts": self.starts,
@@ -153,7 +182,7 @@ class AsrMute:
         if not self._send(START):
             # Still stopped by us. The next tick tries again; a clip starting
             # first cancels that, and its end asks for the start anew.
-            if self.mode == "mute" and not self._closed:
+            if self.mode in RESUMING_MODES and not self._closed and not self._held:
                 self._resume_at = self._clock()
             return
         self.starts += 1

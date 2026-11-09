@@ -78,6 +78,41 @@ def test_a_sparse_or_fragmented_cloud_is_not_cut_apart():
     np.testing.assert_array_equal(without_fringe(scattered), scattered)
 
 
+def point_linked_fringe(local):
+    """Reference: without_fringe linking every point pair, as before voxel linking."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(local)
+    spacing = float(np.median(tree.query(local, k=2)[0][:, 1]))
+    pairs = tree.query_pairs(max(0.015, 4.0 * spacing), output_type="ndarray")
+    graph = coo_matrix((np.ones(len(pairs), dtype=bool), (pairs[:, 0], pairs[:, 1])), shape=(len(local),) * 2)
+    _, labels = connected_components(graph, directed=False)
+    keep = np.bincount(labels)[labels] >= 0.05 * len(local)
+    return local[keep] if keep.any() else local
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_voxel_linking_keeps_exactly_what_point_linking_kept(seed):
+    rng = np.random.default_rng(seed)
+    apple = visible_half_sphere(step=0.0009) + rng.normal(0, 0.0005, (1, 3))  # ~12k points, like a head-camera pick
+    pieces = [
+        apple.mean(0) + direction / np.linalg.norm(direction) * distance + rng.normal(0, 0.003, (count, 3))
+        for direction, distance, count in zip(
+            rng.normal(size=(5, 3)), rng.uniform(0.07, 0.12, 5), rng.integers(5, 900, 5), strict=True
+        )
+    ]
+    local = np.vstack([apple, *pieces])
+    np.testing.assert_array_equal(without_fringe(local), point_linked_fringe(local))
+
+
+def test_a_piece_within_the_link_still_joins_across_voxels():
+    apple = visible_half_sphere(step=0.0009)
+    near = apple[np.argmax(apple[:, 0])] + np.array([0.014, 0.0, 0.0]) + np.zeros((40, 3))
+    assert len(without_fringe(np.vstack([apple, near]))) == len(apple) + len(near)
+
+
 @pytest.mark.parametrize(
     "query", ["a basket", "the red bowl on the left", "a stainless steel tray", "右边的白色收纳盒"]
 )
@@ -226,3 +261,99 @@ def test_cover_reach_keeps_exactly_what_the_full_loop_kept(seed):
     near = np.isfinite(reach)
     assert 0 < near.sum() < len(points)  # the box did skip far points
     np.testing.assert_array_equal(reach[near], full[near])
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_within_spheres_answers_what_cover_reach_answers(seed):
+    from aimdk_grasp.container_perception import cover_reach, within_spheres
+    from scipy.spatial.transform import Rotation
+
+    rng = np.random.default_rng(seed)
+    base_from_camera = np.eye(4)
+    base_from_camera[:3, :3] = Rotation.from_rotvec(rng.normal(size=3)).as_matrix()
+    base_from_camera[:3, 3] = rng.normal(size=3)
+    points = rng.uniform(-1.0, 1.0, size=(20000, 3))
+    base = points @ base_from_camera[:3, :3].T + base_from_camera[:3, 3]
+    # A hand-sized cluster of many small spheres.
+    centers = base[rng.integers(len(base))] + rng.normal(scale=0.05, size=(300, 3))
+    radii = rng.uniform(0.002, 0.06, size=300)
+    for margin in (0.01, 0.052):
+        within = within_spheres(points, base_from_camera, centers, radii, margin)
+        np.testing.assert_array_equal(within, cover_reach(points, base_from_camera, centers, radii, margin) <= margin)
+        assert 0 < within.sum() < len(points)
+
+
+def test_the_holding_hand_leaves_neither_scene_within_the_coarse_margin(monkeypatch, capsys):
+    """CR6 (11-08) / L02 (11-09): a 1-2 cm patch of the real holding hand, beyond the fine set's 1 cm self
+    filter but inside the coarse set's 5.2 cm, rejected every planned way home at the handover pose."""
+    import json
+    from types import SimpleNamespace
+
+    from aimdk_grasp import container_perception
+    from aimdk_grasp.scene_estimation import PreparedScene, SceneEstimationConfig
+
+    from manipulation_execution.grasp_pipeline.contracts import ContainerEstimate
+
+    # Torso == camera. The palm at (0.35, -0.24, 0.22) with one 4 cm sphere; a wrist sphere behind it;
+    # a left-arm sphere and a torso sphere that must not count as the holding hand.
+    palm = np.eye(4)
+    palm[:3, 3] = [0.35, -0.24, 0.22]
+    spheres = np.array(
+        [
+            [0.35, -0.24, 0.22, 0.04],  # R_palm
+            [0.30, -0.24, 0.24, 0.03],  # right_wrist_roll_link
+            [0.35, 0.24, 0.22, 0.04],  # left_wrist_roll_link (the other arm)
+            [0.00, 0.00, 0.00, 0.10],  # torso_link
+        ]
+    )
+    model = SimpleNamespace(
+        side="right",
+        arm=("right_arm",),
+        sphere_links=["R_palm", "right_wrist_roll_link", "left_wrist_roll_link", "torso_link"],
+        link_indices={"R_palm": 0},
+        last_link_frames=palm[:3][None, None],
+        spheres=lambda feedback, q: (spheres[None], np.array([True])),
+    )
+    points = np.array(
+        [
+            [0.35, -0.24 - 0.04 - 0.03, 0.22],  # 3 cm off the palm sphere: the hand patch (dropped)
+            [0.35, -0.24 - 0.04 - 0.08, 0.22],  # 8 cm off: a real obstacle (kept)
+            [0.35, 0.24 - 0.04 - 0.03, 0.22],  # 3 cm off the OTHER arm (kept: not the holding hand)
+            [0.45, 0.0, 0.0],  # the container (kept)
+            [0.46, 0.0, 0.0],
+        ]
+    )
+    n = len(points)
+    prepared = PreparedScene(
+        points, np.arange(n), np.ones(n, bool), np.ones(n, bool), np.ones(n, bool), np.ones(n, bool),
+        np.empty((0, 3)), np.empty(0, int), (1, n), np.empty((0, 4)), np.eye(4), 1, "camera", 1.0, True,
+        SceneEstimationConfig(), n, 0.0, 0.0,
+    )  # fmt: skip
+    seen = {}
+
+    def complete(prepared, mask, **kwargs):
+        seen["prepared"] = prepared
+        return SimpleNamespace(support=SimpleNamespace(normal=np.array([0.0, 0, 1])), diagnostics={})
+
+    monkeypatch.setattr(container_perception, "placement_cover", lambda *args: np.array([[0.0, 0, 0.06, 0.03]]))
+    monkeypatch.setattr(container_perception, "complete_scene", complete)
+    monkeypatch.setattr(
+        container_perception,
+        "opening_from_points",
+        lambda points, normal, radius_m: ContainerEstimate(np.eye(3), np.array([0.0, 0, 1]), 0.0),
+    )
+    feedback = SimpleNamespace(vector=lambda names: np.zeros(1))
+    observation = SimpleNamespace(
+        robot_state=SimpleNamespace(live=SimpleNamespace(observation=SimpleNamespace(image_feedback=feedback))),
+        base_from_camera=np.eye(4),
+    )
+    settings = SimpleNamespace(scene=SimpleNamespace(validation_self_filter_margin_m=0.01, self_filter_margin_m=0.052))
+    held = SimpleNamespace(radius_m=0.04)
+    container_perception.estimate_container(observation, np.ones(n, bool), held, model, settings, prepared=prepared)
+    kept = seen["prepared"]
+    np.testing.assert_array_equal(kept.keep, [False, True, True, True, True])
+    np.testing.assert_array_equal(kept.planning_all, [False, True, True, True, True])
+    line = json.loads(
+        next(text for text in capsys.readouterr().err.splitlines() if text.startswith('{"estimate_container"'))
+    )
+    assert line["estimate_container"]["holding_hand_dropped"] == 1

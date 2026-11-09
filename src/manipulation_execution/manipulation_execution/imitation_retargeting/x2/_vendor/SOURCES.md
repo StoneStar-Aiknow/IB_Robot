@@ -35,6 +35,11 @@ Patches:
   crossing ±π stepped by 2π (`test_x2_followme.py` pins this). When the window
   hits `max_anchor_frames` it also drops the frames before it, which no later
   window reaches; upstream kept every frame while the guard stayed tripped.
+  `FollowMeStream` also catches up a stale output offset (`_catch_up`): upstream
+  calibrates `_offset` once per round, so a round that starts in a stall keeps
+  the stall's lag. When the offset sits more than 0.1 s above the last 3 s of
+  ages + `latency_s` for 2 s of live output, the output clock runs up to 1.2x
+  fast until it is there (within about 4 s); it never raises the offset.
 
 Not copied: the rest of `smplx2robot` (cli, export, delivery, safety, preview,
 compare, verify), which the streaming path does not import.
@@ -66,3 +71,35 @@ Patches (`hand_core.py`):
 Not copied: `data/dexhand_calib_wilor.json` (WiLoR, not used) and
 `thumb_safety.py` (imported by `hand_core` only when `thumb_3d` is set, which
 this package never does).
+
+## Shoulder solver (hri_runtime shoulder_ik_20261108)
+
+Copied byte for byte from granger's hri_runtime
+`output/shoulder_ik_20261108/port/` (2026-11-08); files marked PATCHED were
+then edited, and each edit in `shoulder_ik.py` carries an "IB-Robot patch"
+comment. `x2.followme` solves the mirror shoulders with it; the acceptance
+test and its data sit in `test/`.
+
+| here | upstream | sha256 of the upstream file |
+| --- | --- | --- |
+| `shoulder_ik.py` (PATCHED) | `port/shoulder_ik.py` | `7a6a338e6560878c63ce4ba7ed8ff0ee3216bf85d584a78374fec9ec9da8670b` |
+| `test/test_x2_shoulder_ik.py` (PATCHED) | `port/test_shoulder_ik.py` | `4cb2b6dba5646468809937c15b96e2eaa36d94a3fff6031fdc112631df01e8fc` |
+| `test/data/x2_shoulder_ik/geometry_x2.json` | `port/geometry_x2.json` | `d8b46596369f49f68fcd50df46db970ed24d174dff3c06b2da2abef14442c7f5` |
+| `test/data/x2_shoulder_ik/golden_shoulder_ik.npz` | `port/golden_shoulder_ik.npz` | `3fda1cee539f169bb701a6fc7e0aaf073ae76d0de38cd43533768d08dc9a58bb` |
+
+Patches (`test_x2_shoulder_ik.py`): the import and the data directory, plus a
+docstring line saying so.
+
+Patches (`shoulder_ik.py`): speed only, for the per-frame live chain. `step()`
+asks `yaw_need` (a full FK) only for candidates whose pointing error can still
+win, and reuses those answers for the final yaw; candidates are scored with an
+expanded `pointing_error_deg`; scalar `_cross`/`_clip` replace `np.cross`/
+`np.clip` on 3-vectors and scalars; the input median takes the sorted middle.
+Results are unchanged: `golden_shoulder_ik.npz` still passes, and
+`test_x2_followme.py::test_the_shoulder_speedups_keep_the_output` pins the
+whole mirror chain to its output before the patch (`followme_feaebe22.npz`).
+
+Not copied: `reference/` (geometry export, yaw-need reference, offline
+comparison). `x2.followme.shoulder_geometry` derives the geometry from the
+package's own model at startup and checks it against the model FK;
+`test_x2_followme.py` checks it equals `geometry_x2.json`.

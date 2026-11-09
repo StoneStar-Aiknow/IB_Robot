@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from pathlib import Path
@@ -13,6 +14,7 @@ import pytest
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.joints import HAND_SIGNS, LEFT_HAND
 from aimdk_grasp.omnihand import (
+    CLOSE_SQUEEZE_RAD,
     CONTACT_LAG_RAD,
     FINGERS,
     GRIP_LOST_S,
@@ -527,7 +529,7 @@ def test_finish_discards_the_old_preserved_pose(mapping, right_mapping, side):
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
-def test_grasp_and_release_with_only_the_declared_hand_present(mapping, right_mapping, side):
+def test_grasp_and_release_with_only_the_declared_hand_present(mapping, right_mapping, side, caplog):
     active = mapping if side == "left" else right_mapping
     io = (SimHand if side == "left" else RightSimHand)(active.preset("open"))
     original = io.feedback
@@ -553,11 +555,14 @@ def test_grasp_and_release_with_only_the_declared_hand_present(mapping, right_ma
     for command in io.full_published:
         np.testing.assert_array_equal(command[absent_slice], np.zeros(10))
     active.require_open(io.measured)
-    count = len(io.full_published)
-    io.feedback = original  # A newly attached hand must not receive the absent-hand placeholder.
-    outcome = act(effector, EffectorAction.PRESHAPE)
-    assert not outcome.succeeded and "installed_hands" in outcome.reason
-    assert len(io.full_published) == count
+    # The vendor HAL reports the absent hand too: installed_hands decides, so it still gets the placeholder.
+    io.feedback = original
+    with caplog.at_level(logging.WARNING, logger="aimdk_grasp.omnihand"):
+        assert act(effector, EffectorAction.PRESHAPE).succeeded
+        assert act(effector, EffectorAction.PRESHAPE).succeeded
+    assert sum("installed_hands declares it absent" in r.getMessage() for r in caplog.records) == 1
+    for command in io.full_published:
+        np.testing.assert_array_equal(command[absent_slice], np.zeros(10))
 
 
 def test_the_right_hand_opens_and_grips_in_its_own_slots(right_mapping):
@@ -651,3 +656,52 @@ def test_a_release_with_an_object_in_the_hand_lets_go_along_one_straight_line(ri
     line = np.array(hand.published[sent:])
     moved = line[np.any(line != line[-1], axis=1)]
     np.testing.assert_allclose(moved, np.linspace(HALF_CLOSED, OPEN_RIGHT, len(moved) + 2)[1:-1], atol=1e-9)
+
+
+def _closing(mapping, *blocked):
+    close, open_hand = mapping.preset("close"), mapping.preset("open")
+    hand = SimHand(open_hand)
+    for finger, fraction in blocked:
+        _, flex, _ = FINGERS[finger]
+        hand.block(finger, open_hand[flex] + fraction * (close[flex] - open_hand[flex]))
+    effector = OmniHandEffector(hand, mapping)
+    effector.command = open_hand
+    return hand, act(effector, EffectorAction.CLOSE), effector
+
+
+def test_after_the_grip_the_other_fingers_close_until_they_touch(mapping):
+    """Live 2026-11-09: a close that stopped at thumb + 1 finger left the rest in the air and the fruit slid out."""
+    _, outcome, _ = _closing(mapping, ("thumb", 0.3), ("index", 0.3), ("middle", 0.33), ("ring", 0.35))
+    assert outcome.held is True and set(outcome.report["contacts"]) == {"thumb", "index", "middle", "ring"}
+
+
+def test_the_rest_of_the_close_is_bounded(mapping):
+    hand, outcome, _ = _closing(mapping, ("thumb", 0.2), ("index", 0.2))
+    assert outcome.held is True and outcome.report["seconds"] < 8.0
+    # The free fingers got the rest window, not the whole way to the close preset.
+    flex = FINGERS["ring"][1]
+    assert abs(hand.published[-1][flex] - mapping.preset("close")[flex]) > 0.05
+
+
+def test_only_the_contact_fingers_are_squeezed_and_by_the_set_amount(mapping, monkeypatch):
+    from aimdk_grasp import omnihand
+
+    blocks = (("thumb", 0.3), ("index", 0.3))
+    monkeypatch.setattr(omnihand, "CLOSE_SQUEEZE_RAD", 0.0)
+    plain, _, _ = _closing(mapping, *blocks)
+    monkeypatch.setattr(omnihand, "CLOSE_SQUEEZE_RAD", CLOSE_SQUEEZE_RAD)
+    squeezed, _, effector = _closing(mapping, *blocks)
+    close, open_hand = mapping.preset("close"), mapping.preset("open")
+    gained = (np.asarray(squeezed.published[-1]) - np.asarray(plain.published[-1])) * np.sign(close - open_hand)
+    for finger in ("thumb", "index"):
+        assert gained[FINGERS[finger][1]] == pytest.approx(CLOSE_SQUEEZE_RAD, abs=1e-6)
+    assert gained[FINGERS["middle"][1]] == pytest.approx(0.0, abs=1e-9)
+    # The holding check compares against the squeezed command.
+    np.testing.assert_allclose(effector._grip["command"], squeezed.published[-1])
+
+
+def test_a_squeeze_never_passes_the_close_preset(mapping):
+    hand, outcome, _ = _closing(mapping, ("thumb", 0.99), ("index", 0.99))
+    close, open_hand = mapping.preset("close"), mapping.preset("open")
+    assert np.all((np.asarray(hand.published) - close) * np.sign(close - open_hand) <= 1e-9)
+    assert outcome.succeeded

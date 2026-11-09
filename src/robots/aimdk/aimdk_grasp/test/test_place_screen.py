@@ -160,6 +160,16 @@ def test_screen_feasibility_is_fine_checked_incrementally():
     # Above: first state collides, the second is checked and valid; release: one check.
     assert calls.valid == [1, 1, 1]
     assert calls.pose[0][0] == 0
+    # Where the screen's time went, per end: IK batches, fine rounds and the states they checked.
+    parts = planner.place_report["timings_s"]["screen_parts"]
+    counts = {
+        end: {k: parts[end][k] for k in ("ik_batches", "fine_rounds", "fine_states", "feasible")} for end in parts
+    }
+    assert counts == {
+        "above": {"ik_batches": 1, "fine_rounds": 2, "fine_states": 2, "feasible": 1},
+        "release": {"ik_batches": 1, "fine_rounds": 1, "fine_states": 1, "feasible": 1},
+    }
+    assert all(parts[end]["ik_s"] >= 0 and parts[end]["fine_s"] >= 0 for end in parts)
 
 
 def test_screen_drops_a_failed_candidate_and_tries_the_next():
@@ -175,6 +185,8 @@ def test_screen_drops_a_failed_candidate_and_tries_the_next():
         "failed_stages": {"descend": 1},
     }
     assert "opening_screen" not in report  # no opening hand: nothing pre-checked
+    # Why the first candidate was refused survives the later success.
+    assert report["failures"] == ["candidate 0 at descend: descent: ik"]
 
 
 def test_screen_without_a_both_ended_candidate_is_a_recoverable_exhausted_search():
@@ -239,3 +251,19 @@ def test_an_exhausted_search_still_reports_its_timings():
     report = planner.place_report
     assert report["rounds"] == 1 and report["failed_stages"] == {"descend": 1}
     assert report["timings_s"]["rounds"][0]["failed"] == "descend" and report["timings_s"]["total"] >= 0
+
+
+def test_without_a_home_the_search_stops_at_the_retreat():
+    """BK6 (2026-11-09): home TrajOpt refusals discarded good places and cost 4.3 s; the workflow returns the arm."""
+    states = {(0, ABOVE): [_state(0.0)], (0, RELEASE): [_state(0.0)]}
+    planner, calls = _planner(states)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("no way home is planned")
+
+    planner._path_home = refuse
+    paths = LeftArmPlanner.plan_place(
+        planner, "feedback", _targets(1), None, 0.0, check_deadline=lambda: None, deadline=float("inf")
+    )
+    assert len(paths) == 3 and planner.place_report["candidate"] == 0 and not planner.place_report["failures"]
+    assert not [round_ for round_ in planner.place_report["timings_s"]["rounds"] if "home" in round_]

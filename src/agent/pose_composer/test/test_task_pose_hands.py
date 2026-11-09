@@ -92,6 +92,51 @@ def test_combined_preparation_and_phase_timings(away):
     assert report["total_sec"] == pytest.approx(2.6)
 
 
+class SettledHands(MockHands):
+    """Hands already open and arm gains already ready: preparation commands nothing."""
+
+    def __init__(self, arm, events, *, took_over=False, already_open=("left", "right")):
+        super().__init__(arm, events)
+        self.took_over, self.already_open, self.windows = took_over, already_open, []
+
+    def begin(self, ctx):
+        self.stage(ctx, "takeover", 0.0)
+        return self.took_over
+
+    def open_hand(self, ctx, side):
+        self.stage(ctx, f"opening_{side}", 0.2)
+        self.opened.append(side)
+        return side in self.already_open
+
+    def confirm(self, ctx, sides, arm_check, duration=None):
+        from aimdk_grasp.hand_restore import OBSERVE_S
+
+        self.windows.append(OBSERVE_S if duration is None else duration)
+        self.stage(ctx, "confirming", self.windows[-1])
+        arm_check()
+
+
+@pytest.mark.parametrize(
+    "away,took_over,already_open,window",
+    [
+        (False, False, ("left", "right"), "short"),  # live picks: nothing commanded
+        (True, False, ("left", "right"), "full"),  # the arm moved
+        (False, True, ("left", "right"), "full"),  # a takeover drove the hands
+        (False, False, ("left",), "full"),  # the right hand was opened
+    ],
+)
+def test_only_a_preparation_that_commanded_nothing_confirms_briefly(away, took_over, already_open, window):
+    from aimdk_grasp.hand_restore import OBSERVE_S, UNMOVED_OBSERVE_S
+
+    arm, events = MockArm(away=away), []
+    hands = SettledHands(arm, events, took_over=took_over, already_open=already_open)
+    _, report = execute(arm, hands)
+    expected = UNMOVED_OBSERVE_S if window == "short" else OBSERVE_S
+    assert hands.windows == [expected]
+    assert report["phase_sec"]["confirming"] == pytest.approx(expected)
+    assert (report["stages"]["confirming"]["reason"] == "nothing commanded: short window") is (window == "short")
+
+
 @pytest.mark.parametrize(
     "fault,code",
     [

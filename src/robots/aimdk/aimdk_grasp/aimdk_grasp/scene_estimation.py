@@ -754,6 +754,8 @@ class PreparedScene:
     depth_points: int
     unproject_s: float
     self_filter_s: float
+    #: Points within the coarse margin of the planning arm's hand and wrist (prepare_capture_scene), or None.
+    moving_hand_near: np.ndarray | None = None
 
 
 def prepare_scene(
@@ -920,6 +922,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
     target = flat[prepared.pixel]
     points, reachable, near = prepared.points, prepared.reachable, prepared.near
     keep, planning_all = prepared.keep, prepared.planning_all
+    hand_near = np.zeros(len(points), dtype=bool) if prepared.moving_hand_near is None else prepared.moving_hand_near
     dropped = flat[prepared.dropped_pixel]
     if dropped.any():
         # Target pixels the mask-independent crop dropped rejoin here: self-filter
@@ -938,9 +941,14 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         near = np.concatenate([near, np.zeros(len(extra), dtype=bool)])
         keep = np.concatenate([keep, extra_keep])
         planning_all = np.concatenate([planning_all, extra_planning])
+        hand_near = np.concatenate([hand_near, np.zeros(len(extra), dtype=bool)])
         order = np.argsort(pixel, kind="stable")
         points, target, reachable, near = points[order], target[order], reachable[order], near[order]
-        keep, planning_all = keep[order], planning_all[order]
+        keep, planning_all, hand_near = keep[order], planning_all[order], hand_near[order]
+    # The moving hand's own points, never the target's (prepare_capture_scene).
+    hand_only = keep & hand_near & ~target
+    moving_hand_dropped = int(hand_only.sum())
+    keep = keep & ~hand_only
     input_count = len(points)
     points, target, reachable = points[keep], target[keep], reachable[keep]
     planning_all, near = planning_all[keep], near[keep]
@@ -1012,6 +1020,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         "input_points": input_count,
         "self_filtered_points": int((~keep).sum() + (~self_keep).sum()),
         "validation_self_filtered_points": int((~keep).sum()),
+        "moving_hand_fine_dropped": moving_hand_dropped,
         "planning_extra_filtered_points": int((~self_keep).sum() + (~target_keep).sum()),
         "active_robot_spheres": int((np.asarray(prepared.spheres)[:, 3] > 0).sum()),
         "support_inliers": len(support.inliers),
