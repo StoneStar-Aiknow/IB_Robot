@@ -32,6 +32,19 @@ and its scores reach the gate when it finishes.
 
 A slot is recalled when a hit's look *finished* within ``RECALL_SEC`` of the
 high beep; ``recall_window`` counts any hit.
+
+**Views.** A view reads one method's record of a tick as the scores the gate
+gets and the seconds the look would have cost online. ``0``/``0nv`` are the
+baseline with and without Q3. ``A``/``A1`` are the four- and one-picture
+choice questions in the forward order, ``.cal`` the mean of both orders (two
+prefills), ``.blank`` divided by the blank-picture answers of the header.
+
+**Method C** is worked out here, from ``key_eval run``'s pooled features
+(``<stem>.embeds.npz``): each tick's nearest ``KNN`` ticks among the *other*
+people's videos, by cosine, vote with their labels (an action's hold, from a
+second after the high beep to the low one; "none" where the cue says none,
+away from any key slot). ``C.mean`` compares the mean feature, ``C.grid`` the
+whole 4×4 grid. Its look costs one vision run.
 """
 
 from __future__ import annotations
@@ -145,7 +158,7 @@ def align(
     motion = _robust_z(features["motion"])
     dev, motion = dev - dev.mean(), motion - motion.mean()
     n = len(dev)
-    shifts = int(round(max_offset / bin_sec)) + 1
+    shifts = min(int(round(max_offset / bin_sec)) + 1, n)
     per_version = []
     for version in versions:
         best = None
@@ -184,10 +197,13 @@ LABEL_ACTIONS = {
 }
 
 
-def _baseline(verify: bool) -> Callable[[Mapping], tuple[dict, float] | None]:
+View = Callable[[Mapping, Mapping], "tuple[dict, float] | None"]
+
+
+def _baseline(verify: bool) -> View:
     """Method 0: look_say's Q1 (and Q2) label, after Q3's yes with ``verify``."""
 
-    def view(tick: Mapping) -> tuple[dict, float] | None:
+    def view(tick: Mapping, header: Mapping) -> tuple[dict, float] | None:
         rec = tick.get("methods", {}).get("0")
         if rec is None or "error" in rec:
             return None
@@ -202,10 +218,57 @@ def _baseline(verify: bool) -> Callable[[Mapping], tuple[dict, float] | None]:
     return view
 
 
-VIEWS: dict[str, Callable[[Mapping], tuple[dict, float] | None]] = {
+def _choice(frames: str, mode: str) -> View:
+    """Method A (``frames`` "4") or A1 ("1"): the choice question's shares, see the module docstring."""
+    from visual_interaction.session import key_choice
+
+    def view(tick: Mapping, header: Mapping) -> tuple[dict, float] | None:
+        rec = tick.get("methods", {}).get("A")
+        if rec is None or "error" in rec:
+            return None
+        asked = rec[frames]
+        seconds = rec["vision_s"] + asked["fwd"]["s"]
+        if mode == "cal":
+            answer = key_choice.average(asked["fwd"]["p"], asked["rev"]["p"])
+            seconds += asked["rev"]["s"]
+        elif mode == "blank":
+            blank = header["calibration"]["A"]["blank"][frames]["fwd"]["p"]
+            answer = key_choice.calibrate(asked["fwd"]["p"], blank)
+        else:
+            answer = key_choice.shares(asked["fwd"]["p"])
+        return key_choice.action_scores(answer), seconds
+
+    return view
+
+
+def _computed(name: str) -> View:
+    """A method worked out by this module (C) and put into the ticks."""
+
+    def view(tick: Mapping, header: Mapping) -> tuple[dict, float] | None:
+        rec = tick.get("methods", {}).get(name)
+        if rec is None:
+            return None
+        return dict(rec["scores"]), rec["s"]
+
+    return view
+
+
+VIEWS: dict[str, View] = {
     "0": _baseline(verify=True),
     "0nv": _baseline(verify=False),
+    **{
+        f"A{n}{mode}": _choice(f, m)
+        for n, f in (("", "4"), ("1", "1"))
+        for mode, m in (("", ""), (".cal", "cal"), (".blank", "blank"))
+    },
+    "C.mean": _computed("C.mean"),
+    "C.grid": _computed("C.grid"),
 }
+DEFAULT_VIEWS = ("0", "0nv", "A", "A.cal", "A.blank", "A1", "A1.cal", "A1.blank", "C.mean", "C.grid")
+
+# Method C.
+KNN = 15
+HOLD_FROM_GO = 1.0
 
 
 @dataclass(frozen=True)
@@ -216,9 +279,77 @@ class Look:
     seconds: float
 
 
-def replay(ticks: Sequence[Mapping], view: Callable, tick_sec: float) -> list[Look]:
+def reference_label(alignment: Alignment, t: float) -> str | None:
+    """Method C's label for a tick at ``t``: an action's hold, "none", or None (not used)."""
+    for go, down, slot in alignment.windows():
+        if slot.label in KEY_ACTIONS:
+            if go + HOLD_FROM_GO <= t <= down:
+                return slot.label
+            if go - HIT_EARLY <= t <= down + HIT_LATE:
+                return None
+    label, _ = alignment.label(t)
+    return schedule.NONE if label == schedule.NONE else None
+
+
+def knn_ticks(videos: Sequence[tuple], embeds: Mapping[str, Mapping], k: int = KNN) -> int:
+    """Put method C's scores into the ticks of ``videos``, leaving each person out. Returns ticks scored.
+
+    ``videos`` are ``(stem, alignment, ticks, tick_sec)``; ``embeds`` maps a stem
+    to its ``{"t", "grid"}``. A tick gets ``C.mean`` and ``C.grid`` when it has
+    features and another person has references.
+    """
+    import numpy as np
+
+    keys, people, labels, means, grids = [], [], [], [], []
+    for stem, alignment, _, _ in videos:
+        if stem not in embeds:
+            continue
+        for t, grid in zip(embeds[stem]["t"], embeds[stem]["grid"], strict=True):
+            grid = np.asarray(grid, np.float32)
+            keys.append((stem, round(float(t), 3)))
+            people.append(person_of(stem))
+            labels.append(reference_label(alignment, float(t)) or "")
+            means.append(grid.mean(0))
+            grids.append(grid.ravel())
+    if not keys:
+        return 0
+
+    def unit(rows):
+        matrix = np.stack(rows)
+        return matrix / (np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9)
+
+    people, labels = np.array(people), np.array(labels)
+    found: dict = {}
+    for name, feat in (("C.mean", unit(means)), ("C.grid", unit(grids))):
+        for person in sorted(set(people)):
+            mine = np.flatnonzero(people == person)
+            refs = np.flatnonzero((people != person) & (labels != ""))
+            if not refs.size:
+                continue
+            take = min(k, refs.size)
+            sims = feat[mine] @ feat[refs].T
+            nearest = np.argpartition(-sims, take - 1, axis=1)[:, :take]
+            for row, picks in zip(mine, nearest, strict=True):
+                votes = Counter(labels[refs[picks]])
+                found[(name, keys[row])] = {a: votes[a] / take for a in KEY_ACTIONS if votes[a]}
+    scored = 0
+    for stem, _, ticks, _ in videos:
+        for tick in ticks:
+            key = (stem, round(tick["t"], 3))
+            rec = tick.get("methods", {}).get("A") or {}
+            hit = False
+            for name in ("C.mean", "C.grid"):
+                if (name, key) in found:
+                    tick.setdefault("methods", {})[name] = {"scores": found[(name, key)], "s": rec.get("vision_s", 0.0)}
+                    hit = True
+            scored += hit
+    return scored
+
+
+def replay(ticks: Sequence[Mapping], view: View, tick_sec: float, header: Mapping | None = None) -> list[Look]:
     """The looks the node would have made, back to back (module docstring, cadence)."""
     looks: list[Look] = []
+    header = header or {}
     ticks = sorted(ticks, key=lambda tick: tick["t"])
     if not ticks:
         return looks
@@ -228,7 +359,7 @@ def replay(ticks: Sequence[Mapping], view: Callable, tick_sec: float) -> list[Lo
             i += 1
         if i == len(ticks):
             break
-        out = view(ticks[i])
+        out = view(ticks[i], header)
         if out is not None:
             scores, seconds = out
             decided = max(cursor, ticks[i]["t"]) + seconds
@@ -502,7 +633,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", default="auto", choices=("auto", *map(str, schedule.VERSIONS)))
     parser.add_argument("--offset", action="append", default=[], help="STEM=SECONDS[:VERSION], repeatable")
     parser.add_argument("--max-runner-up", type=float, default=MAX_RUNNER_UP)
-    parser.add_argument("--views", default=",".join(VIEWS), help=f"comma list of {sorted(VIEWS)}")
+    parser.add_argument("--views", default=",".join(DEFAULT_VIEWS), help=f"comma list of {sorted(VIEWS)}")
+    parser.add_argument("--knn", type=int, default=KNN, help="method C's neighbours")
     parser.add_argument("--confirm", default="1,2")
     parser.add_argument("--threshold", default="0.5", help="comma list, one gate per value (all actions)")
     parser.add_argument("--actions", default=",".join(KEY_ACTIONS), help="the actions the gate may trigger")
@@ -517,7 +649,7 @@ def main(argv: list[str] | None = None) -> int:
     versions = schedule.VERSIONS if args.version == "auto" else (int(args.version),)
 
     report: dict = {"alignment": {}, "runs": [], "refused": []}
-    videos = []
+    videos, headers, embeds = [], {}, {}
     for path in sorted(args.dir.glob("*.features.json")):
         stem = path.name[: -len(".features.json")]
         features = json.loads(path.read_text(encoding="utf-8"))
@@ -528,6 +660,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             alignment, _ = align(features, versions)
             accepted = alignment.runner_up <= args.max_runner_up
+        # A video cut short would count its missing slots as misses.
+        last_key = max(down for _, down, slot in alignment.windows() if slot.label in KEY_ACTIONS)
+        if float(features.get("duration", 0.0)) < last_key + HIT_LATE:
+            accepted = False
         report["alignment"][stem] = {**alignment.__dict__, "accepted": accepted, "duration": features.get("duration")}
         if not accepted:
             report["refused"].append(stem)
@@ -536,6 +672,15 @@ def main(argv: list[str] | None = None) -> int:
         if ticks_path.exists():
             header, ticks = read_jsonl(ticks_path)
             videos.append((stem, alignment, ticks, float(header.get("tick_sec", 0.5))))
+            headers[stem] = header
+            embeds_path = args.dir / f"{stem}.embeds.npz"
+            if embeds_path.exists():
+                import numpy as np
+
+                with np.load(embeds_path) as data:
+                    embeds[stem] = {"t": data["t"], "grid": data["grid"]}
+    if embeds and any(view.startswith("C.") for view in views):
+        report["knn"] = {"k": args.knn, "ticks": knn_ticks(videos, embeds, args.knn)}
 
     allowed = [a for a in args.actions.split(",") if a]
     for view in views:
@@ -543,10 +688,11 @@ def main(argv: list[str] | None = None) -> int:
             for threshold in _floats(args.threshold):
                 gate = GateConfig({a: threshold for a in allowed}, confirm, args.release, args.cooldown)
                 results = [
-                    evaluate_video(stem, alignment, replay(ticks, VIEWS[view], tick_sec), gate)
+                    evaluate_video(stem, alignment, replay(ticks, VIEWS[view], tick_sec, headers[stem]), gate)
                     for stem, alignment, ticks, tick_sec in videos
                 ]
-                if results:
+                # A view whose method was not run has no looks: no table for it.
+                if any(r.look_seconds for r in results):
                     report["runs"].append(
                         {"view": view, "confirm": confirm, "threshold": threshold, "summary": summarize(results)}
                     )
@@ -555,7 +701,11 @@ def main(argv: list[str] | None = None) -> int:
     (args.dir / f"{args.name}.md").write_text(text, encoding="utf-8")
     sys.stdout.write(text)
     if report["refused"]:
-        print(f"refused (alignment unclear, give --offset): {', '.join(report['refused'])}", file=sys.stderr)
+        print(
+            f"refused (alignment unclear, give --offset; or the video ends before the last key slot):"
+            f" {', '.join(report['refused'])}",
+            file=sys.stderr,
+        )
     return 0
 
 

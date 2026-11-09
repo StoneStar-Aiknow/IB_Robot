@@ -127,9 +127,9 @@ class TestReplay:
     def test_baseline_views_read_q3(self):
         rec = {"prepare_s": 0.3, "q1_s": 0.6, "q3_s": 0.1, "label": "hand/heart", "yes": False}
         tick = {"t": 0, "methods": {"0": rec}}
-        assert key_eval_score.VIEWS["0"](tick) == ({}, pytest.approx(1.0))
-        assert key_eval_score.VIEWS["0nv"](tick) == ({"heart": 1.0}, pytest.approx(0.9))
-        assert key_eval_score.VIEWS["0"]({"t": 0, "methods": {"0": {"error": "x"}}}) is None
+        assert key_eval_score.VIEWS["0"](tick, {}) == ({}, pytest.approx(1.0))
+        assert key_eval_score.VIEWS["0nv"](tick, {}) == ({"heart": 1.0}, pytest.approx(0.9))
+        assert key_eval_score.VIEWS["0"]({"t": 0, "methods": {"0": {"error": "x"}}}, {}) is None
 
 
 class TestCounting:
@@ -214,6 +214,128 @@ class TestBaseline:
         assert rec["label"] == "hand/thumb" and rec["yes"] is False and rec["fallback"] is True
 
 
+class FakeChoiceVision:
+    """register_choices / prepare_many / score: each picture's features are its mean grey level."""
+
+    HIDDEN = 8
+
+    def __init__(self):
+        self.scored = []
+        self.batches = []
+
+    def register_choices(self, choices):
+        self.choices = dict(choices)
+
+    def prepare_many(self, images):
+        from visual_interaction.session.internvl_vision import Seen
+
+        self.batches.append([float(image.mean()) for image in images])
+        embeds = np.stack([np.full((256, self.HIDDEN), image.mean(), np.float32) for image in images])
+        return Seen(embeds=embeds, image=images[-1], crop_fallback=False, seconds=0.3, images=tuple(images))
+
+    def score(self, seen, key):
+        from visual_interaction.session.internvl_vision import Choice
+
+        assert key in self.choices
+        frames = int(key.split(".")[1])
+        assert len(seen.embeds) == frames
+        self.scored.append(key)
+        # Letter A is likely; the rest share what is left of 0.9.
+        probs = {"A": 0.5, "B": 0.1, "C": 0.1, "D": 0.1, "E": 0.05, "F": 0.05}
+        return Choice(probs=probs, mass=0.9, top="A", seconds=0.15)
+
+
+class TestChoices:
+    def test_one_vision_batch_feeds_both_picture_counts_and_orders(self):
+        vision = FakeChoiceVision()
+        method = key_eval.Choices(vision)
+        assert set(vision.choices) == {"key.1.fwd", "key.1.rev", "key.4.fwd", "key.4.rev"}
+        history = [(round(0.05 * k, 2), np.full((48, 64, 3), k, np.uint8)) for k in range(21)]
+        rec, image = method(history[-1][1], None, tuple(history))
+        assert len(vision.batches) == 1 and vision.batches[0] == pytest.approx([5, 10, 15, 20])
+        assert rec["dt"] == pytest.approx([-0.75, -0.5, -0.25, 0.0]) and rec["fallback"] == 4
+        assert vision.scored == ["key.4.fwd", "key.4.rev", "key.1.fwd", "key.1.rev"]
+        fwd, rev = rec["4"]["fwd"], rec["4"]["rev"]
+        assert fwd["p"][KEY_ACTIONS[0]] == 0.5 and rev["p"][KEY_ACTIONS[-1]] == 0.5
+        assert fwd["p"]["none"] == rev["p"]["none"] == 0.05 and fwd["mass"] == 0.9 and fwd["top"] == "A"
+        assert rec["_pooled"].shape == (16, FakeChoiceVision.HIDDEN) and rec["_pooled"].dtype == np.float16
+        assert float(rec["_pooled"][0, 0]) == 20.0 and image.shape == (448, 448, 3)
+
+    def test_without_history_the_frame_fills_every_slot(self):
+        vision = FakeChoiceVision()
+        rec, _ = key_eval.Choices(vision)(np.zeros((48, 64, 3), np.uint8), None)
+        assert rec["dt"] == [0.0] * 4 and len(vision.batches[0]) == 4
+
+    def test_the_header_scores_blank_pictures(self):
+        vision = FakeChoiceVision()
+        header = key_eval.Choices(vision).header()
+        assert vision.batches == [[128.0] * 4]
+        assert set(header["blank"]) == {"4", "1"} and set(header["blank"]["1"]) == {"fwd", "rev"}
+
+    def test_pooling_averages_blocks(self):
+        embeds = np.arange(256, dtype=np.float32).reshape(256, 1).repeat(2, axis=1)
+        grid = key_eval.pooled(embeds)
+        # Block (0, 0) holds rows 0-3 of the 16x16 grid, columns 0-3.
+        assert grid.shape == (16, 2) and float(grid[0, 0]) == pytest.approx(
+            np.mean([r * 16 + c for r in range(4) for c in range(4)])
+        )
+
+    def test_the_views_read_the_shares(self):
+        p = {"heart": 0.4, "thumb": 0.1, "yeah": 0.05, "wave": 0.05, "open": 0.05, "none": 0.15}
+        rev = {**p, "heart": 0.1, "thumb": 0.4}
+        asked = {"fwd": {"p": p, "s": 0.15}, "rev": {"p": rev, "s": 0.16}}
+        tick = {"t": 0, "methods": {"A": {"vision_s": 0.3, "4": asked, "1": asked}}}
+        scores, seconds = key_eval_score.VIEWS["A"](tick, {})
+        assert seconds == pytest.approx(0.45) and set(scores) == {"heart"}
+        assert scores["heart"] == pytest.approx(0.5)
+        scores, seconds = key_eval_score.VIEWS["A1.cal"](tick, {})
+        assert seconds == pytest.approx(0.61) and scores == pytest.approx({"heart": 0.3125, "thumb": 0.3125})
+        # A blank picture already says heart: calibrated, thumb is what stands out.
+        blank = {**p, "heart": 0.8, "thumb": 0.05, "none": 0.1}
+        header = {"calibration": {"A": {"blank": {"4": {"fwd": {"p": blank}}}}}}
+        scores, _ = key_eval_score.VIEWS["A.blank"](tick, header)
+        assert set(scores) == {"thumb"}
+        assert key_eval_score.VIEWS["A"]({"t": 0, "methods": {"A": {"error": "x"}}}, {}) is None
+
+
+class TestNearestNeighbours:
+    def test_each_person_is_matched_against_the_others_only(self):
+        alignment = Alignment(version=2, offset=0.0)
+        hold = {}
+        for go, _, slot in alignment.windows():
+            if slot.label in KEY_ACTIONS:
+                hold.setdefault(slot.label, go + 2.0)
+        none_t = next(go + 1.0 for go, _, slot in alignment.windows() if slot.label == "none")
+        times = [hold["heart"], hold["thumb"], none_t]
+        directions = {hold["heart"]: 0, hold["thumb"]: 1, none_t: 2}
+
+        def features(seed):
+            rng = np.random.default_rng(seed)
+            grids = [np.eye(3, 8)[directions[t]] + rng.normal(0, 0.05, (16, 8)) for t in times]
+            return {"t": np.array(times), "grid": np.stack(grids).astype(np.float16)}
+
+        def ticks():
+            return [{"t": t, "methods": {"A": {"vision_s": 0.3}}} for t in times]
+
+        videos = [(stem, alignment, ticks(), 0.5) for stem in ("p01_1", "p02_1", "p03_1")]
+        embeds = {"p01_1": features(1), "p02_1": features(2)}
+        assert key_eval_score.knn_ticks(videos, embeds, k=1) == 6
+        heart, thumb, none = videos[0][2]
+        assert heart["methods"]["C.grid"] == {"scores": {"heart": 1.0}, "s": 0.3}
+        assert thumb["methods"]["C.mean"]["scores"] == {"thumb": 1.0}
+        assert none["methods"]["C.grid"]["scores"] == {}
+        assert "C.mean" not in videos[2][2][0]["methods"]  # no features for p03
+        # Alone, a person has nobody to be compared with.
+        assert key_eval_score.knn_ticks(videos[:1], {"p01_1": features(1)}, k=1) == 0
+
+    def test_reference_labels_skip_the_edges_of_a_key_window(self):
+        alignment = Alignment(version=2, offset=0.0)
+        go, down, slot = next(w for w in alignment.windows() if w[2].label in KEY_ACTIONS)
+        assert key_eval_score.reference_label(alignment, go + 0.5) is None
+        assert key_eval_score.reference_label(alignment, go + 1.5) == slot.label
+        assert key_eval_score.reference_label(alignment, down + 0.2) is None
+
+
 def write_video(path, seconds=3.0, fps=10):
     import cv2
 
@@ -255,12 +377,39 @@ class TestFiles:
         assert ticks[1]["methods"]["0"]["label"] == "hand/thumb"
         assert len(list((out / "p03_1" / "crops").glob("*.jpg"))) == 3
 
+        # A 3 s video ends long before the last key slot: refused, however it is aligned.
+        for extra in ([], ["--offset", "p03_1=0:2"]):
+            assert key_eval.main(["score", str(out), "--confirm", "1", *extra]) == 0
+            report = json.loads((out / "report.json").read_text())
+            assert report["refused"] == ["p03_1"] and report["runs"] == []
+
+        path = out / "p03_1.features.json"
+        path.write_text(json.dumps({**features, "duration": schedule.total_sec(2)}))
         code = key_eval.main(["score", str(out), "--offset", "p03_1=0:2", "--confirm", "1"])
         assert code == 0
         report = json.loads((out / "report.json").read_text())
         assert report["alignment"]["p03_1"]["manual"] is True
         assert {(run["view"], run["confirm"]) for run in report["runs"]} == {("0", 1), ("0nv", 1)}
         assert (out / "report.md").read_text().startswith("# 关键动作离线评测")
+
+    def test_process_with_method_a_keeps_features_and_strides(self, tmp_path):
+        video = tmp_path / "p06_1.mp4"
+        write_video(video, seconds=2.0)
+        out = tmp_path / "out"
+        out.mkdir()
+        baseline = key_eval.Baseline(FakeVision({"q1": "站着"}))
+        baseline.stride = 2
+        vision = FakeChoiceVision()
+        key_eval.process(video, out, [baseline, key_eval.Choices(vision)], None, tick_sec=0.5, log=lambda *a: None)
+        rows = [json.loads(line) for line in (out / "p06_1.ticks.jsonl").read_text().splitlines()]
+        header, ticks = rows[0], [row for row in rows if row["kind"] == "tick"]
+        assert header["strides"] == {"0": 2, "A": 1} and header["multi_offsets"] == list(key_eval.MULTI_OFFSETS)
+        assert set(header["calibration"]["A"]["blank"]) == {"4", "1"}
+        assert [("0" in tick["methods"], "A" in tick["methods"]) for tick in ticks] == [(True, True), (False, True)] * 2
+        assert all("_pooled" not in tick["methods"]["A"] for tick in ticks)
+        with np.load(out / "p06_1.embeds.npz") as data:
+            assert data["t"].tolist() == pytest.approx([tick["t"] for tick in ticks])
+            assert data["grid"].shape == (4, 16, FakeChoiceVision.HIDDEN)
 
     def test_features_command_needs_no_model(self, tmp_path, capsys):
         video = tmp_path / "p04_1.mp4"

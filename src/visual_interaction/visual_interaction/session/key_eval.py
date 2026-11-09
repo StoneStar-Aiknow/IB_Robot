@@ -9,6 +9,9 @@ tool walks the video in time order and writes, per video, into ``--out``:
 * ``<stem>.ticks.jsonl`` (``run`` only): one line every ``--tick`` seconds of
   video, with the person box used and what each method answered and how long
   it took. Text and numbers only.
+* ``<stem>.embeds.npz`` (method ``A`` only): per tick, the vision features of
+  the newest crop pooled to a 4×4 grid, for method C's nearest neighbours in
+  key_eval_score. Derived from pictures of people: it stays on the board.
 * ``<stem>/crops/`` (``--dump-every N`` only): every N-th tick's 448² crop, to
   check the box by eye. These are pictures of people: they stay on the board.
 
@@ -22,6 +25,15 @@ Methods (``--methods``):
 * ``0``: look_say as it is — Q1 on the newest frame, Q2 when Q1 names a vague
   hand gesture, Q3's yes/no on a named key action. key_eval_score reads it
   both with and without Q3.
+* ``A``: key_choice's multiple-choice question, scored from the first token.
+  One vision OM run on four crops of the person, ``MULTI_OFFSETS`` apart
+  (each cut with this tick's box), then the four-picture question (A) and the
+  one-picture question on the newest crop alone (A1), each in both option
+  orders. The header carries the same questions' answers on blank grey
+  pictures, for calibration. Its pooled features feed method C.
+
+``--stride METHOD=N`` runs a method on every N-th tick only (the baseline's
+looks take ~1.5 s, so the replay never uses more than one tick in three).
 
 Subcommands::
 
@@ -54,6 +66,10 @@ STANCE_WINDOW_SEC = 60.0
 HOLD_BOX_SEC = 2.0
 MIN_PERSON_CONFIDENCE = 0.3
 DEFAULT_TICK_SEC = 0.5
+# Method A's pictures, seconds before the tick, oldest first.
+MULTI_OFFSETS = (0.75, 0.5, 0.25, 0.0)
+HISTORY_SEC = 1.0
+POOL_GRID = 4
 
 
 def frames(path: Path) -> Iterator[tuple[int, float, object]]:
@@ -228,7 +244,7 @@ class Baseline:
         self._vision = vision
         vision.register_questions(QUESTIONS)
 
-    def __call__(self, frame, box, source_size=None) -> tuple[dict, object]:
+    def __call__(self, frame, box, history=(), source_size=None) -> tuple[dict, object]:
         from visual_interaction.session import look_say
 
         vision = self._vision
@@ -252,7 +268,86 @@ class Baseline:
         return rec, seen.image
 
 
-METHODS = {"0": Baseline}
+def nearest(history: Sequence[tuple[float, object]], seconds: float) -> tuple[float, object]:
+    """The ``(t, frame)`` of ``history`` closest to ``seconds``."""
+    return min(history, key=lambda item: abs(item[0] - seconds))
+
+
+def pooled(embeds) -> object:
+    """One picture's ``(IMAGE_TOKENS, hidden)`` features as a POOL_GRID² grid, float16."""
+    import numpy as np
+
+    side = int(round(len(embeds) ** 0.5))
+    grid = np.asarray(embeds, np.float32).reshape(side, side, -1)
+    step = side // POOL_GRID
+    blocks = grid.reshape(POOL_GRID, step, POOL_GRID, step, -1).mean(axis=(1, 3))
+    return blocks.reshape(POOL_GRID * POOL_GRID, -1).astype(np.float16)
+
+
+class Choices:
+    """Method A (and A1): key_choice's question, scored, see the module docstring."""
+
+    name = "A"
+
+    def __init__(self, vision) -> None:
+        from visual_interaction.session import key_choice
+
+        self._vision = vision
+        self._questions = key_choice.questions(frames=(1, len(MULTI_OFFSETS)))
+        vision.register_choices(self._questions)
+
+    def _ask(self, seen, frames: int) -> dict:
+        from visual_interaction.session import key_choice
+
+        out = {}
+        for order in key_choice.ORDERS:
+            choice = self._vision.score(seen, key_choice.key(frames, order))
+            out[order] = {
+                "p": {a: round(p, 5) for a, p in key_choice.by_answer(choice.probs, order).items()},
+                "mass": round(choice.mass, 4),
+                "top": choice.top,
+                "s": round(choice.seconds, 4),
+            }
+        return out
+
+    def header(self) -> dict:
+        """The answers on blank grey pictures: what the question says about nothing."""
+        import numpy as np
+
+        from visual_interaction.session.internvl_vision import Seen
+
+        grey = np.full((448, 448, 3), 128, np.uint8)
+        seen = self._vision.prepare_many([grey] * len(MULTI_OFFSETS))
+        one = Seen(embeds=seen.embeds[-1:], image=grey, crop_fallback=False, seconds=0.0)
+        return {"blank": {"4": self._ask(seen, len(MULTI_OFFSETS)), "1": self._ask(one, 1)}}
+
+    def __call__(self, frame, box, history=(), source_size=None) -> tuple[dict, object]:
+        from visual_interaction.session import look_crop
+        from visual_interaction.session.internvl_vision import Seen
+
+        now = history[-1][0] if history else 0.0
+        picks = (
+            [nearest(history, now - offset) for offset in MULTI_OFFSETS]
+            if history
+            else [(now, frame)] * len(MULTI_OFFSETS)
+        )
+        started = time.perf_counter()
+        crops = [look_crop.crop_upper_body(picked, box) for _, picked in picks]
+        seen = self._vision.prepare_many([crop.image for crop in crops])
+        vision_s = time.perf_counter() - started
+        newest = Seen(embeds=seen.embeds[-1:], image=seen.image, crop_fallback=crops[-1].fallback, seconds=0.0)
+        rec = {
+            "vision_s": round(vision_s, 4),
+            "fallback": sum(crop.fallback for crop in crops),
+            "dt": [round(t - now, 3) for t, _ in picks],
+            "4": self._ask(seen, len(MULTI_OFFSETS)),
+            "1": self._ask(newest, 1),
+            "_pooled": pooled(seen.embeds[-1]),
+        }
+        return rec, seen.image
+
+
+METHODS = {"0": Baseline, "A": Choices}
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +365,10 @@ def process(
     log=print,
 ) -> dict:
     """Features for ``path``, and with ``methods`` its ticks file. Returns the features."""
+    from collections import deque
+
     import cv2
+    import numpy as np
 
     stem = path.stem
     features = Features()
@@ -284,16 +382,26 @@ def process(
             "video": path.name,
             "tick_sec": tick_sec,
             "methods": [m.name for m in methods],
+            "strides": {m.name: getattr(m, "stride", 1) for m in methods},
+            "multi_offsets": list(MULTI_OFFSETS),
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "calibration": {m.name: m.header() for m in methods if hasattr(m, "header")},
         }
         ticks_file.write(json.dumps(header, ensure_ascii=False) + "\n")
     next_tick, count = 0.0, 0
+    history: deque = deque()
+    embeds_t, embeds = [], []
     try:
         for _, seconds, frame in frames(path):
             if limit_sec is not None and seconds > limit_sec:
                 break
             features.add(seconds, frame)
-            if not methods or seconds + 1e-6 < next_tick:
+            if not methods:
+                continue
+            history.append((seconds, frame))
+            while seconds - history[0][0] > HISTORY_SEC + 0.1:
+                history.popleft()
+            if seconds + 1e-6 < next_tick:
                 continue
             box, source, confidence = boxes(seconds, frame) if boxes else (None, "none", None)
             row = {
@@ -305,10 +413,16 @@ def process(
                 "methods": {},
             }
             for method in methods:
+                if count % getattr(method, "stride", 1):
+                    continue
                 try:
-                    rec, image = method(frame, box)
+                    rec, image = method(frame, box, tuple(history))
                 except Exception as error:  # noqa: BLE001 - recorded per tick, the run goes on
                     rec, image = {"error": f"{type(error).__name__}: {error}"}, None
+                grid = rec.pop("_pooled", None)
+                if grid is not None:
+                    embeds_t.append(seconds)
+                    embeds.append(grid)
                 row["methods"][method.name] = rec
                 if dump_every and count % dump_every == 0 and image is not None:
                     crops = out / stem / "crops"
@@ -326,6 +440,8 @@ def process(
                 json.dumps({"kind": "end", "ticks": count, "seconds": round(time.perf_counter() - started, 1)}) + "\n"
             )
             ticks_file.close()
+        if embeds:
+            np.savez(out / f"{stem}.embeds.npz", t=np.array(embeds_t), grid=np.stack(embeds))
     result = features.result(_fps(path))
     (out / f"{stem}.features.json").write_text(json.dumps(result), encoding="utf-8")
     log(
@@ -353,6 +469,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--yolox", help="the YOLOX person OM")
     run.add_argument("--no-yolox", action="store_true", help="use the fixed middle box throughout")
     run.add_argument("--methods", default="0", help=f"comma list of {sorted(METHODS)}")
+    run.add_argument("--stride", action="append", default=[], help="METHOD=N: run it on every N-th tick only")
     run.add_argument("--tick", type=float, default=DEFAULT_TICK_SEC)
     run.add_argument("--dump-every", type=int, default=0, help="save every N-th tick's crop (stays on the board)")
     run.add_argument("--allow-launch", action="store_true")
@@ -374,6 +491,12 @@ def main(argv: list[str] | None = None) -> int:
     unknown = [m for m in names if m not in METHODS]
     if unknown:
         parser.error(f"unknown methods {unknown}")
+    strides = {}
+    for item in args.stride:
+        name, _, value = item.partition("=")
+        if name not in names or not value.isdigit() or int(value) < 1:
+            parser.error(f"--stride wants METHOD=N for one of {names}, got {item!r}")
+        strides[name] = int(value)
     from visual_interaction.session.look_bench import _launch_running
 
     running = _launch_running()
@@ -387,6 +510,8 @@ def main(argv: list[str] | None = None) -> int:
 
     vision = InternVlVision(demo_root=args.demo_root, frames=1, prompt_mode="chatter")
     methods = [METHODS[name](vision) for name in names]
+    for method in methods:
+        method.stride = strides.get(method.name, 1)
     vision.load()
     if vision.question_failures:
         print(f"questions refused at load: {vision.question_failures}", file=sys.stderr)

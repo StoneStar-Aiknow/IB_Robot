@@ -36,6 +36,14 @@ generator only reads them when it builds a prompt, so any number of questions,
 in any order, can reuse one ``Seen``. The questions are fixed per deployment,
 registered before ``load`` and tokenized and budget-checked there, once; a
 question that does not fit the OM shapes is remembered and refused by ``ask``.
+
+The key-action detector (plan v11) asks multiple-choice questions and reads
+the answer without generating it: ``score`` runs prefill alone and returns the
+probability of each option's token as the first token of the reply, which
+costs one prefill and no decode. Its questions may show up to
+:data:`VISION_BATCH` pictures, which ``prepare_many`` runs through the vision
+OM in one batch; the features of several ``Seen`` (cached reference pictures
+and a live one, say) can be put into one question in order.
 """
 
 from __future__ import annotations
@@ -70,8 +78,12 @@ class VisionBackendError(RuntimeError):
     """The model could not be loaded or reached. Reported as MODEL_NOT_READY."""
 
 
+class _DoesNotFit(ValueError):
+    """A question's prompt is over the OM shapes; the message says by how much."""
+
+
 class QuestionError(ValueError):
-    """``ask`` named a question that was never registered or failed its budget check."""
+    """``ask`` or ``score`` named a question that was never registered, failed its check, or got the wrong pictures."""
 
 
 @dataclass(frozen=True)
@@ -83,12 +95,16 @@ class Seen:
     computed from; ``crop_fallback`` is true when a crop was asked for and the
     whole frame was used instead; ``seconds`` covers crop, preprocessing and
     the vision OM.
+
+    From ``prepare_many``, ``embeds`` has one row per picture, ``images`` holds
+    them all in order and ``image`` is the last.
     """
 
     embeds: object
     image: object
     crop_fallback: bool
     seconds: float
+    images: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -98,6 +114,21 @@ class Answer:
     text: str
     seconds: float
     tokens: int
+
+
+@dataclass(frozen=True)
+class Choice:
+    """One scored question: each option's probability as the reply's first token.
+
+    The probabilities are over the whole vocabulary, so they need not sum to
+    one; ``mass`` is their sum, how much the model kept to the options. ``top``
+    is the most likely token, decoded, option or not.
+    """
+
+    probs: Mapping[str, float]
+    mass: float
+    top: str
+    seconds: float
 
 
 def question_prompt(text: str) -> str:
@@ -150,6 +181,10 @@ class InternVlVision(VisionLanguagePort):
     _questions: dict = field(default_factory=dict, init=False)
     _question_ids: dict = field(default_factory=dict, init=False)
     question_failures: dict = field(default_factory=dict, init=False)
+    # score: key -> (text, options) as registered; key -> (ids, option token
+    # ids, pictures) for the ones that passed their check.
+    _choices: dict = field(default_factory=dict, init=False)
+    _choice_ids: dict = field(default_factory=dict, init=False)
     # One batch buffer for prepare: only row 0 is ever written, the padding
     # rows stay zero, so a call allocates no new batch.
     _pixels: object = field(default=None, init=False)
@@ -243,6 +278,7 @@ class InternVlVision(VisionLanguagePort):
         self._std = live_chat.STD
         self._pixels = np.zeros((VISION_BATCH, 3, 448, 448), np.float32)
         self._check_questions(dict(self._questions))
+        self._check_choices(dict(self._choices))
 
     def _prompt_text(self) -> str:
         """Our closed-schema question, with the image slots expanded.
@@ -306,42 +342,121 @@ class InternVlVision(VisionLanguagePort):
                 raise ValueError(f"question {key!r} has no text")
             if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens <= 0:
                 raise ValueError(f"question {key!r}: max_new_tokens must be a positive int, got {max_new_tokens!r}")
+            if key in self._choices:
+                raise ValueError(f"question {key!r} is already registered as a choice question")
             checked[key] = (text, max_new_tokens)
         self._questions.update(checked)
         if self._loaded:
             self._check_questions(checked)
 
-    def _check_questions(self, questions: Mapping[str, tuple[str, int]]) -> None:
-        """Tokenize each question with one image slot and hold it to the OM shapes."""
+    def register_choices(self, questions: Mapping[str, Sequence[object]]) -> None:
+        """Register ``{key: (text, options)}`` for :meth:`score`.
+
+        ``options`` are the strings whose probability as the reply's first
+        token is read, e.g. ``("A", "B", "C")``; each must be one token, which
+        the load checks. A plain ``text`` shows one picture, like
+        :meth:`register_questions`; a chat prompt may carry 1 to
+        :data:`VISION_BATCH` ``<image>`` slots, filled in order. Otherwise as
+        :meth:`register_questions`.
+        """
+        checked = {}
+        for key, entry in questions.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"question key must be a non-empty string, got {key!r}")
+            if key in self._questions:
+                raise ValueError(f"question {key!r} is already registered for ask")
+            try:
+                text, options = entry
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"question {key!r} must be (text, options), got {entry!r}") from error
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError(f"question {key!r} has no text")
+            if isinstance(options, str) or not options:
+                raise ValueError(f"question {key!r}: options must be a non-empty sequence of strings")
+            options = tuple(options)
+            if not all(isinstance(o, str) and o for o in options) or len(set(options)) != len(options):
+                raise ValueError(f"question {key!r}: options must be distinct non-empty strings, got {options!r}")
+            checked[key] = (text, options)
+        self._choices.update(checked)
+        if self._loaded:
+            self._check_choices(checked)
+
+    def _fit(self, key: str, text: str, max_new_tokens: int, images: int | None):
+        """``(ids, pictures)`` for one prompt, or raise why it does not fit.
+
+        ``images=None`` takes the number of ``<image>`` slots the prompt has.
+        """
         import numpy as np
 
-        from visual_interaction.phase0.budget import OmShape, assess, check_image_slots, expand_images
+        from visual_interaction.phase0.budget import (
+            BudgetError,
+            OmShape,
+            assess,
+            check_image_slots,
+            expand_images,
+            image_slots,
+        )
 
-        shape = OmShape(prefill_len=PREFILL_LEN, context_len=CONTEXT_LEN, frames=1, image_tokens_per_frame=IMAGE_TOKENS)
+        prompt = question_prompt(text)
+        slots = image_slots(prompt)
+        if images is None:
+            if not 1 <= slots <= VISION_BATCH:
+                raise BudgetError(f"{key}: {slots} <image> slot(s), the vision OM takes 1 to {VISION_BATCH}")
+            images = slots
+        shape = OmShape(
+            prefill_len=PREFILL_LEN, context_len=CONTEXT_LEN, frames=images, image_tokens_per_frame=IMAGE_TOKENS
+        )
+        check_image_slots(key, prompt, with_images=True, shape=shape)
+        ids = np.array(self._tokenizer.encode(expand_images(prompt, shape)))
+        fit = assess(
+            f"question:{key}", prompt_tokens=int(len(ids)), max_new_tokens=max_new_tokens, shape=shape, with_images=True
+        )
+        if not fit.fits:
+            raise _DoesNotFit(
+                f"prompt does not fit the OM shapes: {fit.prompt_tokens} tokens + {max_new_tokens} new, "
+                f"prefill {PREFILL_LEN}, cache {CONTEXT_LEN}"
+            )
+        return ids, images
+
+    def _check_questions(self, questions: Mapping[str, tuple[str, int]]) -> None:
+        """Tokenize each question with one image slot and hold it to the OM shapes."""
         for key, (text, max_new_tokens) in questions.items():
             self._question_ids.pop(key, None)
             self.question_failures.pop(key, None)
             try:
-                prompt = question_prompt(text)
-                check_image_slots(key, prompt, with_images=True, shape=shape)
-                ids = np.array(self._tokenizer.encode(expand_images(prompt, shape)))
-                fit = assess(
-                    f"question:{key}",
-                    prompt_tokens=int(len(ids)),
-                    max_new_tokens=max_new_tokens,
-                    shape=shape,
-                    with_images=True,
-                )
+                ids, _ = self._fit(key, text, max_new_tokens, images=1)
+            except _DoesNotFit as error:
+                self.question_failures[key] = str(error)
+                continue
             except Exception as error:  # noqa: BLE001 - recorded per question, see register_questions
                 self.question_failures[key] = f"{type(error).__name__}: {error}"
                 continue
-            if not fit.fits:
-                self.question_failures[key] = (
-                    f"prompt does not fit the OM shapes: {fit.prompt_tokens} tokens + {max_new_tokens} new, "
-                    f"prefill {PREFILL_LEN}, cache {CONTEXT_LEN}"
-                )
-                continue
             self._question_ids[key] = ids
+
+    def _check_choices(self, questions: Mapping[str, tuple[str, tuple[str, ...]]]) -> None:
+        """As _check_questions, for one generated token, and each option must be one token."""
+        import numpy as np
+
+        for key, (text, options) in questions.items():
+            self._choice_ids.pop(key, None)
+            self.question_failures.pop(key, None)
+            try:
+                ids, images = self._fit(key, text, 1, images=None)
+                tokens = []
+                for option in options:
+                    encoded = self._tokenizer.encode(option)
+                    if len(encoded) != 1:
+                        raise ValueError(f"option {option!r} is {len(encoded)} tokens, must be one")
+                    tokens.append(int(encoded[0]))
+                if len(set(tokens)) != len(tokens):
+                    raise ValueError(f"options {options!r} share a token")
+            except _DoesNotFit as error:
+                self.question_failures[key] = str(error)
+                continue
+            except Exception as error:  # noqa: BLE001 - recorded per question, see register_questions
+                self.question_failures[key] = f"{type(error).__name__}: {error}"
+                continue
+            self._choice_ids[key] = (ids, np.array(tokens), images)
 
     def prepare(
         self,
@@ -359,7 +474,6 @@ class InternVlVision(VisionLanguagePort):
         when the model cannot be loaded or the vision OM fails, and ValueError
         for a frame that is not an image.
         """
-        import numpy as np
 
         from visual_interaction.session import look_crop
 
@@ -370,26 +484,68 @@ class InternVlVision(VisionLanguagePort):
             image, fallback = cut.image, cut.fallback
         else:
             image, fallback = look_crop.whole_frame(frame_bgr), False
+        embeds = self._embed([image])
+        return Seen(embeds=embeds, image=image, crop_fallback=fallback, seconds=time.perf_counter() - started)
+
+    def prepare_many(self, images: Sequence[object]) -> Seen:
+        """Run the vision OM once on up to :data:`VISION_BATCH` pictures.
+
+        ``images`` are 448² BGR uint8 pictures, already cut (look_crop's
+        crops, say); their features come back in the same order. Raises
+        ValueError for no pictures, too many, or one of the wrong shape, and
+        :class:`VisionBackendError` as :meth:`prepare` does.
+        """
+        import numpy as np
+
+        from visual_interaction.session.look_crop import SIDE
+
+        images = tuple(images)
+        if not 1 <= len(images) <= VISION_BATCH:
+            raise ValueError(f"prepare_many takes 1 to {VISION_BATCH} pictures, got {len(images)}")
+        for image in images:
+            if not isinstance(image, np.ndarray) or image.shape != (SIDE, SIDE, 3) or image.dtype != np.uint8:
+                raise ValueError(f"each picture must be a {SIDE}×{SIDE}×3 uint8 array")
+        self.load()
+        started = time.perf_counter()
+        embeds = self._embed(images)
+        return Seen(
+            embeds=embeds,
+            image=images[-1],
+            crop_fallback=False,
+            seconds=time.perf_counter() - started,
+            images=images,
+        )
+
+    def _embed(self, images: Sequence[object]):
+        """The read-only features of ``images`` (448² BGR), one vision OM run."""
+        import numpy as np
+
+        count = len(images)
         try:
-            rgb = image[:, :, ::-1]
-            # Same operations, in the same order, as live_chat.preprocess.
-            self._pixels[0] = (np.asarray(rgb, np.float32).transpose(2, 0, 1) / 255.0 - self._mean) / self._std
+            for row, image in enumerate(images):
+                rgb = image[:, :, ::-1]
+                # Same operations, in the same order, as live_chat.preprocess.
+                self._pixels[row] = (np.asarray(rgb, np.float32).transpose(2, 0, 1) / 255.0 - self._mean) / self._std
             out = self._vision({"pixel_values": self._pixels})[0]
-            embeds = np.array(out.reshape(VISION_BATCH, IMAGE_TOKENS, -1)[:1])
+            embeds = np.array(out.reshape(VISION_BATCH, IMAGE_TOKENS, -1)[:count])
         except Exception as error:  # noqa: BLE001 - one failure type for the caller
             self.last_error = f"{type(error).__name__}: {error}"
             raise VisionBackendError(self.last_error) from error
+        finally:
+            # The padding rows stay zero for the next call (see _pixels).
+            if count > 1:
+                self._pixels[1:count] = 0.0
         # Shared by every ask on this picture: nobody may write into it.
         embeds.flags.writeable = False
         self.last_error = ""
         # The same readiness signal observe gives an rt_infer launch, counted
-        # per picture: a look_say node never calls observe.
+        # per vision run: a look_say node never calls observe.
         self._rt_infer_warmups += 1
         if self._rt_infer_warmups == 3 and os.environ.get("RTINFER_LAUNCH_TOKEN"):
             from inference_service.rt_infer_client import mark_runtime_ready
 
             mark_runtime_ready()
-        return Seen(embeds=embeds, image=image, crop_fallback=fallback, seconds=time.perf_counter() - started)
+        return embeds
 
     def ask(self, seen: Seen, key: str) -> Answer:
         """Ask one registered question about ``seen``. Prefill and decode only.
@@ -415,6 +571,48 @@ class InternVlVision(VisionLanguagePort):
             self.last_error = f"{type(error).__name__}: {error}"
             raise VisionBackendError(self.last_error) from error
         return Answer(text=text, seconds=time.perf_counter() - started, tokens=len(result["tokens"]))
+
+    def score(self, seen: Seen | Sequence[Seen], key: str) -> Choice:
+        """Score one registered choice question. Prefill only, no decode.
+
+        ``seen`` is one ``Seen`` or several, whose pictures fill the
+        question's image slots in order; together they must have exactly as
+        many as the question shows. Raises :class:`QuestionError` for a key
+        that is unknown or failed its check, or for the wrong number of
+        pictures, and :class:`VisionBackendError` when the prefill fails.
+        """
+        import numpy as np
+
+        if key in self.question_failures:
+            raise QuestionError(f"question {key!r} was refused at load: {self.question_failures[key]}")
+        loaded = self._choice_ids.get(key)
+        if loaded is None:
+            if key in self._choices:
+                raise QuestionError(f"question {key!r} is not loaded yet: call load() or prepare() first")
+            raise QuestionError(f"question {key!r} is not a registered choice question")
+        ids, tokens, images = loaded
+        parts = [seen] if isinstance(seen, Seen) else list(seen)
+        count = sum(len(part.embeds) for part in parts)
+        if count != images:
+            raise QuestionError(f"question {key!r} shows {images} picture(s), got {count}")
+        embeds = parts[0].embeds if len(parts) == 1 else np.concatenate([part.embeds for part in parts])
+        started = time.perf_counter()
+        try:
+            result = self._generator.run(ids, embeds, max_new_tokens=1, keep_logits=True)
+            logits = np.asarray(result["logits"][0], np.float64)
+            top = self._detokenizer.decode([int(logits.argmax())])
+        except Exception as error:  # noqa: BLE001 - one failure type for the caller
+            self.last_error = f"{type(error).__name__}: {error}"
+            raise VisionBackendError(self.last_error) from error
+        shifted = np.exp(logits - logits.max())
+        probs = shifted[tokens] / shifted.sum()
+        options = self._choices[key][1]
+        return Choice(
+            probs={option: float(p) for option, p in zip(options, probs, strict=True)},
+            mass=float(probs.sum()),
+            top=top,
+            seconds=time.perf_counter() - started,
+        )
 
     # -- one round --------------------------------------------------------
 
@@ -472,6 +670,7 @@ __all__ = [
     "PREFILL_LEN",
     "VISION_BATCH",
     "Answer",
+    "Choice",
     "InternVlVision",
     "QuestionError",
     "Seen",
