@@ -124,7 +124,7 @@ runtime 的 yaw ±0.38 rad 超出 URDF 的 yaw 范围。
 额外 yaw 区间只有运动学外推结果。
 本特性没有改变头部限位或增加头部锁定。
 
-审计目录：`/home/zll/x2-preset-motions-design/simulation/approved_pose_clearance_audit/`。
+审计目录：`<本机设计目录>/simulation/approved_pose_clearance_audit/`（不在仓库内）。
 源网格证据尚未转为运行时认证产物。
 传感器外壳、跟踪误差和完整自碰仍待认证。
 进入、退出和停止回中路径仍待认证。
@@ -165,7 +165,7 @@ RC 差异交给总控判断。
 这些数字不覆盖本文同时提交的停止衔接修改。
 最终 SHA 的复验结果单独记录。
 
-本机报告：`/home/zll/x2-preset-motions-design/board_validation/9793a606/results/RESULTS.txt`。
+本机报告：`<本机设计目录>/board_validation/9793a606/results/RESULTS.txt`（不在仓库内）。
 板端报告：`/root/x2-feat-preset-motions-run/test/acceptance-9793a606-20261110-003912/`。
 
 ## 后续验收

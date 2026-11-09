@@ -40,8 +40,8 @@
 ## 2. 分支与交付边界
 
 开发分支：`feat/x2-preset-motions`。
-工作树：`/mnt/oee/X2-wt/preset-motions`。
-部署包：`/mnt/oee/duck_deploy/x2_feat/preset-motions`。
+工作树：`<本机工作树>/preset-motions`。
+部署包：`<本机部署包目录>/x2_feat/preset-motions`。
 板端目录范围：`/root/x2-feat-preset-motions-*`。
 板端地址：`root@10.42.0.5`。
 
@@ -275,7 +275,7 @@ SSH 已连接 `10.42.0.5:22`。
 
 2026-11-09 18:29：主 agent 核查工作树无修改。
 2026-11-09 18:29：主 agent 启动 3 个设计 subagent。
-首次文档保存在允许写入的 `/home/zll`。
+首次文档保存在允许写入的 `<本机用户目录>`。
 工作树可写后，主 agent把文档复制到仓库文档目录。
 
 用户已授权部署和域 84 隔离测试。
