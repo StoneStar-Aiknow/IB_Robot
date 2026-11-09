@@ -141,6 +141,8 @@ class _TransducerStream:
     consumed: int = 0
     hyp: list[int] = field(default_factory=lambda: [0, 0])
     decoder_out: np.ndarray | None = None
+    #: Start time (s from the stream's first sample) of every token in ``hyp[2:]``.
+    times: list[float] = field(default_factory=list)
 
 
 class AscendTransducerRuntime:
@@ -184,11 +186,12 @@ class AscendTransducerRuntime:
     def reset_stream(self, stream: _TransducerStream, _context) -> None:
         self._encoder.reset()
         fresh = self._new_stream()
-        stream.fbank, stream.consumed, stream.hyp, stream.decoder_out = (
+        stream.fbank, stream.consumed, stream.hyp, stream.decoder_out, stream.times = (
             fresh.fbank,
             fresh.consumed,
             fresh.hyp,
             fresh.decoder_out,
+            fresh.times,
         )
 
     def close_stream(self, _stream: _TransducerStream, _context) -> None:
@@ -212,11 +215,21 @@ class AscendTransducerRuntime:
             stream.fbank.input_finished()
         while stream.consumed + self._window <= stream.fbank.num_frames:
             features = stream.fbank.frames(stream.consumed, self._window)[None]
-            for frame in self._encoder.infer(features):
-                self._greedy_step(stream, frame)
+            frames = self._encoder.infer(features)
+            # The chunk's output frames cover its ``decode_chunk_len`` input frames evenly
+            # (the encoder's subsampling), which is how sherpa times its tokens too.
+            step = self._chunk / max(len(frames), 1)
+            for index, frame in enumerate(frames):
+                at = (stream.consumed + index * step) * FRAME_SHIFT / self._sample_rate
+                self._greedy_step(stream, frame, at)
             stream.consumed += self._chunk
-        text = "".join(self._tokens.get(token, "") for token in stream.hyp[2:]).replace("▁", " ")
-        return {"text": normalize_transcript(text), "is_final": final}
+        pieces = [self._tokens.get(token, "") for token in stream.hyp[2:]]
+        text = "".join(pieces).replace("▁", " ")
+        outputs: dict[str, object] = {"text": normalize_transcript(text), "is_final": final}
+        if final and pieces:
+            outputs["tokens"] = pieces
+            outputs["timestamps"] = list(stream.times)
+        return outputs
 
     def _new_stream(self) -> _TransducerStream:
         stream = _TransducerStream()
@@ -226,11 +239,12 @@ class AscendTransducerRuntime:
     def _run_decoder(self, hyp: list[int]) -> np.ndarray:
         return self._decoder.run(None, {"y": np.array([hyp[-2:]], dtype=np.int64)})[0]
 
-    def _greedy_step(self, stream: _TransducerStream, frame: np.ndarray) -> None:
+    def _greedy_step(self, stream: _TransducerStream, frame: np.ndarray, at: float = 0.0) -> None:
         logits = self._joiner.run(
             None, {"encoder_out": frame[None].astype(np.float32), "decoder_out": stream.decoder_out}
         )[0]
         token = int(np.argmax(logits[0]))
         if token != 0:
             stream.hyp.append(token)
+            stream.times.append(float(at))
             stream.decoder_out = self._run_decoder(stream.hyp)

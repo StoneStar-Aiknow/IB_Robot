@@ -29,6 +29,7 @@ from ibrobot_agent.continuation import (
 from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
     CATALOG_SKILL_NAMES_ZH,
+    CONVERSATION_ADMISSION,
     AgentEvent,
     AgentRequest,
     CatalogPort,
@@ -68,6 +69,11 @@ from ibrobot_agent.planning_timing import snapshot as planning_timing_snapshot
 
 _LOGGER = logging.getLogger(__name__)
 _trace = create_trace_logger("ib_trace.agent")
+
+#: Said instead of a workflow the planner proposed for a request the channel admitted only as
+#: a question or a reply (``AgentRequest.admission``). Naming the action is what admits a
+#: command, so that is what the visitor is asked to do.
+CONVERSATION_ONLY_MESSAGE = "要我做动作的话，请直接说出动作，比如“挥挥手”。"
 
 # Proposals that resume an interrupted step from the Gateway ledger were not
 # planned by a model; the proposal snapshot says so.
@@ -191,6 +197,7 @@ class AgentService:
         max_planning_workers: int = 1,
         robot_scope: str = "so101_single_arm",
         direct_commands: Mapping[str, str] | None = None,
+        answer_skills: tuple[str, ...] = (),
         fruit_delivery: Mapping[str, str] | None = None,
         return_after_place: str | None = None,
         pose_preview: PosePreviewPort | None = None,
@@ -214,6 +221,10 @@ class AgentService:
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
+        #: Skills whose output is a spoken answer (recorded introduction clips). A request the
+        #: channel admitted only as a question may run these and nothing else: on the summit
+        #: "你的芯片是什么" is answered by introduce_platform, not by the planner's own words.
+        self._answer_skills = frozenset(answer_skills)
         # Arm poses described in words are composed before the plan is presented,
         # so the user confirms the pose that will run, and an unreachable or
         # unsafe one is answered without preparing anything.
@@ -451,6 +462,11 @@ class AgentService:
                 "clarification": clarification,
                 "pending_pose_save": pending_save if pending_save.get("pose_id") else None,
             }
+            if request.admission == CONVERSATION_ADMISSION:
+                # The planner is told, so it answers instead of proposing motion; the check
+                # after planning holds even when it does not listen.
+                planner_context["admission"] = CONVERSATION_ADMISSION
+                planner_context["answer_skills"] = sorted(self._answer_skills)
             replayed: PlannerOutcome | None = None
             if (
                 not pending_save.get("pose_id")
@@ -545,6 +561,29 @@ class AgentService:
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
+            if (
+                request.admission == CONVERSATION_ADMISSION
+                and outcome.kind == "workflow"
+                and planned_by not in (self._direct_identity, LEDGER_REPLAY_IDENTITY)
+                and "continuation" not in planner_context
+                and not all(step.skill_name in self._answer_skills for step in outcome.steps)
+            ):
+                # Admitted on the shape of a question or a reply, not on a command: such a
+                # request may be answered -- in words or by an answer skill -- never turned into
+                # other motion. A configured direct command and a resumed task are the
+                # deployment's and the user's own explicit wording.
+                self._store.record_event(
+                    key,
+                    event_type="admission_capped",
+                    state="PLANNING",
+                    detail_json=json.dumps(
+                        {"admission": request.admission, "proposed": planner_outcome_to_mapping(outcome)},
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+                _LOGGER.info("workflow for conversation-only request %s replaced by an answer", request.request_id)
+                outcome = PlannerOutcome(kind="conversation", user_message=CONVERSATION_ONLY_MESSAGE)
             if self._apply_pose_feedback(key, record.planning_generation, request, outcome, pending_save):
                 return
             if outcome.kind != "workflow":

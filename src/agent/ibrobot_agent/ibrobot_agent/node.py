@@ -1078,6 +1078,7 @@ class IncubationAgentNode(Node):
             ),
             robot_scope=str(self.get_parameter("robot_scope").value),
             direct_commands=_direct_commands_from_config(str(self.get_parameter("planner_config_json").value)),
+            answer_skills=_answer_skills_from_config(str(self.get_parameter("planner_config_json").value)),
             fruit_delivery=json.loads(str(self.get_parameter("planner_config_json").value)).get("fruit_delivery"),
             return_after_place=json.loads(str(self.get_parameter("planner_config_json").value)).get(
                 "return_after_place"
@@ -1130,6 +1131,7 @@ class IncubationAgentNode(Node):
                 text=payload["text"],
                 received_at=datetime.now(timezone.utc),
                 reply_to_request_id=payload.get("reply_to_request_id"),
+                admission=payload.get("admission"),
             )
             with trace_scope(request.request_id), trace_stage(_trace, "agent.admit", request_id=request.request_id):
                 response = self._service.send_message(request)
@@ -1293,6 +1295,18 @@ def _direct_commands_from_config(raw: str) -> dict[str, str]:
         for phrase, skill in commands.items()
         if isinstance(phrase, str) and phrase.strip() and isinstance(skill, str) and skill.strip()
     }
+
+
+def _answer_skills_from_config(raw: str) -> tuple[str, ...]:
+    """Skills an answer-only request may run; a malformed value leaves none, never stops the node."""
+    try:
+        config = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    skills = config.get("answer_skills") if isinstance(config, dict) else None
+    if not isinstance(skills, list):
+        return ()
+    return tuple(str(skill) for skill in skills if isinstance(skill, str) and skill.strip())
 
 
 def _log_planner_call(metrics: dict) -> None:

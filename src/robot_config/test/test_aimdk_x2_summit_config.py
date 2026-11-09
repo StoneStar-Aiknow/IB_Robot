@@ -111,12 +111,26 @@ def test_the_summit_follows_only_the_waking_voice_and_vetoes_unaddressed_speech(
     assert bridge["speaker_check_enabled"] is True
     assert bridge["addressee_trigger"] == "wake_phrase" and bridge["wake_phrases"]
     assert bridge["semantic_gate_mode"] == "enforce"
-    assert bridge["semantic_gate_model_path"] == "$(env WORKSPACE)/models/addressee/addressee_zh_v1.json"
+    assert bridge["semantic_gate_model_path"] == "$(env WORKSPACE)/models/addressee/addressee_zh_v2.json"
     assert bridge["semantic_gate_fail_open"] is False
     # The shared mirror/grasp base keeps both checks opt-in.
     base = _load_robot_section(CONFIG.parent / "aimdk_x2_voice_mirror_grasp.yaml")[1]
     assert base["embodied"]["agent"]["voice_bridge"]["speaker_check_enabled"] is False
     assert base["voice_asr"]["speaker_embedding"]["enabled"] is False
+
+
+def test_the_summit_answers_questions_and_replies_without_a_skill_word(config):
+    """Conversation admission: answer-only requests, window voiceprints, and the field misrecognitions."""
+    bridge = config["embodied"]["agent"]["voice_bridge"]
+    assert bridge["semantic_gate_conversation"] is True
+    assert 0 < bridge["semantic_gate_followup_sec"] <= bridge["wake_window_sec"]
+    # A question rescued from the end of a segment is checked by the segment's last windows.
+    assert config["voice_asr"]["speaker_embedding"]["window_hop_seconds"] > 0
+    assert bridge["speaker_split_enabled"] is True
+    assert bridge["text_corrections"]["openEuler"] and bridge["text_corrections"]["Agent"]
+    # The inherited corrections are merged, not replaced.
+    assert "停止照镜子" in bridge["text_corrections"]
+    assert [pattern for pattern, _ in bridge["text_rewrites"]] == ["^作为一个(.{1,6})的动作$"]
 
 
 def test_display_policy_and_legacy_hand_preparation_are_bound_after_inheritance(config):

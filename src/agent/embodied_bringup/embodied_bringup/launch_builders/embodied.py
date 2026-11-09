@@ -660,6 +660,11 @@ def generate_embodied_nodes(
         if not isinstance(agent_config, dict) or agent_config.get("enabled", True) is not True:
             raise ValueError("embodied.agent.enabled must be true for entry_mode=agent")
         planner_config = dict(agent_config.get("planner", {"mode": "rule"}))
+        voice_bridge_config = agent_config.get("voice_bridge") or {}
+        if "answer_skills" not in planner_config and isinstance(voice_bridge_config, dict):
+            # A request the voice channel admitted only as a question may still run the skills
+            # whose output is a spoken answer (a recorded clip): the channel's silent_skills, one list.
+            planner_config["answer_skills"] = list(voice_bridge_config.get("silent_skills", []))
         if (robot_config.get("mirror_session") or {}).get("enabled") is True:
             planner_config["direct_commands"] = {
                 **planner_config.get("direct_commands", {}),
@@ -1023,9 +1028,12 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "speaker_min_similarity",
         "speaker_max_age_sec",
         "speaker_merge_margin",
+        "speaker_split_owner_similarity",
+        "speaker_split_other_similarity",
         "measurement_grace_sec",
         "semantic_gate_threshold",
         "semantic_gate_model_only_threshold",
+        "semantic_gate_followup_sec",
     ):
         if field_name in voice_bridge:
             params[field_name] = float(voice_bridge[field_name])
@@ -1068,7 +1076,9 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "speaker_check_enabled",
         "require_verified_speech",
         "speaker_reject_short",
+        "speaker_split_enabled",
         "semantic_gate_fail_open",
+        "semantic_gate_conversation",
     ):
         if field_name in voice_bridge:
             params[field_name] = bool(voice_bridge[field_name])
@@ -1089,6 +1099,10 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         params["speech_messages_json"] = json.dumps(voice_bridge["speech_messages"], ensure_ascii=False)
     if "text_corrections" in voice_bridge:
         params["text_corrections_json"] = json.dumps(dict(voice_bridge["text_corrections"]), ensure_ascii=False)
+    if "text_rewrites" in voice_bridge:
+        params["text_rewrites_json"] = json.dumps(
+            [list(pair) for pair in voice_bridge["text_rewrites"]], ensure_ascii=False
+        )
     composer = robot_config.get("pose_composer") or {}
     if "free_pose" in agent_config.get("test_allowlist", []) and composer.get("mode") == "fixed":
         from robot_runtime.task_poses import pose_catalog

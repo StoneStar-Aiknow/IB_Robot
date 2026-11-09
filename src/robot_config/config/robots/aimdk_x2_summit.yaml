@@ -21,6 +21,8 @@ robot:
   voice_asr:
     speaker_embedding:
       enabled: true
+      # A voiceprint per 2 s window, every second, for the speaker split below.
+      window_hop_seconds: 1.0
   mirror_session:
     enabled: true
   motion_imitation_stream:
@@ -87,10 +89,30 @@ robot:
         # work from any voice.
         speaker_check_enabled: true
         speaker_min_similarity: 0.45
+        # The VAD cuts at pauses, not at speakers: a bystander's remark and the owner's
+        # request said without a pause arrive as one segment. Keep only the owner's words
+        # (thresholds measured on 510 stitched segments of real speakers, 2026-11-09).
+        speaker_split_enabled: true
+        speaker_split_owner_similarity: 0.45
+        speaker_split_other_similarity: 0.25
         # Intent (semantic) gate: the model ships with the deployment, and a missing or stale
         # model stops the bridge at launch instead of silently turning the gate off.
-        semantic_gate_model_path: $(env WORKSPACE)/models/addressee/addressee_zh_v1.json
+        semantic_gate_model_path: $(env WORKSPACE)/models/addressee/addressee_zh_v2.json
         semantic_gate_fail_open: false
+        # Visitors ask the robot about itself ("你用的系统是什么"), answer what it just said
+        # ("是不是真的", "我想选香蕉") and get glued onto room chatter by the VAD; the corpus has
+        # none of that and scores it 0.000. Inside the woken speaker's session these are
+        # admitted as conversation-only requests: the Agent answers them and never moves.
+        semantic_gate_conversation: true
+        semantic_gate_followup_sec: 20.0
+        # Misrecognitions seen on 2026-11-09: AGENT heard as A准, openEuler as OPEN USER, and
+        # 做一个 as 作为一个 -- the last only in a command-shaped sentence, since "作为一个机器人"
+        # is ordinary speech.
+        text_corrections:
+          Agent: [A准]
+          openEuler: [OPEN USER, OPENUSER, Open User, open user]
+        text_rewrites:
+        - ['^作为一个(.{1,6})的动作$', '做一个\1的动作']
         # The inherited lexicon predates the summit skills: add their catalog aliases
         # (tools/addressee/emit_lexicon.py) and the three fruits, or "我想要一个橘子" and
         # "介绍一下芯片和系统" would rest on a model that never saw them.

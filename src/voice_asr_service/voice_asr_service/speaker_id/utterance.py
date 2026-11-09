@@ -56,6 +56,10 @@ class UtteranceAssembler:
 
     sample_rate: int = 16000
     max_seconds: float = 6.0
+    #: Audio kept beyond ``max_seconds`` for per-window voiceprints, which have to
+    #: see the whole segment: the second voice is usually at its end. 0 keeps
+    #: only ``max_seconds``. ``Utterance.pcm`` holds the longer of the two.
+    window_max_seconds: float = 0.0
     #: A producer that stops mid-utterance would otherwise buffer forever. Same
     #: role as ``voice_asr_node``'s ``external_idle_timeout``, and shorter than it
     #: so the voiceprint is published before the transcript.
@@ -99,7 +103,8 @@ class UtteranceAssembler:
             self._last_at = at
             self._header = header
         self._samples += len(audio) // _BYTES_PER_SAMPLE
-        keep = int(self.max_seconds * self.sample_rate) * _BYTES_PER_SAMPLE - len(self._pcm)
+        keep = int(max(self.max_seconds, self.window_max_seconds) * self.sample_rate) * _BYTES_PER_SAMPLE
+        keep -= len(self._pcm)
         if keep > 0:
             self._pcm += audio[:keep]
         if state != STATE_END:

@@ -30,7 +30,7 @@ fi
 ASR_BUNDLE="$MODELS/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
 TTS_BUNDLE="$MODELS/zipvoice"
 SPEAKER_BUNDLE="$MODELS/campplus-speaker"
-INTENT_MODEL="$MODELS/addressee/addressee_zh_v1.json"
+INTENT_MODEL="$MODELS/addressee/addressee_zh_v2.json"
 VAD_MODEL="$MODELS/silero-vad/assets/silero_vad.onnx"
 missing=0
 for path in "$ASR_BUNDLE/inference_manifest.json" "$TTS_BUNDLE/inference_manifest.json" \

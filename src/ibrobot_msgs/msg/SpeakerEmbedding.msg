@@ -20,3 +20,11 @@ uint64 segment_sequence   # 开启本段的 BEGIN 块的 SpeechAudioChunk.sequen
 float32[] embedding       # 已 L2 归一化的说话人向量,因此余弦相似度等于点积
 string model_id           # 产出该向量的模型标识;不同模型产出的向量不可互相比较
 float32 speech_seconds    # 本段人声时长,消费者据此判断向量可信度
+# 段内逐窗口声纹(可选,用于判断一段里是否混入了另一个人的声音):
+#   - 窗口长 window_seconds,起点 window_starts[i] 是相对本段第一个音频样本的秒数,与
+#     SpeechTranscript.token_starts 同一时间基准
+#   - window_embeddings 按窗口顺序拼接,每 len(embedding) 个数为一个窗口,各自 L2 归一化
+#   - 段太短(不足两个窗口)或生产者不支持时三者为空;embedding 的含义与计算方式不变
+float32 window_seconds
+float32[] window_starts
+float32[] window_embeddings

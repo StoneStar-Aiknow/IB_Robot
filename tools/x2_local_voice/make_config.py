@@ -83,7 +83,7 @@ def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> d
         phrase: skill for phrase, skill in commands.items() if skill not in UNSUPPORTED_SKILLS
     }
     bridge = agent["voice_bridge"]
-    bridge["semantic_gate_model_path"] = str(models / "addressee/addressee_zh_v1.json")
+    bridge["semantic_gate_model_path"] = str(models / "addressee/addressee_zh_v2.json")
     bridge["semantic_gate_log_path"] = str(state / "semantic_gate.jsonl")
     # English words reach ZipVoice only when its English frontend (piper_phonemize) is installed.
     bridge["tts_keep_english"] = keep_english

@@ -15,6 +15,15 @@ words (from the catalog's ``aliases_zh``) and wake-word variants therefore win o
 model, while stop words, confirmations and cancellations never reach this gate at all
 (``VoiceBridgeCore`` routes those first, and safety outruns addressing).
 
+Conversation admission (``conversation=True``) adds three ways in that need no skill word
+and no model score, because the corpus holds commands and meetings but almost no small
+talk with the robot, so every question put to it scores 0.000: a second-person question
+("你用的系统是什么"), a reply-shaped sentence inside the follow-up window the bridge opens
+after the robot spoke ("是不是真的", "我想选香蕉"), and the trailing question of an
+utterance the ASR glued onto chatter ("……跟他说的话你还会做什么动作"). Each of them is
+graded ``conversation``: the bridge marks the request, and the Agent never turns such a
+request into motion, so the worst a mistaken admission costs is one short spoken answer.
+
 Everything here is ROS-free and standard-library only: the model is a JSON file of
 sparse FNV-1a hashed weights, scoring one sentence takes tens of microseconds, and the
 board needs no extra dependency. ``tools/addressee`` trains and exports that file; the
@@ -37,6 +46,11 @@ SEMANTIC_GATE_MODES = ("off", "shadow", "enforce")
 
 _SCHEMA_VERSION = 1
 _SUPPORTED_HASHES = ("fnv1a32",)
+#: ``feature.vector_norm``: ``none`` scores raw ``1 + log(count)`` values (``addressee_zh_v1``
+#: and every artefact without the key); ``l2`` divides them by their Euclidean norm first, so
+#: a sentence's score no longer grows with its length. Grouped CV on the field corpus: the
+#: same model drops 0.948 of the chatter with ``l2`` against 0.904 without, at equal recall.
+_VECTOR_NORMS = ("none", "l2")
 _PUNCT = re.compile(r"[\s，。！？、,.!?~～\"'“”‘’()（）\[\]【】:：;；\-—…]+")
 #: Clamp for the logit, so an absurd weight cannot overflow ``exp``.
 _LOGIT_LIMIT = 30.0
@@ -112,6 +126,103 @@ _COMMAND_MARKERS = (
 #: genuine requests without catalog vocabulary sit far lower. 0.90 is where the corpus'
 #: bimodal scores actually separate the two.
 _MODEL_ONLY_THRESHOLD = 0.90
+#: Discourse fillers the ASR keeps in front of a sentence ("嗯你用的是什么芯片呢", "但是你看起来
+#: ……", "那是怎么实现的呢"). They carry no addressee and only push the subject out of the
+#: positions the rules look at. "那"/"就" only count before a word a sentence starts with, so
+#: "那边的橘子" keeps its demonstrative.
+_LEADING_FILLER = re.compile(
+    r"^(?:嗯|啊|哦|噢|呃|哎|诶|唉|欸|额|那个|然后|但是|可是|所以|就是|那(?=[你您是我就给再])|就(?=[你您是我给都]))+"
+)
+#: Question words of a second-person question or a reply. Wider than ``_QUESTION_MARKERS``
+#: because these never let a skill word past the remark veto on their own: they only admit a
+#: ``conversation``-graded request, which the Agent answers and never executes.
+_ASK_MARKERS = (
+    "什么",
+    "啥",
+    "怎么",
+    "为什么",
+    "谁",
+    "多少",
+    "哪个",
+    "哪一个",
+    "哪些",
+    "哪里",
+    "哪儿",
+    "在哪",
+    "吗",
+    "是不是",
+    "能不能",
+    "会不会",
+    "有没有",
+    "可不可以",
+    "要不要",
+)
+#: Third-person pronouns: a sentence about "him"/"it" is said *about* the robot or a person,
+#: to somebody else ("他实际的表现是什", "你看见它手指刚才抖了吗").
+_THIRD_PERSON = ("他", "她", "它")
+#: Answers to the robot's own question ("有什么水果" -> "我想选香蕉"): a choice verb and a
+#: short object, nothing else. Admitted only inside the follow-up window.
+_CHOICE = re.compile(r"^(?:我想选|我想要|我要|我选|给我个|给我一个|给我来个|来个|来一个|要个|要一个)\S{1,4}$")
+#: Longest sentence the follow-up window admits on shape alone; longer ones are discussions.
+_FOLLOWUP_MAX_CHARS = 20
+#: Longest second-person question admitted on its shape: the field questions run to 16
+#: characters ("你跟openeuler是什么关系"), while "你搞得再说上官网是个干嘛哪个你……" is a
+#: colleague's rant that merely opens with "you".
+_QUESTION_MAX_CHARS = 18
+#: "你这不是跳甄姬吗" is a rhetorical remark, not a question; "是不是" is excluded from the match.
+_RHETORICAL = re.compile(r"(?<!是)不是.*吗")
+#: Bounds of the trailing question rescued from an utterance the ASR glued onto chatter. Six
+#: characters keep "你还会干什么" and drop the tag questions people end their own stories with.
+_TAIL_MIN_CHARS = 6
+_TAIL_MAX_CHARS = 14
+_TAIL_MIN_PREFIX_CHARS = 4
+#: Tags that end a story told to somebody else ("……你知道吗", "……你说是吧").
+_TAG_QUESTIONS = ("你知道吗", "你说是吧", "你说呢", "你说对吧", "你懂吗", "你信吗")
+#: Grades of an admitted utterance. ``command`` is every rule this gate had before conversation
+#: admission; ``conversation`` may only be answered, never executed (the Agent enforces it).
+GRADE_COMMAND = "command"
+GRADE_CONVERSATION = "conversation"
+
+
+def strip_fillers(text: str) -> str:
+    """Drop leading discourse fillers; a sentence that is nothing but fillers is kept as it is."""
+    stripped = _LEADING_FILLER.sub("", text)
+    return stripped or text
+
+
+def collapse_repeats(text: str) -> str:
+    """Fold runs of one character ("故故事", "有有"), for phrase matching only.
+
+    ASR stutter doubles characters, and so does Chinese itself ("挥挥手"), so this is never
+    applied to the text a request carries -- both sides of a comparison are folded instead.
+    """
+    return re.sub(r"(.)\1+", r"\1", text)
+
+
+#: Placeholders that contain a question word without asking anything ("我是开了那个什么").
+_PLACEHOLDERS = re.compile(r"那个什么|什么的|干什么的")
+
+
+def _asks(body: str) -> bool:
+    return any(marker in _PLACEHOLDERS.sub("", body) for marker in _ASK_MARKERS)
+
+
+def _second_person_question(body: str) -> bool:
+    """A short question put to "you" that is not about a third person and not rhetorical."""
+    return (
+        body.startswith(_QUESTION_STARTS)
+        and len(body) <= _QUESTION_MAX_CHARS
+        and _asks(body)
+        and not any(p in body for p in _THIRD_PERSON)
+        and not _RHETORICAL.search(body)
+    )
+
+
+def _reply_shaped(body: str) -> bool:
+    """A sentence that reads as an answer or a reaction to what the robot just said."""
+    if len(body) > _FOLLOWUP_MAX_CHARS or any(p in body for p in _THIRD_PERSON):
+        return False
+    return _asks(body) or body.endswith(("吗", "呢")) or body.startswith(_QUESTION_STARTS) or bool(_CHOICE.match(body))
 
 
 def _fnv1a32(text: str) -> int:
@@ -160,6 +271,11 @@ class SemanticDecision:
     reason: str
     #: The address term that made this "someone talking to someone else", if any.
     address_term: str = ""
+    #: ``command`` or ``conversation``; meaningful only when accepted.
+    grade: str = GRADE_COMMAND
+    #: The part of ``text`` that was admitted when it is not the whole of it (a rescued
+    #: trailing question); empty when the whole utterance is the request.
+    admitted_text: str = ""
 
     @property
     def accepted(self) -> bool:
@@ -197,6 +313,9 @@ class SemanticGate:
         if not self._ngrams or self._dim < 2:
             raise ValueError("semantic model needs at least one n-gram and a dimension of 2 or more")
         self._pad = str(feature.get("pad", "<>")) or "<>"
+        self._vector_norm = str(feature.get("vector_norm", "none"))
+        if self._vector_norm not in _VECTOR_NORMS:
+            raise ValueError(f"unsupported semantic model vector_norm {self._vector_norm!r}")
         self._wake_words = tuple(str(item) for item in payload.get("wake_words", ()))
         self.threshold = float(threshold)
         self.model_only_threshold = float(model_only_threshold)
@@ -263,13 +382,22 @@ class SemanticGate:
                 counts[_fnv1a32(padded[start : start + size]) % self._dim] += 1
         return counts
 
+    def vector(self, text: str) -> dict[int, float]:
+        """The feature values ``score`` weighs; ``tools/addressee`` trains on exactly these."""
+        values = {key: 1.0 + math.log(count) for key, count in self.features(text).items()}
+        if self._vector_norm == "l2":
+            norm = math.sqrt(sum(value * value for value in values.values()))
+            if norm > 0.0:
+                values = {key: value / norm for key, value in values.items()}
+        return values
+
     def score(self, text: str) -> float:
         """Probability-like score in (0, 1) that ``text`` is addressed to the robot."""
         logit = self._bias
-        for key, count in self.features(text).items():
+        for key, value in self.vector(text).items():
             weight = self._weights.get(key)
             if weight:
-                logit += weight * (1.0 + math.log(count))
+                logit += weight * value
         logit = max(-_LOGIT_LIMIT, min(_LOGIT_LIMIT, logit))
         return 1.0 / (1.0 + math.exp(-logit))
 
@@ -288,67 +416,116 @@ class SemanticGate:
             return False
         return any(marker in body for marker in _QUESTION_MARKERS)
 
-    def judge(self, text: str, *, session_open: bool = False) -> SemanticDecision:
+    def _phrase_hit(self, phrases: tuple[str, ...], *texts: str) -> str:
+        """The first phrase found in any of ``texts``, comparing with character runs folded."""
+        folded = [collapse_repeats(text) for text in texts]
+        return next(
+            (phrase for phrase in phrases if any(collapse_repeats(phrase) in text for text in folded)),
+            "",
+        )
+
+    def judge(
+        self,
+        text: str,
+        *,
+        session_open: bool = False,
+        followup_open: bool = False,
+        conversation: bool = False,
+    ) -> SemanticDecision:
         """Decide whether ``text`` is addressed to the robot; stop/confirm never come here.
 
         A skill word is evidence only in a command-sized sentence or when the model does
         not flatly disagree, a sentence naming someone else in the room is not addressed
         to the robot, and a bare fragment needs a session the addressee gate opened --
         the three failure classes the first field session produced on 2026-11-07.
+
+        ``conversation`` turns on conversation admission (see the module docstring):
+        ``session_open`` is required for the second-person question and the rescued tail,
+        ``followup_open`` (the bridge's window after the robot spoke) for a reply.
         """
-        body = self._body(text)
+        body = strip_fillers(self._body(text))
         raw_normalized = normalize_text(text)
         score = self.score(text)
-        lexicon_hit = any(word in raw_normalized or word in body for word in self.lexicon)
+        lexicon_hit = bool(self._phrase_hit(self.lexicon, raw_normalized, body))
         wake_prefix = any(raw_normalized.startswith(prefix) for prefix in self.wake_prefixes)
         address_term = next((term for term in _ADDRESS_TERMS if term in raw_normalized), "")
+
+        def decide(rejected: bool, reason: str, grade: str = GRADE_COMMAND, admitted: str = "") -> SemanticDecision:
+            return SemanticDecision(
+                text, score, rejected, lexicon_hit, wake_prefix, reason, address_term, grade, admitted
+            )
+
         if not body:
-            reason = "empty after wake-word stripping"
-            return SemanticDecision(text, score, False, lexicon_hit, wake_prefix, reason)
+            return decide(False, "empty after wake-word stripping")
         if address_term and not wake_prefix:
-            reason = f"names someone else ({address_term})"
-            return SemanticDecision(text, score, True, lexicon_hit, wake_prefix, reason, address_term)
-        rejected = False
+            return decide(True, f"names someone else ({address_term})")
         # A request to talk is addressed to whatever can talk back, and it can only ever
         # start a conversation, so it outranks the model instead of arguing with it.
-        request_hit = next((phrase for phrase in self.dialogue_requests if phrase in raw_normalized), "")
-        if request_hit:
-            reason = "dialogue request"
-        elif (
+        if self._phrase_hit(self.dialogue_requests, raw_normalized, body):
+            return decide(False, "dialogue request")
+        if (
             lexicon_hit
             and self._leading_skill_word(body)
             and (len(body) <= _LEXICON_MAX_BODY_CHARS or score >= self.threshold)
         ):
-            reason = "skill word"
-        elif wake_prefix:
-            reason = "wake prefix"
-        elif lexicon_hit and self._asks_about_itself(body) and score >= self.threshold:
+            return decide(False, "skill word")
+        if wake_prefix:
+            return decide(False, "wake prefix")
+        if conversation and session_open and _second_person_question(body):
+            # Inside a session the wake word and the voiceprint already opened, a question put
+            # to "you" is the robot's to answer, skill word or not: "你是怎么抓水果的" and "你用的
+            # 系统是什么" both scored 0.000 on a corpus without small talk. It is only ever
+            # answered (conversation grade), which is what lets it skip the remark veto below.
+            return decide(False, "question to the robot", GRADE_CONVERSATION)
+        if lexicon_hit and self._asks_about_itself(body) and score >= self.threshold:
             # "你怎么知道我举手了" carries a skill word and a question. The veto below exists
             # for remarks about the action ("这首歌举手的动作"), and a question put to the robot
             # is the opposite: it can only be answered by it. The shape is only a hint, so the
             # model must not flatly disagree: unlike the skill-word branch, a short sentence
             # gets no pass on length ("你刚才拿的什么水果" is 9 characters and scores 0.000).
-            reason = "question about the robot"
-        elif lexicon_hit:
+            return decide(False, "question about the robot")
+        if lexicon_hit:
             # The word is there but the sentence is about the action, not a request for it,
             # and a character-bag model cannot tell the two apart ("这首歌举手的动作" 1.000).
-            reason = f"mentions a skill word without asking for it ({len(body)} chars)"
-            rejected = True
+            decision = decide(True, f"mentions a skill word without asking for it ({len(body)} chars)")
         elif score >= self.model_only_threshold:
             if len(body) < _FRAGMENT_BODY_CHARS and not session_open:
-                reason = f"fragment of {len(body)} chars outside a session"
-                rejected = True
+                decision = decide(True, f"fragment of {len(body)} chars outside a session")
             else:
-                reason = "model"
+                return decide(False, "model")
         elif score >= self.threshold:
             # High enough for the old rule, but the vocabulary overlap that produced it is
             # not evidence: without a skill word, only a clear score may open the pipeline.
-            reason = f"score {score:.3f} below {self.model_only_threshold:.2f} without a skill word"
-            rejected = True
+            decision = decide(True, f"score {score:.3f} below {self.model_only_threshold:.2f} without a skill word")
         else:
-            reason = f"score {score:.3f} below {self.threshold:.2f}"
-            rejected = True
-        return SemanticDecision(text, score, rejected, lexicon_hit, wake_prefix, reason, address_term)
+            decision = decide(True, f"score {score:.3f} below {self.threshold:.2f}")
+        if conversation and followup_open and _reply_shaped(body):
+            # The robot has just spoken and its listener answers: "是不是真的", "系统是什么",
+            # "我想选香蕉" have no subject and no catalog word, and only the turn says who they
+            # are for. A statement ("其实这个功能可以再优化") is not reply-shaped and stays out.
+            return decide(False, "follow-up to the robot", GRADE_CONVERSATION)
+        if conversation and session_open:
+            tail = self._trailing_question(body)
+            if tail:
+                # One VAD segment can hold two speakers or two listeners: the ASR glued "这都不是
+                # 跟他说的话" to "你还会做什么动作". Only the trailing question is admitted, and the
+                # request carries it alone; the bridge checks the voice of the segment's tail.
+                return decide(False, f"trailing question {tail!r}", GRADE_CONVERSATION, tail)
+        return decision
+
+    def _trailing_question(self, body: str) -> str:
+        """The longest second-person question (or talk request) that ends ``body`` after a prefix."""
+        for start in range(_TAIL_MIN_PREFIX_CHARS, len(body) - _TAIL_MIN_CHARS + 1):
+            tail = body[start:]
+            if len(tail) > _TAIL_MAX_CHARS or not tail.startswith(_QUESTION_STARTS):
+                continue
+            if any(tail.endswith(tag) for tag in _TAG_QUESTIONS):
+                continue
+            if _second_person_question(tail) or (
+                self._phrase_hit(self.dialogue_requests, tail) and not any(p in tail for p in _THIRD_PERSON)
+            ):
+                return tail
+        return ""
 
     def record(self, decision: SemanticDecision, path: str, *, mode: str, **context: Any) -> None:
         """Append one JSON line describing ``decision``; never raises into the bridge.
@@ -374,6 +551,10 @@ class SemanticGate:
         }
         if decision.address_term:
             entry["address_term"] = decision.address_term
+        if not decision.rejected and decision.grade != GRADE_COMMAND:
+            entry["grade"] = decision.grade
+        if decision.admitted_text:
+            entry["admitted_text"] = decision.admitted_text
         try:
             directory = os.path.dirname(path)
             if directory:

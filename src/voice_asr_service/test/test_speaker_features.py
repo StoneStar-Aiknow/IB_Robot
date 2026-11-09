@@ -413,3 +413,23 @@ def test_the_head_refuses_a_batchnorm_parameter_it_cannot_read(tmp_path):
 
     with pytest.raises(ValueError, match="scale|bias|cannot resolve"):
         _load_head(build(tmp_path / "unreadable.onnx", scale_in_constant=False))
+
+
+def test_sliding_windows_hop_through_the_segment_and_reach_its_end():
+    from voice_asr_service.speaker_id.features import WINDOW_FRAMES, sliding_windows
+
+    features = np.arange(450 * 4, dtype=np.float32).reshape(450, 4)
+    windows = sliding_windows(features, 100)
+
+    # 0, 100, 200 fit; 250 is added so the last 50 frames are covered too.
+    assert [start for start, _ in windows] == [0, 100, 200, 250]
+    assert all(window.shape == (WINDOW_FRAMES, 4) for _, window in windows)
+
+
+def test_each_sliding_window_is_normalized_on_its_own():
+    """A mean over a two-voice segment belongs to neither voice."""
+    from voice_asr_service.speaker_id.features import sliding_windows
+
+    features = np.concatenate([np.zeros((200, 2)), np.full((200, 2), 9.0)]).astype(np.float32)
+    for _start, window in sliding_windows(features, 100):
+        np.testing.assert_allclose(window.mean(axis=0), 0.0, atol=1e-5)

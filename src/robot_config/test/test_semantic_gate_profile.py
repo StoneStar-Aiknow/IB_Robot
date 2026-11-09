@@ -93,3 +93,27 @@ def test_fail_open_must_be_a_boolean():
         )
     )
     assert any("semantic_gate_fail_open must be a boolean" in error for error in errors)
+
+
+def test_conversation_admission_needs_a_running_gate():
+    errors = _validate_agent_voice_bridge(_bridge(semantic_gate_conversation=True))
+    assert any("semantic_gate_conversation needs semantic_gate_mode" in error for error in errors)
+
+
+def test_conversation_admission_settings_are_typed():
+    errors = _validate_agent_voice_bridge(
+        _bridge(
+            semantic_gate_mode="enforce",
+            semantic_gate_model_path="/tmp/model.json",
+            semantic_gate_conversation="yes",
+            semantic_gate_followup_sec=-1,
+        )
+    )
+    assert any("semantic_gate_conversation must be a boolean" in error for error in errors)
+    assert any("semantic_gate_followup_sec must be finite and not negative" in error for error in errors)
+
+
+def test_text_rewrites_must_compile():
+    errors = _validate_agent_voice_bridge(_bridge(text_rewrites=[["(", "x"]]))
+    assert any("text_rewrites pattern" in error for error in errors)
+    assert not _validate_agent_voice_bridge(_bridge(text_rewrites=[["^作为一个(.{1,6})的动作$", "做一个\\1的动作"]]))

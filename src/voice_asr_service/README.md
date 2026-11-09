@@ -65,7 +65,16 @@ voice_asr:
     min_speech_seconds: 1.0   # 低于此时长发空向量（「这段没有声纹」），不出不可信的向量
     max_speech_seconds: 6.0   # 只取开头这么长（唤醒词在开头），兼作内存上界
     idle_timeout_sec: 1.2     # 音源没发 END 时兜底收尾，语义同 external_idle_timeout 但必须更短（loader 校验），好让声纹先于转写到达；只有带 PCM 的块续期，runtime 的空心跳不算
+    window_hop_seconds: 0.0   # 可选：>0 时每隔这么长取一个 2 s 窗口单独提取声纹（SpeakerEmbedding.window_*），供寻址门控判断一段里是否混了两个人；0 关闭
+    window_max_seconds: 10.0  # 逐窗口声纹覆盖本段开头这么长（与 ASR 的 max_recording_duration 一致）；整段向量仍只用开头 max_speech_seconds
 ```
+
+逐窗口声纹解决的问题：VAD 按停顿切段，不按说话人切段。旁人的话和主人的指令之间没有足够长的停顿时，
+两个人的声音进同一段，整段向量是两者的平均。开启 `window_hop_seconds` 后节点额外发出每个窗口的向量，
+每个窗口单独做均值归一化（混合段的整段均值不属于任何一个人）。ASR 同时在 `SpeechTranscript` 里给出每个
+token 的起始时间，`agent_voice_bridge` 据此只保留主人的那几个字（`speaker_split_enabled`，见 `ibrobot_agent`
+README）。本机 CPU 实测（16 核，CAM++ torch_cpu）：每个窗口约 20 ms，步长 1 s 时一段 4–8 s 的人声多花约
+70–190 ms；声纹在人声结束时发布、转写还要等补静音，所以通常仍先于转写到达。板端 ARM CPU 未实测。
 
 模型与 ASR 一样是 **schema-v3 bundle**，在仓库外 provision，经统一推理运行时加载：部署名显式给出、
 artifact 摘要记在 manifest 里并由 `scripts/download_models.py` 在下载时校验、线程预算写在部署里

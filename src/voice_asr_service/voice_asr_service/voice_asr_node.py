@@ -901,8 +901,10 @@ class VoiceASRNode(Node):
         if state == 3:
             self._shared_segment = None
 
-    def _publish_segment_transcript(self, text: str, segment: tuple[str, int]) -> None:
-        """Publish the same final text tagged with the segment it came from."""
+    def _publish_segment_transcript(
+        self, text: str, segment: tuple[str, int], alignment: tuple[tuple, tuple] = ((), ())
+    ) -> None:
+        """Publish the same final text tagged with the segment it came from and its token alignment."""
         if self._pub_transcript is None:
             return
         from ibrobot_msgs.msg import SpeechTranscript
@@ -911,6 +913,10 @@ class VoiceASRNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.source_id, msg.segment_sequence = segment[0], int(segment[1])
         msg.text = text
+        starts, ends = alignment
+        if starts and len(starts) == len(ends):
+            msg.token_starts = [float(value) for value in starts]
+            msg.token_ends = [int(value) for value in ends]
         self._pub_transcript.publish(msg)
 
     def _publish_partial_result(self, text: str):

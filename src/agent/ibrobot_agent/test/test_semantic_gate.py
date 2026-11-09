@@ -443,3 +443,57 @@ def test_the_generated_lexicon_holds_no_bare_negation():
 
     assert "不是" not in words
     assert "挥手" in words
+
+
+TRAIN_MODEL = REPO_ROOT / "tools" / "addressee" / "train_model.py"
+
+
+def _train_module():
+    pytest.importorskip("numpy")
+    if not TRAIN_MODEL.exists():
+        pytest.skip("training tool not present")
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("addressee_train_model", TRAIN_MODEL)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_training_scores_exactly_what_the_runtime_scores():
+    """The regression of addressee_zh_v1: training padded "<text>" and L2-normalised while the
+    runtime padded "<>text<>" and did not, so the CV table described a model nobody ran."""
+    import math
+
+    import numpy as np
+
+    train = _train_module()
+    texts = ["灵犀灵犀挥挥手", "今天开会讨论预算", "你用的系统是什么"]
+    vecs = [train.vectorize(text) for text in texts]
+    weights, bias = train.fit(vecs, np.array([1.0, 0.0, 1.0], dtype=np.float32), np.arange(3), epochs=5)
+    nonzero = np.nonzero(weights)[0]
+    gate = SemanticGate(
+        {
+            "schema_version": 1,
+            "feature": dict(train.FEATURE),
+            "wake_words": list(train.WAKE_WORDS),
+            "bias": float(bias),
+            "weights": [[int(index), float(weights[index])] for index in nonzero.tolist()],
+        },
+        threshold=0.1,
+    )
+    for text, (index, values) in zip(texts, vecs, strict=True):
+        logit = float(bias) + float(weights[index] @ values)
+        assert gate.score(text) == pytest.approx(1.0 / (1.0 + math.exp(-logit)), abs=1e-5)
+
+
+def test_an_artefact_without_a_vector_norm_is_scored_on_raw_values():
+    """addressee_zh_v1 has no vector_norm: it keeps scoring exactly as it was deployed."""
+    raw = _payload(_weigh("挥", 1.0))
+    normed = {**raw, "feature": {**raw["feature"], "vector_norm": "l2"}}
+    # "挥挥手": 挥 twice and 手 once -> raw value 1 + log 2 on 挥; L2 divides it by the norm.
+    assert SemanticGate(raw, threshold=0.1).score("挥挥手") > SemanticGate(normed, threshold=0.1).score("挥挥手")
+    with pytest.raises(ValueError, match="vector_norm"):
+        SemanticGate({**raw, "feature": {**raw["feature"], "vector_norm": "max"}}, threshold=0.1)

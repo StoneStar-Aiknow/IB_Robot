@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVariable
 from launch_ros.actions import Node
 
@@ -1695,6 +1696,31 @@ def test_voice_bridge_listens_where_the_voiceprint_producer_publishes():
     params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
 
     assert _decode_launch_string(params["speaker_embedding_topic"]) == "/x2/voiceprint"
+
+
+def test_voice_bridge_forwards_conversation_admission_and_rewrites():
+    nodes = _voice_bridge_nodes(
+        enabled=True,
+        semantic_gate_mode="shadow",
+        semantic_gate_model_path="/opt/ibrobot/models/addressee/addressee_zh_v2.json",
+        semantic_gate_conversation=True,
+        semantic_gate_followup_sec=15.0,
+        text_rewrites=[["^作为一个(.{1,6})的动作$", "做一个\\1的动作"]],
+    )
+    params = _normalize_launch_param_mapping(vars(nodes["agent_voice_bridge"])["_Node__parameters"][0])
+
+    assert params["semantic_gate_conversation"] is True
+    assert float(params["semantic_gate_followup_sec"]) == 15.0
+    # Decoded the way rcl reads the parameter file (YAML), which keeps the backslash.
+    assert json.loads(yaml.safe_load(params["text_rewrites_json"])) == [["^作为一个(.{1,6})的动作$", "做一个\\1的动作"]]
+
+
+def test_the_agent_may_answer_a_question_with_the_voice_channels_silent_skills():
+    nodes = _voice_bridge_nodes(enabled=True, silent_skills=["introduce_platform", "self_introduction"])
+    params = _normalize_launch_param_mapping(vars(nodes["ibrobot_agent_node"])["_Node__parameters"][0])
+
+    planner = json.loads(yaml.safe_load(params["planner_config_json"]))
+    assert planner["answer_skills"] == ["introduce_platform", "self_introduction"]
 
 
 def test_voice_bridge_forwards_the_vendor_session_trigger_when_configured():

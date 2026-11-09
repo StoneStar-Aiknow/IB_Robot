@@ -54,6 +54,12 @@ schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
 
 **向量是生物特征数据**：只存在于进程内存与消息中，不落盘、不跨会话保留、不写日志。
 
+可选的逐窗口声纹（`window_seconds`、`window_starts`、`window_embeddings`）：`speaker_id_node` 开启
+`window_hop_seconds` 时，每隔这么长取一个 2 s 窗口单独提取向量，起点是相对本段第一个音频样本的秒数，
+与 `SpeechTranscript.token_starts` 同一时间基准。消费者用它判断一段里是否混进了另一个人的声音
+（`ibrobot_agent/speaker_split.py`）。`embedding` 的含义和计算方式不变，仍只取开头 `max_speech_seconds`。
+段太短（不足两个窗口）或未开启时三个字段为空。新增字段改变 ROS type hash，发布方和订阅方必须一起重建部署。
+
 ### `SpeechWakeEvent.msg`
 
 音源报告自己的唤醒词（X2 由 `aimdk_robot` 从厂商助手的应答推导，发布在 runtime 接口 `audio.wake_event` 上）。
@@ -70,6 +76,10 @@ schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
 每个产出文本的段发一条，与 `output_topic` 上的纯文本 `std_msgs/String` 同时发布、文本相同（纯文本话题的
 其他订阅者不受影响）。`(source_id, segment_sequence)` 与 `SpeakerEmbedding`、`SpeechWakeEvent` 同一标识，
 `agent_voice_bridge` 的寻址门控据此把转写、声纹与唤醒事件按段配对。本地 VAD 输入没有段标识，不发布。
+
+可选的逐 token 对齐（`token_starts`、`token_ends`）：每个 token 的起始时间（相对本段第一个音频样本的秒数）和它在
+`text` 中的结束偏移，消费者据此按时间截取转写的一部分，不需要知道分词规则。识别器不给时间戳、或 token 拼不回
+`text` 时两者都为空，此时只能整段使用 `text`。流式识别器在听到 token 之后才输出它，所以时间戳比声音晚约 0.35 s。
 
 ### `MHandProFrame.msg` / `HumanHandState.msg`
 

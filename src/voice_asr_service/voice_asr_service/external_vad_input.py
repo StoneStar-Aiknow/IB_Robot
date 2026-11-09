@@ -29,6 +29,19 @@ import numpy as np
 from voice_asr_service.speech_segments import STATE_BEGIN, STATE_END, STATE_PROCESSING, SegmentTracker
 
 
+def _alignment(result) -> tuple[tuple[float, ...], tuple[int, ...]]:
+    """(token start times, token end offsets in ``result.text``); both empty when they do not line up."""
+    from voice_asr_service.asr_inference_module import token_text_ends
+
+    tokens, times = getattr(result, "tokens", None) or (), getattr(result, "timestamps", None) or ()
+    if not tokens or len(tokens) != len(times):
+        return (), ()
+    ends = token_text_ends(list(tokens), str(result.text))
+    if ends is None:
+        return (), ()
+    return tuple(float(value) for value in times), tuple(ends)
+
+
 class ExternalVadInput:
     """Own admission, cancellation and deadlines for one external ASR stream."""
 
@@ -60,9 +73,11 @@ class ExternalVadInput:
         self._finalize_on_idle = bool(finalize_on_idle)
         self._publish_partial = publish_partial
         self._on_final, self._on_partial, self._on_state = on_final, on_partial, on_state
-        # Called with the transcript and its segment, (source_id, BEGIN sequence),
-        # right after on_final: consumers that pair it with the segment's
-        # voiceprint and wake event (SpeechTranscript) need to know which one.
+        # Called with the transcript, its segment, (source_id, BEGIN sequence), and
+        # its token alignment, (start times, end offsets in the text), right after
+        # on_final: consumers that pair it with the segment's voiceprint and wake
+        # event (SpeechTranscript) need to know which one, and the alignment lets
+        # them cut it at a time. Both alignment lists are empty when unavailable.
         self._on_segment_final = on_segment_final
         self._segment: tuple[str, int] | None = None
         self._clock = clock
@@ -141,7 +156,7 @@ class ExternalVadInput:
         if self._on_final is not None:
             self._on_final(result.text)
         if self._on_segment_final is not None and self._segment is not None:
-            self._on_segment_final(result.text, self._segment)
+            self._on_segment_final(result.text, self._segment, _alignment(result))
 
     def _on_chunk(self, message) -> None:
         # Tracked even while disabled, so re-enabling does not read as a gap.

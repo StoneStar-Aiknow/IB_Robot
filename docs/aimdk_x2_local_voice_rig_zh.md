@@ -112,7 +112,7 @@ Silero 会话只使用 1 个线程，并关闭空转等待。项目的 manifest 
    <models>/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05/
    <models>/zipvoice/                      # 含 ubuntu_onnx 部署
    <models>/campplus-speaker/              # 含 torch_cpu 部署
-   <models>/addressee/addressee_zh_v1.json
+   <models>/addressee/addressee_zh_v2.json
    <models>/silero-vad/assets/silero_vad.onnx
    ```
 
@@ -205,7 +205,7 @@ PulseAudio。
 | `missing model file` | 按第 4 节布局准备模型目录，或设置 `X2_LOCAL_VOICE_MODELS` |
 | `already running` | 执行 `stop.sh` |
 | 所有请求回“执行结果未知” | 本次运行中出现过 UNKNOWN。执行 `stop.sh` 和 `start.sh` |
-| 语音桥启动失败，报意图模型 | 确认 `<models>/addressee/addressee_zh_v1.json` 存在 |
+| 语音桥启动失败，报意图模型 | 确认 `<models>/addressee/addressee_zh_v2.json` 存在 |
 | 耳机没有声音 | 用 `--sink` 指定设备，查看 `audio_hal_latest.log` 中的 `playback start` |
 | `say.sh` 无响应 | 查看 `pipeline_latest.log` 中语音桥是否 `ready`，以及会话窗口是否已过期 |
 | 注入的语音没有识别结果 | 确认注入期间麦克风没有语音段；`inject_wav.py` 会等待订阅端匹配后再发送 |

@@ -288,6 +288,31 @@ class SpeakerEmbedder:
                 total += vector / norm
         return l2_normalized(total)
 
+    def embed_windows(self, pcm: bytes, hop_seconds: float) -> list[tuple[float, tuple[float, ...]]]:
+        """Embed overlapping windows of mono S16LE PCM: (start in s, unit vector) each.
+
+        See ``sliding_windows``: a voice per stretch of the segment, for telling
+        whether it holds more than one speaker. Empty when the segment is too
+        short for two windows. ``embed`` is unaffected and stays the vector the
+        anchor and the threshold were calibrated on.
+        """
+        from voice_asr_service.speaker_id.features import FRAMES_PER_SECOND, SAMPLE_RATE, fbank, sliding_windows
+
+        if self._handle is None:
+            raise RuntimeError("speaker embedding runtime is not initialized")
+        hop = int(round(float(hop_seconds) * FRAMES_PER_SECOND))
+        if hop <= 0:
+            return []
+        samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / _PCM_SCALE
+        windows = sliding_windows(fbank(samples, SAMPLE_RATE), hop)
+        result = []
+        for start, window in windows:
+            vector = l2_normalized(np.asarray(self._embed_window(window), dtype=np.float64))
+            if not vector:
+                return []
+            result.append((start / FRAMES_PER_SECOND, vector))
+        return result
+
     def _embed_window(self, window: np.ndarray) -> np.ndarray:
         """One window through the loaded deployment, head included."""
         from inference_service.unified_runtime import ExecutionContext, ModelRequest

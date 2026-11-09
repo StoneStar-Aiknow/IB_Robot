@@ -108,6 +108,8 @@ _SPEAKER_EMBEDDING_KEYS = frozenset(
         "max_speech_seconds",
         "idle_timeout_sec",
         "exit_on_init_failure",
+        "window_hop_seconds",
+        "window_max_seconds",
     }
 )
 

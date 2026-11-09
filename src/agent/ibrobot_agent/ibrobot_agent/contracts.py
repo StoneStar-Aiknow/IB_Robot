@@ -218,6 +218,12 @@ class PlannerIdentity:
         }
 
 
+#: ``AgentRequest.admission`` of a request a channel admitted only as a question or a reply
+#: (the voice bridge's conversation admission): the Agent answers it and never executes it.
+CONVERSATION_ADMISSION = "conversation"
+REQUEST_ADMISSIONS = (CONVERSATION_ADMISSION,)
+
+
 @dataclass(frozen=True)
 class AgentRequest:
     schema_version: int
@@ -229,10 +235,14 @@ class AgentRequest:
     text: str
     received_at: datetime
     reply_to_request_id: str | None = None
+    #: None: an ordinary request. ``conversation``: answer only (``REQUEST_ADMISSIONS``).
+    admission: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or self.schema_version != 1:
             raise ValueError("AgentRequest.schema_version must be 1")
+        if self.admission is not None and self.admission not in REQUEST_ADMISSIONS:
+            raise ValueError(f"AgentRequest.admission must be one of {REQUEST_ADMISSIONS} or absent")
         object.__setattr__(self, "request_id", _non_empty_text(self.request_id, "request_id"))
         object.__setattr__(self, "session_id", _non_empty_text(self.session_id, "session_id"))
         object.__setattr__(self, "channel_id", _non_empty_text(self.channel_id, "channel_id"))
@@ -265,6 +275,7 @@ class AgentRequest:
             "text": self.text,
             "received_at": self.received_at.isoformat(),
             "reply_to_request_id": self.reply_to_request_id,
+            "admission": self.admission,
         }
 
 
@@ -837,7 +848,7 @@ def planner_outcome_to_mapping(outcome: PlannerOutcome) -> dict[str, Any]:
 
 
 def request_hash_preimage(request: AgentRequest) -> dict[str, Any]:
-    return {
+    preimage = {
         "schema_version": request.schema_version,
         "request_id": request.request_id,
         "session_id": request.session_id,
@@ -847,6 +858,10 @@ def request_hash_preimage(request: AgentRequest) -> dict[str, Any]:
         "text": request.text,
         "reply_to_request_id": request.reply_to_request_id,
     }
+    # Only when set, so every request hash recorded before the field existed still matches.
+    if request.admission is not None:
+        preimage["admission"] = request.admission
+    return preimage
 
 
 def request_hash_text(request: AgentRequest) -> str:
@@ -855,6 +870,8 @@ def request_hash_text(request: AgentRequest) -> str:
 
 __all__ = [
     "ASYNC_PRESENTATION_MODE",
+    "CONVERSATION_ADMISSION",
+    "REQUEST_ADMISSIONS",
     "CATALOG_SKILL_NAMES_ZH",
     "GATED_PRESENTATION_MODE",
     "AdmissionResult",

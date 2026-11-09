@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Protocol
 
 from embodied_common.text_normalization import normalize_trigger_text
+from ibrobot_agent.speaker_split import SpeakerSplit, TokenAlignment, WindowVoiceprints, split_by_speaker
 
 #: How the gate decides an utterance proves on its own that it is for the robot.
 #:
@@ -100,6 +101,9 @@ class Voiceprint:
 
     vector: tuple[float, ...]
     model_id: str
+    #: Per-window voiceprints of the same segment, when the producer sent them
+    #: (``speaker_split``); never part of a comparison with the anchor.
+    windows: WindowVoiceprints | None = None
 
 
 @dataclass(frozen=True)
@@ -514,6 +518,55 @@ class AddresseeGate:
             if merge is not None:
                 self.anchors[check.name] = merge(self.anchors[check.name], value)
         return ""
+
+    def split_owner(
+        self,
+        text: str,
+        segment: Segment | None,
+        alignment: TokenAlignment | None,
+        *,
+        heard_at: float,
+        owner_similarity: float,
+        other_similarity: float,
+        apply: bool,
+    ) -> SpeakerSplit | None:
+        """Compare ``segment``'s per-window voiceprints with the owner's anchor; None when there is nothing to compare.
+
+        Nothing to compare: no speaker anchor yet, no windows for this segment,
+        or this transcript is the one that sets the anchor (it starts with the
+        wake phrase, or a wake event opened its segment) -- an opener proves
+        itself whole. With ``apply`` and a mixed verdict, the segment's
+        measurement becomes the mean of the owner's windows, so the speaker
+        check judges, and the anchor learns from, the owner's part only.
+        """
+        if segment is None:
+            return None
+        anchor = self.anchors.get(SpeakerCheck.name)
+        store = self.measurements.get(SpeakerCheck.name, {})
+        measurement = store.get(segment)
+        if anchor is None or measurement is None or measurement.value is None:
+            return None
+        value = measurement.value
+        if not isinstance(value, Voiceprint) or not isinstance(anchor, Voiceprint):
+            return None
+        if value.windows is None or value.model_id != anchor.model_id:
+            return None
+        normalized = normalize_trigger_text(text)
+        if any(normalized.startswith(phrase) for phrase in self.wake_phrases):
+            return None
+        if self.trigger == "vendor_session" and (self._wakes(segment, heard_at) or not self.session_open):
+            return None
+        split = split_by_speaker(
+            _unit_vector(anchor.vector),
+            value.windows,
+            text,
+            alignment,
+            owner_similarity=owner_similarity,
+            other_similarity=other_similarity,
+        )
+        if apply and split.kind == "mixed" and split.vector:
+            store[segment] = _Measurement(Voiceprint(split.vector, value.model_id), measurement.at)
+        return split
 
     def _session_gate(self, raw: str, normalized: str, *, session_opened: bool, segment: Segment | None) -> GateVerdict:
         """The source only released this after its own wake word; the question is whose turn it is.
