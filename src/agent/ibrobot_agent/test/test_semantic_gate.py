@@ -47,6 +47,12 @@ def _quiet_gate(**kwargs) -> SemanticGate:
     return SemanticGate(payload, threshold=kwargs.pop("threshold", 0.10), **kwargs)
 
 
+def _asking_gate(**kwargs) -> SemanticGate:
+    """The quiet model that also likes "怎": "你怎么知道我举手了" scores high, remarks stay near 0."""
+    payload = _payload(_weigh("挥", 6.0) + _weigh("怎", 6.0), bias=-4.0)
+    return SemanticGate(payload, threshold=kwargs.pop("threshold", 0.10), **kwargs)
+
+
 # --- format ------------------------------------------------------------------------------
 
 
@@ -110,12 +116,29 @@ def test_a_question_put_to_the_robot_may_carry_a_skill_word():
     # "你怎么知道我举手了" is addressed to the robot and contains a catalog word; the remark
     # veto would drop it, and no amount of corpus fixes the conflict between "about the
     # action" and "asking the robot". The question shape is what separates them.
-    gate = _quiet_gate(lexicon=("举手",))
+    gate = _asking_gate(lexicon=("举手",))
     decision = gate.judge("你怎么知道我举手了")
     assert decision.accepted
     assert decision.reason == "question about the robot"
     # A remark that only sounds like a question still loses its skill word.
     assert gate.judge("这首歌举手的动作").rejected
+
+
+def test_the_question_shape_alone_does_not_carry_a_skill_word():
+    # The question exception skips the remark veto, so it must stay narrow: remarks that
+    # end in "呢", and short questions the model flatly disagrees with, keep the veto.
+    gate = _asking_gate(lexicon=("举手", "橙子", "挥手", "照镜子", "水果"))
+    for remark in ("你看那个橙子呢", "你看他在挥手呢", "你那个照镜子的视频呢", "你刚才拿的什么水果"):
+        decision = gate.judge(remark)
+        assert decision.rejected, remark
+        assert decision.reason.startswith("mentions a skill word"), remark
+    # "你看他在挥手呢" scores high on "挥": only the dropped "呢" marker keeps it out.
+    assert gate.score("你看他在挥手呢") >= gate.threshold
+    # "你刚才拿的什么水果" asks something in 9 characters: only the model score keeps it out.
+    assert gate.score("你刚才拿的什么水果") < gate.threshold
+    assert gate.judge("你怎么知道我举手了").accepted
+    # The same question against a model that scores it near 0 is not let through on shape.
+    assert _quiet_gate(lexicon=("举手",)).judge("你怎么知道我举手了").rejected
 
 
 def test_a_skill_word_inside_a_remark_about_the_robot_is_not_a_command():

@@ -79,8 +79,10 @@ _FRAGMENT_BODY_CHARS = 3
 #: 2026-11-07 shows why the bare word is not enough: the sentence is *about* the action.
 #: A question put to the robot starts with "you" and asks something; used to let one carry a
 #: skill word ("你怎么知道我举手了") past the remark veto without opening the veto to remarks.
+#: No single-character "哪", "几" or "呢": "你看那个橙子呢" and "你看他在挥手呢" are remarks
+#: that end like a question, and "哪"/"几" sit inside ordinary words ("哪个", "几个").
 _QUESTION_STARTS = ("你", "您")
-_QUESTION_MARKERS = ("什么", "怎么", "为什么", "哪", "谁", "几", "多少", "吗", "呢", "是不是", "能不能")
+_QUESTION_MARKERS = ("什么", "怎么", "为什么", "谁", "多少", "吗", "是不是", "能不能")
 _LEXICON_LEAD_CHARS = 3
 #: Verbs and request words that make a sentence imperative even when the skill word sits
 #: later: "我想看挥手" is a command, "这首歌举手的动作" is a remark about one.
@@ -320,10 +322,12 @@ class SemanticGate:
             reason = "skill word"
         elif wake_prefix:
             reason = "wake prefix"
-        elif lexicon_hit and self._asks_about_itself(body):
+        elif lexicon_hit and self._asks_about_itself(body) and score >= self.threshold:
             # "你怎么知道我举手了" carries a skill word and a question. The veto below exists
             # for remarks about the action ("这首歌举手的动作"), and a question put to the robot
-            # is the opposite: it can only be answered by it.
+            # is the opposite: it can only be answered by it. The shape is only a hint, so the
+            # model must not flatly disagree: unlike the skill-word branch, a short sentence
+            # gets no pass on length ("你刚才拿的什么水果" is 9 characters and scores 0.000).
             reason = "question about the robot"
         elif lexicon_hit:
             # The word is there but the sentence is about the action, not a request for it,
