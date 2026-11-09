@@ -274,3 +274,67 @@ class TestOtherModes:
     def test_bad_arguments_are_refused(self, mode, delay):
         with pytest.raises(ValueError):
             AsrMute(mode, delay, lambda command: None)
+
+
+class TestSession:
+    def test_entering_standby_stops_the_asr(self):
+        asr, _, sent = mute("session")
+        asr.on_asr_status("listening")
+        asr.on_session_state("WAIT")
+        assert sent == []
+
+        asr.on_session_state("STANDBY")
+        asr.on_session_state("MIRRORING")  # still held: nothing more to send
+        assert commands(sent) == ["stop"]
+        assert asr.status()["held"] is True
+
+    def test_an_asr_starting_itself_in_standby_is_stopped_again(self):
+        asr, clock, sent = mute("session")
+        asr.on_session_state("STANDBY")
+        clock.t = 51.0
+        asr.playback_started()
+        clock.t = 52.0
+        asr.playback_ended()
+        clock.t = 60.0
+        asr.tick()  # no resume after a clip while held
+        assert commands(sent) == ["stop"]
+
+        asr.on_asr_status("listening")  # someone else started it
+        assert commands(sent) == ["stop", "stop"]
+
+    def test_back_in_wait_it_starts_only_what_it_stopped(self):
+        asr, clock, sent = mute("session")
+        asr.on_session_state("MIRRORING")
+        clock.t = 55.0
+        asr.on_session_state("WAIT")
+        assert sent == [(50.0, "stop"), (55.0, "start")]
+        assert asr.status()["held"] is False
+
+        idle, _, idle_sent = mute("session")
+        idle.on_asr_status("idle")  # stopped by someone else: left alone
+        idle.on_session_state("STANDBY")
+        idle.on_session_state("WAIT")
+        assert idle_sent == []
+
+    def test_wait_still_mutes_its_clips_and_shutdown_restarts(self):
+        asr, clock, sent = mute("session")
+        asr.on_session_state("WAIT")
+        asr.playback_started()
+        clock.t = 52.0
+        asr.playback_ended()
+        clock.t = 52.8
+        asr.tick()
+        assert commands(sent) == ["stop", "start"]
+
+        asr.on_session_state("STANDBY")
+        asr.shutdown()
+        asr.on_session_state("WAIT")
+        assert commands(sent) == ["stop", "start", "stop", "start"]
+
+    def test_the_other_modes_ignore_the_session_state(self):
+        for mode in ("mute", "off", "keep"):
+            asr, _, sent = mute(mode)
+            asr.on_asr_status("idle")
+            asr.on_session_state("MIRRORING")
+            asr.on_session_state("WAIT")
+            assert sent == [] and asr.status()["held"] is False

@@ -411,6 +411,18 @@ class RateLimiter:
 DEFAULT_LATENCY_S = 0.400
 DEFAULT_LOOKAHEAD_S = 0.250
 
+# IB-Robot patch: catching up a stale `_offset` (FollowMeStream._catch_up). The ages of
+# the last CATCHUP_WINDOW_S give the offset the stream would calibrate now; when the
+# current one sits more than CATCHUP_EXCESS_S above it for CATCHUP_HOLD_S of live
+# output, the output clock runs fast until it gets there: excess / CATCHUP_WITHIN_S
+# faster than real time, at least CATCHUP_MIN_RATE and at most CATCHUP_MAX_RATE.
+CATCHUP_WINDOW_S = 3.0
+CATCHUP_EXCESS_S = 0.100
+CATCHUP_HOLD_S = 2.0
+CATCHUP_WITHIN_S = 4.0
+CATCHUP_MIN_RATE = 0.05
+CATCHUP_MAX_RATE = 0.20
+
 PARK, BLEND_IN, LIVE, BLEND_OUT, FINAL, DONE = (
     "park", "blend_in", "live", "blend_out", "final", "done")
 
@@ -620,6 +632,15 @@ class FollowMeStream:
         self.starved_frames = 0
         self.stretched_frames = 0   # 右窗撑开过几次，见 _live_target
         self.notes: list[str] = []
+        # IB-Robot patch: catch-up state (see _catch_up). The counts are the stream's,
+        # not the session's, so reset() keeps them.
+        self._ages: deque[tuple[float, float]] = deque()
+        self._last_poll: float | None = None
+        self._excess_since: float | None = None
+        self._catchup_rate = 0.0
+        self.offset_target: float | None = None
+        self.catchups = 0
+        self.caught_up_s = 0.0
 
     def reset(self, session: "Session") -> None:
         """清掉**会话级**状态，准备再起一场。输入侧的状态一律不动。
@@ -663,6 +684,11 @@ class FollowMeStream:
         self.stretched_frames = 0
         self.notes.clear()
         self.limiter = RateLimiter(self.rated, self.session.dt, self.vel_scale)
+        self._ages.clear()
+        self._last_poll = None
+        self._excess_since = None
+        self._catchup_rate = 0.0
+        self.offset_target = None
 
     # -- 输入 ------------------------------------------------------------
     def push(self, frame: SourceFrame) -> None:
@@ -746,6 +772,7 @@ class FollowMeStream:
             self._offset = float(np.median(self._warm_ages)) + self.latency_s
             self._warm_ages.clear()
             self._t0 = now - self._offset
+        self._catch_up(now)
         t_now = now - self._offset
         t_latest = self._buf[-1][0] if self._buf else float("nan")
         out: list[Sample] = []
@@ -763,6 +790,46 @@ class FollowMeStream:
     @property
     def finished(self) -> bool:
         return self.session.phase(self._k)[0] == DONE
+
+    def _catch_up(self, now: float) -> None:
+        """IB-Robot patch: bring a stale `_offset` back down without a jump.
+
+        `_offset` is calibrated once per session, from the ages while the buffer
+        filled. A stall then (PEAR at 3 Hz, ages near 0.8 s) keeps the whole session
+        that far behind after the ages recover. Moving `_t0` up and `_offset` down by
+        the same amount leaves every sample due on the same poll; only the camera
+        time each one reads advances faster, so the arms run `_catchup_rate` fast
+        until the offset reaches `offset_target`. It runs in live output only and
+        stops when the ages rise to the offset again; it never raises the offset.
+        """
+        dt = 0.0 if self._last_poll is None else max(0.0, now - self._last_poll)
+        self._last_poll = now
+        if self._buf:
+            self._ages.append((now, now - self._buf[-1][0]))
+        while self._ages and self._ages[0][0] < now - CATCHUP_WINDOW_S:
+            self._ages.popleft()
+        if not self._ages:
+            return
+        self.offset_target = float(np.median([age for _, age in self._ages])) + self.latency_s
+        excess = self._offset - self.offset_target
+        if self.session.phase(self._k)[0] != LIVE or excess <= 0.0:
+            self._excess_since, self._catchup_rate = None, 0.0
+            return
+        if self._catchup_rate == 0.0:
+            if excess <= CATCHUP_EXCESS_S:
+                self._excess_since = None
+            elif self._excess_since is None:
+                self._excess_since = now
+            elif now - self._excess_since >= CATCHUP_HOLD_S:
+                self._catchup_rate = min(max(excess / CATCHUP_WITHIN_S, CATCHUP_MIN_RATE), CATCHUP_MAX_RATE)
+                self.catchups += 1
+            return
+        shift = min(self._catchup_rate * dt, excess)
+        self._t0 += shift
+        self._offset -= shift
+        self.caught_up_s += shift
+        if shift >= excess:
+            self._excess_since, self._catchup_rate = None, 0.0
 
     def _emit(self, t_out: float, t_wall: float, t_latest: float,
               phase: str, weight: float) -> Sample:

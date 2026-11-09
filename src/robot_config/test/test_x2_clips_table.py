@@ -53,7 +53,7 @@ ALLOWED_TRIGGER_LINES = {
     "big_wave_02": {"招手"},
     "big_wave_03": {"打招呼"},
 }
-ASR_MODES_DEAF_DURING_PLAYBACK = ("mute", "off")
+ASR_MODES_DEAF_DURING_PLAYBACK = ("mute", "off", "session")
 
 
 @pytest.fixture(scope="module")
