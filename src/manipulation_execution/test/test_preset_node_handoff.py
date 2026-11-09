@@ -1,5 +1,6 @@
 """Node boundary keeps complete hands in a verified seed and rejects stale targets."""
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,7 @@ def test_verified_seed_bypasses_ordinary_hand_overlay_once():
     def unexpected_apply(*args):
         raise AssertionError("ordinary hand tracking must not overwrite the completed named target")
 
-    publisher = SimpleNamespace(publish=lambda value: sent.append(value.data))
+    publisher = SimpleNamespace(publish=lambda value: sent.append(list(value.data)))
     node = SimpleNamespace(
         _preset=object(),
         session=SimpleNamespace(preset_seed_emitting=True),
@@ -53,3 +54,35 @@ def test_verified_seed_bypasses_ordinary_hand_overlay_once():
     module.MirrorSessionNode._publish(node, seed)
     assert reseeded == [(seed.hand, 20.0)]
     assert sent[1] == sent[3] == list(seed.hand)
+
+
+def test_old_round_decode_cannot_latch_the_new_round_epoch(monkeypatch):
+    from manipulation_execution.preset_motions import match_signal
+
+    submitted = []
+    session = SimpleNamespace(preset_generation=1)
+
+    def observe(active, *, valid, expected_generation, received_at):
+        submitted.append((expected_generation, received_at))
+        return expected_generation == session.preset_generation
+
+    session.observe_preset = observe
+    node = SimpleNamespace(
+        session=session,
+        _preset_signal_lock=threading.RLock(),
+        _preset_signal_generation=1,
+        _preset_selected_actor=(0, 10.0),
+        _preset_match_after_ns=1,
+        _preset_match_epoch=None,
+        _clock_s=lambda: 20.0,
+    )
+    monkeypatch.setattr(module.time, "monotonic", lambda: 10.0)
+
+    def decode(*args, **kwargs):
+        session.preset_generation = 2  # operator cancels and enters a new round before submission
+        return SimpleNamespace(active=True, valid=True, epoch=7)
+
+    monkeypatch.setattr(match_signal, "decode_match_state", decode)
+    module.MirrorSessionNode._on_preset_state(node, SimpleNamespace(data="{}"))
+    assert submitted == [(1, 10.0)]
+    assert node._preset_match_epoch is None

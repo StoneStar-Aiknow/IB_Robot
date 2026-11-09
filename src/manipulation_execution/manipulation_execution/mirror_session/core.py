@@ -282,6 +282,12 @@ class MirrorSession:
         with self._lock:
             return self._preset_seed_emitting
 
+    @property
+    def preset_generation(self) -> int:
+        """Token that must accompany asynchronous matcher evidence."""
+        with self._lock:
+            return self._preset_generation
+
     def observe_status(self, observation: RuntimeObservation) -> None:
         with self._lock:
             self._observe_locked(observation)
@@ -293,14 +299,34 @@ class MirrorSession:
                 self._measured_arm = values
                 self._measured_arm_at = self._clock()
 
-    def observe_preset(self, active: bool, *, valid: bool = True) -> None:
-        """Receive the current round's matcher state; the node enforces its source-time barrier."""
+    def observe_preset(
+        self,
+        active: bool,
+        *,
+        valid: bool = True,
+        expected_generation: int | None = None,
+        received_at: float | None = None,
+    ) -> bool:
+        """Atomically reject evidence decoded for an older round or too long ago."""
         with self._lock:
             if self._preset is None or (self.state, self.phase) != (SessionState.MIRRORING, Phase.RUNNING):
-                return
+                return False
+            if expected_generation is not None and (
+                type(expected_generation) is not int or expected_generation != self._preset_generation
+            ):
+                return False
+            now = self._clock()
+            observed_at = now if received_at is None else received_at
+            if (
+                type(observed_at) not in (int, float)
+                or not math.isfinite(observed_at)
+                or not 0 <= now - observed_at <= PRESET_STATE_MAX_AGE_S
+            ):
+                return False
             self._preset_active = active is True
             self._preset_valid = isinstance(active, bool) and valid is True
-            self._preset_received_at = self._clock()
+            self._preset_received_at = observed_at
+            return True
 
     def _observe_locked(self, observation: RuntimeObservation) -> None:
         self._last_status = observation

@@ -411,6 +411,8 @@ class MirrorSessionNode(Node):
         self._preset_port = None
         self._preset_match_after_ns = None
         self._preset_match_epoch = None
+        self._preset_signal_generation = None
+        self._preset_signal_lock = threading.RLock()
         self._preset_selected_actor = None
         self._preset_last_preview_at = -math.inf
         self._preset_last_raw = None
@@ -651,18 +653,24 @@ class MirrorSessionNode(Node):
         from manipulation_execution.preset_motions.match_signal import decode_match_state
 
         now = time.monotonic()
-        selected = self._preset_selected_actor
-        actor_id = selected[0] if selected is not None and 0 <= now - selected[1] <= 1.0 else None
-        signal = decode_match_state(
-            message.data,
-            now_ros_s=self._clock_s(),
-            source_after_ns=self._preset_match_after_ns,
-            actor_id=actor_id,
-            epoch=self._preset_match_epoch,
-        )
-        if signal.valid and self._preset_match_epoch is None:
-            self._preset_match_epoch = signal.epoch
-        self.session.observe_preset(signal.active, valid=signal.valid)
+        with self._preset_signal_lock:
+            generation = self.session.preset_generation
+            if self._preset_signal_generation != generation:
+                return  # The tick has not installed this round's source-time barrier yet.
+            selected = self._preset_selected_actor
+            actor_id = selected[0] if selected is not None and 0 <= now - selected[1] <= 1.0 else None
+            signal = decode_match_state(
+                message.data,
+                now_ros_s=self._clock_s(),
+                source_after_ns=self._preset_match_after_ns,
+                actor_id=actor_id,
+                epoch=self._preset_match_epoch,
+            )
+            accepted = self.session.observe_preset(
+                signal.active, valid=signal.valid, expected_generation=generation, received_at=now
+            )
+            if accepted and signal.valid and self._preset_match_epoch is None:
+                self._preset_match_epoch = signal.epoch
 
     def _send(self, command) -> None:
         # The gate is the only caller, under the session lock.
@@ -708,12 +716,14 @@ class MirrorSessionNode(Node):
         transitions = self.session.drain_transitions()
         for record in transitions:
             if getattr(self, "_preset", None) is not None:
-                if record["state"] == SessionState.MIRRORING.value and record["phase"] == Phase.RUNNING.value:
-                    self._preset_match_after_ns = self.get_clock().now().nanoseconds
-                    self._preset_match_epoch = None
-                    self._preset_last_raw = None
-                else:
-                    self._preset_match_after_ns = None
+                with self._preset_signal_lock:
+                    if record["state"] == SessionState.MIRRORING.value and record["phase"] == Phase.RUNNING.value:
+                        self._preset_signal_generation = self.session.preset_generation
+                        self._preset_match_after_ns = self.get_clock().now().nanoseconds
+                        self._preset_match_epoch = None
+                        self._preset_last_raw = None
+                    else:
+                        self._preset_signal_generation = self._preset_match_after_ns = None
             self.get_logger().info(
                 f"{record['from']} -> {record['to']} ({record['reason']}); cancel_reason={record['cancel_reason']!r} "
                 f"short_rounds={record['short_rounds']}"

@@ -181,6 +181,21 @@ def make_rig(*, enabled=True, with_preset=True, target_available=True):
     )
 
 
+def test_old_generation_and_delayed_receipt_cannot_become_new_match_evidence():
+    rig = make_rig()
+    token = rig.session.preset_generation
+    assert not rig.session.observe_preset(True, expected_generation=token - 1, received_at=rig.clock())
+    assert rig.session._preset_received_at is None
+    before = rig.clock()
+    rig.clock.advance(0.36)
+    assert not rig.session.observe_preset(True, expected_generation=token, received_at=before)
+    assert rig.session._preset_received_at is None
+    rig.session.tick()
+    assert rig.session.state == SessionState.MIRRORING
+    assert not rig.named.calls
+    assert rig.session.observe_preset(True, expected_generation=token, received_at=rig.clock())
+
+
 def tick(rig, *, active=True, valid=True, seconds=0.0, camera=None, matcher=True):
     rig.clock.advance(seconds)
     rig.session.observe_status(rig.runtime.status)
