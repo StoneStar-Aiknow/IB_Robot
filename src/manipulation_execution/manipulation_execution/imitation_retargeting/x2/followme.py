@@ -81,10 +81,12 @@ _FOREARMS = ((18, 20), (19, 21))
 ELBOW_REST_TWIST_DEG = -23.5
 # The share of the elbow's twist moved: the whole of it also moves PEAR's noise.
 ELBOW_SPIN_GAIN = 0.5
-# The solver's own defaults (360 deg/s, 15 deg behind overhead, ...), but its 3-frame
-# median takes frames from a wider window: the default 0.10 s fills only at 30 fps,
-# and live PEAR runs at 10-20 Hz. 0.25 s holds three frames down to about 10 Hz.
-SHOULDER_PARAMS = ShoulderParams(median_window_s=0.25)
+# The solver's own defaults (360 deg/s, 15 deg behind overhead, a 3-frame median within
+# 0.10 s). That median fills only near 30 fps; a 0.25 s window, filling down to 10 Hz,
+# lagged a frame there: on 12 PEAR clips replayed at 15 and 10 Hz (sp5090, 11-09) its
+# frames over 60 deg off were 17 and 15 against 3 and 4, and it was worse than the old
+# mapping on 10 and 9 arms of the 18 held out, against 2 and 0.
+SHOULDER_PARAMS = ShoulderParams()
 # The analytic shoulder FK must match the model's: past this the constants were read wrong.
 SHOULDER_GEOMETRY_TOLERANCE_DEG = 0.01
 _SHOULDER_JOINTS = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw")
