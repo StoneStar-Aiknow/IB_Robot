@@ -497,6 +497,12 @@ def mock_hand_endpoints(robot_config: Mapping) -> dict | None:
     }
 
 
+def mock_hand_frame_topic(robot_config: Mapping) -> str:
+    """The hand perception frames' topic while the retarget player follows the hands, else ``""``."""
+    hands = _hands_config(robot_config)
+    return "" if hands is None else _required_topic(hands, "frame_topic", "/hri/hand/frame")
+
+
 def _extern_dir(hands: Mapping) -> str:
     """Override directory for the video2x2 hand files; empty: the copies in this package."""
     return str(hands.get("extern_dir", "") or "")
@@ -620,6 +626,7 @@ __all__ = [
     "MOCK_PLAY_SERVICE",
     "generate_motion_imitation_stream_nodes",
     "mock_hand_endpoints",
+    "mock_hand_frame_topic",
     "mock_playback_endpoints",
     "mock_reset_pose",
     "mock_velocity_limits",
