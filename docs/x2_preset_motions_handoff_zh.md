@@ -4,6 +4,25 @@
 状态：部分实现，尚未达到完整功能验收条件。
 本轮禁止启用机器人比心动作。
 
+## 已确认的视觉版本
+
+用户确认保留掌心朝下的 15 cm 仿真比较版本。
+视觉版本名为 `palms_down_v1`。
+双臂 14 维和双手 20 维角度已冻结。
+模板的 `review_state` 为 `visual_approved_safety_pending`。
+模板仍保留 `validated: false` 和 `motion_enabled: false`。
+
+视觉确认不构成实机安全或动作播放许可。
+运行时头部间距仍为 20 cm。
+15 cm 仅表示这组预览的比较条件。
+缺失的头部包络和进出路径认证仍需完成。
+
+模板：`src/robot_config/config/preset_motions/overhead_heart.yaml`。
+预览目录：`/home/zll/x2-preset-motions-design/simulation/palms_down/approved_visual_v1/`。
+预览目录保存源候选、4 张图片和哈希清单。
+算法原始通过标记保留在模板中。
+用户视觉确认不会覆盖安全检查失败的事实。
+
 ## 用户纠正的目标造型
 
 双手掌面必须朝下，手指向头顶中央收拢。
