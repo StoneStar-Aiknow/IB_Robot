@@ -19,7 +19,9 @@ yaw_need(pitch, roll) -> (yaw_cmd_rad, weight)：在这组 pitch/roll 下，要�
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 
@@ -30,6 +32,17 @@ __all__ = ["ShoulderGeometry", "ShoulderParams", "ShoulderSolver"]
 
 def _unit(v: np.ndarray) -> np.ndarray:
     return v / np.linalg.norm(v)
+
+
+# IB-Robot patch: step() runs per frame in the live chain, where numpy's generic calls on 3-vectors
+# and scalars cost more than the arithmetic. _cross and _clip are np.cross and np.clip with the same
+# products and comparisons, so they return the same floats.
+def _cross(u, v) -> np.ndarray:
+    return np.array([u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]])
+
+
+def _clip(v: float, lo: float, hi: float) -> float:
+    return min(max(v, lo), hi)
 
 
 def rot(axis: np.ndarray, angle: float) -> np.ndarray:
@@ -43,7 +56,7 @@ def _signed_angle(u: np.ndarray, v: np.ndarray, axis: np.ndarray) -> float:
     """u 绕 axis 转到 v 的角度（两者先投影到垂直于 axis 的平面）。"""
     u = u - (u @ axis) * axis
     v = v - (v @ axis) * axis
-    return float(np.arctan2(axis @ np.cross(u, v), u @ v))
+    return float(np.arctan2(axis @ _cross(u, v), u @ v))
 
 
 # ---------------------------------------------------------------- 几何
@@ -74,6 +87,22 @@ class ShoulderGeometry:
         """正运动学：上臂方向 = R(pitch 轴, pitch) R(roll 轴, roll) rest_dir。yaw 不改变上臂方向。"""
         return rot(self.pitch_axis, pitch) @ rot(self.roll_axis, roll) @ self.rest_dir
 
+    @cached_property
+    def _direction_terms(self) -> tuple[list[float], list[float], list[float], list[float]]:
+        ar, v0 = _unit(self.roll_axis), self.rest_dir
+        return _unit(self.pitch_axis).tolist(), v0.tolist(), np.cross(ar, v0).tolist(), (ar * (ar @ v0)).tolist()
+
+    def pointing_error_deg(self, pitch: float, roll: float, h: list[float]) -> float:
+        """IB-Robot patch: direction(pitch, roll) 与 h 的夹角（度），Rodrigues 展开成浮点运算，只用于候选打分。"""
+        a, v0, c0, k0 = self._direction_terms
+        s, c = math.sin(roll), math.cos(roll)
+        v = [v0[i] * c + c0[i] * s + k0[i] * (1.0 - c) for i in range(3)]
+        s, c = math.sin(pitch), math.cos(pitch)
+        axv = (a[1] * v[2] - a[2] * v[1], a[2] * v[0] - a[0] * v[2], a[0] * v[1] - a[1] * v[0])
+        av = (a[0] * v[0] + a[1] * v[1] + a[2] * v[2]) * (1.0 - c)
+        dot = sum((v[i] * c + axv[i] * s + a[i] * av) * h[i] for i in range(3))
+        return math.degrees(math.acos(_clip(dot, -1.0, 1.0)))
+
     def exact_solutions(self, h: np.ndarray) -> list[tuple[float, float]]:
         """direction(pitch, roll) == h 的解析解（Paden-Kahan 子问题 2）。
 
@@ -85,7 +114,7 @@ class ShoulderGeometry:
         A, B = ap @ h, ar @ v0
         alpha = (A - d * B) / (1.0 - d * d)
         beta = (B - d * A) / (1.0 - d * d)
-        n = np.cross(ap, ar)
+        n = _cross(ap, ar)
         g2 = (1.0 - alpha * alpha - beta * beta - 2.0 * alpha * beta * d) / (n @ n)
         gammas = (np.sqrt(g2), -np.sqrt(g2)) if g2 > 0 else (0.0,)
         out = []
@@ -149,7 +178,7 @@ class ShoulderSolver:
         self._hist = self._hist[-3:]
         if len(self._hist) < 3:
             return h
-        return _unit(np.median(np.stack([v for _, v in self._hist]), axis=0))
+        return _unit(np.array([sorted(c)[1] for c in zip(*(v.tolist() for _, v in self._hist), strict=True)]))
 
     def _limit_overhead_back(self, h: np.ndarray) -> np.ndarray:
         """头顶后方禁区：上臂高于水平且越过「正上方往后倒 θ」的平面时，投影回平面。
@@ -178,7 +207,7 @@ class ShoulderSolver:
         lo, hi = self._limits()
         r = self.geo.roll_for_pitch(h, pitch_now)
         r = min((r + 2 * np.pi * k for k in (-1, 0, 1)), key=lambda v: abs(v - prev[1]))
-        return float(np.clip(r, lo[1], hi[1]))
+        return float(_clip(r, lo[1], hi[1]))
 
     # ---- 主入口
     def step(self, arm_dir: np.ndarray, dt: float, yaw_need=None) -> tuple[float, float, float | None]:
@@ -192,19 +221,30 @@ class ShoulderSolver:
 
         # 1. 候选：解析解（各自再试 ±2π），夹进限位。打分 = 指向误差 + 扭转代价（yaw 超出限位的量）
         cands, seen = [], set()
+        (lo_p, lo_r), (hi_p, hi_r), h_list = lo.tolist(), hi.tolist(), h.tolist()
         for pitch, roll in self.geo.exact_solutions(h):
             for dp in (0.0, 2 * np.pi, -2 * np.pi):
                 for dr in (0.0, 2 * np.pi, -2 * np.pi):
-                    q = np.clip([pitch + dp, roll + dr], lo, hi)
+                    q = (_clip(pitch + dp, lo_p, hi_p), _clip(roll + dr, lo_r, hi_r))
                     key = (round(q[0], 6), round(q[1], 6))
                     if key in seen:
                         continue
                     seen.add(key)
-                    err = np.degrees(np.arccos(np.clip(self.geo.direction(*q) @ h, -1, 1)))
-                    if yaw_need is not None:
-                        y, w = yaw_need(q[0], q[1])
-                        err += w * p.twist_weight * np.degrees(self._yaw_overshoot(y))
-                    cands.append((err, q))
+                    cands.append((self.geo.pointing_error_deg(*q, h_list), q))
+        if yaw_need is not None:
+            # IB-Robot patch: yaw_need runs a full FK. The twist cost is never negative, so a
+            # candidate whose pointing error alone is past the best total + select_tol_deg can
+            # neither win nor enter `ok` below; the rest are not asked. Results are unchanged.
+            # Step 4 asks again at the final pitch/roll, which is a scored candidate unless
+            # the rate limit moved it, so the answers are kept (yaw_need is fixed within a step).
+            pointing, cands, low, asked = sorted(cands, key=lambda c: c[0]), [], float("inf"), {}
+            for err, q in pointing:
+                if err > low + p.select_tol_deg:
+                    break
+                y, w = asked[q] = yaw_need(q[0], q[1])
+                err += w * p.twist_weight * np.degrees(self._yaw_overshoot(y))
+                low = min(low, err)
+                cands.append((err, q))
 
         # 2. 选解：严格先准、再连续。只有一种写法，没有分支歧义；连续性只用来在 ±2π 等价解之间挑。
         #    （不能用「误差 + λ·距离」：经过侧平举时会选中被限位夹住、方向错的近解，pitch 反向转到限位卡死。）
@@ -219,33 +259,34 @@ class ShoulderSolver:
         #    而是在当前 pitch 下重解去贴人的朝向——侧平举附近 pitch 几乎不影响朝向，所以手臂不甩。
         if prev is not None:
             cap = np.radians(p.max_speed_deg_s) * dt
-            p_new = float(np.clip(pitch, prev[0] - cap, prev[0] + cap))
+            p_new = float(_clip(pitch, prev[0] - cap, prev[0] + cap))
             if abs(p_new - pitch) > 1e-9:
                 st["rate_limited"] += 1
                 r_goal = self._migrate_roll(prev, h, p_new)
             else:
                 r_goal = roll
-            r_new = float(np.clip(r_goal, prev[1] - cap, prev[1] + cap))
+            r_new = float(_clip(r_goal, prev[1] - cap, prev[1] + cap))
             if abs(r_new - r_goal) > 1e-9:
                 st["rate_limited"] += 1
             pitch, roll = p_new, r_new
 
-        q = np.clip([pitch, roll], lo, hi)
-        if np.any(np.isclose(q, lo, atol=1e-6) | np.isclose(q, hi, atol=1e-6)):
+        q = (_clip(pitch, lo_p, hi_p), _clip(roll, lo_r, hi_r))
+        # np.isclose(atol=1e-6) 的判据（默认 rtol=1e-5）
+        if any(abs(v - b) <= 1e-6 + 1e-5 * abs(b) for v, b in zip(q * 2, (lo_p, lo_r, hi_p, hi_r), strict=True)):
             st["at_limit"] += 1
         self._prev = (float(q[0]), float(q[1]))
         if yaw_need is None:
             return self._prev[0], self._prev[1], None
 
         # 4. yaw：在最终的 pitch/roll 下取需要的 yaw -> 离上一帧最近的 2π 分支 -> 夹限位 -> 限速
-        y, _ = yaw_need(*self._prev)
+        y, _ = asked[self._prev] if self._prev in asked else yaw_need(*self._prev)
         ylo, yhi = self.geo.yaw_limit
         m = np.radians(p.limit_margin_deg)
         ref = self._prev_yaw if self._prev_yaw is not None else 0.0
         y = min((y + 2 * np.pi * k for k in (-1, 0, 1)), key=lambda v: abs(v - ref))
-        y = float(np.clip(y, ylo + m, yhi - m))
+        y = float(_clip(y, ylo + m, yhi - m))
         if self._prev_yaw is not None:
             cap = np.radians(p.max_speed_deg_s) * dt
-            y = float(np.clip(y, self._prev_yaw - cap, self._prev_yaw + cap))
+            y = float(_clip(y, self._prev_yaw - cap, self._prev_yaw + cap))
         self._prev_yaw = y
         return self._prev[0], self._prev[1], y

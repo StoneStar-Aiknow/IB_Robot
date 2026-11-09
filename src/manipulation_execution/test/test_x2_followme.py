@@ -368,6 +368,47 @@ def test_shoulder_roll_stays_on_one_branch_for_any_pose():
         assert np.abs(pose[ROLLS]).max() <= ROLL_BOUND, i
 
 
+def _motion(count, seed, scale):
+    # Smooth random motion of every joint at 15 Hz, as 6D rows; scale 2 crosses the wrist's Euler cut.
+    rng = np.random.default_rng(seed)
+    knots = rng.normal(size=(count // 15 + 2, 52, 3)) * scale
+    t = np.arange(count) / 15.0
+    rotvecs = np.stack([np.stack([np.interp(t, np.arange(len(knots)), knots[:, j, k]) for k in range(3)], -1)
+                        for j in range(52)], 1)
+    return t, encode_rotation_6d(Rotation.from_rotvec(rotvecs.reshape(-1, 3)).as_matrix()).reshape(count, -1)
+
+
+def test_the_shoulder_speedups_keep_the_output():
+    # followme_feaebe22.npz is this exact run on feaebe22, before the shoulder solver skipped
+    # yaw_need for candidates that cannot win and reused its answers; there the twist cost
+    # decided on 138 of the 540 solver steps. Bit for bit on x86; the tolerance is for libm.
+    golden = np.load(Path(__file__).resolve().parent / "data" / "x2_shoulder_ik" / "followme_feaebe22.npz")
+    for seed, scale, mirror in ((0, 0.6, True), (1, 2.0, True), (2, 1.2, False)):
+        t, raw = _motion(90, seed, scale)
+        stream = create_stream("x2_followme", base_pose=NEUTRAL, mirror=mirror, elbow_spin_to_wrist=True,
+                               elbow_spin_gain=1.0)
+        poses = []
+        for i, (ti, row) in enumerate(zip(t, raw, strict=True)):
+            if i == 60:
+                stream.reset_input()
+            poses.append(stream.retarget(ti, i, row))
+        np.testing.assert_allclose(poses, golden[f"seed{seed}"], rtol=0, atol=1e-9, err_msg=f"seed {seed}")
+
+
+def test_her_arms_reads_what_twist_indicators_does():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    retargeter = stream._stream.retargeter
+    _, raw = _motion(30, 3, 2.0)
+    animation = retargeter._animation([stream._frame(i / 15, i, row) for i, row in enumerate(raw)])
+    arms = followme._her_arms(animation, "plane")
+    for side in ("left", "right"):
+        full = followme.readouts.twist_indicators(animation, side)
+        assert arms[side].keys() == {"bone", "plane", "conditioning"}
+        for key, value in arms[side].items():
+            np.testing.assert_array_equal(value, full[key])
+    assert followme._her_arms(animation, "spin")["left"].keys() == full.keys()
+
+
 def test_shoulder_geometry_is_the_ports():
     # The port exported geometry_x2.json from the same x2_ultra.xml (md5 6992648c...).
     stream = create_stream("x2_followme", base_pose=NEUTRAL)

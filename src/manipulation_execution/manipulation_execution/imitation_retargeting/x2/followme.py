@@ -57,7 +57,7 @@ from ..rotations import decode_rotation_6d, encode_rotation_6d
 from ._vendor import followme_core as core
 from ._vendor.neutral_fk import NeutralFK
 from ._vendor.shoulder_ik import ShoulderGeometry, ShoulderParams, ShoulderSolver
-from ._vendor.smplx2robot import readouts
+from ._vendor.smplx2robot import readouts, source
 from ._vendor.smplx2robot.robot import ARM_JOINT_NAMES, wrap_deg
 
 POSE_DIM = 52 * 6
@@ -121,6 +121,31 @@ def elbow_spin_to_wrist(rotations: np.ndarray, forearm_axes: Sequence[np.ndarray
 
 def _unit(vector: np.ndarray) -> np.ndarray:
     return vector / np.linalg.norm(vector)
+
+
+def _her_arms(animation, readout: str) -> dict[str, dict[str, np.ndarray]]:
+    """``readouts.twist_indicators`` for both sides, the keys the shoulders read only.
+
+    The same calls on the same arrays, so the same numbers, without the shoulder link
+    rotations and the clip-average rest direction behind readout A ("spin"), which
+    readout B does not use, and with the torso frame built once for both sides.
+    """
+    if readout != "plane":
+        return {side: readouts.twist_indicators(animation, side) for side in ("left", "right")}
+    points = animation.points
+    transform = source.torso_coordinates(points)
+
+    def to_torso(vectors: np.ndarray) -> np.ndarray:
+        return np.einsum("nij,nj->ni", transform, vectors)
+
+    out = {}
+    for side in ("left", "right"):
+        bone = source.unit(points[:, source.ELBOW_JOINT[side]] - points[:, source.SHOULDER_JOINT[side]])
+        forearm = source.unit(points[:, source.WRIST_JOINT[side]] - points[:, source.ELBOW_JOINT[side]])
+        normal = np.cross(bone, forearm)
+        out[side] = {"bone": to_torso(bone), "plane": to_torso(source.unit(normal)),
+                     "conditioning": np.linalg.norm(normal, axis=-1)}
+    return out
 
 
 def shoulder_geometry(kinematics, ledger) -> dict[str, ShoulderGeometry]:
@@ -195,8 +220,9 @@ class ShoulderRetargeter(core.StreamRetargeter):
         dt = 0.0 if self._stamp is None else stamp - self._stamp
         self._stamp = stamp
         raw, arm_pos, clipped = trajectory.raw.copy(), trajectory.arm_pos.copy(), trajectory.clipped.copy()
+        her_arms = _her_arms(animation, readout)
         for side, solver in self.solvers.items():
-            indicators = readouts.twist_indicators(animation, side)
+            indicators = her_arms[side]
             her_twist = float(readouts.upper_arm_twist_deg(indicators, readout)[-1])
             weight = float(np.clip(indicators["conditioning"][-1] / 0.5, 0.0, 1.0))
             need = self._yaw_need(kinematics, ledger, side, trajectory.arm_pos[-1], her_twist, weight)
