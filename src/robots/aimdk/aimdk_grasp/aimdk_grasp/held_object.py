@@ -24,6 +24,10 @@ from .robot_spheres import RobotSphereModel
 SURFACE_LINK_M = 0.015
 #: A piece holding less than this share of the cloud is fringe, not object.
 FRINGE_MAX_SHARE = 0.05
+#: Pieces are found on voxel centres of this size, not on every point: linking
+#: ~13k points at 1.5 cm makes millions of pairs, and on the 310P (2026-11-09,
+#: 12812 points) that took 2.6 s, outlasting the lift by 1.4 s.
+FRINGE_VOXEL_M = 0.002
 
 
 def without_fringe(local):
@@ -31,16 +35,24 @@ def without_fringe(local):
 
     Pieces are linked at SURFACE_LINK_M, or at four times the cloud's own median
     point spacing when that is coarser, so a sparse cloud is not cut apart.
+    Linking runs on occupied FRINGE_VOXEL_M voxels, at that distance plus the
+    voxel diagonal, so any two points within it still join; each piece's share
+    counts its points, and points are kept or dropped with their voxel.
     """
     local = np.asarray(local, float)
     if len(local) < 2:
         return local
-    tree = cKDTree(local)
-    spacing = float(np.median(tree.query(local, k=2)[0][:, 1]))
-    pairs = tree.query_pairs(max(SURFACE_LINK_M, 4.0 * spacing), output_type="ndarray")
-    graph = coo_matrix((np.ones(len(pairs), dtype=bool), (pairs[:, 0], pairs[:, 1])), shape=(len(local),) * 2)
-    _, labels = connected_components(graph, directed=False)
-    keep = np.bincount(labels)[labels] >= FRINGE_MAX_SHARE * len(local)
+    spacing = float(np.median(cKDTree(local).query(local, k=2)[0][:, 1]))
+    link = max(SURFACE_LINK_M, 4.0 * spacing) + FRINGE_VOXEL_M * np.sqrt(3.0)
+    voxels, voxel_of, points_in = np.unique(
+        np.floor(local / FRINGE_VOXEL_M).astype(np.int64), axis=0, return_inverse=True, return_counts=True
+    )
+    voxel_of = voxel_of.reshape(-1)
+    pairs = cKDTree((voxels + 0.5) * FRINGE_VOXEL_M).query_pairs(link, output_type="ndarray")
+    graph = coo_matrix((np.ones(len(pairs), dtype=bool), (pairs[:, 0], pairs[:, 1])), shape=(len(voxels),) * 2)
+    _, piece = connected_components(graph, directed=False)
+    piece_points = np.bincount(piece, weights=points_in)
+    keep = (piece_points[piece] >= FRINGE_MAX_SHARE * len(local))[voxel_of]
     return local[keep] if keep.any() else local
 
 

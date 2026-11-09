@@ -78,3 +78,27 @@ def test_nothing_measurable_is_unseen(detected):
     verdict, _ = detected(mask((0, 2), (0, 2)))  # 4 points, below the minimum
     assert (verdict.success, verdict.reason_code) == (False, "PLACE_UNSEEN")
     assert verdict.report == {"candidates": []}
+
+
+def test_a_verdict_is_recorded_with_its_image_and_candidate_masks(monkeypatch, tmp_path, detected):
+    """CR6/CL2 (2026-11-08): false verdicts could not be checked offline without the image and the masks."""
+    import pickle
+
+    from aimdk_grasp import inputs_record
+
+    monkeypatch.setenv(inputs_record.INPUTS_DIR_ENV, str(tmp_path))
+    threads = []
+    original = place_verify.save_record
+    monkeypatch.setattr(place_verify, "save_record", lambda *args: threads.append(original(*args)))
+    verdict, _ = detected(OUTSIDE, INSIDE)
+    for thread in threads:
+        thread.join(timeout=10)
+    (saved,) = tmp_path.glob("verify_*.pkl")
+    record = pickle.loads(saved.read_bytes())
+    assert verdict.success  # unchanged by the record
+    assert record["kind"] == "verify" and record["target_query"] == "an apple" and record["held_radius_m"] == 0.05
+    shapes, packed = zip(*record["masks"], strict=True)
+    masks = [np.unpackbits(bits)[: SIZE * SIZE].reshape(shape).astype(bool) for shape, bits in record["masks"]]
+    assert shapes == ((SIZE, SIZE),) * 2 and (masks[0] == OUTSIDE).all() and (masks[1] == INSIDE).all()
+    assert record["verdict"] == dict(success=True, reason_code="", report=verdict.report)
+    assert record["observation"]["depth_m"].shape == (SIZE, SIZE) and record["container"]["rim_height_m"] == 0.95

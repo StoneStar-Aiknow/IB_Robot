@@ -213,6 +213,21 @@ def test_already_open_uses_new_feedback_without_publishing(restore):
     assert not ports.sent and ports.now >= 12.4
 
 
+def test_unmoved_confirmation_is_short_but_still_observes_and_only_two_windows_exist(restore):
+    from aimdk_grasp.hand_restore import UNMOVED_OBSERVE_S
+
+    restorer, ports, ctx, _ = restore
+    ports.hands = {side: plan.open_pose.copy() for side, plan in restorer.plans.items()}
+    prepare(restorer, ports, ctx)
+    for side in ("left", "right"):
+        assert restorer.open_hand(ctx, side)
+    began, checks = ports.now, []
+    restorer.confirm(ctx, ("left", "right"), lambda: checks.append(ports.now), duration=UNMOVED_OBSERVE_S)
+    assert UNMOVED_OBSERVE_S <= ports.now - began < 1.0 and len(checks) >= 2 and not ports.sent
+    with pytest.raises(ValueError, match="confirmation window"):
+        restorer.confirm(ctx, ("left", "right"), lambda: None, duration=0.05)
+
+
 def test_long_hand_preflight_refreshes_owner_and_checks_every_sample(restore):
     restorer, ports, ctx, _ = restore
     restorer.step_rad = 0.001

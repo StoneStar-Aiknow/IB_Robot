@@ -56,9 +56,10 @@ class Feedback:
     after the runtime's own process has stopped; joint-level faults are
     reported by the runtime, not re-derived here.
 
-    Each hand is None when the hand view does not carry it (a hand that is not
-    installed, ``backend_options.installed_hands``), and :meth:`hand` refuses
-    it. Whoever needs a hand asks for it by side, so a missing hand fails there
+    Each hand is None when the hand view does not carry it or the deployment
+    declares it not installed (``backend_options.installed_hands``; the vendor
+    HAL reports unmounted hands too), and :meth:`hand` refuses it. Whoever
+    needs a hand asks for it by side, so a missing hand fails there
     instead of being skipped.
     """
 
@@ -197,9 +198,11 @@ def _assemble(
         for side in required_hands:
             if hands[side] is None:
                 raise ValueError(f"Feedback lacks installed {side} hand joints")
-        unexpected = [side for side, values in hands.items() if values is not None and side not in required_hands]
-        if unexpected:
-            raise ValueError(f"Feedback carries hands declared not installed: {unexpected}")
+        # The vendor HAL reports both hands whether or not one is mounted, so a
+        # hand declared not installed is dropped rather than refused.
+        for side in hands:
+            if side not in required_hands:
+                hands[side] = None
     elif hands["left"] is None and hands["right"] is None:
         raise ValueError("Feedback carries no hand joints")
     feedback = Feedback(min(stamps) * 1e-9, positions, hands["left"], healthy, hands["right"])

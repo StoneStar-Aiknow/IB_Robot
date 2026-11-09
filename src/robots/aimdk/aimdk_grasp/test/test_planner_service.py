@@ -940,6 +940,39 @@ def test_candidates_whose_hand_ends_close_to_the_target_follow_the_others_of_the
     assert list(dict.fromkeys(planned)) == [0, 1, 3, 2, 4]
     assert error.value.planning_report["palm_left"]["later"] == [1]
 
+    # A candidate whose approach pose sits on a joint limit in the start's branch,
+    # or that the start's branch cannot reach at all (no convergence), goes beside
+    # the palm-left ones (live 2026-11-09 NX8 and NXE: shoulder raised to 2.8 rad).
+    class Branches(Planner):
+        def local_branch_margin(self, feedback, grasps, matrix, offset):
+            asked.append(("branch", [int(g[0, 3]) for g in grasps], offset))
+            margins = {0: 0.3, 1: 0.0, 2: 0.25, 3: np.nan, 4: 0.05}
+            return np.array([margins[int(g[0, 3])] for g in grasps])
+
+    planned.clear()
+    asked.clear()
+    with (
+        GraspPlanningService(
+            gripper=GRIPPER, clock=lambda: 0.0, planner_factory=Branches, planning_profile="latency"
+        ) as service,
+        pytest.raises(RuntimeError, match="No candidate") as error,
+    ):
+        service.plan(
+            {},
+            SimpleNamespace(received_at=0.0),
+            grasps,
+            [0.99, 0.98, 0.97, 0.96, 0.95],
+            matrix,
+            screen_check=True,
+            target_points_camera=np.zeros((3, 3)),
+        )
+    branch = [entry for entry in asked if entry[0] == "branch"]
+    assert branch == [("branch", [1, 3, 0, 2, 4], planner_service.LOCAL_BRANCH_OFFSET_M)]
+    report = error.value.planning_report["local_branch"]
+    assert report["later"] == [1, 3, 4] and report["margin_rad"] == {1: 0.0, 0: 0.3, 2: 0.25, 4: 0.05}
+    # 1 (on a limit) and 3 (unconverged) now follow the tight 0; 4 stays last (unreachable).
+    assert list(dict.fromkeys(planned)) == [0, 1, 3, 2, 4]
+
 
 def test_when_every_reachable_line_is_blocked_unreachable_candidates_are_checked_at_a_shorter_approach(monkeypatch):
     # Live 2026-10-14 clr_1: four blocked candidates failed 13 attempts (8.9 s on
@@ -1207,6 +1240,8 @@ def test_a_recorded_plan_call_keeps_its_inputs_built_fine_scene_and_outcome(monk
         assert service.plan({"locked": 0}, estimate, grasps, [0.8, 0.9], np.eye(4))[1]["candidate_index"] == 0
     planned, refused = (pickle.loads(path.read_bytes()) for path in sorted((tmp_path / "calls").glob("plan_*.pkl")))
     assert planned["outcome"]["success"] and planned["outcome"]["candidate_index"] == report["candidate_index"]
+    # The whole planning report is kept, so a recording shows why each candidate ranked where it did.
+    assert planned["outcome"]["report"]["candidate_index"] == report["candidate_index"]
     assert planned["options"] == {"snapshot_now": 6.5} and 29 < planned["budget_s"] <= 30
     assert planned["estimate"].validation_scene == fine and planned["estimate"].received_at == 5.0
     assert np.array_equal(planned["camera_from_grasps"], grasps) and planned["feedback"] == {"locked": 0}
@@ -1218,6 +1253,7 @@ def test_a_recorded_plan_call_keeps_its_inputs_built_fine_scene_and_outcome(monk
         max_goalset=100,
     )
     assert not refused["outcome"]["success"] and "three-segment" in refused["outcome"]["error"]
+    assert isinstance(refused["outcome"]["report"], dict)
     assert refused["budget_s"] is None and refused["outcome"]["wall_s"] >= 0
     assert fine_builds == [True]
 

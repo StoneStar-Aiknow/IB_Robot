@@ -25,8 +25,13 @@ class PlaceTargetConfig:
     #: Where the extra positions are taken: this fraction of the way from the centre to the rim.
     #: Positions that leave the held object too close to the rim are dropped either way.
     edge_fraction: float = 0.25
+    #: Plan the empty hand's way home as part of the place. Off when the task returns the arms
+    #: itself afterwards: a home the optimizer cannot solve then no longer discards a good place.
+    plan_return_home: bool = True
 
     def __post_init__(self):
+        if type(self.plan_return_home) is not bool:
+            raise ValueError("backend_options.place.plan_return_home must be a boolean")
         if not _metres(self.bottom_clearance_m) or not 0.0 <= self.bottom_clearance_m <= MAX_CLEARANCE_M:
             raise ValueError(f"backend_options.place.bottom_clearance_m must be metres in [0, {MAX_CLEARANCE_M}]")
         if not _metres(self.transfer_clearance_m) or not 0.0 < self.transfer_clearance_m <= MAX_CLEARANCE_M:

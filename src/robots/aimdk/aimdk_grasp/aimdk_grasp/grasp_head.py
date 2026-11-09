@@ -54,6 +54,7 @@ from .head_interface import (
     head_endpoints,
     parse_session,
 )
+from .inputs_record import inputs_directory, observation_fields, save_record
 from .joints import HEAD, arm_joints
 from .proposer import prepare_capture_scene
 from .rgbd_to_cloud import mask_depth_to_points
@@ -541,17 +542,47 @@ class X2GraspHeadNode(Node):
             if stored is not None and time.monotonic() - stored[0] <= SUPPORT_HINT_MAX_AGE_S:
                 hint = stored[1].get(held.arm_side, stored[1].get("*"))
                 timings["support_hint_age"] = round(time.monotonic() - stored[0], 1)
+            mask = wire.decode_mask(request.container_mask)
+            # The container estimate's raw inputs and its result (or refusal), for offline replay (inputs_record).
+            directory, record = inputs_directory(), None
+            if directory is not None:
+                try:
+                    record = dict(
+                        kind="container",
+                        arm_side=held.arm_side,
+                        observation=observation_fields(capture.observation),
+                        mask=np.asarray(mask, bool),
+                        held=held,
+                        support_hint=hint,
+                        perception=self._place_planner.robots[held.arm_side].perception,
+                    )
+                except Exception as exc:  # noqa: BLE001 - a diagnostic must never change the place
+                    print(f"container record not built: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
             with head.gpu:
                 lap("gpu_wait")
-                container = estimate_container(
-                    capture.observation,
-                    wire.decode_mask(request.container_mask),
-                    held,
-                    head.spheres,
-                    self._place_planner.robots[held.arm_side].perception,
-                    prepared=prepared,
-                    support_hint=hint,
+                try:
+                    container = estimate_container(
+                        capture.observation,
+                        mask,
+                        held,
+                        head.spheres,
+                        self._place_planner.robots[held.arm_side].perception,
+                        prepared=prepared,
+                        support_hint=hint,
+                    )
+                except Exception as exc:
+                    if record is not None:
+                        record["error"] = dict(code=getattr(exc, "code", type(exc).__name__), message=str(exc)[:2000])
+                        save_record(directory, "container", record)
+                    raise
+            if record is not None:
+                record["container"] = dict(
+                    opening=container.opening,
+                    normal=container.normal,
+                    rim_height_m=container.rim_height_m,
+                    report=dict(container.report),
                 )
+                save_record(directory, "container", record)
             lap("container")
             plan = self._place_planner.plan(
                 capture.observation,

@@ -30,14 +30,14 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from std_msgs.msg import Bool, Float64MultiArray, String
 
 from aimdk_robot import dataplane, projection
 from aimdk_robot import vendor_gateway as vg
 from aimdk_robot.projection import CommandRejected
 from aimdk_robot.wake_ack import WakeAckPairer
-from ibrobot_msgs.msg import PowerState, RuntimeStatus, SpeechWakeEvent
+from ibrobot_msgs.msg import JointCommandState, PowerState, RuntimeStatus, SpeechWakeEvent
 from ibrobot_msgs.srv import (
     GetRuntimeStatus,
     PlayExpression,
@@ -121,6 +121,11 @@ _SPEECH_FRAME_ID = "enhanced_audio"
 _SPEECH_MAX_CHUNK_MS = 2000
 #: SpeechAudioChunk carries mono 16 kHz signed 16-bit PCM (see the message definition).
 _SPEECH_MAX_CHUNK_BYTES = _SPEECH_MAX_CHUNK_MS * 16000 * 2 // 1000
+
+#: An arm command echo older than this no longer tells what the platform is driving (s).
+ARM_ECHO_MAX_AGE_S = 0.25
+#: A commanded arm this far from the measured one is not the load sag a takeover must keep (rad).
+ARM_TAKEOVER_MAX_OFFSET_RAD = 0.3
 
 #: How long to wait before asking for audio focus again after a refusal. A
 #: refusal means another source holds the speaker, so retrying every tick would
@@ -247,6 +252,8 @@ class AimdkRuntimeNode(Node):
         # are relative to that moment.
         self._dataplane_at = float("-inf")
         self._dataplane_seen = threading.Condition(self._lock)
+        #: The platform's latest arm target in vendor order and when it arrived (monotonic s).
+        self._arm_command_echo: tuple[list[float], float] | None = None
         #: Token of the named motion replaying a trajectory on the arm channel;
         #: while set, the public arm stream is refused instead of interleaved.
         self._arm_owner: int | None = None
@@ -380,6 +387,15 @@ class AimdkRuntimeNode(Node):
         self.create_subscription(
             String, dataplane.STATUS_TOPIC, self._on_dataplane_status, 20, callback_group=self._dataplane_cb
         )
+        echo = dataplane.arm_command_state(self._profile)
+        if echo is not None:
+            self.create_subscription(
+                JointCommandState,
+                echo[0],
+                self._on_arm_command_state,
+                qos_profile_sensor_data,
+                callback_group=self._dataplane_cb,
+            )
 
         def caller(service_type: Any, key: str, default: str) -> vg.ServiceCaller:
             endpoint = str(services.get(key, default))
@@ -1963,6 +1979,33 @@ class AimdkRuntimeNode(Node):
         """
         sample = self.measured_arm_sample()
         return sample[0] if sample is not None else None
+
+    def _on_arm_command_state(self, message: JointCommandState) -> None:
+        by_name = dict(zip(message.name, message.position, strict=False))
+        if not all(joint in by_name for joint in projection.VENDOR_ARM_ORDER):
+            return
+        commanded = [float(by_name[joint]) for joint in projection.VENDOR_ARM_ORDER]
+        if all(math.isfinite(value) for value in commanded):
+            with self._lock:
+                self._arm_command_echo = (commanded, time.monotonic())
+
+    def arm_takeover_start(self, measured: list[float]) -> list[float]:
+        """Where a planned arm motion must start: the platform's current target, else ``measured``.
+
+        Under load the arm settles below its target (0.11-0.16 rad at the
+        shoulder over the bowl, live 2026-11-09). Starting from the measured
+        pose steps the command down and back up, and the arm rings at 3-5 Hz.
+        A stale target, or one far from the arm, says nothing about this
+        motion: the measured pose it is, as before.
+        """
+        with self._lock:
+            echo = self._arm_command_echo
+        if echo is None or time.monotonic() - echo[1] > ARM_ECHO_MAX_AGE_S:
+            return list(measured)
+        commanded = echo[0]
+        if max(abs(a - b) for a, b in zip(commanded, measured, strict=True)) > ARM_TAKEOVER_MAX_OFFSET_RAD:
+            return list(measured)
+        return list(commanded)
 
     def measured_arm_sample(self) -> tuple[list[float], float] | None:
         """Fresh arm values and their conservative monotonic acquisition time."""

@@ -123,6 +123,23 @@ PALM_LEFT_Y = 0.707
 # -0.10 m; replay 2.6 -> 0.6 s on the 3090, 12.6 s on the Orin). Used by 4 of 141
 # replayed inputs. None disables it.
 APPROACH_REACH_FALLBACK_M = -0.10
+# Candidates whose approach pose, solved locally from the measured start
+# (planner.local_branch_margin), keeps some joint closer than this to its limit
+# go after the tight ones of their tier, beside the palm-left ones (kept, never
+# removed). There TrajOpt may leave the start's branch: live 2026-11-09 NX8
+# picked a palm facing straight back whose local solution held the wrist roll
+# on its limit (margin 0.000), and the arm reached it with the shoulder roll at
+# 2.8 rad and pitch at 1.55. The other seven picks that day planned candidates
+# with local margins 0.116-0.440; NX8 had 12 converged candidates above 0.10.
+# A checked candidate whose local solve does not converge goes there too: the
+# start's branch cannot reach it, so TrajOpt can only by leaving it (live
+# 2026-11-09 NXE: unconverged candidate 116 planned second and raised the
+# shoulder roll to 2.87 rad, while converged 151 at 0.47 rad margin waited
+# behind it; every other pick that day planned a converged candidate).
+# Checked on the first LOCAL_BRANCH_CANDIDATES in order. None disables it.
+LOCAL_BRANCH_MARGIN_RAD = 0.10
+LOCAL_BRANCH_OFFSET_M = -0.10
+LOCAL_BRANCH_CANDIDATES = 30
 
 
 class GraspPlanningService:
@@ -315,10 +332,12 @@ class GraspPlanningService:
         began = time.perf_counter()
         try:
             result = self._plan(feedback, estimate, camera_from_grasps, confidence, base_from_camera, **options)
-            recorded["outcome"] = dict(success=True, candidate_index=result[1].get("candidate_index"))
+            recorded["outcome"] = dict(success=True, candidate_index=result[1].get("candidate_index"), report=result[1])
             return result
         except BaseException as exc:
-            recorded["outcome"] = dict(success=False, error=f"{type(exc).__name__}: {exc}")
+            recorded["outcome"] = dict(
+                success=False, error=f"{type(exc).__name__}: {exc}", report=getattr(exc, "planning_report", None)
+            )
             raise
         finally:
             recorded["outcome"]["wall_s"] = time.perf_counter() - began
@@ -541,6 +560,34 @@ class GraspPlanningService:
                     level = np.zeros(len(grasps), dtype=int) if later is None else np.asarray(later, dtype=int)
                     later = np.where(left, np.maximum(level, 2), level)
                     report[f"palm_{self.side}"] = {"min_y": PALM_LEFT_Y, "later": np.flatnonzero(left).tolist()}
+                if (
+                    LOCAL_BRANCH_MARGIN_RAD is not None
+                    and feasible is not None
+                    and hasattr(self._planner, "local_branch_margin")
+                ):
+                    began = time.perf_counter()
+                    level = np.zeros(len(grasps), dtype=int) if later is None else np.asarray(later, dtype=int)
+                    indices = np.array(
+                        sorted(np.flatnonzero(feasible), key=lambda i: (priority[i], level[i], -scores[i]))[
+                            :LOCAL_BRANCH_CANDIDATES
+                        ],
+                        dtype=int,
+                    )
+                    margin = np.full(len(grasps), np.nan)
+                    if len(indices):
+                        margin[indices] = self._planner.local_branch_margin(
+                            feedback, grasps[indices], base_from_camera, LOCAL_BRANCH_OFFSET_M
+                        )
+                    edge = np.zeros(len(grasps), dtype=bool)
+                    edge[indices] = ~(margin[indices] >= LOCAL_BRANCH_MARGIN_RAD)  # NaN: did not converge
+                    later = np.where(edge, np.maximum(level, 2), level)
+                    report["local_branch"] = {
+                        "min_margin_rad": LOCAL_BRANCH_MARGIN_RAD,
+                        "checked": indices.tolist(),
+                        "later": np.flatnonzero(edge).tolist(),
+                        "margin_rad": {int(i): round(float(margin[i]), 4) for i in indices if np.isfinite(margin[i])},
+                        "wall_s": time.perf_counter() - began,
+                    }
                 if LOW_CONFIDENCE is not None and feasible is not None:
                     low = np.asarray(feasible, dtype=bool) & (scores < LOW_CONFIDENCE)
                     later = np.where(low, 3, np.zeros(len(grasps), dtype=int) if later is None else later)

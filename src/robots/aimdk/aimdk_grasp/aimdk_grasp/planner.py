@@ -34,6 +34,8 @@ from .trajectory import TimedTrajectory
 #: (live 2026-11-06: hand=0.0319 rad rebuilt the planner inside a request, 39 s).
 #: 5 mm is a quarter of the optimizer's 0.02 m collision activation distance.
 LOCKED_SPHERE_SHIFT_M = 0.005
+#: How much of one refused place candidate's reason its report keeps.
+PLACE_FAILURE_CHARS = 700
 #: How far (rad) past a model joint bound a measured planning-arm start may be
 #: and still plan, from just inside the bound (START_BOUND_INSET_RAD); see
 #: LeftArmPlanner._measured_start. Far below the 0.025 rad start tolerance the
@@ -1553,6 +1555,32 @@ class LeftArmPlanner:
         positions = np.concatenate([batch[1] for batch in batches])
         return self._fine_valid_states(success, positions)[0].any(axis=1)
 
+    def local_branch_margin(self, feedback, camera_from_grasps, base_from_camera, offset_m, iterations=40):
+        """Per candidate: the joint-limit margin (rad) of its approach pose in the measured start's branch.
+
+        Damped least squares (_dls_update) from the measured start toward each
+        pose moved offset_m along the palm axis stays in the start's IK branch.
+        Returns the smallest joint margin of a converged solution, NaN where it
+        does not converge. Ranking only: live 2026-11-09 NX8 the only
+        reachable way to a palm facing straight back in this branch held the
+        wrist roll on its limit, so TrajOpt raised the shoulder to 2.8 rad.
+        """
+        grasps = np.asarray(camera_from_grasps, dtype=float)
+        if not len(grasps):
+            return np.zeros(0)
+        goals = palm_goals_from_camera_grasps(grasps, base_from_camera, self.grasp_to_palm)
+        goals[:, :3, 3] += float(offset_m) * goals[:, :3, 2]
+        q = np.repeat(np.asarray(feedback.vector(self.arm), dtype=float)[None], len(goals), axis=0)
+        for _ in range(int(iterations)):
+            q = self._dls_update(q, goals)
+        error = _palm_twist(goals, self._palm_poses(q))
+        converged = (np.linalg.norm(error[:, :3], axis=1) < 5e-3) & (
+            np.linalg.norm(error[:, 3:], axis=1) < np.radians(3.0)
+        )
+        limits = self.motion.kinematics.config.kinematics_config.joint_limits.position.detach().cpu().numpy()
+        margin = np.minimum(q - limits[0], limits[1] - q).min(axis=1)
+        return np.where(converged, margin, np.nan)
+
     def contact_target_clearance(self, candidates, target_points_base, camera_from_grasps=None, base_from_camera=None):
         """Per screened candidate: the open hand's clearance (m) to the target points at its contact state.
 
@@ -2173,14 +2201,17 @@ class LeftArmPlanner:
             raise RuntimeError("no checked path to home")
         return self._joined(reach, finish)
 
-    def _place_screen(self, start, transforms, check_deadline):
+    def _place_screen(self, start, transforms, check_deadline, profile=None):
         """Batched per-candidate screen IK over Kx4x4 palm goals, fine-checked with the carried object.
 
         Returns (feasible K mask, KxS coarse success, KxSx7 states). A goal is
         feasible iff one of its states passes valid_positions (complete model,
         attachment); states are checked incrementally as in _fine_valid_states.
         Coarse states only seed later solves; nothing here authorizes a path.
+        ``profile`` (a dict) receives the IK and fine-check seconds, the IK
+        batches and fine rounds, and the states fine-checked.
         """
+        began = time.perf_counter()
         success, positions = [], []
         for offset in range(0, len(transforms), self._screen_batch_size):
             check_deadline()
@@ -2188,14 +2219,26 @@ class LeftArmPlanner:
             success.append(batch[0])
             positions.append(batch[1])
         success, positions = np.concatenate(success), np.concatenate(positions)
+        solved = time.perf_counter()
         check_deadline()
         valid = np.zeros_like(success)
         checked = np.zeros_like(success)
         batch = success & (np.cumsum(success, axis=1) == 1)
+        rounds = 0
         while batch.any():
             valid[batch] = self.valid_positions(positions[batch])
             checked |= batch
+            rounds += 1
             batch = success & ~checked & ~valid.any(axis=1, keepdims=True)
+        if profile is not None:
+            profile.update(
+                ik_s=round(solved - began, 4),
+                fine_s=round(time.perf_counter() - solved, 4),
+                ik_batches=-(-len(transforms) // self._screen_batch_size),
+                fine_rounds=rounds,
+                fine_states=int(checked.sum()),
+                feasible=int(valid.any(axis=1).sum()),
+            )
         return valid.any(axis=1), success, positions
 
     @staticmethod
@@ -2267,12 +2310,15 @@ class LeftArmPlanner:
         the X2 (2026-11-08) 6 of 8 failed rounds failed the opening, each after
         ~1 s of transfer and descent planning.
 
+        With ``home`` None no way home is planned and the three segments up to
+        the retreat are returned: the task returns the arm itself afterwards.
+
         ``place_report["timings_s"]`` holds the screen, opening screen and
         per-round stage durations (s) and the total, also when the search is
         exhausted.
         """
         started = time.perf_counter()
-        timings = {"screen": None, "opening_screen": None, "rounds": []}
+        timings = {"screen": None, "opening_screen": None, "screen_parts": {}, "rounds": []}
         if not self.snapshot_matches(feedback, now):
             raise RuntimeError("Feedback or collision scene changed/stale; rebuild snapshot")
         if not self.carrying:
@@ -2293,14 +2339,18 @@ class LeftArmPlanner:
                 **fields,
                 "candidates": len(targets),
                 "failed_stages": dict(stages),
+                # Why each tried candidate was refused, also when a later one succeeds.
+                "failures": [str(failure)[:PLACE_FAILURE_CHARS] for failure in failures],
                 **({"opening_screen": opening_report} if opening_report is not None else {}),
                 "timings_s": timings,
             }
 
         if getattr(self, "screen_ik", None) is not None:
             began = time.perf_counter()
-            above_ok, above_success, above_q = self._place_screen(q, aboves, check_deadline)
-            release_ok, release_success, release_q = self._place_screen(q, releases, check_deadline)
+            parts = timings["screen_parts"]
+            parts["above"], parts["release"] = {}, {}
+            above_ok, above_success, above_q = self._place_screen(q, aboves, check_deadline, parts["above"])
+            release_ok, release_success, release_q = self._place_screen(q, releases, check_deadline, parts["release"])
             screen = (above_success, above_q, release_success, release_q)
             remaining = [i for i in remaining if above_ok[i] and release_ok[i]]
             # Cheapest joint-space route first (see _place_pair): the preference
@@ -2383,6 +2433,10 @@ class LeftArmPlanner:
                     if retreat is None:
                         raise RuntimeError(f"retreat: {reason}")
                     lap(stage)
+                    if home is None:
+                        check_deadline()
+                        report(candidate=index, rounds=rounds)
+                        return transfer, descend, retreat
                     stage = "home"
                     # The retreat ends where the transfer ended: the transfer,
                     # checked with the closed hand and object, leads back.

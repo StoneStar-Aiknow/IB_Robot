@@ -72,3 +72,46 @@ def test_the_same_table_is_reused_in_the_current_camera_frame(seed):
 def test_any_doubt_falls_back_to_the_search(table, bowl, reason):
     (plane, report), _ = _reuse(table, bowl)
     assert plane is None and report["accepted"] is False and report["reason"] == reason
+
+
+class _Filtered(Exception):
+    pass
+
+
+def _filtered_scene(monkeypatch, near_hand, target_pixels):
+    """What complete_scene passes on after its filters: (near points, target points)."""
+    from aimdk_grasp import scene_estimation
+
+    points = np.arange(18, dtype=np.float32).reshape(6, 3)
+    n = len(points)
+    prepared = scene_estimation.PreparedScene(
+        points, np.arange(n), np.ones(n, bool), np.ones(n, bool), np.ones(n, bool), np.ones(n, bool),
+        np.empty((0, 3)), np.empty(0, int), (1, n), np.empty((0, 4)), np.eye(4), 1, "camera", 1.0, True,
+        CONFIG, n, 0.0, 0.0, moving_hand_near=near_hand,
+    )  # fmt: skip
+    seen = {}
+
+    def capture(near, target, up, config):
+        seen.update(near=np.asarray(near).copy(), target=np.asarray(target).copy())
+        raise _Filtered
+
+    monkeypatch.setattr(scene_estimation, "select_support_plane", capture)
+    mask = np.zeros((1, n), bool)
+    mask[0, target_pixels] = True
+    with pytest.raises(_Filtered):
+        scene_estimation.complete_scene(prepared, mask)
+    return points, seen
+
+
+def test_the_moving_hands_points_leave_the_scene_but_the_targets_stay(monkeypatch):
+    """BK3 (2026-11-09): a patch of the real hand at grasp_ready refused all 22 approach paths."""
+    near_hand = np.array([True, True, False, False, False, True])
+    points, seen = _filtered_scene(monkeypatch, near_hand, [0, 3, 4])
+    # Point 0 is near the hand but on the target: it stays. Points 1 and 5 are the hand's own.
+    np.testing.assert_array_equal(seen["target"], points[[0, 3, 4]])
+    np.testing.assert_array_equal(seen["near"], points[[2]])
+
+
+def test_without_the_hand_mask_the_scene_is_unchanged(monkeypatch):
+    points, seen = _filtered_scene(monkeypatch, None, [0, 3, 4])
+    np.testing.assert_array_equal(seen["near"], points[[1, 2, 5]])

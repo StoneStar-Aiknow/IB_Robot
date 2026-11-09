@@ -157,6 +157,9 @@ robot:
       # artifact after changing mounting or task poses; their digest is frozen.
       installed_hands: [left, right]
       arm_side: auto
+      # The workflow returns the arms (embodied.agent.planner.return_after_place).
+      place:
+        plan_return_home: false
       planning:
         approach_over_height_m: 0.18
         approach_order_m: [0.10, 0.15, 0.07, 0.05]

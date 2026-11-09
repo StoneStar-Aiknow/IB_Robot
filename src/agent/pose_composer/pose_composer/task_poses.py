@@ -157,7 +157,7 @@ class TaskPoseRunner:
             if hand_seconds >= deadline - self.clock():
                 raise ComposeError("TASK_POSE_TIMEOUT", "the hand phase alone exceeds the task-pose budget")
             with self._stage("takeover", progress):
-                self._hand_call(lambda: restorer.begin(context))
+                took_over = bool(self._hand_call(lambda: restorer.begin(context)))
             # Takeover may have taken time. Always plan from a new measured arm pose.
             start = check()
             skipped = self.verify_arrival and at_target(start)
@@ -238,8 +238,17 @@ class TaskPoseRunner:
             self.report["completed_hands"].append(side)
             if hand_skipped:
                 self.report["skipped_hands"].append(side)
+        # Nothing was commanded when the arms were already there, no takeover was
+        # needed and every hand was already open: a short window on fresh samples.
+        unmoved = skipped and not took_over and all(side in self.report["skipped_hands"] for side in sides)
         with self._stage("confirming", progress):
-            self._hand_call(lambda: restorer.confirm(context, sides, arms_still_there))
+            if unmoved:
+                from aimdk_grasp.hand_restore import UNMOVED_OBSERVE_S
+
+                self.report["stages"]["confirming"]["reason"] = "nothing commanded: short window"
+                self._hand_call(lambda: restorer.confirm(context, sides, arms_still_there, duration=UNMOVED_OBSERVE_S))
+            else:
+                self._hand_call(lambda: restorer.confirm(context, sides, arms_still_there))
         return skipped
 
     @staticmethod
