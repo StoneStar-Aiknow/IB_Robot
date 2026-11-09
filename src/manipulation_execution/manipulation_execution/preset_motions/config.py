@@ -162,6 +162,8 @@ def motion_parameters(robot_config, resolver=lambda value: value):
         raise ValueError("preset geometry lacks complete continuous-motion safety evidence")
     if record.get("stop_bridge_certified") is not True:
         raise ValueError("preset motion requires a separately certified stop bridge")
+    if record.get("motion_enabled") is not True:
+        raise ValueError("preset template motion output must be explicitly enabled")
     return {
         "motion_name": name,
         "match_state_topic": topic(section.get("state_topic", MATCH_STATE_TOPIC), "match state topic"),

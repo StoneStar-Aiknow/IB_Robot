@@ -467,7 +467,11 @@ class MirrorSessionNode(Node):
             raise ValueError("named preset requires the live arm preview and both-hand follow target")
         session_options = {"hooks": hooks, "cover": cover}
         if self._preset is not None:
-            session_options.update(preset=self._preset, preset_target=self._preset_target)
+            session_options.update(
+                preset=self._preset,
+                preset_target=self._preset_target,
+                preset_stop_target=self._preset_stop_target,
+            )
         self.session = MirrorSession(config, self._port, self._send, **session_options)
 
         self._inputs = InputCollector()
@@ -648,6 +652,22 @@ class MirrorSessionNode(Node):
         if hands is None:
             return None
         return UpperBodyCommand(tuple(self._preset_last_raw.arm), hands, self._preset_last_raw.source_stamp_s)
+
+    def _preset_stop_target(self, command) -> UpperBodyCommand | None:
+        """Complete the reset pose for validation by the same named owner.
+
+        Stopping must not depend on fresh perception. The runtime checks this
+        entire bridge from fresh measured joints before it sends any target.
+        """
+        if command is None or self._hands is None:
+            return None
+        try:
+            arm = tuple(float(value) for value in command.arm)
+            if len(arm) != ARM_JOINT_COUNT or not all(map(math.isfinite, arm)):
+                return None
+            return UpperBodyCommand(arm, self._hands.neutral_target())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
 
     def _on_preset_state(self, message) -> None:
         from manipulation_execution.preset_motions.match_signal import decode_match_state

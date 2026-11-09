@@ -149,6 +149,7 @@ class AimdkRuntimeNode(Node):
         self.declare_parameter("instance_id", "")
         self.declare_parameter("startup_timeout_s", 20.0)
         self.declare_parameter("cancel_return_motions", "")
+        self.declare_parameter("named_hold_json", "")
         # In simulated transport the launch entry supplies the description it
         # also feeds to the synthetic sensor publishers, so what the runtime
         # advertises and what it produces cannot drift apart.
@@ -158,6 +159,11 @@ class AimdkRuntimeNode(Node):
         if not profile_path:
             raise RuntimeError("aimdk_runtime requires the 'profile' parameter")
         self._profile = load_profile(profile_path)
+        named_hold_json = str(self.get_parameter("named_hold_json").value or "").strip()
+        if named_hold_json:
+            from aimdk_robot.named_hold_registration import register_named_hold
+
+            self._profile = register_named_hold(self._profile, named_hold_json)
         self._use_sim = bool(self.get_parameter("use_sim").value)
         self._sim_platform = str(self.get_parameter("sim_platform").value or "").strip()
         instance_id = str(self.get_parameter("instance_id").value or "")
@@ -798,6 +804,12 @@ class AimdkRuntimeNode(Node):
             from aimdk_robot.named_motion import NamedMotionServer  # noqa: PLC0415
 
             self._named_motion = NamedMotionServer(self)
+            if (self._vendor.get("named_motion") or {}).get("hold_registered_native_target") is not None:
+                from aimdk_robot.named_hold_registration import verify_loaded_named_hold
+
+                verify_loaded_named_hold(
+                    self._profile, self._named_motion._trajectories, getattr(self, "_named_hold_guard", None)
+                )
 
     def _on_set_navigation(self, request, response):
         """Gate externally sourced velocity, with the platform's own precondition.
@@ -2054,6 +2066,9 @@ class AimdkRuntimeNode(Node):
         if not resolved.is_absolute():
             resolved = Path(str(self.get_parameter("profile").value)).parent / resolved
         self._named_hold_guard = load_guard(resolved)
+        expected = config.get("hold_registered_geometry_sha256")
+        if expected and self._named_hold_guard.record.get("sha256") != expected:
+            self._named_hold_guard.invalid_reason = "named hold geometry changed after registration"
 
     def validate_named_hold_path(self, name, times, positions) -> tuple[bool, str]:
         """A hold cannot inherit the ordinary mirror CBF's safety claim."""

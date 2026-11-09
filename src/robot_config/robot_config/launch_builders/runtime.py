@@ -63,6 +63,34 @@ def runtime_profile(robot_config: dict[str, Any]) -> str:
     return str((robot_config.get("runtime") or {}).get("profile", "") or "").strip()
 
 
+def _named_hold_json(robot_config: dict[str, Any], provider: str) -> str:
+    """Pass only this feature's explicit opt-in; the provider owns registration."""
+    section = robot_config.get("preset_motions")
+    if section is None:
+        return ""
+    if not isinstance(section, dict):
+        raise ValueError("preset_motions must be a mapping")
+    for key in ("enabled", "motion_enabled"):
+        if key in section and type(section[key]) is not bool:
+            raise ValueError(f"preset_motions.{key} must be a boolean")
+    if not section.get("enabled", False) or not section.get("motion_enabled", False):
+        return ""
+    if provider != "aimdk_robot":
+        raise ValueError("preset_motions motion output requires runtime.provider=aimdk_robot")
+    from robot_config.utils import resolve_ros_path
+
+    payload = {"motion_name": section.get("motion_name", "overhead_heart")}
+    for key in ("template_file", "geometry_file"):
+        value = section.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"preset_motions.{key} is required for motion")
+        path = Path(str(resolve_ros_path(value)))
+        if not path.is_absolute() or not path.is_file():
+            raise ValueError(f"preset_motions.{key} must resolve to an existing absolute file")
+        payload[key] = str(path.resolve())
+    return json.dumps(payload, sort_keys=True, allow_nan=False)
+
+
 def required_capabilities(robot_config: dict[str, Any]) -> list[str]:
     return [str(name) for name in ((robot_config.get("capabilities") or {}).get("requires") or [])]
 
@@ -257,6 +285,9 @@ def generate_runtime_provider_actions(
     }
     if provider == "aimdk_robot" and (robot_config.get("runtime") or {}).get("cancel_return_motions"):
         include_arguments["cancel_return_motions"] = str(robot_config["runtime"]["cancel_return_motions"])
+    named_hold_json = _named_hold_json(robot_config, provider)
+    if named_hold_json:
+        include_arguments["named_hold_json"] = named_hold_json
     include_arguments["use_sim"] = "true" if use_sim else "false"
     cbf_safety_json = _cbf_safety_json(robot_config)
     if cbf_safety_json:

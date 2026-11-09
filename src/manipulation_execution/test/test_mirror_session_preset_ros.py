@@ -13,7 +13,7 @@ import pytest
 from manipulation_execution.mirror_session import preset_ros
 from manipulation_execution.mirror_session.endpoints import SessionBindingError
 from manipulation_execution.mirror_session.hooks import UpperBodyCommand
-from manipulation_execution.mirror_session.preset import PresetEpoch
+from manipulation_execution.mirror_session.preset import PresetConfig, PresetCoordinator, PresetEpoch, PresetPhase
 
 
 class Clock:
@@ -168,9 +168,14 @@ def digest(target):
     return hashlib.sha256(json.dumps(values, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
-def finish(handle, *, status=4, success=True, code=0, motion="overhead_heart", target=None, message=None):
+def finish(
+    handle, *, status=4, success=True, code=0, motion="overhead_heart", target=None, stop_target=None, message=None
+):
     if message is None:
-        message = json.dumps({"motion": motion, "exit_target_sha256": digest(target) if target is not None else ""})
+        field_name, submitted = (
+            ("stop_target_sha256", stop_target) if stop_target is not None else ("exit_target_sha256", target)
+        )
+        message = json.dumps({"motion": motion, field_name: digest(submitted) if submitted is not None else ""})
     handle.result.set_result(
         SimpleNamespace(status=status, result=SimpleNamespace(success=success, error_code=code, message=message))
     )
@@ -257,6 +262,195 @@ def test_cancel_before_ack_prevents_dispatch_and_refresh(rig):
     assert not rig.node.client.calls
     assert len(rig.node.publisher.messages) == 1
     assert state.terminal and state.release_confirmed and not state.accepted and not state.pending
+
+
+def test_stop_before_ack_closes_dispatch_barrier_without_claiming_a_verified_target(rig):
+    lease = begin(rig)
+    rig.port.stop_to(command())
+    ack(rig, lease)
+    rig.port.refresh(command(0.4))
+    rig.port.stop_to(command(0.5))
+    state = rig.port.snapshot()
+    assert not rig.node.client.calls and len(rig.node.publisher.messages) == 1
+    assert state.stage == "stopped_before_dispatch"
+    assert state.terminal and state.release_confirmed and not state.accepted and not state.pending
+    assert not state.success and not state.stop_target_verified and state.stop_target is None
+    assert state.stop_target_at is None and state.final_target is None and not state.final_target_verified
+    rig.port.begin("overhead_heart", PresetEpoch(8, 2))
+    assert rig.port.snapshot().epoch == PresetEpoch(8, 2)
+
+
+def test_stop_before_ack_near_stale_boundary_timestamps_new_barrier_for_coordinator(rig):
+    coordinator = PresetCoordinator(PresetConfig(enabled=True), rig.port, rig.clock)
+    assert coordinator.request(7)
+    coordinator.step(7, True)
+    rig.clock.now += 0.6
+    coordinator.step(7, True)
+    began_at = rig.clock.now
+    rig.clock.now += 0.9
+    coordinator.step(7, True)  # renew the lease while the peer still withholds ACK
+    assert rig.port.snapshot().observed_at == began_at
+    rig.clock.now += 0.09
+    coordinator.stop("operator_touch", stop_target=command())
+    state = rig.port.snapshot()
+    assert state.stage == "stopped_before_dispatch" and state.observed_at == rig.clock.now
+    rig.clock.now += 0.02  # the old begin evidence would now be too old
+    result = coordinator.step(7, False)
+    assert result.phase == PresetPhase.IDLE and result.release_confirmed and not result.block_public
+    assert not result.fault and result.resume_seed is None and result.stop_seed is None
+    assert not rig.node.client.calls
+
+
+def test_pending_stop_keeps_first_target_and_lease_then_accepts_late_handle_without_cancel(rig):
+    lease = begin(rig)
+    ack(rig)
+    target = command(0.2)
+    rig.port.stop_to(target)
+    rig.port.stop_to(command(0.5))
+    rig.port.refresh(command(0.7))
+    rig.port.refresh(UpperBodyCommand((float("nan"),), ()))
+    rig.port.refresh()
+    expected = {**lease, "stop_target": list(target.arm + target.hand)}
+    assert rig.node.publisher.messages[1:] == [expected] * 5
+    assert not rig.port._flight.submitted
+    assert rig.port.snapshot().pending and not rig.port.snapshot().release_confirmed
+    ack(rig)
+    assert len(rig.node.client.calls) == 1 and not rig.port.snapshot().terminal
+    handle = accept(rig)
+    assert handle.cancel_calls == 0 and rig.port.snapshot().accepted
+    rig.clock.now = 21.0
+    finish(handle, stop_target=target)
+    state = rig.port.snapshot()
+    assert state.goal_id == lease["goal_id"] and state.epoch == rig.epoch
+    assert state.success and state.terminal and state.release_confirmed and not state.pending
+    assert state.stop_target_verified and state.stop_target == target
+    assert state.stop_target_at == state.observed_at == 21.0
+    assert state.final_target is None and state.final_target_at is None and not state.final_target_verified
+    assert not state.fault
+
+
+def test_stop_supersedes_an_older_exit_without_reusing_its_resume_evidence(rig):
+    begin(rig)
+    handle = accept(rig)
+    old_exit, stop = command(0.7), command(0.2)
+    rig.port.refresh(old_exit)
+    rig.port.stop_to(stop)
+    rig.port.refresh(old_exit)
+    assert "exit_target" not in rig.node.publisher.messages[-1]
+    finish(handle, target=old_exit)
+    state = rig.port.snapshot()
+    assert state.terminal and not state.release_confirmed and not state.success
+    assert state.final_target is None and not state.final_target_verified
+    assert state.stop_target is None and not state.stop_target_verified
+
+
+@pytest.mark.parametrize("stage", ["stopping", "stop_blocked"])
+def test_stop_feedback_updates_evidence_clock_without_proving_release(rig, stage):
+    begin(rig)
+    accept(rig)
+    rig.port.stop_to(command())
+    call = rig.node.client.calls[-1]
+    rig.clock.now = 12.5
+    call.feedback(Message(goal_id=call.uuid, feedback=Message(state=stage)))
+    state = rig.port.snapshot()
+    assert state.stage == stage and state.observed_at == 12.5 and not state.fault
+    assert not state.terminal and not state.release_confirmed and not state.stop_target_verified
+    assert state.final_target is None and state.stop_target is None
+
+
+def test_real_cancel_overrides_pending_stop_and_cancel_ack_is_not_stop_proof(rig):
+    begin(rig)
+    ack(rig)
+    target = command()
+    rig.port.stop_to(target)
+    rig.port.cancel("unsafe")
+    count = len(rig.node.publisher.messages)
+    rig.port.refresh(command(0.6))
+    rig.port.stop_to(command(0.7))
+    assert len(rig.node.publisher.messages) == count
+    handle = accept(rig)
+    assert handle.cancel_calls == 1 and rig.port.snapshot().stage == "cancelling"
+    handle.cancellation.set_result(SimpleNamespace(goals_canceling=[handle.goal_id]))
+    assert not rig.port.snapshot().release_confirmed and not rig.port.snapshot().stop_target_verified
+    finish(handle, status=5, success=False, code=9)
+    state = rig.port.snapshot()
+    assert state.terminal and state.release_confirmed and not state.success
+    assert state.stop_target is None and state.stop_target_at is None and not state.stop_target_verified
+    assert state.final_target is None and not state.final_target_verified
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"status": 0},
+        {"status": 6},
+        {"success": False},
+        {"code": 255},
+        {"motion": "wrong"},
+        {"stop_target": command(0.9)},
+        {"message": "not-json"},
+        {"message": "null"},
+        {"message": "{}"},
+        {"message": json.dumps({"motion": "overhead_heart", "stop_target_sha256": []})},
+        {"message": json.dumps({"motion": "overhead_heart", "stop_target_sha256": digest(command()), "unknown": 1})},
+        {
+            "message": json.dumps(
+                {
+                    "motion": "overhead_heart",
+                    "stop_target_sha256": digest(command()),
+                    "exit_target_sha256": digest(command()),
+                }
+            )
+        },
+    ],
+)
+def test_failed_unknown_or_ambiguous_stop_result_is_never_release_proof(rig, result):
+    begin(rig)
+    handle = accept(rig)
+    target = command()
+    rig.port.stop_to(target)
+    finish(handle, **{"stop_target": target, **deepcopy(result)})
+    state = rig.port.snapshot()
+    assert state.fault and not state.success and not state.release_confirmed
+    assert state.stop_target is None and state.stop_target_at is None and not state.stop_target_verified
+    assert state.final_target is None and state.final_target_at is None and not state.final_target_verified
+    with pytest.raises(RuntimeError):
+        rig.port.begin("overhead_heart", PresetEpoch(8, 2))
+
+
+@pytest.mark.parametrize("dual_hash", [False, True])
+def test_unrequested_stop_hash_or_dual_hash_does_not_prove_a_normal_exit(rig, dual_hash):
+    begin(rig)
+    handle = accept(rig)
+    target = command()
+    rig.port.refresh(target)
+    payload = {"motion": "overhead_heart", "stop_target_sha256": digest(target)}
+    if dual_hash:
+        payload["exit_target_sha256"] = digest(target)
+    finish(handle, message=json.dumps(payload))
+    state = rig.port.snapshot()
+    assert not state.release_confirmed and not state.stop_target_verified and not state.final_target_verified
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        None,
+        [],
+        UpperBodyCommand((0.0,) * 13, (0.0,) * 20),
+        UpperBodyCommand((True,) * 14, (0.0,) * 20),
+        UpperBodyCommand((float("nan"),) * 14, (0.0,) * 20),
+    ],
+)
+def test_invalid_stop_target_does_not_publish_or_alter_the_pending_flight(rig, target):
+    begin(rig)
+    ack(rig)
+    before = rig.port.snapshot()
+    with pytest.raises(ValueError):
+        rig.port.stop_to(target)
+    assert rig.port.snapshot() == before
+    assert len(rig.node.publisher.messages) == 1
+    assert rig.port._flight.stop_target is None
 
 
 def test_pending_acceptance_is_cancelled_when_handle_arrives_and_cancel_ack_is_not_release(rig):

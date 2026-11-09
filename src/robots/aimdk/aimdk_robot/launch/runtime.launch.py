@@ -45,6 +45,11 @@ NODE_STAGGER_S = 0.6
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("aimdk_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
+    named_hold_json = LaunchConfiguration("named_hold_json", default="").perform(context).strip()
+    if named_hold_json:
+        from aimdk_robot.named_hold_registration import register_named_hold
+
+        profile = register_named_hold(profile, named_hold_json)
     use_sim, sim_platform = resolve_sim_selection(
         profile,
         LaunchConfiguration("use_sim").perform(context),
@@ -81,6 +86,7 @@ def _launch_setup(context, *_args, **_kwargs):
                     "cancel_return_motions": LaunchConfiguration("cancel_return_motions", default="").perform(context),
                     "instance_id": instance_id,
                     "interface_description_json": description_json,
+                    **({"named_hold_json": named_hold_json} if named_hold_json else {}),
                 }
             ],
         )
@@ -207,6 +213,11 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument("initial_mode", default_value="", description="Initial runtime mode override"),
+            DeclareLaunchArgument(
+                "named_hold_json",
+                default_value="",
+                description="Optional feature-owned fixed hold template and certified geometry paths",
+            ),
             DeclareLaunchArgument(
                 "cbf_safety_json", default_value="", description="Optional CBF configuration for aimdk_dataplane only"
             ),

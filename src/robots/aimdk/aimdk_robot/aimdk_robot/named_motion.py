@@ -103,6 +103,14 @@ class _Cancelled(Exception):
         self.progress = progress
 
 
+class _StopRequested(Exception):
+    """Interrupt a leased pose with its first UUID-bound graceful stop target."""
+
+    def __init__(self, target: tuple[float, ...]) -> None:
+        super().__init__("named hold graceful stop requested")
+        self.target = target
+
+
 @dataclass(frozen=True)
 class _Checkpoint:
     """Where a cancelled replay stopped, and what must not have changed to resume it."""
@@ -247,6 +255,7 @@ class NamedMotionServer:
         self._executing_hold = False
         self._hold_leases: dict[tuple[str, str], float] = {}
         self._hold_exit_targets: dict[tuple[str, str], tuple[float, ...]] = {}
+        self._hold_stop_targets: dict[tuple[str, str], tuple[float, ...]] = {}
         self._hold_lease_lock = threading.Lock()
         self._hold_active: tuple[str, str] | None = None
         self._hold_subscription = None
@@ -338,7 +347,10 @@ class NamedMotionServer:
                 "goal_id",
                 "motion",
                 "exit_target",
+                "stop_target",
             }:
+                return
+            if "exit_target" in value and "stop_target" in value:
                 return
             motion = value["motion"]
             if not isinstance(motion, str) or motion not in self._hold_names:
@@ -347,12 +359,14 @@ class NamedMotionServer:
             if int(goal_id, 16) == 0:
                 return
             exit_target = value.get("exit_target")
-            if exit_target is not None and (
-                not isinstance(exit_target, list)
-                or len(exit_target) != 34
-                or any(type(item) not in (int, float) or not math.isfinite(item) for item in exit_target)
-            ):
-                return
+            stop_target = value.get("stop_target")
+            for field in ("exit_target", "stop_target"):
+                if field in value and (
+                    not isinstance(value[field], list)
+                    or len(value[field]) != 34
+                    or any(type(item) not in (int, float) or not math.isfinite(item) for item in value[field])
+                ):
+                    return
         except (TypeError, ValueError, AttributeError, OverflowError):
             return
         now = time.monotonic()
@@ -372,11 +386,17 @@ class NamedMotionServer:
                 if oldest is None:
                     return
                 del self._hold_leases[oldest]
-            self._hold_leases[key] = now
             self._hold_exit_targets = {
                 item: target for item, target in self._hold_exit_targets.items() if item in self._hold_leases
             }
-            if exit_target is not None:
+            self._hold_stop_targets = {
+                item: target for item, target in self._hold_stop_targets.items() if item in self._hold_leases
+            }
+            self._hold_leases[key] = now
+            if stop_target is not None:
+                self._hold_stop_targets.setdefault(key, tuple(float(item) for item in stop_target))
+                self._hold_exit_targets.pop(key, None)
+            elif exit_target is not None and key not in self._hold_stop_targets:
                 self._hold_exit_targets[key] = tuple(float(item) for item in exit_target)
         acknowledgement = getattr(self, "_hold_lease_ack", None)
         if acknowledgement is not None:
@@ -431,7 +451,7 @@ class NamedMotionServer:
         feedback.progress = progress
         goal_handle.publish_feedback(feedback)
 
-    def _hold_check(self, key, mode, generation, epoch, started):
+    def _hold_check(self, key, mode, generation, epoch, started, *, allow_stop=True):
         self._still_current(generation, epoch)
         if self._node.current_mode() != mode or not self._node.output_admitted():
             raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "named hold lost runtime admission")
@@ -446,6 +466,11 @@ class NamedMotionServer:
             raise _Superseded(
                 ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, f"measured named hold geometry rejected: {reason}"
             )
+        if allow_stop:
+            with self._hold_lease_lock:
+                stop_target = self._hold_stop_targets.get(key)
+            if stop_target is not None:
+                raise _StopRequested(stop_target)
         return actual
 
     def _hold_command(self, values, generation, epoch):
@@ -482,7 +507,7 @@ class NamedMotionServer:
         while True:
             if goal_handle.is_cancel_requested:
                 self._hold_cancel(name, current, goal_handle, generation, epoch)
-            self._hold_check(key, mode, generation, epoch, started)
+            self._hold_check(key, mode, generation, epoch, started, allow_stop=state != "stopping")
             elapsed = time.monotonic() - begin
             current = traj.blend(start, target, elapsed / duration)
             self._hold_command(current, generation, epoch)
@@ -500,7 +525,7 @@ class NamedMotionServer:
         while time.monotonic() < deadline:
             if goal_handle.is_cancel_requested:
                 self._hold_cancel(name, point, goal_handle, generation, epoch)
-            self._hold_check(key, mode, generation, epoch, started)
+            self._hold_check(key, mode, generation, epoch, started, allow_stop=state != "stopping")
             self._hold_command(point, generation, epoch)
             now = time.monotonic()
             if now - last_feedback >= 0.1:
@@ -515,6 +540,13 @@ class NamedMotionServer:
                 return True
             time.sleep(1.0 / self._rate_hz)
         return False
+
+    @staticmethod
+    def _hold_target_message(name, final, field):
+        identity = hashlib.sha256(
+            json.dumps([float(value) for value in final], separators=(",", ":"), allow_nan=False).encode()
+        ).hexdigest()
+        return json.dumps({"motion": name, field: identity}, separators=(",", ":"))
 
     def _run_hold_pose(self, name, mode, target, resume_token, goal_handle, generation, epoch):
         """Run only an explicitly leased, geometrically certified fixed pose."""
@@ -533,9 +565,14 @@ class NamedMotionServer:
         start = self._hold_sample()
         recording = self._trajectories[name]
         pose = list(recording.positions[0]) + list(recording.hands[0])
-        duration = self._hold_duration(start, pose)
-        ok, reason = self._hold_validate(name, [0.0, duration], [start, pose])
+        with self._hold_lease_lock:
+            stop_target = self._hold_stop_targets.get(key)
+        first_target = list(stop_target) if stop_target is not None else pose
+        duration = self._hold_duration(start, first_target)
+        ok, reason = self._hold_validate(name, [0.0, duration], [start, first_target])
         if not ok:
+            if stop_target is not None:
+                self._node.fail_named_hold(f"named hold stop target rejected: {reason}")
             return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, reason
         self._take_over(name, generation)
         if not self._node.claim_arm(generation):
@@ -548,58 +585,88 @@ class NamedMotionServer:
         normal_exit = canceled = False
         failure_reason = "named hold execution failed or arrival was unconfirmed"
         try:
-            # Claim confirmation can take several feedback cycles. Rebuild
-            # the entry from the actual state after ownership was obtained.
-            start = self._hold_sample()
-            current = start
-            ok, reason, current = self._hold_move(
-                name, mode, start, pose, goal_handle, key, generation, epoch, started, "entering"
-            )
-            if not ok:
-                return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, reason
-            if not self._hold_wait_arrival(name, mode, current, goal_handle, key, generation, epoch, started):
-                return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, "named hold arrival unconfirmed"
-            last_feedback = -math.inf
-            while True:
+            try:
+                # Claim confirmation can take several feedback cycles. Rebuild
+                # the entry from actual state, and honour a stop already leased
+                # before acceptance without first sending the template pose.
                 if goal_handle.is_cancel_requested:
                     self._hold_cancel(name, current, goal_handle, generation, epoch)
-                actual = self._hold_check(key, mode, generation, epoch, started)
-                self._hold_command(current, generation, epoch)
-                now = time.monotonic()
-                if now - last_feedback >= 0.1:
-                    self._hold_feedback(goal_handle, "holding", 1.0)
-                    last_feedback = now
-                with self._hold_lease_lock:
-                    exit_target = self._hold_exit_targets.get(key)
-                if exit_target is not None:
-                    ok, reason, final = self._hold_move(
-                        name, mode, actual, list(exit_target), goal_handle, key, generation, epoch, started, "exiting"
-                    )
-                    if ok:
-                        if not self._hold_wait_arrival(
-                            name, mode, final, goal_handle, key, generation, epoch, started, state="exiting"
-                        ):
-                            return (
-                                False,
-                                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
-                                "named hold exit arrival unconfirmed",
-                            )
-                        normal_exit = True
-                        identity = hashlib.sha256(
-                            json.dumps(
-                                [float(value) for value in final], separators=(",", ":"), allow_nan=False
-                            ).encode()
-                        ).hexdigest()
-                        return (
-                            True,
-                            ExecuteNamedMotion.Result.NONE,
-                            json.dumps({"motion": name, "exit_target_sha256": identity}, separators=(",", ":")),
-                        )
-                    self._hold_feedback(goal_handle, "exit_blocked", 1.0)
-                    # Reject this request without losing the safe holding pose.
+                start = self._hold_check(key, mode, generation, epoch, started)
+                current = start
+                ok, reason, current = self._hold_move(
+                    name, mode, start, pose, goal_handle, key, generation, epoch, started, "entering"
+                )
+                if not ok:
+                    return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, reason
+                if not self._hold_wait_arrival(name, mode, current, goal_handle, key, generation, epoch, started):
+                    return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, "named hold arrival unconfirmed"
+                last_feedback = -math.inf
+                while True:
+                    if goal_handle.is_cancel_requested:
+                        self._hold_cancel(name, current, goal_handle, generation, epoch)
+                    actual = self._hold_check(key, mode, generation, epoch, started)
+                    self._hold_command(current, generation, epoch)
+                    now = time.monotonic()
+                    if now - last_feedback >= 0.1:
+                        self._hold_feedback(goal_handle, "holding", 1.0)
+                        last_feedback = now
                     with self._hold_lease_lock:
-                        self._hold_exit_targets.pop(key, None)
-                time.sleep(1.0 / self._rate_hz)
+                        exit_target = self._hold_exit_targets.get(key)
+                    if exit_target is not None:
+                        ok, reason, final = self._hold_move(
+                            name,
+                            mode,
+                            actual,
+                            list(exit_target),
+                            goal_handle,
+                            key,
+                            generation,
+                            epoch,
+                            started,
+                            "exiting",
+                        )
+                        if ok:
+                            if not self._hold_wait_arrival(
+                                name, mode, final, goal_handle, key, generation, epoch, started, state="exiting"
+                            ):
+                                return (
+                                    False,
+                                    ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+                                    "named hold exit arrival unconfirmed",
+                                )
+                            normal_exit = True
+                            return (
+                                True,
+                                ExecuteNamedMotion.Result.NONE,
+                                self._hold_target_message(name, final, "exit_target_sha256"),
+                            )
+                        self._hold_feedback(goal_handle, "exit_blocked", 1.0)
+                        # Reject this request without losing the safe holding pose.
+                        with self._hold_lease_lock:
+                            self._hold_exit_targets.pop(key, None)
+                    time.sleep(1.0 / self._rate_hz)
+            except _StopRequested as stop:
+                # This bridge keeps the named owner's lease, all runtime guards
+                # and measured arrival. It is a successful execution, not an
+                # ActionCancel transition on a goal still in EXECUTING state.
+                actual = self._hold_check(key, mode, generation, epoch, started, allow_stop=False)
+                ok, reason, final = self._hold_move(
+                    name, mode, actual, list(stop.target), goal_handle, key, generation, epoch, started, "stopping"
+                )
+                if not ok:
+                    failure_reason = f"named hold stop target rejected: {reason}"
+                    return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, failure_reason
+                if not self._hold_wait_arrival(
+                    name, mode, final, goal_handle, key, generation, epoch, started, state="stopping"
+                ):
+                    failure_reason = "named hold stop arrival unconfirmed"
+                    return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, failure_reason
+                normal_exit = True
+                return (
+                    True,
+                    ExecuteNamedMotion.Result.NONE,
+                    self._hold_target_message(name, final, "stop_target_sha256"),
+                )
         except _Cancelled:
             canceled = True
             raise
@@ -613,6 +680,7 @@ class NamedMotionServer:
                 self._hold_active = None
                 self._hold_leases.pop(key, None)
                 self._hold_exit_targets.pop(key, None)
+                self._hold_stop_targets.pop(key, None)
             self._hold_sent = None
             release = getattr(self._node, "release_arm_confirmed", None)
             if release is None or not release(generation, wait_s=self._hold_release_timeout_s):

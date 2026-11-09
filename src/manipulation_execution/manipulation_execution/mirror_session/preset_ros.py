@@ -74,13 +74,13 @@ def _resolve(description: Mapping) -> dict:
     return result
 
 
-def _target(command: UpperBodyCommand) -> tuple[UpperBodyCommand, list[float], str]:
+def _target(command: UpperBodyCommand, field_name: str = "exit_target") -> tuple[UpperBodyCommand, list[float], str]:
     if not isinstance(command, UpperBodyCommand):
-        raise ValueError("exit_target must be an UpperBodyCommand")
+        raise ValueError(f"{field_name} must be an UpperBodyCommand")
     try:
         arm, hand = tuple(command.arm), tuple(command.hand)
     except TypeError as exc:
-        raise ValueError("exit_target must contain all 34 finite joint values") from exc
+        raise ValueError(f"{field_name} must contain all 34 finite joint values") from exc
     values = arm + hand
     if (
         len(arm) != ARM_JOINT_COUNT
@@ -90,7 +90,7 @@ def _target(command: UpperBodyCommand) -> tuple[UpperBodyCommand, list[float], s
             for value in values
         )
     ):
-        raise ValueError("exit_target must contain all 34 finite joint values")
+        raise ValueError(f"{field_name} must contain all 34 finite joint values")
     values = list(map(float, values))
     encoded = json.dumps(values, separators=(",", ":"), allow_nan=False)
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -109,6 +109,8 @@ class _Flight:
     transport_uncertain: bool = False
     handle: Any = None
     submitted: OrderedDict[str, UpperBodyCommand] = field(default_factory=OrderedDict)
+    stop_target: UpperBodyCommand | None = None
+    stop_digest: str = ""
 
 
 class RosPresetPort:
@@ -118,7 +120,9 @@ class RosPresetPort:
     before lease acknowledgement prevents dispatch; a cancel while acceptance
     is pending is delivered to the late accepted handle. A cancel response is
     never treated as owner-release proof: only the runtime's terminal result
-    can provide that proof after a goal has been dispatched.
+    can provide that proof after a goal has been dispatched. A graceful stop
+    fixes one target on the same UUID and keeps renewing its lease until that
+    target is verified; its evidence is separate from a mirror resume target.
     """
 
     def __init__(
@@ -170,12 +174,13 @@ class RosPresetPort:
             self._publish(flight)
 
     def refresh(self, exit_target: UpperBodyCommand | None = None) -> None:
-        # Validate before publishing or altering any in-flight evidence.
-        submitted = _target(exit_target) if exit_target is not None else None
         with self._lock:
             flight = self._flight
             if flight is None or flight.cancel_requested or self._state.terminal:
                 return
+            # Once a stop is fixed, stale mirror exits cannot replace it or
+            # prevent its lease renewal, even if their shape is no longer valid.
+            submitted = _target(exit_target) if exit_target is not None and flight.stop_target is None else None
             values = None
             if submitted is not None:
                 command, values, digest = submitted
@@ -184,6 +189,35 @@ class RosPresetPort:
                 while len(flight.submitted) > _MAX_SUBMITTED_TARGETS:
                     flight.submitted.popitem(last=False)
             self._publish(flight, values)
+
+    def stop_to(self, target: UpperBodyCommand) -> None:
+        """Fix the first complete stop target for this UUID and keep its lease.
+
+        A lease awaiting ACK has not claimed an owner, so stopping there closes
+        the dispatch barrier immediately. A dispatched request may already own
+        the arms even before its acceptance arrives; it must instead complete
+        the same-owner stop bridge and prove its exact final stop target.
+        """
+        command, _, digest = _target(target, "stop_target")
+        with self._lock:
+            flight = self._flight
+            if flight is None or flight.cancel_requested or self._state.terminal:
+                return
+            if not flight.dispatched and not flight.transport_uncertain:
+                flight.cancel_requested = True
+                self._state = replace(
+                    self._state,
+                    stage="stopped_before_dispatch",
+                    pending=False,
+                    terminal=True,
+                    release_confirmed=True,
+                    observed_at=self._clock(),
+                )
+                return
+            if flight.stop_target is None:
+                flight.stop_target, flight.stop_digest = command, digest
+            self._state = replace(self._state, stage="stopping")
+            self._publish(flight)
 
     def cancel(self, reason: str) -> None:
         del reason  # The standard action cancel request carries only the UUID.
@@ -211,7 +245,9 @@ class RosPresetPort:
 
     def _publish(self, flight: _Flight, values: list[float] | None = None) -> None:
         payload = {"goal_id": flight.goal_id, "motion": flight.name}
-        if values is not None:
+        if flight.stop_target is not None:
+            payload["stop_target"] = list(flight.stop_target.arm + flight.stop_target.hand)
+        elif values is not None:
             payload["exit_target"] = values
         try:
             self._publisher.publish(self._ros.String(data=json.dumps(payload, separators=(",", ":"), allow_nan=False)))
@@ -231,6 +267,9 @@ class RosPresetPort:
             final_target=None,
             final_target_at=None,
             final_target_verified=False,
+            stop_target=None,
+            stop_target_at=None,
+            stop_target_verified=False,
             fault=self._state.fault or f"preset_{operation}:{type(error).__name__}",
             observed_at=self._clock(),
         )
@@ -296,7 +335,7 @@ class RosPresetPort:
             flight.handle = handle
             self._state = replace(
                 self._state,
-                stage="cancelling" if flight.cancel_requested else "entering",
+                stage="cancelling" if flight.cancel_requested else "stopping" if flight.stop_target else "entering",
                 pending=False,
                 accepted=True,
                 observed_at=self._clock(),
@@ -344,7 +383,17 @@ class RosPresetPort:
                 if bytes(event.goal_id.uuid).hex() != flight.goal_id:
                     return
                 stage = event.feedback.state
-                if stage not in {"accepted", "running", "completing", "entering", "holding", "exiting", "exit_blocked"}:
+                if stage not in {
+                    "accepted",
+                    "running",
+                    "completing",
+                    "entering",
+                    "holding",
+                    "exiting",
+                    "exit_blocked",
+                    "stopping",
+                    "stop_blocked",
+                }:
                     raise ValueError("unknown named hold stage")
             except Exception as exc:
                 self._transport_fault(flight, "feedback", exc)
@@ -368,14 +417,29 @@ class RosPresetPort:
                     and result.success is False
                     and code == self._ros.ExecuteNamedMotion.Result.CANCELLED
                 )
-                target = None
+                target = stop_target = None
                 if succeeded and code == self._ros.ExecuteNamedMotion.Result.NONE:
                     payload = json.loads(result.message)
                     if isinstance(payload, dict) and payload.get("motion") == flight.name:
-                        digest = payload.get("exit_target_sha256")
-                        if isinstance(digest, str):
-                            target = flight.submitted.get(digest)
-                verified = target is not None
+                        exit_digest = payload.get("exit_target_sha256")
+                        stop_digest = payload.get("stop_target_sha256")
+                        # Exactly one known target hash is required. A stop
+                        # success can never become a public mirror resume seed.
+                        if (
+                            flight.stop_target is not None
+                            and set(payload) == {"motion", "stop_target_sha256"}
+                            and isinstance(stop_digest, str)
+                            and stop_digest == flight.stop_digest
+                        ):
+                            stop_target = flight.stop_target
+                        elif (
+                            flight.stop_target is None
+                            and set(payload) == {"motion", "exit_target_sha256"}
+                            and isinstance(exit_digest, str)
+                        ):
+                            target = flight.submitted.get(exit_digest)
+                final_verified, stop_verified = target is not None, stop_target is not None
+                verified = final_verified or stop_verified
                 released = verified or cancelled
             except Exception as exc:
                 self._transport_fault(flight, "result", exc)
@@ -389,8 +453,11 @@ class RosPresetPort:
                 success=verified,
                 release_confirmed=released,
                 final_target=target,
-                final_target_at=now if verified else None,
-                final_target_verified=verified,
+                final_target_at=now if final_verified else None,
+                final_target_verified=final_verified,
+                stop_target=stop_target,
+                stop_target_at=now if stop_verified else None,
+                stop_target_verified=stop_verified,
                 fault=self._state.fault or ("" if released else "preset_result_unverified"),
                 observed_at=now,
             )

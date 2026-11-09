@@ -3,7 +3,23 @@
 import numpy as np
 import pytest
 
-from manipulation_execution.mirror_session.hand_overlay import HandOverlay
+from manipulation_execution.mirror_session.hand_overlay import HAND_HIGH, HAND_LOW, HAND_NEUTRAL, HandOverlay
+
+
+def test_neutral_target_is_complete_bounded_and_independent_of_tracking():
+    overlay = HandOverlay(50)
+    expected = tuple(float(value) for value in np.clip(HAND_NEUTRAL, HAND_LOW, HAND_HIGH))
+    assert overlay.neutral_target() == expected
+    overlay.observe_follow(np.zeros(20), 10.0)
+    overlay.reseed(np.zeros(20), 10.0)
+    before = overlay.snapshot(20.0)
+    assert overlay.neutral_target() == expected
+    assert overlay.snapshot(20.0) == before
+
+
+def test_neutral_target_preserves_the_configured_bounded_reset():
+    overlay = HandOverlay(50, neutral=np.ones(20) * 100.0)
+    assert overlay.neutral_target() == tuple(float(value) for value in HAND_HIGH)
 
 
 def test_reading_a_fresh_follow_target_does_not_advance_the_hand_output():

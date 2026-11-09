@@ -210,6 +210,7 @@ class MirrorSession:
         sleep: Callable[[float], None] = time.sleep,
         preset: PresetCoordinator | None = None,
         preset_target: Callable[[UpperBodyCommand | None], UpperBodyCommand | None] | None = None,
+        preset_stop_target: Callable[[UpperBodyCommand | None], UpperBodyCommand | None] | None = None,
     ):
         self._config = config
         self._port = port
@@ -255,6 +256,8 @@ class MirrorSession:
         self._last_transition: dict | None = None
         self._preset = preset if preset is not None and preset.enabled else None
         self._preset_target = preset_target
+        self._preset_stop_target = preset_stop_target
+        self._preset_stop_requested: UpperBodyCommand | None = None
         self._preset_generation = 0
         self._preset_active = False
         self._preset_valid = False
@@ -278,7 +281,7 @@ class MirrorSession:
 
     @property
     def preset_seed_emitting(self) -> bool:
-        """True only inside the publication callback for a verified full-body resume seed."""
+        """True only inside publication of a verified full-body handoff seed."""
         with self._lock:
             return self._preset_seed_emitting
 
@@ -382,6 +385,7 @@ class MirrorSession:
             self._preset_hold_required = self._preset_hold_sent = False
             self._preset_failure = ""
             self._preset_suspended = self._preset_had_owner = self._preset_stop_without_wrap = False
+            self._preset_stop_requested = None
             self._gate.open()
             self._arm_at_takeover = self._measured_arm
             self._phase_started = self._clock()
@@ -668,17 +672,63 @@ class MirrorSession:
         self._enter_wait_locked(WaitReason.FAULT, self._preset_failure)
         return True
 
-    def _stop_preset_locked(self, reason: str) -> None:
-        if self._preset is None or (not self._preset_suspended and self._preset.phase == PresetPhase.IDLE):
+    def _stop_preset_locked(
+        self,
+        reason: str,
+        stop_target: UpperBodyCommand | None = None,
+        *,
+        allow_exit_handoff: bool = False,
+    ) -> None:
+        if self._preset is None or (
+            not self._preset_suspended and self._preset.phase in (PresetPhase.IDLE, PresetPhase.STOPPED)
+        ):
             return
         self._gate.close()
         self._preset_suspended = True
-        result = self._preset.stop(reason)
+        result = self._preset.stop(reason, stop_target=stop_target)
         self._preset_had_owner |= not result.release_confirmed
         self._preset_stop_without_wrap |= self._preset_had_owner
+        if (
+            allow_exit_handoff
+            and not self._preset_hold_required
+            and not result.fault
+            and result.release_confirmed
+            and result.phase == PresetPhase.IDLE
+            and result.resume_seed is not None
+            and result.stop_seed is None
+            and well_formed(result.resume_seed)
+        ):
+            now = self._clock()
+            age = None if self._last_valid_at is None else now - self._last_valid_at
+            if self._holding and age is not None and 0 <= age <= self._config.status_max_age_s:
+                # A normal exit result arrived just before stop/cancel. Seed
+                # both the gate and hand overlay from that released owner,
+                # then let the ordinary public wrap run from this real pose.
+                self._gate.open()
+                self._gate.last = result.resume_seed
+                self._preset_seed_emitting = True
+                try:
+                    self._gate.emit(result.resume_seed)
+                except Exception as exc:
+                    self._gate.close()
+                    self._preset_failure = f"preset exit handoff seed publication failed: {type(exc).__name__}"
+                else:
+                    self._preset_suspended = self._preset_had_owner = self._preset_stop_without_wrap = False
+                    self._preset_stop_requested = None
+                    return
+                finally:
+                    self._preset_seed_emitting = False
+            else:
+                self._preset_failure = "runtime status unavailable for the preset exit handoff"
+        if result.phase == PresetPhase.STOPPING and not result.fault:
+            self._preset_stop_requested = stop_target
+            return
+        self._preset_stop_requested = None
         if self._preset_had_owner:
             self._preset_hold_required = True
-            self._preset_failure = "named preset stop has no certified reset bridge"
+            self._preset_failure = (
+                result.fault or self._preset_failure or "named preset stop has no certified reset bridge"
+            )
 
     def _preset_release_locked(self) -> bool:
         if self._preset is None or not self._preset_suspended:
@@ -750,16 +800,62 @@ class MirrorSession:
         """One wrap-up step; ``wrap_up_done`` / ``wrap_up_overrun`` once it ends, else None."""
         elapsed = now - self._phase_started
         if self._preset_suspended:
-            released = self._preset_release_locked()
-            if not released:
-                if elapsed >= self._config.wrap_up_budget_s:
+            if self._preset_had_owner and elapsed >= self._config.wrap_up_budget_s:
+                self._preset_hold_required = True
+                self._preset_failure = "named preset owner release was not confirmed within the stop budget"
+                self._stop_preset_locked(self._preset_failure)
+                self._wrap_purpose = WrapUpPurpose.STOP
+                self._stop_reason = (WaitReason.FAULT, self._preset_failure)
+                return "wrap_up_overrun"
+            result = self._preset.step(self._preset_generation, False, public_quiet=not self._gate.is_open)
+            self._preset_had_owner |= not result.release_confirmed
+            if result.fault:
+                self._preset_hold_required = True
+                self._preset_failure = result.fault
+                self._wrap_purpose = WrapUpPurpose.STOP
+                self._stop_reason = (WaitReason.FAULT, self._preset_failure)
+                return "wrap_up_done"
+            if result.stop_seed is not None:
+                seed = result.stop_seed
+                if (
+                    not result.release_confirmed
+                    or self._preset_stop_requested is None
+                    or not well_formed(seed)
+                    or seed != self._preset_stop_requested
+                ):
                     self._preset_hold_required = True
-                    self._preset_failure = "named preset owner release was not confirmed"
+                    self._preset_failure = "named preset reset seed does not match the requested stop target"
                     self._wrap_purpose = WrapUpPurpose.STOP
                     self._stop_reason = (WaitReason.FAULT, self._preset_failure)
-                    return "wrap_up_overrun"
+                    return "wrap_up_done"
+                self._gate.last = seed
+                if self._wrap_purpose == WrapUpPurpose.CANCEL:
+                    self._gate.open()
+                    self._gate.last = seed
+                    self._preset_seed_emitting = True
+                    try:
+                        self._gate.emit(seed)
+                    except Exception as exc:
+                        self._preset_hold_required = True
+                        self._preset_failure = f"preset stop seed publication failed: {type(exc).__name__}"
+                        self._wrap_purpose = WrapUpPurpose.STOP
+                        self._stop_reason = (WaitReason.HOOK_ERROR, self._preset_failure)
+                        return "wrap_up_done"
+                    finally:
+                        self._preset_seed_emitting = False
+                self._preset_suspended = self._preset_had_owner = self._preset_stop_without_wrap = False
+                self._preset_stop_requested = None
+                return "wrap_up_done"
+            if not result.release_confirmed:
                 return None
+            if result.phase == PresetPhase.IDLE and self._preset_stop_requested is not None:
+                # Only the coordinator's strict stopped-before-dispatch
+                # proof can return IDLE without a stop seed for this request.
+                self._preset_had_owner = self._preset_stop_without_wrap = False
+                self._preset_stop_requested = None
             if self._preset_stop_without_wrap:
+                self._preset_hold_required = True
+                self._preset_failure = self._preset_failure or "named preset stopped without a verified reset seed"
                 if self._wrap_purpose == WrapUpPurpose.CANCEL:
                     self._wrap_purpose = WrapUpPurpose.STOP
                     self._stop_reason = (WaitReason.STOPPED, self._cancel_reason or "preset round cancelled")
@@ -800,7 +896,20 @@ class MirrorSession:
         return release
 
     def _begin_wrap_locked(self, purpose: WrapUpPurpose, reason: str, stop_reason=None) -> None:
-        self._stop_preset_locked(reason)
+        stop_target = None
+        if (
+            purpose in (WrapUpPurpose.STOP, WrapUpPurpose.CANCEL)
+            and self._preset_suspended
+            and self._preset_stop_target is not None
+        ):
+            try:
+                raw_reset = self._reset_target()
+                candidate = self._hook("preset_stop_target", self._preset_stop_target, raw_reset)
+                if candidate is not None and well_formed(candidate):
+                    stop_target = UpperBodyCommand(tuple(map(float, candidate.arm)), tuple(map(float, candidate.hand)))
+            except _HookError:
+                pass  # a missing or unsafe certified reset target retains immediate cancel/HOLD
+        self._stop_preset_locked(reason, stop_target, allow_exit_handoff=True)
         self._phase_started = self._clock()
         self._wrap_purpose = purpose
         if purpose == WrapUpPurpose.STOP:

@@ -122,3 +122,13 @@ def test_motion_requires_unchanged_clearance_and_a_certified_stop_bridge(tmp_pat
     template.write_text(yaml.safe_dump(record))
     with pytest.raises(ValueError, match="0.20"):
         motion_parameters(settings)
+    record["required_head_clearance_m"] = 0.2
+    record["stop_bridge_certified"] = True
+    for enabled in (None, False, "true", 1):
+        record["motion_enabled"] = enabled
+        template.write_text(yaml.safe_dump(record))
+        with pytest.raises(ValueError, match="template motion output"):
+            motion_parameters(settings)
+    record["motion_enabled"] = True
+    template.write_text(yaml.safe_dump(record))
+    assert motion_parameters(settings)["motion_name"] == "overhead_heart"

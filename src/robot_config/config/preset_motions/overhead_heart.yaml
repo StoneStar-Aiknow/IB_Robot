@@ -1,6 +1,7 @@
 schema_version: 1
 name: overhead_heart
 visual_version: palms_down_v1
+recording_file: overhead_heart_palms_down_v1.json
 units: rad
 validated: false
 motion_enabled: false

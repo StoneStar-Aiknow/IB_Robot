@@ -124,6 +124,11 @@ class HandOverlay:
             self._command_at = now
 
     # -- output (the gate's publish, under the session lock) --------------------
+    def neutral_target(self) -> tuple[float, ...]:
+        """Read the bounded reset target without requiring or advancing tracking."""
+        with self._lock:
+            return tuple(float(value) for value in self._neutral)
+
     def follow_target(self, now: float) -> tuple[float, ...] | None:
         """Read a fresh, bounded normal-mirror target without advancing output."""
         with self._lock:

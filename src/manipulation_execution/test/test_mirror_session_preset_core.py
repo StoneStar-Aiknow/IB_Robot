@@ -63,6 +63,7 @@ class Named:
         self.calls = []
         self.state = PresetSnapshot()
         self.cancelled = threading.Event()
+        self.stop_before_dispatch = False
 
     def begin(self, name, epoch):
         self.calls.append(("begin", name, epoch))
@@ -74,6 +75,17 @@ class Named:
     def cancel(self, reason):
         self.calls.append(("cancel", reason))
         self.cancelled.set()
+
+    def stop_to(self, target):
+        self.calls.append(("stop_to", target))
+        if self.stop_before_dispatch:
+            self.observe(
+                stage="stopped_before_dispatch",
+                pending=False,
+                terminal=True,
+                success=False,
+                release_confirmed=True,
+            )
 
     def snapshot(self):
         return self.state
@@ -93,6 +105,17 @@ class Named:
             final_target=target,
             final_target_at=self.clock(),
             final_target_verified=target is not None,
+        )
+
+    def finish_stop(self, target):
+        self.observe(
+            pending=False,
+            terminal=True,
+            success=True,
+            release_confirmed=True,
+            stop_target=target,
+            stop_target_at=self.clock(),
+            stop_target_verified=True,
         )
 
 
@@ -128,16 +151,21 @@ class Cover(CoverDetector):
         return frame == "covered"
 
 
-def make_rig(*, enabled=True, with_preset=True, target_available=True):
+def make_rig(*, enabled=True, with_preset=True, target_available=True, stop_target_available=False):
     clock, runtime, sent, hooks = Clock(), Runtime(), [], Hooks()
     seed_flags, publish_fail, holder = [], [False], {}
     named = Named(clock)
     preset = PresetCoordinator(PresetConfig(enabled=enabled), named, clock)
     targets = []
+    stop_targets = []
 
     def target(raw):
         targets.append(raw)
         return raw if target_available else None
+
+    def stop_target(raw):
+        stop_targets.append(raw)
+        return raw if stop_target_available else None
 
     def publish(value):
         seed_flags.append(holder["session"].preset_seed_emitting)
@@ -155,6 +183,7 @@ def make_rig(*, enabled=True, with_preset=True, target_available=True):
         clock.sleep,
         preset=preset if with_preset else None,
         preset_target=target,
+        preset_stop_target=stop_target,
     )
     holder["session"] = session
     assert session.startup().idle
@@ -176,6 +205,7 @@ def make_rig(*, enabled=True, with_preset=True, target_available=True):
         hooks=hooks,
         preset=preset,
         targets=targets,
+        stop_targets=stop_targets,
         seed_flags=seed_flags,
         publish_fail=publish_fail,
     )
@@ -400,8 +430,9 @@ def test_unconfirmed_release_overruns_to_hold_without_public_wrap():
 
 
 @pytest.mark.parametrize("cause", ["shutdown", "runtime_mode", "runtime_latch", "runtime_loss"])
-def test_revocation_and_shutdown_cancel_before_hold_and_never_publish(cause):
-    rig = make_rig()
+@pytest.mark.parametrize("certified_target", [False, True])
+def test_revocation_and_shutdown_cancel_before_hold_and_never_publish(cause, certified_target):
+    rig = make_rig(stop_target_available=certified_target)
     dispatch(rig)
     if cause == "shutdown":
         outcome = rig.session.shutdown()
@@ -419,6 +450,7 @@ def test_revocation_and_shutdown_cancel_before_hold_and_never_publish(cause):
     assert rig.sent == [] and rig.hooks.wrap_calls == []
     assert ("stop", "HOLD") in rig.runtime.calls
     assert not any(call[0] == "set_mode" for call in rig.runtime.calls)
+    assert rig.stop_targets == [] and not any(call[0] == "stop_to" for call in rig.named.calls)
 
 
 def test_stop_during_drain_dispatches_nothing_and_preserves_baseline_cancel_wrap():
@@ -430,6 +462,24 @@ def test_stop_during_drain_dispatches_nothing_and_preserves_baseline_cancel_wrap
     assert len(rig.hooks.wrap_calls) == 1
     assert rig.named.calls == []
     assert ("stop", "HOLD") not in rig.runtime.calls
+
+
+@pytest.mark.parametrize("cause", ["touch", "cover"])
+def test_stop_before_action_dispatch_uses_explicit_no_owner_proof_and_baseline_wrap(cause):
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig, accept=False)
+    rig.named.stop_before_dispatch = True
+    if cause == "touch":
+        rig.session.operator_touch()
+    else:
+        tick(rig, camera="covered")
+    tick(rig, matcher=False)
+    assert len(rig.hooks.wrap_calls) == 1 and rig.sent == [command(0.0)]
+    assert ("stop", "HOLD") not in rig.runtime.calls
+    if cause == "touch":
+        assert rig.session.state == SessionState.STANDBY and rig.session.phase == Phase.COOLDOWN
+    else:
+        assert rig.session.state == SessionState.WAIT and rig.session.last_release.idle
 
 
 def test_new_round_drops_old_match_state_and_uses_its_own_preset_generation():
@@ -446,16 +496,91 @@ def test_new_round_drops_old_match_state_and_uses_its_own_preset_generation():
     assert rig.preset.epoch.generation == first_generation + 1
 
 
-def test_stop_wins_over_same_tick_normal_terminal_seed():
-    rig = make_rig()
+@pytest.mark.parametrize("certified_target", [False, True])
+@pytest.mark.parametrize("cause", ["touch", "cover", "criteria"])
+def test_stop_after_normal_exit_terminal_seeds_hands_once_then_runs_baseline_wrap(cause, certified_target):
+    rig = make_rig(stop_target_available=certified_target)
     dispatch(rig)
     tick(rig, active=False)
     rig.named.finish(rig.hooks.raw)
-    rig.session.operator_touch()
+    if cause == "touch":
+        rig.session.operator_touch()
+    elif cause == "cover":
+        tick(rig, active=False, camera="covered")
+    else:
+        rig.hooks.cancel = True
+        tick(rig, active=False)
+    if cause == "touch":
+        assert rig.sent == [rig.hooks.raw] and rig.seed_flags[-1] is True
+        tick(rig, active=False)
+    assert rig.sent == [rig.hooks.raw, command(0.0)] and rig.seed_flags[-2:] == [True, False]
+    assert len(rig.hooks.wrap_calls) == 1
+    assert rig.hooks.wrap_calls[-1].last_command == rig.hooks.raw
+    assert not rig.session.preset_seed_emitting
+    assert not any(call[0] in {"stop_to", "cancel"} for call in rig.named.calls)
+    assert ("stop", "HOLD") not in rig.runtime.calls
+    if cause == "cover":
+        assert rig.session.state == SessionState.WAIT and rig.session.last_release.idle
+    else:
+        assert rig.session.state == SessionState.STANDBY and rig.session.phase == Phase.COOLDOWN
+
+
+def test_public_stop_after_normal_exit_terminal_uses_current_seed_then_observed_idle():
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
     tick(rig, active=False)
-    assert rig.sent == []
-    assert rig.session.state == SessionState.WAIT
+    rig.named.finish(rig.hooks.raw)
+    result = []
+    thread = threading.Thread(target=lambda: result.append(rig.session.request("stop")))
+    thread.start()
+    try:
+        with rig.session._changed:
+            assert rig.session._changed.wait_for(lambda: rig.session.phase == Phase.WRAP_UP, timeout=1.0)
+        assert rig.sent == [rig.hooks.raw] and rig.seed_flags[-1] is True
+        tick(rig, active=False)
+        thread.join(1.0)
+        assert not thread.is_alive() and result[0][0]
+        assert rig.session.state == SessionState.WAIT and rig.session.last_release.idle
+        assert rig.sent == [rig.hooks.raw, command(0.0)] and rig.seed_flags[-2:] == [True, False]
+        assert len(rig.hooks.wrap_calls) == 1 and rig.hooks.wrap_calls[-1].last_command == rig.hooks.raw
+        assert not any(call[0] in {"stop_to", "cancel"} for call in rig.named.calls)
+    finally:
+        if thread.is_alive():
+            tick(rig, active=False)
+            thread.join(1.0)
+
+
+@pytest.mark.parametrize("failure", ["publish", "runtime_stale"])
+def test_normal_exit_handoff_failure_before_stop_still_holds(failure):
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    tick(rig, active=False)
+    rig.named.finish(rig.hooks.raw)
+    if failure == "publish":
+        rig.publish_fail[0] = True
+    else:
+        rig.session._last_valid_at = rig.clock() - rig.session._config.status_max_age_s - 0.01
+    rig.session.operator_touch()
+    assert rig.sent == [] and not rig.session.preset_seed_emitting
+    tick(rig, active=False)
+    assert rig.session.state == SessionState.WAIT and rig.sent == []
+    assert ("stop", "HOLD") in rig.runtime.calls and not rig.session.last_release.idle
+
+
+@pytest.mark.parametrize("failure", ["shutdown", "runtime_latch"])
+def test_completed_normal_exit_does_not_reopen_gate_for_fault_or_shutdown(failure):
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    tick(rig, active=False)
+    rig.named.finish(rig.hooks.raw)
+    if failure == "shutdown":
+        rig.session.shutdown()
+    else:
+        rig.session.observe_status(replace(rig.runtime.status, stop_latched=True))
+        rig.session.tick()
+    assert rig.session.state == SessionState.WAIT and rig.sent == [] and rig.hooks.wrap_calls == []
     assert ("stop", "HOLD") in rig.runtime.calls
+    assert not any(call[0] == "set_mode" for call in rig.runtime.calls)
 
 
 def test_seed_publication_failure_is_caught_and_holds_without_clearing_stop_latch():
@@ -472,3 +597,187 @@ def test_seed_publication_failure_is_caught_and_holds_without_clearing_stop_latc
     assert ("stop", "HOLD") in rig.runtime.calls
     assert not any(call[0] == "set_mode" for call in rig.runtime.calls)
     assert not rig.session.last_release.idle
+
+
+@pytest.mark.parametrize("stage", ["pending", "entering", "holding", "exiting"])
+@pytest.mark.parametrize("cause", ["touch", "cover", "criteria"])
+def test_certified_reset_stop_reaches_wait_or_standby_without_old_public_wrap(stage, cause):
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig, accept=stage != "pending")
+    if stage == "entering":
+        rig.named.observe(stage="entering")
+    elif stage == "exiting":
+        tick(rig, active=False)
+    if cause == "touch":
+        assert rig.session.operator_touch()[0]
+    elif cause == "cover":
+        tick(rig, camera="covered")
+    else:
+        rig.hooks.cancel = True
+        tick(rig)
+    reset = command(0.0)
+    assert rig.named.calls[-2:] == [("stop_to", reset), ("refresh", None)]
+    assert rig.stop_targets == [reset]
+    assert rig.sent == [] and rig.hooks.wrap_calls == [] and not rig.named.cancelled.is_set()
+    if stage == "pending":
+        rig.named.accept(stage="stopping")
+    # Matcher evidence expires while runtime/action feedback stays fresh.
+    tick(rig, seconds=0.4, matcher=False)
+    assert rig.session.phase == Phase.WRAP_UP and not rig.named.cancelled.is_set()
+    rig.named.finish_stop(reset)
+    tick(rig, matcher=False)
+    assert rig.session._gate.last == reset
+    assert rig.hooks.wrap_calls == [] and not rig.named.cancelled.is_set()
+    assert ("stop", "HOLD") not in rig.runtime.calls
+    if cause == "cover":
+        assert rig.session.state == SessionState.WAIT
+        assert rig.sent == [] and rig.session.last_release.idle
+        assert ("set_mode", "idle") in rig.runtime.calls
+    else:
+        assert rig.session.state == SessionState.STANDBY and rig.session.phase == Phase.COOLDOWN
+        assert rig.sent == [reset] and rig.seed_flags[-1] is True
+        assert not rig.session.preset_seed_emitting and rig.session.holding
+        assert not any(call[0] == "set_mode" for call in rig.runtime.calls)
+        tick(rig, matcher=False)
+        assert rig.sent[-1] == reset and rig.seed_flags[-1] is False
+
+
+def test_certified_public_stop_reaches_reset_then_observed_idle_without_seed_publication():
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    result = []
+    stopped = threading.Event()
+
+    def stop():
+        result.append(rig.session.request("stop"))
+        stopped.set()
+
+    thread = threading.Thread(target=stop)
+    thread.start()
+    try:
+        with rig.session._changed:
+            assert rig.session._changed.wait_for(lambda: rig.session.phase == Phase.WRAP_UP, timeout=1.0)
+        assert ("stop_to", command(0.0)) in rig.named.calls
+        assert not stopped.is_set()
+        rig.named.finish_stop(command(0.0))
+        tick(rig, matcher=False)
+        thread.join(1.0)
+        assert not thread.is_alive() and result[0][0] is True
+        assert rig.session.state == SessionState.WAIT and rig.session.last_release.idle
+        assert rig.session.stop_final_gap_deg == 0.0
+        assert rig.sent == [] and rig.hooks.wrap_calls == []
+        assert ("set_mode", "idle") in rig.runtime.calls and ("stop", "HOLD") not in rig.runtime.calls
+    finally:
+        if thread.is_alive():
+            rig.named.finish_stop(command(0.0))
+            tick(rig, matcher=False)
+            thread.join(1.0)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"stop_target_verified": False},
+        {"stop_target": command(0.9)},
+        {"stop_target_at": 0.0},
+        {"success": False},
+        {"release_confirmed": False},
+        {"stop_target": None},
+    ],
+)
+def test_invalid_certified_reset_result_holds_and_never_reopens_public_gate(changes):
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    rig.session.operator_touch()
+    rig.named.finish_stop(command(0.0))
+    rig.named.observe(**changes)
+    tick(rig, matcher=False)
+    assert rig.session.state == SessionState.WAIT and rig.session.wait_reason == WaitReason.FAULT
+    assert rig.sent == [] and rig.hooks.wrap_calls == []
+    assert ("stop", "HOLD") in rig.runtime.calls and not rig.session.last_release.idle
+    assert not any(call[0] == "set_mode" for call in rig.runtime.calls)
+
+
+@pytest.mark.parametrize("failure", ["budget", "late_success", "action_fault", "runtime_loss", "runtime_latch"])
+def test_certified_stop_failure_keeps_hold_and_the_existing_stop_budget(failure):
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    budget = rig.session._config.wrap_up_budget_s
+    rig.session.operator_touch()
+    if failure in {"budget", "late_success"}:
+        if failure == "late_success":
+            rig.named.finish_stop(command(0.0))
+        tick(rig, seconds=budget + 0.01, matcher=False)
+    elif failure == "action_fault":
+        rig.named.observe(fault="stop_bridge_rejected")
+        tick(rig, matcher=False)
+    elif failure == "runtime_loss":
+        rig.clock.advance(2.01)
+        rig.session.tick()
+    else:
+        rig.runtime.status = replace(rig.runtime.status, stop_latched=True)
+        rig.session.observe_status(rig.runtime.status)
+        rig.session.tick()
+    assert rig.session._config.wrap_up_budget_s == budget
+    assert rig.session.state == SessionState.WAIT and rig.named.cancelled.is_set()
+    assert rig.sent == [] and rig.hooks.wrap_calls == []
+    assert ("stop", "HOLD") in rig.runtime.calls
+    assert not any(call[0] == "set_mode" for call in rig.runtime.calls)
+
+
+def test_cancel_seed_publication_failure_cancels_and_holds_without_clearing_latch():
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    rig.session.operator_touch()
+    rig.named.finish_stop(command(0.0))
+    rig.publish_fail[0] = True
+    tick(rig, matcher=False)
+    assert rig.session.state == SessionState.WAIT and rig.session.wait_reason == WaitReason.HOOK_ERROR
+    assert not rig.session.preset_seed_emitting and rig.sent == []
+    assert ("stop", "HOLD") in rig.runtime.calls and not rig.session.last_release.idle
+
+
+@pytest.mark.parametrize("failure", ["none", "malformed", "exception"])
+def test_missing_or_unsafe_stop_callback_keeps_original_cancel_hold_path(failure):
+    rig = make_rig(stop_target_available=True)
+    if failure == "none":
+        rig.session._preset_stop_target = None
+    elif failure == "malformed":
+        rig.session._preset_stop_target = lambda raw: UpperBodyCommand((0.0,) * 13, (0.0,) * 20)
+    else:
+
+        def bad_target(raw):
+            raise RuntimeError("uncertified reset")
+
+        rig.session._preset_stop_target = bad_target
+    dispatch(rig)
+    rig.session.operator_touch()
+    assert rig.named.cancelled.is_set() and not any(call[0] == "stop_to" for call in rig.named.calls)
+    rig.named.finish()
+    tick(rig, matcher=False)
+    assert rig.session.state == SessionState.WAIT and rig.sent == []
+    assert ("stop", "HOLD") in rig.runtime.calls
+
+
+def test_stop_wins_during_certified_cancel_without_replacing_the_frozen_reset():
+    rig = make_rig(stop_target_available=True)
+    dispatch(rig)
+    rig.session.operator_touch()
+    result = []
+    thread = threading.Thread(target=lambda: result.append(rig.session.request("stop")))
+    thread.start()
+    try:
+        with rig.session._changed:
+            assert rig.session._changed.wait_for(lambda: rig.session._stop_waiters == 1, timeout=1.0)
+        rig.named.finish_stop(command(0.0))
+        tick(rig, matcher=False)
+        thread.join(1.0)
+        assert not thread.is_alive() and result[0][0]
+        assert rig.session.state == SessionState.WAIT and rig.sent == []
+        assert sum(call[0] == "stop_to" for call in rig.named.calls) == 1
+        assert len(rig.stop_targets) == 1 and not rig.named.cancelled.is_set()
+    finally:
+        if thread.is_alive():
+            rig.named.finish_stop(command(0.0))
+            tick(rig, matcher=False)
+            thread.join(1.0)

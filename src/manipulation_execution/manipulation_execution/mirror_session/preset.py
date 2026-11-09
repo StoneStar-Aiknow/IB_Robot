@@ -26,6 +26,7 @@ class PresetPhase(str, Enum):
     ENTERING = "entering"
     HOLDING = "holding"
     EXITING = "exiting"
+    STOPPING = "stopping"
     CANCELLING = "cancelling"
     STOPPED = "stopped"
     FAULT = "fault"
@@ -71,7 +72,10 @@ class PresetSnapshot:
     ``observed_at`` is the latest goal/feedback/result evidence, not the time
     ``snapshot()`` was called. ``final_target_verified`` asserts server success
     and a target identity matching this UUID's submitted exit, not cached feedback
-    or the pre-preset public command. A terminal alone is not release proof.
+    or the pre-preset public command. ``stop_target_verified`` instead asserts
+    this UUID's guarded stop bridge arrived at its submitted reset target.
+    These two kinds of seed evidence are never interchangeable. A terminal
+    alone is not release proof.
     """
 
     epoch: PresetEpoch | None = None
@@ -87,6 +91,9 @@ class PresetSnapshot:
     final_target_verified: bool = False
     fault: str = ""
     observed_at: float | None = None
+    stop_target: UpperBodyCommand | None = None
+    stop_target_at: float | None = None
+    stop_target_verified: bool = False
 
 
 class PresetPort(Protocol):
@@ -97,11 +104,15 @@ class PresetPort(Protocol):
     Old callbacks must not replace the current epoch's snapshot; the adapter
     cancels an old accepted UUID directly instead. ``refresh`` renews only the
     current UUID and optionally asks it to run its checked same-owner exit.
+    ``stop_to`` fixes a complete reset target for the same owner; later leases
+    retain that stop target in preference to any normal exit request.
     """
 
     def begin(self, name: str, epoch: PresetEpoch) -> None: ...
 
     def refresh(self, exit_target: UpperBodyCommand | None = None) -> None: ...
+
+    def stop_to(self, target: UpperBodyCommand) -> None: ...
 
     def cancel(self, reason: str) -> None: ...
 
@@ -115,6 +126,7 @@ class PresetStep:
     fault: str = ""
     phase: PresetPhase = PresetPhase.IDLE
     release_confirmed: bool = True
+    stop_seed: UpperBodyCommand | None = None
 
 
 def _finite(value) -> bool:
@@ -162,10 +174,13 @@ class PresetCoordinator:
         self._begun = False
         self._released = True
         self._goal_id = ""
+        self._accepted = False
         self._cancelled_goal_id: str | None = None
         self._stop_reason = ""
         self._fault = ""
         self._exit_target: UpperBodyCommand | None = None
+        self._stop_target: UpperBodyCommand | None = None
+        self._graceful_stop_reason = ""
 
     @property
     def enabled(self) -> bool:
@@ -186,14 +201,63 @@ class PresetCoordinator:
         self._begun = False
         self._released = True
         self._goal_id = ""
+        self._accepted = False
         self._cancelled_goal_id = None
         self._stop_reason = self._fault = ""
         self._exit_target = None
+        self._stop_target = None
+        self._graceful_stop_reason = ""
         return True
 
-    def stop(self, reason: str = "stop") -> PresetStep:
-        """Stop renewing immediately, including while goal acceptance is pending."""
+    def stop(self, reason: str = "stop", stop_target: UpperBodyCommand | None = None) -> PresetStep:
+        """Use a checked same-owner stop only with a complete reset target.
+
+        The caller supplies the current reset target. The runtime still has to
+        approve the stop bridge and attest exact target arrival and release.
+        A normal exit already completed before this request may return its
+        verified resume seed for a subsequent public wrap. Missing targets
+        and every fault otherwise retain immediate cancellation.
+        """
         if not self.enabled or self.phase == PresetPhase.IDLE:
+            return self._result()
+        target = _command(stop_target)
+        if (
+            self._begun
+            and not self._fault
+            and not self._stop_reason
+            and (target is not None or self.phase == PresetPhase.EXITING)
+        ):
+            if self.phase == PresetPhase.STOPPING:
+                if target != self._stop_target:
+                    self._cancel("stop_target_changed", fault="preset_stop_target_changed")
+                return self._result()
+            now = self._clock()
+            if not _finite(now) or (self._last_now is not None and now < self._last_now):
+                self._cancel("clock_invalid", fault="preset_clock_invalid")
+                return self._result()
+            if self._lease_at is not None and now - self._lease_at > self.config.lease_timeout_s:
+                self._cancel("lease_lapsed", fault="preset_lease_lapsed")
+                return self._result()
+            self._last_now = now
+            snapshot = self._snapshot(now)
+            if snapshot is not None and snapshot.fault:
+                self._cancel(snapshot.fault, fault=snapshot.fault)
+            if self._fault:
+                return self._result()
+            if self.phase == PresetPhase.EXITING and snapshot is not None and snapshot.terminal:
+                # The result callback may win the race with this stop. Its
+                # independently verified normal-exit seed remains a resume
+                # seed; the released action cannot run a new stop bridge.
+                return self._consume(snapshot, now) or self._result()
+            if target is None:
+                self._cancel(reason or "stop")
+                return self._result()
+            self._stop_target = target
+            self._exit_target = None
+            self._graceful_stop_reason = reason or "stop"
+            self.phase = PresetPhase.STOPPING
+            if self._call("stop_to", target):
+                self._refresh(now, force=True)
             return self._result()
         self._cancel(reason or "stop")
         return self._result()
@@ -235,6 +299,9 @@ class PresetCoordinator:
                 if result is not None:
                     return result
         if self._stop_reason:
+            return self._result()
+        if self.phase == PresetPhase.STOPPING:
+            self._refresh(now)
             return self._result()
         if self.phase == PresetPhase.DRAINING:
             if not human_active:
@@ -309,14 +376,15 @@ class PresetCoordinator:
         if not _finite(snapshot.observed_at) or not 0 <= now - snapshot.observed_at <= self.config.snapshot_max_age_s:
             self._cancel("status_stale", fault="preset_status_stale")
             return None
-        if snapshot.accepted:
-            if not snapshot.goal_id or (self._goal_id and snapshot.goal_id != self._goal_id):
+        if snapshot.goal_id:
+            if self._goal_id and snapshot.goal_id != self._goal_id:
                 self._cancel("goal_identity_changed", fault="preset_goal_identity_changed")
                 return None
             self._goal_id = snapshot.goal_id
-        elif self._goal_id and snapshot.goal_id != self._goal_id:
+        elif snapshot.accepted or self._goal_id:
             self._cancel("goal_identity_changed", fault="preset_goal_identity_changed")
             return None
+        self._accepted |= snapshot.accepted is True
         return snapshot
 
     def _consume(self, snapshot: PresetSnapshot, now: float) -> PresetStep | None:
@@ -332,6 +400,40 @@ class PresetCoordinator:
             return self._result()
         if snapshot.terminal:
             self._released = snapshot.release_confirmed and not snapshot.pending
+            if self.phase == PresetPhase.STOPPING:
+                if (
+                    snapshot.stage == "stopped_before_dispatch"
+                    and snapshot.terminal is True
+                    and snapshot.release_confirmed is True
+                    and snapshot.accepted is False
+                    and not self._accepted
+                    and snapshot.pending is False
+                    and snapshot.success is False
+                ):
+                    # The adapter closed its ACK barrier before send_goal;
+                    # no named owner ever displaced the public baseline.
+                    self._begun = False
+                    self._stop_reason = self._graceful_stop_reason
+                    self.phase = PresetPhase.IDLE
+                    return self._result()
+                seed = _command(snapshot.stop_target)
+                valid = (
+                    self._released
+                    and snapshot.success
+                    and snapshot.accepted
+                    and bool(self._goal_id)
+                    and snapshot.stop_target_verified is True
+                    and seed is not None
+                    and seed == self._stop_target
+                    and _finite(snapshot.stop_target_at)
+                    and 0 <= now - snapshot.stop_target_at <= self.config.final_target_max_age_s
+                )
+                if not valid:
+                    self._cancel("stop_evidence_invalid", fault="preset_stop_evidence_invalid")
+                    return self._result()
+                self._stop_reason = self._graceful_stop_reason
+                self.phase = PresetPhase.STOPPED
+                return self._result(stop_seed=seed)
             if self.phase != PresetPhase.EXITING or not snapshot.success:
                 self._cancel("unexpected_terminal", fault="preset_unexpected_terminal")
                 return self._result()
@@ -355,6 +457,6 @@ class PresetCoordinator:
             self.phase = PresetPhase.HOLDING
         return None
 
-    def _result(self, seed: UpperBodyCommand | None = None) -> PresetStep:
+    def _result(self, seed: UpperBodyCommand | None = None, *, stop_seed: UpperBodyCommand | None = None) -> PresetStep:
         blocked = self.phase != PresetPhase.IDLE and (not self._released or self.phase == PresetPhase.DRAINING)
-        return PresetStep(blocked or bool(self._fault), seed, self._fault, self.phase, self._released)
+        return PresetStep(blocked or bool(self._fault), seed, self._fault, self.phase, self._released, stop_seed)

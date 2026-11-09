@@ -73,6 +73,7 @@ class _ProtocolPeer:
         self.expected_id = ""
         self.owner = None
         self.events = []
+        self.payloads = []
         self.errors = []
         self.group = ReentrantCallbackGroup()
         self.ack = node.create_publisher(String, f"{prefix}/ack", 10)
@@ -97,6 +98,7 @@ class _ProtocolPeer:
             assert len(bytes.fromhex(goal_id)) == 16 and motion == _MOTION
             with self.lock:
                 self.leases[goal_id] = payload
+                self.payloads.append(payload)
                 self.events.append(("lease", goal_id))
         except Exception as exc:
             with self.lock:
@@ -171,11 +173,17 @@ class _ProtocolPeer:
                         success=False, error_code=ExecuteNamedMotion.Result.CANCELLED, message="test owner released"
                     )
                 with self.lock:
-                    target = self.leases[goal_id].get("exit_target")
+                    payload = self.leases[goal_id]
+                    field_name = "stop_target" if "stop_target" in payload else "exit_target"
+                    target = payload.get(field_name)
                 if target is not None:
                     assert len(target) == 34
                     encoded = json.dumps(target, separators=(",", ":"), allow_nan=False).encode("utf-8")
-                    result = json.dumps({"motion": _MOTION, "exit_target_sha256": hashlib.sha256(encoded).hexdigest()})
+                    result = json.dumps(
+                        {"motion": _MOTION, f"{field_name}_sha256": hashlib.sha256(encoded).hexdigest()}
+                    )
+                    with self.lock:
+                        self.events.append((f"{field_name}_applied", goal_id))
                     self._release(goal_id)
                     handle.succeed()
                     return ExecuteNamedMotion.Result(
@@ -341,3 +349,28 @@ def test_real_cancelled_result_confirms_release_without_a_resume_target(graph):
         assert graph.peer.owner is None
         order = [event for event, identifier in graph.peer.events if identifier == goal_id]
         assert order.index("executing") < order.index("cancel_request") < order.index("released")
+
+
+def test_real_stop_target_success_proves_release_without_a_resume_final_target(graph):
+    goal_id = graph.begin_with_ack_barrier()
+    stop = UpperBodyCommand((0.15,) * 14, (0.25,) * 20)
+    graph.port.stop_to(stop)
+    # The coordinator can keep passing an ordinary mirror exit while it renews
+    # a stopping flight. Only the fixed stop target is allowed onto the wire.
+    graph.port.refresh(UpperBodyCommand((0.7,) * 14, (0.8,) * 20))
+    graph.wait(lambda: graph.port.snapshot().terminal)
+    state = graph.port.snapshot()
+    assert state.goal_id == goal_id and state.epoch == PresetEpoch(7, 1)
+    assert state.accepted and not state.pending and state.success and state.release_confirmed
+    assert state.stop_target_verified and state.stop_target == stop
+    assert state.stop_target_at == state.observed_at
+    assert state.final_target is None and state.final_target_at is None and not state.final_target_verified
+    assert not state.fault
+    with graph.peer.lock:
+        assert graph.peer.owner is None
+        order = [event for event, identifier in graph.peer.events if identifier == goal_id]
+        assert order.index("executing") < order.index("stop_target_applied") < order.index("released")
+        assert "exit_target_applied" not in order and "cancel_request" not in order
+        targets = [payload for payload in graph.peer.payloads if "stop_target" in payload]
+        assert targets and all(payload["stop_target"] == list(stop.arm + stop.hand) for payload in targets)
+        assert not any("exit_target" in payload for payload in graph.peer.payloads)

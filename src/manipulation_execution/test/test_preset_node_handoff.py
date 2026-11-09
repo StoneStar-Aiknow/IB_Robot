@@ -56,6 +56,24 @@ def test_verified_seed_bypasses_ordinary_hand_overlay_once():
     assert sent[1] == sent[3] == list(seed.hand)
 
 
+def test_stop_target_uses_reset_arms_and_neutral_hands_without_live_perception():
+    node = SimpleNamespace(_hands=SimpleNamespace(neutral_target=lambda: (0.1,) * 20))
+    reset = UpperBodyCommand((0.2,) * 14, (0.0,) * 20, source_stamp_s=1.0)
+    assert module.MirrorSessionNode._preset_stop_target(node, reset) == UpperBodyCommand((0.2,) * 14, (0.1,) * 20)
+
+
+@pytest.mark.parametrize("arms", [(), (0.0,) * 13, (float("nan"),) * 14, (float("inf"),) * 14])
+def test_bad_stop_reset_is_not_submitted(arms):
+    node = SimpleNamespace(_hands=SimpleNamespace(neutral_target=lambda: (0.1,) * 20))
+    assert module.MirrorSessionNode._preset_stop_target(node, UpperBodyCommand(arms, (0.0,) * 20)) is None
+
+
+def test_missing_reset_or_hands_does_not_invent_a_stop_target():
+    node = SimpleNamespace(_hands=None)
+    assert module.MirrorSessionNode._preset_stop_target(node, None) is None
+    assert module.MirrorSessionNode._preset_stop_target(node, UpperBodyCommand((0.0,) * 14, (0.0,) * 20)) is None
+
+
 def test_old_round_decode_cannot_latch_the_new_round_epoch(monkeypatch):
     from manipulation_execution.preset_motions import match_signal
 
