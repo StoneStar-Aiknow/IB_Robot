@@ -24,6 +24,13 @@ utterance the ASR glued onto chatter ("……跟他说的话你还会做什么�
 graded ``conversation``: the bridge marks the request, and the Agent never turns such a
 request into motion, so the worst a mistaken admission costs is one short spoken answer.
 
+Inside an addressed session, a complete manipulation command ("把苹果抓进黑色的碗里")
+also supplies evidence even when neither the model nor a literal catalog alias knows
+its object/container combination. Bounded noun slots and a whole-sentence match keep
+this exception from admitting a mention of the action inside a discussion. The bridge
+still checks the wake window and the speaker before this gate, and the planner/Gateway
+still decide whether and how an admitted command can execute.
+
 Everything here is ROS-free and standard-library only: the model is a JSON file of
 sparse FNV-1a hashed weights, scoring one sentence takes tens of microseconds, and the
 board needs no extra dependency. ``tools/addressee`` trains and exports that file; the
@@ -258,6 +265,160 @@ def strip_wake_words(text: str, wake_words: tuple[str, ...]) -> str:
     return text
 
 
+# Full commands, not a substring vocabulary: fruit names, colors and container
+# descriptions remain free noun slots rather than another copy of a robot's catalog.
+_MANIPULATION_PREFIX = r"(?:(?:请(?:你|您)?|麻烦(?:你|您)?|帮我|给我)){0,2}"
+_MANIPULATION_OBJECT = r"(?P<object>[\u4e00-\u9fffa-z0-9]{1,16}?)"
+_MANIPULATION_CONTAINER = r"(?P<container>[\u4e00-\u9fffa-z0-9]{0,12}(?:碗|盒子?|箱子?|杯子?|盘子?|篮子?|筐|料框|容器))"
+_MANIPULATION_END = r"(?:里面|里|内)(?:吧)?"
+_MANIPULATION_PATTERNS = (
+    re.compile(
+        _MANIPULATION_PREFIX
+        + r"[把将]"
+        + _MANIPULATION_OBJECT
+        + r"(?P<transfer>抓进|抓紧|抓到|放进|放到|放入|拿到)"
+        + _MANIPULATION_CONTAINER
+        + _MANIPULATION_END
+    ),
+    re.compile(
+        _MANIPULATION_PREFIX
+        + r"(?P<pick>抓取|拿起)"
+        + _MANIPULATION_OBJECT
+        + r"(?:然后|再|并)?(?P<transfer>放进|放到|放入)"
+        + _MANIPULATION_CONTAINER
+        + _MANIPULATION_END
+    ),
+)
+# A noun slot cannot swallow a negation, a reported/conditional clause, a question,
+# or another action. Conservative misses keep using the normal model/planner path.
+_MANIPULATION_SLOT_MARKERS = (
+    "不",
+    "别",
+    "没",
+    "勿",
+    "禁止",
+    "取消",
+    "停止",
+    "如果",
+    "假如",
+    "要是",
+    "假设",
+    "怎么",
+    "怎样",
+    "如何",
+    "什么",
+    "是否",
+    "吗",
+    "呢",
+    "说",
+    "问",
+    "觉得",
+    "以为",
+    "可以",
+    "能不能",
+    "先",
+    "再",
+    "然后",
+    "抓",
+    "放",
+    "拿",
+)
+_MANIPULATION_PAST_ADVERBS = ("已经", "刚刚", "刚才", "曾经", "早已", "早就", "先前", "之前", "以前", "已", "刚")
+
+
+def _manipulation_completed(body: str, match: re.Match[str]) -> bool:
+    """Perfective particles and past adverbs at action boundaries describe completed work.
+
+    Check their grammatical position, not every occurrence inside a noun: a
+    cicada toy (知了玩具) or an already prepared apple is still a valid target.
+    The check is shared by command admission, its high-score veto and correction.
+    """
+    return (
+        body[: match.start("transfer")].endswith(_MANIPULATION_PAST_ADVERBS)
+        or body[: match.start()].endswith(_MANIPULATION_PAST_ADVERBS)
+        or match["container"].startswith(("了", "过"))
+        or body[match.end() :].startswith("了")
+        or (bool(match.groupdict().get("pick")) and match["object"].startswith(("了", "过")))
+    )
+
+
+def _manipulation_match(body: str, original: str) -> re.Match[str] | None:
+    # Normalization removes quotes and question marks, so examine the original too.
+    if any(mark in original for mark in ("?", "？", '"', "'", "“", "”", "‘", "’")):
+        return None
+    for pattern in _MANIPULATION_PATTERNS:
+        match = pattern.fullmatch(body)
+        if (
+            match
+            and not _manipulation_completed(body, match)
+            and not any(
+                marker in match[group] for group in ("object", "container") for marker in _MANIPULATION_SLOT_MARKERS
+            )
+        ):
+            return match
+    return None
+
+
+def _manipulation_noncommand(body: str, original: str) -> bool:
+    """A recognizable transfer inside an explicit negation, quotation or discussion.
+
+    This veto also applies to a high model score: adding command examples must not
+    turn a bag-of-grams model's vocabulary overlap into permission for the opposite.
+    Other requests (including multi-step instructions) keep their existing path.
+    """
+    match = next((match for pattern in _MANIPULATION_PATTERNS if (match := pattern.search(body))), None)
+    if match is None:
+        return False
+    before = body[: match.start("transfer")]
+    after = body[match.end() :]
+    return (
+        _manipulation_completed(body, match)
+        or any(mark in original for mark in ("?", "？", '"', "'", "“", "”", "‘", "’"))
+        or body.endswith(("吗", "呢"))
+        or any(
+            word in before
+            for word in (
+                "不要",
+                "不许",
+                "不能",
+                "不准",
+                "不用",
+                "不想",
+                "没让",
+                "别",
+                "勿",
+                "禁止",
+                "取消",
+                "停止",
+                "如果",
+                "假如",
+                "要是",
+                "假设",
+            )
+        )
+        or before.endswith(("不", "没"))
+        or body.startswith(("刚才", "刚刚", "这句", "听说"))
+        or bool(re.search(r"(?:我|你|他|她|它|有人)说", before))
+        or any(
+            word in after for word in ("这句", "句话", "意图", "说法", "指令", "命令", "识别", "怎么", "怎样", "如何")
+        )
+    )
+
+
+def correct_manipulation_transcript(text: str, *, wake_phrases: tuple[str, ...] = ()) -> str:
+    """Correct 抓紧 only in a complete command that clearly means transfer into a container.
+
+    Preserve the original wording/punctuation and legitimate grip-strength requests
+    ("抓紧苹果不要松手"). The same grammar is used for L3 admission below.
+    """
+    wakes = tuple(sorted((normalize_text(wake) for wake in wake_phrases if wake), key=len, reverse=True))
+    body = strip_fillers(strip_wake_words(normalize_text(text), wakes))
+    match = _manipulation_match(body, text)
+    if match and match["transfer"] == "抓紧":
+        return text.replace("抓紧", "抓进", 1)
+    return text
+
+
 @dataclass(frozen=True)
 class SemanticDecision:
     """One gate verdict, kept whole so the shadow log can be replayed as training data."""
@@ -459,6 +620,12 @@ class SemanticGate:
             return decide(False, "empty after wake-word stripping")
         if address_term and not wake_prefix:
             return decide(True, f"names someone else ({address_term})")
+        if _manipulation_noncommand(body, text):
+            if conversation and session_open and _second_person_question(body):
+                return decide(False, "question to the robot", GRADE_CONVERSATION)
+            if conversation and followup_open and _reply_shaped(body):
+                return decide(False, "follow-up to the robot", GRADE_CONVERSATION)
+            return decide(True, "manipulation reference or negation, not an instruction")
         # A request to talk is addressed to whatever can talk back, and it can only ever
         # start a conversation, so it outranks the model instead of arguing with it.
         if self._phrase_hit(self.dialogue_requests, raw_normalized, body):
@@ -471,6 +638,8 @@ class SemanticGate:
             return decide(False, "skill word")
         if wake_prefix:
             return decide(False, "wake prefix")
+        if session_open and _manipulation_match(body, text):
+            return decide(False, "manipulation command")
         if conversation and session_open and _second_person_question(body):
             # Inside a session the wake word and the voiceprint already opened, a question put
             # to "you" is the robot's to answer, skill word or not: "你是怎么抓水果的" and "你用的

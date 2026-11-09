@@ -43,7 +43,13 @@ from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE, TERMINAL_REQUEST_ST
 from ibrobot_agent.execution_feedback import FeedbackTracker, execution_reply
 from ibrobot_agent.gift_workflow import GiftWorkflowSpeech
 from ibrobot_agent.presentation import presentation_digest
-from ibrobot_agent.semantic_gate import GRADE_CONVERSATION, SEMANTIC_GATE_MODES, SemanticDecision, SemanticGate
+from ibrobot_agent.semantic_gate import (
+    GRADE_CONVERSATION,
+    SEMANTIC_GATE_MODES,
+    SemanticDecision,
+    SemanticGate,
+    correct_manipulation_transcript,
+)
 from ibrobot_agent.speaker_split import SpeakerSplit, TokenAlignment, WindowVoiceprints
 from ibrobot_agent.speech_pipeline import SpeechPipeline
 from ibrobot_agent.speech_policy import GraspSpeechPolicy, MirrorSpeechPolicy
@@ -325,7 +331,7 @@ class VoiceBridgeConfig:
             text = text.replace(variant, term)
         for pattern, replacement in self.text_rewrites:
             text = re.sub(pattern, replacement, text)
-        return text
+        return correct_manipulation_transcript(text, wake_phrases=self.wake_phrases + self.semantic_gate_wake_prefixes)
 
 
 @dataclass(frozen=True)
@@ -968,7 +974,14 @@ class VoiceBridgeCore:
         return any(phrase in normalized for phrase in self.config.stop_phrases)
 
     def _judge_semantics(
-        self, raw: str, normalized: str, now: float, *, session_opened: bool, segment: Segment | None
+        self,
+        raw: str,
+        normalized: str,
+        now: float,
+        *,
+        session_opened: bool,
+        segment: Segment | None,
+        addressed: bool = False,
     ) -> tuple[list[Action] | None, SemanticDecision | None]:
         """Run the L3 gate; returns the actions that stop the utterance (or None) and the verdict.
 
@@ -986,6 +999,12 @@ class VoiceBridgeCore:
         # only the session says which conversation it belongs to.
         session_open = bool(self._state.session_id) and (
             now - self._state.last_activity <= self.config.session_idle_sec
+        )
+        # A wake-only utterance opens L1/L2 before there is an Agent session ID.
+        # Only the caller's successful addressee verdict supplies that evidence;
+        # merely configuring a wake phrase must not enable shape-based admission.
+        session_open = session_open or (
+            addressed and (bool(self.config.wake_phrases) or self.config.addressee_trigger == "vendor_session")
         )
         conversation = self.config.semantic_gate_conversation
         followup_open = conversation and now - self._last_robot_turn <= self.config.semantic_gate_followup_sec
@@ -1042,7 +1061,7 @@ class VoiceBridgeCore:
             # merely mentioning STOP must also pass the enabled intent gate.
             if self._contains_stop(normalized) and normalized not in self.config.stop_phrases:
                 semantic_block, _ = self._judge_semantics(
-                    heard_raw, normalized, now, session_opened=session_opened, segment=segment
+                    heard_raw, normalized, now, session_opened=session_opened, segment=segment, addressed=True
                 )
                 if semantic_block is not None:
                     return semantic_block
@@ -1140,7 +1159,12 @@ class VoiceBridgeCore:
                 )
             return actions
         semantic_block, semantic = self._judge_semantics(
-            heard_raw, normalized, now, session_opened=session_opened, segment=segment
+            heard_raw,
+            normalized,
+            now,
+            session_opened=session_opened,
+            segment=segment,
+            addressed=verdict is not None and verdict.addressed,
         )
         if semantic_block is not None:
             # Vetoed as not meant for the robot, yet it passed the wake and voiceprint checks:

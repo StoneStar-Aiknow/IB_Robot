@@ -81,6 +81,29 @@ python3 tools/addressee/score_text.py --model models/addressee/addressee_zh_v1.j
 (`--lexicon` overrides the catalog-derived list; without it the list comes from
 the skill catalog, which is what the bridge uses.)
 
+Complete manipulation commands also have a session-scoped grammar exception:
+`把<物体>抓进<容器>里`, `把<物体>放进<容器>里`, and
+`抓取<物体>然后放进<容器>里` (including polite forms). It matches the whole
+sentence, bounds the noun slots, and excludes quoted/question forms and clauses
+hidden inside the slots. It supplies command admission only after the bridge's
+wake/voiceprint gate has admitted the utterance. The thresholds and the
+planner/Gateway execution checks remain in force. The bridge corrects `抓紧`
+to `抓进` only in this complete transfer shape; `抓紧苹果不要松手` is unchanged.
+An explicit negation, quotation, conditional, reported or completed transfer remains vetoed
+even if a retrained model scores it highly or it includes a wake prefix. Questions
+can still receive conversation admission, which permits answers only.
+Perfective particles at a verb boundary (`放进了`) and adjacent past adverbs
+(`已经`, `刚刚`) describe completed work; noun slots must not hide them. These
+reports are also excluded from homophone correction. Aspect characters inside
+a noun (`知了玩具`) do not by themselves mark a completed action.
+
+`data/x2_manipulation_20261110.jsonl` contains five intended commands and two
+discussion utterances from the X2 field test/operator report. Append these rows
+to the original labelled corpus when training a candidate model; retain the
+original corpus and evaluate grouped CV and chatter false positives before
+replacing a deployed model. Synthetic contrast sentences belong in regression
+tests rather than being silently mixed into this field-only training set.
+
 `emit_lexicon.py` regenerates the `semantic_gate_lexicon` list from
 `src/agent/skill_catalog/config/skills/*/manifest.yaml` (`description.aliases_zh`,
 minus ordinary dialogue such as 是的 / 同意, which as an override would only
