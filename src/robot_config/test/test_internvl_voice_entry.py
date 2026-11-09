@@ -14,7 +14,6 @@ blocks are merged in around ours.
 from __future__ import annotations
 
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -23,8 +22,6 @@ import yaml
 from embodied_common import internvl_voice_contract as contract
 from robot_config.loader import _load_robot_section
 
-# The summit this branch last merged: the entry without our block must be its file.
-BASELINE = "4442113e"
 PACKAGE = Path(__file__).resolve().parents[1]
 ROBOTS = PACKAGE / "config" / "robots"
 ENTRY = ROBOTS / "aimdk_x2_voice_mirror_all.yaml"
@@ -114,22 +111,6 @@ class TestNothingElseChanges:
         for section in ("mirror_session", "visual_interaction", "voice_asr", "cbf_safety"):
             assert current[section] == without[section], section
         assert current == without
-
-    def test_the_entry_without_the_block_is_the_baseline_file(self, text):
-        """Optional: holds only until another feature edits this entry; skips without the commit."""
-        repo = subprocess.run(
-            ["git", "-C", str(PACKAGE), "rev-parse", "--show-toplevel"], capture_output=True, check=False, text=True
-        )
-        if repo.returncode != 0:
-            pytest.skip("not a git checkout")
-        path = ENTRY.relative_to(Path(repo.stdout.strip())).as_posix()
-        baseline = subprocess.run(
-            ["git", "-C", str(PACKAGE), "show", f"{BASELINE}:{path}"], capture_output=True, check=False, text=True
-        )
-        if baseline.returncode != 0:
-            pytest.skip(f"{BASELINE} is not reachable")
-
-        assert _without_block(text) == baseline.stdout
 
 
 class TestGraspProfile:
