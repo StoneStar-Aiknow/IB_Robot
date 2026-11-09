@@ -48,7 +48,7 @@ STANDBY_POOL = "standby.any"
 # Pools a usable table must have at least one clip in.
 REQUIRED_POOLS = (*EVENT_POOLS.values(), STANDBY_POOL)
 
-ASR_MODES = ("mute", "off", "keep")
+ASR_MODES = ("mute", "off", "session", "keep")
 
 DEFAULT_CLIPS_TABLE = "$(find robot_config)/config/mirror_voice/x2_clips_v1.yaml"
 DEFAULT_CLIP_DIR = "assets/audio/x2_mirror_clips_v1"

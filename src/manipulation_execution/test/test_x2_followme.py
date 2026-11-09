@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
@@ -45,6 +48,79 @@ def test_status_reports_how_far_the_output_runs_behind_the_camera():
     assert status["age_ms"] == 200.0 and status["offset_ms"] == 600.0
 
 
+def _wave(t):
+    return np.array(NEUTRAL) + 0.3 * np.sin(t) * np.array([1, 0, 1, 1, 0, 0, 0] * 2)
+
+
+def _follow(stream, age, until, start=0.0, frame_dt=0.1):
+    """Frames every ``frame_dt`` of camera time, each arriving ``age(t)`` later (None: lost),
+    polled at 50 Hz from ``start`` to ``until``. One (now, samples, status) per poll."""
+    frames = [(t + age(t), t) for t in np.arange(0.0, until, frame_dt) if age(t) is not None]
+    frames.sort()
+    out, i = [], 0
+    for now in np.arange(start, until, 0.02):
+        while i < len(frames) and frames[i][0] <= now:
+            stream.push_pose(frames[i][1], _wave(frames[i][1]))
+            i += 1
+        out.append((now, stream.poll(now), stream.status()))
+    return out
+
+
+def _stalled_until(t_end):
+    # PEAR at ~3 Hz and 0.8 s old while the buffer fills, then 10 Hz and 0.15 s old.
+    return lambda t: (0.8 if round(t * 10) % 3 == 0 else None) if t < t_end else 0.15
+
+
+def test_a_stall_while_filling_is_caught_up_within_five_seconds():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    polls = _follow(stream, _stalled_until(2.0), 20.0)
+    offsets = [s["offset_ms"] for _, _, s in polls if s["offset_ms"] is not None]
+    assert offsets[0] > 1100.0                      # calibrated in the stall
+    caught = [now for now, _, s in polls if s["catchup_rate"] > 0.0]
+    assert caught and caught[-1] - caught[0] < 5.0
+    final = polls[-1][2]
+    assert final["catchups"] == 1 and final["catchup_rate"] == 0.0
+    assert abs(final["offset_ms"] - final["offset_target_ms"]) < 1.0
+    assert final["offset_ms"] < 700.0
+    assert (np.diff(offsets) <= 0.0).all()                 # only ever down
+    live = [samples for now, samples, s in polls if s["phase"] == "live"]
+    assert all(len(samples) == 1 for samples in live)          # still one sample per tick
+    steps = np.abs(np.diff(np.array([p for samples in live for p in samples]), axis=0)).max()
+    assert steps < 0.3 * 0.02 * 1.5, steps                     # the wave at most 1.2x fast, no jump
+    assert final["starved_frames"] == polls[len(polls) // 2][2]["starved_frames"]
+
+
+def test_without_a_stall_the_offset_never_moves():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    rng = np.random.default_rng(0)
+    ages = {round(t, 1): a for t, a in zip(np.arange(0.0, 30.0, 0.1), rng.uniform(0.12, 0.3, 300))}
+    polls = _follow(stream, lambda t: ages[round(t, 1)], 30.0)
+    offsets = {s["offset_ms"] for _, _, s in polls if s["offset_ms"] is not None}
+    assert len(offsets) == 1
+    assert polls[-1][2]["catchups"] == 0 and polls[-1][2]["caught_up_ms"] == 0.0
+
+
+def test_a_second_stall_or_a_reentry_while_catching_up_stops_it():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, latency_s=0.4)
+    stream.start_round()
+    polls = _follow(stream, _stalled_until(2.0), 7.0)
+    assert polls[-1][2]["catchup_rate"] > 0.0
+    # PEAR stalls again: the ages climb back over the offset and the catch-up stops.
+    again = _follow(stream, lambda t: 0.15 if t < 6.9 or t > 10.0 else (1.2 if t > 9.0 else None), 10.5, start=7.0)
+    stopped = [s for _, _, s in again if s["catchup_rate"] == 0.0]
+    assert stopped and stopped[0]["offset_ms"] <= stopped[0]["offset_target_ms"] + 0.1
+    offsets = [s["offset_ms"] for _, _, s in polls + again if s["offset_ms"] is not None]
+    assert (np.diff(offsets) <= 0.0).all()
+    # A re-entry recalibrates from scratch and drops the catch-up; the counts carry on.
+    caught = again[-1][2]["caught_up_ms"]
+    stream.start_round(from_pose=again[-1][1][-1] if again[-1][1] else NEUTRAL)
+    status = stream.status()
+    assert status["catchup_rate"] == 0.0 and status["offset_ms"] is None and status["offset_target_ms"] is None
+    assert status["catchups"] >= 1 and status["caught_up_ms"] == caught
+
+
 def test_a_round_from_a_pose_parks_on_it_then_blends_into_the_person():
     stream = create_stream("x2_followme", base_pose=NEUTRAL)
     inside = np.array([1, 0, 1, 1, 1, 0, 0] * 2)  # joints with room either way of neutral
@@ -79,7 +155,7 @@ def test_branch_guard_survives_trimmed_history():
     frames = [stream._frame(i * 0.05, i, _raw(body_index, axis, a)) for i, a in enumerate(angles)]
 
     def run(max_anchor_frames):
-        retargeter = core.StreamRetargeter(ref._v, ref.kinematics, ref.ledger,
+        retargeter = core.StreamRetargeter(stream._vendor, ref.kinematics, ref.ledger,
                                            max_anchor_frames=max_anchor_frames, mirror=False)
         return np.array([retargeter.push(f) for f in frames]), retargeter
 
@@ -152,7 +228,7 @@ def test_a_mapping_process_gives_the_in_process_poses_and_counts():
             np.testing.assert_array_equal(mine, theirs)
         local_status, remote_status = local.status(), remote.status()
         assert remote_status["branch_guard_trips"] > 0
-        for key in ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets", "notes"):
+        for key in ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets", "shoulder_ik", "notes"):
             assert remote_status[key] == local_status[key], key
         with pytest.raises(ValueError, match="smplx_pose_raw"):
             remote.retarget(2.0, 99, np.zeros(5))
@@ -305,3 +381,142 @@ def test_the_mapping_process_moves_the_spin_too_and_status_says_so():
         remote.close()
     status = create_stream("x2_followme", base_pose=NEUTRAL).status()
     assert (status["elbow_spin_to_wrist"], status["elbow_spin_gain"]) == (False, followme.ELBOW_SPIN_GAIN)
+
+
+# The shoulders: _vendor/shoulder_ik solves pitch/roll/yaw for her upper arm's direction.
+LEFT_SHOULDER, RIGHT_SHOULDER = 16, 17               # indices into the 52 rotations
+ROLLS = [1, 8]
+# Branch A: |roll| <= 90 deg, plus the 0.0002 deg the mirror adds to roll (Trajectory.mirrored).
+ROLL_BOUND = np.pi / 2 + np.radians(0.001)
+
+
+def _arms_raised(stream, elevation, azimuth):
+    # Both upper arms swung (no twist) from hanging to `elevation` deg up, `azimuth` deg
+    # from her front towards her side (0 in front, 90 out to the side), mirror images.
+    e, a = np.radians(elevation), np.radians(azimuth)
+    left = np.array([np.sin(e) * np.sin(a), -np.cos(e), np.sin(e) * np.cos(a)])  # SMPL-X: left, up, front
+    rotations = np.tile(np.eye(3), (52, 1, 1))
+    for shoulder, elbow, her in ((LEFT_SHOULDER, LEFT_ELBOW, left), (RIGHT_SHOULDER, RIGHT_ELBOW, left * [-1, 1, 1])):
+        rest = stream._fk.offsets[elbow] / np.linalg.norm(stream._fk.offsets[elbow])
+        axis = np.cross(rest, her)
+        angle = np.arctan2(np.linalg.norm(axis), rest @ her)
+        rotations[shoulder] = Rotation.from_rotvec(angle * axis / np.linalg.norm(axis)).as_matrix()
+    return encode_rotation_6d(rotations).reshape(-1)
+
+
+def _pointing_error_deg(stream, pose, raw):
+    # Per robot arm, the angle between its upper arm and hers (both arms raised alike).
+    retargeter = stream._stream.retargeter
+    animation = retargeter._animation([stream._frame(0.0, 0, raw)])
+    kinematics = retargeter.kinematics
+    kinematics.set_arm(pose)
+    errors = []
+    for side in ("left", "right"):
+        her = followme.readouts.twist_indicators(animation, side)["bone"][-1]
+        robot = kinematics.anchor(f"{side}_elbow_joint") - kinematics.anchor(f"{side}_shoulder_roll_joint")
+        errors.append(np.degrees(np.arccos(np.clip(robot @ her / np.linalg.norm(robot), -1.0, 1.0))))
+    return np.array(errors)
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+@pytest.mark.parametrize("azimuth", [20.0, 45.0, 90.0])
+def test_arms_raised_overhead_point_overhead(mirror, azimuth):
+    # The vendor's readouts counted the lift twice past the horizontal: overhead its
+    # roll read ~150 deg too and the arm pointed 100-140 deg off, behind her.
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, mirror=mirror)
+    vendor = core.StreamRetargeter(stream._vendor, stream._stream.retargeter.kinematics,
+                                   stream._stream.retargeter.ledger, mirror=mirror)
+    for i, elevation in enumerate(np.linspace(1.0, 160.0, 90)):   # 3 s, slow enough for 360 deg/s
+        raw = _arms_raised(stream, elevation, azimuth)
+        pose, before = stream.retarget(i / 30, i, raw), vendor.push(stream._frame(i / 30, i, raw))
+        assert np.abs(pose[ROLLS]).max() <= ROLL_BOUND
+    assert _pointing_error_deg(stream, pose, raw).max() < 15.0
+    assert _pointing_error_deg(stream, before, raw).min() > 90.0
+
+
+def test_shoulder_roll_stays_on_one_branch_for_any_pose():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    for i, rotations in enumerate(_people(200, seed=4)):
+        pose = stream.retarget(i / 15, i, encode_rotation_6d(rotations).reshape(-1))
+        assert np.abs(pose[ROLLS]).max() <= ROLL_BOUND, i
+
+
+def _motion(count, seed, scale):
+    # Smooth random motion of every joint at 15 Hz, as 6D rows; scale 2 crosses the wrist's Euler cut.
+    rng = np.random.default_rng(seed)
+    knots = rng.normal(size=(count // 15 + 2, 52, 3)) * scale
+    t = np.arange(count) / 15.0
+    rotvecs = np.stack([np.stack([np.interp(t, np.arange(len(knots)), knots[:, j, k]) for k in range(3)], -1)
+                        for j in range(52)], 1)
+    return t, encode_rotation_6d(Rotation.from_rotvec(rotvecs.reshape(-1, 3)).as_matrix()).reshape(count, -1)
+
+
+def test_the_shoulder_speedups_keep_the_output():
+    # followme_feaebe22.npz is this exact run on feaebe22, before the shoulder solver skipped
+    # yaw_need for candidates that cannot win and reused its answers; there the twist cost
+    # decided on 138 of the 540 solver steps. Bit for bit on x86. On the 310P (aarch64) both
+    # feaebe22 and the patched code land up to 5e-7 rad off x86, identical to each other; skipping
+    # a candidate that could win or reusing the wrong answer moves joints by 0.2 rad or more.
+    golden = np.load(Path(__file__).resolve().parent / "data" / "x2_shoulder_ik" / "followme_feaebe22.npz")
+    for seed, scale, mirror in ((0, 0.6, True), (1, 2.0, True), (2, 1.2, False)):
+        t, raw = _motion(90, seed, scale)
+        stream = create_stream("x2_followme", base_pose=NEUTRAL, mirror=mirror, elbow_spin_to_wrist=True,
+                               elbow_spin_gain=1.0)
+        poses = []
+        for i, (ti, row) in enumerate(zip(t, raw, strict=True)):
+            if i == 60:
+                stream.reset_input()
+            poses.append(stream.retarget(ti, i, row))
+        np.testing.assert_allclose(poses, golden[f"seed{seed}"], rtol=0, atol=1e-5, err_msg=f"seed {seed}")
+
+
+def test_her_arms_reads_what_twist_indicators_does():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    retargeter = stream._stream.retargeter
+    _, raw = _motion(30, 3, 2.0)
+    animation = retargeter._animation([stream._frame(i / 15, i, row) for i, row in enumerate(raw)])
+    arms = followme._her_arms(animation, "plane")
+    for side in ("left", "right"):
+        full = followme.readouts.twist_indicators(animation, side)
+        assert arms[side].keys() == {"bone", "plane", "conditioning"}
+        for key, value in arms[side].items():
+            np.testing.assert_array_equal(value, full[key])
+    assert followme._her_arms(animation, "spin")["left"].keys() == full.keys()
+
+
+def test_shoulder_geometry_is_the_ports():
+    # The port exported geometry_x2.json from the same x2_ultra.xml (md5 6992648c...).
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    data = json.loads((Path(__file__).resolve().parent / "data" / "x2_shoulder_ik" / "geometry_x2.json").read_text())
+    for side, geometry in stream._shoulders.items():
+        port = followme.ShoulderGeometry.from_dict(data["sides"][side])
+        for field in ("pitch_axis", "roll_axis", "rest_dir", "pitch_limit", "roll_limit", "yaw_limit"):
+            np.testing.assert_allclose(getattr(geometry, field), getattr(port, field), atol=1e-9, err_msg=field)
+
+
+def test_a_wrong_shoulder_geometry_is_refused(monkeypatch):
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    retargeter = stream._stream.retargeter
+    anchor = retargeter.kinematics.anchor
+    # The upper arm measured from the pitch joint, as the port warns against: 1.4 deg off.
+    monkeypatch.setattr(retargeter.kinematics, "anchor",
+                        lambda name: anchor(name.replace("shoulder_roll", "shoulder_pitch")))
+    with pytest.raises(RuntimeError, match="shoulder geometry"):
+        followme.shoulder_geometry(retargeter.kinematics, retargeter.ledger)
+
+
+def test_reset_input_starts_new_shoulder_solvers_and_keeps_their_counts():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    for i, elevation in enumerate(np.linspace(1.0, 160.0, 20)):
+        stream.retarget(i / 30, i, _arms_raised(stream, elevation, 90.0))
+    before = stream.status()["shoulder_ik"]
+    assert before["left"]["frames"] == 20 and before["left"]["rate_limited"] > 0
+    old = stream._stream.retargeter.solvers
+    stream.reset_input()
+    assert stream.status()["shoulder_ik"] == before
+    solvers = stream._stream.retargeter.solvers
+    assert all(solvers[side] is not old[side] and solvers[side].stats["frames"] == 0 for side in old)
+    # A fresh solver does not rate-limit its first frame: the arm lands at once.
+    pose = stream.retarget(5.0, 20, _arms_raised(stream, 1.0, 90.0))
+    assert _pointing_error_deg(stream, pose, _arms_raised(stream, 1.0, 90.0)).max() < 20.0
+    assert stream.status()["shoulder_ik"]["left"]["frames"] == 21
