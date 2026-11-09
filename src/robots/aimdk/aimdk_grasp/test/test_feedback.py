@@ -104,8 +104,20 @@ def test_only_explicitly_installed_hands_are_required(sides):
                     feedback.hand(side)
 
 
-@pytest.mark.parametrize("names", [(), RIGHT_HAND[:-1], LEFT_HAND + RIGHT_HAND])
-def test_missing_partial_or_unexpected_hand_feedback_cannot_change_the_mounting_configuration(names):
+def test_a_reported_hand_declared_not_installed_is_dropped():
+    history = FeedbackHistory(required_hands=("left",))
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, LEFT_HAND + RIGHT_HAND, [0.1] * 10 + [0.2] * 10)
+    feedback = history.latest()
+    np.testing.assert_allclose(feedback.hand("left"), [0.1] * 10)
+    assert feedback.right_hand is None
+    with pytest.raises(ValueError, match="right"):
+        feedback.hand("right")
+
+
+@pytest.mark.parametrize("names", [(), RIGHT_HAND[:-1], LEFT_HAND])
+def test_missing_or_partial_hand_feedback_cannot_change_the_mounting_configuration(names):
     history = FeedbackHistory(required_hands=("right",))
     history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
     history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])

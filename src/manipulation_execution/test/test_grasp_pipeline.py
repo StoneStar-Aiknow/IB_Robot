@@ -878,3 +878,62 @@ def test_a_retained_pick_hears_the_close_before_the_lift_and_a_failing_hook_chan
     outcome = run(backends, on_held=lambda *context: None, on_closed=broken)
     assert outcome.success and names(executor) == ["approach", "grasp", "lift", "hold"]
     assert outcome.report["on_closed_errors"] == ["RuntimeError: worker gone"]
+
+
+def test_a_prefetched_preshape_runs_while_planning_and_is_not_repeated():
+    import threading
+
+    backends, executor, effector, planner, _ = streaming()
+    started = threading.Event()
+    effector.on_act = lambda action: action is EffectorAction.PRESHAPE and started.set()
+    plan = planner.plan
+
+    def planning(*args, **kwargs):
+        # The hand is opening while the plan is computed, not after it.
+        assert started.wait(5.0), "the preshape did not start while planning"
+        return plan(*args, **kwargs)
+
+    planner.plan = planning
+    outcome = run(backends, config=PipelineConfig(prefetch_preshape=True))
+    assert outcome.success and outcome.held is True
+    assert effector.log == [EffectorAction.PRESHAPE, EffectorAction.CLOSE]
+    assert outcome.completed_phases[:4] == ["observe", "perceive", "plan", "preshape"]
+    (row,) = outcome.report["preshape_prefetch"]
+    assert row["succeeded"] is True and row["s"] >= 0
+
+
+@pytest.mark.parametrize("failure", ["blocked", "supervision"])
+def test_a_failed_prefetched_preshape_is_run_again_by_the_sequence(failure):
+    backends, executor, effector, _, _ = streaming()
+    act = effector.act
+    calls = []
+
+    def acting(action, *, halted, cancelled):
+        calls.append(action)
+        if action is EffectorAction.PRESHAPE and len(calls) == 1:
+            effector.log.append(action)
+            if failure == "supervision":
+                # The arm leaves its command while the hand opens: the supervision stops the action.
+                executor.supervision = "tracking anomaly while holding"
+                assert cancelled()
+                executor.supervision = ""
+                return EffectorOutcome(False, "cancelled during preshape")
+            return EffectorOutcome(False, "hand blocked 0.2 rad short of open")
+        return act(action, halted=halted, cancelled=cancelled)
+
+    effector.act = acting
+    outcome = run(backends, config=PipelineConfig(prefetch_preshape=True))
+    assert outcome.success and outcome.held is True
+    assert calls[:2] == [EffectorAction.PRESHAPE, EffectorAction.PRESHAPE]
+    (row,) = outcome.report["preshape_prefetch"]
+    assert ("fault" in row) if failure == "supervision" else (row["succeeded"] is False)
+
+
+def test_a_planning_failure_waits_for_the_prefetched_preshape_and_does_not_move_the_arm():
+    backends, executor, effector, planner, _ = streaming()
+    planner.failures = [GraspFailure("NO_EXECUTABLE_CANDIDATE", "nothing reachable")]
+    outcome = run(backends, config=PipelineConfig(prefetch_preshape=True, max_attempts=1))
+    assert not outcome.success and outcome.error_code == "NO_EXECUTABLE_CANDIDATE"
+    assert effector.log == [EffectorAction.PRESHAPE] and names(executor) == []
+    (row,) = outcome.report["preshape_prefetch"]
+    assert row["succeeded"] is True

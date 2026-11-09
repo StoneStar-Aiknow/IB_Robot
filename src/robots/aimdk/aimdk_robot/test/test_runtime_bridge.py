@@ -3303,3 +3303,54 @@ def test_display_trajectory_tolerance_opt_out_requires_runtime_profile_opt_in(tm
         assert ("final pose not verified" if opt_in else "did not follow") in result.error_string
     finally:
         harness.shutdown()
+
+
+def test_a_planned_motion_takes_over_from_the_platforms_target(tmp_path):
+    """OR1/AP1 (2026-11-09): from the measured pose the command stepped 0.11-0.16 rad and the arm rang at 3-5 Hz."""
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        origin = [0.12] * len(projection.VENDOR_ARM_ORDER)
+        harness.runtime.arm_takeover_start = lambda measured: list(origin)
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.5], 1.0)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, result.result.error_string
+        # The joints the goal does not name hold the target the platform was driving.
+        harness.wait_for(
+            lambda: harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(-0.5, abs=1e-6),
+            "the final target on the vendor wire",
+        )
+        assert harness.mock.last_upper_body.arm_pos[0] == pytest.approx(0.12, abs=1e-6)
+    finally:
+        harness.shutdown()
+
+
+def _echo(positions):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(name=list(projection.VENDOR_ARM_ORDER), position=list(positions))
+
+
+@pytest.mark.parametrize(
+    "offset,age_s,expect_commanded",
+    [(0.11, 0.0, True), (0.31, 0.0, False), (0.11, 1.0, False)],
+    ids=["load_sag", "unrelated_target", "stale_echo"],
+)
+def test_the_takeover_start_is_the_platforms_target_only_when_it_describes_this_arm(offset, age_s, expect_commanded):
+    import threading
+    import time as clock
+    from types import SimpleNamespace
+
+    from aimdk_robot.runtime_node import AimdkRuntimeNode
+
+    count = len(projection.VENDOR_ARM_ORDER)
+    node = SimpleNamespace(_lock=threading.RLock(), _arm_command_echo=None)
+    measured = [0.0] * count
+    assert AimdkRuntimeNode.arm_takeover_start(node, measured) == measured  # no echo yet
+    AimdkRuntimeNode._on_arm_command_state(node, _echo([offset] * count))
+    commanded, received = node._arm_command_echo
+    node._arm_command_echo = (commanded, received - age_s)
+    assert clock.monotonic() >= received - age_s
+    assert AimdkRuntimeNode.arm_takeover_start(node, measured) == ([offset] * count if expect_commanded else measured)

@@ -1,5 +1,6 @@
 """Placement contract: release once, stop on faults, preserve custody facts."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -62,6 +63,38 @@ def test_release_retreat_and_verification_are_all_required_for_success():
     assert outcome.verification == "success" and np.allclose(backends.executor.position, 0)
     assert backends.effector.log == [EffectorAction.RELEASE]
     assert "verify_place" in outcome.completed_phases
+
+
+def test_without_visual_verification_the_confirmed_release_is_the_success():
+    """The summit bowl has a slide: a correctly placed fruit leaves it, so looking in the bowl fails a good place."""
+
+    def never(*args, **kwargs):
+        raise AssertionError("verification is off")
+
+    held, backends = fixture()
+    backends = replace(backends, verifier=SimpleNamespace(verify=never))
+    outcome = PlacePipeline(backends, verify_placement=False).run(
+        held, "a bowl", deadline=float("inf"), cancelled=lambda: False
+    )
+    assert outcome.success and outcome.release_status == "released" and outcome.custody_outcome == "released"
+    assert outcome.verification == "not_run" and outcome.execution_detail.verification_status == "NOT_RUN"
+    assert outcome.execution_detail.place_succeeded
+    assert "observe_placed" not in outcome.completed_phases and "verify_place" not in outcome.completed_phases
+
+
+def test_without_visual_verification_an_unconfirmed_release_still_fails():
+    held, backends = fixture(release_confirmed=False)
+    outcome = PlacePipeline(backends, verify_placement=False).run(
+        held, "a bowl", deadline=float("inf"), cancelled=lambda: False
+    )
+    assert not outcome.success and outcome.reason_code
+
+
+@pytest.mark.parametrize("value", [0, "false", None])
+def test_invalid_verify_placement_is_rejected(value):
+    _, backends = fixture()
+    with pytest.raises(ValueError, match="verify_placement"):
+        PlacePipeline(backends, verify_placement=value)
 
 
 @pytest.mark.parametrize("reason", ["PLACE_UNSEEN", "PLACED_OUTSIDE"])

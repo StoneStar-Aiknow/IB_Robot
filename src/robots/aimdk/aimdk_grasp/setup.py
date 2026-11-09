@@ -28,6 +28,7 @@ setup(
             "mirror_x2_side_config = aimdk_grasp.mirror_side:main",
             "export_x2_leg_obstacle = aimdk_grasp.leg_obstacle:main",
             "replay_x2_plan_inputs = aimdk_grasp.plan_replay:main",
+            "replay_x2_place_inputs = aimdk_grasp.place_replay:main",
             "x2_grasp_head_node = aimdk_grasp.grasp_head:main",
         ],
     },

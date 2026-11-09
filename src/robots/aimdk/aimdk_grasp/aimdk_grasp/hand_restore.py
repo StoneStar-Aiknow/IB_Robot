@@ -55,6 +55,11 @@ COMMAND_DRIFT_RAD = 0.005
 TRACKING_RAD = 0.2
 #: Two seconds of observation after the hands are released.
 OBSERVE_S = 2.0
+#: The observation when the preparation commanded nothing: the arms were already
+#: at the pose, no takeover was needed and every hand was already open (live
+#: 2026-11-09: 2.04-2.09 s of every pick's ~3 s preparation, with the robot still).
+#: The same checks run on fresh samples; only the window is shorter.
+UNMOVED_OBSERVE_S = 0.3
 #: Measured within tolerance for this long (s) counts as settled.
 SETTLE_S = 0.2
 #: One drive loop (all frames and the settle wait) may not take longer.
@@ -723,11 +728,18 @@ class HandRestorer:
                 raise RestoreError("HAND_PRESERVED_MOVED", f"{other} hand moved between preparation stages")
         return held
 
-    def confirm(self, ctx: RestoreContext, sides: Sequence[str], arm_check: Callable[[], None]) -> None:
-        """Observe the released hands and the arms together for :data:`OBSERVE_S`; any change is a failure."""
+    def confirm(
+        self, ctx: RestoreContext, sides: Sequence[str], arm_check: Callable[[], None], duration: float = OBSERVE_S
+    ) -> None:
+        """Observe the released hands and the arms together for ``duration`` s; any change is a failure.
+
+        :data:`OBSERVE_S` after any motion; :data:`UNMOVED_OBSERVE_S` only when nothing was commanded.
+        """
+        if duration not in (OBSERVE_S, UNMOVED_OBSERVE_S):
+            raise ValueError(f"confirmation window must be OBSERVE_S or UNMOVED_OBSERVE_S, got {duration!r}")
         ctx.progress("confirming", 0.0)
         obs = self._observe(ctx)
-        self._confirm(ctx, sides, arm_check, OBSERVE_S, obs)
+        self._confirm(ctx, sides, arm_check, duration, obs)
 
     def _confirm(self, ctx, sides, arm_check, duration, first):
         """Require new samples throughout the hold; cached feedback cannot prove stability."""

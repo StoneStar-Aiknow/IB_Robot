@@ -17,6 +17,7 @@ the result; nothing here imports ROS.
 from __future__ import annotations
 
 import enum
+import threading
 import time
 from collections.abc import Callable
 from copy import deepcopy
@@ -24,7 +25,16 @@ from dataclasses import dataclass, field, replace
 
 from embodied_common.execution_detail import ExecutionDetail
 
-from .contracts import Flag, GraspBackends, GraspFailure, GraspPlan, Observation, Proposals
+from .contracts import (
+    EffectorAction,
+    EffectorOutcome,
+    Flag,
+    GraspBackends,
+    GraspFailure,
+    GraspPlan,
+    Observation,
+    Proposals,
+)
 from .outcome_message import failure_action
 from .sequence import GraspSequence, PhaseCallback
 
@@ -50,10 +60,16 @@ class PipelineConfig:
     home_tolerance_rad: float = 0.02
     #: Put the object back after every successful pick, whether or not the goal asks to.
     release_after_success: bool = False
+    #: Run the plan's PRESHAPE while planning instead of after it. The preshape does not
+    #: depend on the candidate; on the X2 it opens the hand (~0.6 s) while the Orin plans
+    #: (1.8-2.9 s), supervised as in the sequence. Its outcome is recorded as the plan's
+    #: first PRESHAPE step; a failed or unfinished one is run there again.
+    prefetch_preshape: bool = False
 
     def __post_init__(self):
-        if not isinstance(self.release_after_success, bool):
-            raise ValueError("release_after_success must be a boolean")
+        for name in ("release_after_success", "prefetch_preshape"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
         for name in ("max_attempts", "max_moved_replans", "max_regrasps"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < (1 if name == "max_attempts" else 0):
@@ -218,7 +234,11 @@ class GraspPipeline:
                         "perceive", phase, steps, backends.proposer.propose, observation, query, **budget
                     )
                     self._check_budget(cancelled, deadline)
-                    plan = self._step("plan", phase, steps, backends.planner.plan, observation, proposals, **budget)
+                    preshape = self._prefetch_preshape(stop) if mode is PickMode.EXECUTE else None
+                    try:
+                        plan = self._step("plan", phase, steps, backends.planner.plan, observation, proposals, **budget)
+                    finally:
+                        preshaped = self._preshape_result(preshape, outcome)
                     self._check_budget(cancelled, deadline)
                 except GraspFailure as failure:
                     planning_failures += 1
@@ -252,7 +272,15 @@ class GraspPipeline:
                 # but stopping on it mid-sequence would leave an object lifted in
                 # the air. A caller that must stop at its deadline cancels the goal.
                 result = self._execute(
-                    observation, proposals, plan, deadline, cancelled, phase, release_after_success, outcome
+                    observation,
+                    proposals,
+                    plan,
+                    deadline,
+                    cancelled,
+                    phase,
+                    release_after_success,
+                    outcome,
+                    preshaped=preshaped,
                 )
                 if (
                     result.retreated is not None
@@ -302,8 +330,72 @@ class GraspPipeline:
         except Exception as exc:  # noqa: BLE001 - every failure ends the goal with a code
             return self._fail(outcome, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
 
+    def _prefetch_preshape(self, stop: Flag):
+        """Start the PRESHAPE on a thread while planning; None when not configured or not offered.
+
+        Supervised as GraspSequence._act supervises it: the arm is not commanded,
+        and a hand that drags it or a controller that drops its target stops it.
+        """
+        effector = self._backends.effector
+        if not self._config.prefetch_preshape or getattr(effector, "act", None) is None:
+            return None
+        supervise = getattr(self._backends.executor, "supervise", None)
+        box: dict = {"began": time.monotonic()}
+
+        def run() -> None:
+            try:
+                check = supervise() if supervise is not None else (lambda: "")
+
+                def stopped() -> bool:
+                    if stop():
+                        return True
+                    reason = check()
+                    if reason:
+                        box["fault"] = reason
+                    return bool(reason)
+
+                box["outcome"] = effector.act(EffectorAction.PRESHAPE, halted=lambda: False, cancelled=stopped)
+            except Exception as exc:  # noqa: BLE001 - the sequence runs the preshape itself
+                box["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                box["ended"] = time.monotonic()
+
+        thread = threading.Thread(target=run, name="prefetch-preshape", daemon=True)
+        box["thread"] = thread
+        thread.start()
+        return box
+
+    @staticmethod
+    def _preshape_result(box, outcome) -> EffectorOutcome | None:
+        """Wait for the prefetched PRESHAPE; its successful, unsupervision-faulted outcome or None."""
+        if box is None:
+            return None
+        box["thread"].join()
+        row = {"s": round(box["ended"] - box["began"], 3)}
+        result = box.get("outcome")
+        if "error" in box:
+            row["error"] = box["error"]
+        elif box.get("fault"):
+            row["fault"] = box["fault"]
+        elif result is not None:
+            row.update(succeeded=bool(result.succeeded), reason=result.reason)
+        outcome.report.setdefault("preshape_prefetch", []).append(row)
+        if result is None or box.get("fault") or "error" in box or not result.succeeded or result.halted:
+            return None
+        return result
+
     def _execute(
-        self, observation: Observation, proposals: Proposals, plan: GraspPlan, deadline, stop, phase, release, outcome
+        self,
+        observation: Observation,
+        proposals: Proposals,
+        plan: GraspPlan,
+        deadline,
+        stop,
+        phase,
+        release,
+        outcome,
+        *,
+        preshaped: EffectorOutcome | None = None,
     ):
         watch = self._backends.watch
         watched = getattr(watch, "phase", None)
@@ -330,7 +422,9 @@ class GraspPipeline:
         outcome.at_rest = False
         outcome.execution_detail = replace(outcome.execution_detail, recovery_state="UNKNOWN")
         try:
-            result = sequence.run(plan, deadline=deadline, cancelled=stop, release_after_success=release)
+            result = sequence.run(
+                plan, deadline=deadline, cancelled=stop, release_after_success=release, preshaped=preshaped
+            )
         finally:
             # From the arm's last step to the terminal record (the handover to a place).
             sequence_done = time.monotonic()

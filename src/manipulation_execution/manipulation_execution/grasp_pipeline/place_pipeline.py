@@ -34,7 +34,9 @@ class PlaceOutcome:
 
 
 class PlacePipeline:
-    def __init__(self, backends, *, max_attempts=2, execute_reserve_s=15.0, clock=time.monotonic):
+    def __init__(
+        self, backends, *, max_attempts=2, execute_reserve_s=15.0, verify_placement=True, clock=time.monotonic
+    ):
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be positive")
         if (
@@ -46,6 +48,9 @@ class PlacePipeline:
             raise ValueError("execute_reserve_s must be finite and non-negative")
         self.backends, self.max_attempts, self.clock = backends, max_attempts, clock
         self.execute_reserve_s = float(execute_reserve_s)
+        if type(verify_placement) is not bool:
+            raise ValueError("verify_placement must be a boolean")
+        self.verify_placement = verify_placement
 
     def run(self, held, query, *, deadline, cancelled, on_phase=lambda *_: None):
         result, starts = PlaceOutcome(), {}
@@ -224,18 +229,24 @@ class PlacePipeline:
                 raise GraspFailure(
                     "CANCELED" if cancelled() else "SKILL_TIMEOUT", "placement released; verification did not finish"
                 )
-            after = call("observe_placed", backends.observation.capture)
+            # A container that passes the object on (a slide) has nothing left to look at.
+            if self.verify_placement:
+                after = call("observe_placed", backends.observation.capture)
 
-            def verify(*, deadline, cancelled):
-                verdict = backends.verifier.verify(after, plan, held, deadline=deadline, cancelled=cancelled)
-                result.report["verification"] = dict(verdict.report)
-                result.verification = (
-                    "success" if verdict.success else "uncertain" if verdict.reason_code == "PLACE_UNSEEN" else "failed"
-                )
-                if not verdict.success:
-                    raise GraspFailure(verdict.reason_code or "PLACE_UNSEEN", "placement could not be verified")
+                def verify(*, deadline, cancelled):
+                    verdict = backends.verifier.verify(after, plan, held, deadline=deadline, cancelled=cancelled)
+                    result.report["verification"] = dict(verdict.report)
+                    result.verification = (
+                        "success"
+                        if verdict.success
+                        else "uncertain"
+                        if verdict.reason_code == "PLACE_UNSEEN"
+                        else "failed"
+                    )
+                    if not verdict.success:
+                        raise GraspFailure(verdict.reason_code or "PLACE_UNSEEN", "placement could not be verified")
 
-            call("verify_place", verify)
+                call("verify_place", verify)
         except GraspFailure as failure:
             remember_failure(failure.reason_code, str(failure))
             result.reason_code, result.message = failure.reason_code, str(failure)
@@ -293,7 +304,8 @@ class PlacePipeline:
                         )
                         result.message = str(exc)
                         result.custody_outcome = "uncertain"
-        result.success = not result.reason_code and result.verification == "success"
+        # Without visual verification the confirmed release is the success; the status stays NOT_RUN.
+        result.success = not result.reason_code and (result.verification == "success" or not self.verify_placement)
         result.execution_detail = place_execution_detail(
             result.execution_detail,
             release_status=result.release_status.upper(),

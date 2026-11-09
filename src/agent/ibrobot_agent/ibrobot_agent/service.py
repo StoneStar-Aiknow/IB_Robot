@@ -56,6 +56,7 @@ from ibrobot_agent.planner import (
     _HYPOTHETICAL_MARKERS,
     _NEGATION_MARKERS,
     RulePlanner,
+    append_return_after_place,
     direct_command_outcome,
     fruit_delivery_from_config,
     planner_outcome_from_payload,
@@ -191,6 +192,7 @@ class AgentService:
         robot_scope: str = "so101_single_arm",
         direct_commands: Mapping[str, str] | None = None,
         fruit_delivery: Mapping[str, str] | None = None,
+        return_after_place: str | None = None,
         pose_preview: PosePreviewPort | None = None,
         pose_skills: frozenset[str] = frozenset({"free_pose"}),
         pose_memory: PoseMemoryPort | None = None,
@@ -208,6 +210,7 @@ class AgentService:
         self._allowed_skills = frozenset(allowed_skills or ())
         self._robot_scope = robot_scope
         self._fruit_delivery = fruit_delivery_from_config({"fruit_delivery": fruit_delivery})
+        self._return_after_place = return_after_place
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
@@ -571,6 +574,7 @@ class AgentService:
                 raise RuntimeError("Gateway registry is not ready")
             if status.get("control_plane_ready", True) is False:
                 raise RuntimeError("Gateway control plane is not ready")
+            outcome = append_return_after_place(outcome, self._return_after_place)
             outcome = self._bind_catalog_targets(outcome, catalog)
             self._validate_workflow(outcome, catalog)
             outcome = self._bind_step_schema_versions(outcome, catalog)

@@ -23,6 +23,7 @@ constants.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -34,6 +35,8 @@ from manipulation_execution.grasp_pipeline.streaming import JointSample, receive
 
 from .hand import PRESERVED_HAND_DRIFT_RAD, HandMapping, is_open
 from .joints import ABSENT_HAND_COMMAND, HAND_PARTS, check_side, other_side
+
+_LOG = logging.getLogger(__name__)
 
 HAND_HZ = 50.0
 HAND_STEP_RAD = 0.01
@@ -72,6 +75,15 @@ GRIP_LOST_S = 0.2
 # last grip's levels would freeze every finger of the next close at once.
 TOUCH_MAX_AGE_S = 0.1
 CONTACT_LAG_RAD = 0.15
+# A grip is the thumb and one finger, but stopping there left the other fingers
+# in the air and the grip at the force of first contact: live 2026-11-09 fruit
+# held by two or three fingers slid out during the lift (OR2: the fingers crept
+# 0.34 -> 0.41 rad onto their command 0.7 s after it). After the grip the other
+# fingers close for at most this long, each until it touches.
+CLOSE_REST_MAX_S = 0.4
+# Then the contact fingers' flex commands advance this far, in CLOSE_SQUEEZE_S, for grip force.
+CLOSE_SQUEEZE_RAD = 0.06
+CLOSE_SQUEEZE_S = 0.3
 # Native joint indices per finger (HAND_PARTS order, either hand), flex joint, touch pad.
 FINGERS = {
     "thumb": ((0, 1, 2), 2, "thumb"),
@@ -194,7 +206,9 @@ class OmniHandEffector:
     mapping: HandMapping
     feedback_max_age_s: float = 0.1
     #: The other hand is not installed (``backend_options.installed_hands``): its
-    #: slots carry ``ABSENT_HAND_COMMAND`` and its feedback is never read.
+    #: slots carry ``ABSENT_HAND_COMMAND`` and its feedback is never read. The
+    #: vendor HAL reports both hands whether or not one is mounted, so feedback
+    #: for it is ignored (warned once), not refused.
     absent_other: bool = False
     command: np.ndarray | None = None
     report: dict = field(default_factory=dict)
@@ -202,6 +216,7 @@ class OmniHandEffector:
     _grip: dict | None = field(default=None, repr=False)
     _lost_since: float | None = field(default=None, repr=False)
     _preserved_hand: np.ndarray | None = field(default=None, repr=False)
+    _absent_reported: bool = field(default=False, repr=False)
 
     def act(self, action: EffectorAction, *, halted: Flag, cancelled: Flag) -> EffectorOutcome:
         try:
@@ -357,6 +372,7 @@ class OmniHandEffector:
         direction = np.sign(target - command)
         frozen: dict[str, dict] = {}
         began = self.io.monotonic()
+        gripped_at = None
         while True:
             tick = self.io.monotonic()
             if cancelled():
@@ -397,9 +413,19 @@ class OmniHandEffector:
                 for finger, (joints, _, _) in FINGERS.items()
             )
             gripped = "thumb" in frozen and len(frozen) >= 2
-            if gripped or done:
+            if gripped and gripped_at is None:
+                gripped_at = tick
+            if done or (gripped and tick - gripped_at >= CLOSE_REST_MAX_S):
                 break
             self.io.wait(max(0.0, tick + 1.0 / HAND_HZ - self.io.monotonic()))
+        if gripped:
+            ticks = max(1, int(CLOSE_SQUEEZE_S * HAND_HZ))
+            for _ in range(ticks):
+                for finger in frozen:
+                    flex = FINGERS[finger][1]
+                    room = max(0.0, float((target[flex] - command[flex]) * direction[flex]))
+                    command[flex] += direction[flex] * min(CLOSE_SQUEEZE_RAD / ticks, room)
+                self._frame(command, cancelled, "close")
         for _ in range(int(CLOSE_SETTLE_S * HAND_HZ)):
             self._frame(command, cancelled, "close")
         if gripped:
@@ -451,12 +477,18 @@ class OmniHandEffector:
         other_offset = HAND_OFFSETS[preserved_side]
         other_joints = self.io.channel_joints[other_offset : other_offset + len(HAND_PARTS)]
         if self.absent_other:
-            if any(name in sample.positions for name in other_joints):
-                raise _Failed(f"{preserved_side} hand feedback conflicts with installed_hands")
+            reported = any(name in sample.positions for name in other_joints)
+            if reported and not self._absent_reported:
+                self._absent_reported = True
+                _LOG.warning(
+                    "%s hand feedback is reported but installed_hands declares it absent; "
+                    "ignoring it and commanding its rest placeholder",
+                    preserved_side,
+                )
             # Not installed: nothing to measure or preserve; its slots carry the rest command.
             if self._preserved_hand is None:
                 self._preserved_hand = np.array(ABSENT_HAND_COMMAND)
-                self.report["preserved_hand"] = dict(side=preserved_side, installed=False)
+                self.report["preserved_hand"] = dict(side=preserved_side, installed=False, reported=reported)
         else:
             try:
                 other = np.asarray([sample.positions[name] for name in other_joints], dtype=float)
