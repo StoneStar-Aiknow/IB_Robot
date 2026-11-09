@@ -7,8 +7,17 @@ import pytest
 
 from visual_interaction.session import key_eval, key_eval_score
 from visual_interaction.session import key_eval_schedule as schedule
-from visual_interaction.session.key_actions import KEY_ACTIONS, GateConfig, KeyGate
-from visual_interaction.session.key_eval_score import Alignment, Look, align, evaluate_video, replay, summarize
+from visual_interaction.session.key_actions import KEY_ACTIONS, GateConfig, KeyGate, Smoother
+from visual_interaction.session.key_eval_score import (
+    Alignment,
+    Look,
+    align,
+    evaluate_video,
+    replay,
+    smoothed,
+    split_view,
+    summarize,
+)
 
 
 class TestSchedule:
@@ -77,11 +86,47 @@ class TestGate:
         assert gate.update(1, {"wave": 0.99}) is None
         assert gate.update(2, {"heart": 0.6, "thumb": 0.8}).action == "thumb"
 
+    def test_the_candidate_is_the_action_furthest_over_its_own_threshold(self):
+        """heart is the higher score, but thumb is further over its (lower) threshold."""
+        gate = KeyGate(GateConfig({"heart": 0.5, "thumb": 0.2}, confirm=1))
+        fired = gate.update(0, {"heart": 0.6, "thumb": 0.4})
+        assert (fired.action, fired.score) == ("thumb", 0.4)
+
     def test_bad_configs_are_refused(self):
         with pytest.raises(ValueError):
             GateConfig({"dance": 0.5})
         with pytest.raises(ValueError):
             GateConfig({"heart": 0.5}, confirm=0)
+
+    def test_the_contract_names_the_same_actions(self):
+        from embodied_common.internvl_voice_contract import KEY_ACTION_NAMES
+
+        assert KEY_ACTION_NAMES == KEY_ACTIONS
+
+
+class TestSmoother:
+    def test_each_action_is_averaged_over_the_last_looks(self):
+        smoother = Smoother(2)
+        assert smoother.update({"wave": 0.6}) == {"wave": 0.6}
+        assert smoother.update({"wave": 0.2, "open": 0.4}) == pytest.approx({"wave": 0.4, "open": 0.2})
+        assert smoother.update({"open": 0.8}) == pytest.approx({"wave": 0.1, "open": 0.6})
+
+    def test_an_empty_look_adds_nothing_and_resets_nothing(self):
+        smoother = Smoother(2)
+        smoother.update({"wave": 0.6})
+        assert smoother.update({}) == {}
+        assert smoother.update({"wave": 0.2}) == pytest.approx({"wave": 0.4})
+
+    def test_reset_forgets_the_looks(self):
+        smoother = Smoother(3)
+        smoother.update({"wave": 0.9})
+        smoother.reset()
+        assert smoother.update({"open": 0.3}) == {"open": 0.3}
+
+    def test_size_one_passes_the_scores_through(self):
+        smoother = Smoother()
+        for scores in ({"wave": 0.6}, {"thumb": 0.7, "open": 0.1}):
+            assert smoother.update(scores) == scores
 
 
 def synthetic_features(version, offset, seconds=None, seed=0, rate=1.0):
@@ -130,6 +175,31 @@ class TestReplay:
         assert key_eval_score.VIEWS["0"](tick, {}) == ({}, pytest.approx(1.0))
         assert key_eval_score.VIEWS["0nv"](tick, {}) == ({"heart": 1.0}, pytest.approx(0.9))
         assert key_eval_score.VIEWS["0"]({"t": 0, "methods": {"0": {"error": "x"}}}, {}) is None
+
+
+class TestSmoothing:
+    LOOKS = [Look(t, t + 0.4, scores, 0.4) for t, scores in enumerate([{"wave": 0.9}, {}, {"wave": 0.3}])]
+
+    def test_size_one_is_the_looks_unchanged(self):
+        assert smoothed(self.LOOKS, 1) == self.LOOKS
+
+    def test_a_size_averages_like_the_online_smoother(self):
+        out = smoothed(self.LOOKS, 2)
+        assert [(look.frame_t, look.decided, look.seconds) for look in out] == [
+            (0, 0.4, 0.4),
+            (1, 1.4, 0.4),
+            (2, 2.4, 0.4),
+        ]
+        assert [look.scores for look in out] == [{"wave": 0.9}, {}, pytest.approx({"wave": 0.6})]
+
+    @pytest.mark.parametrize(("name", "split"), [("A", ("A", 1)), ("A1.blank~3", ("A1.blank", 3)), ("0~1", ("0", 1))])
+    def test_a_view_name_carries_its_smoothing(self, name, split):
+        assert split_view(name) == split
+
+    @pytest.mark.parametrize("name", ["nope", "A~", "A~0", "A~x", "nope~2"])
+    def test_a_bad_view_name_is_refused(self, name):
+        with pytest.raises(ValueError):
+            split_view(name)
 
 
 class TestCounting:
@@ -391,6 +461,13 @@ class TestFiles:
         assert report["alignment"]["p03_1"]["manual"] is True
         assert {(run["view"], run["confirm"]) for run in report["runs"]} == {("0", 1), ("0nv", 1)}
         assert (out / "report.md").read_text().startswith("# 关键动作离线评测")
+
+        smooth = ["score", str(out), "--offset", "p03_1=0:2", "--confirm", "1", "--name", "smooth"]
+        assert key_eval.main([*smooth, "--views", "0,0nv~3", "--smooth", "2"]) == 0
+        report = json.loads((out / "smooth.json").read_text())
+        assert {run["view"] for run in report["runs"]} == {"0~2", "0nv~3"}
+        with pytest.raises(SystemExit):
+            key_eval.main([*smooth, "--views", "0~0"])
 
     def test_process_with_method_a_keeps_features_and_strides(self, tmp_path):
         video = tmp_path / "p06_1.mp4"

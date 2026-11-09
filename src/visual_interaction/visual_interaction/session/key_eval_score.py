@@ -38,6 +38,8 @@ gets and the seconds the look would have cost online. ``0``/``0nv`` are the
 baseline with and without Q3. ``A``/``A1`` are the four- and one-picture
 choice questions in the forward order, ``.cal`` the mean of both orders (two
 prefills), ``.blank`` divided by the blank-picture answers of the header.
+A suffix ``~N`` (or ``--smooth N`` for every view) averages each action's
+score over the last N looks before the gate, as the node's Smoother does.
 
 **Method C** is worked out here, from ``key_eval run``'s pooled features
 (``<stem>.embeds.npz``): each tick's nearest ``KNN`` ticks among the *other*
@@ -58,7 +60,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from visual_interaction.session import key_eval_schedule as schedule
-from visual_interaction.session.key_actions import KEY_ACTIONS, GateConfig, KeyGate
+from visual_interaction.session.key_actions import KEY_ACTIONS, GateConfig, KeyGate, Smoother
 
 HIT_EARLY = 0.5
 HIT_LATE = 1.0
@@ -369,6 +371,22 @@ def replay(ticks: Sequence[Mapping], view: View, tick_sec: float, header: Mappin
     return looks
 
 
+def smoothed(looks: Sequence[Look], size: int) -> list[Look]:
+    """The looks with each action's score averaged over the last ``size`` (key_actions.Smoother)."""
+    if size <= 1:
+        return list(looks)
+    smoother = Smoother(size)
+    return [Look(look.frame_t, look.decided, smoother.update(look.scores), look.seconds) for look in looks]
+
+
+def split_view(name: str) -> tuple[str, int]:
+    """``"A1.blank~3"`` -> ``("A1.blank", 3)``; no suffix is 1. Raises ValueError for a bad one."""
+    base, mark, size = name.partition("~")
+    if base not in VIEWS or (mark and (not size.isdigit() or int(size) < 1)):
+        raise ValueError(name)
+    return base, int(size) if mark else 1
+
+
 # ---------------------------------------------------------------------------
 # Counting
 
@@ -633,7 +651,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", default="auto", choices=("auto", *map(str, schedule.VERSIONS)))
     parser.add_argument("--offset", action="append", default=[], help="STEM=SECONDS[:VERSION], repeatable")
     parser.add_argument("--max-runner-up", type=float, default=MAX_RUNNER_UP)
-    parser.add_argument("--views", default=",".join(DEFAULT_VIEWS), help=f"comma list of {sorted(VIEWS)}")
+    parser.add_argument(
+        "--views", default=",".join(DEFAULT_VIEWS), help=f"comma list of {sorted(VIEWS)}, each with an optional ~N"
+    )
+    parser.add_argument("--smooth", type=int, default=1, help="~N for every view given without one")
     parser.add_argument("--knn", type=int, default=KNN, help="method C's neighbours")
     parser.add_argument("--confirm", default="1,2")
     parser.add_argument("--threshold", default="0.5", help="comma list, one gate per value (all actions)")
@@ -641,8 +662,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release", type=int, default=1)
     parser.add_argument("--cooldown", type=float, default=8.0)
     args = parser.parse_args(argv)
+    if args.smooth < 1:
+        parser.error("--smooth must be at least 1")
     views = [view for view in args.views.split(",") if view]
-    unknown = [view for view in views if view not in VIEWS]
+    if args.smooth > 1:
+        views = [view if "~" in view else f"{view}~{args.smooth}" for view in views]
+    unknown = []
+    for view in views:
+        try:
+            split_view(view)
+        except ValueError:
+            unknown.append(view)
     if unknown:
         parser.error(f"unknown views {unknown}")
     offsets = _parse_offsets(args.offset)
@@ -684,11 +714,14 @@ def main(argv: list[str] | None = None) -> int:
 
     allowed = [a for a in args.actions.split(",") if a]
     for view in views:
+        base, size = split_view(view)
         for confirm in (int(c) for c in args.confirm.split(",") if c):
             for threshold in _floats(args.threshold):
                 gate = GateConfig({a: threshold for a in allowed}, confirm, args.release, args.cooldown)
                 results = [
-                    evaluate_video(stem, alignment, replay(ticks, VIEWS[view], tick_sec, headers[stem]), gate)
+                    evaluate_video(
+                        stem, alignment, smoothed(replay(ticks, VIEWS[base], tick_sec, headers[stem]), size), gate
+                    )
                     for stem, alignment, ticks, tick_sec in videos
                 ]
                 # A view whose method was not run has no looks: no table for it.

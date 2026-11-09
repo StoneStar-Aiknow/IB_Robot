@@ -16,6 +16,13 @@ The answers are mapped by keyword (:func:`classify`, reusing
 decides when a line is due and which one. Every line is a recording; the
 model's words are never spoken.
 
+**Key mode** (``look.key_actions``, plan v11 §5): a detector outside this
+module names key actions (:meth:`LookSay.key`), and the named lines are its
+alone. A trigger is said as soon as the voice is free, ahead of the rhythm
+and outside ``max_per_round``; Q1 still picks the general lines, but a
+gesture it names goes to its family's coarse pool, and Q2 and Q3 are not
+asked.
+
 Pure Python, no ROS, no model: the node passes the clock (every method takes
 ``now``), the voice's busy state and the answers in, and an RNG is injected,
 so all of it is tested on a workstation.
@@ -213,6 +220,15 @@ SEQ_SWITCH = "seq.switch"
 SEQ_INVITE = "seq.invite"
 OTHER_ANY = "other.any"
 
+# The pool each key action's line comes from (key_actions.KEY_ACTIONS).
+KEY_POOLS: Mapping[str, str] = {
+    "yeah": YEAH.pool,
+    "thumb": THUMB.pool,
+    "wave": WAVE.pool,
+    "heart": HEART.pool,
+    "open": OPEN.pool,
+}
+
 # Looks slower than this are discarded when the look runs back to back
 # (round_period_sec 0); otherwise the period itself is the limit.
 DEFAULT_SLOW_LOOK_SEC = 2.5
@@ -240,6 +256,9 @@ class LookConfig:
     # After our own line, how long past its estimated end the voice may stay
     # unconfirmed before the line counts as over anyway.
     speech_margin_sec: float = 0.5
+    # look.key_actions: its enabled, and its say_within_sec.
+    key_mode: bool = False
+    key_say_within_sec: float = 3.0
 
     @classmethod
     def from_look(cls, look: Mapping[str, object]) -> LookConfig:
@@ -249,6 +268,10 @@ class LookConfig:
             if name in look:
                 value = look[name]
                 values[name] = tuple(float(item) for item in value) if isinstance(value, list | tuple) else value
+        key_actions = look.get("key_actions")
+        if isinstance(key_actions, Mapping):
+            values["key_mode"] = bool(key_actions.get("enabled", False))
+            values["key_say_within_sec"] = float(key_actions.get("say_within_sec", cls.key_say_within_sec))
         return cls(**values)
 
 
@@ -259,12 +282,14 @@ class Pick:
     pool: str
     clip_id: str
     text: str
-    # Which rule chose it: named, general, other, seq.repeat, seq.still,
+    # Which rule chose it: key, named, general, other, seq.repeat, seq.still,
     # seq.switch or fallback.
     reason: str
-    # Said before its time: a verified named gesture, quick_gap after the last line.
+    # Said before its time: a verified named gesture, quick_gap after the last
+    # line; or a key action.
     quick: bool
-    # 1-based within this round, and across the node's life (for event ids).
+    # 1-based within this round (a key line does not count), and across the
+    # node's life (for event ids).
     seq: int
     total: int
 
@@ -292,6 +317,7 @@ class LookSay:
     being heard at all); :meth:`looked` with each look's label; and
     :meth:`decide` to learn whether to say something now. ``verify(key, ref)``
     is Q3 — it returns the model's yes/no, or None when it could not ask.
+    In key mode, :meth:`key` with each trigger of the key-action detector.
     """
 
     config: LookConfig
@@ -305,6 +331,8 @@ class LookSay:
         self._last_end = 0.0
         self._estimated_end = 0.0
         self._gap = 0.0
+        # Key triggers dropped unsaid because the voice stayed busy too long.
+        self.key_dropped = 0
         self._clear()
         self._active = False
 
@@ -317,6 +345,9 @@ class LookSay:
         self._order = {pool: [clip_id for clip_id, _ in entries] for pool, entries in self.pools.items()}
         for order in self._order.values():
             self.rng.shuffle(order)
+        self._clip_said_at: dict[str, float] = {}
+        # The newest key trigger not yet said: (action, when).
+        self._key: tuple[str, float] | None = None
         self.spoken = 0
         self._slow = 0
         self.stopped = False
@@ -346,7 +377,7 @@ class LookSay:
 
     @property
     def done(self) -> bool:
-        """This round has said all it may; no more looking either."""
+        """This round has said all the general lines it may (key lines do not count)."""
         return self.spoken >= self.config.max_per_round
 
     # -- voice ------------------------------------------------------------
@@ -411,30 +442,45 @@ class LookSay:
         In MIRRORING, not done, not stopped, and inside the window: always with
         ``window_sec`` 0, otherwise from ``window_sec`` before the next line is
         due until it is said. The voice playing does not close it: a look
-        during a clip is what lets the next line answer quickly.
+        during a clip is what lets the next line answer quickly. In key mode a
+        key action may come at any time: neither done nor the window closes it.
         """
-        if not self._active or self.done or self.stopped:
+        if not self._active or self.stopped:
+            return False
+        if self.config.key_mode:
+            return True
+        if self.done:
             return False
         window = self.config.window_sec
         return window <= 0 or now >= self.due_at - window
 
     def wants_refine(self, label: Label | None) -> bool:
-        return self.config.refine_hand and needs_refine(label)
+        return self.config.refine_hand and not self.config.key_mode and needs_refine(label)
 
     def looked(self, now: float, label: Label | None, ref: object = None) -> None:
         """Record one look that finished in time; ``label`` None is a look with no candidate."""
-        self._slow = 0
-        keep = ref if label is not None and label.named else None
+        self.in_time()
+        keep = ref if label is not None and label.named and not self.config.key_mode else None
         self._looks.append(_Look(now, label, keep))
         for look in self._looks:
             if look.ref is not None and now - look.at > self.config.fresh_sec:
                 look.ref = None
+
+    def in_time(self) -> None:
+        """A look finished in time, with nothing for :meth:`looked` (key mode without Q1)."""
+        self._slow = 0
 
     def slow(self) -> None:
         """A look ran too long and its answer was discarded."""
         self._slow += 1
         if self._slow >= self.config.max_slow_looks:
             self.stopped = True
+
+    def key(self, action: str, now: float) -> None:
+        """The detector saw ``action``: its line goes next, once the voice is free (the newest wins)."""
+        if action not in KEY_POOLS:
+            raise ValueError(f"unknown key action {action!r}; known: {sorted(KEY_POOLS)}")
+        self._key = (action, now)
 
     @property
     def labels(self) -> list[Label | None]:
@@ -445,11 +491,26 @@ class LookSay:
     def decide(self, now: float, verify: Verify | None = None) -> Pick | None:
         """The line to say now, if any; a returned pick counts as said.
 
-        At most one Q3 per call. Nothing while the voice is busy or the round
-        is full. When due, plan §4.4's order; before that, only a quick reply
-        to a verified named gesture seen since the last line.
+        At most one Q3 per call. Nothing while the voice is busy. A key
+        trigger comes first, whatever the rhythm and the round's count. Else
+        nothing once the round is full; when due, plan §4.4's order; before
+        that, only a quick reply to a verified named gesture seen since the
+        last line.
         """
-        if not self._active or self.done or self.busy(now):
+        if not self._active:
+            return None
+        if self._key is not None and now - self._key[1] > self.config.key_say_within_sec:
+            self._key = None
+            self.key_dropped += 1
+        if self.busy(now):
+            return None
+        if self._key is not None:
+            pool = KEY_POOLS[self._key[0]]
+            clip = self._key_clip(pool)
+            if clip is not None:
+                self._key = None
+                return self._commit(now, pool, clip, "key", True, counted=False)
+        if self.done:
             return None
         due = self.due_at
         if now >= due:
@@ -488,7 +549,9 @@ class LookSay:
         return None
 
     def _named(self, now: float, verify: Verify | None, since: float = float("-inf")) -> tuple[str, str] | None:
-        """A fresh named gesture whose pool is free, after Q3 says yes (one Q3 at most)."""
+        """A fresh named gesture whose pool is free, after Q3 says yes (one Q3 at most); never in key mode."""
+        if self.config.key_mode:
+            return None
         asked = False
         for look in reversed(self._looks):
             label = look.label
@@ -511,7 +574,7 @@ class LookSay:
         return None
 
     def _general_pool(self, look: _Look) -> str | None:
-        """Where a look lands when it is not said by name: named ones go to their family's any."""
+        """Where a look lands when it is not said by name: named ones go to their family's any (always in key mode)."""
         label = look.label
         if label.named:
             return label.coarse_pool
@@ -563,12 +626,24 @@ class LookSay:
             return clip_id
         return None
 
-    def _commit(self, now: float, pool: str, clip_id: str, reason: str, quick: bool) -> Pick:
+    def _key_clip(self, pool: str) -> str | None:
+        """A key line: the pool's least recently said clip this round, never the last clip said.
+
+        No cooldown and no running out: a pool said through starts over.
+        """
+        order = self._order.get(pool, ())
+        clips = [clip_id for clip_id in order if clip_id != self._last_clip]
+        if not clips:
+            return None
+        return min(clips, key=lambda clip_id: self._clip_said_at.get(clip_id, float("-inf")))
+
+    def _commit(self, now: float, pool: str, clip_id: str, reason: str, quick: bool, *, counted: bool = True) -> Pick:
         self._used.add(clip_id)
         self._said_at[pool] = now
+        self._clip_said_at[clip_id] = now
         self._last_clip = clip_id
         self._last_pick = now
-        self.spoken += 1
+        self.spoken += int(counted)
         self.total += 1
         text = self._texts[clip_id]
         self._last_end = max(self._last_end, now)
@@ -581,6 +656,7 @@ class LookSay:
 
 __all__ = [
     "FAMILIES",
+    "KEY_POOLS",
     "LABELS",
     "QUESTIONS",
     "RULES",

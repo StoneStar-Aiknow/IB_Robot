@@ -5,6 +5,7 @@ the rule under test throughout is: a bad item warns and keeps its default,
 everything else goes on.
 """
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -43,6 +44,18 @@ def _section(**changes):
             "fallback_after_sec": 1.5,
             "latest_start_sec": 2.0,
             "dump_dir": "",
+            "key_actions": {
+                "enabled": False,
+                "frames": 1,
+                "calibrate": "none",
+                "smooth": 3,
+                "confirm": 2,
+                "release": 1,
+                "cooldown_sec": 8.0,
+                "q1_period_sec": 3.0,
+                "say_within_sec": 3.0,
+                "thresholds": {"thumb": 0.5, "wave": 0.38, "open": 0.38},
+            },
         },
     }
     section.update(changes)
@@ -259,6 +272,105 @@ class TestLook:
         assert settings.look == contract.LookSettings()
         assert len(warnings) == 1
         assert "period" in warnings[0]
+
+
+def _keys(**changes):
+    """The look section with ``changes`` on its key_actions block."""
+    look = dict(_section()["look"])
+    look["key_actions"] = dict(look["key_actions"], **changes)
+    return _section(look=look)
+
+
+class TestKeyActions:
+    def test_the_written_block_is_the_defaults(self):
+        settings, warnings = contract.normalize(_section())
+
+        assert warnings == []
+        assert settings.look.key_actions == contract.KeyActionSettings()
+        assert settings.look.key_actions.enabled is False
+
+    def test_a_block_left_out_is_off_without_a_warning(self):
+        look = dict(_section()["look"])
+        del look["key_actions"]
+
+        settings, warnings = contract.normalize(_section(look=look))
+
+        assert settings.look == contract.LookSettings()
+        assert warnings == []
+
+    @pytest.mark.parametrize("value", ["on", [1], True, 3])
+    def test_a_block_that_is_not_a_mapping_warns_and_is_off(self, value):
+        look = dict(_section()["look"], key_actions=value)
+
+        settings, warnings = contract.normalize(_section(look=look))
+
+        assert settings.look.key_actions == contract.KeyActionSettings()
+        assert len(warnings) == 1
+        assert warnings[0].startswith("internvl_voice.look.key_actions:")
+
+    def test_every_key_may_be_set(self):
+        values = {
+            "enabled": True,
+            "frames": 4,
+            "calibrate": "blank",
+            "smooth": 1,
+            "confirm": 3,
+            "release": 2,
+            "cooldown_sec": 4.0,
+            "q1_period_sec": 0.0,
+            "say_within_sec": 1.5,
+            "thresholds": {"yeah": 0.5, "heart": 1.0},
+        }
+
+        settings, warnings = contract.normalize(_keys(**values))
+
+        assert warnings == []
+        assert settings.look.key_actions == contract.KeyActionSettings(**values)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("enabled", "yes"),
+            ("frames", 2),
+            ("frames", True),
+            ("calibrate", "grey"),
+            ("smooth", 0),
+            ("smooth", 11),
+            ("confirm", 0),
+            ("confirm", 6),
+            ("release", 0),
+            ("release", 11),
+            ("cooldown_sec", -1),
+            ("q1_period_sec", -1),
+            ("say_within_sec", 0),
+            ("thresholds", {}),
+            ("thresholds", [0.5]),
+            ("thresholds", {"none": 0.5}),
+            ("thresholds", {"thumb": 0.0}),
+            ("thresholds", {"thumb": 1.5}),
+            ("thresholds", {"thumb": "high"}),
+        ],
+    )
+    def test_a_bad_item_warns_and_keeps_its_default(self, key, value):
+        settings, warnings = contract.normalize(_keys(**{key: value}))
+
+        assert settings.look.key_actions == contract.KeyActionSettings()
+        assert len(warnings) == 1
+        assert warnings[0].startswith(f"internvl_voice.look.key_actions.{key}:")
+
+    def test_an_unknown_key_warns(self):
+        settings, warnings = contract.normalize(_keys(confirms=3))
+
+        assert settings.look.key_actions == contract.KeyActionSettings()
+        assert len(warnings) == 1
+        assert "confirms" in warnings[0]
+
+    def test_one_bad_item_leaves_the_others(self):
+        settings, warnings = contract.normalize(_keys(enabled=True, smooth=0))
+
+        assert settings.look.key_actions.enabled is True
+        assert settings.look.key_actions.smooth == 3
+        assert len(warnings) == 1
 
 
 class TestResolve:
@@ -511,8 +623,42 @@ class TestLookJson:
 
         assert warnings == []
         expected = {key: getattr(contract.LookSettings(), key) for key in contract.LOOK_KEYS}
+        expected["key_actions"] = dataclasses.asdict(contract.KeyActionSettings())
         assert {key: data[key] for key in contract.LOOK_KEYS} == expected
         assert data["pools"]["seq.invite"] == (("seq_invite_01", "你看，这一下我学得像吗？"),)
+
+    def test_key_actions_round_trip_as_plain_values(self, settings_and_table):
+        _, table = settings_and_table
+        values = {"enabled": True, "frames": 1, "calibrate": "none", "thresholds": {"open": 0.7}}
+        settings, _ = contract.normalize(_keys(**values))
+
+        text = contract.look_json(settings, table)
+        data, warnings = contract.parse_look_json(text)
+
+        assert warnings == []
+        assert json.loads(text)["key_actions"] == dataclasses.asdict(settings.look.key_actions)
+        assert data["key_actions"] == dataclasses.asdict(settings.look.key_actions)
+        assert data["key_actions"]["thresholds"] == {"open": 0.7}
+
+    def test_a_bad_key_action_item_in_the_json_keeps_its_default(self, settings_and_table):
+        data = json.loads(contract.look_json(*settings_and_table))
+        data["key_actions"]["confirm"] = 0
+        data["key_actions"]["thresholds"] = {"none": 0.5}
+
+        parsed, warnings = contract.parse_look_json(json.dumps(data))
+
+        assert parsed["key_actions"] == dataclasses.asdict(contract.KeyActionSettings())
+        assert len(warnings) == 2
+        assert all(".key_actions." in warning for warning in warnings)
+
+    def test_key_actions_that_are_not_a_mapping_in_the_json_are_off(self, settings_and_table):
+        data = json.loads(contract.look_json(*settings_and_table))
+        data["key_actions"] = "on"
+
+        parsed, warnings = contract.parse_look_json(json.dumps(data))
+
+        assert parsed["key_actions"]["enabled"] is False
+        assert len(warnings) == 1
 
     def test_a_look_that_is_off_has_no_json(self, settings_and_table):
         settings, table = settings_and_table

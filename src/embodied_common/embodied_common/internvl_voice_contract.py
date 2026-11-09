@@ -50,6 +50,11 @@ REQUIRED_POOLS = (*EVENT_POOLS.values(), STANDBY_POOL)
 
 ASR_MODES = ("mute", "off", "session", "keep")
 
+# The key actions the look can tell apart; visual_interaction's key_actions.KEY_ACTIONS, in its order.
+KEY_ACTION_NAMES = ("yeah", "thumb", "wave", "heart", "open")
+KEY_CALIBRATIONS = ("blank", "none")
+KEY_FRAMES = (1, 4)
+
 DEFAULT_CLIPS_TABLE = "$(find robot_config)/config/mirror_voice/x2_clips_v1.yaml"
 DEFAULT_CLIP_DIR = "assets/audio/x2_mirror_clips_v1"
 DEFAULT_DEMO_ROOT = "/root/vlx_internvl_310p"
@@ -77,6 +82,35 @@ class StandbySettings:
     gap_sec: Interval = (2.0, 5.0)
 
 
+def _default_thresholds() -> dict[str, float]:
+    # Round 2, three people pooled, one frame, 3 looks averaged, confirm 2: each action's
+    # lowest threshold with at most 0.15 false triggers a minute (plan v11 §8, 11-10).
+    return {"thumb": 0.5, "wave": 0.38, "open": 0.38}
+
+
+@dataclass(frozen=True)
+class KeyActionSettings:
+    """``look.key_actions``: a choice question scored every look; off is the plain look."""
+
+    enabled: bool = False
+    # Pictures per question: the newest frame, or 4 spread over the last 0.75 s.
+    # One frame separated as well as 4 and triggered falsely less often.
+    frames: int = 1
+    # "blank": shares divided by the shares on a grey picture, scored at preload.
+    calibrate: str = "none"
+    # Each action's score is averaged over this many looks.
+    smooth: int = 3
+    confirm: int = 2
+    release: int = 1
+    cooldown_sec: float = 8.0
+    # A free description (Q1) for the general lines at most this often.
+    q1_period_sec: float = 3.0
+    # A key line not said within this long after its trigger is dropped.
+    say_within_sec: float = 3.0
+    # Only the actions named here trigger, each over its own threshold.
+    thresholds: Mapping[str, float] = field(default_factory=_default_thresholds)
+
+
 @dataclass(frozen=True)
 class LookSettings:
     # Always true here: a look that is off is ``Settings.look is None``.
@@ -100,6 +134,7 @@ class LookSettings:
     fallback_after_sec: float = 1.5
     latest_start_sec: float = 2.0
     dump_dir: str = ""
+    key_actions: KeyActionSettings = field(default_factory=KeyActionSettings)
 
 
 @dataclass(frozen=True)
@@ -219,6 +254,41 @@ _LOOK_CHECKS: Mapping[str, Callable[[Any], Any]] = MappingProxyType(
 )
 
 
+def _frames(value: Any) -> int:
+    if isinstance(value, bool) or value not in KEY_FRAMES:
+        raise _Bad(f"must be one of {list(KEY_FRAMES)}, not {value!r}")
+    return int(value)
+
+
+def _thresholds(value: Any) -> dict[str, float]:
+    if not isinstance(value, Mapping) or not value:
+        raise _Bad(f"must map key actions to thresholds, not {value!r}")
+    out = {}
+    for action, threshold in value.items():
+        if action not in KEY_ACTION_NAMES:
+            raise _Bad(f"{action!r} is not one of {list(KEY_ACTION_NAMES)}")
+        if isinstance(threshold, bool) or not isinstance(threshold, int | float) or not 0.0 < threshold <= 1.0:
+            raise _Bad(f"{action}: {threshold!r} is not a number in (0, 1]")
+        out[action] = float(threshold)
+    return out
+
+
+_KEY_CHECKS: Mapping[str, Callable[[Any], Any]] = MappingProxyType(
+    {
+        "enabled": _flag,
+        "frames": _frames,
+        "calibrate": _choice(KEY_CALIBRATIONS),
+        "smooth": _integer(1, 10),
+        "confirm": _integer(1, 5),
+        "release": _integer(1, 10),
+        "cooldown_sec": _seconds(),
+        "q1_period_sec": _seconds(),
+        "say_within_sec": _seconds(positive=True),
+        "thresholds": _thresholds,
+    }
+)
+
+
 def _items(
     data: Mapping[str, Any],
     checks: Mapping[str, Callable[[Any], Any]],
@@ -312,7 +382,21 @@ def _look(value: Any, warnings: list[str]) -> LookSettings | None:
         return None
     if not _switch(value, path, warnings):
         return None
-    return LookSettings(enabled=True, **_items(value, _LOOK_CHECKS, LookSettings, path, warnings, known=("enabled",)))
+    return LookSettings(
+        enabled=True,
+        key_actions=_key_actions(value.get("key_actions"), f"{path}.key_actions", warnings),
+        **_items(value, _LOOK_CHECKS, LookSettings, path, warnings, known=("enabled", "key_actions")),
+    )
+
+
+def _key_actions(value: Any, path: str, warnings: list[str]) -> KeyActionSettings:
+    """Left out is off quietly; not a mapping warns and is off."""
+    if value is None:
+        return KeyActionSettings()
+    if not isinstance(value, Mapping):
+        warnings.append(f"{path}: must be a mapping, not {value!r}; key actions are off")
+        return KeyActionSettings()
+    return KeyActionSettings(**_items(value, _KEY_CHECKS, KeyActionSettings(), path, warnings))
 
 
 def resolve(path: str, workspace: str | None) -> str:
@@ -648,14 +732,19 @@ class _AsrDefaults:
 LOOK_KEYS = tuple(item.name for item in fields(LookSettings))
 
 
+def _plain(value: Any) -> Any:
+    if isinstance(value, KeyActionSettings):
+        return {item.name: _plain(getattr(value, item.name)) for item in fields(value)}
+    if isinstance(value, Mapping):
+        return dict(value)
+    return list(value) if isinstance(value, tuple) else value
+
+
 def look_json(settings: Settings, table: ClipTable) -> str:
     """What the look needs, as one string parameter: every ``look`` key plus the look pools."""
     if settings.look is None:
         raise ValueError(f"{SECTION_PATH}.look is off; there is no look_json")
-    data: dict[str, Any] = {
-        key: list(value) if isinstance(value, tuple) else value
-        for key, value in ((key, getattr(settings.look, key)) for key in LOOK_KEYS)
-    }
+    data: dict[str, Any] = {key: _plain(getattr(settings.look, key)) for key in LOOK_KEYS}
     data["pools"] = {
         pool: [[clip_id, table.clips[clip_id]] for clip_id in ids]
         for pool, ids in table.pools().items()
@@ -667,13 +756,15 @@ def look_json(settings: Settings, table: ClipTable) -> str:
 def parse_look_json(text: str) -> tuple[dict[str, Any], list[str]]:
     """``look_json`` read back; a bad field warns and takes its default.
 
-    Intervals come back as ``(lo, hi)`` floats and ``pools`` as
-    ``{pool: ((id, text), ...)}`` with look pools only.
+    Intervals come back as ``(lo, hi)`` floats, ``key_actions`` as a plain
+    dict of its fields and ``pools`` as ``{pool: ((id, text), ...)}`` with
+    look pools only.
     """
     path = "look_json"
     warnings: list[str] = []
     data = _load_json(text, path, warnings)
-    values = _items(data, _LOOK_CHECKS, LookSettings, path, warnings, known=("enabled", "pools"))
+    values = _items(data, _LOOK_CHECKS, LookSettings, path, warnings, known=("enabled", "key_actions", "pools"))
+    values["key_actions"] = _plain(_key_actions(data.get("key_actions"), f"{path}.key_actions", warnings))
     if data.get("enabled", True) is not True:
         warnings.append(f"{path}.enabled: {data.get('enabled')!r} read as true")
 

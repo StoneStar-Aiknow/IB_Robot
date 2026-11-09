@@ -5,18 +5,23 @@ choice-letter probabilities, ...); the rule that turns the scores into one
 trigger per gesture does not, and the offline evaluation and the node share
 it, or the numbers measured would not be the robot's.
 
-* A look's candidate is its best-scoring action, if that score reaches the
-  action's threshold. An action with no threshold is never a candidate.
+* A look's candidate is the action furthest over its own threshold (score
+  minus threshold): InternVL favours some options on every picture, so the
+  thresholds differ a lot and the raw best score would mostly be the
+  favourite. An action with no threshold is never a candidate.
 * ``confirm`` looks in a row with the same candidate trigger it.
 * A triggered action has to be absent for ``release`` looks before it can
   trigger again: someone holding a heart for ten seconds is one heart.
 * And it waits ``cooldown_sec`` after its last trigger in any case.
+
+:class:`Smoother` averages the scores over the last few looks before the gate.
 
 Pure Python; the caller passes the clock.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -66,14 +71,15 @@ class KeyGate:
         self._last.clear()
 
     def candidate(self, scores: Mapping[str, float]) -> tuple[str, float] | None:
-        """The look's best action with its score, if it reaches its threshold."""
+        """The action furthest over its own threshold, with its score; None if none reaches it."""
         best = None
+        margin = 0.0
         for action, threshold in self.config.thresholds.items():
             score = scores.get(action)
             if score is None or score < threshold:
                 continue
-            if best is None or score > best[1]:
-                best = (action, float(score))
+            if best is None or score - threshold > margin:
+                best, margin = (action, float(score)), score - threshold
         return best
 
     def update(self, now: float, scores: Mapping[str, float]) -> Trigger | None:
@@ -99,4 +105,28 @@ class KeyGate:
         return Trigger(action, now, found[1])
 
 
-__all__ = ["KEY_ACTIONS", "GateConfig", "KeyGate", "Trigger"]
+class Smoother:
+    """Each action's score averaged over the last ``size`` looks that scored anything.
+
+    An action missing from one of those looks counts 0 there. A failed or
+    empty look adds nothing, resets nothing and comes out empty, so the gate
+    still sees it as a look without a candidate.
+    """
+
+    def __init__(self, size: int = 1) -> None:
+        if size < 1:
+            raise ValueError("size must be at least 1")
+        self._looks: deque[dict[str, float]] = deque(maxlen=size)
+
+    def reset(self) -> None:
+        self._looks.clear()
+
+    def update(self, scores: Mapping[str, float]) -> dict[str, float]:
+        if not scores:
+            return {}
+        self._looks.append({action: float(score) for action, score in scores.items()})
+        names = dict.fromkeys(action for look in self._looks for action in look)
+        return {action: sum(look.get(action, 0.0) for look in self._looks) / len(self._looks) for action in names}
+
+
+__all__ = ["KEY_ACTIONS", "GateConfig", "KeyGate", "Smoother", "Trigger"]
