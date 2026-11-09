@@ -289,6 +289,10 @@ robot:
   mirror_session:
     voice:
       enabled: false
+    # integration: photos stay off here (and in aimdk_x2_summit.yaml built on
+    # this entry); only aimdk_x2_voice_mirror_all.yaml turns them on.
+    photo:
+      enabled: false
 
 # Runtime prerequisites for pick_object: the model bundles configured above
 # must be installed on the 310P, and the matching grasp head must run on the

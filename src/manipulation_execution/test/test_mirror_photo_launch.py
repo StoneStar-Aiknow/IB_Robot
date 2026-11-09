@@ -4,9 +4,9 @@ Without a ``photo`` block, or with ``enabled: false``, the actions are what
 they were before the feature: no photo node and the session's parameters
 untouched. On, one ``mirror_photo_node`` comes last, with the parameters the
 node declares. A section the node would refuse, or no camera, is a WARNING
-and the mirror launches without photos. The three X2 entries that carry the
-feature (voice_mirror_all, and grasp and summit built on it) have it on, any
-entry built on them can turn it off, and the marked block adds nothing but
+and the mirror launches without photos. voice_mirror_all has it on (grasp and
+summit turn it off: integration decision, see test_mirror_photo_entries_off.py),
+any entry built on them can turn it off, and the marked block adds nothing but
 ``mirror_session.photo``.
 """
 
@@ -33,7 +33,7 @@ from robot_config.loader import _load_robot_section
 REPO = Path(__file__).resolve().parents[3]
 ROBOTS = REPO / "src" / "robot_config" / "config" / "robots"
 ENTRY = ROBOTS / "aimdk_x2_voice_mirror_all.yaml"
-ENTRIES = ("aimdk_x2_voice_mirror_all.yaml", "aimdk_x2_voice_mirror_grasp.yaml", "aimdk_x2_summit.yaml")
+ENTRIES = ("aimdk_x2_voice_mirror_all.yaml",)
 BLOCK_START = "    # feat/x2-photo-capture\n"
 BLOCK_END = "    # /feat/x2-photo-capture\n"
 

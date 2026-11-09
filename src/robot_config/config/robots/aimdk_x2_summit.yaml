@@ -23,6 +23,10 @@ robot:
       enabled: true
   mirror_session:
     enabled: true
+    # integration: no mirror photos in this deployment (said here as well as
+    # in its base aimdk_x2_voice_mirror_grasp.yaml).
+    photo:
+      enabled: false
   motion_imitation_stream:
     enabled: true
     pause_during_manipulation: true
