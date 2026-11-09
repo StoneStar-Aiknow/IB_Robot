@@ -135,6 +135,38 @@ def test_manipulation_pause_is_wired_only_for_opted_in_resident_streams(enabled)
     assert _decode_launch_string(params["motion_imitation_pause_service"]) == (PAUSE_SERVICE if enabled else "")
 
 
+@pytest.mark.parametrize(
+    ("flags", "service", "scope"),
+    [
+        ({}, "", ""),
+        ({"pause_during_manipulation": True}, "/motion_imitation_stream/set_paused", "manipulation"),
+        ({"pause_during_robot_motion": True}, "/motion_imitation_stream/set_paused", "robot_motion"),
+        (
+            {"pause_during_manipulation": True, "pause_during_robot_motion": True},
+            "/motion_imitation_stream/set_paused",
+            "robot_motion",
+        ),
+    ],
+)
+def test_pause_scope_reaches_the_gateway(flags, service, scope):
+    config = {
+        "embodied": {"enabled": True, "entry_mode": "hermes"},
+        "motion_imitation_stream": {"enabled": True, **flags},
+    }
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+    assert _decode_launch_string(params["motion_imitation_pause_service"]) == service
+    assert _decode_launch_string(params["motion_imitation_pause_scope"]) == scope
+
+
+def test_robot_motion_pause_rejects_a_disabled_stream():
+    config = {
+        "embodied": {"enabled": True, "entry_mode": "hermes"},
+        "motion_imitation_stream": {"enabled": False, "pause_during_robot_motion": True},
+    }
+    with pytest.raises(ValueError, match="pause_during_robot_motion requires an enabled"):
+        generate_embodied_nodes(config, active_control_mode="moveit_planning")
+
+
 def test_manipulation_pause_rejects_a_disabled_stream():
     config = {
         "embodied": {"enabled": True, "entry_mode": "hermes"},

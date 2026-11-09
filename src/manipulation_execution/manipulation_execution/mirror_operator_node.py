@@ -83,6 +83,7 @@ from manipulation_execution.mirror_operator.frames import FrameThrottle, gray_fr
 from manipulation_execution.mirror_operator.gateway import MIRROR_START, MIRROR_STOP, GatewayError, MirrorSkillRequest
 from manipulation_execution.mirror_operator.judge import CoverJudge, build_cover_judge
 from manipulation_execution.mirror_session.business import load_business_config
+from manipulation_execution.perception_pause_follower import PausableSubscription
 
 TICK_PERIOD_S = 0.1
 CAMERA_KINDS = {"compressed": (CompressedImage, gray_from_compressed), "image": (Image, gray_from_image)}
@@ -321,12 +322,14 @@ class MirrorOperatorNode(Node):
         )
         self._throttle = FrameThrottle(parts.config.frame_rate_max_hz)
         camera_type, self._decode = CAMERA_KINDS[settings.camera_kind]
-        self.create_subscription(
+        # A double cover cannot start the mirror while a skill runs, so this reader follows the
+        # stream's pause too; the frame gap clears any half-finished gesture when it returns.
+        self.camera_reader = PausableSubscription(
+            self,
             camera_type,
             settings.camera_topic,
             self._on_camera,
             qos_profile_sensor_data,
-            callback_group=MutuallyExclusiveCallbackGroup(),
         )
         inputs_group = MutuallyExclusiveCallbackGroup()
         if parts.touch_type is not None:
@@ -392,6 +395,7 @@ class MirrorOperatorNode(Node):
         status = self.operator.status()
         status["cover_judge"] = self._settings.cover_judge
         status["camera_topic"] = self._settings.camera_topic
+        status["camera_paused"] = self.camera_reader.paused
         self._status_publisher.publish(String(data=json.dumps(status, sort_keys=True)))
 
 

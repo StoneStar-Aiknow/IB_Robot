@@ -46,9 +46,9 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage, Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
-from embodied_common.motion_imitation_contract import PAUSE_SERVICE
+from embodied_common.motion_imitation_contract import PAUSE_SERVICE, PAUSED_STATE_TOPIC
 from ibrobot_msgs.msg import ActorState, Detection2D, DetectionArray, PearFrame
 from ibrobot_msgs.srv import PearParameterPredict, SetPerceptionPaused, YoloXDetect
 from manipulation_execution.actor_selector import ActorDecision, ActorSelector
@@ -61,6 +61,7 @@ from manipulation_execution.hri_vision import (
     validated_person_confidence_threshold,
     validated_yolox_refresh_interval,
 )
+from manipulation_execution.perception_pause_follower import PAUSED_STATE_QOS, PausableSubscription
 
 SCHEMA = "pear_parameter_v1"
 
@@ -179,7 +180,6 @@ class MotionImitationStreamNode(Node):
         self._stats_lock = threading.RLock()
         self._pause_owners = set()
         self._retired_pause_owners = deque(maxlen=256)
-        self._subscription_epoch = 0
         self._source_generation = 0
         self._source_healthy = None
         self._received = 0
@@ -247,6 +247,10 @@ class MotionImitationStreamNode(Node):
         self._frame_publisher = self.create_publisher(PearFrame, frame_topic, qos_profile_sensor_data)
         self._actor_publisher = self.create_publisher(ActorState, actor_state_topic, 10)
         self._status_publisher = self.create_publisher(String, status_topic, 10)
+        # The other camera readers of the mirror follow this; False also clears a
+        # latched True left by a previous run of this node.
+        self._paused_state_publisher = self.create_publisher(Bool, PAUSED_STATE_TOPIC, PAUSED_STATE_QOS)
+        self._paused_state_publisher.publish(Bool(data=False))
 
         self._pear_worker = threading.Thread(target=self._pear_loop, name="mi-stream-pear", daemon=True)
         self._yolox_worker = threading.Thread(target=self._yolox_loop, name="mi-stream-yolox", daemon=True)
@@ -254,7 +258,15 @@ class MotionImitationStreamNode(Node):
         self._pear_worker.start()
         self._yolox_worker.start()
         self._decode_worker.start()
-        self._rgb_subscription = self._subscribe_rgb()
+        # Its own thread creates and drops the DDS reader; the callback never runs on this executor.
+        self._rgb_reader = PausableSubscription(
+            self,
+            CompressedImage,
+            self._rgb_topic,
+            self._on_compressed_frame,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+            state_topic=None,
+        )
         self._pause_service = self.create_service(
             SetPerceptionPaused, PAUSE_SERVICE, self._set_paused, callback_group=MutuallyExclusiveCallbackGroup()
         )
@@ -274,15 +286,6 @@ class MotionImitationStreamNode(Node):
         )
         if self._actor_zone_summary:
             self.get_logger().info(f"motion imitation stream actor zone: {self._actor_zone_summary}")
-
-    def _subscribe_rgb(self):
-        epoch = self._subscription_epoch
-        return self.create_subscription(
-            CompressedImage,
-            self._rgb_topic,
-            lambda message: self._on_compressed_frame(message, subscription_epoch=epoch),
-            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
-        )
 
     def _set_paused(self, request, response):
         """Drop the reader and retire work before acknowledgement; no hardware commands.
@@ -307,22 +310,21 @@ class MotionImitationStreamNode(Node):
                 if owner not in self._retired_pause_owners:
                     self._retired_pause_owners.append(owner)
             paused = bool(self._pause_owners)
-            if paused != was_paused:
-                self._subscription_epoch += 1
+            changed = paused != was_paused
+            if changed:
                 self._invalidate_source_locked()
                 self._source_healthy = None
                 if paused:
-                    if self._rgb_subscription is not None:
-                        self.destroy_subscription(self._rgb_subscription)
-                        self._rgb_subscription = None
                     state = ActorState()
                     state.header.stamp = self.get_clock().now().to_msg()
                     state.reason = "perception_paused"
                     self._actor_publisher.publish(state)
-                else:
-                    self._rgb_subscription = self._subscribe_rgb()
             response.success, response.paused = True, paused
             response.message = "paused" if paused else "resumed; waiting for fresh camera and person detections"
+        if changed:
+            # Outside the state lock: the frame callback takes it, and this waits for that callback.
+            self._rgb_reader.set_paused(paused)
+            self._paused_state_publisher.publish(Bool(data=paused))
         self.get_logger().info(f"motion imitation perception {response.message}: owner={owner}")
         return response
 
@@ -404,12 +406,10 @@ class MotionImitationStreamNode(Node):
             and (self._source_geometry is None or self._source_geometry == (message.width, message.height))
         )
 
-    def _on_compressed_frame(self, message: CompressedImage, *, subscription_epoch=None) -> None:
+    def _on_compressed_frame(self, message: CompressedImage) -> None:
         """Keep the newest compressed frame without decoding on the ROS callback."""
         stamp = (int(message.header.stamp.sec), int(message.header.stamp.nanosec))
         with self._stats_lock:
-            if subscription_epoch is not None and subscription_epoch != self._subscription_epoch:
-                return
             if not self._source_available():
                 self._source_rejected += 1
                 self._yolox_detections = None

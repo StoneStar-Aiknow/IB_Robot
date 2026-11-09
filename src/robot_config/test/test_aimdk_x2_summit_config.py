@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from embodied_common.motion_imitation_contract import manipulation_pause_service
+from embodied_common.motion_imitation_contract import perception_pause_settings
 from robot_config.loader import _load_robot_section, _validate_agent_voice_bridge, validate_runtime_named_motion_config
 
 CONFIG = Path(__file__).resolve().parents[1] / "config" / "robots" / "aimdk_x2_summit.yaml"
@@ -22,7 +22,7 @@ def test_mirror_and_fruit_delivery_share_the_deployment(config):
     assert config["mirror_session"]["enabled"] is True
     assert config["mirror_session"]["publish_enabled"] is True
     assert config["motion_imitation_stream"]["enabled"] is True
-    assert manipulation_pause_service(config) == "/motion_imitation_stream/set_paused"
+    assert perception_pause_settings(config) == ("/motion_imitation_stream/set_paused", "robot_motion")
     services = {service["id"] for service in config["perception_services"]["services"]}
     assert services == {
         "hri_yolox_person",

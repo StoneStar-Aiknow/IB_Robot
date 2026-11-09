@@ -163,7 +163,21 @@ already running on a model server may finish, but their results are discarded.
 This releases the mirror reader of
 `/aima/hal/sensor/rgb_head_front_center/rgb_image/compressed`; it does not stop
 the platform camera publisher or the grasp head's RGB-D capture and execution
-watch. Stop the motion-imitation session before manipulating, as required by
+watch. The stream republishes its state on the latched
+`/motion_imitation_stream/perception_paused` (`std_msgs/Bool`), and the other
+camera readers of the mirror (hand perception, the session's cover input and the
+operator's rear camera) drop and recreate their subscriptions with it.
+
+`motion_imitation_stream.pause_during_robot_motion` (on in `aimdk_x2_summit`)
+widens the rule from manipulation to every skill whose capability declares
+`moves_robot: true`, except the mirror skills, which need the stream. The pause is
+taken before the skill's own preparation (hand opening, feedback checks), for an
+Agent program and for a directly submitted skill alike, and released when it
+ends; a mirror step in a program gives the pause back first. Return, pick and
+place still refuse to move without an acknowledged pause. Any other skill waits
+at most 1 s for the acknowledgement, logs a warning and moves with the camera
+readers on. A running mirror session is never paused for a skill its admission
+would reject. Stop the motion-imitation session before manipulating, as required by
 the shared arm control mode. Pausing its perception does not arbitrate motions.
 
 A definite child terminal releases only that delegation's pause owner; the root

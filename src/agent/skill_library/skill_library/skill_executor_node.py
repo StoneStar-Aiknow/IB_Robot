@@ -37,6 +37,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
+from embodied_common import motion_imitation_contract as MIRROR_PERCEPTION
 from embodied_common import pose_composer_contract as POSE_COMPOSER
 from embodied_common.caller_auth import is_caller_authorized
 from embodied_common.canon import sha256_text, to_canonical_json
@@ -142,6 +143,14 @@ PRIMITIVE_CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
 # The X2 mirror session's switch. Its skills take no arguments: the catalog
 # implementation binds the command, sent as the session's SetBool.
 MIRROR_SESSION_EXECUTOR = "mirror_session"
+# How a skill treats the resident mirror perception stream (see _motion_imitation_pause_need).
+PERCEPTION_PAUSE_RELEASE = "release"
+PERCEPTION_PAUSE_REQUIRED = "required"
+PERCEPTION_PAUSE_BEST_EFFORT = "best_effort"
+_MANIPULATION_PAUSE_EXECUTORS = frozenset({"grasp_pipeline", "placement_pipeline"})
+# A healthy stream answers in milliseconds. A crashed one still looks ready until its DDS lease
+# expires (about 20 s), and a gesture must not stand still for the full RPC timeout meanwhile.
+_BEST_EFFORT_PAUSE_TIMEOUT_SEC = 1.0
 # Delegated executor that plays a recorded clip bound by the catalog.
 RUNTIME_PLAY_AUDIO_EXECUTOR = "runtime_play_audio"
 MIRROR_SESSION_COMMANDS = {"start": True, "stop": False}
@@ -683,6 +692,10 @@ class SkillExecutorNode(Node):
         self.declare_parameter("mirror_session_service", "", descriptor=startup_descriptor)
         self.declare_parameter("mirror_session_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("motion_imitation_pause_service", "", descriptor=startup_descriptor)
+        # manipulation: pause for return/pick/place only; robot_motion: for every moves_robot skill.
+        self.declare_parameter(
+            "motion_imitation_pause_scope", MIRROR_PERCEPTION.PAUSE_SCOPE_MANIPULATION, descriptor=startup_descriptor
+        )
         # How long the session may take to answer stop; mirror_stop's timeout must exceed it.
         self.declare_parameter(
             "mirror_session_stop_timeout_sec", MIRROR_SESSION.DEFAULT_STOP_TIMEOUT_SEC, descriptor=startup_descriptor
@@ -1133,6 +1146,12 @@ class SkillExecutorNode(Node):
         )
         self._motion_mode_client = self.create_client(SetBool, self._motion_mode_service, callback_group=callback_group)
         pause_service = str(self.get_parameter("motion_imitation_pause_service").value).strip()
+        pause_scope = str(self.get_parameter("motion_imitation_pause_scope").value).strip()
+        if pause_service and pause_scope not in MIRROR_PERCEPTION.PAUSE_SCOPES:
+            raise ValueError(
+                f"motion_imitation_pause_scope must be one of {MIRROR_PERCEPTION.PAUSE_SCOPES}, got {pause_scope!r}"
+            )
+        self._motion_imitation_pause_scope = pause_scope
         self._motion_imitation_pause_client = (
             self.create_client(SetPerceptionPaused, pause_service, callback_group=callback_group)
             if pause_service
@@ -6473,41 +6492,118 @@ class SkillExecutorNode(Node):
             self._retained_admission_cleanup.pop(id(admission), None)
             return True
 
-    def _pause_workflow_motion_imitation(self, workflow: _WorkflowExecution) -> bool:
-        """Hold one root owner across preparation and every manipulation step.
+    def _motion_imitation_pause_need(self, snapshot, skill_name: str) -> str:
+        """How *skill_name* treats the resident mirror perception stream.
+
+        ``release``  a mirror skill: the session needs the stream, so a held pause is let go;
+        ``required`` return, pick or place: motion never starts without an acknowledged pause;
+        ``best_effort`` any other ``moves_robot`` skill when the scope is ``robot_motion``:
+                     paused to free the CPU and network, but a stream that does not
+                     acknowledge only costs a warning;
+        ``""``       no pause (and an existing one is kept).
+        """
+        templates = getattr(snapshot, "templates", None) or {}
+        template = templates.get(skill_name) if isinstance(templates, Mapping) else None
+        executor = str(template.get("executor", "")).strip() if isinstance(template, Mapping) else ""
+        if executor == MIRROR_SESSION_EXECUTOR:
+            return PERCEPTION_PAUSE_RELEASE
+        from robot_runtime.task_poses import RETURN_TASK_POSE
+
+        if skill_name == RETURN_TASK_POSE or executor in _MANIPULATION_PAUSE_EXECUTORS:
+            return PERCEPTION_PAUSE_REQUIRED
+        scope = getattr(self, "_motion_imitation_pause_scope", MIRROR_PERCEPTION.PAUSE_SCOPE_MANIPULATION)
+        if scope == MIRROR_PERCEPTION.PAUSE_SCOPE_ROBOT_MOTION:
+            capabilities = getattr(snapshot, "capability_view", None) or {}
+            capability = capabilities.get(skill_name) if isinstance(capabilities, Mapping) else None
+            if isinstance(capability, Mapping) and capability.get("moves_robot") is True:
+                return PERCEPTION_PAUSE_BEST_EFFORT
+        return ""
+
+    def _pause_workflow_motion_imitation(self, workflow: _WorkflowExecution, skill_name: str) -> bool:
+        """Hold one root owner from the first step that needs it to the end of the workflow.
 
         Called outside the state lock after child admission, which prevents
         root finalization/expiry while the pause acknowledgement is pending.
         Delegations keep their own owners; ending one cannot resume the stream
-        between the root workflow's return, pick and place steps.
+        between the root workflow's return, pick and place steps. A mirror step
+        releases the root owner first (the session needs the stream); a later
+        motion step takes a fresh one. False only when a required pause failed.
         """
-        if getattr(self, "_motion_imitation_pause_client", None) is None or workflow.perception_pause_owner:
+        if getattr(self, "_motion_imitation_pause_client", None) is None:
             return True
-        from robot_runtime.task_poses import RETURN_TASK_POSE
-
-        templates = workflow.bundle.snapshot.templates
-        if not any(
-            step.skill_name == RETURN_TASK_POSE
-            or templates.get(step.skill_name, {}).get("executor") in {"grasp_pipeline", "placement_pipeline"}
-            for step in workflow.workflow_steps
-        ):
+        need = self._motion_imitation_pause_need(workflow.bundle.snapshot, skill_name)
+        if need != PERCEPTION_PAUSE_RELEASE and self._mirror_session_owns_perception():
             return True
-        owner_id = f"workflow:{workflow.root_lease_nonce}"
-        if not self._pause_motion_imitation(owner_id):
+        if need == PERCEPTION_PAUSE_RELEASE:
+            owner_id, workflow.perception_pause_owner = workflow.perception_pause_owner, ""
+            if owner_id:
+                self._resume_motion_imitation(owner_id)
+            return True
+        if not need or workflow.perception_pause_owner:
+            return True
+        owner_id = f"workflow:{workflow.root_lease_nonce}:{uuid.uuid4().hex[:8]}"
+        if self._pause_motion_imitation(owner_id, required=need == PERCEPTION_PAUSE_REQUIRED):
+            workflow.perception_pause_owner = owner_id
+            return True
+        if need == PERCEPTION_PAUSE_REQUIRED:
             return False
-        workflow.perception_pause_owner = owner_id
+        self._warn_perception_pause_skipped(skill_name)
         return True
 
-    def _pause_motion_imitation(self, owner_id: str) -> bool:
-        """Require acknowledgement before motion; a missing stream never starts motion."""
+    def _pause_skill_motion_imitation(self, skill_name: str) -> tuple[str, bool]:
+        """Pause for one directly submitted skill: ``(owner to release, motion may start)``."""
+        if getattr(self, "_motion_imitation_pause_client", None) is None:
+            return "", True
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        need = self._motion_imitation_pause_need(bundle.snapshot if bundle is not None else None, skill_name)
+        if need not in (PERCEPTION_PAUSE_REQUIRED, PERCEPTION_PAUSE_BEST_EFFORT):
+            return "", True
+        if self._mirror_session_owns_perception():
+            return "", True
+        owner_id = f"skill:{uuid.uuid4().hex}"
+        if self._pause_motion_imitation(owner_id, required=need == PERCEPTION_PAUSE_REQUIRED):
+            return owner_id, True
+        if need == PERCEPTION_PAUSE_REQUIRED:
+            return "", False
+        self._warn_perception_pause_skipped(skill_name)
+        return "", True
+
+    def _mirror_session_owns_perception(self) -> bool:
+        """A running mirror needs the stream; its admission rejects this skill just after.
+
+        Pausing first would cost the round its person box for a request that cannot run.
+        """
+        if not getattr(self, "_mirror_session_enabled", False):
+            return False
+        with self._mirror_session_state_lock:
+            state = self._mirror_session_state
+        return state is not None and (
+            state["state"] != MIRROR_SESSION.STATE_WAIT or bool(state["holding"]) or bool(state["releasing"])
+        )
+
+    def _warn_perception_pause_skipped(self, skill_name: str) -> None:
+        self.get_logger().warning(
+            f"mirror perception pause not acknowledged; {skill_name} runs with the camera stream on"
+        )
+
+    def _pause_motion_imitation(self, owner_id: str, *, required: bool = True) -> bool:
+        """Require acknowledgement before motion; a missing stream never starts a required motion.
+
+        A best-effort pause does not hold the motion for a stream that is not up: an
+        absent service fails at once and an unanswered call after a short timeout.
+        """
         client = getattr(self, "_motion_imitation_pause_client", None)
         if client is None:
             return True
         try:
-            if not client.wait_for_service(timeout_sec=self._rpc_timeout):
+            if required:
+                if not client.wait_for_service(timeout_sec=self._rpc_timeout):
+                    return False
+            elif not client.service_is_ready():
                 return False
             future = client.call_async(SetPerceptionPaused.Request(owner_id=owner_id, paused=True))
-            if not self._wait_for_future(future, timeout_sec=self._rpc_timeout):
+            timeout_sec = self._rpc_timeout if required else min(self._rpc_timeout, _BEST_EFFORT_PAUSE_TIMEOUT_SEC)
+            if not self._wait_for_future(future, timeout_sec=timeout_sec):
                 # A late successful pause must not leave an idle stream held forever.
                 # The motion has not been submitted. Owner fencing makes this
                 # compensating release harmless to any later manipulation.
@@ -7368,6 +7464,7 @@ class SkillExecutorNode(Node):
 
         started = time.monotonic()
         result = None
+        pause_owner = ""
         deferred_goal_handle = _DeferredTerminalGoalHandle(goal_handle)
         try:
             allowed, reason = self._validate_skill(
@@ -7417,12 +7514,28 @@ class SkillExecutorNode(Node):
                         "skill timeout exceeds remaining root task budget",
                     )
                 else:
-                    result = self._execute_skill_child(
-                        deferred_goal_handle,
-                        validation_done=True,
-                        effective_timeout_sec=min(admission.effective_timeout_sec, remaining_budget),
-                        canonical_task_id=prepared.identity.task_id,
-                    )
+                    # Before the executor's own preparation (hand opening, feedback checks):
+                    # the camera readers are released while the robot moves.
+                    pause_owner, pause_ready = self._pause_skill_motion_imitation(goal.skill_name)
+                    if not pause_ready:
+                        result = SkillCommand.Result()
+                        result = self._abort_skill(
+                            result,
+                            deferred_goal_handle,
+                            [],
+                            "PERCEPTION_PAUSE_FAILED",
+                            "mirror perception did not acknowledge the skill pause",
+                        )
+                    elif goal_handle.is_cancel_requested:
+                        result = SkillCommand.Result()
+                        result = self._cancel_skill(result, deferred_goal_handle, [], goal.skill_name)
+                    else:
+                        result = self._execute_skill_child(
+                            deferred_goal_handle,
+                            validation_done=True,
+                            effective_timeout_sec=min(admission.effective_timeout_sec, remaining_budget),
+                            canonical_task_id=prepared.identity.task_id,
+                        )
         except Exception as exc:
             self.get_logger().error(f"[skill_executor] gateway execution failed: {exc}")
             self._audit("gateway_exception", error_code="SKILL_REJECTED", **audit_context)
@@ -7484,6 +7597,9 @@ class SkillExecutorNode(Node):
                         **audit_context,
                     )
                     deferred_goal_handle.commit()
+            if pause_owner:
+                # Pick/place delegations hold their own owners until their cleanup is definite.
+                self._resume_motion_imitation(pause_owner)
         return result
 
     def _execute_workflow_skill_gateway(self, goal_handle):
@@ -7676,7 +7792,7 @@ class SkillExecutorNode(Node):
             else:
                 remaining_budget = workflow.deadline_unix_sec - self._ros_time_sec()
                 if remaining_budget > 0.0:
-                    if not self._pause_workflow_motion_imitation(workflow):
+                    if not self._pause_workflow_motion_imitation(workflow, goal.skill_name):
                         result = self._abort_skill(
                             result,
                             deferred_goal_handle,

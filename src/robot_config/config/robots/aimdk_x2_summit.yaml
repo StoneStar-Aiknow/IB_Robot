@@ -26,6 +26,10 @@ robot:
   motion_imitation_stream:
     enabled: true
     pause_during_manipulation: true
+    # Every moves_robot skill except the mirror's own releases the camera readers while it
+    # runs, so its feedback checks do not compete with the streams. Pick, place and return
+    # refuse to start without the pause; other skills warn and continue.
+    pause_during_robot_motion: true
   # Inherit both HRI services and all three grasp services from the combined
   # base instead of replacing its model list. CBF stays disabled as in that
   # base: both executors share policy_stream without an arm-owner identity.

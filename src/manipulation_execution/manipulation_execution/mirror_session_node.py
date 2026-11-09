@@ -113,14 +113,20 @@ from embodied_common.mirror_session_contract import NODE_NAME, STATE_PERIOD_SEC,
 from ibrobot_msgs.msg import ActorState, PearFrame, RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StopRuntime
 from manipulation_execution.mirror_session.business import build_hooks, load_business_config
-from manipulation_execution.mirror_session.core import DEFAULT_STOP_TIMEOUT_S, MirrorSession, SessionConfig
-from manipulation_execution.mirror_session.core import Phase, SessionState
+from manipulation_execution.mirror_session.core import (
+    DEFAULT_STOP_TIMEOUT_S,
+    MirrorSession,
+    Phase,
+    SessionConfig,
+    SessionState,
+)
 from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, RELEASE_INTERFACES, resolve_endpoints
 from manipulation_execution.mirror_session.hand_overlay import HandOverlay
 from manipulation_execution.mirror_session.hooks import HookContext
 from manipulation_execution.mirror_session.inputs import InputCollector
 from manipulation_execution.mirror_session.mock_playback import MockPlaybackHooks
 from manipulation_execution.mirror_session.runtime import RuntimeObservation, release_to_idle
+from manipulation_execution.perception_pause_follower import PausableSubscription
 
 
 def observation_from_status(status: RuntimeStatus, now_ns: int) -> RuntimeObservation:
@@ -159,9 +165,7 @@ class RosRuntimePort:
         self._set = node.create_client(
             SetRuntimeMode, endpoints["runtime.set_mode"].endpoint, callback_group=callback_group
         )
-        self._stop = node.create_client(
-            StopRuntime, endpoints["runtime.stop"].endpoint, callback_group=callback_group
-        )
+        self._stop = node.create_client(StopRuntime, endpoints["runtime.stop"].endpoint, callback_group=callback_group)
         self.spin_once = None
 
     def get_status(self, timeout_s: float) -> RuntimeObservation | None:
@@ -424,12 +428,21 @@ class MirrorSessionNode(Node):
         for name, message_type, callback in (
             ("pear_frame_topic", PearFrame, self._inputs.pear),
             ("actor_state_topic", ActorState, self._inputs.actor),
-            ("camera_topic", CompressedImage, self._inputs.camera),
         ):
             if input_topics[name]:
                 self.create_subscription(
                     message_type, input_topics[name], callback, qos_profile_sensor_data, callback_group=inputs_group
                 )
+        self.camera_reader = None
+        if input_topics["camera_topic"]:
+            # The cover input follows the stream's pause; the session is in WAIT whenever a skill pauses it.
+            self.camera_reader = PausableSubscription(
+                self,
+                CompressedImage,
+                input_topics["camera_topic"],
+                self._inputs.camera,
+                qos_profile_sensor_data,
+            )
         if self._mock is not None:
             self._play_client = self.create_client(SetBool, mock_play, callback_group=ReentrantCallbackGroup())
             self.create_subscription(
@@ -493,13 +506,18 @@ class MirrorSessionNode(Node):
         overlay = HandOverlay(rate)
         group = MutuallyExclusiveCallbackGroup()
         self.create_subscription(
-            Float64MultiArray, follow, self._guarded(lambda msg: overlay.observe_follow(msg.data, self._clock_s())),
-            10, callback_group=group,
+            Float64MultiArray,
+            follow,
+            self._guarded(lambda msg: overlay.observe_follow(msg.data, self._clock_s())),
+            10,
+            callback_group=group,
         )
         # Vendor types by name: this package does not depend on aimdk_msgs.
         from rosidl_runtime_py.utilities import get_message
 
-        vendor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+        vendor_qos = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE
+        )
         wired = []
         for key, observe in (("hand_state", overlay.observe_state), ("hand_command", overlay.observe_command)):
             topic = _optional_topic(self, f"{key}_topic")
@@ -511,11 +529,15 @@ class MirrorSessionNode(Node):
                 self.get_logger().error(f"hands: {key} type not loadable ({exc!r}); {topic} not subscribed")
                 continue
             self.create_subscription(
-                message_type, topic,
-                self._guarded(lambda msg, observe=observe: observe(
-                    [h.position for h in msg.left_hands], [h.position for h in msg.right_hands], self._clock_s()
-                )),
-                vendor_qos, callback_group=group,
+                message_type,
+                topic,
+                self._guarded(
+                    lambda msg, observe=observe: observe(
+                        [h.position for h in msg.left_hands], [h.position for h in msg.right_hands], self._clock_s()
+                    )
+                ),
+                vendor_qos,
+                callback_group=group,
             )
             wired.append(topic)
         self.get_logger().info(f"hands: follow {follow}, feedback {wired or 'none'}; neutral outside mirroring")
