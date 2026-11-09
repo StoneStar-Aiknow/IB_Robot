@@ -13,6 +13,8 @@
   <depend>sensor_msgs</depend>
   <depend>std_srvs</depend>
   <depend>std_msgs</depend>
+  <depend>action_msgs</depend>
+  <depend>unique_identifier_msgs</depend>
   <depend>robot_runtime</depend>
   <depend>tf2_ros</depend>
   <depend>ibrobot_msgs</depend>

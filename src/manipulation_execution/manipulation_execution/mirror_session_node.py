@@ -113,11 +113,16 @@ from embodied_common.mirror_session_contract import NODE_NAME, STATE_PERIOD_SEC,
 from ibrobot_msgs.msg import ActorState, PearFrame, RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StopRuntime
 from manipulation_execution.mirror_session.business import build_hooks, load_business_config
-from manipulation_execution.mirror_session.core import DEFAULT_STOP_TIMEOUT_S, MirrorSession, SessionConfig
-from manipulation_execution.mirror_session.core import Phase, SessionState
+from manipulation_execution.mirror_session.core import (
+    DEFAULT_STOP_TIMEOUT_S,
+    MirrorSession,
+    Phase,
+    SessionConfig,
+    SessionState,
+)
 from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, RELEASE_INTERFACES, resolve_endpoints
 from manipulation_execution.mirror_session.hand_overlay import HandOverlay
-from manipulation_execution.mirror_session.hooks import HookContext
+from manipulation_execution.mirror_session.hooks import HookContext, UpperBodyCommand
 from manipulation_execution.mirror_session.inputs import InputCollector
 from manipulation_execution.mirror_session.mock_playback import MockPlaybackHooks
 from manipulation_execution.mirror_session.runtime import RuntimeObservation, release_to_idle
@@ -159,9 +164,7 @@ class RosRuntimePort:
         self._set = node.create_client(
             SetRuntimeMode, endpoints["runtime.set_mode"].endpoint, callback_group=callback_group
         )
-        self._stop = node.create_client(
-            StopRuntime, endpoints["runtime.stop"].endpoint, callback_group=callback_group
-        )
+        self._stop = node.create_client(StopRuntime, endpoints["runtime.stop"].endpoint, callback_group=callback_group)
         self.spin_once = None
 
     def get_status(self, timeout_s: float) -> RuntimeObservation | None:
@@ -239,6 +242,7 @@ SESSION_PARAMETERS = {
     "hand_state_type": "aimdk_msgs/msg/HandStateArray",
     "hand_command_topic": "",
     "hand_command_type": "aimdk_msgs/msg/HandCommandArray",
+    "preset_motion_json": "",
 }
 
 
@@ -403,6 +407,48 @@ class MirrorSessionNode(Node):
         from robot_config.contract_utils import qos_profile_from_dict
 
         runtime_group = ReentrantCallbackGroup()
+        self._preset = None
+        self._preset_port = None
+        self._preset_match_after_ns = None
+        self._preset_match_epoch = None
+        self._preset_signal_generation = None
+        self._preset_signal_lock = threading.RLock()
+        self._preset_selected_actor = None
+        self._preset_last_preview_at = -math.inf
+        self._preset_last_raw = None
+        preset_settings_json = _string(self, "preset_motion_json")
+        preset_settings = None
+        if preset_settings_json:
+            from manipulation_execution.mirror_session.preset import PresetConfig, PresetCoordinator
+            from manipulation_execution.mirror_session.preset_ros import RosPresetPort
+            from manipulation_execution.preset_motions.config import motion_parameters
+
+            candidate = json.loads(preset_settings_json)
+            if not isinstance(candidate, dict) or set(candidate) != {
+                "motion_name",
+                "match_state_topic",
+                "template_file",
+                "geometry_file",
+            }:
+                raise ValueError("preset_motion_json has an invalid deployment shape")
+            preset_settings = motion_parameters(
+                {
+                    "preset_motions": {
+                        "enabled": True,
+                        "motion_enabled": True,
+                        "motion_name": candidate["motion_name"],
+                        "state_topic": candidate["match_state_topic"],
+                        "template_file": candidate["template_file"],
+                        "geometry_file": candidate["geometry_file"],
+                    }
+                }
+            )
+            if not self._publish_enabled:
+                raise ValueError("named preset requires the deployment's authorized mirror output")
+            self._preset_port = RosPresetPort(self, description, callback_group=runtime_group)
+            self._preset = PresetCoordinator(
+                PresetConfig(enabled=True, motion_name=preset_settings["motion_name"]), self._preset_port
+            )
         self._port = RosRuntimePort(self, endpoints, runtime_group)
         arm, hand, joint_state = endpoints["joint.arm_stream"], endpoints["joint.hand_stream"], endpoints["joint.state"]
         self._arm_joints = arm.joint_names
@@ -417,25 +463,38 @@ class MirrorSessionNode(Node):
         self._latency = LatencyMeter()
         self._hands = self._hand_overlay(rate)
         self._hands_last: tuple[float, ...] | None = None
-        self.session = MirrorSession(config, self._port, self._send, hooks=hooks, cover=cover)
+        if self._preset is not None and (self._hands is None or self._mock is None):
+            raise ValueError("named preset requires the live arm preview and both-hand follow target")
+        session_options = {"hooks": hooks, "cover": cover}
+        if self._preset is not None:
+            session_options.update(
+                preset=self._preset,
+                preset_target=self._preset_target,
+                preset_stop_target=self._preset_stop_target,
+            )
+        self.session = MirrorSession(config, self._port, self._send, **session_options)
 
         self._inputs = InputCollector()
         inputs_group = MutuallyExclusiveCallbackGroup()
         for name, message_type, callback in (
             ("pear_frame_topic", PearFrame, self._inputs.pear),
-            ("actor_state_topic", ActorState, self._inputs.actor),
+            ("actor_state_topic", ActorState, self._preset_actor if self._preset is not None else self._inputs.actor),
             ("camera_topic", CompressedImage, self._inputs.camera),
         ):
             if input_topics[name]:
                 self.create_subscription(
                     message_type, input_topics[name], callback, qos_profile_sensor_data, callback_group=inputs_group
                 )
+        if preset_settings is not None:
+            self.create_subscription(
+                String, preset_settings["match_state_topic"], self._on_preset_state, 10, callback_group=inputs_group
+            )
         if self._mock is not None:
             self._play_client = self.create_client(SetBool, mock_play, callback_group=ReentrantCallbackGroup())
             self.create_subscription(
                 Float64MultiArray,
                 mock_preview,
-                lambda msg: self._mock.offer(msg.data),
+                self._preset_preview if self._preset is not None else lambda msg: self._mock.offer(msg.data),
                 10,
                 callback_group=inputs_group,
             )
@@ -493,13 +552,18 @@ class MirrorSessionNode(Node):
         overlay = HandOverlay(rate)
         group = MutuallyExclusiveCallbackGroup()
         self.create_subscription(
-            Float64MultiArray, follow, self._guarded(lambda msg: overlay.observe_follow(msg.data, self._clock_s())),
-            10, callback_group=group,
+            Float64MultiArray,
+            follow,
+            self._guarded(lambda msg: overlay.observe_follow(msg.data, self._clock_s())),
+            10,
+            callback_group=group,
         )
         # Vendor types by name: this package does not depend on aimdk_msgs.
         from rosidl_runtime_py.utilities import get_message
 
-        vendor_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE)
+        vendor_qos = QoSProfile(
+            depth=1, reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE
+        )
         wired = []
         for key, observe in (("hand_state", overlay.observe_state), ("hand_command", overlay.observe_command)):
             topic = _optional_topic(self, f"{key}_topic")
@@ -511,11 +575,15 @@ class MirrorSessionNode(Node):
                 self.get_logger().error(f"hands: {key} type not loadable ({exc!r}); {topic} not subscribed")
                 continue
             self.create_subscription(
-                message_type, topic,
-                self._guarded(lambda msg, observe=observe: observe(
-                    [h.position for h in msg.left_hands], [h.position for h in msg.right_hands], self._clock_s()
-                )),
-                vendor_qos, callback_group=group,
+                message_type,
+                topic,
+                self._guarded(
+                    lambda msg, observe=observe: observe(
+                        [h.position for h in msg.left_hands], [h.position for h in msg.right_hands], self._clock_s()
+                    )
+                ),
+                vendor_qos,
+                callback_group=group,
             )
             wired.append(topic)
         self.get_logger().info(f"hands: follow {follow}, feedback {wired or 'none'}; neutral outside mirroring")
@@ -537,7 +605,11 @@ class MirrorSessionNode(Node):
 
     def _publish(self, command) -> None:
         # The gate is the only caller, under the session lock.
-        if self._hands is not None:
+        seed = getattr(self, "_preset", None) is not None and self.session.preset_seed_emitting
+        if seed and self._hands is not None:
+            self._hands.reseed(command.hand, self._clock_s())
+            self._hands_last = tuple(command.hand)
+        elif self._hands is not None:
             following = self.session.state == SessionState.MIRRORING and self.session.phase == Phase.RUNNING
             try:
                 self._hands_last = self._hands.apply(following, self._clock_s())
@@ -551,6 +623,74 @@ class MirrorSessionNode(Node):
             self._hand_publisher.publish(hand)
         self._arm_preview.publish(arm)
         self._hand_preview.publish(hand)
+
+    def _preset_actor(self, message) -> None:
+        self._inputs.actor(message)
+        self._preset_selected_actor = (
+            int(message.actor_id) if message.actor_present and message.start_ready and message.actor_id >= 0 else None,
+            time.monotonic(),
+        )
+
+    def _preset_preview(self, message) -> None:
+        try:
+            values = tuple(float(value) for value in message.data)
+            if len(values) != ARM_JOINT_COUNT or not all(map(math.isfinite, values)):
+                return
+        except (TypeError, ValueError, OverflowError):
+            return
+        self._preset_last_preview_at = time.monotonic()
+        self._mock.offer(values)
+
+    def _preset_target(self, command) -> UpperBodyCommand | None:
+        if not 0 <= time.monotonic() - self._preset_last_preview_at <= 0.35:
+            return None
+        if command is not None:
+            self._preset_last_raw = command
+        if self._preset_last_raw is None or self._hands is None:
+            return None
+        hands = self._hands.follow_target(self._clock_s())
+        if hands is None:
+            return None
+        return UpperBodyCommand(tuple(self._preset_last_raw.arm), hands, self._preset_last_raw.source_stamp_s)
+
+    def _preset_stop_target(self, command) -> UpperBodyCommand | None:
+        """Complete the reset pose for validation by the same named owner.
+
+        Stopping must not depend on fresh perception. The runtime checks this
+        entire bridge from fresh measured joints before it sends any target.
+        """
+        if command is None or self._hands is None:
+            return None
+        try:
+            arm = tuple(float(value) for value in command.arm)
+            if len(arm) != ARM_JOINT_COUNT or not all(map(math.isfinite, arm)):
+                return None
+            return UpperBodyCommand(arm, self._hands.neutral_target())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    def _on_preset_state(self, message) -> None:
+        from manipulation_execution.preset_motions.match_signal import decode_match_state
+
+        now = time.monotonic()
+        with self._preset_signal_lock:
+            generation = self.session.preset_generation
+            if self._preset_signal_generation != generation:
+                return  # The tick has not installed this round's source-time barrier yet.
+            selected = self._preset_selected_actor
+            actor_id = selected[0] if selected is not None and 0 <= now - selected[1] <= 1.0 else None
+            signal = decode_match_state(
+                message.data,
+                now_ros_s=self._clock_s(),
+                source_after_ns=self._preset_match_after_ns,
+                actor_id=actor_id,
+                epoch=self._preset_match_epoch,
+            )
+            accepted = self.session.observe_preset(
+                signal.active, valid=signal.valid, expected_generation=generation, received_at=now
+            )
+            if accepted and signal.valid and self._preset_match_epoch is None:
+                self._preset_match_epoch = signal.epoch
 
     def _send(self, command) -> None:
         # The gate is the only caller, under the session lock.
@@ -595,6 +735,15 @@ class MirrorSessionNode(Node):
         self.session.tick(dataclasses.replace(self._inputs.take(), publish_enabled=self._publish_enabled))
         transitions = self.session.drain_transitions()
         for record in transitions:
+            if getattr(self, "_preset", None) is not None:
+                with self._preset_signal_lock:
+                    if record["state"] == SessionState.MIRRORING.value and record["phase"] == Phase.RUNNING.value:
+                        self._preset_signal_generation = self.session.preset_generation
+                        self._preset_match_after_ns = self.get_clock().now().nanoseconds
+                        self._preset_match_epoch = None
+                        self._preset_last_raw = None
+                    else:
+                        self._preset_signal_generation = self._preset_match_after_ns = None
             self.get_logger().info(
                 f"{record['from']} -> {record['to']} ({record['reason']}); cancel_reason={record['cancel_reason']!r} "
                 f"short_rounds={record['short_rounds']}"

@@ -394,3 +394,21 @@ robot:
       latest_start_sec: 2.0
       dump_dir: ""
   # /feat/x2-internvl-voice
+
+  # feat/x2-preset-motions
+  preset_motions:
+    enabled: true
+    # Matching emits perception events. Motion stays off until the complete
+    # dual-hand target and session handoff pass the head-clearance gates.
+    motion_enabled: false
+    match_topic: /preset_motions/matched
+    status_topic: /preset_motions/status
+    state_topic: /preset_motions/state
+    motion_name: overhead_heart
+    template_file: $(find robot_config)/config/preset_motions/overhead_heart.yaml
+    geometry_file: ""  # A certified runtime artifact is required before enabling motion.
+    matcher:
+      enter_confirm_s: 0.5
+      exit_confirm_s: 0.4
+      min_enter_frames: 3
+  # /feat/x2-preset-motions

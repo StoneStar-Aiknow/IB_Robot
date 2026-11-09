@@ -1,0 +1,160 @@
+schema_version: 1
+name: overhead_heart
+visual_version: palms_down_v1
+recording_file: overhead_heart_palms_down_v1.json
+units: rad
+validated: false
+motion_enabled: false
+review_state: visual_approved_safety_pending
+required_head_clearance_m: 0.2
+preview_comparison_clearance_m: 0.15
+visual_approval:
+  approved: true
+  recorded_at: '2026-11-09T22:09:46+08:00'
+  scope: static_visual_pose_only
+  requirements:
+  - palms_down
+  - fingers_inward
+  - wrists_flexed_with_limit_reserve
+  source_candidate_sha256: 3aa87f640306ad6e29cb591dc1588b6416745c1aa2a23d5464229a37d37cb322
+pending_safety_acceptance:
+- runtime_0.20_m_head_clearance
+- head_motion_and_sensor_envelope
+- entry_and_exit_paths
+- self_and_body_collision
+- tracking_uncertainty
+- board_behavior_tests
+- physical_robot_acceptance
+arm_joint_names:
+- left_shoulder_pitch_joint
+- left_shoulder_roll_joint
+- left_shoulder_yaw_joint
+- left_elbow_joint
+- left_wrist_yaw_joint
+- left_wrist_pitch_joint
+- left_wrist_roll_joint
+- right_shoulder_pitch_joint
+- right_shoulder_roll_joint
+- right_shoulder_yaw_joint
+- right_elbow_joint
+- right_wrist_yaw_joint
+- right_wrist_pitch_joint
+- right_wrist_roll_joint
+arm_target_rad:
+- -3.055
+- 1.0825944077019802
+- -0.7182308086770405
+- -1.2172729588744344
+- 1.8782361201618694
+- 0.40359999999999996
+- -0.9764538017115757
+- -3.055
+- -1.0825944077019802
+- 0.7182308086770405
+- -1.2172729588744344
+- -1.8782361201618694
+- 0.40359999999999996
+- 0.9764538017115757
+hand_joint_names:
+- L_thumb_roll_joint
+- L_thumb_abad_joint
+- L_thumb_mcp_joint
+- L_index_abad_joint
+- L_index_pip_joint
+- L_middle_pip_joint
+- L_ring_abad_joint
+- L_ring_pip_joint
+- L_pinky_abad_joint
+- L_pinky_pip_joint
+- R_thumb_roll_joint
+- R_thumb_abad_joint
+- R_thumb_mcp_joint
+- R_index_abad_joint
+- R_index_pip_joint
+- R_middle_pip_joint
+- R_ring_abad_joint
+- R_ring_pip_joint
+- R_pinky_abad_joint
+- R_pinky_pip_joint
+hand_target_rad:
+- -0.0
+- -0.0
+- -0.0
+- -0.0
+- 0.15
+- 0.15
+- -0.0
+- 0.15
+- -0.0
+- 0.15
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.15
+- 0.15
+- 0.0
+- 0.15
+- 0.0
+- 0.15
+static_metrics:
+  left_hand_head_gap_m: 0.15360027376208849
+  left_forearm_wrist_head_gap_m: 0.15190724084840931
+  left_palm_down_error_deg: 3.3676155244123147
+  left_palm_down_tilt_deg: 86.63238447558768
+  left_hand_forward_inward: 0.7983470026706306
+  left_head_surface_top_m: 0.5365734495016073
+  left_wrist_roll_forward_z_lowering: 0.8175724543470655
+  left_actual_finger_inward_dot: 0.7847251653344415
+  left_actual_finger_direction_z: -0.2393174146842361
+  left_tip_below_palm_m: 0.014041327499005996
+  right_hand_head_gap_m: 0.15176696125826125
+  right_forearm_wrist_head_gap_m: 0.1519242174387702
+  right_palm_down_error_deg: 2.8830222860989347
+  right_palm_down_tilt_deg: 87.11697771390106
+  right_hand_forward_inward: 0.7995780529198708
+  right_head_surface_top_m: 0.5365734495016073
+  right_wrist_roll_forward_z_lowering: 0.8189076349266353
+  right_actual_finger_inward_dot: 0.7841568847356927
+  right_actual_finger_direction_z: -0.24154143122365024
+  right_tip_below_palm_m: 0.014455122466113135
+  hand_hand_gap_m: 0.24181182197671314
+  palm_span_m: 0.5766686623785842
+  palm_height_m: 0.5494378307915821
+  palm_forward_m: -0.15305733695090618
+  fingertip_span_m: 0.28482686785164324
+  fingertip_height_m: 0.5351896058090226
+  left_wrist_yaw_rad: 1.8782361201618694
+  left_wrist_pitch_rad: 0.40359999999999996
+  left_wrist_roll_rad: -0.9764538017115757
+  right_wrist_yaw_rad: -1.8782361201618694
+  right_wrist_pitch_rad: 0.40359999999999996
+  right_wrist_roll_rad: 0.9764538017115757
+  minimum_head_gap_m: 0.15176696125826125
+search_checks:
+  orientation_passed: true
+  wrist_margin_passed: true
+  comparison_0.15_m_head_clearance_passed: true
+  runtime_0.20_m_head_clearance_passed: false
+  algorithmic_overhead_height_passed: false
+  algorithmic_shape_passed: false
+wrist_hard_limit_reserve_rad:
+  left_wrist_yaw_joint: 0.6777638798381307
+  left_wrist_pitch_joint: 0.12
+  left_wrist_roll_joint: 0.5332461982884243
+  right_wrist_yaw_joint: 0.6777638798381307
+  right_wrist_pitch_joint: 0.12
+  right_wrist_roll_joint: 0.5332461982884243
+model_sha256:
+  src/robots/aimdk/aimdk_description/urdf/x2_ultra.urdf: f628a969aaf3d5785b8c8901611a85f358d7eb62a8b06b1216dc42291a72944e
+  src/robots/aimdk/aimdk_description/urdf/x2_ultra_omnihand_v1.4.0.urdf: 344c188605f307474456749525259ad8ca2e7b356d9ef3c50ad887f228045259
+  src/robots/aimdk/aimdk_grasp/config/x2_ultra/hand_collision_cover.json: d8f184ecfc3cf2225b3226f2ae9527959724eb9fab5cd330fb5719ac90629e17
+  src/robots/aimdk/aimdk_grasp/config/x2_ultra_right/hand_collision_cover.json: fe7994e34338f6e9cecc6c1a459a2956ed3793cd3dc98dcb8e964ccb51bc2f3c
+model_mapping:
+  palm_mount: legacy
+  thumb_mount: legacy
+  distal_coupling: aimdk_grasp.joints.DIP_FOLLOWERS
+body_policy:
+  waist: fixed
+  legs: fixed
+  head: zero_angles_only_for_this_preview
