@@ -381,7 +381,9 @@ def _motion(count, seed, scale):
 def test_the_shoulder_speedups_keep_the_output():
     # followme_feaebe22.npz is this exact run on feaebe22, before the shoulder solver skipped
     # yaw_need for candidates that cannot win and reused its answers; there the twist cost
-    # decided on 138 of the 540 solver steps. Bit for bit on x86; the tolerance is for libm.
+    # decided on 138 of the 540 solver steps. Bit for bit on x86. On the 310P (aarch64) both
+    # feaebe22 and the patched code land up to 5e-7 rad off x86, identical to each other; skipping
+    # a candidate that could win or reusing the wrong answer moves joints by 0.2 rad or more.
     golden = np.load(Path(__file__).resolve().parent / "data" / "x2_shoulder_ik" / "followme_feaebe22.npz")
     for seed, scale, mirror in ((0, 0.6, True), (1, 2.0, True), (2, 1.2, False)):
         t, raw = _motion(90, seed, scale)
@@ -392,7 +394,7 @@ def test_the_shoulder_speedups_keep_the_output():
             if i == 60:
                 stream.reset_input()
             poses.append(stream.retarget(ti, i, row))
-        np.testing.assert_allclose(poses, golden[f"seed{seed}"], rtol=0, atol=1e-9, err_msg=f"seed {seed}")
+        np.testing.assert_allclose(poses, golden[f"seed{seed}"], rtol=0, atol=1e-5, err_msg=f"seed {seed}")
 
 
 def test_her_arms_reads_what_twist_indicators_does():
