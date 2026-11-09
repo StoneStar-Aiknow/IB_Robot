@@ -310,3 +310,9 @@ robot:
   internvl_voice:
     enabled: false
   # /feat/x2-internvl-voice
+
+  # feat/x2-preset-motions
+  preset_motions:
+    enabled: false
+    motion_enabled: false
+  # /feat/x2-preset-motions

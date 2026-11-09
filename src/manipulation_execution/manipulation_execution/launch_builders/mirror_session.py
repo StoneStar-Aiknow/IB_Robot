@@ -499,6 +499,19 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
                 parameters=[voice],
             )
         )
+    from manipulation_execution.preset_motions.config import launch_parameters
+
+    preset = launch_parameters(robot_config, stream)
+    if preset is not None:
+        actions.append(
+            Node(
+                package="manipulation_execution",
+                executable="preset_motion_matcher_node",
+                name="preset_motion_matcher",
+                output="screen",
+                parameters=[preset],
+            )
+        )
     return actions
 
 
