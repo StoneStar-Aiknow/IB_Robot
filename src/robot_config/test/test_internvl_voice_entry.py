@@ -14,7 +14,7 @@ blocks are merged in around ours.
 from __future__ import annotations
 
 import shutil
-import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,8 +23,6 @@ import yaml
 from embodied_common import internvl_voice_contract as contract
 from robot_config.loader import _load_robot_section
 
-# The summit this branch last merged: the entry without our block must be its file.
-BASELINE = "4442113e"
 PACKAGE = Path(__file__).resolve().parents[1]
 ROBOTS = PACKAGE / "config" / "robots"
 ENTRY = ROBOTS / "aimdk_x2_voice_mirror_all.yaml"
@@ -88,8 +86,12 @@ class TestTheBlock:
         assert settings.look is not None
 
     def test_it_is_written_at_the_contract_s_defaults(self, config):
-        """The defaults stand in for a bad item, so they must be what is deployed."""
-        assert contract.normalize(config["internvl_voice"])[0] == contract.Settings()
+        """The defaults stand in for a bad item, so they must be what is deployed.
+
+        Except asr: feat/x2-retarget-tune deploys "session", the mode that stopped the
+        STANDBY/MIRRORING stalls on the robot.
+        """
+        assert contract.normalize(config["internvl_voice"])[0] == replace(contract.Settings(), asr="session")
 
     def test_its_table_is_the_installed_one(self, config):
         """``$(find robot_config)`` against the source tree, laid out as the share dir is."""
@@ -115,21 +117,13 @@ class TestNothingElseChanges:
             assert current[section] == without[section], section
         assert current == without
 
-    def test_the_entry_without_the_block_is_the_baseline_file(self, text):
-        """Optional: holds only until another feature edits this entry; skips without the commit."""
-        repo = subprocess.run(
-            ["git", "-C", str(PACKAGE), "rev-parse", "--show-toplevel"], capture_output=True, check=False, text=True
-        )
-        if repo.returncode != 0:
-            pytest.skip("not a git checkout")
-        path = ENTRY.relative_to(Path(repo.stdout.strip())).as_posix()
-        baseline = subprocess.run(
-            ["git", "-C", str(PACKAGE), "show", f"{BASELINE}:{path}"], capture_output=True, check=False, text=True
-        )
-        if baseline.returncode != 0:
-            pytest.skip(f"{BASELINE} is not reachable")
+    def test_nothing_of_ours_is_outside_the_block(self, text):
+        """Only our block is checked: other features merged into this entry may change the rest."""
+        outside = _without_block(text)
 
-        assert _without_block(text) == baseline.stdout
+        assert "feat/x2-internvl-voice" not in outside
+        assert "x2_clips_" not in outside
+        assert not any(line.lstrip().startswith("internvl_voice:") for line in outside.splitlines())
 
 
 class TestGraspProfile:

@@ -700,6 +700,141 @@ def test_entering_mirroring_resets_the_round():
 
 
 # ---------------------------------------------------------------------------
+# Key mode: the detector's triggers, said at once.
+
+
+def keyed(**overrides) -> LookSay:
+    return start(make(key_mode=True, **overrides), 0.0)
+
+
+def test_key_mode_comes_from_the_look_s_key_actions():
+    config = LookConfig.from_look({"key_actions": {"enabled": True, "say_within_sec": 2.0}})
+    assert (config.key_mode, config.key_say_within_sec) == (True, 2.0)
+    assert LookConfig.from_look({"key_actions": {"enabled": False}}).key_mode is False
+    assert LookConfig.from_look({}).key_mode is False
+
+
+def test_a_key_action_is_said_at_once_and_restarts_the_gap():
+    look = keyed()
+    look.key("wave", 0.5)
+    pick = look.decide(0.6)
+    assert (pick.pool, pick.reason, pick.quick) == ("big.wave", "key", True)
+    played(look, 0.6, 0.5)
+    assert look.due_at == pytest.approx(1.1 + 4.0)
+    assert look.decide(5.0) is None
+
+
+@pytest.mark.parametrize(("action", "pool"), sorted(look_say.KEY_POOLS.items()))
+def test_each_key_action_has_its_own_pool(action, pool):
+    look = keyed()
+    look.key(action, 0.5)
+    assert look.decide(0.6).pool == pool
+
+
+def test_an_unknown_key_action_is_refused():
+    with pytest.raises(ValueError, match="dance"):
+        keyed().key("dance", 0.5)
+
+
+def test_a_key_line_waits_for_the_voice():
+    look = keyed()
+    look.voice(1.0, busy=True, heard=True)
+    look.key("thumb", 1.0)
+    assert look.decide(1.5) is None
+    look.voice(2.0, busy=False, heard=True)
+    assert look.decide(2.1).reason == "key"
+
+
+def test_a_key_line_not_said_in_time_is_dropped():
+    look = keyed()
+    look.voice(1.0, busy=True, heard=True)
+    look.key("open", 1.0)
+    assert look.decide(4.5) is None
+    assert look.key_dropped == 1
+    look.voice(5.0, busy=False, heard=True)
+    pick = look.decide(5.1)
+    assert pick is None or pick.reason != "key"
+    assert look.key_dropped == 1
+
+
+def test_the_newest_trigger_wins():
+    look = keyed()
+    look.voice(1.0, busy=True, heard=True)
+    look.key("thumb", 1.0)
+    look.key("wave", 1.2)
+    look.voice(1.5, busy=False, heard=True)
+    assert look.decide(1.6).pool == "big.wave"
+
+
+def test_key_lines_are_outside_max_per_round_and_the_pool_cooldown():
+    look = keyed(max_per_round=1, pool_cooldown_sec=100.0)
+    look.key("wave", 0.5)
+    first = look.decide(0.6)
+    played(look, 0.6, 0.5)
+    assert (first.seq, first.total, look.spoken, look.done) == (0, 1, 0, False)
+    general = look.decide(5.1 + 2.5)
+    assert general.reason == "fallback" and look.done
+    played(look, 7.6, 0.5)
+    look.key("wave", 10.0)
+    second = look.decide(10.0)
+    assert (second.pool, second.reason, second.seq, second.total) == ("big.wave", "key", 1, 3)
+    assert second.clip_id != first.clip_id
+    assert look.spoken == 1
+
+
+def test_a_key_pool_is_reused_but_never_the_same_clip_twice_in_a_row():
+    look = keyed(clip_pools=pools(big_wave=2))
+    said = []
+    at = 0.5
+    for _ in range(4):
+        look.key("wave", at)
+        said.append(look.decide(at).clip_id)
+        played(look, at, 0.5)
+        at += 1.0
+    assert set(said) == {"big_wave_01", "big_wave_02"}
+    assert all(a != b for a, b in zip(said, said[1:], strict=False))
+
+
+def test_a_key_pool_of_one_clip_waits_rather_than_repeat_the_last_line():
+    look = keyed(clip_pools=pools(big_wave=1))
+    look.key("wave", 0.5)
+    assert look.decide(0.5).clip_id == "big_wave_01"
+    played(look, 0.5, 0.5)
+    look.key("wave", 1.5)
+    assert look.decide(1.5) is None
+    assert look.decide(5.0) is None
+    assert look.key_dropped == 1
+
+
+def test_key_mode_looks_whatever_the_window_and_the_round_s_count():
+    look = keyed(max_per_round=1, window_sec=1.0)
+    assert look.wants_look(0.1)
+    assert look.decide(5.5).reason == "fallback" and look.done
+    assert look.wants_look(5.6)
+
+
+@pytest.mark.parametrize(("label", "coarse"), [(HEART, "hand.any"), (YEAH, "hand.any"), (WAVE, "big.any")])
+def test_in_key_mode_a_named_q1_answer_only_picks_its_family_s_line(label, coarse):
+    look = keyed()
+    look.looked(1.0, label, ref="seen")
+    q3 = Q3(True)
+    pick = look.decide(3.0, q3)
+    assert (pick.pool, pick.reason) == (coarse, "general")
+    assert q3.asked == []
+    assert not look.wants_refine(HAND_ANY)
+
+
+def test_entering_mirroring_clears_a_pending_trigger():
+    look = keyed()
+    look.voice(1.0, busy=True, heard=True)
+    look.key("wave", 1.0)
+    look.leave()
+    start(look, 2.0)
+    assert look.decide(2.1) is None
+    assert look.key_dropped == 0
+
+
+# ---------------------------------------------------------------------------
 # The clip table the deployment ships.
 
 

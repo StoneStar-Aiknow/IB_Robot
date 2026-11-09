@@ -22,6 +22,7 @@ import os
 import threading
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import replace
 
 import rclpy
 from builtin_interfaces.msg import Time
@@ -52,6 +53,7 @@ from visual_interaction.session.core import SessionConfig, VisualInteractionSess
 from visual_interaction.session.endpoints import CAMERA_COMPRESSED, Endpoint, resolve_camera
 from visual_interaction.session.fake_vl import ScriptedVision
 from visual_interaction.session.hooks import ActorSignal, RoundInputs, SessionHooks, Window
+from visual_interaction.session.key_actions import GateConfig, KeyGate, Smoother
 from visual_interaction.session.look_say import (
     DEFAULT_SLOW_LOOK_SEC,
     Q1,
@@ -144,6 +146,10 @@ PARAMETERS: dict[str, object] = {
 LOOK_TICK_SEC = 0.05
 # A failed look is logged at most this often; the status topic counts them all.
 LOOK_ERROR_LOG_SEC = 30.0
+# Key mode's four pictures span this much of the stream, newest last (key_eval.MULTI_OFFSETS).
+KEY_WINDOW_SEC = 0.75
+# The grey picture the key question is calibrated on.
+KEY_BLANK_GREY = 128
 
 
 def camera_qos(declared: Mapping[str, object]) -> QoSProfile:
@@ -724,17 +730,25 @@ class VisualInteractionNode(Node):
         self._look_mirroring = False
         # What one tick did, for dump_dir; reset at the start of every tick.
         self._look_record: dict = {}
+        # Key mode (look.key_actions): None when it is off, or turned off at preload.
+        self._key_gate: KeyGate | None = None
+        self._key_smoother: Smoother | None = None
+        self._key_blank: dict | None = None
+        self._look_q1_at = float("-inf")
         if self._look_build_error is not None:
             self._look_off(f"no model: {self._look_build_error}")
             return
         vision = self._session.hooks.vision
-        missing = [
-            name for name in ("register_questions", "prepare", "ask") if not callable(getattr(vision, name, None))
-        ]
+        needed = ("register_questions", "prepare", "ask")
+        if self._look.config.key_mode:
+            needed += ("register_choices", "prepare_many", "score")
+        missing = [name for name in needed if not callable(getattr(vision, name, None))]
         if missing:
             self._look_off(f"the vision has no {', '.join(missing)}")
             return
         vision.register_questions(QUESTIONS)
+        if self._look.config.key_mode:
+            self._init_key(vision, settings["key_actions"])
         if not any(settings["pools"].values()):
             self.get_logger().warning("look: look_json carries no pools; the look has nothing to say")
         self.get_logger().info(
@@ -742,6 +756,61 @@ class VisualInteractionNode(Node):
             f"verify {self._look.config.verify}, refine {self._look.config.refine_hand}, "
             f"crop {self._look_crop}, {sum(len(v) for v in settings['pools'].values())} clips"
         )
+
+    def _init_key(self, vision, key: dict) -> None:
+        """The key-action question, gate and smoother (key_actions, key_choice)."""
+        from visual_interaction.session import key_choice
+
+        self._key_frames = int(key["frames"])
+        self._key_question = key_choice.key(self._key_frames, "fwd")
+        self._key_calibrate = str(key["calibrate"])
+        self._key_q1_period = float(key["q1_period_sec"])
+        vision.register_choices(key_choice.questions(frames=(self._key_frames,), orders=("fwd",)))
+        self._key_gate = KeyGate(
+            GateConfig(dict(key["thresholds"]), int(key["confirm"]), int(key["release"]), float(key["cooldown_sec"]))
+        )
+        self._key_smoother = Smoother(int(key["smooth"]))
+        self.get_logger().info(
+            f"look: key actions {dict(key['thresholds'])}, {self._key_frames} frame(s), "
+            f"calibrate {self._key_calibrate}, smooth {key['smooth']}, confirm {key['confirm']}, "
+            f"Q1 every {self._key_q1_period:g} s"
+        )
+
+    def _key_off(self, why: str) -> None:
+        """Key detection off for good; the look goes on as it does without key_actions."""
+        self._key_gate = None
+        self._key_smoother = None
+        self._look.config = replace(self._look.config, key_mode=False)
+        self.get_logger().warning(f"look: key actions off: {why}")
+
+    def _key_reset(self) -> None:
+        if self._key_gate is not None:
+            self._key_gate.reset()
+            self._key_smoother.reset()
+
+    def _key_preload(self) -> None:
+        """Check the key question loaded and, with calibrate blank, score it on grey pictures."""
+        import numpy as np
+
+        from visual_interaction.session import key_choice
+        from visual_interaction.session.look_crop import SIDE
+
+        vision = self._session.hooks.vision
+        failures = dict(getattr(vision, "question_failures", {}) or {})
+        if self._key_question in failures:
+            self._key_off(f"{self._key_question} refused: {failures[self._key_question]}")
+            return
+        if self._key_calibrate != "blank":
+            return
+        try:
+            grey = np.full((SIDE, SIDE, 3), KEY_BLANK_GREY, np.uint8)
+            choice = vision.score(vision.prepare_many([grey] * self._key_frames), self._key_question)
+            self._key_blank = key_choice.by_answer(choice.probs, "fwd")
+        except Exception as error:  # noqa: BLE001 - no calibration, no key actions; the look goes on
+            self._key_off(f"blank calibration failed: {error}")
+            return
+        shown = {answer: round(p, 3) for answer, p in key_choice.shares(self._key_blank).items()}
+        self.get_logger().info(f"look: key blank shares {shown}")
 
     def _look_off(self, why: str) -> None:
         self._look_dead = why
@@ -763,6 +832,8 @@ class VisualInteractionNode(Node):
             return
         for key, why in sorted(failures.items()):
             self.get_logger().warning(f"look: question {key} refused, skipped: {why}")
+        if self._key_gate is not None:
+            self._key_preload()
         self._look_ready = True
         self.get_logger().info("look: model preloaded")
 
@@ -778,6 +849,8 @@ class VisualInteractionNode(Node):
         if mirroring and not self._look_mirroring:
             self._look.enter(now)
             self._look_last_end = float("-inf")
+            self._look_q1_at = float("-inf")
+            self._key_reset()
             self.get_logger().info("look: mirroring; a new round")
         elif not mirroring and self._look_mirroring:
             self._look.leave()
@@ -804,7 +877,10 @@ class VisualInteractionNode(Node):
             self._look_once(now)
             now = self._now()
             look.voice(now, self._voice_busy_now, self._voice_heard(now), self._voice_status_at)
+        dropped = look.key_dropped
         pick = look.decide(now, self._look_verify if self._look_ready else None)
+        if look.key_dropped > dropped:
+            self._count("key_stale")
         if pick is not None:
             self._look_say(pick, now)
         if self._look_record:
@@ -820,12 +896,17 @@ class VisualInteractionNode(Node):
             return
         if self._actor_received_at is None or now - self._actor_received_at > self._stale_actor_sec:
             self._count("look_no_actor")
+            # Whoever comes next is someone else, or the same person seen afresh.
+            self._key_reset()
             return
         # Looking while the voice is synthesizing put two models on the NPU at
         # once and the mirror's pose model fell behind (see _chatter_round).
         # Clips are not synthesized, so in the clip mode this never holds.
         if self._voice_synthesizing(now):
             self._count("skip_voice_synthesis")
+            return
+        if self._key_gate is not None:
+            self._key_look(now)
             return
         frame = _decode(window.frames[-1])
         if frame is None:
@@ -870,6 +951,91 @@ class VisualInteractionNode(Node):
         self._count("look")
         self._look_frame_stamp = window.newest_stamp
         look.looked(after, label, ref=seen)
+
+    def _key_look(self, now: float) -> None:
+        """Key mode's look: the key question on the last frames, and Q1 at most every q1_period_sec.
+
+        The key scores go through the smoother and the gate every look; a
+        trigger goes to the look's decisions as a key line. Q1's label goes to
+        the decisions as in the plain look, for the general lines.
+        """
+        from visual_interaction.session import key_choice, look_crop
+        from visual_interaction.session.internvl_vision import Seen
+
+        look = self._look
+        if self._key_frames > 1:
+            window = self._buffer.window(KEY_WINDOW_SEC, self._key_frames)
+        else:
+            window = self._buffer.window(0.0, 1)
+        frames = [_decode(data) for data in window.frames]
+        if any(frame is None for frame in frames):
+            self._count("look_bad_frame")
+            return
+        actor = self._actor
+        bbox = actor.bbox if actor.present else None
+        vision = self._session.hooks.vision
+        record = self._look_record
+        self._look_ticks += 1
+        record.update(tick=self._look_ticks, t=round(now, 3), bbox=list(bbox) if bbox else None)
+        ask_q1 = not look.done and now - self._look_q1_at >= self._key_q1_period
+        label = None
+        started = self._now()
+        try:
+            if self._look_crop:
+                crops = [look_crop.crop_upper_body(frame, bbox) for frame in frames]
+                images, fallback = [crop.image for crop in crops], crops[-1].fallback
+            else:
+                images, fallback = [look_crop.whole_frame(frame) for frame in frames], False
+            seen = vision.prepare_many(images)
+            record.update(crop_fallback=bool(fallback), image=seen.image)
+            answers = key_choice.by_answer(vision.score(seen, self._key_question).probs, "fwd")
+            if self._key_blank is not None:
+                shares = key_choice.calibrate(answers, self._key_blank)
+            else:
+                shares = key_choice.shares(answers)
+            scores = key_choice.action_scores(shares)
+            if ask_q1:
+                one = Seen(embeds=seen.embeds[-1:], image=seen.image, crop_fallback=bool(fallback), seconds=0.0)
+                q1 = vision.ask(one, Q1)
+                record["q1"] = q1.text
+                label = classify(q1.text)
+        except Exception as error:  # noqa: BLE001 - plan §4.6: a failed look is a silent tick
+            self._look_last_end = self._now()
+            self._count("look_error")
+            record["error"] = f"{type(error).__name__}: {error}"
+            if now - self._look_error_logged_at >= LOOK_ERROR_LOG_SEC:
+                self._look_error_logged_at = now
+                self.get_logger().warning(f"look failed: {record['error']}")
+            return
+        after = self._now()
+        self._look_last_end = after
+        seconds = after - started
+        record.update(seconds=round(seconds, 3), scores={a: round(s, 3) for a, s in scores.items()})
+        if ask_q1:
+            record["label"] = label.tag if label else None
+        self._rounds += 1
+        if seconds > self._look_slow_sec:
+            look.slow()
+            record["slow"] = True
+            self._count("look_slow")
+            if look.stopped:
+                self.get_logger().warning(f"look: {seconds:.1f} s looks; no more looking this round")
+            return
+        self._count("look")
+        self._look_frame_stamp = window.newest_stamp
+        smoothed = self._key_smoother.update(scores)
+        trigger = self._key_gate.update(after, smoothed)
+        if trigger is not None:
+            look.key(trigger.action, after)
+            record["trigger"] = trigger.action
+            self._count(f"key_trigger_{trigger.action}")
+            shown = {a: round(s, 2) for a, s in smoothed.items()}
+            self.get_logger().info(f"look: key action {trigger.action} ({trigger.score:.2f}; {shown})")
+        if ask_q1:
+            self._look_q1_at = after
+            look.looked(after, label)
+        else:
+            look.in_time()
 
     def _look_verify(self, key: str, seen) -> bool | None:
         """Q3 on the picture the named gesture was seen in; None when asking it failed.
@@ -1027,6 +1193,7 @@ class VisualInteractionNode(Node):
                 "spoken": self._look.total,
                 "stopped": self._look.stopped,
                 "looks": self._look_ticks,
+                "key": self._key_gate is not None,
             }
             payload["voice_busy"] = self._look.busy(self._now())
         self._status.publish(String(data=json.dumps(payload, ensure_ascii=False)))

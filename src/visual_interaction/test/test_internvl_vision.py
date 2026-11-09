@@ -18,6 +18,7 @@ from visual_interaction.session.internvl_vision import (
     PREFILL_LEN,
     VISION_BATCH,
     Answer,
+    Choice,
     InternVlVision,
     QuestionError,
     Seen,
@@ -81,6 +82,8 @@ _FAKES = {
 
         RUNS = []
         REPLY = {{"text": "比心"}}
+        # score: the first token's logits, zero but for these characters.
+        BOOST = {{"A": 2.0, "B": 1.0}}
 
         class Generator:
             def __init__(self, embed, prefill, decode, P, L, img_ctx, eos):
@@ -98,7 +101,13 @@ _FAKES = {
                 RUNS.append(dict(ids=np.asarray(input_ids), embeds=vit_embeds, max_new_tokens=max_new_tokens,
                                  first=float(vit[0, 0])))
                 tokens = [ord(ch) for ch in REPLY["text"]][: max_new_tokens - 1] + [self.eos]
-                return dict(tokens=tokens, prefill_s=0.0, decode_s=[])
+                logits = []
+                if keep_logits:
+                    first = np.zeros(65536, np.float32)
+                    for ch, value in BOOST.items():
+                        first[ord(ch)] = value
+                    logits = [first]
+                return dict(tokens=tokens, logits=logits, prefill_s=0.0, decode_s=[])
     """,
     "live/live_chat.py": """
         import numpy as np
@@ -299,6 +308,121 @@ class TestQuestionBudget:
         prompt = question_prompt("这个人在挥手吗？")
         assert prompt.count("<image>") == 1
         assert CHATTER_SYSTEM in prompt and prompt.endswith("<|im_start|>assistant\n")
+
+
+def choice_prompt(images):
+    from visual_interaction.phase0.prompts import chat, frame_header
+
+    return chat(frame_header(images) + "这个人在做哪个动作？A 比心 B 挥手 C 都不是", system="只回答一个字母。")
+
+
+def picture(value):
+    return np.full((448, 448, 3), value, np.uint8)
+
+
+class TestPrepareManyAndScore:
+    def test_four_pictures_run_in_one_batch_and_score_reads_the_options(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.register_choices({"pick": (choice_prompt(4), ("A", "B", "C"))})
+        seen = vision.prepare_many([picture(v) for v in (10, 20, 30, 40)])
+        choice = vision.score(seen, "pick")
+        oms, host = fakes()
+
+        assert len(oms.VISION_CALLS) == 1 and oms.VISION_CALLS[0][1:].any()
+        assert seen.embeds.shape == (4, IMAGE_TOKENS, HIDDEN) and not seen.embeds.flags.writeable
+        assert len(seen.images) == 4 and seen.image is seen.images[-1]
+        assert isinstance(choice, Choice) and set(choice.probs) == {"A", "B", "C"}
+        # Softmax over the whole fake vocabulary: A and B boosted, C at zero like the rest.
+        expected = np.exp([2.0, 1.0, 0.0]) / (np.exp(2.0) + np.exp(1.0) + 65534)
+        assert np.allclose([choice.probs[o] for o in "ABC"], expected)
+        assert choice.mass == pytest.approx(expected.sum())
+        assert choice.top == "A" and choice.seconds >= 0.0
+        assert host.RUNS[-1]["max_new_tokens"] == 1 and host.RUNS[-1]["embeds"] is seen.embeds
+
+    def test_several_seen_fill_the_slots_in_order(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.register_choices({"pick": (choice_prompt(3), ("A", "B", "C"))})
+        references = vision.prepare_many([picture(200), picture(100)])
+        live = vision.prepare(picture(50), None, crop=False)
+        vision.score([references, live], "pick")
+        _, host = fakes()
+        embeds = host.RUNS[-1]["embeds"]
+        assert embeds.shape == (3, IMAGE_TOKENS, HIDDEN)
+        assert embeds[0, 0, 0] > embeds[1, 0, 0] > embeds[2, 0, 0]
+
+    def test_prepare_after_prepare_many_still_pads_with_zeros(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.prepare_many([picture(200)] * 3)
+        vision.prepare(frame(), None)
+        oms, _ = fakes()
+        assert oms.VISION_CALLS[0][1:3].any() and not oms.VISION_CALLS[1][1:].any()
+
+    def test_the_wrong_number_of_pictures_is_refused(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.register_choices({"pick": (choice_prompt(2), ("A", "B"))})
+        seen = vision.prepare_many([picture(1)] * 3)
+        with pytest.raises(QuestionError, match="shows 2 picture"):
+            vision.score(seen, "pick")
+
+    def test_a_plain_choice_question_shows_one_picture(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.register_choices({"one": ("这个人在比心吗？A 是 B 不是", ("A", "B"))})
+        seen = vision.prepare(frame(), None)
+        assert vision.score(seen, "one").probs["A"] > vision.score(seen, "one").probs["B"]
+
+    def test_bad_choice_questions_are_refused_at_load(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.register_choices(
+            {
+                "five": (choice_prompt(5), ("A", "B")),
+                "none": ("<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n", ("A", "B")),
+                "long": (choice_prompt(4) + "长" * 300, ("A", "B")),
+                "words": (choice_prompt(1), ("A", "比心")),
+                "ok": (choice_prompt(1), ("A", "B")),
+            }
+        )
+        vision.load()
+        assert set(vision.question_failures) == {"five", "none", "long", "words"}
+        assert "prefill" in vision.question_failures["long"]
+        assert "2 tokens" in vision.question_failures["words"]
+        seen = vision.prepare(frame(), None)
+        with pytest.raises(QuestionError, match="refused"):
+            vision.score(seen, "words")
+        assert vision.score(seen, "ok").top == "A"
+
+    def test_ask_and_score_keep_to_their_own_questions(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        vision.register_questions(QUESTIONS)
+        vision.register_choices({"pick": (choice_prompt(1), ("A", "B"))})
+        with pytest.raises(ValueError, match="already registered"):
+            vision.register_choices({"q1": (choice_prompt(1), ("A",))})
+        with pytest.raises(ValueError, match="already registered"):
+            vision.register_questions({"pick": ("这个人在挥手吗？", 3)})
+        seen = vision.prepare(frame(), None)
+        with pytest.raises(QuestionError, match="not registered"):
+            vision.ask(seen, "pick")
+        with pytest.raises(QuestionError, match="not a registered choice"):
+            vision.score(seen, "q1")
+
+    @pytest.mark.parametrize(
+        "choices",
+        [{"q": ("text", "AB")}, {"q": ("text", ())}, {"q": ("text", ("A", "A"))}, {"q": ("", ("A",))}, {"q": "x"}],
+    )
+    def test_a_malformed_choice_registration_raises_at_once(self, demo_root, choices):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        with pytest.raises(ValueError):
+            vision.register_choices(choices)
+
+    @pytest.mark.parametrize("count", [0, 5])
+    def test_prepare_many_takes_one_to_four_pictures(self, demo_root, count):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        with pytest.raises(ValueError, match="1 to 4"):
+            vision.prepare_many([picture(1)] * count)
+
+    def test_prepare_many_wants_cut_pictures(self, demo_root):
+        vision = InternVlVision(demo_root=str(demo_root), frames=1, prompt_mode="chatter")
+        with pytest.raises(ValueError, match="448"):
+            vision.prepare_many([frame()])
 
 
 class TestObserveUnchanged:

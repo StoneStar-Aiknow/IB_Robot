@@ -429,6 +429,17 @@ robot:
       fallback_after_sec: 1.5
       latest_start_sec: 2.0
       dump_dir: ""
+      key_actions:               # a choice question every look; a confident key action is answered at once
+        enabled: false           # false = the look above, unchanged
+        frames: 1                # 1 = newest frame; 4 = spread over the last 0.75 s
+        calibrate: none          # none | blank = divide by the scores on a grey picture
+        smooth: 3                # average each action's score over this many looks
+        confirm: 2               # looks in a row over the threshold before it triggers
+        release: 1               # looks under the threshold before the same action can trigger again
+        cooldown_sec: 8.0        # per action, after it triggered
+        q1_period_sec: 3.0       # free description for the general lines at most this often
+        say_within_sec: 3.0      # a key line not said this soon after its trigger is dropped
+        thresholds: {thumb: 0.5, wave: 0.38, open: 0.38}   # only these trigger: yeah | thumb | wave | heart | open
   # /feat/x2-internvl-voice
 
   # feat/x2-preset-motions

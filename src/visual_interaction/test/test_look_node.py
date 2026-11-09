@@ -28,6 +28,7 @@ from test_look_builder import logged, look_config  # noqa: E402, F401 - logged i
 from test_look_say import pools  # noqa: E402
 
 from visual_interaction.launch_builders.visual_interaction import generate_visual_interaction_nodes  # noqa: E402
+from visual_interaction.session import key_choice  # noqa: E402
 from visual_interaction.session.hooks import SessionHooks  # noqa: E402
 from visual_interaction.session.internvl_vision import QuestionError, VisionBackendError  # noqa: E402
 from visual_interaction.session.look_say import QUESTIONS  # noqa: E402
@@ -94,9 +95,19 @@ class FakeVision:
         self.prepare_error = None
         self.cost = 0.0
         self.rig = None
+        self.choices: dict | None = None
+        self.batches: list[int] = []
+        self.scored: list[str] = []
+        self.score_error = None
+        # What the key question answers, by answer: on live pictures and on the grey one.
+        self.key_scores = {"none": 0.9}
+        self.blank_scores: dict[str, float] = {}
 
     def register_questions(self, questions) -> None:
         self.registered = dict(questions)
+
+    def register_choices(self, questions) -> None:
+        self.choices = dict(questions)
 
     def load(self) -> None:
         self.loads += 1
@@ -112,6 +123,29 @@ class FakeVision:
             raise self.prepare_error
         self.rig.now += self.cost
         return types.SimpleNamespace(image=np.zeros((448, 448, 3), np.uint8), crop_fallback=False)
+
+    def prepare_many(self, images):
+        self.prepares += 1
+        self.batches.append(len(images))
+        if self.prepare_error is not None:
+            raise self.prepare_error
+        self.rig.now += self.cost
+        blank = all((image == 128).all() for image in images)
+        return types.SimpleNamespace(
+            embeds=np.zeros((len(images), 1)), image=images[-1], crop_fallback=False, seconds=0.0, blank=blank
+        )
+
+    def score(self, seen, key):
+        self.scored.append(key)
+        if self.score_error is not None:
+            raise self.score_error
+        wanted = self.blank_scores if seen.blank else self.key_scores
+        answers = key_choice.options(key_choice.ORDERS["fwd"])
+        return types.SimpleNamespace(
+            probs={
+                letter: wanted.get(answer, 0.02) for letter, answer in zip(key_choice.LETTERS, answers, strict=False)
+            }
+        )
 
     def ask(self, seen, key):
         if key in self.question_failures:
@@ -595,3 +629,202 @@ def test_a_dump_that_cannot_be_written_does_not_stop_the_look(rig, tmp_path):
     look = rig(vision, dump_dir=str(blocked)).preload().mirror().run(1.5)
     assert look.pools_said == ["hand.heart"]
     assert look.counts["look_dump_error"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Key mode: the choice question every look, a confident action answered at once.
+
+_KEY_ON = {"enabled": True, "frames": 4, "calibrate": "none", "smooth": 1, "confirm": 2}
+_WAVE = {"wave": 0.9}
+
+
+def test_without_key_actions_no_choice_question_exists(rig):
+    vision = FakeVision(q1="比心", q3_heart="是")
+    look = rig(vision).preload().mirror().run(1.5)
+    assert vision.choices is None and vision.scored == [] and vision.batches == []
+    assert look.pools_said == ["hand.heart"]
+    assert look.node._key_gate is None
+
+
+def test_key_actions_written_off_are_the_same_look(rig):
+    vision = FakeVision(q1="比心", q3_heart="是")
+    look = rig(vision, key_actions={**_KEY_ON, "enabled": False}).preload().mirror().run(1.5)
+    assert vision.choices is None and vision.scored == []
+    assert look.pools_said == ["hand.heart"]
+
+
+@pytest.mark.parametrize("frames", [1, 4])
+def test_only_the_configured_key_question_is_registered(rig, frames):
+    vision = FakeVision()
+    look = rig(vision, key_actions={**_KEY_ON, "frames": frames}).preload().mirror().run(0.3)
+    assert list(vision.choices) == [f"key.{frames}.fwd"]
+    assert set(vision.batches) == {frames}
+    assert set(vision.scored) == {f"key.{frames}.fwd"}
+    assert vision.prepares == len(vision.batches)
+    assert look.node._key_gate is not None
+
+
+def test_a_confident_action_is_said_at_once_and_once_while_held(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(0.5)
+    assert look.pools_said == ["big.wave"]
+    assert look.counts["key_trigger_wave"] == 1
+    look.run(6.0)
+    assert look.pools_said.count("big.wave") == 1
+    assert look.counts["key_trigger_wave"] == 1
+
+
+def test_one_look_over_the_threshold_is_not_enough(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(0.05)
+    assert "key_trigger_wave" not in look.counts
+    vision.key_scores = {"none": 0.9}
+    look.run(0.5)
+    assert "key_trigger_wave" not in look.counts and look.said == []
+
+
+def test_an_action_without_a_threshold_is_never_said(rig):
+    vision = FakeVision()
+    vision.key_scores = {"heart": 0.9}
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(0.8)
+    assert look.said == []
+    assert not [name for name in look.counts if name.startswith("key_trigger")]
+
+
+def test_q1_is_asked_at_most_every_period_and_only_names_the_general_line(rig):
+    vision = FakeVision(q1="比心")
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(1.5)
+    assert vision.asked == ["q1"]
+    assert look.pools_said == ["hand.any"]
+    assert look.node._look.spoken == 1
+    look.run(5.0)
+    assert vision.asked.count("q1") == 3
+    assert not [key for key in vision.asked if key != "q1"]
+
+
+def test_the_key_line_waits_for_the_voice(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    made = rig(vision, key_actions=_KEY_ON).preload()
+    made.busy = True
+    made.mirror().run(1.0)
+    assert made.said == []
+    made.busy = False
+    made.run(0.2)
+    assert made.pools_said == ["big.wave"]
+
+
+def test_a_key_line_the_voice_never_let_through_is_dropped_and_counted(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    made = rig(vision, key_actions=_KEY_ON).preload()
+    made.busy = True
+    made.mirror().run(4.0)
+    assert made.counts["key_stale"] == 1
+    made.busy = False
+    made.run(0.5)
+    assert "big.wave" not in made.pools_said
+
+
+def test_a_full_round_still_answers_a_key_action(rig):
+    vision = FakeVision(q1="比心")
+    look = rig(vision, key_actions=_KEY_ON, max_per_round=1).preload().mirror().run(1.5)
+    assert look.pools_said == ["hand.any"] and look.node._look.done
+    look.busy = True  # the line plays
+    look.run(0.3)
+    look.busy = False
+    asked = len(vision.asked)
+    vision.key_scores = _WAVE
+    look.run(5.0)
+    assert look.pools_said == ["hand.any", "big.wave"]
+    assert look.node._look.spoken == 1
+    assert len(vision.asked) == asked
+
+
+def test_a_new_round_starts_the_gate_over(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(0.5)
+    assert look.counts["key_trigger_wave"] == 1
+    look.mirror("STANDBY").run(1.0)
+    look.mirror("MIRRORING").run(0.5)
+    assert look.counts["key_trigger_wave"] == 2
+
+
+def test_a_failing_key_look_feeds_nothing_to_the_gate(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    vision.prepare_error = VisionBackendError("npu")
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(0.5)
+    assert look.counts["look_error"] > 0
+    assert "key_trigger_wave" not in look.counts and look.said == []
+
+
+def test_slow_key_looks_feed_nothing_to_the_gate_and_stop_the_looking(rig):
+    vision = FakeVision()
+    vision.key_scores = _WAVE
+    vision.cost = 3.0
+    look = rig(vision, key_actions=_KEY_ON, fallback_after_sec=0.5).preload().mirror().run(20.0)
+    assert look.counts["look_slow"] == 3 and look.node._look.stopped
+    assert "key_trigger_wave" not in look.counts
+    assert "big.wave" not in look.pools_said
+
+
+def test_the_status_says_key_mode(rig):
+    look = rig(FakeVision(), key_actions=_KEY_ON).preload().mirror().run(0.1)
+    look.node._publish_status()
+    status = json.loads(look.publishers[look.module.STATUS_TOPIC].messages[-1].data)
+    assert status["look"]["key"] is True
+
+
+def test_blank_calibration_is_scored_on_grey_pictures_before_the_first_look(rig):
+    vision = FakeVision()
+    vision.blank_scores = {"heart": 0.6, "wave": 0.08, "yeah": 0.08, "thumb": 0.08, "open": 0.08, "none": 0.08}
+    made = rig(vision, key_actions={**_KEY_ON, "calibrate": "blank"}).preload()
+    assert vision.scored == ["key.4.fwd"] and vision.batches == [4]
+    assert any("key blank shares" in text for text in made.log.infos)
+
+
+def test_blank_calibration_is_what_lets_a_biased_answer_through(rig):
+    """Raw, wave's share stays under its threshold; over the grey picture's bias it clears it."""
+    live = {"wave": 0.3, "heart": 0.5}
+    blank = {"heart": 0.6, "wave": 0.08, "yeah": 0.08, "thumb": 0.08, "open": 0.08, "none": 0.08}
+    for calibrate, said in (("none", []), ("blank", ["big.wave"])):
+        vision = FakeVision()
+        vision.key_scores = live
+        vision.blank_scores = blank
+        look = rig(vision, key_actions={**_KEY_ON, "calibrate": calibrate}).preload().mirror().run(0.5)
+        assert look.pools_said == said
+
+
+def _key_went_off(look, why: str) -> None:
+    assert look.node._key_gate is None and look.node._look.config.key_mode is False
+    assert any("key actions off" in text and why in text for text in look.look_warnings)
+
+
+def test_a_failed_blank_calibration_turns_key_mode_off_and_the_look_goes_on(rig):
+    vision = FakeVision(q1="比心", q3_heart="是")
+    vision.score_error = VisionBackendError("npu")
+    look = rig(vision, key_actions={**_KEY_ON, "calibrate": "blank"}).preload().mirror().run(1.5)
+    _key_went_off(look, "blank calibration failed")
+    assert look.pools_said == ["hand.heart"]
+    assert vision.scored == ["key.4.fwd"]
+
+
+def test_a_refused_key_question_turns_key_mode_off_and_the_look_goes_on(rig):
+    vision = FakeVision(refused={"key.4.fwd": "over budget"}, q1="比心", q3_heart="是")
+    look = rig(vision, key_actions=_KEY_ON).preload().mirror().run(1.5)
+    _key_went_off(look, "over budget")
+    assert look.pools_said == ["hand.heart"]
+    assert vision.scored == []
+
+
+def test_a_vision_without_the_choice_surface_turns_the_look_off(rig):
+    class Old(FakeVision):
+        score = None
+
+    look = rig(Old(), key_actions=_KEY_ON).preload().mirror().run(0.5)
+    assert look.said == []
+    assert any("the vision has no score" in text for text in look.look_warnings)
