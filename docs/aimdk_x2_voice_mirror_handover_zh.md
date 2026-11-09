@@ -468,7 +468,8 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 ### 14.6 展会语音交互的行为（2026-11-09）
 
 本节说明 `aimdk_x2_summit` 的语音交互规则。本机验证使用真实的 Agent、语音桥、ASR、TTS 和 X2 runtime，
-只把机器人动作换成厂商 Mock。310P 上尚未部署。
+只把机器人动作换成厂商 Mock。310P 上尚未部署。本机验证环境的实现和用法见
+[`aimdk_x2_local_voice_rig_zh.md`](aimdk_x2_local_voice_rig_zh.md)。
 
 **受理与播报**
 
