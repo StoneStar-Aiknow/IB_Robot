@@ -263,6 +263,26 @@ def test_with_the_disk_nearly_full_a_photo_is_kept_in_memory_and_still_sent(tmp_
     assert rig.outbox.names() == []
 
 
+def test_a_photo_the_disk_refuses_is_kept_in_memory_and_still_sent(tmp_path, receiver, monkeypatch):
+    from manipulation_execution.mirror_photo import outbox as outbox_module
+
+    rig = Rig(tmp_path, receiver.address)
+    one = photo(names(1)[0])
+    real_write = outbox_module._write_atomic
+
+    def failing(path, data):
+        if path.suffix == ".json":
+            raise OSError(5, "Input/output error")
+        real_write(path, data)
+
+    monkeypatch.setattr(outbox_module, "_write_atomic", failing)
+    assert rig.outbox.put(one) == "memory"
+    assert rig.files() == []  # the half-written JPEG is not left behind
+    assert "Input/output error" in rig.log.at("error")[0]
+    rig.uploader.step()
+    assert receiver.delivered == [one.name]
+
+
 # -- the upload --------------------------------------------------------------------------
 
 

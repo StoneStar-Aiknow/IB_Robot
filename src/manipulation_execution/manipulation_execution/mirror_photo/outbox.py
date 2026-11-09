@@ -13,9 +13,9 @@ round's photo (``quality: recovered``) unless the round's photo already is in.
 
 The bounds are ``outbox_max_files``, ``outbox_max_mb``: past either the
 oldest photo is dropped with an ERROR naming its round, the only way a photo
-is ever lost. Below ``min_free_gb`` of free disk a new photo is not written
-at all but kept in memory (ERROR as well) and still delivered; it is lost only
-if the node stops before that.
+is ever lost. Below ``min_free_gb`` of free disk, or when the disk refuses the
+write, a new photo is kept in memory instead (ERROR as well) and still
+delivered; it is lost only if the node stops before that.
 """
 
 from __future__ import annotations
@@ -157,19 +157,28 @@ class Outbox:
         """Queue ``photo``; returns ``disk`` or ``memory`` (no room on disk)."""
         with self._lock:
             if self._low_disk(len(photo.jpeg)):
-                self._memory[photo.name] = photo
-                self._log(
-                    "error",
-                    f"photo outbox: less than {self.min_free_bytes / 1024**3:g} GB free on {self.path}; round "
-                    f"{photo.name} kept in memory only (lost if the node stops before it is delivered)",
-                )
-                self._hold_bounds(incoming=0)
-                return "memory"
+                return self._in_memory(photo, f"less than {self.min_free_bytes / 1024**3:g} GB free on {self.path}")
             self._hold_bounds(incoming=len(photo.jpeg))
-            _write_atomic(self.path / f"{photo.name}.jpg", photo.jpeg)
-            _write_atomic(self.path / f"{photo.name}.json", _meta_bytes(photo.meta))
-            _sync_dir(self.path)
+            try:
+                _write_atomic(self.path / f"{photo.name}.jpg", photo.jpeg)
+                _write_atomic(self.path / f"{photo.name}.json", _meta_bytes(photo.meta))
+                _sync_dir(self.path)
+            except OSError as exc:
+                for suffix in (".json", ".jpg"):
+                    with contextlib.suppress(OSError):
+                        (self.path / f"{photo.name}{suffix}").unlink(missing_ok=True)
+                return self._in_memory(photo, f"cannot write to {self.path} ({exc})")
             return "disk"
+
+    def _in_memory(self, photo: Photo, why: str) -> str:
+        self._memory[photo.name] = photo
+        self._log(
+            "error",
+            f"photo outbox: {why}; round {photo.name} kept in memory only "
+            "(lost if the node stops before it is delivered)",
+        )
+        self._hold_bounds(incoming=0)
+        return "memory"
 
     def names(self) -> list[str]:
         """Queued photos, newest first."""

@@ -21,6 +21,7 @@ from manipulation_execution.mirror_photo.selector import (
     SCHEMA,
     PhotoCore,
     choose_photo,
+    emergency_photo,
     provisional_photo,
 )
 from manipulation_execution.mirror_photo.triggers import EVENT, GESTURE, STILL, UNIFORM, Trigger
@@ -226,6 +227,33 @@ def test_a_round_ended_by_the_node_stopping_still_chooses():
     one.core.shutdown()
     photo, _ = choose_photo(one.finished[0], SECTION)
     assert photo.meta["end_reason"] == "shutdown"
+
+
+def test_when_choosing_fails_the_heaviest_candidate_is_sent_unscored():
+    one = started()
+    one.frames(2.0, 8.0)
+    round_now = one.core._round
+    stamps = [frame[0] for frame in round_now.frames]
+    one.core._offer(round_now, _gesture(stamps[-10]))
+    one.core._offer(round_now, Trigger(STILL, STILL, 1.5, 1.0, stamps[-1]))
+    photo = emergency_photo(one.stop(), "RuntimeError: boom")
+    assert (photo.meta["source"], photo.meta["stamp"]) == (GESTURE, stamps[-10])
+    assert (photo.meta["quality"], photo.meta["scoring"], photo.meta["error"]) == (
+        "fallback",
+        "error",
+        "RuntimeError: boom",
+    )
+
+
+def test_when_choosing_fails_without_candidates_the_last_frame_is_sent():
+    one = Round()
+    one.state(STATE_MIRRORING)
+    one.frames(0.0, 0.5)
+    finished = one.stop()
+    assert emergency_photo(finished, "x").meta["stamp"] == finished.last_frame[0]
+    empty = Round()
+    empty.state(STATE_MIRRORING)
+    assert emergency_photo(empty.stop(), "x") is None
 
 
 # -- warm-up and the rhythm --------------------------------------------------------------

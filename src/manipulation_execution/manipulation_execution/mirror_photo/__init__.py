@@ -13,6 +13,8 @@ Modules:
                out; the photo's metadata.
 ``outbox``     the photos not yet delivered, on disk, crash-safe and bounded.
 ``uploader``   the outbox to the upper PC over HTTP, retried until confirmed.
+``worker``     the node's disk thread: a finished round chosen and queued, the
+               running round's crash copy kept.
 
 The external trigger message is in ``embodied_common.mirror_photo_contract``.
 Nothing in this package makes a ROS call, so all of it can be exercised with

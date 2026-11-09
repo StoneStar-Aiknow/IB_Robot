@@ -22,6 +22,7 @@ def test_launch_builder_modules_stay_within_the_core_import_budget():
     core = core_import_budget()
     loaded = imported_top_level_packages(
         "import manipulation_execution.launch_builders.mirror_session\n"
+        "import manipulation_execution.launch_builders.mirror_photo\n"
         "import manipulation_execution.launch_builders.motion_imitation_stream\n"
     )
     overflow = sorted(loaded - core - HARD_DEPENDENCY_ALLOWANCE - {"manipulation_execution"})

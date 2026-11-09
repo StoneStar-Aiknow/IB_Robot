@@ -449,17 +449,21 @@ def photo_meta(
     return meta
 
 
-def choose_photo(
-    finished: FinishedRound, section: PhotoSection, *, clock: Callable[[], float] = time.monotonic
-) -> tuple[Photo | None, Choice | None]:
-    """The round's one photo, or None when the round saw no frame at all."""
-    round_info = {
+def _round_info(finished: FinishedRound) -> dict:
+    return {
         "round_started_at": _iso(finished.started_at),
         "round_ended_at": _iso(finished.ended_at),
         "end_reason": finished.reason,
         "candidates": len(finished.candidates),
         "candidate_sources": _source_counts(finished.candidates),
     }
+
+
+def choose_photo(
+    finished: FinishedRound, section: PhotoSection, *, clock: Callable[[], float] = time.monotonic
+) -> tuple[Photo | None, Choice | None]:
+    """The round's one photo, or None when the round saw no frame at all."""
+    round_info = _round_info(finished)
     if not finished.candidates:
         if finished.last_frame is None:
             return None, None
@@ -501,6 +505,31 @@ def choose_photo(
         },
     )
     return Photo(finished.round_id, chosen.jpeg, meta), choice
+
+
+def emergency_photo(finished: FinishedRound, why: str) -> Photo | None:
+    """The round's photo when ``choose_photo`` failed: the heaviest candidate (the later on a tie), else the last frame.
+
+    No decoding and no scoring, so nothing here can fail the same way; None
+    only for a round without a single frame.
+    """
+    if finished.candidates:
+        best = max(finished.candidates, key=lambda kept: (kept.trigger.weight, kept.stamp))
+        stamp, jpeg, trigger = best.stamp, best.jpeg, best.trigger
+    elif finished.last_frame is not None:
+        (stamp, jpeg), trigger = finished.last_frame, None
+    else:
+        return None
+    meta = photo_meta(
+        finished.round_id,
+        jpeg,
+        stamp=stamp,
+        trigger=trigger,
+        quality="fallback",
+        bbox=finished.bbox_at(stamp),
+        extra={**_round_info(finished), "scoring": "error", "error": why},
+    )
+    return Photo(finished.round_id, jpeg, meta)
 
 
 def provisional_photo(

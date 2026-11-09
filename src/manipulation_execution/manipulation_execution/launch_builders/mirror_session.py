@@ -83,6 +83,12 @@ paths under ``$WORKSPACE``, robot_config's ``config/mirror_voice/x2_clips_v1.yam
 when the configured table is unusable). Left out or ``enabled: false``, the
 parameters are exactly the 676fa608 ones. It needs the voice node: without
 ``mirror_session.voice.enabled`` a WARNING says so and nothing more starts.
+
+``photo.enabled`` (feat/x2-photo-capture) appends the photo node (one photo
+per MIRRORING round, sent to the upper PC) after the voice node, wired in
+``launch_builders.mirror_photo``. Like the voice it is an extra: any error
+while working it out is a WARNING and the mirror starts without photos.
+Without a ``photo`` block the actions are exactly what they were.
 """
 
 import json
@@ -94,6 +100,7 @@ from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch_ros.actions import Node
 
+from manipulation_execution.launch_builders.mirror_photo import PHOTO_OFF, photo_parameters
 from manipulation_execution.launch_builders.motion_imitation_stream import (
     mock_hand_endpoints,
     mock_playback_endpoints,
@@ -118,6 +125,7 @@ _KEYS = frozenset(
         "business",
         "operator",
         "voice",
+        "photo",
     }
 )
 _BUSINESS_KEYS = frozenset({"hooks", "cover_judge", "config"})
@@ -399,9 +407,10 @@ def _clips_json(robot_config: Mapping) -> str | None:
 
 
 def generate_mirror_session_nodes(robot_config: dict) -> list:
-    """The session node, its process-exit release and, if enabled, the operator node and the voice node."""
+    """The session node, its process-exit release and, if enabled, the operator, voice and photo nodes."""
     # Function-local imports: keep registry construction free of the
     # embodied_common dependency chain (import budget, design decision 6).
+    from embodied_common.mirror_photo_contract import NODE_NAME as PHOTO_NODE_NAME
     from embodied_common.mirror_session_contract import (
         DEFAULT_STOP_TIMEOUT_SEC,
         NODE_NAME,
@@ -497,6 +506,22 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
                 name=VOICE_NODE_NAME,
                 output="screen",
                 parameters=[voice],
+            )
+        )
+    # Photos are an extra as well: no photo error may fail this launch either.
+    try:
+        photo = photo_parameters(robot_config, config, parameters, logger.warning)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"mirror_session.photo: {type(exc).__name__}: {exc}; {PHOTO_OFF}")
+        photo = None
+    if photo is not None:
+        actions.append(
+            Node(
+                package="manipulation_execution",
+                executable="mirror_photo_node",
+                name=PHOTO_NODE_NAME,
+                output="screen",
+                parameters=[photo],
             )
         )
     return actions

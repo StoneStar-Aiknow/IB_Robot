@@ -322,6 +322,42 @@ robot:
     # back of the head IS a long cover (a stop) -- that is the gesture, by design.
     operator:
       send_enabled: true
+    # feat/x2-photo-capture
+    # One photo per MIRRORING round, sent with its person box to the upper PC
+    # (the AIGC machine). The address is the first line of target_file, written
+    # on the board with scripts/x2_photo_capture/photo_target.sh <ip>[:port]; it
+    # is read again before every send, so no restart. A photo the PC has not
+    # confirmed waits in <photos_dir>/outbox and is retried until it is, at most
+    # 200 kept. The mirror never waits on any of it; enabled: false (here or in
+    # an entry built on this one) and the launch is the one before the feature.
+    photo:
+      enabled: true
+      photos_dir: /root/x2-feat-photo-capture-run/photos
+      target_file: /root/x2-feat-photo-capture-run/photo_target
+      warmup_sec: 1.5
+      triggers:
+        uniform: {enabled: true, period_sec: 3.0, weight: 0.0}
+        # Body speed in rad/s; first values, to be tuned on the robot.
+        still: {enabled: true, v_still: 0.25, v_move: 0.6, hold_sec: 0.4, min_gap_sec: 2.0, weight: 1.5}
+        # The hand perception recognizes only these three.
+        gesture:
+          enabled: true
+          min_score: 0.6
+          hold_sec: 0.2
+          min_gap_sec: 1.5
+          labels: {Victory: 3.0, Thumb_Up: 3.0, Pointing_Up: 1.5}
+        # Requests on /mirror_photo/trigger (embodied_common.mirror_photo_contract).
+        event: {enabled: true, default_weight: 2.5}
+      weights: {stillness: 0.5, sharpness: 0.5}
+      scoring_deadline_sec: 1.0
+      limits: {max_candidates_per_round: 24, reserve_for_priority: 6, max_priority_per_minute: 20}
+      upload:
+        default_target: ""   # the target is target_file's; leave this empty
+        timeout_sec: 3.0
+        outbox_max_files: 200
+        outbox_max_mb: 100
+        min_free_gb: 2.0
+    # /feat/x2-photo-capture
 
   # The base entry turns the visual interaction ("看图说话") on. This deployment
   # does not run it: the base names the fake backend, whose scripted replies
