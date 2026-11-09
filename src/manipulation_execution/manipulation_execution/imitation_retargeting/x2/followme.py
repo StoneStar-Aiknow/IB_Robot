@@ -23,10 +23,18 @@ its inputs and its round:
   so most of a palm flip was lost. With it on, ``wrist_yaw`` reads a share
   (``elbow_spin_gain``) of the elbow's twist away from PEAR's rest twist, plus
   the wrist, unlike the ledger's note; see docs/x2_wrist_spin_plan_A.md.
+* the shoulders' pitch, roll and yaw come from ``_vendor/shoulder_ik`` (granger's
+  single_A, see ``_vendor/SOURCES.md``), not from the vendor's readouts. Those read
+  pitch and roll off two separate planes, which above the horizontal count the same
+  lift twice: an arm raised in front read ~160 deg of roll too and the robot's arm
+  pointed behind her. The solver inverts the robot's own chain for her upper arm's
+  direction, using only the |roll| <= 90 deg branch, so the arm never has to swing
+  round to change branch; yaw is the vendor's twist formula at the solved pitch/roll.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import signal
@@ -48,6 +56,9 @@ import scipy.spatial.transform  # noqa: F401
 from ..rotations import decode_rotation_6d, encode_rotation_6d
 from ._vendor import followme_core as core
 from ._vendor.neutral_fk import NeutralFK
+from ._vendor.shoulder_ik import ShoulderGeometry, ShoulderParams, ShoulderSolver
+from ._vendor.smplx2robot import readouts
+from ._vendor.smplx2robot.robot import ARM_JOINT_NAMES, wrap_deg
 
 POSE_DIM = 52 * 6
 # The branch guard's longest window, in frames. Push cost grows with the window
@@ -58,7 +69,7 @@ MAX_ANCHOR_FRAMES = 200
 # Notes kept across retargeter rebuilds and per-frame truncation notes.
 NOTES_KEPT = 10
 # Status keys that describe the mapping; with a child process they come from there.
-_MAPPING_KEYS = ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets")
+_MAPPING_KEYS = ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets", "shoulder_ik")
 _CHILD_START_TIMEOUT_S = 120.0
 # (elbow, wrist) indices into the 52 decoded rotations, left then right.
 _FOREARMS = ((18, 20), (19, 21))
@@ -70,6 +81,13 @@ _FOREARMS = ((18, 20), (19, 21))
 ELBOW_REST_TWIST_DEG = -23.5
 # The share of the elbow's twist moved: the whole of it also moves PEAR's noise.
 ELBOW_SPIN_GAIN = 0.5
+# The solver's own defaults (360 deg/s, 15 deg behind overhead, ...), but its 3-frame
+# median takes frames from a wider window: the default 0.10 s fills only at 30 fps,
+# and live PEAR runs at 10-20 Hz. 0.25 s holds three frames down to about 10 Hz.
+SHOULDER_PARAMS = ShoulderParams(median_window_s=0.25)
+# The analytic shoulder FK must match the model's: past this the constants were read wrong.
+SHOULDER_GEOMETRY_TOLERANCE_DEG = 0.01
+_SHOULDER_JOINTS = ("shoulder_pitch", "shoulder_roll", "shoulder_yaw")
 
 
 def elbow_spin_to_wrist(rotations: np.ndarray, forearm_axes: Sequence[np.ndarray],
@@ -99,6 +117,106 @@ def elbow_spin_to_wrist(rotations: np.ndarray, forearm_axes: Sequence[np.ndarray
     return out
 
 
+def _unit(vector: np.ndarray) -> np.ndarray:
+    return vector / np.linalg.norm(vector)
+
+
+def shoulder_geometry(kinematics, ledger) -> dict[str, ShoulderGeometry]:
+    """Each shoulder's ``ShoulderGeometry``, read off the robot model at the zero pose.
+
+    As ``reference/export_geometry.py`` of the port defines it: the pitch and roll
+    axes, the upper arm from the ROLL joint to the elbow (from the pitch joint it is
+    1.4 deg off), and the joint limits. The analytic FK is then checked against the
+    model's on fixed random poses, and a miss over the tolerance raises.
+    """
+    names = ARM_JOINT_NAMES
+    kinematics.set_arm(np.zeros(len(names)))
+    geometry, index = {}, {}
+    for side in ("left", "right"):
+        index[side] = tuple(ledger[joint].index(side) for joint in _SHOULDER_JOINTS)
+        pitch, roll, yaw = (names[i] for i in index[side])
+        elbow = f"{side}_elbow_joint"
+        geometry[side] = ShoulderGeometry.from_dict({
+            "pitch_axis": kinematics.axis(pitch),
+            "roll_axis": kinematics.axis(roll),
+            "rest_dir": _unit(kinematics.anchor(elbow) - kinematics.anchor(roll)),
+            "pitch_limit_rad": kinematics.limits_rad[index[side][0]],
+            "roll_limit_rad": kinematics.limits_rad[index[side][1]],
+            "yaw_limit_rad": kinematics.limits_rad[index[side][2]],
+        })
+    rng = np.random.default_rng(0)
+    worst = 0.0
+    for _ in range(50):
+        pose = np.zeros(len(names))
+        for side in geometry:
+            pose[list(index[side][:2])] = rng.uniform(-2.5, 2.5, 2)
+        kinematics.set_arm(pose)
+        for side, geo in geometry.items():
+            model = _unit(kinematics.anchor(f"{side}_elbow_joint") - kinematics.anchor(names[index[side][1]]))
+            analytic = geo.direction(*pose[list(index[side][:2])])
+            worst = max(worst, float(np.degrees(np.arccos(np.clip(model @ analytic, -1.0, 1.0)))))
+    if worst > SHOULDER_GEOMETRY_TOLERANCE_DEG:
+        raise RuntimeError(f"the shoulder geometry misses the robot model by {worst:.4f} deg "
+                           f"(over {SHOULDER_GEOMETRY_TOLERANCE_DEG} deg); its constants were read wrong")
+    return geometry
+
+
+class ShoulderRetargeter(core.StreamRetargeter):
+    """The vendor's retargeter, with each shoulder solved by a ``ShoulderSolver``.
+
+    The vendor's ``retarget`` still maps every channel. On the window's last frame
+    the shoulders' pitch, roll and yaw are then replaced, before the mirror, so the
+    solver works on her own side as the vendor does (her left arm on the robot's
+    left), and the mirror, the clip and everything after them are the vendor's.
+
+    Per side the solver gets her upper arm in her torso frame (the vendor's
+    ``twist_indicators`` bone), the camera stamps' step, and yaw as the vendor
+    computes it: wrap(the robot's plane twist at the candidate pitch/roll, yaw 0 and
+    this frame's elbow, minus her twist), through the ledger, weighted by how bent
+    her elbow is. A new retargeter (``reset_input``) starts new solvers.
+    """
+
+    def __init__(self, vendor: dict, kinematics, ledger, geometry: dict[str, ShoulderGeometry],
+                 **kwargs) -> None:
+        self._retarget_all = vendor["retarget"]
+        super().__init__({**vendor, "retarget": self._retarget}, kinematics, ledger, **kwargs)
+        self.solvers = {side: ShoulderSolver(geo, SHOULDER_PARAMS) for side, geo in geometry.items()}
+        self._index = {side: tuple(self.ledger[joint].index(side) for joint in _SHOULDER_JOINTS)
+                       for side in self.solvers}
+        self._stamp: float | None = None
+
+    def _retarget(self, animation, *, kinematics, ledger, readout, verify):
+        trajectory = self._retarget_all(animation, kinematics=kinematics, ledger=ledger,
+                                        readout=readout, verify=verify)
+        stamp = float(animation.timestamp_ns[-1]) * 1e-9
+        # The solver floors dt (repeated stamps) and does not rate-limit its first frame.
+        dt = 0.0 if self._stamp is None else stamp - self._stamp
+        self._stamp = stamp
+        raw, arm_pos, clipped = trajectory.raw.copy(), trajectory.arm_pos.copy(), trajectory.clipped.copy()
+        for side, solver in self.solvers.items():
+            indicators = readouts.twist_indicators(animation, side)
+            her_twist = float(readouts.upper_arm_twist_deg(indicators, readout)[-1])
+            weight = float(np.clip(indicators["conditioning"][-1] / 0.5, 0.0, 1.0))
+            need = self._yaw_need(kinematics, ledger, side, trajectory.arm_pos[-1], her_twist, weight)
+            index = list(self._index[side])
+            raw[-1, index] = arm_pos[-1, index] = solver.step(indicators["bone"][-1], dt, need)
+            clipped[-1, index] = False
+        return dataclasses.replace(trajectory, raw=raw, arm_pos=arm_pos, clipped=clipped)
+
+    def _yaw_need(self, kinematics, ledger, side: str, pose: np.ndarray, her_twist: float, weight: float):
+        """``(pitch, roll) -> (yaw command, weight)``: the vendor's shoulder_yaw at that pitch/roll."""
+        pitch_i, roll_i, yaw_i = self._index[side]
+        channel = ledger["shoulder_yaw"]
+        pose = pose.copy()
+
+        def need(pitch: float, roll: float) -> tuple[float, float]:
+            pose[pitch_i], pose[roll_i], pose[yaw_i] = pitch, roll, 0.0
+            source = wrap_deg(kinematics.plane_twist_deg(side, pose) - her_twist)
+            return float(channel.command_rad(side, np.radians(source))), weight
+
+        return need
+
+
 def _session() -> core.Session:
     return core.Session(live_s=0.0)
 
@@ -126,12 +244,17 @@ class X2FollowMe:
         self._stream = core.FollowMeStream(
             vendor=self._vendor, session=_session(), latency_s=latency_s, lookahead_s=lookahead_s,
             base_pose=base, limit_rate=False, mirror=mirror)
-        self._stream.retargeter = self._new_retargeter(self._stream.retargeter)
+        retargeter = self._stream.retargeter
+        self._shoulders = shoulder_geometry(retargeter.kinematics, retargeter.ledger)
+        self._stream.retargeter = self._new_retargeter(retargeter)
         self.retarget_count = 0
         self.input_resets = 0
         # Guard counts of the retargeters that reset_input replaced.
         self._guard_trips = 0
         self._guard_worst = 0
+        # Shoulder solver counts of the retargeters that reset_input replaced.
+        self._shoulder_before = {side: dict.fromkeys(ShoulderSolver(geo).stats, 0)
+                                 for side, geo in self._shoulders.items()}
         # Starved/stretched counts of the earlier legs of a round that re-entries restarted.
         self._starved_before = 0
         self._stretched_before = 0
@@ -208,13 +331,16 @@ class X2FollowMe:
         old = self._stream.retargeter
         self._guard_trips += old.guard.trips
         self._guard_worst = max(self._guard_worst, old.guard.worst_branch)
+        for side, solver in old.solvers.items():
+            for key, count in solver.stats.items():
+                self._shoulder_before[side][key] += count
         self._stream.retargeter = self._new_retargeter(old)
         self._stream.retargeter.notes.extend(old.notes[-NOTES_KEPT:])
         self.input_resets += 1
 
-    def _new_retargeter(self, old: core.StreamRetargeter) -> core.StreamRetargeter:
-        return core.StreamRetargeter(self._vendor, old.kinematics, old.ledger,
-                                     max_anchor_frames=MAX_ANCHOR_FRAMES, mirror=old.mirror)
+    def _new_retargeter(self, old: core.StreamRetargeter) -> ShoulderRetargeter:
+        return ShoulderRetargeter(self._vendor, old.kinematics, old.ledger, self._shoulders,
+                                  max_anchor_frames=MAX_ANCHOR_FRAMES, mirror=old.mirror)
 
     def start_round(self, from_pose: Sequence[float] | None = None) -> None:
         # The core parks on, and blends out of, its base; the neutral pose stays the default.
@@ -257,6 +383,10 @@ class X2FollowMe:
             "branch_guard_worst": max(self._guard_worst, guard.worst_branch),
             "retargeted": self.retarget_count,
             "input_resets": self.input_resets,
+            # Per side, all session: frames solved, pitch/roll steps the 360 deg/s cap
+            # bit, frames at a joint limit, frames held off the space behind overhead.
+            "shoulder_ik": {side: {key: count + solver.stats[key] for key, count in self._shoulder_before[side].items()}
+                            for side, solver in stream.retargeter.solvers.items()},
             "elbow_spin_to_wrist": self.elbow_spin_to_wrist,
             "elbow_spin_gain": self.elbow_spin_gain,
             "notes": (stream.notes + stream.retargeter.notes)[-3:],

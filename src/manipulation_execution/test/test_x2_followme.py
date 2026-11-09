@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
@@ -79,7 +82,7 @@ def test_branch_guard_survives_trimmed_history():
     frames = [stream._frame(i * 0.05, i, _raw(body_index, axis, a)) for i, a in enumerate(angles)]
 
     def run(max_anchor_frames):
-        retargeter = core.StreamRetargeter(ref._v, ref.kinematics, ref.ledger,
+        retargeter = core.StreamRetargeter(stream._vendor, ref.kinematics, ref.ledger,
                                            max_anchor_frames=max_anchor_frames, mirror=False)
         return np.array([retargeter.push(f) for f in frames]), retargeter
 
@@ -152,7 +155,7 @@ def test_a_mapping_process_gives_the_in_process_poses_and_counts():
             np.testing.assert_array_equal(mine, theirs)
         local_status, remote_status = local.status(), remote.status()
         assert remote_status["branch_guard_trips"] > 0
-        for key in ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets", "notes"):
+        for key in ("branch_guard_trips", "branch_guard_worst", "retargeted", "input_resets", "shoulder_ik", "notes"):
             assert remote_status[key] == local_status[key], key
         with pytest.raises(ValueError, match="smplx_pose_raw"):
             remote.retarget(2.0, 99, np.zeros(5))
@@ -305,3 +308,99 @@ def test_the_mapping_process_moves_the_spin_too_and_status_says_so():
         remote.close()
     status = create_stream("x2_followme", base_pose=NEUTRAL).status()
     assert (status["elbow_spin_to_wrist"], status["elbow_spin_gain"]) == (False, followme.ELBOW_SPIN_GAIN)
+
+
+# The shoulders: _vendor/shoulder_ik solves pitch/roll/yaw for her upper arm's direction.
+LEFT_SHOULDER, RIGHT_SHOULDER = 16, 17               # indices into the 52 rotations
+ROLLS = [1, 8]
+# Branch A: |roll| <= 90 deg, plus the 0.0002 deg the mirror adds to roll (Trajectory.mirrored).
+ROLL_BOUND = np.pi / 2 + np.radians(0.001)
+
+
+def _arms_raised(stream, elevation, azimuth):
+    # Both upper arms swung (no twist) from hanging to `elevation` deg up, `azimuth` deg
+    # from her front towards her side (0 in front, 90 out to the side), mirror images.
+    e, a = np.radians(elevation), np.radians(azimuth)
+    left = np.array([np.sin(e) * np.sin(a), -np.cos(e), np.sin(e) * np.cos(a)])  # SMPL-X: left, up, front
+    rotations = np.tile(np.eye(3), (52, 1, 1))
+    for shoulder, elbow, her in ((LEFT_SHOULDER, LEFT_ELBOW, left), (RIGHT_SHOULDER, RIGHT_ELBOW, left * [-1, 1, 1])):
+        rest = stream._fk.offsets[elbow] / np.linalg.norm(stream._fk.offsets[elbow])
+        axis = np.cross(rest, her)
+        angle = np.arctan2(np.linalg.norm(axis), rest @ her)
+        rotations[shoulder] = Rotation.from_rotvec(angle * axis / np.linalg.norm(axis)).as_matrix()
+    return encode_rotation_6d(rotations).reshape(-1)
+
+
+def _pointing_error_deg(stream, pose, raw):
+    # Per robot arm, the angle between its upper arm and hers (both arms raised alike).
+    retargeter = stream._stream.retargeter
+    animation = retargeter._animation([stream._frame(0.0, 0, raw)])
+    kinematics = retargeter.kinematics
+    kinematics.set_arm(pose)
+    errors = []
+    for side in ("left", "right"):
+        her = followme.readouts.twist_indicators(animation, side)["bone"][-1]
+        robot = kinematics.anchor(f"{side}_elbow_joint") - kinematics.anchor(f"{side}_shoulder_roll_joint")
+        errors.append(np.degrees(np.arccos(np.clip(robot @ her / np.linalg.norm(robot), -1.0, 1.0))))
+    return np.array(errors)
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+@pytest.mark.parametrize("azimuth", [20.0, 45.0, 90.0])
+def test_arms_raised_overhead_point_overhead(mirror, azimuth):
+    # The vendor's readouts counted the lift twice past the horizontal: overhead its
+    # roll read ~150 deg too and the arm pointed 100-140 deg off, behind her.
+    stream = create_stream("x2_followme", base_pose=NEUTRAL, mirror=mirror)
+    vendor = core.StreamRetargeter(stream._vendor, stream._stream.retargeter.kinematics,
+                                   stream._stream.retargeter.ledger, mirror=mirror)
+    for i, elevation in enumerate(np.linspace(1.0, 160.0, 90)):   # 3 s, slow enough for 360 deg/s
+        raw = _arms_raised(stream, elevation, azimuth)
+        pose, before = stream.retarget(i / 30, i, raw), vendor.push(stream._frame(i / 30, i, raw))
+        assert np.abs(pose[ROLLS]).max() <= ROLL_BOUND
+    assert _pointing_error_deg(stream, pose, raw).max() < 15.0
+    assert _pointing_error_deg(stream, before, raw).min() > 90.0
+
+
+def test_shoulder_roll_stays_on_one_branch_for_any_pose():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    for i, rotations in enumerate(_people(200, seed=4)):
+        pose = stream.retarget(i / 15, i, encode_rotation_6d(rotations).reshape(-1))
+        assert np.abs(pose[ROLLS]).max() <= ROLL_BOUND, i
+
+
+def test_shoulder_geometry_is_the_ports():
+    # The port exported geometry_x2.json from the same x2_ultra.xml (md5 6992648c...).
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    data = json.loads((Path(__file__).resolve().parent / "data" / "x2_shoulder_ik" / "geometry_x2.json").read_text())
+    for side, geometry in stream._shoulders.items():
+        port = followme.ShoulderGeometry.from_dict(data["sides"][side])
+        for field in ("pitch_axis", "roll_axis", "rest_dir", "pitch_limit", "roll_limit", "yaw_limit"):
+            np.testing.assert_allclose(getattr(geometry, field), getattr(port, field), atol=1e-9, err_msg=field)
+
+
+def test_a_wrong_shoulder_geometry_is_refused(monkeypatch):
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    retargeter = stream._stream.retargeter
+    anchor = retargeter.kinematics.anchor
+    # The upper arm measured from the pitch joint, as the port warns against: 1.4 deg off.
+    monkeypatch.setattr(retargeter.kinematics, "anchor",
+                        lambda name: anchor(name.replace("shoulder_roll", "shoulder_pitch")))
+    with pytest.raises(RuntimeError, match="shoulder geometry"):
+        followme.shoulder_geometry(retargeter.kinematics, retargeter.ledger)
+
+
+def test_reset_input_starts_new_shoulder_solvers_and_keeps_their_counts():
+    stream = create_stream("x2_followme", base_pose=NEUTRAL)
+    for i, elevation in enumerate(np.linspace(1.0, 160.0, 20)):
+        stream.retarget(i / 30, i, _arms_raised(stream, elevation, 90.0))
+    before = stream.status()["shoulder_ik"]
+    assert before["left"]["frames"] == 20 and before["left"]["rate_limited"] > 0
+    old = stream._stream.retargeter.solvers
+    stream.reset_input()
+    assert stream.status()["shoulder_ik"] == before
+    solvers = stream._stream.retargeter.solvers
+    assert all(solvers[side] is not old[side] and solvers[side].stats["frames"] == 0 for side in old)
+    # A fresh solver does not rate-limit its first frame: the arm lands at once.
+    pose = stream.retarget(5.0, 20, _arms_raised(stream, 1.0, 90.0))
+    assert _pointing_error_deg(stream, pose, _arms_raised(stream, 1.0, 90.0)).max() < 20.0
+    assert stream.status()["shoulder_ik"]["left"]["frames"] == 21
