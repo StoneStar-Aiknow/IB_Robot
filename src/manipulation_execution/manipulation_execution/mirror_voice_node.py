@@ -391,6 +391,8 @@ class MirrorVoiceNode(Node):
             self._state = state
             self._phase = payload.get("phase")
             self._state_at = self._now()
+            if self.mute is not None:
+                self.mute.on_session_state(state)
         self.speaker.on_state(message.data)
 
     def _on_utterance(self, message: VisualInteractionUtterance) -> None:
