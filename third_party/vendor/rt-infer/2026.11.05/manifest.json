@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "name": "rt-infer",
+  "version": "2026.11.05-candidate10",
+  "status": "validated-periodic-with-limitations",
+  "native_recovery": "reboot-required",
+  "artifacts": {
+    "scheduler": {
+      "path": "bin/aicore_scheduler",
+      "sha256": "752c59291a3b3b270b92822b440f7b1d85e8735950ba106f2da34a534c484ea1",
+      "size_bytes": 422256
+    },
+    "runtime": {
+      "path": "lib/libruntime.so",
+      "sha256": "51ea244f2d8aac50b497500dc3fed0e905837684861f7f369fa52f464ce55264",
+      "size_bytes": 1292544
+    },
+    "module": {
+      "path": "modules/5.10.0-openeuler/aicore_device.ko",
+      "sha256": "0ff837d764754475a2cb723d7eab75e129dd400fafd3bd85a7210fb45b3fdf6d",
+      "size_bytes": 355784
+    }
+  },
+  "compatibility": {
+    "architecture": "aarch64",
+    "chip": "Ascend310P1",
+    "mode": "RC",
+    "os_id": "openeuler",
+    "os_build_id": "20251020093351",
+    "kernel_release": "5.10.0-openeuler",
+    "module_vermagic": "5.10.0-openeuler SMP mod_unload aarch64",
+    "cann": "8.1.RC1",
+    "official_runtime_path": "/usr/local/Ascend/ascend-toolkit/8.1.RC1/aarch64-linux/lib64/libruntime.so",
+    "official_runtime_sha256": "94029220e9849e4c479c34f7ebf7441c0b80631dfd9301667c28af7f20979e37",
+    "chip_detection": "operator must confirm Ascend310P1 RC before start",
+    "svm_module_sha256": "6441b69ea03273fb064571223c83f6fc665971391c9679db2687c77045b037b7"
+  },
+  "validation": {
+    "scope": "candidate10 cross-board periodic validation; 19/3060 deadline misses; background starvation observed",
+    "baseline_source_revision": "d8768b51cb86b6449dc3c5dd071bf90b875c63e4",
+    "candidate": "candidate10"
+  },
+  "distribution": {
+    "scope": "internal evaluation"
+  },
+  "metadata_files": [
+    "SHA256SUMS"
+  ],
+  "payload_files": [
+    {
+      "path": "artifacts/svm.ko",
+      "sha256": "6441b69ea03273fb064571223c83f6fc665971391c9679db2687c77045b037b7",
+      "size_bytes": 981936
+    },
+    {
+      "path": "bin/om_probe",
+      "sha256": "21ad46c80db4eb42c9959e8f79761f1690f7521aba2fe9cf0cd3eb850d38bbe1",
+      "size_bytes": 79200
+    },
+    {
+      "path": "lib/periodic_control_bridge.so",
+      "sha256": "49d4f81537d9e09c4db979a6e15bb1d15bcf5f281c6360ca253438cfb26e8a5f",
+      "size_bytes": 70504
+    },
+    {
+      "path": "lib/persistent_acl_bridge.so",
+      "sha256": "da2833178ff2605a1775c17b77900556d5234fab5d64748e7340e44c31881628",
+      "size_bytes": 74320
+    },
+    {
+      "path": "NOTICE",
+      "sha256": "00fb7efd865d7229109b35cd7792440f70f9af997d1ec1289fbd886d5ff33424",
+      "size_bytes": 339
+    },
+    {
+      "path": "scripts/base_control.py",
+      "sha256": "265d32d008155624f85e4d7068b1334bceadd760afca44c828a91c0c03925112",
+      "size_bytes": 32967
+    },
+    {
+      "path": "scripts/priorityctl.py",
+      "sha256": "bb8aa60556ee06db7d850e9906716eb0f9d7631c2dc06d488e3cc77bd9fa5c3c",
+      "size_bytes": 12106
+    },
+    {
+      "path": "scripts/summarize.py",
+      "sha256": "9abc98534a7d89d2a3b4558bf2691ab9bab7fed72d46d45cc875e5f2e39d24ee",
+      "size_bytes": 1077
+    },
+    {
+      "path": "SVM.md",
+      "sha256": "b1c7a64592988462a034b725049dad07bfa351417c4b48b1510e682095766236",
+      "size_bytes": 4178
+    },
+    {
+      "path": "svm_bind_probe.py",
+      "sha256": "5af8ae86cb27f3ae24474c53f8d5522dee838d559323c1b3bb5ef6d9f79af3e8",
+      "size_bytes": 1190
+    }
+  ]
+}

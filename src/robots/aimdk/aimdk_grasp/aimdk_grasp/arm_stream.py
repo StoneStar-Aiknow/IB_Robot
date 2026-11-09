@@ -9,7 +9,7 @@ fixed home command.
 
 from __future__ import annotations
 
-from manipulation_execution.grasp_pipeline.streaming import StreamConfig, StreamExecutor, StreamIO
+from manipulation_execution.pick.pipeline.streaming import StreamConfig, StreamExecutor, StreamIO
 
 from .arm_gravity import LIMIT_MARGIN_RAD, ArmGravity, GravityShaper
 from .joints import HEAD, LEFT_ARM, RIGHT_ARM

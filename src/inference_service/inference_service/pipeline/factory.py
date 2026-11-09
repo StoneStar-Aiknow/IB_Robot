@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 
 import numpy as np
 
@@ -288,7 +289,7 @@ def create_inference_pipeline(
     default_task: str | None = None,
     execution_mode: str = "monolithic",
     runtime_options: Mapping[str, object] | None = None,
-    priority_scheduling: bool = False,
+    priority_scheduling: bool | None = None,
     registry: BackendRegistry | None = None,
     registry_set: RegistrySet | None = None,
     providers: RuntimeProviders | None = None,
@@ -319,7 +320,7 @@ def create_inference_pipeline(
     context = RuntimeContext(
         validated_manifest,
         runtime_options=runtime_options or {},
-        priority_scheduling=priority_scheduling,
+        **({"priority_scheduling": priority_scheduling} if priority_scheduling is not None else {}),
     )
     selected_registry.validate(context)
     preprocessor = None
@@ -380,7 +381,7 @@ def create_pipeline_manager(
     default_task: str | None = None,
     execution_mode: str = "monolithic",
     runtime_options: Mapping[str, object] | None = None,
-    priority_scheduling: bool = False,
+    priority_scheduling: bool | None = None,
     registry: BackendRegistry | None = None,
     registry_set: RegistrySet | None = None,
     providers: RuntimeProviders | None = None,
@@ -413,8 +414,13 @@ def create_pipeline_manager(
         stage_scheduling=stage_scheduling,
         frame_base_priority=frame_base_priority,
     )
-    manager = InferencePipelineManager((pipeline,), retry_pending_close=priority_scheduling)
-    manager.start()
+    manager = InferencePipelineManager((pipeline,))
+    try:
+        manager.start()
+    except Exception as exc:
+        if providers is not None and getattr(exc, "cleanup_owner", None) is manager:
+            providers.retain_cleanup(manager)
+        raise
     return manager
 
 
@@ -665,8 +671,8 @@ def _build_hisilicon_act_handle(
     )
     return _PolicySessionHandle(
         model_executor,
-        RuntimeContext(
-            context.validated_manifest,
+        replace(
+            context,
             runtime_options=options,
             priority_scheduling=context.priority_scheduling,
         ),
@@ -894,8 +900,8 @@ def _create_ascend_session(
 
 def _build_session_context(context: RuntimeContext, options: Mapping[str, object]) -> RuntimeContext:
     session_options: dict[str, object] = {"device_id": options["device_id"]}
-    return RuntimeContext(
-        context.validated_manifest,
+    return replace(
+        context,
         runtime_options=session_options,
         priority_scheduling=context.priority_scheduling,
         runtime_profile=context.runtime_profile,
@@ -946,8 +952,8 @@ def _create_hmm_session(
 
 def _build_hmm_session_context(context: RuntimeContext, options: Mapping[str, object]) -> RuntimeContext:
     session_options: dict[str, object] = {"device_id": options["device_id"]}
-    return RuntimeContext(
-        context.validated_manifest,
+    return replace(
+        context,
         runtime_options=session_options,
         priority_scheduling=context.priority_scheduling,
     )
@@ -1178,8 +1184,8 @@ def _create_rknn_session(
 
 def _build_rknn_session_context(context: RuntimeContext, options: Mapping[str, object]) -> RuntimeContext:
     session_options: dict[str, object] = {"target": options["target"], "core_mask": options["core_mask"]}
-    return RuntimeContext(
-        context.validated_manifest,
+    return replace(
+        context,
         runtime_options=session_options,
         priority_scheduling=context.priority_scheduling,
     )

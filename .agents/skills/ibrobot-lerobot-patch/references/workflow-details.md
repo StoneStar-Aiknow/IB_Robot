@@ -98,7 +98,7 @@ If the patch affects actual runtime or build behavior, also use the relevant
 follow-up workflow:
 
 - `ibrobot-build` for workspace build / import validation.
-- `ibrobot-docker-verify` or `ibrobot-docker-verify-oee` after changing setup
+- `ibrobot-docker-verify` or `ibrobot-verify-oee` after changing setup
   or platform-sensitive patch behavior.
 
 ## Step 8. Clean The Submodule Checkout Before Committing IB_Robot

@@ -47,6 +47,7 @@ from inference_service.pipeline.runtime_core import (
     StageFrame,
 )
 from inference_service.pipeline.staged_executor import StagedModelExecutor, StagedScheduling
+from inference_service.pipeline.stages import _model_evidence
 from inference_service.pipeline.state import PipelineState
 from inference_service.pipeline.types import PipelineDiagnostics, PipelineResult
 from inference_service.pipeline.validation import validate_action_output
@@ -59,6 +60,7 @@ from inference_service.unified_runtime import (
     ModelRequest,
     ModelResult,
     ModelRuntimeHandle,
+    OutcomeState,
     OwnedComponent,
     RuntimeAssembly,
 )
@@ -222,7 +224,13 @@ class _PolicyPreprocessStage:
             if trace.enabled and self._facade._instrument_processors
             else nullcontext()
         )
-        with preprocess_span:
+        processor_session = getattr(self._facade._preprocessor, "session", None)
+        progress = (
+            _model_evidence(frame, processor_session, "preprocess", stateful=False)
+            if processor_session is not None
+            else nullcontext()
+        )
+        with preprocess_span, progress:
             preprocess_start = time.perf_counter()
             canonical_inputs = self._facade._preprocessor(processor_inputs)
             preprocess_latency_ms = (time.perf_counter() - preprocess_start) * 1000.0
@@ -440,7 +448,13 @@ class _PolicyPostprocessStage:
             if trace.enabled and self._facade._instrument_processors
             else nullcontext()
         )
-        with postprocess_span:
+        processor_session = getattr(self._facade._postprocessor, "session", None)
+        progress = (
+            _model_evidence(frame, processor_session, "postprocess", stateful=False)
+            if processor_session is not None
+            else nullcontext()
+        )
+        with postprocess_span, progress:
             postprocess_start = time.perf_counter()
             action = self._facade._postprocessor(frame.values["_semantic_action"])
             postprocess_latency_ms = (time.perf_counter() - postprocess_start) * 1000.0
@@ -1049,19 +1063,28 @@ class InferencePipeline:
     @staticmethod
     def _raise_execution_failure(failure: ExecutionFailure) -> None:
         cause = failure.cause
-        if isinstance(cause, Exception):
-            raise cause from failure
         details = {
             **dict(failure.details),
             "evidence": failure.evidence.to_dict(),
             "recovery": failure.recovery.to_dict(),
         }
-        raise PipelineLifecycleError(
-            str(failure),
-            pipeline_id="policy",
-            code=failure.code,
-            details=details,
-        ) from failure
+        # Keep legacy exception types, but the handle's normalized evidence is
+        # authoritative. The ROS boundary consumes these compatibility fields.
+        error = (
+            cause
+            if isinstance(cause, Exception) and not isinstance(cause, ExecutionFailure)
+            else PipelineLifecycleError(str(failure), pipeline_id="policy", code=failure.code, details=details)
+        )
+        error.evidence = failure.evidence
+        error.recovery = failure.recovery
+        error.details = details
+        error.operation_started = failure.evidence.state is not OutcomeState.NOT_STARTED
+        error.outcome_known = failure.evidence.outcome_known
+        error.state_mutated = failure.evidence.state_mutated
+        error.recoverable = failure.recoverable
+        error.close_pending = failure.close_pending
+        error.stage = failure.evidence.phase
+        raise error from failure
 
     # ------------------------------------------------------------------
     # Policy helpers (preserved from the original implementation)
@@ -1198,6 +1221,10 @@ class InferencePipeline:
             exc.operation_started = bool(backend_execution_started)
         if not hasattr(exc, "outcome_known"):
             exc.outcome_known = True
+        # A later readiness rejection must not replace the original model
+        # failure. Only a successful reset clears that recovery diagnostic.
+        if self._policy_failure is not None:
+            return
         capabilities = self.capabilities
         if isinstance(exc, PipelineCanceledError):
             return
@@ -1211,7 +1238,9 @@ class InferencePipeline:
                 )
             return
         non_mutating_rejection = isinstance(exc, BackendAdmissionError) and not exc.operation_started
-        if backend_execution_started and not non_mutating_rejection and capabilities.stateful:
+        evidence = getattr(exc, "evidence", None)
+        state_mutated = evidence.state_mutated if evidence is not None else backend_execution_started
+        if state_mutated and not non_mutating_rejection and capabilities.stateful:
             self._policy_failure = BackendHealth(
                 state=BackendState.FAILED,
                 ready=False,

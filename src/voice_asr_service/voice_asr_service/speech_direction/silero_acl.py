@@ -9,6 +9,8 @@ import numpy as np
 
 from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
 from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel
+from inference_service.backends.errors import BackendLifecycleError
+from inference_service.unified_runtime.lifecycle import lifecycle_lock
 from voice_asr_service.speech_direction.contract import SILERO_AUDIO_SHAPE, speech_direction_bindings
 
 # Silero VAD OM（silero_vad_v6_310p_mixed16，openvino_16k 变体）固定静态 ABI。
@@ -27,13 +29,14 @@ class SileroVadAclRunner:
         *,
         device_id: int = 0,
         runtime_manager: AclRuntimeManager | None = None,
+        cleanup=None,
     ) -> None:
         path = Path(model_path)
         if not path.is_file():
             raise FileNotFoundError(f"Silero VAD Ascend ACL OM 不存在: {path}")
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理（reset/inference 见此标志即拒绝）
-        self._cleanup_complete = False  # 所有可执行清理已尝试完毕（含失败项），重入据此返回
+        self._cleanup_complete = False  # 仅在所有资源释放成功后置位
         self._poisoned = False
         self._bank = 0
         if runtime_manager is None:
@@ -41,6 +44,8 @@ class SileroVadAclRunner:
         self._lease = runtime_manager.acquire(device_id)
         self._model: AclModel | None = None
         self._states: tuple[AclDeviceBuffer, AclDeviceBuffer] = ()
+        if cleanup is not None:
+            cleanup.defer(self.close)
         try:
             self._model = AclModel(
                 self._lease,
@@ -66,8 +71,17 @@ class SileroVadAclRunner:
                 host_output_indices={0},
             )
             self.reset()
-        except Exception:
-            self.close()
+        except Exception as exc:
+            if cleanup is not None:
+                exc.cleanup_owner = cleanup
+                exc.close_pending = True
+            else:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    exc.cleanup_owner = self
+                    exc.close_pending = True
+                    exc.rollback_errors = (str(cleanup_error),)
             raise
 
     def infer(self, audio: np.ndarray) -> float:
@@ -99,31 +113,20 @@ class SileroVadAclRunner:
             self._poisoned = False
 
     def close(self) -> None:
-        """best-effort terminal 关闭：尽力释放模型与 lease，单项失败不阻断其余清理，末尾汇总异常。
-
-        关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
-        因此失败后再次调用并不会"重新执行整个关闭"——属 best-effort terminal，非可重试。
-        """
-        with self._lock:
-            if self._cleanup_complete:
-                # 清理已尝试完毕（含失败项），重入直接返回，避免重复释放已成功资源。
-                return
-            self._closed = True  # 禁新推理；释放动作放在锁外，避免持锁阻塞推理线程的退出
-        errors = []
-        model = getattr(self, "_model", None)
-        if model is not None:
-            try:
-                model.close()
-            except Exception as exc:
-                errors.append(str(exc))
+        """保留释放失败的模型及 lease，后续 close 从未完成处重试。"""
+        self._closed = True
         try:
-            self._lease.close()
+            with lifecycle_lock(self._lock):
+                if self._cleanup_complete:
+                    return
+                if self._model is not None:
+                    self._model.close()
+                    self._model = None
+                    self._states = ()
+                self._lease.close()
+                self._cleanup_complete = True
         except Exception as exc:
-            errors.append(str(exc))
-        finally:
-            self._cleanup_complete = True
-        if errors:
-            raise RuntimeError("; ".join(errors))
+            raise BackendLifecycleError(str(exc), close_pending=True) from exc
 
 
 __all__ = ["SileroVadAclRunner"]

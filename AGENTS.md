@@ -83,6 +83,8 @@ Signed-off-by: Name <email>  # 必须，使用 git commit -s
 当变更触发 Ubuntu/openEuler 双平台 Docker 门禁时，运行验证前必须询问用户 PR 是临时 WIP 还是
 准备交给 reviewer 正式检视。WIP 标题统一为 `[WIP] <title>` 并暂缓双平台 Docker；移除 `[WIP]`
 转为正式检视时，必须补齐当前 Git tree 的两平台验证。WIP 不豁免 DCO、AI 披露、其他测试或 CI。
+openEuler 一侧本机有 ascend-vm 时在 ascend-vm 虚拟机中验证，否则用 Docker，规则见
+`ibrobot-verify-oee`。
 
 ### 测试规范（ROS 2 / ament）
 
@@ -96,6 +98,9 @@ Signed-off-by: Name <email>  # 必须，使用 git commit -s
 - 带自有 `pytest.ini` 的包必须重复根 `addopts` 的 `-p no:launch_testing -p no:launch_ros`，防止模块级 skip 把整包测试静默归零。
 - 删测试前先判断被测行为是否仍然存在；删除时在 commit message 写明覆盖面去向（先例：`src/inference_service/tests/LEGACY_COVERAGE.md`）。
 - AI 生成的测试按草稿对待：断言行为而非结构、真在 `colcon test` 下跑过、API 确实存在、不与既有测试重复。
+
+X2 独立 MuJoCo 的真实权重交接验收使用 `python -m aimdk_mujoco.verify_handoff --assets <目录> --report <JSON>`，
+详见该包 README；仅首个舞蹈 goal 重置，后续交接不重置，不连接真机、不复制权重，不能替代步态验收。
 
 ## 关键约定
 
@@ -264,7 +269,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [ibrobot-git-flow](.agents/skills/ibrobot-git-flow) | git commit、git push、DCO sign-off |
 | [ibrobot-lerobot-patch](.agents/skills/ibrobot-lerobot-patch) | 导出 lerobot patch、patch 栈管理 |
 | [ibrobot-docker-verify](.agents/skills/ibrobot-docker-verify) | Ubuntu Docker 验证 setup+build；作者侧 `[WIP]` PR 暂缓 |
-| [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 Docker 验证；作者侧 `[WIP]` PR 暂缓 |
+| [ibrobot-verify-oee](.agents/skills/ibrobot-verify-oee) | openEuler aarch64 验证（本机有 ascend-vm 时用 ascend-vm，否则用 Docker）；作者侧 `[WIP]` PR 暂缓 |
 | [sync-github](.agents/skills/sync-github) | 同步 AtomGit master 到 GitHub |
 | [skill-creator](.agents/skills/skill-creator) | 新建/重构 Agent skill、编写 SKILL.md、按 agentskills.io 规范校验 |
 

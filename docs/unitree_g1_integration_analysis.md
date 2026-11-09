@@ -1,6 +1,8 @@
 # Unitree G1 接入可行性分析
 
-> 分析阶段文档，**不含任何实现**。
+> 分析阶段文档，**不含任何实现**。（历史记录：Q2 的“纯 ROS 2 消息”路线已在
+> AtomGit Issue #171 PR 2 被官方 `unitree_sdk2py` SDK 路线取代，vendored
+> `unitree_hg`/`unitree_go`/`unitree_api` 消息包已删除；本节其余内容保留为当时的分析依据。）
 > 基线：**upstream master `ca7b8c23`**（2026-10-12 重新对齐）。PR #422（运行时契约本体）与
 > PR #426（AgiBot X2 bridge）都已合入 master，合入版比 2026-09-18 分析时的 PR head 多出约 23k 行，
 > 本文已按合入版重新核对（变化汇总见 §2.3）。旧基线 `6835cc1c` 保留在 tag `backup/unitree-g1-pre-master`。
@@ -273,7 +275,7 @@ vendoring 清单（Q1 + Q2 共同要求）：
 | `inference_service/pipeline_policy_node.py` | `joint_groups["all"]` | 只关心 `all`，不关心怎么分组 |
 | `task_dispatch/task_executor_node.py` | `joint_groups["gripper"]` | **"exactly one joint required"** |
 | `robot_teleop/public_target.py`、`so101_robot/teleoperation.py` | 一个 arm 组 + 一个 gripper | 单臂单夹爪 |
-| `manipulation_execution/pick_executor_node.py` | `joint_groups["arm"]` | |
+| `manipulation_execution/pick/node.py` | `joint_groups["arm"]` | |
 | `joint_conversion.py` | `gripper` 成员 | 仅改归一化区间：gripper → `0..100`，其余 → `-100..100` |
 
 注意最后一行：**`gripper` 成员身份在数值上只影响归一化区间**，并不强制"一个开度值"。
@@ -343,7 +345,7 @@ G1 应预期同样的修订）：
    `arm + gripper + base` 恰好**划分** `all`；腰不进 `arm` 组 ⇒ 腰无法出现在 `all` 里 ⇒
    带腰的模型拿不到腰的归一化参数。改为"三组互不相交，且都是 `all` 的子集"（约 3 行 + 测试）。
    已核对的消费者——`interface_binding`、`robot_teleop/public_target`、`so101_robot/teleoperation`、
-   `task_executor_node`、`pick_executor_node`、`dataset_tools/bag_to_lerobot`——都只按组名取组，
+   `task_executor_node`、`pick/node.py`（pick_executor_node）、`dataset_tools/bag_to_lerobot`——都只按组名取组，
    不依赖"`all` 恰好等于三组之和"；SO-101 / LeKiwi / X2 仍满足原划分，行为不变。不动 JSON schema。
 2. **归一化保持机器人关节顺序（Q8，已定）**。`pipeline_policy_node.py:738` 按 `joint_groups["all"]`
    建换算表，在 `_rad_to_lerobot` / `_lerobot_to_rad` 中按下标作用于状态/动作向量。不改。

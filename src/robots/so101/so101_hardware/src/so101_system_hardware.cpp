@@ -16,8 +16,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include <nlohmann/json.hpp>
 #include "feetech/conversion.hpp"
@@ -33,6 +35,29 @@ namespace
 bool is_truthy(const std::string & value)
 {
   return value == "1" || value == "true" || value == "True" || value == "TRUE";
+}
+
+// Optional servo tuning parameter: an empty (or quoted-empty) value keeps the
+// driver default; anything else must be a plain decimal integer in range.
+std::optional<unsigned> parse_servo_param(
+  const std::unordered_map<std::string, std::string> & params, const std::string & key,
+  unsigned min_value, unsigned max_value)
+{
+  const auto entry = params.find(key);
+  if (entry == params.end() || entry->second.empty() || entry->second == "''" ||
+    entry->second == "\"\"")
+  {
+    return std::nullopt;
+  }
+  const std::string & text = entry->second;
+  const bool digits_only =
+    text.size() <= 5 && text.find_first_not_of("0123456789") == std::string::npos;
+  const unsigned value = digits_only ? static_cast<unsigned>(std::stoul(text)) : 0U;
+  if (!digits_only || value < min_value || value > max_value) {
+    const std::string range = std::to_string(min_value) + ", " + std::to_string(max_value);
+    throw std::invalid_argument(key + " must be an integer in [" + range + "]");
+  }
+  return value;
 }
 
 // One deadline covers every retry and every transport operation within it.
@@ -161,6 +186,19 @@ SO101SystemHardware::on_init(const hardware_interface::HardwareInfo & info)
         throw std::invalid_argument("protection_timeout is below clock resolution");
       }
     }
+    // Servo motion tuning (unset = feetech defaults 2400 / 50 / 16). Speed
+    // and acceleration 0 mean "no limit" on STS3215; kp 0 would remove the
+    // position loop stiffness, so it is rejected.
+    const auto & hw_params = info_.hardware_parameters;
+    if (const auto speed = parse_servo_param(hw_params, "profile_speed", 0, 32767)) {
+      config.profile_speed = static_cast<std::uint16_t>(*speed);
+    }
+    if (const auto acc = parse_servo_param(hw_params, "profile_acc", 0, 254)) {
+      config.profile_acc = static_cast<std::uint8_t>(*acc);
+    }
+    if (const auto kp = parse_servo_param(hw_params, "position_kp", 1, 254)) {
+      config.position_kp = static_cast<std::uint8_t>(*kp);
+    }
     config.motor_ids = so101::resolve_motor_ids(config.joint_order, config.motor_ids);
     arm_ = std::make_unique<so101::Arm>(config);
     arm_config_ = config;
@@ -209,6 +247,7 @@ SO101SystemHardware::on_configure(const rclcpp_lifecycle::State &)
       motor.homing_offset = joint.homing_offset;
       motor.range_min = joint.range_min;
       motor.range_max = joint.range_max;
+      so101::apply_servo_tuning(arm_config_, motor);
       options.motors.push_back(motor);
     }
     bus_ = std::make_unique<feetech::Bus>(options);

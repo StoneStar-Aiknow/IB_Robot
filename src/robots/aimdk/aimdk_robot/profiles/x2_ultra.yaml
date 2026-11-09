@@ -659,6 +659,12 @@ interfaces:
     message_type: audio_common_msgs/msg/AudioDataStamped
     sample_rate_hz: 16000.0
     channels: 1
+    # hal_audio reports a PLAYING/STOPPED pair around every write it has to wait for, so a
+    # 50 ms stream paced in real time started and stopped about 20 times a second (159
+    # transitions for one 12 s reply, measured 2026-10-20) and long replies stuttered:
+    # publishers write 200 ms chunks and keep 1 s queued ahead of real time.
+    write_chunk_ms: 200
+    prebuffer_ms: 1000
     qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
 
   imu.chest:

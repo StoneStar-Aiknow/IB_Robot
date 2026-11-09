@@ -567,6 +567,11 @@ setup_python_venv() {
     if setup_profile_enables hardware; then
         log_info "Installing hardware dependencies..."
         run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/hardware.txt" --quiet
+        # The Unitree G1 vendor SDK is source-only upstream (not on PyPI), so it
+        # cannot ride in hardware.txt: install_unitree_sdk acquires the pinned
+        # checkout, installs its CycloneDDS pin, and import-verifies the result.
+        source "${SCRIPT_DIR}/setup/install_unitree_sdk.sh"
+        install_unitree_sdk "${pip_install[@]}"
     else
         log_info "Skipping hardware dependencies (${SETUP_PROFILE} profile)."
     fi

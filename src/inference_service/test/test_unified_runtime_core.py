@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import threading
+import weakref
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -119,6 +121,38 @@ def test_reset_completion_runs_inside_admission_barrier():
         handle.close()
 
 
+@pytest.mark.parametrize("retry_failed_reset", [False, True])
+def test_explicit_reload_from_reset_cannot_be_retried(retry_failed_reset):
+    executor = EchoExecutor([])
+    calls = []
+
+    def reset(_):
+        calls.append("reset")
+        if len(calls) == 1:
+            raise ExecutionFailure(
+                "reset_failed",
+                "native state requires replacement",
+                recovery=RecoveryRequirement("runtime", "reload"),
+                evidence=OutcomeEvidence.started("reset", outcome_known=False),
+            )
+
+    executor.reset = reset
+    owner = ModelRuntimeHandle(
+        RuntimeAssembly(runtime_executor=executor, resettable=True, retry_failed_reset=retry_failed_reset)
+    )
+    owner.load()
+    try:
+        with pytest.raises(ExecutionFailure):
+            owner.reset()
+        assert owner.state is LifecycleState.FAILED
+        with pytest.raises(ExecutionFailure):
+            owner.reset()
+        assert calls == ["reset"] and not owner.ready
+        assert owner.health.recovery_requirement.action is RecoveryAction.RELOAD
+    finally:
+        owner.close()
+
+
 def test_failed_load_retains_pending_rollback_resources_for_close_retry():
     from inference_service.backends.errors import BackendLifecycleError
 
@@ -126,6 +160,7 @@ def test_failed_load_retains_pending_rollback_resources_for_close_retry():
     provider = RecordingComponent("provider", events)
     resource = RecordingComponent("device", events)
     failing = RecordingComponent("failing", events, fail_load=True)
+    unattempted = RecordingComponent("unattempted", events)
     original_close = resource.close
 
     def pending_close():
@@ -138,7 +173,7 @@ def test_failed_load_retains_pending_rollback_resources_for_close_retry():
     handle = ModelRuntimeHandle(
         RuntimeAssembly(
             runtime_executor=EchoExecutor(events),
-            owned_components=(provider, resource, failing),
+            owned_components=(provider, resource, failing, unattempted),
         )
     )
     with pytest.raises(ExecutionFailure, match="failed to load"):
@@ -146,9 +181,10 @@ def test_failed_load_retains_pending_rollback_resources_for_close_retry():
     assert provider.close_count == 0
     handle.close()
     handle.close()
+    assert unattempted.close_count == 1
     assert resource.close_count == 2
     assert provider.close_count == 1
-    assert failing.close_count == 0
+    assert failing.close_count == 1
 
 
 def test_non_pending_cleanup_error_releases_dependencies_once():
@@ -178,8 +214,7 @@ def test_non_pending_cleanup_error_releases_dependencies_once():
     assert executor.close_count == provider.close_count == 1
 
 
-@pytest.mark.parametrize("scheduled", [False, True])
-def test_manager_pending_close_retry_requires_opt_in(scheduled):
+def test_manager_retries_pending_close():
     from types import SimpleNamespace
 
     from inference_service.backends.errors import BackendLifecycleError
@@ -194,13 +229,13 @@ def test_manager_pending_close_retry_requires_opt_in(scheduled):
             raise BackendLifecycleError("drain pending", close_pending=True)
 
     pipeline = SimpleNamespace(pipeline_id="policy", load=lambda: None, close=close)
-    manager = InferencePipelineManager((pipeline,), retry_pending_close=scheduled)
+    manager = InferencePipelineManager((pipeline,))
     manager.start()
     with pytest.raises(PipelineManagerError):
         manager.close()
     manager.close()
     manager.close()
-    assert len(attempts) == (2 if scheduled else 1)
+    assert len(attempts) == 2
 
 
 @pytest.mark.parametrize("scheduled", [False, True])
@@ -343,7 +378,7 @@ def test_load_rolls_back_in_reverse_order_and_close_is_idempotent() -> None:
     handle.close()
     assert first.close_count == 1
     assert second.close_count == 1
-    assert failing.close_count == 0
+    assert failing.close_count == 1
     assert handle.state is LifecycleState.CLOSED
 
 
@@ -439,23 +474,86 @@ def test_control_operations_drain_active_requests_and_stop_admission() -> None:
     handle.close()
 
 
-def test_legacy_parallel_requests_keep_accepting_the_same_request_id() -> None:
+def test_policy_requests_reject_duplicate_ids_without_overwriting_cancellation() -> None:
     from concurrent.futures import ThreadPoolExecutor
 
-    both_entered = threading.Barrier(2)
+    entered = threading.Event()
+    release = threading.Event()
 
     class Executor(EchoExecutor):
         def execute(self, request, execution_context):
-            both_entered.wait(timeout=2)
+            entered.set()
+            assert release.wait(2)
             return super().execute(request, execution_context)
 
     handle = ModelRuntimeHandle(Executor([]), max_active_executions=2)
     handle.load()
+    authority = handle.bind_execution_policy(
+        SimpleNamespace(
+            ready=True,
+            cancel=lambda *_args, **_kwargs: None,
+            execute=lambda request, context: handle._execute_local(request, context, _dispatch_key=authority),
+            reset=lambda context: handle._reset_local(context, _dispatch_key=authority),
+            close=lambda context: handle._close_local(context, _dispatch_key=authority),
+        )
+    )
+    original = context("same")
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            futures = [pool.submit(handle.execute, ModelRequest({"value": value}), context("same")) for value in (1, 2)]
-            assert [future.result(timeout=3).outputs["value"] for future in futures] == [1, 2]
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(handle.execute, ModelRequest({"value": 1}), original)
+            try:
+                assert entered.wait(1)
+                with pytest.raises(ExecutionFailure) as rejected:
+                    handle.execute(ModelRequest({"value": 2}), context("same"))
+                assert rejected.value.code == "request_conflict"
+                handle.cancel("same")
+                assert original.cancellation_token.is_cancelled
+            finally:
+                release.set()
+            with pytest.raises(ExecutionFailure):
+                first.result(timeout=1)
         assert handle._active_executions == 0
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize("cancel_remaining", [False, True])
+def test_parallel_direct_requests_keep_duplicate_ids_and_all_cancel_owners(cancel_remaining):
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered = threading.Barrier(3)
+    release = [threading.Event(), threading.Event()]
+    contexts = [context("same"), context("same")]
+
+    def execute(request, execution_context):
+        entered.wait(timeout=2)
+        assert release[request.inputs["index"]].wait(2)
+        return request.inputs
+
+    handle = ModelRuntimeHandle(SimpleNamespace(execute=execute), max_active_executions=2)
+    handle.load()
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            futures = [pool.submit(handle.execute, ModelRequest({"index": i}), contexts[i]) for i in range(2)]
+            try:
+                entered.wait(timeout=2)
+                release[0].set()
+                assert futures[0].result(timeout=1).outputs == {"index": 0}
+                if cancel_remaining:
+                    handle.cancel("same")
+                    assert contexts[1].cancellation_token.is_cancelled
+                    assert not contexts[0].cancellation_token.is_cancelled
+                release[1].set()
+                if cancel_remaining:
+                    with pytest.raises(ExecutionFailure) as failure:
+                        futures[1].result(timeout=1)
+                    assert failure.value.evidence.state is OutcomeState.COMPLETED
+                else:
+                    assert futures[1].result(timeout=1).outputs == {"index": 1}
+                assert handle.active_executions == 0 and handle.ready
+            finally:
+                for event in release:
+                    event.set()
     finally:
         handle.close()
 
@@ -558,6 +656,136 @@ def test_stream_limits_identity_close_and_reset_are_scoped() -> None:
     handle.close()
 
 
+def test_closed_stream_history_releases_native_state_and_never_reuses_public_ids() -> None:
+    class NativeStream:
+        stream_id = "recycled-native-id"
+
+    handle, streaming = stream_handle()
+    native_refs = []
+
+    def open_native(_context):
+        native = NativeStream()
+        native_refs.append(weakref.ref(native))
+        streaming.states[native.stream_id] = 0
+        return native
+
+    streaming.open_stream = open_native
+    public_handles = []
+    try:
+        for index in range(300):
+            stream = handle.open_stream(context(f"open-{index}"))
+            public_handles.append(stream)
+            assert handle.step(stream, ModelRequest(), context()).outputs["count"] == 1
+            handle.close_stream(stream)
+            assert native_refs[-1]() is None
+
+        assert len({stream.stream_id for stream in public_handles}) == 300
+        assert len(handle.stream_diagnostics()) == 128
+        assert handle.open_stream_count == 0
+        oldest = public_handles[0]
+        handle.close_stream(oldest)
+        with pytest.raises(ExecutionFailure, match="stream_closed"):
+            handle.step(oldest, ModelRequest(), context())
+        with pytest.raises(ExecutionFailure, match="stream_closed"):
+            handle.reset_stream(oldest, context())
+        with pytest.raises(ExecutionFailure, match="stream_not_found"):
+            handle.close_stream(oldest.stream_id)
+        with pytest.raises(ExecutionFailure, match="stream_not_found"):
+            handle.close_stream(StreamHandle(public_handles[-1].stream_id))
+        assert len(streaming.close_calls) == 300
+    finally:
+        handle.close()
+
+
+def test_closed_history_eviction_keeps_failed_stream_owned_until_close_confirmation() -> None:
+    handle, streaming = stream_handle(limit=2)
+    pending = handle.open_stream(context())
+    close = streaming.close_stream
+
+    def fail_pending(stream, execution_context):
+        if stream.stream_id == pending.stream_id:
+            raise RuntimeError("native close outcome unknown")
+        close(stream, execution_context)
+
+    streaming.close_stream = fail_pending
+    try:
+        with pytest.raises(ExecutionFailure) as failed:
+            handle.close_stream(pending)
+        assert failed.value.close_pending
+        for _ in range(300):
+            stream = handle.open_stream(context())
+            handle.close_stream(stream)
+        diagnostics = handle.stream_diagnostics()
+        assert len(diagnostics) == 129
+        assert any(item.stream_id == pending.stream_id and item.state is StreamState.FAILED for item in diagnostics)
+        assert pending.stream_id in streaming.states
+        assert handle.open_stream_count == 1
+        streaming.close_stream = close
+        handle.close_stream(pending)
+        assert pending.closed and handle.open_stream_count == 0
+        assert not streaming.states
+    finally:
+        streaming.close_stream = close
+        handle.close()
+
+
+@pytest.mark.parametrize("failure_kind", ["canceled", "deadline", "backend"])
+def test_failed_stream_close_retains_resources_until_successful_retry(failure_kind) -> None:
+    handle, streaming = stream_handle(limit=1)
+    stream = handle.open_stream(context("open"))
+    close_context = context("close")
+    original_close = streaming.close_stream
+    if failure_kind == "canceled":
+        close_context.cancellation_token.cancel("stop")
+    elif failure_kind == "deadline":
+        close_context = ExecutionContext("close", Deadline.after(0))
+    else:
+
+        def fail_close(*_args):
+            raise RuntimeError("native close is pending")
+
+        streaming.close_stream = fail_close
+    with pytest.raises(ExecutionFailure) as failed:
+        handle.close_stream(stream, close_context)
+    assert failed.value.close_pending
+    assert failed.value.evidence.outcome_known is (failure_kind != "backend")
+    assert handle.open_stream_count == 1
+    assert stream.stream_id in streaming.states
+    with pytest.raises(ExecutionFailure):
+        handle.step(stream, ModelRequest(), context("after-close"))
+    with pytest.raises(ExecutionFailure):
+        handle.reset_stream(stream, context("reset-after-close"))
+    with pytest.raises(ExecutionFailure):
+        handle.open_stream(context("replacement"))
+    streaming.close_stream = original_close
+    handle.close_stream(stream, context("retry-close"))
+    assert handle.open_stream_count == 0
+    assert stream.stream_id not in streaming.states
+    handle.close()
+
+
+def test_runtime_close_does_not_release_model_before_failed_stream_cleanup() -> None:
+    handle, streaming = stream_handle(limit=1)
+    stream = handle.open_stream(context("open"))
+    original_close = streaming.close_stream
+    released = []
+    streaming.close = lambda: released.append("model")
+
+    def fail_close(*_args):
+        raise RuntimeError("native close is pending")
+
+    streaming.close_stream = fail_close
+    with pytest.raises(ExecutionFailure) as failed:
+        handle.close()
+    assert failed.value.close_pending
+    assert not handle.closed and not released
+    assert stream.stream_id in streaming.states
+    streaming.close_stream = original_close
+    handle.close()
+    assert handle.closed and released == ["model"]
+    assert not streaming.states
+
+
 def test_same_stream_reentrancy_does_not_block_other_isolated_stream() -> None:
     handle, streaming = stream_handle(limit=2)
     first = handle.open_stream(context("open-1"))
@@ -629,7 +857,9 @@ def test_started_unknown_failure_isolated_to_stream_or_runtime_bank() -> None:
         exclusive.open_stream(context("blocked"))
     assert blocked.value.code == "recovery_required"
     exclusive_streaming.fail_unknown = False
-    exclusive.reset_stream(only, context("recover-exclusive"))
+    with pytest.raises(ExecutionFailure, match="recovery_required"):
+        exclusive.reset_stream(only, context("recover-exclusive"))
+    exclusive.reset(context("recover-runtime"))
     assert exclusive.state is LifecycleState.READY
     assert exclusive.step(only, ModelRequest({"x": 1}), context("after-exclusive-reset")).outputs["count"] == 1
     exclusive.close()

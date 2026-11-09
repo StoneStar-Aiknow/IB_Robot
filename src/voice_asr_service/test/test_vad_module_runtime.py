@@ -75,3 +75,37 @@ def test_file_segmentation_keeps_onset_frame_once_and_reports_contiguous_bounds(
     np.testing.assert_array_equal(segment, audio[start:end])
     assert start < len(silence) <= start + module._max_pre_roll_samples + frame
     assert np.count_nonzero(segment == np.float32(0.3)) == frame
+
+
+def test_manifest_vad_runtime_reset_calls_owned_session_once():
+    from types import SimpleNamespace
+
+    from inference_service.unified_runtime import ExecutionContext, ModelRuntimeHandle, OwnedComponent, RuntimeAssembly
+    from voice_asr_service.vad_runtime import ManifestVadRuntime, _VadStreamExecutor, _VadStreamingAdapter
+
+    calls = []
+    session = SimpleNamespace(reset=lambda: calls.append("reset"), close=lambda: None)
+    runtime = ManifestVadRuntime("unused")
+    adapter = _VadStreamingAdapter(session)
+    runtime._handle = ModelRuntimeHandle(
+        RuntimeAssembly(
+            runtime_executor=_VadStreamExecutor(),
+            streaming_runtime=adapter,
+            session=session,
+            owned_components=(OwnedComponent(session, "vad"),),
+            stateful=True,
+            resettable=True,
+            state_scope="stream",
+            state_bank_mode="runtime_exclusive",
+            max_open_streams=1,
+        )
+    )
+    runtime._handle.load()
+    runtime._stream = runtime._handle.open_stream(ExecutionContext("open"))
+    runtime._audio_context.fill(1)
+    try:
+        runtime.reset()
+        assert calls == ["reset"]
+        assert not runtime._audio_context.any()
+    finally:
+        runtime.close()

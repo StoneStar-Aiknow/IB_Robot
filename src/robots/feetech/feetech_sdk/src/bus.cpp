@@ -233,6 +233,17 @@ bool Bus::SimControl::eprom_locked(std::uint8_t id) const
   return true;
 }
 
+std::uint8_t Bus::SimControl::register_byte(std::uint8_t id, std::uint8_t addr) const
+{
+  if (impl_ && impl_->sim) {
+    if (auto * m = impl_->sim->motor(id)) {
+      const auto reg = m->regs.find(addr);
+      return reg == m->regs.end() ? 0 : reg->second;
+    }
+  }
+  return 0;
+}
+
 // ---------------------------------------------------------------------------
 // Bus
 // ---------------------------------------------------------------------------

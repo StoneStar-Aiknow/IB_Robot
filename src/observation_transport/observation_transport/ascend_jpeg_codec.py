@@ -189,6 +189,10 @@ class AscendJpegDecoder(VideoDecoder):
         )
 
     def _dispose(self):
+        # Cleared resource handles already record disposal. A retry may only
+        # own the lease's device/finalize phase, whose context is gone.
+        if self._stream is None and self._channel is None and not self._buffers and not self._pictures:
+            return
         self._lease.bind_current_thread()
         self._free_frames()
         errors = []

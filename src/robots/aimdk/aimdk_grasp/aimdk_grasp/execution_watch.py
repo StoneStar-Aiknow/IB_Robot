@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure, GraspPlan, Observation, Proposals
+from manipulation_execution.pick.pipeline.contracts import GraspFailure, GraspPlan, Observation, Proposals
 
 from .observation import AdmittedState, LiveState
 from .target_watch import WATCHED_PHASES, ExecutionWatcher, OrientationBuffer, WatchConfig

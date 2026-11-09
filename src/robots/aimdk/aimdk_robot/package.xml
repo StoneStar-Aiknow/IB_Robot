@@ -26,6 +26,7 @@
   <exec_depend>aimdk_msgs</exec_depend>
   <!-- the data plane: vendor state intake, public state views and the command stream -->
   <exec_depend>aimdk_dataplane</exec_depend>
+  <exec_depend>aimdk_interfaces</exec_depend>
 
   <!-- message packages the bridge publishes on the neutral surface -->
   <exec_depend>rclpy</exec_depend>
@@ -44,6 +45,7 @@
   <test_depend>ibrobot_msgs</test_depend>
   <test_depend>robot_runtime</test_depend>
   <test_depend>aimdk_dataplane</test_depend>
+  <test_depend>aimdk_interfaces</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

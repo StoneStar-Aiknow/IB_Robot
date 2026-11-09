@@ -24,8 +24,8 @@ from inference_service.backends.types import (
     BackendCapabilities,
     RuntimeContext,
 )
-from inference_service.model_sessions.base import ModelSession
-from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.model_sessions.base import ModelSession, numpy_dtype
+from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest, OutcomeEvidence
 
 _GRAPH_OPTIMIZATION_LEVELS = ("disable_all", "basic", "extended", "all")
 
@@ -169,7 +169,7 @@ class OnnxRuntimeModelSession(ModelSession):
                 )
             bank = {}
             for input_semantic, output_binding in state_outputs.get(role, {}).items():
-                bank[input_semantic] = np.zeros(output_binding.shape, dtype=np.dtype(output_binding.dtype))
+                bank[input_semantic] = np.zeros(output_binding.shape, dtype=numpy_dtype(output_binding.dtype))
             if bank:
                 state_banks[role] = bank
 
@@ -183,12 +183,11 @@ class OnnxRuntimeModelSession(ModelSession):
         rollback.defer(self._release)
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
         deployment = self._loaded_deployment()
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
-        for role in deployment.execution:
-            outputs = self._run_role(role, values, context)
+        for role_index, role in enumerate(deployment.execution):
+            outputs = self._execute_role_with_progress(role, values, request, context, completed=role_index > 0)
             values.update(outputs)
             for semantic, output in outputs.items():
                 if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
@@ -203,28 +202,34 @@ class OnnxRuntimeModelSession(ModelSession):
         context: ExecutionContext,
     ) -> Mapping[str, object]:
         del request
-        return self._run_role(role, dict(inputs), context)
+        return self._run_role(role, inputs, context)
 
-    def _run_role(self, role: str, values: dict[str, object], context: ExecutionContext) -> dict[str, object]:
-        context.check(f"model.{role}")
+    def _run_role(self, role: str, values: Mapping[str, object], context: ExecutionContext) -> dict[str, object]:
+        self._check_not_started_context(context, f"model.{role}")
         deployment = self._loaded_deployment()
         session = self._sessions[role]
         semantic_inputs = self._input_names[role]
         state_bank = self._state_banks.get(role, {})
         feed: dict[str, np.ndarray] = {}
-        for binding in deployment.bindings[role].inputs:
-            semantic = binding.semantic
-            runtime_name = semantic_inputs[semantic]
-            if semantic in state_bank:
-                feed[runtime_name] = state_bank[semantic]
-                continue
-            try:
-                feed[runtime_name] = np.asarray(values[semantic])
-            except KeyError as exc:
-                raise BackendInferenceError(
-                    f"ONNX Runtime role {role!r} is missing semantic input {semantic!r}",
-                    code="missing_semantic_input",
-                ) from exc
+        try:
+            for binding in deployment.bindings[role].inputs:
+                semantic = binding.semantic
+                runtime_name = semantic_inputs[semantic]
+                if semantic in state_bank:
+                    value = state_bank[semantic]
+                else:
+                    try:
+                        value = np.asarray(values[semantic])
+                    except KeyError as exc:
+                        raise BackendInferenceError(
+                            f"ONNX Runtime role {role!r} is missing semantic input {semantic!r}",
+                            code="missing_semantic_input",
+                        ) from exc
+                self._validate_values({semantic: value}, (binding,), f"role_{role}_input")
+                feed[runtime_name] = value
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.not_started(f"model.{role}.inputs")
+            raise
         try:
             runtime_outputs = session.run(None, feed)
         except BackendInferenceError:
@@ -233,24 +238,25 @@ class OnnxRuntimeModelSession(ModelSession):
             raise BackendInferenceError(
                 f"ONNX Runtime role {role!r} failed: {exc}", code="onnxruntime_execute_failed"
             ) from exc
-        output_names = self._output_names[role]
-        reverse_outputs = {name: semantic for semantic, name in output_names.items()}
-        outputs: dict[str, object] = {}
-        for index, name in enumerate(_graph_output_names(session)):
-            semantic = reverse_outputs.get(name)
-            if semantic is None:
-                raise BackendInferenceError(
-                    f"ONNX Runtime role {role!r} returned unbound output {name!r}", code="missing_runtime_output"
-                )
-            outputs[semantic] = runtime_outputs[index]
-        for input_semantic, output_binding in self._state_outputs.get(role, {}).items():
-            state_bank[input_semantic] = np.asarray(outputs.pop(output_binding.semantic))
-        return outputs
+        with self._completed_validation(f"model.{role}.outputs"):
+            output_names = self._output_names[role]
+            reverse_outputs = {name: semantic for semantic, name in output_names.items()}
+            outputs: dict[str, object] = {}
+            for index, name in enumerate(_graph_output_names(session)):
+                semantic = reverse_outputs.get(name)
+                if semantic is None:
+                    raise BackendInferenceError(
+                        f"ONNX Runtime role {role!r} returned unbound output {name!r}", code="missing_runtime_output"
+                    )
+                outputs[semantic] = runtime_outputs[index]
+            for input_semantic, output_binding in self._state_outputs.get(role, {}).items():
+                state_bank[input_semantic] = np.asarray(outputs.pop(output_binding.semantic))
+            return outputs
 
     def _reset(self) -> None:
         for role, bank in self._state_banks.items():
             for semantic, state_binding in self._state_outputs.get(role, {}).items():
-                bank[semantic] = np.zeros(state_binding.shape, dtype=np.dtype(state_binding.dtype))
+                bank[semantic] = np.zeros(state_binding.shape, dtype=numpy_dtype(state_binding.dtype))
 
     def _close(self) -> None:
         self._release()

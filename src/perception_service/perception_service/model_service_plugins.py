@@ -173,7 +173,11 @@ class _SessionPlugin(ModelServicePlugin):
         try:
             self._runtime_handle.load(context)
         except Exception:
-            self._closed = True
+            try:
+                self._runtime_handle.close()
+            except Exception:
+                if not self._runtime_handle.closed:
+                    providers.retain_cleanup(self._runtime_handle)
             raise
 
     def _infer(self, inputs):
@@ -208,8 +212,8 @@ class _SessionPlugin(ModelServicePlugin):
 
     def close(self) -> None:
         if not self._closed:
-            self._closed = True
             self._runtime_handle.close()
+            self._closed = self._runtime_handle.closed
 
 
 class RAMPlusRecognizeTagsPlugin(_SessionPlugin):

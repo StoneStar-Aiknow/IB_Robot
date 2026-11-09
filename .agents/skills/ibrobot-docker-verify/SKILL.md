@@ -34,7 +34,7 @@ detection, making the new-source install path untested.
 - Do not infer this skill from PR review alone.
 - Before an author-side gate invokes this skill, ask whether the PR is WIP or
   review-ready — via the interactive ask-user tool (the `question` tool in
-  opencode), not a prose question and not an assumed default. A `[WIP]` PR skips both Docker skills until promotion; explicit
+  opencode), not a prose question and not an assumed default. A `[WIP]` PR skips both platform verification skills until promotion; explicit
   standalone Docker requests still run normally.
 
 ## Review Boundary
@@ -51,7 +51,7 @@ detection, making the new-source install path untested.
 
 ## Tree Binding for PR Verification
 
-When an author-side PR gate triggers both Docker skills, verification evidence
+When an author-side PR gate triggers both platform verification skills, verification evidence
 must describe one exact committed tree:
 
 1. Resolve the target commit and record

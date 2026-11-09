@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>unitree_g1_adapter</name>
+  <version>0.1.0</version>
+  <description>
+    ROS-free Unitree G1 SDK adapter: a thin, injectable boundary over the
+    official unitree_sdk2_python channels, IDL and RPC clients. It owns vendor
+    import guarding, factory/channel lifecycle and vendor return-code mapping;
+    it never re-implements the vendor RPC or DDS protocol and it carries no
+    robot-specific joint mapping or control policy (AtomGit Issue #171).
+  </description>
+  <maintainer email="maintainer@example.com">IB-Robot Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Intentionally EMPTY runtime dependency list: this package is ROS-free
+       (no rclpy, no message packages). The vendor SDK itself is installed by
+       scripts/setup/install_unitree_sdk.sh at a pinned revision and is NOT a
+       pip dependency here: unitree_sdk2py does not exist on PyPI, so a pip
+       requirement would break every unrelated build. -->
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

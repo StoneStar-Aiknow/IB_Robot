@@ -1,8 +1,8 @@
 import pytest
 from sensor_msgs.msg import JointState
 
-from manipulation_execution.grasp_geometry import CandidatePlan
-from manipulation_execution.pick_executor_node import IKPayload, PickExecutorNode, PickFlowError
+from manipulation_execution.pick.candidate_geometry import CandidatePlan
+from manipulation_execution.pick.node import IKPayload, PickExecutorNode, PickFlowError
 
 
 class _ExecutorHarness:

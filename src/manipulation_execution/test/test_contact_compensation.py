@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from manipulation_execution.contact_compensation import ContactPrediction, compensate_contact_xy
+from manipulation_execution.pick.contact_compensation import ContactPrediction, compensate_contact_xy
 
 
 def test_compensation_moves_command_more_negative_for_positive_y_underreach() -> None:

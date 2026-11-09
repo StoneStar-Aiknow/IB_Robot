@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterable, Mapping
-from contextlib import nullcontext
 from datetime import datetime
 from types import MappingProxyType
 
@@ -12,10 +11,11 @@ from inference_service.backends import BackendCapabilities, InferenceRequest
 from inference_service.pipeline.errors import PipelineManagerError, PipelineNotFoundError
 from inference_service.pipeline.runtime import InferencePipeline
 from inference_service.pipeline.types import PipelineDiagnostics, PipelineResult
+from inference_service.unified_runtime.lifecycle import lifecycle_lock
 
 
 class InferencePipelineManager:
-    def __init__(self, pipelines: Iterable[InferencePipeline] = (), *, retry_pending_close: bool = False) -> None:
+    def __init__(self, pipelines: Iterable[InferencePipeline] = ()) -> None:
         owned: dict[str, InferencePipeline] = {}
         for pipeline in pipelines:
             if pipeline.pipeline_id in owned:
@@ -27,8 +27,8 @@ class InferencePipelineManager:
             owned[pipeline.pipeline_id] = pipeline
         self._pipelines = owned
         self._lock = threading.RLock()
-        self._cleanup_lock = threading.RLock() if retry_pending_close else None
-        self._unreleased_pipelines = set(owned) if retry_pending_close else None
+        self._cleanup_lock = threading.RLock()
+        self._unreleased_pipelines = set(owned)
         self._started = False
         self._starting = False
         self._closed = False
@@ -60,12 +60,16 @@ class InferencePipelineManager:
             with self._lock:
                 self._starting = False
                 self._closed = True
-            raise PipelineManagerError(
+            failure = PipelineManagerError(
                 f"pipeline manager startup failed while loading {failed_pipeline!r}: {exc}",
                 code="startup_failed",
                 pipeline_id=failed_pipeline,
                 details={"cleanup_errors": tuple(str(error) for error in cleanup_errors)},
-            ) from exc
+            )
+            failure.close_pending = bool(self._unreleased_pipelines)
+            if failure.close_pending:
+                failure.cleanup_owner = self
+            raise failure from exc
         else:
             with self._lock:
                 self._starting = False
@@ -137,17 +141,19 @@ class InferencePipelineManager:
             self._pipeline(pipeline_id).close()
             return
         with self._lock:
-            if self._closed and self._unreleased_pipelines is None:
+            if self._closed and not self._unreleased_pipelines:
                 return
             self._closed = True
             self._started = False
         errors = self._close_owned_pipelines()
         if errors:
-            raise PipelineManagerError(
+            failure = PipelineManagerError(
                 "pipeline manager shutdown encountered errors: " + "; ".join(str(error) for error in errors),
                 code="shutdown_failed",
                 details={"errors": tuple(str(error) for error in errors)},
             )
+            failure.close_pending = bool(self._unreleased_pipelines)
+            raise failure
 
     def _pipeline(self, pipeline_id: str) -> InferencePipeline:
         try:
@@ -170,16 +176,18 @@ class InferencePipelineManager:
 
     def _close_owned_pipelines(self) -> tuple[Exception, ...]:
         errors: list[Exception] = []
-        with self._cleanup_lock or nullcontext():
-            for pipeline in reversed(tuple(self._pipelines.values())):
-                if self._unreleased_pipelines is not None and pipeline.pipeline_id not in self._unreleased_pipelines:
-                    continue
-                try:
-                    pipeline.close()
-                except Exception as exc:
-                    errors.append(exc)
-                    if getattr(exc, "close_pending", False):
+        try:
+            with lifecycle_lock(self._cleanup_lock):
+                for pipeline in reversed(tuple(self._pipelines.values())):
+                    if pipeline.pipeline_id not in self._unreleased_pipelines:
                         continue
-                if self._unreleased_pipelines is not None:
+                    try:
+                        pipeline.close()
+                    except Exception as exc:
+                        errors.append(exc)
+                        if getattr(exc, "close_pending", False):
+                            continue
                     self._unreleased_pipelines.discard(pipeline.pipeline_id)
+        except Exception as exc:
+            errors.append(exc)
         return tuple(errors)

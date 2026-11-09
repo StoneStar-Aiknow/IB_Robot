@@ -1,12 +1,12 @@
 """SO-101 grasp providers satisfy the generic pick pipeline's provider contract.
 
-The contract tuples belong to the consumer (``manipulation_execution.providers``)
+The contract tuples belong to the consumer (``manipulation_execution.pick.providers``)
 and the providers to the robot suite (``so101_suite``). Neither package may
 depend on the other, so the conformance check lives here, in the composition
 root that already test-depends on both.
 """
 
-from manipulation_execution.providers import (
+from manipulation_execution.pick.providers import (
     GRASP_GEOMETRY_FUNCTIONS,
     WRIST_GUARD_FUNCTIONS,
     load_provider,

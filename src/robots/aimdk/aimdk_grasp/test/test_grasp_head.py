@@ -28,7 +28,7 @@ from aimdk_grasp_msgs.srv import (  # noqa: E402
     WatchGraspTarget,
 )
 
-from manipulation_execution.grasp_pipeline.contracts import (  # noqa: E402
+from manipulation_execution.pick.pipeline.contracts import (  # noqa: E402
     ArmSegment,
     Effect,
     EffectorAction,
@@ -68,7 +68,15 @@ class Camera:
         )
         state = SimpleNamespace(live=SimpleNamespace(observation=registered, feedback="current feedback"))
         return Observation(
-            np.zeros((H, W, 3), np.uint8), frame.depth, np.eye(3), "optical", self.stamp, "torso_link", np.eye(4), state
+            np.zeros((H, W, 3), np.uint8),
+            frame.depth,
+            np.eye(3),
+            "optical",
+            self.stamp,
+            "torso_link",
+            np.eye(4),
+            state,
+            report={"stamp_ns": self.stamp, "wait_s": 0.01},
         )
 
 
@@ -158,6 +166,28 @@ def head(monkeypatch):
         rclpy.shutdown()
 
 
+class HeldElsewhere:
+    """Hold ``lock`` on another thread (a planner), as long as the ``with`` block runs."""
+
+    def __init__(self, lock):
+        self.lock, self.taken, self.done = lock, threading.Event(), threading.Event()
+
+    def _hold(self):
+        with self.lock:
+            self.taken.set()
+            self.done.wait(10.0)
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self._hold, daemon=True)
+        self.thread.start()
+        assert self.taken.wait(5.0)
+        return self
+
+    def __exit__(self, *exc):
+        self.done.set()
+        self.thread.join(5.0)
+
+
 def call(handler, kind, **fields):
     return handler(kind.Request(**fields), kind.Response())
 
@@ -202,6 +232,38 @@ def test_a_scene_completes_with_its_mask_or_says_why_not(head):
     response = call(node._on_scene, CompleteGraspScene, capture_id=capture_id, target_mask=mask(), timeout_s=1.0)
     assert response.success and "scene_s" in wire.from_json(response.report_json)
     assert node._capture(capture_id).estimate == ("scene", 4)
+
+
+def test_the_scene_stages_wait_while_the_gpu_is_held(head):
+    """A planner capturing CUDA graphs holds the head's GPU; scene work on the GPU then must not run."""
+    node, gpu = head.node, head.parts.gpu
+    ready(node)
+    with gpu:  # this thread stands in for the planner
+        response = call(node._on_capture, CaptureGraspObservation, timeout_s=1.0)
+        prepared = node._capture(response.capture_id).prepared
+        assert response.success and not prepared.done()
+        scene = threading.Thread(
+            target=call,
+            args=(node._on_scene, CompleteGraspScene),
+            kwargs=dict(capture_id=response.capture_id, target_mask=mask(), timeout_s=5.0),
+            daemon=True,
+        )
+        scene.start()
+        scene.join(0.3)
+        assert scene.is_alive() and not prepared.done()
+    scene.join(5.0)
+    assert not scene.is_alive() and node._capture(response.capture_id).estimate == ("scene", 4)
+
+
+def test_a_scene_behind_a_long_plan_gives_up_at_its_deadline(head):
+    node, gpu = head.node, head.parts.gpu
+    ready(node)
+    capture_id = call(node._on_capture, CaptureGraspObservation, timeout_s=1.0).capture_id
+    node._capture(capture_id).prepared.result(5.0)
+    with HeldElsewhere(gpu):  # a plan on another thread
+        began = time.monotonic()
+        response = call(node._on_scene, CompleteGraspScene, capture_id=capture_id, target_mask=mask(), timeout_s=0.3)
+    assert (response.success, response.error_code) == (False, "SKILL_TIMEOUT") and time.monotonic() - began < 1.0
 
 
 def test_a_capture_reports_its_own_timings_and_an_error_is_answered_not_raised(head):

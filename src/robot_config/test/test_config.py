@@ -1165,6 +1165,39 @@ def test_validate_voice_tts_requires_explicit_deployment_and_valid_limits():
     assert "voice_tts.max_segments must be positive" in errors
 
 
+def test_voice_tts_playback_message_type_must_be_what_the_bound_speaker_subscribes_to():
+    """A playback stream of another type than the bound speaker takes is never heard."""
+
+    def errors_for(**playback):
+        config = RobotConfig(
+            name="test_robot",
+            type="so101",
+            robot_type="so_101",
+            ros2_control=Ros2ControlConfig(hardware_plugin="so101_hardware/SO101SystemHardware", params={}),
+        )
+        config.voice_tts = load_voice_tts_config(
+            {
+                "enabled": True,
+                "deployment": "ascend_310p",
+                "audio_output": {"interface": "audio.play", "type": "audio_common_msgs/msg/AudioDataStamped"},
+                **playback,
+            }
+        )
+        return [error for error in validate_config(config) if "voice_tts" in error]
+
+    assert errors_for(audio_message_type="audio_common_msgs/msg/AudioDataStamped", resample_to_playback_rate=True) == []
+    # Unset keeps the node's AudioData default for every speaker, as before the key existed.
+    assert errors_for() == []
+    assert any(
+        "must match voice_tts.audio_output.type" in error
+        for error in errors_for(audio_message_type="audio_common_msgs/msg/AudioData")
+    )
+    assert any(
+        "audio_message_type must be one of" in error for error in errors_for(audio_message_type="std_msgs/msg/String")
+    )
+    assert "voice_tts.resample_to_playback_rate must be a boolean" in errors_for(resample_to_playback_rate="yes")
+
+
 def test_validate_embodied_ignores_disabled_named_target_poses():
     """Disabled target-grasp config must not be required for the basic embodied pipeline."""
     config = RobotConfig(

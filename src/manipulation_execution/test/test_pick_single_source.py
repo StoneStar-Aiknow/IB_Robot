@@ -15,13 +15,13 @@ def test_legacy_supervised_script_does_not_exist():
 def test_supervised_pick_action_client_is_installed():
     package_dir = _REPOSITORY_ROOT / "src" / "manipulation_execution"
 
-    assert (package_dir / "manipulation_execution" / "pick_action_client.py").exists()
+    assert (package_dir / "manipulation_execution" / "pick" / "action_client.py").exists()
     setup_source = (package_dir / "setup.py").read_text(encoding="utf-8")
-    assert "pick_action_client = manipulation_execution.pick_action_client:main" in setup_source
+    assert "pick_action_client = manipulation_execution.pick.action_client:main" in setup_source
 
 
 def test_supervised_pick_action_client_uses_seconds_cli_names():
-    from manipulation_execution.pick_action_client import build_parser
+    from manipulation_execution.pick.action_client import build_parser
 
     args = build_parser().parse_args(
         [
@@ -43,7 +43,7 @@ def test_supervised_pick_action_client_uses_seconds_cli_names():
 
 
 def test_supervised_pick_task_id_is_unique_per_attempt():
-    from manipulation_execution.pick_action_client import resolve_supervised_task_id
+    from manipulation_execution.pick.action_client import resolve_supervised_task_id
 
     assert resolve_supervised_task_id("pick-banana-pc-001", unique_suffix="attempt-a") == (
         "pick-banana-pc-001-attempt-a"
@@ -52,7 +52,7 @@ def test_supervised_pick_task_id_is_unique_per_attempt():
 
 
 def test_supervised_pick_exact_task_id_is_explicit():
-    from manipulation_execution.pick_action_client import resolve_supervised_task_id
+    from manipulation_execution.pick.action_client import resolve_supervised_task_id
 
     assert resolve_supervised_task_id(" pick-banana-pc-001 ", exact=True) == "pick-banana-pc-001"
     with pytest.raises(RuntimeError, match="requires a non-empty --task-id"):
@@ -60,20 +60,20 @@ def test_supervised_pick_exact_task_id_is_explicit():
 
 
 def test_supervised_pick_timeout_leaves_root_budget_headroom():
-    from manipulation_execution.pick_action_client import resolve_supervised_timeouts
+    from manipulation_execution.pick.action_client import resolve_supervised_timeouts
 
     assert resolve_supervised_timeouts(230.0, 240.0) == (230.0, 240.0)
 
 
 def test_supervised_pick_timeout_rejects_full_root_budget():
-    from manipulation_execution.pick_action_client import resolve_supervised_timeouts
+    from manipulation_execution.pick.action_client import resolve_supervised_timeouts
 
     with pytest.raises(RuntimeError, match="less than the Gateway task budget"):
         resolve_supervised_timeouts(240.0, 240.0)
 
 
 def test_supervised_pick_retries_transient_readiness_query():
-    from manipulation_execution.pick_action_client import PickActionClient
+    from manipulation_execution.pick.action_client import PickActionClient
 
     response = object()
     wait_results = [RuntimeError("transient timeout"), response]

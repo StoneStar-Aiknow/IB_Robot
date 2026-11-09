@@ -62,7 +62,7 @@ class StatefulFullSubNetEnhancer:
         self._initialize_backend = bool(initialize_backend)
         self._lock = threading.RLock()
         self._closed = False  # 关闭一旦开始即禁新推理（process/reset 见此即拒绝）
-        self._cleanup_complete = False  # 清理已尝试完毕（含失败项），重入据此返回
+        self._cleanup_complete = False  # 本对象负责的清理已终结，无待重试项；仅关闭 host 不代表后端已释放
         self._timing_sample_counter = 0
         self.last_timing_ms: dict[str, float] = {}
         # periodic Hann 与当前 FullSubNet/历史 B4 验证保持一致。
@@ -126,14 +126,15 @@ class StatefulFullSubNetEnhancer:
         self._timing_sample_counter = 0
         self.last_timing_ms = {}
 
-    def reset(self) -> None:
+    def reset(self, *, reset_backend: bool = True) -> None:
         """Clear host state and reset recurrent backend state in place."""
 
         with self._lock:
             if self._closed:
                 return
             self._reset_host_state()
-            self._executor.reset()
+            if reset_backend:
+                self._executor.reset()
 
     def _stft_two_frames(self, audio4: np.ndarray) -> np.ndarray:
         """连续512样本生成两个512/256分析帧，返回[B,T=2,F]。"""
@@ -268,23 +269,20 @@ class StatefulFullSubNetEnhancer:
         return result
 
     def close(self, *, close_executor: bool = True) -> None:
-        """best-effort terminal 关闭：释放后端 executor 资源。
-
-        关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
-        属 best-effort terminal，非可重试。
-        """
+        """停止推理；保留后端明确要求重试的清理责任。"""
         with self._lock:
             if self._cleanup_complete:
-                # 清理已尝试完毕（含失败项），重入直接返回，避免重复释放已成功资源。
+                # 没有待重试资源，避免重复释放已成功资源。
                 return
             self._closed = True  # 禁新推理
             self._clear_host_state()
             try:
                 if close_executor:
                     self._executor.close()
-            finally:
-                # A host-only close leaves backend ownership to the assembly;
-                # the later backend-resource close must still be able to run.
+            except Exception as exc:
+                self._cleanup_complete = close_executor and not getattr(exc, "close_pending", False)
+                raise
+            else:
                 if close_executor:
                     self._cleanup_complete = True
 

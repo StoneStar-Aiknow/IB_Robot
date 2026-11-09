@@ -28,7 +28,7 @@ from test_observation import OPEN  # noqa: E402
 from tf2_ros import StaticTransformBroadcaster, TransformBroadcaster  # noqa: E402
 
 from ibrobot_msgs.msg import RuntimeStatus  # noqa: E402
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure  # noqa: E402
+from manipulation_execution.pick.pipeline.contracts import GraspFailure  # noqa: E402
 from robot_config.contract_utils import qos_profile_from_dict  # noqa: E402
 from robot_runtime.interface_description import build_description  # noqa: E402
 from robot_runtime.profile import load_profile  # noqa: E402
@@ -113,6 +113,32 @@ class FakeHead(Node):
             pub.publish(message)
 
 
+#: The head's GPU lock (head_parts shares one with the planner).
+GPU = threading.RLock()
+
+
+class HeldElsewhere:
+    """Hold ``lock`` on another thread (a planner), as long as the ``with`` block runs."""
+
+    def __init__(self, lock):
+        self.lock, self.taken, self.done = lock, threading.Event(), threading.Event()
+
+    def _hold(self):
+        with self.lock:
+            self.taken.set()
+            self.done.wait(10.0)
+
+    def __enter__(self):
+        self.thread = threading.Thread(target=self._hold, daemon=True)
+        self.thread.start()
+        assert self.taken.wait(5.0)
+        return self
+
+    def __exit__(self, *exc):
+        self.done.set()
+        self.thread.join(5.0)
+
+
 @pytest.fixture
 def head():
     owned = not rclpy.ok()
@@ -121,7 +147,7 @@ def head():
     open_hand = HandMapping(planning_model(), {"open": OPEN}).preset("open")
     fake = FakeHead(description()["interfaces"], open_hand)
     consumer = rclpy.create_node("head_camera_test")
-    camera = HeadCamera(consumer, description(), FeedbackHistory(), device="cpu")
+    camera = HeadCamera(consumer, description(), FeedbackHistory(), device="cpu", gpu_lock=GPU)
     executor = MultiThreadedExecutor(num_threads=4)
     for node in (fake, consumer):
         executor.add_node(node)
@@ -198,6 +224,38 @@ def test_the_current_feedback_is_taken_after_a_slow_registration(head, monkeypat
     assert current - observation.stamp_ns * 1e-9 >= 0.25
 
 
+def test_a_capture_registers_only_once_the_gpu_is_free(head):
+    """While the planner holds the GPU (cuRobo capturing CUDA graphs), registering would fail."""
+    _, camera = head
+    capture(camera)
+    taken = []
+    with GPU:  # this thread stands in for the planner
+        worker = threading.Thread(
+            target=lambda: taken.append(camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(0.3)
+        assert worker.is_alive() and not taken
+    worker.join(5.0)
+    assert taken and camera.calls[-1]["gpu_wait_s"] >= 0.25
+
+
+def test_a_capture_behind_a_long_plan_gives_up_at_its_deadline_or_on_cancel(head):
+    _, camera = head
+    capture(camera)
+    with HeldElsewhere(GPU):  # a plan that outlasts the capture
+        began = time.monotonic()
+        with pytest.raises(GraspFailure) as raised:
+            camera.capture(deadline=time.monotonic() + 0.3, cancelled=lambda: False)
+        assert raised.value.code == "OBSERVATION_UNAVAILABLE" and "GPU was busy" in str(raised.value)
+        assert time.monotonic() - began < 1.0
+        asked = time.monotonic() + 0.2
+        with pytest.raises(GraspFailure) as raised:
+            camera.capture(deadline=time.monotonic() + 30.0, cancelled=lambda: time.monotonic() > asked)
+        assert raised.value.code == "CANCELED"
+
+
 def test_without_tf_a_capture_reports_the_missing_transform(head):
     fake, camera = head
     capture(camera)
@@ -217,7 +275,7 @@ def test_a_stale_capture_is_taken_again_once_then_refused(head):
     with pytest.raises(GraspFailure, match="stale") as raised:
         camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
     assert raised.value.code == "OBSERVATION_UNAVAILABLE" and len(camera.calls) == calls + 2
-    assert camera.calls[-1]["recaptured"] and camera.calls[-1]["feedback_wait_s"] >= 0.09  # it waited first
+    assert camera.calls[-1]["feedback_wait_s"] >= 0.09  # it waited for fresh feedback before recapturing
 
 
 def test_a_feedback_sample_just_late_waits_for_the_next_one_instead_of_a_new_image(head):
@@ -227,9 +285,11 @@ def test_a_feedback_sample_just_late_waits_for_the_next_one_instead_of_a_new_ima
     calls = len(camera.calls)
     caught_up = time.monotonic() + 0.06  # the feedback stream lags, then catches up
     camera.clock = lambda: time.time() + (0.2 if time.monotonic() < caught_up else 0.0)
-    camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
-    assert len(camera.calls) == calls + 1 and not camera.calls[-1].get("recaptured")
-    assert camera.calls[-1]["feedback_wait_s"] >= 0.03
+    observation = camera.capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    assert len(camera.calls) == calls + 1 and observation.report["recaptured"] is False
+    assert observation.report["feedback_wait_s"] >= 0.03
+    report = observation.report  # the capture's own entry, with the whole capture's time
+    assert report["stamp_ns"] == observation.stamp_ns and report["capture_s"] >= report["total_s"]
 
 
 def test_a_cancel_stops_the_wait(head):

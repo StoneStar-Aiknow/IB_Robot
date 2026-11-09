@@ -2610,7 +2610,8 @@ def test_pipeline_rejects_priority_not_supported_by_single_priority_backend():
     assert result.error.recoverable is False
 
 
-def test_pipeline_post_inference_failure_is_completed_not_not_started():
+@pytest.mark.parametrize("failure_kind", ["publication", "late_deadline", "late_cancel", "unknown"])
+def test_pipeline_post_inference_failure_is_completed_not_not_started(failure_kind):
     class _Controller:
         @staticmethod
         def admit(*_args, **_kwargs):
@@ -2623,6 +2624,10 @@ def test_pipeline_post_inference_failure_is_completed_not_not_started():
         @staticmethod
         def is_stale_generation(_generation):
             return True
+
+        @staticmethod
+        def mark_failed_quarantine():
+            return None
 
         @staticmethod
         def release_in_flight(_work_class):
@@ -2651,6 +2656,62 @@ def test_pipeline_post_inference_failure_is_completed_not_not_started():
             total_latency_ms=2.0,
         ),
     )
+    if failure_kind != "publication":
+        from inference_service.backends import RuntimeContext
+        from inference_service.model_sessions import ModelSession
+        from inference_service.pipeline.runtime import InferencePipeline
+        from inference_service.unified_runtime import (
+            ExecutionContext,
+            ExecutionFailure,
+            ExecutionFailureFactory,
+            ModelRequest,
+            OutcomeEvidence,
+        )
+        from inference_service.unified_runtime.errors import DeadlineExceeded
+
+        class Session(ModelSession):
+            def __init__(self):
+                super().__init__("late-session", BackendCapabilities())
+
+            def _load(self, context, rollback):
+                pass
+
+            def _execute(self, request, context):
+                if failure_kind == "unknown":
+                    raise ExecutionFailureFactory().from_exception(
+                        DeadlineExceeded(), evidence=OutcomeEvidence.started("device", outcome_known=False)
+                    )
+                context.cancellation_token.cancel()
+                return {}
+
+            def _close(self):
+                pass
+
+        session = Session()
+        session.load(
+            RuntimeContext(
+                SimpleNamespace(
+                    deployment=SimpleNamespace(),
+                    manifest=SimpleNamespace(model=SimpleNamespace(inputs=(), outputs=())),
+                )
+            )
+        )
+
+        def infer(*_args):
+            try:
+                session.execute(ModelRequest(), ExecutionContext("late-session"))
+            except ExecutionFailure as failure:
+                if failure_kind == "late_deadline":
+                    failure = ExecutionFailureFactory().from_exception(
+                        DeadlineExceeded(),
+                        evidence=failure.evidence,
+                    )
+                # This is the production compatibility bridge read by the ROS node.
+                InferencePipeline._raise_execution_failure(failure)
+            finally:
+                session.close()
+
+        manager.infer = infer
     node = object.__new__(PipelinePolicyNode)
     node._session_controller = _Controller()
     node._boot_id = BOOT_ID
@@ -2677,8 +2738,10 @@ def test_pipeline_post_inference_failure_is_completed_not_not_started():
 
     result = PipelinePolicyNode._scheduled_dispatch_once(node, goal_handle)
 
-    assert goal_handle.aborted
-    assert result.outcome.value == InferenceOutcome.COMPLETED
+    assert goal_handle.aborted or goal_handle.canceled
+    assert result.outcome.value == (
+        InferenceOutcome.UNKNOWN if failure_kind == "unknown" else InferenceOutcome.COMPLETED
+    )
     assert result.error.recoverable is False
 
 

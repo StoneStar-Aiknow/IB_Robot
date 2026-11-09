@@ -19,6 +19,7 @@ from embodied_common.canon import (
     sha256_text,
     to_canonical_json,
 )
+from embodied_common.capability_presentation import presentation_errors
 
 # --------------------------------------------------------------------------- #
 # Canonical JSON and deep-freeze helpers                                       #
@@ -233,6 +234,9 @@ def derive_capability_view_from_registry(registry_preimage: Mapping[str, Any]) -
             ):
                 raise ValueError("registry skill capability fields are invalid")
             expected_fields.add("required_capabilities")
+        if presentation_errors(capability):
+            raise ValueError("registry skill capability fields are invalid")
+        expected_fields.update(field for field in ("display_name", "tags") if field in capability)
         if set(capability) != expected_fields:
             raise ValueError("registry skill capability fields are invalid")
         rebuilt = dict(capability)

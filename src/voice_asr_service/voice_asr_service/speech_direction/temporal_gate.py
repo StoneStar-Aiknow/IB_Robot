@@ -47,10 +47,13 @@ class TemporalSpeechGate:
         self._candidate_first_end: int | None = None
         self._non_gray_start: int | None = None
 
-    def reset(self) -> None:
+    def reset(self, *, reset_backend: bool = True) -> None:
         """重置门控和 Silero 隐藏状态；gap后不得跨不连续音频复用。"""
         self._reset_host_state()
-        self.silero.reset_state()
+        if reset_backend:
+            self.silero.reset_state()
+        else:
+            self.silero.reset_state(reset_backend=False)
 
     def close(self, *, close_silero: bool = True) -> None:
         """释放 Silero 后端资源；具体 ONNX/Ascend ACL 差异由引擎内部处理。"""

@@ -14,11 +14,11 @@ import cv2
 import numpy as np
 from sensor_msgs.msg import CompressedImage
 
-from manipulation_execution.compressed_image_decode import CompressedImageDecoder, byte_array
-from manipulation_execution.frame_decoder import AutoDecoder, DvppDecoder
+from manipulation_execution.hri.compressed_image_decode import CompressedImageDecoder, byte_array
+from manipulation_execution.hri.frame_decoder import AutoDecoder, DvppDecoder
 from observation_transport.video_codec import CodecLifecycleState, VideoFrame
 
-_DECODER_LOGGER = "manipulation_execution.compressed_image_decode"
+_DECODER_LOGGER = "manipulation_execution.hri.compressed_image_decode"
 
 
 def _encoded_message():

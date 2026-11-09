@@ -154,8 +154,13 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         try:
             self._runtime_handle.load(context)
         except Exception:
-            self._runtime_handle.close()
-            self._closed = True
+            try:
+                self._runtime_handle.close()
+            except Exception:
+                if not self._runtime_handle.closed:
+                    providers.retain_cleanup(self._runtime_handle)
+            else:
+                self._closed = True
             raise
 
     def _infer(self, request: ModelRequest):
@@ -234,8 +239,8 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
 
     def close(self) -> None:
         if not self._closed:
-            self._closed = True
             self._runtime_handle.close()
+            self._closed = True
 
 
 __all__ = ["ZipVoiceSynthesizePlugin"]

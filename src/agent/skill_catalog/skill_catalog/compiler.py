@@ -288,6 +288,10 @@ class SkillCatalogCompiler:
             }
             if "required_capabilities" in capability:
                 capability_view[skill_name]["required_capabilities"] = list(capability["required_capabilities"])
+            if "display_name" in capability:
+                capability_view[skill_name]["display_name"] = capability["display_name"]
+            if "tags" in capability:
+                capability_view[skill_name]["tags"] = list(capability["tags"])
             if manifest["schema_version"] == 2:
                 capability_view[skill_name]["schema_version"] = 2
             enabled_names.append(skill_name)

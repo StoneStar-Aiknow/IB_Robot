@@ -28,7 +28,7 @@ from aimdk_grasp.types import CameraIntrinsics, RGBDFrame
 from test_arm_stream import APPROACH, GRASP, START
 from test_observation import OPEN
 
-from manipulation_execution.grasp_pipeline.contracts import (
+from manipulation_execution.pick.pipeline.contracts import (
     Effect,
     EffectorAction,
     GraspFailure,

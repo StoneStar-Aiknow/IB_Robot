@@ -20,6 +20,237 @@ leases, buffers, and workers.
 
 ## Core Concepts
 
+### Backend completion and cleanup evidence
+
+`runtime_context_defaults` scopes the `priority_scheduling` and `managed_execution` defaults to one context.
+Explicit values take precedence; leaving the context restores the previous values and other threads do not inherit them.
+Pipeline and Manager factories inherit the scoped priority default when the argument is omitted; explicit False overrides it.
+Standalone `AscendOmModelSession` construction reads the same priority default.
+The existing monolithic policy node sets both defaults from `robot.runtime_scheduler.enable`:
+scheduled policy Sessions use managed completion, while disabled scheduling loads direct Sessions.
+Typed model services do not yet consume that switch; the policy interface does not install a perception scheduler.
+`TorchModelSession` and `LeRobotTorchModelSession` share `torch_execution_scope()`. Failures preserve the original
+exception and its execution, recovery and cleanup evidence. Synchronization supplements completion evidence for work
+that has started; explicit pre-execution rejection stays NOT_STARTED. Successful inference adds a
+completion wait only with `managed_execution=True`. Failure and close wait in both modes; LeRobot reset also waits
+before mutating policy state. A direct result discarded on delivery timeout or cancellation also waits for device
+completion; a failed wait retains an unknown outcome. The public Session API remains available.
+Raw cancellation or deadline exceptions inside a callable still require a device fence; their default flags are not
+native proof that work never started.
+CUDA and NPU Sessions resolve a concrete device index during load; execution and Close fence that device even if the
+calling thread later selects another current device.
+LeRobot preprocessing and postprocessing may also enqueue device work and use the same completion helpers.
+Processor completion does not imply that policy model state advanced. Request validation errors after
+preprocessing retain device evidence without recording a persistent policy failure.
+Managed processor success waits for completion; normal direct success adds no fence. If a later pipeline checkpoint
+discards a direct Session result, the failure boundary fences it before reporting completion. Multiple fences combine
+their evidence without erasing an unconfirmed operation. The frame tracks participating Sessions that still need a
+completion fence; it reuses error completion evidence and never waits on idle components.
+Managed CUDA/NPU success waits only for the current stream captured on callback entry. Callbacks must submit on that
+stream or join child streams back to it before returning; unjoined background work is unsupported. Failure, Close
+and fault recovery retain conservative device-wide waits. `force_completion_on_error` controls only exception handling;
+`complete_on_success` independently controls successful-return completion. SpeechDirection FullSubNet Torch
+also uses completion checks on execution failure and fences fault recovery/Close, retaining resources if completion fails.
+A device stuck in a sticky error never reports completion; after 2 consecutive failed close drains the
+executor abandons the wait, releases the references, and lets close terminate. The abandoned completion
+state is unknown and the abandonment is logged.
+Healthy FullSubNet reset reuses completion proved by its host output and does not wait for unrelated streams.
+After reset initializes state, only the CUDA stream submitting that initialization is synchronized.
+Execution errors retain secondary synchronization diagnostics. The Torch error boundary clears unwound inference
+locals. Both direct and policy failure diagnostics keep a snapshot without an exception chain or traceback, so rejected request and result
+payloads are not retained by the Handle.
+FullSubNet Torch registers rollback before device construction.
+It also pins the CUDA index at construction so models, state and completion fences use the same device.
+ACL reports secondary release failures through `details.cleanup_error`, preserving both errors across normalization
+and serialization. Failed D2H host-buffer release quarantines native pointers and clears unwound NumPy output frames.
+
+ACL, HMM and RKNN owners retain resources after failed cleanup. ACL retries unfinished resources;
+RKNN/HMM require explicit nonstart evidence before retrying an SDK release, as described under Close failures below.
+Once JPEG codec resources are released, Close retries only the remaining ACL lease cleanup without rebinding a
+destroyed context. HMM, Ascend, Hisilicon and ONNX pre-submission input errors report NOT_STARTED. ONNX reuses
+Session role-progress merging so a later rejection preserves earlier execution. RKNN output validation after a
+successful native inference retains COMPLETED evidence, including aggregation across multiple roles.
+ONNX validates binding dtype, rank and static dimensions before the native call using the existing tensor validator.
+Ascend input diagnostic capture is also inside the pre-submission input boundary.
+ACL synchronous and shared-stream output errors retain completion after successful execution or synchronization.
+Static dataset banks reuse ordinary ACL input preparation and host output reading. Rejected bank inputs
+report NOT_STARTED; output errors after completion still require recovery of advanced model state.
+HMM output extraction and conversion, and Ascend, Hisilicon and ONNX role output mapping also retain completion.
+Host output failures preserve state mutation and recovery requirements without retaining idle device admission.
+HMM, RKNN, ACL priority stream pool and speech ACL runner constructors accept an optional `cleanup.defer` owner. When supplied, that external
+rollback owns partial construction. Without it, constructors attempt Close and attach `cleanup_owner` to the original
+initialization error if cleanup remains pending. Constructor rollback errors use `rollback_errors` consistently.
+ASR import errors preserve their cause and cleanup owner. Both failed startup and normal shutdown retain cleanup
+ownership; normal shutdown also attempts executor and ROS cleanup. The ASR node retries failed construction cleanup,
+including Handle load failures and post-load sample-rate or VAD initialization errors. VAD owners retain their
+Handle and provider until release succeeds; partially initialized VAD runtimes remain owned by the node.
+The ASR constructor also transfers the node through `cleanup_owner` after ROS interface or timer initialization failure.
+Both the entry point and embedded callers can retry cleanup through that owner.
+Hisilicon Close retains a worker that has not exited and rejects subsequent start/execute calls.
+An execution-time worker exit preserves `worker_exited` and unknown-outcome evidence and requires runtime reload.
+Hisilicon request writes and response waits observe deadlines, cancellation and protocol Close. Writes use a
+nonblocking pipe and resume after short writes. Interrupted partial requests keep unknown outcomes, require reload,
+and make the byte stream unusable; the existing process owner retains cleanup responsibility. Interrupted responses
+and protocol errors also require reload. Response cancellation or timeout marks the protocol unusable before another
+request can be sent, including direct Session/protocol calls. Once I/O exits, Close can terminate and reap the worker.
+An unbounded Handle request still waits unless its caller cancels it.
+Video codec probing treats FFmpeg driver errors as an unavailable device.
+
+### Resource rollback and lifecycle budgets
+
+`LoadRollback` releases resources in reverse order and retains a failing callback and its dependencies for retry.
+`ModelSession` and the Factory share this rollback mechanism. Factory errors expose a retryable `cleanup_owner`.
+`RuntimeProviders.retain_cleanup()` retains failed Factory and plugin construction owners until shutdown retries them.
+Perception and ZipVoice plugins first close a failed Handle and retain it only when cleanup is unfinished.
+ZipVoice marks itself closed only after Handle Close succeeds and keeps the original load error when rollback fails. Manager startup failures expose
+their cleanup owner. Pipeline and Model Service nodes transfer pending shutdown to providers before dropping ownership.
+If ROS entity construction fails after a model loads, the constructor runs the same node cleanup path.
+Provider shutdown failures preserve close_pending=True and the original cause chain.
+Service exit, including SpeechDirection, attempts provider cleanup and ROS shutdown even when node destruction or
+provider cleanup fails.
+SpeechDirection timer construction failure closes its already started runtime and transfers pending cleanup to
+providers. The entry point also covers node and dependency construction failures.
+These owners close before the admission provider and ACL provider. `process_resources` supplies the shared resource
+list for process cleanup and Handle ownership filtering.
+`InferencePipelineManager` retries unfinished cleanup in direct and priority modes alike.
+Cleanup retry is unconditional; the manager has no retry toggle.
+`lifecycle_budget` shares one deadline across nested cleanup; `lifecycle_scope` propagates a control call's deadline
+and cancellation token. SpeechDirection thread joins poll this shared budget and cancellation token.
+The inherited deadline covers startup checks, control-lock waits, ACL completion waits and Hisilicon process waits.
+Control-lock and quiescence waits observe the control call's cancellation token.
+Hisilicon EOF, terminate, kill and stderr-thread waits poll cancellation in slices of at most 50 ms,
+retaining worker ownership for a later Close retry when interrupted.
+Nested control calls without an explicit context inherit the parent token and use the stricter deadline.
+Rollback, provider and ACL ownership lock waits use the same budget. HMM and RKNN check startup before later native
+initialization.
+ACL cleanup checks the remaining budget between individual release calls and retains unfinished resources for retry.
+An already running SDK call without cancellation support must finish; the budget does not forcibly interrupt it.
+Handle checks startup before loading, before each resource load and before publishing READY.
+Derived runtime contexts preserve `managed_execution`. Multi-role requests and pipeline stages pass through existing
+metadata. `StageTicket` is an optional identity utility; production scheduling does not create or consume it automatically.
+
+### Handle execution policies and streams
+
+`bind_execution_policy` installs one immutable `RuntimeExecutionPolicy` and returns a local dispatch authority.
+Native Sessions must load with `managed_execution=True`. Binding a direct-loaded Session is rejected;
+binding before load requires the same managed context at load time.
+Public execute, stream, reset and close operations use that policy without falling back to direct execution after
+failure. Policies can also support frame submission. `StageTicket` is an immutable handoff identity
+with no scheduler dependency.
+The base policy requires boolean `ready` plus `execute/reset/close/cancel`; it owns cancellation of queued requests
+that have not entered local execution. Streaming policies also require
+`open_stream/step/reset_stream/close_stream`. Binding validates the required interface and requires an idle Handle.
+Stream runtime assembly also requires those four methods; missing control methods cannot count as successful cleanup.
+A context provider must preserve the caller's request ID and cancellation token and may only shorten its deadline.
+The authority also remains accepted by the compatible execute/step `_dispatch_key` argument.
+Stages use the existing `StagedModelExecutor`; Handle does not maintain a second stage control interface.
+Policy exceptions and returned frame Futures share failure normalization at completion.
+`drain_managed` validates dispatch authority,
+revokes admission, holds the control lock and propagates the lifecycle budget. Drain does not reopen readiness.
+Drain also acquires existing stream control locks so it cannot overlap stream reset or close.
+Every declared native Session and additional executable component must support drain; otherwise drain rejects
+the composition before returning any capacity. Without declared Sessions, the executor itself must support drain.
+Drain expands nested Factory assemblies, handles self links and deduplicates native Sessions by identity.
+Orchestration wrappers are not required to prove device completion.
+Exclusive stream reset uses the runtime control lock as well; drain revokes admission again after taking that lock
+in case an earlier reset reopened readiness while drain was waiting.
+
+Handles without a bound policy continue to use direct execution. `ready` includes policy
+availability, while `local_ready` reports backend state. Deadlines and cancellation apply to local and control
+operations. Ordinary requests, frames and stream steps share active request identities and cancellation registration;
+policies and frame-capable executors require unique active IDs. Unbound synchronous direct execution continues to allow
+duplicate IDs; cancel signals every matching active context, and completion removes only that execution's registration.
+Cancellation callbacks run synchronously outside the Handle condition lock and must return promptly. They may signal
+another owner but must not wait for execution completion or subsequent cancellation hooks. Arbitrary blocking Python
+callbacks are unsupported and cannot be interrupted by the cancellation budget. Cancellation signals local tokens, notifies the policy,
+then invokes the executor hook. A notification
+exception does not suppress the other hook. Executor signature compatibility is checked before calling, so an
+internal TypeError does not cause a duplicate call. Stream steps share instance and resource-domain
+admission and respect the Handle execution limit. Known unstarted admission rejections do not count as model failures
+at either request or stream entry points. Unknown native work retains its instance and shared-domain slots
+until successful recovery, explicit drain, or Close, so another Handle cannot reuse unconfirmed capacity.
+Request and stream failures use the same evidence conversion before leaving native admission; a raw control
+exception after submission cannot prove completion. A successful per-stream Close must drain that bank before its
+slots are returned. Runtime-exclusive logical Close and single-stream recovery cannot release runtime-fault slots.
+`reset_stream()` rejects runtime recovery requirements; `reset()` must restore the runtime before admission reopens.
+Voice ASR's VAD reset uses runtime reset and clears its host audio context only after recovery succeeds.
+Host stream cleanup within runtime reset keeps capacity retained until all native Session resets succeed.
+Without an independent native reset, an active stream uses its full reset_stream barrier.
+If an exclusive stream is already closed and no native reset is available, recovery returns
+reset_unsupported and retains the capacity. The caller must close and rebuild the runtime.
+Unknown work in an exclusive bank retains runtime recovery even when stream Close is already pending.
+Queued local requests check existing Handle/stream control state while waiting for instance or domain capacity,
+so Close/reset can drain their own waiters without depending on those waiters acquiring retained slots.
+Direct admission waits observe cancellation and check again after grant. Frame admission errors synchronously raise
+`ExecutionFailure`; admitted frames deliver through a Future. Policy delivery rechecks deadline and cancellation for
+execute, frame, step and open_stream. Completed Sessions and frames keep COMPLETED evidence on delivery
+timeout/cancellation. These work entry points also reject expired or cancelled contexts before policy dispatch with
+NOT_STARTED evidence; control entry points retain irreversible Close semantics. The Pipeline preserves legacy
+exception types and carries normalized evidence to ROS.
+Known execution with pending
+cleanup also revokes admission. State-bank isolation sets the default recovery scope, but explicit runtime reset
+or reload requirements remain runtime-wide, even during stream Close. Outcome certainty stays unchanged.
+Failed delivery after a stateful step advances its bank requires recovery even with known completion. Completion
+releases native capacity but does not prove that the caller advanced its matching host state.
+Request failures also enforce explicit recovery for known outcomes and never downgrade RELOAD to reset.
+The delivered exception, last failure snapshot and Handle state share the final recovery decision.
+After reset completes, recovery finalization precedes the delivery deadline/cancellation check. A late control failure
+keeps COMPLETED evidence and does not quarantine the recovered runtime again.
+Stream-scoped CLOSE_STREAM and RELOAD block further steps and cannot be replaced by reset_stream. For unknown
+runtime-exclusive work, these requirements escalate to runtime RELOAD. Explicit RELOAD after reset failure also
+prevents another reset, regardless of the reset-retry configuration.
+Failures observed while reset waits update the recovery state; a drain timeout cannot restore stale READY.
+Stream reset rechecks stream state and recovery after waiting under the condition lock and preserves new CLOSE_STREAM
+or RELOAD requirements. Local stream reset/close errors use the same recovery path as step, including runtime-wide
+admission revocation. Full reset/close/drain_managed reentry from synchronous execute/step is rejected before waiting or changing state.
+Opening threads participate in the same runtime control reentry check. Same-stream reset/close reentry is
+rejected at the public boundary before policy dispatch or closing intent, leaving the stream usable.
+Stateless executor errors without completion proof remain unknown, just like errors from the dispatch policy.
+The Handle does not cache raised Close exceptions, so a successful retry does not retain their call stacks.
+RKNN empty-output checks and array conversion preserve completed native execution. Public Session validation
+does the same; direct Torch validation failures reuse the existing device completion fence.
+Hisilicon cancellation or expiry before the protocol lock or the first request byte reports NOT_STARTED and
+leaves the worker usable. Read/write polling supports pipe descriptors numbered 1024 or higher.
+Role entry cancellation reports NOT_STARTED; the common Ascend role boundary preserves completed predecessor
+evidence for both generic and host-orchestrated Sessions. Input size errors identify the role, input index, actual
+bytes and expected bytes.
+Sequential and staged executors accumulate frame evidence across roles and loop iterations. Visual snapshots do not
+carry old-frame evidence into a new Action request. RequestDirectExecutor also preserves predecessor execution and
+state mutations. Input validation before native submission reports NOT_STARTED. Synchronous frame submission failures
+use native start evidence even before a Future exists, and open_stream preserves native rejection evidence.
+Policy sync and Future failures use
+the same control-error conversion; only an explicit native entry check proves non-start.
+An interrupted SpeechDirection hop explicitly requires reset even when its device work is known complete.
+An explicit native RELOAD requirement and its availability survive the stream adapter.
+A later role's NOT_STARTED evidence cannot erase Host or predecessor progress. The implicit reset on open_stream
+inherits the opening request's lifecycle context.
+SpeechDirection reset uses runtime recovery while preserving the stream ID. The production stream layer clears Host
+state while Handle resets each owned native Session once. Public reset_stream has no internal control-lock bypass;
+stream-only reset still clears the complete stream state. Its exclusive composition supports one
+shared device domain; mixed Torch FullSubNet and Ascend VAD still acquire the Ascend lease. Multiple domains or
+conflicting limits are rejected at construction.
+The shared-domain slot covers the whole audio hop, including Host and other-backend work. This safety boundary also
+applies with runtime scheduling disabled; it is not per-role scheduling or a latency guarantee.
+The Handle rejects later inputs until recovery. Stream reset records its intent before waiting for an active step.
+Close never reopens admission and retains unfinished cleanup for retry.
+Handle owns the whole assembly, including constructed components whose load was not reached. Policy close still
+requires completion after local close finishes. Local and policy frame delivery share the same reentry guard.
+Handle rejects reset/close from inline frame-result callbacks before
+draining; an external owner performs those operations. Direct staged-executor Close from its worker still returns
+pending. Worker joins obey the inherited lifecycle deadline and successful Close clears the final visual snapshot.
+An ACL completion callback cannot wait
+for queued tasks on its own worker. Normal D2H buffers remain local; only failed frees transfer to quarantine.
+Stream close records irreversible intent before waiting or policy dispatch; reset cannot reopen that stream. Late open
+results and open/Close races retain native cleanup ownership. Stream calls validate their owning
+handle; successful Close releases native state and retains at most 128 closed records. Unconfirmed stream cleanup
+keeps its resource ownership independently of that history limit.
+SpeechDirection also bounds its native closed history to 128 entries while old owned closed objects remain idempotent.
+SpeechDirection stop, compatibility wrappers and node shutdown preserve pending cleanup ownership.
+Node shutdown also closes a Handle created before Runtime construction failed. A later pending cleanup cannot be
+hidden by an earlier worker-wait error; final worker and Handle state determine whether cleanup needs retry.
+SigLIP2, SAM2 automatic and GraspGen carry request priorities through each role to the actual OM execution stream.
+SAM2 checks cancellation and deadlines before constructing decoder inputs and before final postprocessing.
+
 ### Policy Bundle
 
 Every deployable policy directory contains the LeRobot semantic files and exactly one
@@ -209,12 +440,19 @@ monotonic anchor, including producer queueing and execution time. Dispatch refre
 direct runtime calls without capture metadata age from initial admission. A refresh that is still stale fails instead
 of repeatedly recomputing the same expired observation.
 
-Four lifecycle fixes apply only when scheduling is enabled: repeated manager Close retries retained `close_pending` pipelines;
-reset skips explicitly stateless, non-resettable non-executor components; stateful policy late/completed failures or
-failures after execution started make subsequent `infer()` calls report not-ready until a successful reset; and reset support discovered
-during LeRobot Torch session loading enables actual `policy.reset()`. With the scheduler disabled or absent,
-the legacy topology, synchronous execution and lifecycle semantics are preserved. Tests cover launch parameters,
-late results, reset and Close behavior.
+Two lifecycle behaviors apply only when scheduling is enabled: reset skips explicitly stateless,
+non-resettable non-executor components; stateful policy late/completed failures or
+failures after execution started make subsequent `infer()` calls report not-ready until a successful reset.
+Reset support discovered during LeRobot Torch session loading always enables actual `policy.reset()`, regardless
+of whether scheduling is enabled, disabled or absent. Reset is therefore no longer a harmless no-op: a drain or
+`policy.reset()` error records a failure on the Handle. Handles with `retry_failed_reset` enabled enter
+RESET_REQUIRED and may retry reset; other handles enter FAILED and require RELOAD. The reset service then
+returns `success=false` and later requests are rejected with `recovery_required`; reset callers must handle
+the failed return. With the scheduler disabled or absent,
+the legacy topology and synchronous execution remain. Cleanup retries are independent of scheduling: manager Close
+retries retained `close_pending` pipelines in both modes. Torch failure, reset and close confirm device completion;
+successful direct inference adds no synchronization. Handle cancellation and irreversible
+stream Close also apply to direct execution. Tests cover launch parameters, late results, reset and Close behavior.
 
 Priority `0` is highest. Its resource ordering and fallback depend on the scheduler policy:
 
@@ -704,3 +942,20 @@ python scripts/check_inference_legacy_identifiers.py
 
 Run Ruff only on Python files changed by the current work. Always source `.shrc_local` before project or ROS
 commands.
+
+### Close failures and recovery limits
+
+The Handle retains a stream and its capacity when Close fails. `retry_pending_stream_closes()` retries those
+operations; runtime reset and ASR reopening also retry pending stream closure. Releasing quarantined capacity
+requires native recovery proof, not an empty reset.
+
+RKNN/HMM retain ownership and report `close_pending` after an SDK release exception without completion evidence.
+Later Close calls do not invoke the same native release again or claim successful cleanup; a process restart is
+required. Only explicit `NOT_STARTED` evidence permits retrying native release. Successful Close remains idempotent.
+
+String stream IDs have idempotent Close receipts for the most recent 128 closures. Evicted IDs return
+`stream_not_found`; an original closed `StreamHandle` remains idempotent. SpeechDirection has the same string-ID limit.
+
+Direct stateless synchronous errors retain known completion unless native evidence says otherwise. LeRobot CUDA/NPU
+execution pins the resolved device at load; resource domains remain conservative device-family groups such as
+`torch:npu`, not per-device identifiers.

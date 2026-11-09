@@ -13,12 +13,6 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
-from rclpy.qos import (
-    DurabilityPolicy,
-    HistoryPolicy,
-    QoSProfile,
-    ReliabilityPolicy,
-)
 
 # Bridge to tensormsg for global registry
 import tensormsg.registry as tensormsg_registry
@@ -30,6 +24,7 @@ from robot_config.observation_transport import (
     require_valid_observation_transports,
     resolve_observation_transport,
 )
+from robot_config.qos_profiles import qos_profile_from_dict  # noqa: F401  (re-exported for callers)
 
 # ---------- Contract datamodel ----------
 
@@ -575,21 +570,8 @@ def encode_value(
 
 
 # ---------- QoS utilities ----------
-
-
-def qos_profile_from_dict(d: dict[str, Any] | None) -> QoSProfile | None:
-    if not d:
-        return None
-    rel = str(d.get("reliability", "reliable")).lower()
-    hist = str(d.get("history", "keep_last")).lower()
-    dur = str(d.get("durability", "volatile")).lower()
-    depth = int(d.get("depth", 10))
-    return QoSProfile(
-        reliability=(ReliabilityPolicy.BEST_EFFORT if rel == "best_effort" else ReliabilityPolicy.RELIABLE),
-        history=(HistoryPolicy.KEEP_ALL if hist == "keep_all" else HistoryPolicy.KEEP_LAST),
-        depth=depth,
-        durability=(DurabilityPolicy.TRANSIENT_LOCAL if dur == "transient_local" else DurabilityPolicy.VOLATILE),
-    )
+# qos_profile_from_dict is imported at the top: it lives in robot_config.qos_profiles so a node
+# bound to one endpoint can apply that interface's QoS without this module's tensormsg/torch chain.
 
 
 # ---------- Data processing utilities ----------

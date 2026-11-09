@@ -47,6 +47,8 @@
   <!-- the ROS feedback test runs the X2 runtime against its vendor mock -->
   <test_depend>aimdk_robot</test_depend>
   <test_depend>aimdk_dataplane</test_depend>
+  <!-- the feedback and lazy-TF tests build on-demand subscriptions themselves -->
+  <test_depend>robot_runtime</test_depend>
   <!-- the head camera test publishes the camera, joint views and TF itself -->
   <test_depend>geometry_msgs</test_depend>
   <test_depend>std_msgs</test_depend>

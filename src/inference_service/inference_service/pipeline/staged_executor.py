@@ -16,12 +16,14 @@ from types import MappingProxyType
 import numpy as np
 
 from ibrobot_tracing import get_trace_emitter
+from inference_service.backends.errors import BackendAdmissionError, BackendLifecycleError
 from inference_service.backends.types import BackendHealth, RuntimeContext
 from inference_service.pipeline.executor import ComponentModelExecutor
 from inference_service.pipeline.runtime_core import ExecutionControl, StageFrame
 from inference_service.pipeline.stages import InferenceStage, IterativeStage, ModelStage, ResultAdapter
 from inference_service.scheduler.operations import OperationIdentity, OperationKind, OperationRegistry
-from inference_service.unified_runtime import ExecutionContext, ModelRequest
+from inference_service.unified_runtime import ExecutionContext, ModelRequest, OutcomeEvidence
+from inference_service.unified_runtime.lifecycle import POLL_INTERVAL_SECONDS, check_lifecycle, lifecycle_remaining
 
 trace = get_trace_emitter("ib_trace.policy.staged", component_id="policy.staged")
 
@@ -132,19 +134,23 @@ class StagedModelExecutor(ComponentModelExecutor):
         self, request: object, *, context: ExecutionContext | None = None, deadline: datetime | None = None
     ) -> Future:
         context = context or ExecutionContext(self._request_id(request), deadline)
-        context.check("frame_admission")
-        # ROS timestamps are converted by the node, which owns that clock.
-        # Direct callers without capture metadata age from initial admission.
-        request = self._stamp_observation(request)
+        try:
+            context.check("frame_admission")
+            # ROS timestamps are converted by the node, which owns that clock.
+            # Direct callers without capture metadata age from initial admission.
+            request = self._stamp_observation(request)
+        except Exception as exc:
+            exc.evidence = OutcomeEvidence.not_started("frame_admission")
+            raise
         caller_future: Future = Future()
         caller_future.set_running_or_notify_cancel()
         pending = None
         submit_error = None
         with self._snapshot_condition:
             if self._closed:
-                raise RuntimeError("staged executor is closed")
+                raise BackendAdmissionError("staged executor is closed")
             if self._resetting:
-                raise RuntimeError("staged executor is resetting")
+                raise BackendAdmissionError("staged executor is resetting")
             generation = self._generation
             if self._visual_active:
                 pending = self._visual_pending
@@ -292,11 +298,7 @@ class StagedModelExecutor(ComponentModelExecutor):
                 self._snapshot_condition.notify_all()
                 return self._snapshot_version
         except Exception as exc:
-            if self._error_handler is not None:
-                self._error_handler(
-                    exc,
-                    bool(frame.values.get("_backend_started", False)) or bool(getattr(exc, "operation_started", False)),
-                )
+            self._record_frame_failure(frame, exc)
             raise
         finally:
             frame.close()
@@ -337,11 +339,7 @@ class StagedModelExecutor(ComponentModelExecutor):
                 stage.execute(frame, deadline=deadline)
             return self._result_adapter.adapt(frame)
         except Exception as exc:
-            if self._error_handler is not None:
-                self._error_handler(
-                    exc,
-                    bool(frame.values.get("_backend_started", False)) or bool(getattr(exc, "operation_started", False)),
-                )
+            self._record_frame_failure(frame, exc)
             raise
         finally:
             frame.close()
@@ -488,16 +486,29 @@ class StagedModelExecutor(ComponentModelExecutor):
 
     def close(self) -> None:
         with self._snapshot_condition:
-            if self._closed:
-                return
             self._closed = True
             pending = self._visual_pending
             self._visual_pending = None
             self._snapshot_condition.notify_all()
         if pending is not None:
             self._supersede_visual_future(pending[3])
-        self._visual_worker.shutdown(wait=True, cancel_futures=False)
-        self._action_worker.shutdown(wait=True, cancel_futures=False)
+        workers = (self._visual_worker, self._action_worker)
+        for worker in workers:
+            worker.shutdown(wait=False, cancel_futures=False)
+        # ThreadPoolExecutor has no timed shutdown. Reuse its retained threads
+        # to bound joins, including callbacks that run on a worker at delivery.
+        try:
+            for worker in workers:
+                for thread in tuple(worker._threads):
+                    if thread is threading.current_thread():
+                        raise RuntimeError("staged close must be retried outside its worker callback")
+                    while thread.is_alive():
+                        check_lifecycle()
+                        thread.join(timeout=lifecycle_remaining(POLL_INTERVAL_SECONDS))
+        except Exception as exc:
+            raise BackendLifecycleError(str(exc), code="close_pending", close_pending=True) from exc
+        with self._snapshot_condition:
+            self._snapshot = None
 
     def _partition_stages(self) -> int:
         triggered = [

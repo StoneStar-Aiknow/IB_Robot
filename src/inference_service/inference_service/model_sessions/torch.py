@@ -9,10 +9,22 @@ from contextlib import nullcontext, suppress
 from typing import Any
 
 from inference_manifest import TorchRuntimeProfile
-from inference_service.backends.errors import BackendError, BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import (
+    BackendError,
+    BackendInferenceError,
+    BackendLifecycleError,
+    BackendLoadError,
+)
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.model_sessions.base import ModelSession
+from inference_service.model_sessions.torch_completion import (
+    drain_torch_device_before_release,
+    resolve_torch_device,
+    torch_execution_scope,
+)
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime.errors import CancellationRequested, DeadlineExceeded
+from inference_service.unified_runtime.lifecycle import check_lifecycle
 
 
 class TorchModelSession(ModelSession):
@@ -45,6 +57,7 @@ class TorchModelSession(ModelSession):
         self._device: Any | None = None
         self._device_name: str | None = None
         self._module: object | None = None
+        self._release_drain_failures = 0
 
     @property
     def runtime_version(self) -> str:
@@ -87,20 +100,26 @@ class TorchModelSession(ModelSession):
             if not callable(is_available) or not is_available():
                 raise BackendLoadError(f"Torch {device_name} device is unavailable", code="device_unavailable")
         try:
-            device = torch_module.device(device_name)
-            module = self._module_loader(context)
+            device = resolve_torch_device(torch_module, device_name)
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise BackendLoadError(
+                f"unable to resolve Torch device {device_name!r}: {exc}", code="device_unavailable"
+            ) from exc
+        self._torch = torch_module
+        self._device = device
+        self._device_name = device_name
+        # Register the device drain before construction can enqueue native work.
+        rollback.defer(self._release)
+        try:
+            self._module = module = self._module_loader(context)
         except BackendError:
             raise
         except Exception as exc:
             raise BackendLoadError(f"unable to load callable Torch module: {exc}") from exc
         if not callable(module):
             raise BackendLoadError("Torch module loader did not return a callable", code="invalid_model")
-
-        self._torch = torch_module
-        self._device = device
-        self._device_name = device_name
-        self._module = module
-        rollback.defer(self._release)
         move = getattr(module, "to", None)
         if callable(move):
             moved = move(device)
@@ -114,6 +133,43 @@ class TorchModelSession(ModelSession):
                 self._module = evaluated
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
+        with torch_execution_scope(
+            self._torch,
+            self._device_name,
+            self._device,
+            complete_on_success=self._require_context().managed_execution,
+            stateful=self.capabilities.stateful,
+        ):
+            return self._execute_torch(request, context)
+
+    def complete_failure(self, error: Exception) -> None:
+        """Confirm direct device work when the enclosing pipeline discards a result."""
+        if not self._require_context().managed_execution:
+            from .torch_completion import complete_torch_failure
+
+            complete_torch_failure(
+                error,
+                self._torch,
+                self._device_name,
+                self._device,
+                discarded_result=True,
+                stateful=self.capabilities.stateful,
+            )
+
+    def _check_completed_context(self, context: ExecutionContext, phase: str) -> None:
+        from .torch_completion import check_torch_completed_context
+
+        check_torch_completed_context(
+            context,
+            phase,
+            self._torch,
+            self._device_name,
+            self._device,
+            managed=self._require_context().managed_execution,
+            stateful=self.capabilities.stateful,
+        )
+
+    def _execute_torch(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
         del context
         module = self._module
         torch_module = self._torch
@@ -140,6 +196,29 @@ class TorchModelSession(ModelSession):
     def _release(self) -> None:
         torch_module = self._torch
         device_name = self._device_name
+        if torch_module is not None:
+            # A failed device drain keeps completion unknown, so the references
+            # are retained for a retry. A device stuck in a sticky error state
+            # never completes; after bounded drain failures the release abandons
+            # the wait, drops the references, and lets close terminate. Drain
+            # failures during the load's own rollback path do not count: the
+            # load error handling retries the release before any public close,
+            # and those attempts must not consume the bound.
+            try:
+                check_lifecycle()
+                drain_torch_device_before_release(
+                    torch_module,
+                    device_name,
+                    self._device,
+                    failed_attempts=self._release_drain_failures,
+                    owner="Torch model session release",
+                )
+            except BackendLifecycleError:
+                if not self._loading:
+                    self._release_drain_failures += 1
+                raise
+            except (DeadlineExceeded, CancellationRequested) as exc:
+                raise BackendLifecycleError(str(exc), close_pending=True) from exc
         self._module = None
         self._device = None
         self._device_name = None

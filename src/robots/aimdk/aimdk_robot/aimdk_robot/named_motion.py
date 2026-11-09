@@ -344,6 +344,10 @@ class NamedMotionServer:
             raise CommandRejected("INVALID_TARGET", f"unknown target {area_name!r}")
         area = int(area_name) if str(area_name).isdigit() else CONTROL_AREAS[area_name]
         area = int(entry.get("area", area))
+        if target and "area" in entry and CONTROL_AREAS.get(target, target) not in (area, str(area)):
+            raise CommandRejected("INVALID_TARGET", f"{name} requires area {area}")
+        if "targets" in entry and area not in {CONTROL_AREAS[t] for t in entry["targets"]}:
+            raise CommandRejected("INVALID_TARGET", f"{name} does not support area {area}")
         # The platform executes preset motions only from stable stand. Checking
         # its own reported action turns "accepted, nothing happened" into a
         # refusal that names the reason.

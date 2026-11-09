@@ -270,3 +270,7 @@ LeRobot patch stack 的生效路径大致如下：
 - `scripts/setup/lerobot_patches.sh`
 - `scripts/setup/lerobot_resolve_active.py`
 - `scripts/setup/lerobot_filter_series.py`
+
+## RT-Infer
+
+`vendor/rt-infer/2026.11.04` provides paired scheduler/runtime binaries, driver modules and deployment utilities. See [deployment](../docs/rt_infer_deployment.md). Core implementation source is not included.

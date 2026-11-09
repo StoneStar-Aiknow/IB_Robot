@@ -21,6 +21,13 @@ from .robot_model import collision_robot_config, planning_model
 from .scene_estimation import LazyScene, SceneEstimate
 from .trajectory import TimedTrajectory
 
+#: How far a locked joint (right arm, head, left hand) may be from the snapshot
+#: the planner was built on before the snapshot has to be rebuilt. The rebuild
+#: is the service's most expensive operation (47.6-49.9 s on the Orin) and no
+#: request deadline can preempt it, so `planner_service` names which group
+#: crossed this when it happens.
+LOCKED_JOINT_ATOL = 0.025
+
 
 @dataclass(frozen=True)
 class GraspPlan:
@@ -770,9 +777,9 @@ class LeftArmPlanner:
 
     def locked_joints_match(self, feedback):
         return bool(
-            np.allclose(feedback.vector(RIGHT_ARM), self.right, atol=0.025, rtol=0)
-            and np.allclose(feedback.vector(HEAD), self.head, atol=0.025, rtol=0)
-            and np.allclose(self.hand_mapping.check(feedback.left_hand), self.hand, atol=0.025, rtol=0)
+            np.allclose(feedback.vector(RIGHT_ARM), self.right, atol=LOCKED_JOINT_ATOL, rtol=0)
+            and np.allclose(feedback.vector(HEAD), self.head, atol=LOCKED_JOINT_ATOL, rtol=0)
+            and np.allclose(self.hand_mapping.check(feedback.left_hand), self.hand, atol=LOCKED_JOINT_ATOL, rtol=0)
         )
 
     def _bound_mesh_query(self, model):

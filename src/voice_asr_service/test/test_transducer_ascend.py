@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from voice_asr_service.transducer_ascend import OnlineFbank
+from inference_service.unified_runtime import ExecutionContext, ExecutionFailure, ModelRequest
+from voice_asr_service.transducer_ascend import AscendTransducerRuntime, OnlineFbank
 
 
 def test_online_fbank_is_chunking_invariant_and_matches_kaldi_frame_count():
@@ -27,10 +29,53 @@ def test_reset_keeps_a_runtime_only_module_ready():
     from voice_asr_service.asr_inference_module import ASRInferenceModule, ASRState
 
     module = ASRInferenceModule()
-    # A healthy handle: reset() only asks whether the runtime needs recovery.
-    module._runtime_handle = SimpleNamespace(reset_required=False)
+    # A healthy handle has no pending stream cleanup or runtime recovery.
+    module._runtime_handle = SimpleNamespace(reset_required=False, retry_pending_stream_closes=lambda _: None)
     module.state = ASRState.READY
 
     module.reset()
 
     assert module.state is ASRState.READY and module.is_ready
+
+
+@pytest.mark.parametrize("reset_fails", [False, True])
+def test_closed_ascend_stream_recovers_only_after_encoder_reset(reset_fails):
+    from inference_service.backends.errors import BackendInferenceError
+    from voice_asr_service.asr_inference_module import ASRInferenceModule
+
+    calls = []
+
+    def reset():
+        calls.append("encoder-reset")
+        if reset_fails:
+            raise RuntimeError("encoder reset failed")
+
+    def unknown(*_):
+        raise BackendInferenceError("encoder outcome unknown", operation_started=True, outcome_known=False)
+
+    runtime = object.__new__(AscendTransducerRuntime)
+    runtime._encoder = SimpleNamespace(reset=reset, close=lambda: None)
+    runtime.open_stream = lambda _: object()
+    runtime.step = unknown
+    module = ASRInferenceModule()
+    module._install_streaming_runtime(runtime, state_bank_mode="runtime_exclusive")
+    owner = module._runtime_handle
+    context = ExecutionContext.create("ascend-reset")
+    try:
+        stream = owner.open_stream(context)
+        with pytest.raises(ExecutionFailure):
+            owner.step(stream, ModelRequest(), context)
+        owner.close_stream(stream, context)
+        assert calls == []
+        if reset_fails:
+            with pytest.raises(ExecutionFailure, match="encoder reset failed"):
+                owner.reset(context)
+            assert not owner.ready
+            assert owner.recovery_requirement is not None
+        else:
+            owner.reset(context)
+            assert owner.ready
+            assert owner.recovery_requirement is None
+        assert calls == ["encoder-reset"]
+    finally:
+        module.cleanup()

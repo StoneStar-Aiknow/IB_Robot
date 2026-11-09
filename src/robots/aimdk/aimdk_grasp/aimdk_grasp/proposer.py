@@ -34,8 +34,8 @@ from dataclasses import asdict, dataclass, field, replace
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.contracts import Flag, GraspFailure, Observation, Proposals
-from manipulation_execution.grasp_pipeline.perception import Detection, PerceptionServices
+from manipulation_execution.pick.pipeline.contracts import Flag, GraspFailure, Observation, Proposals
+from manipulation_execution.pick.pipeline.perception import Detection, PerceptionServices
 
 from .feedback import Feedback
 from .joints import LEFT_ARM

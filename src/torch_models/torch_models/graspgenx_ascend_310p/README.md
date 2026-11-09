@@ -55,20 +55,31 @@ is portable: the operator package is compiled for a CANN release and the
 `ascend310p` compute unit, and the Torch bridge links the installed Torch's ABI.
 See `src/torch_models/torch_models/graspgenx_ascend_310p/custom_ops/kernels/manifest.yaml`.
 
-**Two variables must be exported before the process starts.** `ASCEND_CUSTOM_OPP_PATH`
-cannot be set from inside a running process, so a launch file has to carry it:
+**The two products go to different places, and that is load-bearing.** The
+Torch bridges land in the per-host cache; the CANN vendor packages are
+installed into the CANN tree's own `opp/vendors/`, because that is the only
+location CANN reuses their packaged binary kernels from. So the build needs
+write access there, and `--root` moves only the bridges:
 
 ```bash
 root=~/.cache/ibrobot/graspgenx_ascend_ops   # or wherever --root built them
 export IBROBOT_GRASPGENX_ASCEND_OPS="${root}"
-export ASCEND_CUSTOM_OPP_PATH="${root}/vendors/graspgenx_subm:${root}/vendors/graspgenx_grid"
+# and deliberately NOT ASCEND_CUSTOM_OPP_PATH -- see below
 ```
 
-`IBROBOT_GRASPGENX_ASCEND_OPS` is the only place the operator location is
-written down: this package reads it, and a launch that has to carry
-`ASCEND_CUSTOM_OPP_PATH` forwards it rather than recomputing a path. Export it
-even when the operators sit in the cache default, or the launch has nothing to
-forward and the operators fail to load.
+`IBROBOT_GRASPGENX_ASCEND_OPS` is the only place the bridge location is written
+down: this package reads it, and a launch that has to carry it forwards the
+variable rather than recomputing a path. Export it even when the bridges sit in
+the cache default, or the launch has nothing to forward and the operators fail
+to load.
+
+**Do not set `ASCEND_CUSTOM_OPP_PATH` for these packages.** It selects CANN's
+external-install branch, which registers their operator-info, proto and tiling
+stores but *not* the binary store: GE then recompiles every operator once per
+process. On an idle 310P that is 17.9 s, 11.2 s and 12.4 s against 6.4 s, 3.4 s
+and 3.4 s when the same kernels are found through `opp/vendors`, and the full
+first served request is 44.7 s against 12.3 s. A value inherited from
+elsewhere is left alone, because it may name someone else's package.
 
 ## Shape and version contracts
 
@@ -135,17 +146,70 @@ resamples a served cloud to `data.num_points`, as upstream's batched entry point
 Through the ROS service on the X2 bottle frame, 400 grasps:
 
 ```text
-load                 63 s      once per process, not per request
-first request        47 s      kernel caches and internal-format conversions
-steady state        429 ms
+load                 72 s      once per process, not per request
+first request       6.1 s
+steady state        304 ms
 ```
 
+Measured on an **idle** board: no other stack running, load average at its
+14-15 baseline, and `/proc/sys/kernel/random/boot_id` checked before and after
+each run so that a reboot could not be mistaken for a result. The GE arm was
+rebuilt from the pre-aclnn sources into a separate operator root and measured
+under the same conditions, five requests per run:
+
+```text
+                      GE / OpCommand        aclnn
+first request            44654.3 ms       6138.7 ms
+steady state     302.5 ms (299-310)   303.7 ms (298-308)
+load                        72.0 s          66.9 s
+```
+
+So the first request drops **44.7 s to 6.1 s**, and **steady state does not
+regress**: 1.2 ms apart with the two intervals almost entirely overlapping.
+
+That last point corrects this file's own earlier figures, which are worth
+recording because the mistake is easy to repeat. An initial pair of runs gave
+GE 321.1 ms and aclnn 330.5 ms and was read as a 9 ms regression caused by the
+bridges building ACL descriptors and running tiling per call; a later aclnn run
+gave 342.0 ms with a 29 ms spread. All three were taken while another stack
+held the NPU, at load averages from 17.7 to 19.4. On an idle board the two
+paths are indistinguishable, so that "regression" was contention, measured
+against a baseline taken under *different* contention. A steady-state figure
+from this board is only meaningful with the load average and the other stacks
+recorded beside it.
+
+One real defect was found while chasing that phantom. The stream handed to the
+launch closure came from the no-argument `NPUStream::stream()`, which calls
+`MakeSureQueueEmpty()` first -- so asking for the stream drained the task
+queue once per operator call, giving back exactly the host-side overlap
+`RunOpApi` exists to preserve. The code now uses `stream(false)`. A
+per-operator benchmark cannot see this, because it synchronises around every
+call: it measures 0.39/0.41/0.78 ms with the drain removed against
+0.43/0.38/0.78 ms with it.
+
+Per operator, first call against steady, in a process that does nothing else:
+
+```text
+                 GE / OpCommand      aclnn        steady GE -> aclnn
+GridEncode            17375.8 ms   1379.7 ms      0.29 -> 0.39 ms
+BuildSubmMap          11119.0 ms      2.3 ms      0.40 -> 0.41 ms
+SubmConv3d            11428.6 ms      2.1 ms      0.59 -> 0.78 ms
+```
+
+The 1.4 s left on the first operator is not compilation: it is a
+once-per-process aclnn and vendor-package initialisation, which is why the two
+operators after it cost ~2 ms. That cost is paid by whichever operator runs
+first, not by each of them.
+
 The same frame and bundle through `torch_cuda` on an RTX 3090, driven by the same
-harness, take **159 ms** steady with a 481 ms first request, so the board is 2.7x of
-CUDA here. At the 2048 points the earlier table used, the board measures 293 ms steady
-and a 62 s first request through the model session, against the 196 ms and ~9 s recorded
-before -- so the recompiled `--precision_mode=force_fp32` loop is slower than its
-predecessor on both counts, and the earlier claim of 1.6x of CUDA no longer holds.
+harness, take **159 ms** steady with a 481 ms first request, so the board is 1.9x of
+CUDA on steady state and now within 13x on the first request rather than 93x. The
+2048-point figures below were taken before the aclnn bridges and have not been
+re-measured: the board gave 293 ms steady and a 62 s first request through the model
+session, against the 196 ms and ~9 s recorded before that -- so the recompiled
+`--precision_mode=force_fp32` loop is slower than its predecessor on both counts, and
+the earlier claim of 1.6x of CUDA no longer holds. Of that 62 s, ~40 s was the operator
+compilation the bridges no longer pay.
 
 **Rotations are not the weak point, and the recorded ~2e-3 cannot be reproduced.**
 Orthonormality measures 4.4e-07 to 5.3e-07 on the board against 3.8e-07 to 4.5e-07 on
@@ -232,9 +296,58 @@ GraspGenX-ascend checkout, with the operator bridges, the offline model and
 both checkpoints resolving to the operator cache and the bundle.
 The module scan above is the cheap standing version of that check.
 
-A test or tool that calls the operators directly must set
-`torch.npu.set_compile_mode(jit_compile=False)` itself. That flag is not a
-performance knob here: left at its default the runtime recompiles a custom
-operator instead of using its packaged binary kernels, and the recompile fails
-on a host without an Ascend C toolchain with a message that names no caller.
-`assemble` sets it and asserts it afterwards, so a deployment never has to.
+A test or tool that calls the operators directly no longer has to set
+`torch.npu.set_compile_mode(jit_compile=False)` for their sake, and the reason
+is worth writing down because this README got it wrong twice.
+
+The flag does reach CANN. torch_npu maps it to
+`aclSetCompileopt(ACL_OP_JIT_COMPILE)`, and a CANN debug log from the board
+shows `ge.jit_compile` set to 0 a quarter of a second before the first
+operator's compile request. An earlier version of this section said the switch
+"never reached these operators"; that was wrong. What it cannot do is give GE a
+binary it has not been told about: a custom package's *binary* store comes from
+the GE option `op.binary.custom`, and under the external install that option is
+never set ("GetCustomBinaryPath Not found custom binary key:op.binary.custom in
+options"), so this package's own
+`op_impl/ai_core/tbe/kernel/config/ascend310p/binary_info_config.json` is never
+read and FE falls through to a full compile, reporting "Cur op[GridEncode1] not
+support dynamic rank in binary info store". That is the 17.4 s per operator,
+paid with the flag already False.
+
+The earlier claim that *no* configuration could fix this was also wrong. FE
+generates `op.binary.custom` by itself from `opp/vendors/config.ini`
+(`Configuration::LoadOppConfigFile` / `ResolveBinaryPath`), so installing the
+packages there -- which is what setup now does -- makes GE read both
+`binary_info_config.json` files, load the three `.o` kernels and skip the
+compile: `ParallelCompileOp` drops from 10.6 s to 1.5 ms. The flag is
+irrelevant either way.
+
+What remains on the GE path is `ParallelPreCompileOp`, ~2.94 s per operator,
+which costs the same whichever way the packages are installed: it is FE's
+prebuild step, not the kernel compile. That is why the first *call* of each
+operator still costs 6.4 s, 3.4 s and 3.4 s rather than milliseconds, and why
+the warmup below exists. Note that GridEncode logs "not support dynamic rank in
+binary info store" even while reusing its binary, so that line alone does not
+prove a compile happened.
+
+`assemble` still sets the flag and asserts it afterwards, for the built-in
+operators the model runs around these three.
+
+### The operators are warmed when the model loads
+
+The cost above is per process per operator and **independent of the input**: a
+64-point call pays it in full, after which a real 3500-point request costs
+1.2 ms, 1.5 ms and 0.9 ms. It is also paid on the first *call*, not at load, so
+without a warmup it lands on the first grasp the robot is asked for -- 12.3 s
+for a request that then takes 300 ms, once per model-service lifetime.
+
+`perception_service.model_session_builders` therefore calls each operator once
+with 64 points as soon as an npu Torch session has loaded its model. The first
+served request drops from 12.3 s to 6.2 s, with 10.7 s moved into a load that
+already takes tens of seconds. A failing warmup is logged and swallowed: it
+would only mean a slow first grasp, which is what the code did before, and
+refusing to serve would turn a latency problem into an outage.
+
+The remaining 6.2 s is not these operators -- a warmed process still spends
+~4 s on other first-call costs inside the model, and the same is true on CUDA.
+

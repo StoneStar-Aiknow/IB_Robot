@@ -25,8 +25,8 @@ from typing import Protocol
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.contracts import EffectorAction, EffectorOutcome, Flag
-from manipulation_execution.grasp_pipeline.streaming import JointSample, received_at_or_stale
+from manipulation_execution.pick.pipeline.contracts import EffectorAction, EffectorOutcome, Flag
+from manipulation_execution.pick.pipeline.streaming import JointSample, received_at_or_stale
 
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
 from .joints import LEFT_HAND
@@ -54,6 +54,16 @@ CLOSE_MAX_S = 15.0
 # reported codes while tracking their command (lag <= 0.01) and the thumb
 # closed to its full target unblocked, so both runs would have claimed a grip.
 CONTACT_TOUCH = 30
+# While an object is carried, a contact finger still presses it when its flex
+# joint trails the frozen close command by at least this much, or its pad reads
+# CONTACT_TOUCH. Held = the thumb and one more finger still pressing. Live
+# 2026-10-23: in held grips every contact finger trailed by 0.04-0.16 rad for
+# the whole hold; in the two that slipped out (one tipped on release, one flung)
+# thumb and fingers crept to within 0.001-0.016 rad of their command 0.5-3 s
+# after the close, with the arm still at the grasp pose.
+HOLD_LAG_RAD = 0.025
+# The grip counts as lost once it has failed this long without a break.
+GRIP_LOST_S = 0.2
 # Touch readings older than this are not used: when the touch stream stops, the
 # last grip's levels would freeze every finger of the next close at once.
 TOUCH_MAX_AGE_S = 0.1
@@ -106,6 +116,9 @@ class OmniHandEffector:
     feedback_max_age_s: float = 0.1
     command: np.ndarray | None = None
     report: dict = field(default_factory=dict)
+    #: The last close's grip while it is held: contact fingers, frozen command, closing direction.
+    _grip: dict | None = field(default=None, repr=False)
+    _lost_since: float | None = field(default=None, repr=False)
 
     def act(self, action: EffectorAction, *, halted: Flag, cancelled: Flag) -> EffectorOutcome:
         try:
@@ -121,10 +134,42 @@ class OmniHandEffector:
         """Stop sending; the platform keeps the last hand target."""
         self.io.release()
         self.command = None
+        self._grip = None
+
+    def holding(self) -> str | None:
+        """While an object is carried: '' while the grip holds, the reason once it is lost, None if unknown.
+
+        The close froze each contact finger's command past where the object
+        stopped it; a finger that still presses trails that command or reads
+        touch. One whose object slipped out closes onto its command.
+        """
+        grip = self._grip
+        if grip is None:
+            return None
+        try:
+            measured = self._measured()
+        except _Failed:
+            return None  # the arm's supervision reports stale feedback
+        touch = self.io.touch()
+        lags, pressing = {}, []
+        for finger in grip["contacts"]:
+            _, flex, pad = FINGERS[finger]
+            lags[finger] = round(float((grip["command"][flex] - measured[flex]) * grip["direction"][flex]), 3)
+            if lags[finger] >= HOLD_LAG_RAD or (touch is not None and touch.get(pad, 0.0) >= CONTACT_TOUCH):
+                pressing.append(finger)
+        if "thumb" in pressing and len(pressing) >= 2:
+            self._lost_since = None
+            return ""
+        now = self.io.monotonic()
+        self._lost_since = now if self._lost_since is None else self._lost_since
+        if now - self._lost_since < GRIP_LOST_S:
+            return ""
+        return f"the contact fingers no longer press the object (lag rad: {lags})"
 
     # -- actions --------------------------------------------------------------------
 
     def _open(self, name: str, cancelled: Flag) -> EffectorOutcome:
+        self._grip = None  # whatever was held is let go
         target = self.mapping.preset("open")
         start = self._measured()
         row = self.report[name] = {}
@@ -151,6 +196,7 @@ class OmniHandEffector:
         return EffectorOutcome(True, report=dict(row))
 
     def _close(self, halted: Flag, cancelled: Flag) -> EffectorOutcome:
+        self._grip = None
         target = self.mapping.preset("close")
         command = self._measured().copy()
         direction = np.sign(target - command)
@@ -201,6 +247,9 @@ class OmniHandEffector:
             self.io.wait(max(0.0, tick + 1.0 / HAND_HZ - self.io.monotonic()))
         for _ in range(int(CLOSE_SETTLE_S * HAND_HZ)):
             self._frame(command, cancelled, "close")
+        if gripped:
+            self._grip = dict(contacts=tuple(frozen), command=command.copy(), direction=direction.copy())
+            self._lost_since = None
         self.report["close"] = dict(
             gripped=gripped,
             contacts=frozen,
@@ -266,7 +315,7 @@ class RosHandIO:
     def __init__(self, node, description: Mapping):
         from std_msgs.msg import Float64MultiArray
 
-        from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
+        from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, bind_stream
         from robot_config.contract_utils import qos_profile_from_dict
         from robot_runtime.on_demand import OnDemandSubscriptions
 

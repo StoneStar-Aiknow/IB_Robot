@@ -1,11 +1,258 @@
 # manipulation_execution
 
+## 职责概览
+
 `manipulation_execution` 是抓取、放置和 HRI 模拟执行的闭环执行层。它把一次 `PickObject` action 请求编排为
 GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证；
 `ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。采集窗口内每一条 PEAR 结果都会逐帧留存在节点内存里，供后续重定向阶段消费；
-窗口关闭后 executor 把录到的 PEAR 帧重定向成 SO-101 手臂关节轨迹（`imitation_retargeting` 子包），驱动**真实机械臂**回放；重定向失败时回退为预置动画。也就是说该 executor 既消费视频也产生运动输出。
+窗口关闭后 executor 把录到的 PEAR 帧重定向成 SO-101 手臂关节轨迹（`hri/retargeting` 子包），驱动**真实机械臂**回放；重定向失败时回退为预置动画。也就是说该 executor 既消费视频也产生运动输出。
 
 配置了 `grasp_execution.backend` 的机器人不经 GraspGen/IK 这条链，改用 `grasp_pipeline_node` 和机器人自己的抓取后端服务 `PickObject`，见「通用抓取管线：为机器人接入新后端」一节。
+
+### 架构位置
+
+```text
+Hermes -> ibrobot-control -> robot-skill
+  -> Agent plan / Gateway -> /embodied/execute_skill (pick_object)
+  -> skill_library Gateway (admit + canonicalize dispatch_binding, stamp dispatch_nonce)
+  -> /manipulation/execute_pick (PickObject, delegated)
+  -> pick_executor_node
+       -> /grasp_planner/plan_grasp
+       -> /compute_ik + /compute_fk
+       -> /embodied/execute_primitive
+       -> /grasp_verifier/verify_grasp
+```
+
+Hermes 只看到一个原子技能。内部运动仍逐步经过 `skill_library` 和 `safety_guard`，本包不直接发布
+控制器命令，也不直接调用 MoveIt 原始位姿接口。
+
+抓取 executor 将同一份 `dispatch_binding` 传给每个 `PrimitiveCommand`。`skill_library` 依据
+`dispatch_nonce` 和完整 binding 让 pipeline primitive 借用父 skill 的 root lease；调用方不得绕过
+Gateway 自行构造 delegated `PickObject` 请求。
+
+`supervised_direct=true` 仅供 `pick_action_client` 真机 bring-up 使用。此模式要求空
+`dispatch_nonce`、完整当前 registry identity 和 `task_budget`，并且它派生的每个 primitive 仍由
+`skill_library` 做 direct-root admission；Hermes 和 `robot-skill` 始终使用
+`supervised_direct=false` 及 Gateway delegated nonce。该客户端把 `--task-id` 作为人工可读前缀，每次运行
+都会追加唯一后缀；实际 ID 会显示在 `PICK_ACTION_SEND` 中。只有排查同一请求身份时才使用
+`--exact-task-id`，此时重复运行会被 Gateway ledger 拒绝。
+
+`pick/node.py` 只管理 ROS action、service client、TF 和 joint-state 生命周期。抓取行为按职责拆分到
+`pick/phases/flow.py`、`planning.py`、`preparation.py` 和 `execution.py`；共享状态模型与纯转换函数分别位于
+`pick/models.py` 和 `pick/helpers.py`。机器人特有的抓取几何（STL 网格、桌面间隙）与
+SO-101 joint5 分支/闭合轴守卫不在本包：它们由 robot YAML 声明的 provider 模块提供（见下文「Provider 声明」），
+节点对两种 kinematics backend 一视同仁地只从配置读取。阶段 mixin 保留原有方法入口，便于隔离测试且不改变
+action 行为。
+
+### 公开接口
+
+| 接口 | 类型 | 说明 |
+| --- | --- | --- |
+| `/embodied/execute_skill` | `ibrobot_msgs/action/SkillCommand` | 对外技能入口；放置使用 `place_in_container`、`target_name` 和 `container_name` |
+| `/manipulation/execute_pick` | `ibrobot_msgs/action/PickObject` | Gateway 内部 delegated 抓取执行，不是外部入口 |
+| `/manipulation/execute_place` | `ibrobot_msgs/action/PlaceObject` | Gateway 内部固定位置释放与视觉确认，不是外部入口 |
+| `/hri/imitate_human_motion` | `ibrobot_msgs/action/ImitateHumanMotion` | Gateway 内部 HRI 模拟执行，不是外部入口 |
+
+goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、exact registry identity）、
+`target_query`、`timeout_sec`、`expected_executor` 和仅供 supervised bring-up 的 `supervised_direct`。
+`target_query` 是 Grounded-SAM2/GraspGen 的文本查询
+（例如 `banana`），不是 `named_targets` 中的静态配置键。result 携带 `actual_executor`、`attempts`、
+`verification_status`、`completed_phases` 和 `debug_output_dir`。
+
+`PickObject.mode` 支持 `MODE_EXECUTE`、`MODE_PLAN_ONLY` 和 `MODE_OBSERVE_ONLY`。三个模式共享同一
+观测、规划和配置入口；plan-only 会完成正式候选筛选与 IK/FK 准备但不执行抓取。`release_after_success`
+可让 executor 在验证成功并运输到 place container 后开爪。该字段属于内部 delegated 契约；当前 v1
+catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求自动释放。
+
+目标字段 `target_query` 是 Grounded-SAM2/GraspGen 的文本查询，例如 `banana`，不是
+`named_targets` 中的静态配置键。
+
+放置反馈阶段包括 `preflight`、`move_to_place`、`release`、`move_to_verify`、`verify_place` 和
+`return_to_place`；抓取反馈阶段包括 `preflight`、`observe`、`planning`、`selecting`、`approach`、`descend`、
+`close`、`verify_close`、`transport` 和 `release`。
+
+只有最终抓取验证成功时 action 才返回 `success=true`。动作执行完成但验证失败或不确定分别返回
+`GRASP_VERIFICATION_FAILED` 或 `GRASP_UNCERTAIN`。
+
+### 代码布局
+
+包内代码按 `pick`、`place`、`hri` 三个子系统分组。本次重组新建的各级 `__init__.py` 只含 docstring，不在树中列出。原有目录的入口文件不在此列：`hri/retargeting/__init__.py` 保留其原有实现（含重定向入口 `retarget_capture`），已在树中该子包处标注：
+
+```text
+manipulation_execution/
+├── __init__.py
+├── geometry.py                      通用平面/旋转几何，不依赖包内其他模块
+├── launch_builders/                 跨包 launch 构建入口：mirror_session.py、motion_imitation_stream.py
+├── shared/                          跨子系统共享的无 ROS 代码
+│   └── runtime_ownership.py         运行时模式接管与释放
+├── pick/                            抓取子系统
+│   ├── node.py                      可执行 pick_executor_node
+│   ├── action_client.py             可执行 pick_action_client
+│   ├── goal.py                      PickObject goal 准入
+│   ├── models.py                    共享状态模型
+│   ├── helpers.py                   纯转换函数
+│   ├── providers.py
+│   ├── contact_compensation.py      接触点补偿
+│   ├── candidate_geometry.py        候选筛选几何
+│   ├── pipeline_node.py             可执行 grasp_pipeline_node
+│   ├── phases/                      flow.py、planning.py、preparation.py、execution.py
+│   └── pipeline/                    通用抓取管线：backends.py、candidates.py、contracts.py、perception.py、pipeline.py、ros_stream.py、sequence.py、streaming.py
+├── place/                           放置子系统
+│   ├── node.py                      可执行 place_executor_node
+│   ├── containment.py               无 ROS 节点的 mask 包含判定
+│   └── replay.py                    可执行 placement_replay
+└── hri/                             HRI 子系统
+    ├── vision.py                    YOLOX/PEAR 感知链
+    ├── actor_selector.py            选人逻辑
+    ├── frame_decoder.py             解码器按名字选择
+    ├── compressed_image_decode.py   传输层解码（JPEG/PNG → bgr8）
+    ├── animation.py                 AnimationPlan、normalized_motion_config、waypoints
+    ├── imitate/                     ImitateHumanMotion 执行器：executor.py、node.py（可执行 imitate_human_motion_executor_node）
+    ├── retargeting/                 PEAR 帧 → SO-101 关节轨迹：base.py、cadence.py、frames.py、idle.py、plan_builder.py、rotations.py、scoring.py、smoothing.py、smplx2so101.py；`__init__.py` 含入口 `retarget_capture`（唯一非 docstring-only 的包入口）
+    ├── stream/                      X2 常驻感知流：node.py（可执行 motion_imitation_stream_node）、mock_node.py（可执行 motion_imitation_mock_node）
+    └── mirror_session/              镜像会话：core.py、endpoints.py、hooks.py、inputs.py、mock_playback.py、node.py（可执行 mirror_session_node、mirror_session_release）
+```
+
+## 抓取
+
+`PickObject` 是 delegated action：goal 必须携带 `dispatch_binding`（`DispatchBinding`，含同一 root 的
+共享 `task_budget` 和 exact registry identity）以及 `expected_executor`（`DelegatedExecutorIdentity`）；
+result 必须返回 `actual_executor`。server 在 goal acceptance 时比对自身实际 identity 与
+`expected_executor`，不匹配时直接 reject，且不得仅凭 endpoint 名判断。
+
+本包也是抓取行为的唯一实现源。Hermes、生产 catalog 和批量自动化都必须通过
+`robot-skill execute pick_object` 进入 Capability Gateway。真机 bring-up 另提供
+已安装的 `pick_action_client` 这一显式 supervised-direct 客户端：它先读取当前 Gateway
+registry，再以 `supervised_direct=true` 发送一次受监督 goal；这不是 Hermes 入口，也不能伪造 delegated
+nonce。`/manipulation/execute_pick` 仍是 Gateway 准入后的 delegated action，Hermes 调用方不得自行构造
+binding 或 executor identity。
+
+旧的长脚本实现及 legacy-only replay benchmark 已删除。当前监督式客户端只负责 live registry preflight、
+goal 发送和反馈收敛，抓取行为仍只在正式 phases 中实现；`test_pick_single_source.py` 会确保旧脚本不被
+重新引入，且客户端保持为唯一的 supervised-direct 入口。
+
+### 通用抓取管线：为机器人接入新后端
+
+`manipulation_execution` 有两个 `PickObject` 执行器，按 `grasp_execution.backend` 选择：
+
+| 执行器 | 启用条件 | 抓取链 |
+| --- | --- | --- |
+| `pick_executor_node` | `backend` 未配置 | GraspGen 规划、SO101 夹爪几何、IK/FK 接触补偿、primitive 执行、抓后验证（见上文） |
+| `grasp_pipeline_node` | `backend` 命名了后端工厂 | 机器人无关的 observe / perceive / plan / 执行流程，机器人差异全部在后端 |
+
+节点选择规则（embodied launch）：
+
+- 配置了 `backend` 的机器人，launch 启动 `grasp_pipeline_node`，不启动 `pick_executor_node`、
+  GraspGen planner 和 gripper verifier。
+- 未配置 `backend` 的机器人，launch 行为与旧版一致。
+- Gateway 与节点用同一个函数（`delegated_grasp_execution`）推导 executor identity，两侧对
+  `grasp_execution` 的哈希保持一致。
+
+#### 最小配置
+
+```yaml
+robot:
+  grasp_execution:
+    enabled: true
+    backend: "my_robot_grasp.backends:make_backends"
+    backend_options:
+      stream: joint.arm_stream        # 内容由该工厂自行校验
+    pipeline:
+      max_attempts: 2
+      max_moved_replans: 1
+      home_tolerance_rad: 0.02
+      release_after_success: false
+```
+
+`robot_config` 在配置加载时校验：
+
+- `backend` 必须是 `package.module:callable` 形式。
+- `backend_options` 是传给工厂的映射。配置 `backend_options` 时必须同时配置 `backend`。
+- `pipeline` 只接受上表的 4 个键，范围：`max_attempts` 不小于 1，`max_moved_replans` 不小于 0，
+  `home_tolerance_rad` 大于 0，`release_after_success` 是布尔值。
+
+#### 后端工厂的签名与生命周期
+
+```python
+def make_backends(*, node, grasp_execution, description) -> GraspBackends:
+    ...
+```
+
+| 参数 | 内容 |
+| --- | --- |
+| `node` | `grasp_pipeline_node` 自身。后端用它创建 service client 和订阅。 |
+| `grasp_execution` | 完整的 `grasp_execution` 配置映射，含 `backend_options`。 |
+| `description` | 绑定到机器人的 interface description。`runtime.provider` 已配置时取 `runtime.interface_description`。 |
+
+`GraspBackends` 的字段（`pick/pipeline/contracts.py`）：
+
+- 必填 5 个：`observation`、`proposer`、`planner`、`executor`、`effector`。
+- `watch` 可选。没有 `watch` 时，管线不检查目标移动。
+- `close()` 在节点销毁时调用一次，后端在这里释放它创建的 ROS 资源。
+- `prepare()` 可选，见下节。
+
+节点拥有所有机器人共享的部分：goal 准入（`pick/goal.py`，规则与 `pick_executor_node` 一致）、
+单 goal 串行、预算、取消、feedback 和 result 映射。close 步骤的结果映射为
+`verification_status`，管线报告写入 `pipeline_timings_json`。
+
+后端的 `proposer` 通过 `pick/pipeline/perception.py` 的 client 调用 3 个感知服务：
+GroundingDetect、SegmentDetections 和 GenerateGrasps。模型跑在哪个加速器上由服务部署决定，
+后端不加载模型。
+
+#### 预热
+
+后端给出 `prepare()` 时，节点在 goal 线程外重试调用它：
+
+1. `prepare()` 抛出异常时，节点记录警告，1 秒后重试。
+2. `prepare()` 正常返回后，节点开始接受 goal。
+3. 预热完成前，节点拒绝所有 goal，拒绝原因写明「still warming up」。
+
+目的：机器人的第一个 goal 不承担加载规划器和模型的时间。
+
+#### 预算与放回
+
+预算：
+
+- 节点取 `goal.timeout_sec` 与共享 task budget 剩余时间的较小值，作为执行 deadline。
+- deadline 门控 observe、perceive、plan 的每个阶段边界，以及是否启动执行。
+- 某个阶段正常返回时预算已耗尽，goal 以 `SKILL_TIMEOUT` 结束；已取消则以 `CANCELED` 结束。
+- 执行开始后，只有 goal 自身的取消会停止机械臂。deadline 不再中断执行，避免物体悬在空中。
+- 执行中 deadline 已过导致的运动失败，映射为 `SKILL_TIMEOUT`。
+
+放回：
+
+- `release_after_success` 为真（goal 请求，或 `pipeline.release_after_success` 配置）时，
+  成功的抓取放回物体。
+- plan 自带 release 步骤时执行该步骤。plan 没有 release 步骤时，按原路径回放，在支撑面开爪。
+- result 的 `released_after_success` 报告是否放回。
+
+#### 流式执行器与 ROS 绑定
+
+机器人 runtime 支持关节位置流（joint.position_stream）时，后端用 `pick/pipeline/streaming.py`
+的 `StreamExecutor` 执行轨迹，用 `pick/pipeline/ros_stream.py` 的 `RosStreamIO` 绑定运行时接口：
+
+- `bind_stream` 按 interface ID 绑定命令流、反馈视图、命令回显和 runtime status。接口的 kind、
+  direction 或 message type 不匹配时，绑定失败并指出第一个不匹配的接口。
+- 反馈视图用不同的关节名时，用 `feedback_names` 映射。反馈在返回前已重命名为流的关节名，
+  执行器只读流自己的关节名。
+- 执行器持有流期间，最后一条命令每 0.1 秒重发一次。`release()` 停止重发，机器人保持最后一条命令；
+  `release()` 返回后不再发送任何旧命令。
+
+## 放置
+
+`PlaceObject` 使用相同 delegated 契约。`place_executor_node` 只接受 Gateway
+构造的 binding，并通过 `/embodied/execute_primitive` 复用受保护的
+`move_to_joint_positions` 和 `open_gripper`；不存在 direct place action client。
+放置先到固定 `place_container`（3 号电机 raw 1500）开爪，再只将 3 号电机移动到 raw 1700
+（`verify_joint_position: -0.533825`）做视觉确认，
+最后返回 raw 1500。请求中的
+`container_name` 只作为运行时容器检测 query，不参与运动规划；`target_name` 和 `container_name` 原样作为
+Grounding-DINO 文本输入，颜色等描述词不得丢失。容器与目标存在多个候选时，执行器按置信度选择最高候选
+进行二维包含判定，并保留全部候选证据；目标检测始终使用配置的静态夹爪排除 mask。每次请求在不可逆动作前创建版本化证据目录，保存开爪后的新鲜 JointState、RGB、
+容器/目标 mask 和终态；使用 `placement_replay` 可在无 ROS、
+无真机条件下重放，旧三维容器规划记录没有当前 manifest 时会被标记为 `legacy_incompatible`。
+
+## HRI / 照镜子
 
 ### HRI RGB 输入与人体感知链
 
@@ -59,7 +306,7 @@ result 的 `actual_duration_sec` 报的是**回放**时长，不是采集时长�
 使用最新整帧；YOLOX 成功但没有合格 person 时，executor 构造图像中心方框，
 边长为 `min(width, height) / 1.25`，再用恰好一个框调用 PEAR。任务首次完成 YOLOX 成功响应前不调用
 PEAR；之后的 YOLOX 刷新失败继续使用任务内最近一次成功结果。服务不可用、RPC 超时、模型失败和无效图像
-不会创建初始 fallback。模型语义预处理仍全部在 perception adapter 内，本节点不含 `cv2`，也不使用 PEAR 输出驱动关节。该节点订阅的是已解码的 `sensor_msgs/Image`；本包唯一的像素代码是 `compressed_image_decode.py` 的传输层解码（JPEG/PNG → `bgr8`），因为模型服务只收原始 `Image`，编码流必须有人在调用侧解。
+不会创建初始 fallback。模型语义预处理仍全部在 perception adapter 内，本节点不含 `cv2`。PEAR 输出不直接驱动关节。回放阶段把采集帧送进 `hri/retargeting` 生成关节轨迹，重定向失败时回退预置动画。该节点订阅的是已解码的 `sensor_msgs/Image`；本包唯一的像素代码是 `hri/compressed_image_decode.py` 的传输层解码（JPEG/PNG → `bgr8`），因为模型服务只收原始 `Image`，编码流必须有人在调用侧解。
 
 任务 deadline 是相机计数和视觉推理的硬边界：边界后的帧不计数、不入队，worker 不提交过期
 请求，边界后返回的响应也不计入任务。每次调用分别跟踪 RPC deadline 和任务 deadline；只有
@@ -73,35 +320,7 @@ result 的 message 继续附带 `rgb_input` JSON；feedback 不附带该 JSON。
 输出校验失败。`vision_sample` 增加 `source=yolox` 或 `source=center_fallback`，便于区分真实检测框和
 中心 fallback。
 
-`PickObject` 是 delegated action：goal 必须携带 `dispatch_binding`（`DispatchBinding`，含同一 root 的
-共享 `task_budget` 和 exact registry identity）以及 `expected_executor`（`DelegatedExecutorIdentity`）；
-result 必须返回 `actual_executor`。server 在 goal acceptance 时比对自身实际 identity 与
-`expected_executor`，不匹配时直接 reject，且不得仅凭 endpoint 名判断。
-
-`PlaceObject` 使用相同 delegated 契约。`place_executor_node` 只接受 Gateway
-构造的 binding，并通过 `/embodied/execute_primitive` 复用受保护的
-`move_to_joint_positions` 和 `open_gripper`；不存在 direct place action client。
-放置先到固定 `place_container`（3 号电机 raw 1500）开爪，再只将 3 号电机移动到 raw 1700
-（`verify_joint_position: -0.533825`）做视觉确认，
-最后返回 raw 1500。请求中的
-`container_name` 只作为运行时容器检测 query，不参与运动规划；`target_name` 和 `container_name` 原样作为
-Grounding-DINO 文本输入，颜色等描述词不得丢失。容器与目标存在多个候选时，执行器按置信度选择最高候选
-进行二维包含判定，并保留全部候选证据；目标检测始终使用配置的静态夹爪排除 mask。每次请求在不可逆动作前创建版本化证据目录，保存开爪后的新鲜 JointState、RGB、
-容器/目标 mask 和终态；使用 `placement_replay` 可在无 ROS、
-无真机条件下重放，旧三维容器规划记录没有当前 manifest 时会被标记为 `legacy_incompatible`。
-
-本包也是抓取行为的唯一实现源。Hermes、生产 catalog 和批量自动化都必须通过
-`robot-skill execute pick_object` 进入 Capability Gateway。真机 bring-up 另提供
-已安装的 `pick_action_client` 这一显式 supervised-direct 客户端：它先读取当前 Gateway
-registry，再以 `supervised_direct=true` 发送一次受监督 goal；这不是 Hermes 入口，也不能伪造 delegated
-nonce。`/manipulation/execute_pick` 仍是 Gateway 准入后的 delegated action，Hermes 调用方不得自行构造
-binding 或 executor identity。
-
-旧的长脚本实现及 legacy-only replay benchmark 已删除。当前监督式客户端只负责 live registry preflight、
-goal 发送和反馈收敛，抓取行为仍只在正式 phases 中实现；`test_pick_single_source.py` 会确保旧脚本不被
-重新引入，且客户端保持为唯一的 supervised-direct 入口。
-
-## X2 照镜子：常驻感知流与镜像会话
+### X2 照镜子：常驻感知流与镜像会话
 
 `robot_config` 的 `aimdk_x2_magicmirror` 配置启动以下三个节点（launch 接线与配置项见 `robot_config`
 README 的“X2 照镜子”一节）：
@@ -118,11 +337,11 @@ mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ 
 | `motion_imitation_mock_node` | 模拟重定向（播放随包动画 `data/x2_mock_imitation/`）与模拟安全（关节限位钳制、限速） | 订阅 `PearFrame`（只作存活判据），发布 `/motion_imitation_mock/arm_command_preview`；`~/play`（`std_srvs/SetBool`） |
 | `mirror_session_node` | WAIT / STANDBY / MIRRORING 状态机、运行时模式的接管与释放；手臂与手指通道的唯一发布者 | `~/set_session`（`std_srvs/SetBool`，只由 Gateway 的 `mirror_session` 执行器调用）、`~/status`（JSON）、`~/arm_command_preview` / `~/hand_command_preview` |
 
-解码器按名字选择（`frame_decoder.py`），当前只注册了 `mock_cpu`（OpenCV 软件解码）；选人逻辑在
-`actor_selector.py`，当前取置信度最高的人且不跨帧保持身份。两者与模拟节点的 `_retarget` /
+解码器按名字选择（`hri/frame_decoder.py`），当前注册了三个。`mock_cpu` 是 OpenCV 软件解码。`auto` 对 JPEG 走 DVPP，PNG 或硬件不可用时回退 CPU。`dvpp` 对 JPEG 强制 DVPP，失败不回退。选人逻辑在
+`hri/actor_selector.py`，当前取置信度最高的人且不跨帧保持身份。两者与模拟节点的 `_retarget` /
 `_apply_safety` 都可以单独替换，替换时保持各自的输出契约。
 
-会话与运行时的约定（`mirror_session/core.py`、`mirror_session/runtime.py`）：
+会话与运行时的约定（`hri/mirror_session/core.py`、`shared/runtime_ownership.py`）：
 
 - 节点启动后处于 WAIT。`mirror_start` 由 Gateway 先把运行时切到控制模式 `model_inference` 对应的
   `policy_stream`，会话再接管该模式；会话从不自行从 idle 申请 `policy_stream`。
@@ -135,7 +354,7 @@ mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ 
   `embodied_common/mirror_session_contract.py`。
 - `publish_enabled`（默认 `false`）为 `false` 时，闸门输出只发到会话的 preview 话题，不发到运行时通道；
   接管与释放照常执行。
-- `mirror_session/hooks.py` 的 `SessionHooks` 是镜像行为的扩展点（起止判据、窗口流水线、收尾），默认值
+- `hri/mirror_session/hooks.py` 的 `SessionHooks` 是镜像行为的扩展点（起止判据、窗口流水线、收尾），默认值
   均取最保守的行为。启用 `mock_playback` 时窗口流水线为 `MockPlaybackHooks`：每轮通过 `~/play` 从第 0 帧
   播放模拟动画，手指 20 路恒为 0。
 
@@ -154,71 +373,6 @@ mirror_session_node（输出闸门）-> 运行时 joint.arm_stream（14 路）/ 
   技能，包括 `mirror_stop`。复位要在 `/runtime/set_mode` 上请求 idle，这会清除锁存：
   `ros2 service call /runtime/set_mode ibrobot_msgs/srv/SetRuntimeMode "{mode: idle}"`。之后会话停在 WAIT，
   直到下一次 `mirror_start`。
-
-## 架构位置
-
-```text
-Hermes -> ibrobot-control -> robot-skill
-  -> Agent plan / Gateway -> /embodied/execute_skill (pick_object)
-  -> skill_library Gateway (admit + canonicalize dispatch_binding, stamp dispatch_nonce)
-  -> /manipulation/execute_pick (PickObject, delegated)
-  -> pick_executor_node
-       -> /grasp_planner/plan_grasp
-       -> /compute_ik + /compute_fk
-       -> /embodied/execute_primitive
-       -> /grasp_verifier/verify_grasp
-```
-
-Hermes 只看到一个原子技能。内部运动仍逐步经过 `skill_library` 和 `safety_guard`，本包不直接发布
-控制器命令，也不直接调用 MoveIt 原始位姿接口。
-
-抓取 executor 将同一份 `dispatch_binding` 传给每个 `PrimitiveCommand`。`skill_library` 依据
-`dispatch_nonce` 和完整 binding 让 pipeline primitive 借用父 skill 的 root lease；调用方不得绕过
-Gateway 自行构造 delegated `PickObject` 请求。
-
-`supervised_direct=true` 仅供 `pick_action_client` 真机 bring-up 使用。此模式要求空
-`dispatch_nonce`、完整当前 registry identity 和 `task_budget`，并且它派生的每个 primitive 仍由
-`skill_library` 做 direct-root admission；Hermes 和 `robot-skill` 始终使用
-`supervised_direct=false` 及 Gateway delegated nonce。该客户端把 `--task-id` 作为人工可读前缀，每次运行
-都会追加唯一后缀；实际 ID 会显示在 `PICK_ACTION_SEND` 中。只有排查同一请求身份时才使用
-`--exact-task-id`，此时重复运行会被 Gateway ledger 拒绝。
-
-`pick_executor_node.py` 只管理 ROS action、service client、TF 和 joint-state 生命周期。抓取行为按职责拆分到
-`phases/flow.py`、`planning.py`、`preparation.py` 和 `execution.py`；共享状态模型与纯转换函数分别位于
-`pick_executor_models.py` 和 `pick_executor_helpers.py`。机器人特有的抓取几何（STL 网格、桌面间隙）与
-SO-101 joint5 分支/闭合轴守卫不在本包：它们由 robot YAML 声明的 provider 模块提供（见下文「Provider 声明」），
-节点对两种 kinematics backend 一视同仁地只从配置读取。阶段 mixin 保留原有方法入口，便于隔离测试且不改变
-action 行为。
-
-## 公开接口
-
-| 接口 | 类型 | 说明 |
-| --- | --- | --- |
-| `/embodied/execute_skill` | `ibrobot_msgs/action/SkillCommand` | 对外技能入口；放置使用 `place_in_container`、`target_name` 和 `container_name` |
-| `/manipulation/execute_pick` | `ibrobot_msgs/action/PickObject` | Gateway 内部 delegated 抓取执行，不是外部入口 |
-| `/manipulation/execute_place` | `ibrobot_msgs/action/PlaceObject` | Gateway 内部固定位置释放与视觉确认，不是外部入口 |
-| `/hri/imitate_human_motion` | `ibrobot_msgs/action/ImitateHumanMotion` | Gateway 内部 HRI 模拟执行，不是外部入口 |
-
-goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、exact registry identity）、
-`target_query`、`timeout_sec`、`expected_executor` 和仅供 supervised bring-up 的 `supervised_direct`。
-`target_query` 是 Grounded-SAM2/GraspGen 的文本查询
-（例如 `banana`），不是 `named_targets` 中的静态配置键。result 携带 `actual_executor`、`attempts`、
-`verification_status`、`completed_phases` 和 `debug_output_dir`。
-
-`PickObject.mode` 支持 `MODE_EXECUTE`、`MODE_PLAN_ONLY` 和 `MODE_OBSERVE_ONLY`。三个模式共享同一
-观测、规划和配置入口；plan-only 会完成正式候选筛选与 IK/FK 准备但不执行抓取。`release_after_success`
-可让 executor 在验证成功并运输到 place container 后开爪。该字段属于内部 delegated 契约；当前 v1
-catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求自动释放。
-
-目标字段 `target_query` 是 Grounded-SAM2/GraspGen 的文本查询，例如 `banana`，不是
-`named_targets` 中的静态配置键。
-
-放置反馈阶段包括 `preflight`、`move_to_place`、`release`、`move_to_verify`、`verify_place` 和
-`return_to_place`；抓取反馈阶段包括 `preflight`、`observe`、`planning`、`selecting`、`approach`、`descend`、
-`close`、`verify_close`、`transport` 和 `release`。
-
-只有最终抓取验证成功时 action 才返回 `success=true`。动作执行完成但验证失败或不确定分别返回
-`GRASP_VERIFICATION_FAILED` 或 `GRASP_UNCERTAIN`。
 
 ## 配置
 
@@ -257,6 +411,7 @@ prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节�
   `ik.auto_start_workers` 和任何与绑定公共接口不一致的 `ik_service` / `fk_service` /
   `move_configuration_service` / `joint_state_topic` 覆写；worker 数量来自 runtime profile
   （如 `lekiwi_robot` 的 `motion.ik_worker_count`）。
+
 - GraspGen、验证器、IK/FK 服务名。
 - 相机 topic 和 base/EE frame。
 - source gripper 到目标夹爪的几何适配。
@@ -316,113 +471,6 @@ timeout_sec: 240.0
 `model_deployment` 必须指向可由 `inference_manifest` 严格校验的 bundle；Gateway 与本节点分别加载同一
 manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment name、fingerprint 和 bundle digest。
 模型 identity 缺失、manifest 不可用或两端不一致时 fail closed，不接受抓取 goal。
-
-## 通用抓取管线：为机器人接入新后端
-
-`manipulation_execution` 有两个 `PickObject` 执行器，按 `grasp_execution.backend` 选择：
-
-| 执行器 | 启用条件 | 抓取链 |
-| --- | --- | --- |
-| `pick_executor_node` | `backend` 未配置 | GraspGen 规划、SO101 夹爪几何、IK/FK 接触补偿、primitive 执行、抓后验证（见上文） |
-| `grasp_pipeline_node` | `backend` 命名了后端工厂 | 机器人无关的 observe / perceive / plan / 执行流程，机器人差异全部在后端 |
-
-节点选择规则（embodied launch）：
-
-- 配置了 `backend` 的机器人，launch 启动 `grasp_pipeline_node`，不启动 `pick_executor_node`、
-  GraspGen planner 和 gripper verifier。
-- 未配置 `backend` 的机器人，launch 行为与旧版一致。
-- Gateway 与节点用同一个函数（`delegated_grasp_execution`）推导 executor identity，两侧对
-  `grasp_execution` 的哈希保持一致。
-
-### 最小配置
-
-```yaml
-robot:
-  grasp_execution:
-    enabled: true
-    backend: "my_robot_grasp.backends:make_backends"
-    backend_options:
-      stream: joint.arm_stream        # 内容由该工厂自行校验
-    pipeline:
-      max_attempts: 2
-      max_moved_replans: 1
-      home_tolerance_rad: 0.02
-      release_after_success: false
-```
-
-`robot_config` 在配置加载时校验：
-
-- `backend` 必须是 `package.module:callable` 形式。
-- `backend_options` 是传给工厂的映射。配置 `backend_options` 时必须同时配置 `backend`。
-- `pipeline` 只接受上表的 4 个键，范围：`max_attempts` 不小于 1，`max_moved_replans` 不小于 0，
-  `home_tolerance_rad` 大于 0，`release_after_success` 是布尔值。
-
-### 后端工厂的签名与生命周期
-
-```python
-def make_backends(*, node, grasp_execution, description) -> GraspBackends:
-    ...
-```
-
-| 参数 | 内容 |
-| --- | --- |
-| `node` | `grasp_pipeline_node` 自身。后端用它创建 service client 和订阅。 |
-| `grasp_execution` | 完整的 `grasp_execution` 配置映射，含 `backend_options`。 |
-| `description` | 绑定到机器人的 interface description。`runtime.provider` 已配置时取 `runtime.interface_description`。 |
-
-`GraspBackends` 的字段（`grasp_pipeline/contracts.py`）：
-
-- 必填 5 个：`observation`、`proposer`、`planner`、`executor`、`effector`。
-- `watch` 可选。没有 `watch` 时，管线不检查目标移动。
-- `close()` 在节点销毁时调用一次，后端在这里释放它创建的 ROS 资源。
-- `prepare()` 可选，见下节。
-
-节点拥有所有机器人共享的部分：goal 准入（`pick_goal.py`，规则与 `pick_executor_node` 一致）、
-单 goal 串行、预算、取消、feedback 和 result 映射。close 步骤的结果映射为
-`verification_status`，管线报告写入 `pipeline_timings_json`。
-
-后端的 `proposer` 通过 `grasp_pipeline/perception.py` 的 client 调用 3 个感知服务：
-GroundingDetect、SegmentDetections 和 GenerateGrasps。模型跑在哪个加速器上由服务部署决定，
-后端不加载模型。
-
-### 预热
-
-后端给出 `prepare()` 时，节点在 goal 线程外重试调用它：
-
-1. `prepare()` 抛出异常时，节点记录警告，1 秒后重试。
-2. `prepare()` 正常返回后，节点开始接受 goal。
-3. 预热完成前，节点拒绝所有 goal，拒绝原因写明「still warming up」。
-
-目的：机器人的第一个 goal 不承担加载规划器和模型的时间。
-
-### 预算与放回
-
-预算：
-
-- 节点取 `goal.timeout_sec` 与共享 task budget 剩余时间的较小值，作为执行 deadline。
-- deadline 门控 observe、perceive、plan 的每个阶段边界，以及是否启动执行。
-- 某个阶段正常返回时预算已耗尽，goal 以 `SKILL_TIMEOUT` 结束；已取消则以 `CANCELED` 结束。
-- 执行开始后，只有 goal 自身的取消会停止机械臂。deadline 不再中断执行，避免物体悬在空中。
-- 执行中 deadline 已过导致的运动失败，映射为 `SKILL_TIMEOUT`。
-
-放回：
-
-- `release_after_success` 为真（goal 请求，或 `pipeline.release_after_success` 配置）时，
-  成功的抓取放回物体。
-- plan 自带 release 步骤时执行该步骤。plan 没有 release 步骤时，按原路径回放，在支撑面开爪。
-- result 的 `released_after_success` 报告是否放回。
-
-### 流式执行器与 ROS 绑定
-
-机器人 runtime 支持关节位置流（joint.position_stream）时，后端用 `grasp_pipeline/streaming.py`
-的 `StreamExecutor` 执行轨迹，用 `grasp_pipeline/ros_stream.py` 的 `RosStreamIO` 绑定运行时接口：
-
-- `bind_stream` 按 interface ID 绑定命令流、反馈视图、命令回显和 runtime status。接口的 kind、
-  direction 或 message type 不匹配时，绑定失败并指出第一个不匹配的接口。
-- 反馈视图用不同的关节名时，用 `feedback_names` 映射。反馈在返回前已重命名为流的关节名，
-  执行器只读流自己的关节名。
-- 执行器持有流期间，最后一条命令每 0.1 秒重发一次。`release()` 停止重发，机器人保持最后一条命令；
-  `release()` 返回后不再发送任何旧命令。
 
 ## 安全边界
 
@@ -493,7 +541,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q --import-mode=importlib src/manipulat
 SO101 joint5 运动学约束由 `so101_suite/test/test_wrist_guard.py` 覆盖；SO101 provider 是否满足本包契约由组装根
 `embodied_bringup/test/test_so101_provider_contract.py` 检查。本包不依赖任何机器人套件（含 test_depend），
 节点测试一律使用 fake/stub provider；通用网格/平面几何由
-`test_geometry.py`、`test_grasp_geometry.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
+`test_geometry.py` 覆盖，抓取候选几何由 `test_candidate_geometry.py` 覆盖。phases 测试继续验证配置解析、错误码和执行编排。
 
 ### Providerless 部署前置（手眼抓取配置）
 
@@ -531,4 +579,4 @@ YOLOX 对其缩小图像转色，PEAR 对源分辨率的扩展 ROI 单独转色�
 `status.decode_ms` 是窗口内每次解码调用的平均耗时，包含冷启动时的初始化，不代表网络时延。
 测吞吐时使用业务节点自身状态计数；现场额外相机订阅会扰动实收帧率，不要把吞吐测试和
 额外图像订阅的时延测试混在一起。前后对照及名义 30 FPS 复核见
-[JPEG 解码验证记录](JPEG_DECODE_VALIDATION.md)。
+[JPEG 解码验证记录](docs/jpeg_decode_validation.md)。

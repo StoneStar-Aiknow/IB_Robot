@@ -87,14 +87,20 @@ def test_native_runtime_deadline_rejects_before_backend() -> None:
     handle.close()
 
 
-def test_native_runtime_started_failure_reports_recovery_evidence() -> None:
-    runtime = _Runtime(fail=RuntimeError("backend failed"))
+@pytest.mark.parametrize("unknown", [False, True])
+def test_native_runtime_started_failure_reports_recovery_evidence(unknown) -> None:
+    error = RuntimeError("backend failed")
+    if unknown:
+        error.operation_started = True
+        error.outcome_known = False
+    runtime = _Runtime(fail=error)
     handle = _handle(runtime)
     with pytest.raises(ExecutionFailure) as error:
         handle.execute(ModelRequest({"input": np.float32(1)}), ExecutionContext("failed"))
 
     assert error.value.evidence.state_mutated is False
-    assert error.value.evidence.outcome_known is True
+    assert error.value.evidence.outcome_known is not unknown
+    assert handle.ready is not unknown
     handle.close()
 
 

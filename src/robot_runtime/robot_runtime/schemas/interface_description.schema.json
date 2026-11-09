@@ -249,6 +249,18 @@
             "minimum": 0
           }
         },
+        "write_chunk_ms": {
+          "description": "Duration of each PCM write a playback interface wants from its publishers.",
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 200
+        },
+        "prebuffer_ms": {
+          "description": "Audio a playback interface wants written ahead of real time for a whole stream.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2000
+        },
         "modes": {
           "type": "array",
           "uniqueItems": true,

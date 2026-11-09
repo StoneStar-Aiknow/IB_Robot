@@ -13,6 +13,16 @@ import numpy as np
 import torch
 from torch import nn
 
+from inference_service.backends.errors import BackendLifecycleError
+from inference_service.model_sessions.torch_completion import (
+    drain_torch_device,
+    drain_torch_device_before_release,
+    resolve_torch_device,
+    torch_execution_scope,
+)
+from inference_service.unified_runtime.errors import CancellationRequested, DeadlineExceeded
+from inference_service.unified_runtime.lifecycle import check_lifecycle, lifecycle_lock
+
 from .fullsubnet_stateful_executor import (
     FB_FRAME_SHAPE,
     FB_OUTPUT_SHAPE,
@@ -96,20 +106,41 @@ class StatefulTorchFullSubNetExecutor:
         *,
         device: str = "cuda",
         timing_enabled: bool = False,
+        cleanup=None,
     ):
         if device not in {"cuda", "cpu"}:
             raise ValueError("stateful Torch executor 的 device 只能为 cuda 或 cpu")
         if device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("stateful Torch/CUDA 后端要求 CUDA 可用，禁止静默回退 CPU")
-        self.device = torch.device(device)
+        self.device = resolve_torch_device(torch, device)
         self.backend = "stateful_torch_cuda" if device == "cuda" else "stateful_torch_cpu"
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理
-        self._cleanup_complete = False  # 清理已尝试完毕（含失败项），重入据此返回
+        self._cleanup_complete = False  # 仅在设备工作完成且引用释放后标记成功
         self._poisoned = False
+        self._release_drain_failures = 0  # 连续 drain 失败计数，达到上限后放弃等待
         self._timing_enabled = bool(timing_enabled)
         self._timing_ms = {"fb_infer_ms": 0.0, "sb_infer_ms": 0.0}
 
+        self._fb_model = self._sb_model = None
+        if cleanup is not None:
+            cleanup.defer(self.close)
+        try:
+            self._load_models(checkpoint_path, manifest_path)
+        except Exception as exc:
+            from inference_service.unified_runtime.errors import clear_exception_frames
+
+            clear_exception_frames(exc)
+            if cleanup is None:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    exc.cleanup_owner = self
+                    exc.close_pending = True
+                    exc.rollback_errors = (str(cleanup_error),)
+            raise
+
+    def _load_models(self, checkpoint_path, manifest_path):
         checkpoint = Path(checkpoint_path)
         if not checkpoint.is_file():
             raise FileNotFoundError(f"FullSubNet cumulative checkpoint 不存在: {checkpoint}")
@@ -166,13 +197,17 @@ class StatefulTorchFullSubNetExecutor:
         with self._lock:
             self._ensure_runnable()
             try:
-                with torch.inference_mode():
+                with torch_execution_scope(torch, self.device.type, self.device, stateful=True), torch.inference_mode():
                     output, self._fb_hidden, self._fb_cell = self._fb_model(
                         torch.from_numpy(value).to(self.device), self._fb_hidden, self._fb_cell
                     )
-                result = output.detach().cpu().numpy().astype(np.float32, copy=False)
-                if result.shape != FB_OUTPUT_SHAPE:
-                    raise RuntimeError(f"FullSubNet FB 输出必须为{FB_OUTPUT_SHAPE}，得到{result.shape}")
+                    result = output.detach().cpu().numpy().astype(np.float32, copy=False)
+                    if result.shape != FB_OUTPUT_SHAPE:
+                        from inference_service.unified_runtime import OutcomeEvidence
+
+                        error = RuntimeError(f"FullSubNet FB 输出必须为{FB_OUTPUT_SHAPE}，得到{result.shape}")
+                        error.evidence = OutcomeEvidence.completed("fullsubnet.fb.outputs", state_mutated=True)
+                        raise error
                 if self._timing_enabled:
                     self._timing_ms["fb_infer_ms"] = (time.perf_counter() - started) * 1000.0
                 return result
@@ -186,13 +221,17 @@ class StatefulTorchFullSubNetExecutor:
         with self._lock:
             self._ensure_runnable()
             try:
-                with torch.inference_mode():
+                with torch_execution_scope(torch, self.device.type, self.device, stateful=True), torch.inference_mode():
                     output, self._sb_hidden, self._sb_cell = self._sb_model(
                         torch.from_numpy(value).to(self.device), self._sb_hidden, self._sb_cell
                     )
-                result = output.detach().cpu().numpy().astype(np.float32, copy=False)
-                if result.shape != SB_OUTPUT_SHAPE:
-                    raise RuntimeError(f"FullSubNet SB 输出必须为{SB_OUTPUT_SHAPE}，得到{result.shape}")
+                    result = output.detach().cpu().numpy().astype(np.float32, copy=False)
+                    if result.shape != SB_OUTPUT_SHAPE:
+                        from inference_service.unified_runtime import OutcomeEvidence
+
+                        error = RuntimeError(f"FullSubNet SB 输出必须为{SB_OUTPUT_SHAPE}，得到{result.shape}")
+                        error.evidence = OutcomeEvidence.completed("fullsubnet.sb.outputs", state_mutated=True)
+                        raise error
                 if self._timing_enabled:
                     self._timing_ms["sb_infer_ms"] = (time.perf_counter() - started) * 1000.0
                 return result
@@ -208,29 +247,51 @@ class StatefulTorchFullSubNetExecutor:
             raise RuntimeError("FullSubNet stateful Torch 状态不确定，必须先 reset")
 
     def reset(self) -> None:
-        with self._lock:
+        with lifecycle_lock(self._lock):
             if self._closed:
                 return
-            self._reset_states()
+            check_lifecycle()
+            if self._poisoned:
+                drain_torch_device(torch, self.device.type, self.device)
+            with torch_execution_scope(torch, self.device.type, self.device, complete_on_success=True, stateful=True):
+                self._reset_states()
             self._poisoned = False
             self._timing_ms = {"fb_infer_ms": 0.0, "sb_infer_ms": 0.0}
 
     def close(self) -> None:
-        """best-effort terminal 关闭：释放模型与状态引用，单项失败不阻断其余清理。
-
-        关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
-        属 best-effort terminal，非可重试。
-        """
-        with getattr(self, "_lock", threading.Lock()):
-            if getattr(self, "_cleanup_complete", False):
-                # 清理已尝试完毕（含失败项），重入直接返回。
-                return
-            self._closed = True  # 禁新推理
-            self._fb_model = None
-            self._sb_model = None
-            for name in ("_fb_hidden", "_fb_cell", "_sb_hidden", "_sb_cell"):
-                setattr(self, name, None)
-            self._cleanup_complete = True
+        """Fence device work before releasing references; retain failed cleanup."""
+        self._closed = True
+        try:
+            with lifecycle_lock(self._lock):
+                if self._cleanup_complete:
+                    return
+                # 设备卡在 sticky error 时永远不会报告完成；连续 drain 失败达到
+                # 上限后放弃等待并释放引用，让 close 可以终止（见
+                # drain_torch_device_before_release）。周期/取消异常不计入失败次数，
+                # 换新预算的关闭仍可重试。
+                try:
+                    check_lifecycle()
+                    drain_torch_device_before_release(
+                        torch,
+                        self.device.type,
+                        self.device,
+                        failed_attempts=self._release_drain_failures,
+                        owner="FullSubNet stateful Torch close",
+                    )
+                except (DeadlineExceeded, CancellationRequested) as exc:
+                    raise BackendLifecycleError(
+                        f"FullSubNet device completion pending: {exc}", close_pending=True
+                    ) from exc
+                except BackendLifecycleError:
+                    self._release_drain_failures += 1
+                    raise
+                self._fb_model = None
+                self._sb_model = None
+                for name in ("_fb_hidden", "_fb_cell", "_sb_hidden", "_sb_cell"):
+                    setattr(self, name, None)
+                self._cleanup_complete = True
+        except Exception as exc:
+            raise BackendLifecycleError(f"FullSubNet device completion pending: {exc}", close_pending=True) from exc
 
 
 __all__ = [

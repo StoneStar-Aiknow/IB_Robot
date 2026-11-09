@@ -26,7 +26,7 @@ from aimdk_grasp.target_watch import WatchConfig
 from aimdk_grasp.types import RGBDFrame
 from test_target_watch import K, far_spheres, scene, watcher_inputs
 
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure, Observation, Proposals
+from manipulation_execution.pick.pipeline.contracts import GraspFailure, Observation, Proposals
 
 STILL, MOVED = scene(), scene(target_at=(30, 55))
 

@@ -79,7 +79,7 @@
   - `docker_verification_mismatch`：inputs 指纹不匹配当前输入，或 full 模式下 tested tree 不匹配当前 head tree。
 - 两种情况都是阻塞性问题。作者 push 后只有源码 tree 改变才要求重跑 Ubuntu 与 openEuler；只改 commit message、作者或 trailer 而 tree 不变时，已有验证仍有效。
 - **review 默认只检查 PR 描述中由开发者声明的验证结果，禁止自动执行双平台 Docker 验证。**
-- "review / 审查 / 帮我看看 PR"本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如"你来跑一下 Ubuntu/openEuler Docker 验证""帮我实际验证 setup/build"）时，才调用对应验证 skill。
+- "review / 审查 / 帮我看看 PR"本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如"你来跑一下 Ubuntu/openEuler Docker 验证""帮我实际验证 setup/build"）时，才调用对应验证 skill。
 - 如果 PR 描述缺少任一平台验证说明，只给出命令但没有结果，验证没有覆盖 setup/build 两个阶段，或验证 tree 与最新 head tree 不一致，都应视为**阻塞性 review 问题**，要求开发者补充或重跑。
 
 ## 4. openEuler AI 贡献元数据检查（阻塞性）

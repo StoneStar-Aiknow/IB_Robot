@@ -5,7 +5,8 @@
 # artifact (see src/torch_models/torch_models/graspgenx_ascend_310p/custom_ops/kernels/manifest.yaml):
 #
 #   * a CANN vendor package, compiled for one CANN release and the ascend310p
-#     compute unit;
+#     compute unit, installed into the CANN tree's own opp/vendors/ so that
+#     CANN reuses the binary kernels instead of recompiling them per process;
 #   * a Torch bridge, linked against the venv's libtorch and libtorch_npu with
 #     the ABI flag read from the installed Torch.
 #
@@ -14,7 +15,11 @@
 # looks for:
 #
 #   <root>/<vendor_name>/torch_bridge.so
-#   <root>/vendors/<vendor_name>/...        (for ASCEND_CUSTOM_OPP_PATH)
+#
+# and the vendor packages go to the CANN installation instead:
+#
+#   $ASCEND_HOME_PATH/opp/vendors/<vendor_name>/...
+#   $ASCEND_HOME_PATH/opp/vendors/config.ini   (load_priority, written by the .run)
 #
 # Usage: install_graspgenx_ascend_ops.sh [--root <dir>] [--force]
 #
@@ -163,8 +168,38 @@ graspgenx_ops_build_one() {
         graspgenx_ops_die "${vendor}: the package target produced no .run in ${project}/build_out"
     [[ ${#packages[@]} == 1 ]] ||
         graspgenx_ops_die "${vendor}: expected one .run, found ${#packages[@]}: ${packages[*]}"
+    # Install the vendor package where CANN itself keeps custom operators,
+    # which is what makes it reuse the binary kernels just compiled. The
+    # alternative -- --install-path into a directory named by
+    # ASCEND_CUSTOM_OPP_PATH -- registers the operator-info, proto and tiling
+    # stores but *not* the binary store, so GE recompiles every operator once
+    # per process: 17.9 s, 11.2 s and 12.4 s on an Ascend 310P against 6.4 s,
+    # 3.4 s and 3.4 s here, measured on an idle board with the same kernels.
+    # The binary store comes from the GE option op.binary.custom, which FE
+    # generates by itself from vendors/config.ini (the .run writes that file,
+    # prepending this vendor and keeping the entries already there), and which
+    # nothing on the single-operator path can set.
+    #
+    # The cost is that this writes into the CANN installation: it is lost on a
+    # CANN upgrade or a create_version_softlink.sh run, and the install needs
+    # write permission there. That is checked rather than escalated -- a build
+    # script that silently sudoes into a system directory is worse than one
+    # that says what to run.
+    local vendors_dir="${ASCEND_HOME_PATH}/opp/vendors"
+    if ! mkdir -p "${vendors_dir}" 2>/dev/null || [[ ! -w "${vendors_dir}" ]]; then
+        graspgenx_ops_die "$(printf '%s\n' \
+            "${vendor}: ${vendors_dir} is not writable by $(id -un)." \
+            "CANN keeps custom operator packages there and the binary kernels are" \
+            "only reused from that location. Re-run this script with write access:" \
+            "    sudo -E GRASPGENX_OPS_CANN_HOME=${GRASPGENX_OPS_CANN_HOME} ${BASH_SOURCE[0]}" \
+            "or point GRASPGENX_OPS_CANN_HOME at a CANN installation you own.")"
+    fi
     graspgenx_ops_step "vendor package install" \
-        bash "${packages[0]}" --install-path="${GRASPGENX_OPS_ROOT}" --quiet
+        bash "${packages[0]}" --quiet
+    [[ -d "${vendors_dir}/${vendor}" ]] ||
+        graspgenx_ops_die "${vendor}: the package reported success but wrote no ${vendors_dir}/${vendor}"
+    grep -q "${vendor}" "${vendors_dir}/config.ini" 2>/dev/null ||
+        graspgenx_ops_die "${vendor}: ${vendors_dir}/config.ini does not list it, so its binaries will not be reused"
 
     graspgenx_ops_log "linking ${vendor} Torch bridge"
     local torch_dir npu_dir python_include abi
@@ -172,6 +207,9 @@ graspgenx_ops_build_one() {
     npu_dir="$("${GRASPGENX_OPS_VENV_PYTHON}" -c 'import torch_npu; print(torch_npu.__path__[0])')"
     python_include="$("${GRASPGENX_OPS_VENV_PYTHON}" -c 'import sysconfig; print(sysconfig.get_path("include"))')"
     abi="$("${GRASPGENX_OPS_VENV_PYTHON}" -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))')"
+    # The bridge stays in the per-host cache rather than going into the CANN
+    # tree with the vendor package: it is linked against the venv's Torch ABI,
+    # so it belongs to the workspace, not to the CANN release.
     mkdir -p "${GRASPGENX_OPS_ROOT}/${vendor}"
     graspgenx_ops_step "Torch bridge link" \
         ${CXX:-c++} -O2 -std=c++17 -fPIC -shared "${staged}/torch_bridge.cpp" \
@@ -185,16 +223,40 @@ graspgenx_ops_build_one() {
         -ltorch -ltorch_cpu -ltorch_python -lc10 -ltorch_npu
 }
 
+# What the build was made *from*, as opposed to the environment it was made
+# *for*. Without this the stamp describes only CANN, Torch and the compute
+# unit, so pulling new operator sources or changing a compiler flag leaves an
+# untouched environment matching its old stamp: the guard below reports
+# "already built" and the deployment keeps running the previous bridges. That
+# is how an upgrade silently fails to take effect, which is worse than a
+# rebuild nobody needed, so this hashes every file the build reads -- both
+# operator trees -- plus this script, which carries the compiler and link
+# flags. Editing manifest.yaml also invalidates it; that is accepted rather
+# than filtered, because a rule about which files "count" is one more thing to
+# get wrong.
+graspgenx_ops_recipe_digest() {
+    [[ -d "${GRASPGENX_OPS_SOURCE_ROOT}" ]] ||
+        graspgenx_ops_die "no operator sources at ${GRASPGENX_OPS_SOURCE_ROOT}; set GRASPGENX_OPS_SOURCE_ROOT."
+    # No process substitution: this has to run under the board's shell too.
+    # Paths are excluded from the hash so that building the same sources from
+    # a different checkout still matches.
+    {
+        find "${GRASPGENX_OPS_SOURCE_ROOT}" -type f | sort | xargs sha256sum | cut -d' ' -f1
+        sha256sum "${BASH_SOURCE[0]}" | cut -d' ' -f1
+    } | sha256sum | cut -d' ' -f1
+}
+
 # The identity the products are only valid for. Mixing any of these produces a
 # vendor package or a bridge that loads and then fails, so a build whose stamp
 # disagrees with the host is rebuilt rather than reused.
 graspgenx_ops_stamp() {
-    printf 'cann_release=%s\ncann_home=%s\ncompute_unit=%s\ntorch_version=%s\ntorch_cxx11_abi=%s\n' \
+    printf 'cann_release=%s\ncann_home=%s\ncompute_unit=%s\ntorch_version=%s\ntorch_cxx11_abi=%s\nrecipe_digest=%s\n' \
         "$(basename "${GRASPGENX_OPS_CANN_HOME}")" \
         "${GRASPGENX_OPS_CANN_HOME}" \
         "${GRASPGENX_OPS_COMPUTE_UNIT}" \
         "$("${GRASPGENX_OPS_VENV_PYTHON}" -c 'import torch; print(torch.__version__)')" \
-        "$("${GRASPGENX_OPS_VENV_PYTHON}" -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))')"
+        "$("${GRASPGENX_OPS_VENV_PYTHON}" -c 'import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))')" \
+        "$(graspgenx_ops_recipe_digest)"
 }
 
 install_graspgenx_ascend_ops() {
@@ -222,14 +284,15 @@ install_graspgenx_ascend_ops() {
         [[ -f "${root}/graspgenx_subm/torch_bridge.so" ]] &&
         [[ -f "${root}/graspgenx_grid/torch_bridge.so" ]]; then
         if [[ -f "${stamp_path}" ]] && [[ "$(cat "${stamp_path}")" == "${want}" ]]; then
-            graspgenx_ops_log "already built in ${root} for this host; pass --force to rebuild"
+            graspgenx_ops_log "already built in ${root} from these sources for this host; pass --force to rebuild"
             return 0
         fi
         # Testing only that the .so files exist would reuse a build made for
-        # another CANN release, compute unit or Torch ABI, which is what
-        # GraspGenX-ascend's own notes warn against.
+        # another CANN release, compute unit or Torch ABI -- which is what
+        # GraspGenX-ascend's own notes warn against -- or from older operator
+        # sources, which is how an upgrade stops taking effect.
         if [[ -f "${stamp_path}" ]]; then
-            graspgenx_ops_log "rebuilding: ${stamp_path} does not describe this host"
+            graspgenx_ops_log "rebuilding: ${stamp_path} does not describe this host and these sources"
             # No process substitution: this script has to run under the board's
             # minimal shell too (scripts/setup/tests/test_accel_axis.sh guards
             # that). Report the two stamps instead of diffing them.
@@ -257,10 +320,14 @@ install_graspgenx_ascend_ops() {
     # two cannot drift into disagreeing about what identity means.
     graspgenx_ops_stamp > "${stamp_path}"
 
-    graspgenx_ops_log "built into ${root}"
-    graspgenx_ops_log "the runtime needs these exported before the process starts:"
+    graspgenx_ops_log "built: bridges into ${root}, vendor packages into ${ASCEND_HOME_PATH}/opp/vendors"
+    graspgenx_ops_log "the runtime needs this exported before the process starts:"
     graspgenx_ops_log "  export IBROBOT_GRASPGENX_ASCEND_OPS=${root}"
-    graspgenx_ops_log "  export ASCEND_CUSTOM_OPP_PATH=${root}/vendors/graspgenx_subm:${root}/vendors/graspgenx_grid"
+    # Deliberately no ASCEND_CUSTOM_OPP_PATH: setting it selects CANN's
+    # external-install branch, which does not register the binary store and so
+    # recompiles every operator once per process. The packages are found
+    # through opp/vendors/config.ini instead.
+    graspgenx_ops_log "do NOT set ASCEND_CUSTOM_OPP_PATH for these: it would bypass the packaged kernels"
 }
 
 # Allow both `source` for the setup script and direct execution.

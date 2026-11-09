@@ -22,11 +22,10 @@
   <!-- runtime contract layer (the only IB-Robot packages a runtime may depend on) -->
   <exec_depend>ibrobot_msgs</exec_depend>
   <exec_depend>robot_runtime</exec_depend>
+  <exec_depend>unitree_g1_adapter</exec_depend>
 
   <!-- vendored Unitree interface definitions (BSD-3-Clause, see each
        package's PROVENANCE.md for the upstream commit) -->
-  <exec_depend>unitree_hg</exec_depend>
-  <exec_depend>unitree_api</exec_depend>
   <!-- vendored robot description: the URDF robot_state_publisher renders for
        TF only (design D6); it never reaches build_description -->
   <exec_depend>unitree_g1_description</exec_depend>
@@ -54,6 +53,9 @@
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>robot_runtime</test_depend>
+  <test_depend>unitree_g1_adapter</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>builtin_interfaces</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

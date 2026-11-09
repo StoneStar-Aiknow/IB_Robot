@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -25,6 +26,8 @@ from inference_service.unified_runtime import (  # noqa: E402
     ExecutionFailure,
     ModelRequest,
     ModelRuntimeHandle,
+    OutcomeState,
+    RecoveryAction,
     RuntimeAssembly,
 )
 from voice_asr_service.asr_inference_module import ASRInferenceModule, ASRState  # noqa: E402
@@ -210,3 +213,67 @@ def test_manifest_vad_runtime_real_load_reset_and_close():
 
     with pytest.raises(RuntimeError, match="not initialized"):
         runtime.infer(np.zeros(512, dtype=np.float32))
+
+
+@pytest.mark.parametrize("failure_at", ["native", "output"])
+def test_manifest_vad_failure_blocks_desynchronized_state_until_public_reset(tmp_path, monkeypatch, failure_at):
+    from inference_service.model_sessions import onnx as onnx_session
+    from voice_asr_service.package_silero_vad_bundle import package_silero_vad_bundle
+
+    feeds, native_sessions = [], []
+    failure = [None]
+
+    class Graph:
+        def __init__(self, *args, **kwargs):
+            native_sessions.append(self)
+
+        def get_inputs(self):
+            return [SimpleNamespace(name=name) for name in ("input", "state", "sr")]
+
+        def get_outputs(self):
+            return [SimpleNamespace(name=name) for name in ("output", "stateN")]
+
+        def run(self, _, feed):
+            feeds.append({key: value.copy() for key, value in feed.items()})
+            if failure[0] == "native":
+                raise RuntimeError("ONNX execution interrupted")
+            probability = np.ones((2, 1) if failure[0] == "output" else (1, 1), np.float32)
+            return [probability, feed["state"] + np.float32(1)]
+
+    sdk = SimpleNamespace(
+        InferenceSession=Graph,
+        SessionOptions=SimpleNamespace,
+        get_available_providers=lambda: ["CPUExecutionProvider"],
+    )
+    monkeypatch.setattr(onnx_session, "_import_onnxruntime", lambda: sdk)
+    artifact = tmp_path / "silero.onnx"
+    artifact.write_bytes(b"fake ORT artifact")
+    bundle = tmp_path / "silero-vad"
+    package_silero_vad_bundle(bundle, onnx_source=artifact, include_ascend=False)
+    runtime = ManifestVadRuntime(bundle, "torch_cpu")
+    runtime.initialize()
+    stream = runtime._stream
+    try:
+        assert runtime.infer(np.ones(512, np.float32)) == 1.0
+        failure[0] = failure_at
+        with pytest.raises(ExecutionFailure) as caught:
+            runtime.infer(np.full(512, 2, np.float32))
+        error = caught.value
+        assert error.evidence.state is (OutcomeState.STARTED if failure_at == "native" else OutcomeState.COMPLETED)
+        assert error.evidence.outcome_known is (failure_at == "output")
+        assert error.evidence.state_mutated and error.recovery.action is RecoveryAction.RESET_RUNTIME
+        assert not runtime._handle.ready
+        np.testing.assert_array_equal(runtime._audio_context, np.ones(64, np.float32))
+        with pytest.raises(ExecutionFailure, match="recovery_required"):
+            runtime.infer(np.full(512, 3, np.float32))
+        assert len(feeds) == 2
+        failure[0] = None
+        runtime.reset()
+        assert runtime._handle.ready
+        assert runtime._stream is stream and len(native_sessions) == 1
+        assert runtime.infer(np.full(512, 3, np.float32)) == 1.0
+        np.testing.assert_array_equal(feeds[-1]["state"], np.zeros((2, 1, 128), np.float32))
+        np.testing.assert_array_equal(feeds[-1]["input"][0, :64], np.zeros(64, np.float32))
+        np.testing.assert_array_equal(runtime._audio_context, np.full(64, 3, np.float32))
+    finally:
+        runtime.close()

@@ -176,11 +176,12 @@ def test_module_import_has_no_pyav_or_ascend_dependency():
     assert result.returncode == 0, result.stderr
 
 
-def test_ffmpeg_resolution_order_and_child_only_library_path(tmp_path: Path):
+def test_ffmpeg_resolution_order_and_child_only_library_path(tmp_path: Path, monkeypatch):
     explicit = _executable(tmp_path / "explicit" / "ffmpeg")
     prefix = tmp_path / "private"
     prefixed = _executable(prefix / "bin" / "ffmpeg")
     (prefix / "lib").mkdir()
+    monkeypatch.setattr(Path, "is_dir", lambda path: path == prefix / "lib")
     environment = {
         "IBROBOT_ASCEND_FFMPEG": str(explicit),
         "IBROBOT_ASCEND_FFMPEG_PREFIX": str(prefix),
@@ -307,10 +308,11 @@ def test_wrapper_isolation_preserves_ascend_device_variables(tmp_path: Path):
     assert "ASCEND_TOOLKIT_HOME" not in child
 
 
-def test_standard_ascend_wrapper_honors_explicit_prefix(tmp_path: Path):
+def test_standard_ascend_wrapper_honors_explicit_prefix(tmp_path: Path, monkeypatch):
     wrapper = Path("/usr/bin/ffmpeg-ascend")
     prefix = tmp_path / "explicit-ffmpeg"
     (prefix / "lib").mkdir(parents=True)
+    monkeypatch.setattr(Path, "is_dir", lambda path: path == prefix / "lib")
     environment = {
         "IBROBOT_ASCEND_FFMPEG_PREFIX": str(prefix),
         "ASCEND_TOOLKIT_HOME": "/cann-8.3",

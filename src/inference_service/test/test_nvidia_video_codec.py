@@ -25,6 +25,18 @@ from inference_service.video_codec import (
 )
 
 
+def test_probe_treats_driver_ffmpeg_error_as_unavailable(monkeypatch):
+    import av
+
+    from observation_transport import nvidia_video_codec
+
+    def unavailable(*args, **kwargs):
+        raise av.error.UnknownError(1313558101, "device unavailable")
+
+    monkeypatch.setattr(nvidia_video_codec, "_create_nvenc_context", unavailable)
+    assert probe_nvidia_codec("encoder") is None
+
+
 class _Packet:
     def __init__(self, payload: bytes, pts: int, *, keyframe: bool) -> None:
         self._payload = payload

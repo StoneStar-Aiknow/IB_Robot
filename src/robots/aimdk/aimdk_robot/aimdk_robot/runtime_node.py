@@ -289,6 +289,7 @@ class AimdkRuntimeNode(Node):
         self.create_timer(1.0, self._check_clock_skew, callback_group=self._client_cb)
         self.create_timer(0.2, self._check_feedback, callback_group=self._client_cb)
         self.create_timer(5.0, self._recheck_hand_type, callback_group=self._client_cb)
+        self._startup_cancel = threading.Event()
         self._startup_thread = threading.Thread(target=self._startup_checks, daemon=True)
         self._startup_thread.start()
 
@@ -404,6 +405,15 @@ class AimdkRuntimeNode(Node):
         self._setup_processed_audio_if_declared(topics)
         if self._state.has_capability("localization.pose") and topics.get("localization_pose"):
             self._setup_localization(topics)
+        if "x2.mc.leg_odometry" in self._speech_description["interfaces"] and topics.get("leg_odometry"):
+            from nav_msgs.msg import Odometry  # noqa: PLC0415
+
+            # Preserve source frames, covariance and capture time; do not invent TF.
+            endpoint = self._speech_description["interfaces"]["x2.mc.leg_odometry"]["endpoint"]
+            self._odom_pub = self.create_publisher(Odometry, endpoint, _RELIABLE_QOS)
+            self.create_subscription(
+                Odometry, str(topics["leg_odometry"]), self._odom_pub.publish, self._vendor_qos("leg_odometry")
+            )
 
     def _setup_audio_capture(self, audio_capture_type: Any, topics: dict[str, Any]) -> None:
         """Republish vendor microphone audio on the project's audio contract."""
@@ -722,6 +732,10 @@ class AimdkRuntimeNode(Node):
         # The command channels themselves are the data plane's: it subscribes
         # them, applies the mode, admission and navigation gate this runtime
         # reports in its control word, and reports what it refused.
+        if any(name in self._speech_description["interfaces"] for name in ("x2.mc.state", "x2.mc.locomotion_profiles")):
+            from aimdk_robot.mc_queries import McQueries  # noqa: PLC0415
+
+            self._mc_queries = McQueries(self, self._speech_description["interfaces"])
 
         if self._state.has_capability("interaction.tts"):
             self.create_service(SpeakText, SPEAK_SERVICE, self._on_speak, callback_group=self._service_cb)
@@ -808,10 +822,12 @@ class AimdkRuntimeNode(Node):
         deadline = time.time() + float(self.get_parameter("startup_timeout_s").value)
         required = [("SetMcAction", self._set_action), ("SetMcInputSource", self._set_input)]
         missing = []
-        while time.time() < deadline:
+        while time.time() < deadline and not self._startup_cancel.is_set():
             missing = [name for name, client in required if not client.ready(0.5)]
             if not missing:
                 break
+        if self._startup_cancel.is_set():
+            return
         if missing:
             self._set_fault(
                 "startup", f"vendor services unavailable: {', '.join(missing)}", lifecycle=LIFECYCLE_FAULTED
@@ -820,8 +836,10 @@ class AimdkRuntimeNode(Node):
             return
         # The data plane is half of this runtime: without its report there is no
         # feedback, no hand type from the state stream and no command output.
-        while time.time() < deadline and not self._dataplane_reporting():
+        while time.time() < deadline and not self._dataplane_reporting() and not self._startup_cancel.is_set():
             time.sleep(0.05)
+        if self._startup_cancel.is_set():
+            return
         if not self._dataplane_reporting():
             self._set_fault(
                 "startup",
@@ -830,11 +848,15 @@ class AimdkRuntimeNode(Node):
             )
             self._state.set_lifecycle(LIFECYCLE_FAULTED)
             return
-        if not self._verify_hand_type():
+        if not self._verify_hand_type() or self._startup_cancel.is_set():
             return
         if not self._register_input_source():
+            if self._startup_cancel.is_set():
+                return
             self._set_fault("arbitration", "vendor input source registration failed; commands would be discarded")
             self._state.set_lifecycle(LIFECYCLE_DEGRADED)
+            return
+        if self._startup_cancel.is_set():
             return
         self._state.set_lifecycle(LIFECYCLE_ACTIVE)
         # Faults observed while CONNECTING (a quiet feedback source, a
@@ -856,9 +878,13 @@ class AimdkRuntimeNode(Node):
         a service that reports NONE while the state stream reports a real hand
         type has simply been asked too early.
         """
+        if not self._vendor.get("hand"):
+            return True
         declared = "claw" if self._hand_type == "claw" else "dexterous"
         reported: list[int] = []
         if self._get_hand_type.ready(2.0):
+            if self._startup_cancel.is_set():
+                return False
             result = self._get_hand_type.call(vg.hand_type_request(self))
             if result.ok and result.response is not None:
                 reported = [
@@ -920,6 +946,12 @@ class AimdkRuntimeNode(Node):
             return
         self._verify_hand_type()
 
+    def destroy_node(self):
+        # Join startup before destroying the clients it may still be waiting on.
+        self._startup_cancel.set()
+        self._startup_thread.join()
+        return super().destroy_node()
+
     def _register_input_source(self) -> bool:
         """ADD, then ENABLE — the SDK's documented registration sequence.
 
@@ -940,7 +972,11 @@ class AimdkRuntimeNode(Node):
                 action_value=action,
             )
 
+        if self._startup_cancel.is_set():
+            return False
         self._set_input.call(request(vg.INPUT_ACTION_ADD))
+        if self._startup_cancel.is_set():
+            return False
         if not self._set_input.call(request(vg.INPUT_ACTION_ENABLE)).ok:
             return False
         with self._lock:
@@ -1092,7 +1128,13 @@ class AimdkRuntimeNode(Node):
             response.message = mismatch
             response.valid_transitions = sorted(self._modes.valid_transitions())
             return response
-        ok, detail = self._request_vendor_mode(target, epoch)
+        try:
+            ok, detail = self._request_vendor_mode(target, epoch)
+        except projection.ProjectionError as error:
+            response.success = False
+            response.message = str(error)
+            response.valid_transitions = sorted(self._modes.valid_transitions())
+            return response
         if not ok:
             response.success = False
             response.message = detail

@@ -43,6 +43,7 @@ NODE_STAGGER_S = 0.6
 
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("aimdk_robot", LaunchConfiguration("profile").perform(context))
+    profile_path = profile_path.resolve()
     profile = load_profile(profile_path)
     use_sim, sim_platform = resolve_sim_selection(
         profile,
@@ -63,6 +64,9 @@ def _launch_setup(context, *_args, **_kwargs):
     simulated = use_sim
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
+
+    if simulated and sim_platform != "sdk":
+        raise ValueError("aimdk_robot supports only the sdk protocol mock; use aimdk_mujoco for standalone physics")
 
     def runtime_node(description_json: str = "") -> Node:
         return Node(

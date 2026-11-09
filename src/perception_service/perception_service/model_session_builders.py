@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 
 from inference_manifest import TorchRuntimeProfile
 from inference_service.backends import RuntimeContext
@@ -55,11 +56,16 @@ def build_perception_session(
     if context.backend == "ascend":
         device_id = _ascend_device_id(model_type, adapter, context, options, {"device_id"})
         runtime_manager = getattr(providers, "acl_runtime_provider", None) if providers is not None else None
+        session_options = {
+            "device_id": device_id,
+            "runtime_manager": runtime_manager,
+            "priority_scheduling": context.priority_scheduling,
+        }
         if model_type == "siglip2":
-            return SigLIP2AscendSession(device_id=device_id, runtime_manager=runtime_manager)
+            return SigLIP2AscendSession(**session_options)
         if model_type == "sam2" and adapter.identity.operation == "automatic":
-            return SAM2AutomaticAscendSession(device_id=device_id, runtime_manager=runtime_manager)
-        return AscendOmModelSession(device_id=device_id, runtime_manager=runtime_manager)
+            return SAM2AutomaticAscendSession(**session_options)
+        return AscendOmModelSession(**session_options)
     if context.backend == "torch":
         if options:
             raise ValueError(
@@ -98,6 +104,7 @@ def build_graspgen_session(
     return GraspGenAscendSession(
         device_id=device_id,
         config=adapter.config,
+        priority_scheduling=context.priority_scheduling,
         runtime_manager=(getattr(providers, "acl_runtime_provider", None) if providers is not None else None),
     )
 
@@ -124,6 +131,55 @@ def build_graspgenx_session(
     return _cuda_torch_session(context, "GraspGenX")
 
 
+def _warm_custom_ascend_operators() -> None:
+    """Pay the custom operators' per-process cost here, not on the first grasp.
+
+    CANN resolves a custom operator's kernel once per process per operator, and
+    on an Ascend 310P that resolution costs seconds even when the kernel comes
+    from the packaged binaries: 6.4 s, 3.4 s and 3.4 s measured on an idle
+    board. It is paid on the first *call*, so without this it lands on the
+    first grasp the robot is asked for -- 12.3 s for a request that then takes
+    300 ms, once per model-service lifetime.
+
+    The cost does not depend on the input, which is what makes a warmup work: a
+    64-point call pays it in full, and the real 3500-point request afterwards
+    costs 1.2 ms, 1.5 ms and 0.9 ms. So this calls each operator once with the
+    smallest input that exercises it.
+
+    Failure here is logged and swallowed. A warmup that cannot run is a slow
+    first grasp, which is what the code did before; refusing to serve would
+    turn a latency problem into an outage.
+    """
+    try:
+        import numpy as np
+        import torch
+
+        from torch_models.graspgenx_ascend_310p.custom_ops.grid_encode import grid_encode
+        from torch_models.graspgenx_ascend_310p.custom_ops.submconv3d import build_subm_map, subm_conv3d
+
+        points = 64
+        rng = np.random.default_rng(0)
+        # Distinct voxels: build_subm_map's coordinate-only lookup requires
+        # unique rows, and a random draw would repeat them.
+        flat = rng.choice(64**3, size=points, replace=False)
+        grid = np.stack([flat // 4096, (flat // 64) % 64, flat % 64], axis=1).astype(np.int32)
+        coordinates = torch.from_numpy(grid).npu().contiguous()
+        indices = torch.from_numpy(np.concatenate([np.zeros((points, 1), np.int32), grid], axis=1)).npu().contiguous()
+        features = torch.randn(points, 32).half().npu().contiguous()
+        weight = torch.randn(27, 32, 32).half().npu().contiguous()
+
+        grid_encode(coordinates, 6)
+        neighbours = build_subm_map(indices, 3)
+        subm_conv3d(features, indices, weight, None, 3, neighbours)
+        torch.npu.synchronize()
+    except Exception as exc:  # noqa: BLE001 - a warmup must not fail a load
+        logging.getLogger(__name__).warning(
+            "could not warm the custom Ascend operators (%s); the first request will pay their "
+            "per-process resolution instead",
+            exc,
+        )
+
+
 def _npu_torch_session(context: RuntimeContext, label: str) -> TorchModelSession:
     """A Torch session on an Ascend device, taking no runtime options.
 
@@ -134,7 +190,13 @@ def _npu_torch_session(context: RuntimeContext, label: str) -> TorchModelSession
     if context.runtime_options:
         raise ValueError(f"{label} Torch deployment does not accept runtime options: {sorted(context.runtime_options)}")
     model_type = context.model_type
-    return TorchModelSession(lambda runtime_context: _load_torch_module(model_type, runtime_context))
+
+    def load(runtime_context):
+        module = _load_torch_module(model_type, runtime_context)
+        _warm_custom_ascend_operators()
+        return module
+
+    return TorchModelSession(load)
 
 
 def _cuda_torch_session(context: RuntimeContext, label: str) -> TorchModelSession:

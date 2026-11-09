@@ -204,6 +204,53 @@ def test_voice_tts_without_a_binding_keeps_the_audio_io_path(tmp_path, monkeypat
     assert parameters["playback_sample_rate"] == 24000
 
 
+def test_voice_tts_publishes_audio_data_unless_the_config_names_the_speaker_type(tmp_path, monkeypatch):
+    # A bound speaker keeps receiving AudioData unless the deployment names another type: the
+    # ALSA speaker is projected as AudioDataStamped while audio_play is documented to take AudioData.
+    config = _bound_tts_config(_bound_audio_output())
+    default = _playback_parameters(voice_tts.generate_voice_tts_nodes(config))
+    assert default["audio_message_type"] == "audio_common_msgs/msg/AudioData"
+
+    config["voice_tts"]["audio_message_type"] = "audio_common_msgs/msg/AudioDataStamped"
+    stamped = _playback_parameters(voice_tts.generate_voice_tts_nodes(config))
+    assert stamped["audio_message_type"] == "audio_common_msgs/msg/AudioDataStamped"
+
+
+def test_voice_tts_resampling_to_the_speaker_rate_is_opt_in(tmp_path, monkeypatch):
+    config = _bound_tts_config(_bound_audio_output(sample_rate_hz=16000, channels=1))
+    assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is False
+
+    config["voice_tts"]["resample_to_playback_rate"] = True
+    assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["resample_to_playback_rate"] is True
+
+
+def _decode_launch_json_string(raw_value):
+    """Launch quotes a string that holds YAML-special characters; strip that before parsing."""
+    normalized = raw_value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1]
+    import json
+
+    return json.loads(normalized)
+
+
+def test_voice_tts_forwards_the_bound_speaker_qos(tmp_path, monkeypatch):
+    """The speaker's subscription QoS is part of the contract: the X2 runtime subscribes best_effort."""
+    speaker_qos = {"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 10}
+    config = _bound_tts_config(_bound_audio_output(qos=speaker_qos))
+
+    parameters = _playback_parameters(voice_tts.generate_voice_tts_nodes(config))
+
+    assert _decode_launch_json_string(parameters["audio_qos_json"]) == speaker_qos
+
+
+def test_voice_tts_without_a_declared_qos_keeps_the_node_default(tmp_path, monkeypatch):
+    # A speaker that declares no qos must keep the node's rclpy default rather than inherit one.
+    config = _bound_tts_config(_bound_audio_output())
+
+    assert _playback_parameters(voice_tts.generate_voice_tts_nodes(config))["audio_qos_json"].strip("'") == ""
+
+
 def test_voice_tts_builder_passes_num_steps_to_the_session(monkeypatch, tmp_path):
     """The flow step count must be reachable from YAML.
 
@@ -254,3 +301,62 @@ def test_voice_tts_builder_leaves_num_steps_to_the_bundle_when_unset(monkeypatch
     options = _runtime_options(nodes[0])
 
     assert "num_steps" not in options
+def _additional_env(node):
+    """Node.additional_env holds (name, value) substitution pairs, not plain strings."""
+
+    def text(value):
+        return "".join(getattr(item, "text", str(item)) for item in value)
+
+    return {text(name): text(value) for name, value in (node.additional_env or ())}
+
+
+def _manifest_with_profiles(monkeypatch, *, role_runtime_profiles=None, runtime_profile=None):
+    import sys
+    import types
+
+    deployment = types.SimpleNamespace(role_runtime_profiles=role_runtime_profiles, runtime_profile=runtime_profile)
+    module = types.ModuleType("inference_manifest")
+    module.load_inference_manifest = lambda *_args, **_kwargs: types.SimpleNamespace(deployment=deployment)
+    monkeypatch.setitem(sys.modules, "inference_manifest", module)
+
+
+def _model_host(nodes):
+    return next(node for node in nodes if node._Node__node_executable == "model_service_node")
+
+
+def test_ascend_deployment_runs_under_the_cann_abi_its_om_declares(monkeypatch, tmp_path):
+    """The OM is built against one CANN ABI; the node must not inherit the caller's toolkit."""
+    from types import SimpleNamespace
+
+    from voice_tts_service import cann_runtime
+
+    toolkit = tmp_path / "cann" / "8.1.RC1"
+    (toolkit / "lib64").mkdir(parents=True)
+    (tmp_path / "cann" / "latest").mkdir()
+    monkeypatch.setattr(cann_runtime, "CANN_INSTALL_ROOT", tmp_path / "cann")
+    ascend = SimpleNamespace(backend="ascend", target=SimpleNamespace(runtime_abi="cann-8.1.RC1"))
+    _manifest_with_profiles(monkeypatch, role_runtime_profiles={"text_encoder": ascend})
+
+    host = _model_host(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
+
+    assert _additional_env(host)["ASCEND_TOOLKIT_HOME"] == str(toolkit)
+
+
+def test_non_ascend_deployment_gets_no_cann_environment(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    _manifest_with_profiles(monkeypatch, runtime_profile=SimpleNamespace(backend="onnxruntime", target=None))
+
+    host = _model_host(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
+
+    assert _additional_env(host) == {}
+
+
+def test_the_playback_node_writes_pcm_the_way_the_bound_speaker_asks(tmp_path, monkeypatch):
+    paced_output = _bound_audio_output(write_chunk_ms=200, prebuffer_ms=1000)
+    paced = _playback_parameters(voice_tts.generate_voice_tts_nodes(_bound_tts_config(paced_output)))
+    assert (paced["chunk_ms"], paced["prebuffer_ms"]) == (200, 1000)
+
+    # A speaker that declares nothing leaves the node on its own defaults.
+    unpaced = _playback_parameters(voice_tts.generate_voice_tts_nodes(_bound_tts_config(_bound_audio_output())))
+    assert "chunk_ms" not in unpaced and "prebuffer_ms" not in unpaced

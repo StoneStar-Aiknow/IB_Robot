@@ -118,9 +118,7 @@ def plan(profile: dict[str, Any]) -> dict[str, Any]:
         ],
         "hand_state": hand_state,
         "arm_command": endpoint("arm_command", topics["arm_command"]) if echo and topics.get("arm_command") else None,
-        "upper_body_command": endpoint(
-            "upper_body_command", topics.get("upper_body_command", "/mc/upper_body_command")
-        ),
+        "upper_body_command": endpoint("upper_body_command", topics.get("upper_body_command", "")),
         "locomotion_command": endpoint(
             "locomotion_command", topics.get("locomotion_command", "/aima/mc/locomotion/velocity")
         ),

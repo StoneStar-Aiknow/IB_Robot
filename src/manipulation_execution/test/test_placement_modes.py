@@ -10,17 +10,19 @@ from sensor_msgs.msg import Image, JointState
 from ibrobot_msgs.action import PlaceObject
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from ibrobot_msgs.srv import GroundingDetect, SegmentDetections
-from manipulation_execution.placement_executor_node import (
+from manipulation_execution.place.containment import (
+    evaluate_mask_arrays,
+    evaluate_mask_containment,
+    load_exclusion_mask,
+    normalized_polygon_mask,
+)
+from manipulation_execution.place.node import (
     PlacementExecutorNode,
     PlacementFlowError,
     PlacementState,
     PrimitiveFlowError,
-    _load_exclusion_mask,
-    _normalized_polygon_mask,
-    evaluate_mask_arrays,
-    evaluate_mask_containment,
 )
-from manipulation_execution.placement_replay import audit_placement_evidence
+from manipulation_execution.place.replay import audit_placement_evidence
 
 
 def _mask(array: np.ndarray) -> Image:
@@ -139,7 +141,7 @@ def test_mask_array_replay_matches_ros_mask_containment():
 
 
 def test_normalized_gripper_exclusion_mask_scales_to_wrist_frame():
-    mask = _normalized_polygon_mask(
+    mask = normalized_polygon_mask(
         (360, 640),
         [[[0.59, 0.70], [0.73, 0.70], [0.73, 1.0], [0.59, 1.0]]],
     )
@@ -172,7 +174,7 @@ def test_external_sam_mask_is_loaded_and_resized(tmp_path):
     path = tmp_path / "gripper_mask.png"
     PILImage.fromarray(source).save(path)
 
-    result = _load_exclusion_mask(str(path), (8, 12))
+    result = load_exclusion_mask(str(path), (8, 12))
 
     assert result.shape == (8, 12)
     assert result.dtype == bool
@@ -198,7 +200,7 @@ def test_target_exclusion_mask_is_cached_per_frame_shape(monkeypatch):
         calls.append((path, shape))
         return expected
 
-    monkeypatch.setattr("manipulation_execution.placement_executor_node._load_exclusion_mask", load_mask)
+    monkeypatch.setattr("manipulation_execution.place.node.load_exclusion_mask", load_mask)
 
     first = node._target_exclusion_mask(image)
     second = node._target_exclusion_mask(image)

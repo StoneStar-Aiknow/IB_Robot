@@ -16,8 +16,8 @@ from aimdk_grasp.proposer import NO_EXECUTABLE_CANDIDATE, PerceptionSettings, X2
 from aimdk_grasp.scene_estimation import SceneEstimate
 from aimdk_grasp.types import CameraIntrinsics, RGBDFrame
 
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure, Observation
-from manipulation_execution.grasp_pipeline.perception import Detection
+from manipulation_execution.pick.pipeline.contracts import GraspFailure, Observation
+from manipulation_execution.pick.pipeline.perception import Detection
 
 SIZE, STAMP, FRAME = 50, 123_000_000, "optical"
 ON_TABLE = np.s_[20:28, 20:28]  # 0.1 m above the table

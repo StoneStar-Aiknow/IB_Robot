@@ -24,7 +24,7 @@
 | [ibrobot-lerobot-patch](./ibrobot-lerobot-patch) | 工作流 | 将 `libs/lerobot` 的本地改动导出为 `third_party/patches/lerobot/<tag>/*.patch`，并通过辅助脚本同步 `series/manifest/test`。 |
 | [ibrobot-git-flow](./ibrobot-git-flow) | 工作流 | 提交代码、推送至个人仓库、确保符合 openEuler DCO/Commit 规范。 |
 | [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓。 |
-| [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓。 |
+| [ibrobot-verify-oee](./ibrobot-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) 环境中验证 setup.sh + build.sh：本机有 ascend-vm 时用 ascend-vm，否则用 Docker 容器；作者侧 `[WIP]` PR 暂缓。 |
 | [sync-github](./sync-github) | 工作流 | 将 IB_Robot 仓库的 origin 远端（个人 AtomGit fork）的 master 分支同步推送到 GitHub 远端。 |
 | [skill-creator](./skill-creator) | 工作流 | 新建/重构 Agent skill，按 agentskills.io 规范编写 SKILL.md，校验 frontmatter 与渐进式披露。 |
 | [oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg) | 板端 | 为 OpenHarmony 板交叉编译移植第三方 ROS 2 包（如 usb_cam）。 |
@@ -69,7 +69,7 @@
 - **LeRobot 补丁纳管 ([ibrobot-lerobot-patch](./ibrobot-lerobot-patch))**: 把 `libs/lerobot` 的本地改动回收为受管 patch 栈，而不是直接提交子模块 gitlink。
 - **工程规范 ([ibrobot-git-flow](./ibrobot-git-flow))**: 自动化执行开源社区繁琐的提交规范校验。
 - **容器验证 ([ibrobot-docker-verify](./ibrobot-docker-verify))**: 在全新 Ubuntu 22.04 Docker 容器中运行 setup.sh 和 build.sh；作者侧门禁先询问 WIP/正式检视，`[WIP]` 暂缓验证。
-- **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器中验证 setup.sh + build.sh；作者侧 `[WIP]` PR 暂缓。
+- **openEuler 验证 ([ibrobot-verify-oee](./ibrobot-verify-oee))**: 在 openEuler Embedded aarch64 环境中验证 setup.sh + build.sh（本机有 ascend-vm 时用 ascend-vm，否则用 Docker 容器）；作者侧 `[WIP]` PR 暂缓。
 - **OH 交叉编译移植 ([oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg))**: 将第三方 ROS 2 包（如 usb_cam）通过 Docker 交叉编译工具链移植到 OpenHarmony 板，覆盖克隆、编译、部署、板端验证和 launch 集成全流程。
 - **OH 内核重编 ([oh-rebuild-kernel](./oh-rebuild-kernel))**: 重新编译并刷入 OpenHarmony 板的 Linux 内核 (boot_linux.img)，用于启用 USB ACM（SO-101 机械臂）、游戏手柄等内核驱动。
 

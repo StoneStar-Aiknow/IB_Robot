@@ -101,6 +101,9 @@ VENDOR_SKILL_ACTIONS: frozenset[str] = frozenset(
 
 VENDOR_ACTIONS: frozenset[str] = VENDOR_MOTION_MODES | VENDOR_SKILL_ACTIONS
 
+# MC-only interface: no upper-body streaming receiver or recovery-action contract.
+MC_MOTION_MODES = (VENDOR_MOTION_MODES - {"HEAD_ONLY", "UPPERBODY_REMOTE_SPLIT"}) | {"LOCOMOTION_STEP"}
+
 # (motion, area) pairs the platform actually maps to an animation
 # (Interface/control_mod/preset_motion.html). Since v0.8.0 `area` is no longer
 # a body region — "area 原有的分区概念已经弱化, 仅和 motion 联合使用映射具体
@@ -319,12 +322,17 @@ def is_fresh(command_stamp_s: float, now_s: float, window_s: float) -> bool:
 
 def mode_action(profile: dict[str, Any], mode: str) -> str:
     """Vendor MC motion mode required by a runtime mode."""
-    actions = (profile.get("vendor") or {}).get("mc_actions") or {}
+    vendor = profile.get("vendor") or {}
+    actions = vendor.get("mc_actions") or {}
     try:
         action = str(actions[mode])
     except KeyError as exc:
         raise ProjectionError(f"profile declares no vendor MC action for mode {mode!r}") from exc
-    if action not in VENDOR_MOTION_MODES:
+    motion_api = vendor.get("motion_api", "upper_body")
+    if motion_api not in ("mc", "upper_body"):
+        raise ProjectionError(f"unsupported vendor motion API: {motion_api!r}")
+    supported = MC_MOTION_MODES if motion_api == "mc" else VENDOR_MOTION_MODES
+    if action not in supported:
         raise ProjectionError(
             f"mode {mode!r} maps to {action!r}, which the platform does not register as a motion mode"
         )

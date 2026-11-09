@@ -1,0 +1,7 @@
+schema_version: 1
+name: unitree_g1_arm_presets
+robot_name: unitree_g1_arm_presets
+enabled_skills:
+  - name: arms_horizontal
+    implementation: g1_preset_v1
+    planner_visible: true

@@ -3,15 +3,15 @@ from typing import Any, cast
 
 import pytest
 
-import manipulation_execution.phases.planning as planning_module
-from manipulation_execution.grasp_geometry import CandidatePlan
-from manipulation_execution.pick_executor_models import (
+import manipulation_execution.pick.phases.planning as planning_module
+from manipulation_execution.pick.candidate_geometry import CandidatePlan
+from manipulation_execution.pick.models import (
     BaseSceneGeometry,
     CandidateSelectionDiagnostics,
     PickFlowError,
     PlannerSceneGeometry,
 )
-from manipulation_execution.pick_executor_node import PickExecutorNode
+from manipulation_execution.pick.node import PickExecutorNode
 
 
 def _candidate(index: int):

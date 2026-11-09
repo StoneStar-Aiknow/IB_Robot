@@ -523,7 +523,7 @@ class SpeechDirectionPipeline:
         angle = int(self.srp.angles[int(np.argmax(acc))])
         return angle, acc
 
-    def _reset_temporal_context(self) -> None:
+    def _reset_temporal_context(self, *, reset_backend: bool = True) -> None:
         """清除只能跨连续样本复用的状态，不回退会话级输出序号。"""
         self._state = "IDLE"
         self._seg_scores = []
@@ -536,7 +536,7 @@ class SpeechDirectionPipeline:
         self._enh_full4_total = 0
         self._enh_full4_dropped = 0
         self._prev_block = np.zeros((self.hop_size, 4), dtype=np.float32)
-        self.speech_gate.reset()
+        self.speech_gate.reset(reset_backend=reset_backend)
 
     def reset_for_gap(self, *, next_capture_sample: int, dropped_samples: int) -> None:
         """采集缺口后丢弃未完成段，并从新的绝对采样位置冷启动。"""
@@ -545,9 +545,13 @@ class SpeechDirectionPipeline:
         self._reset_temporal_context()
         self._samples_processed = int(next_capture_sample)
 
-    def reset(self):
+    def reset_host(self) -> None:
+        """Clear host history while Handle resets the separately owned Sessions."""
+        self.reset(reset_backend=False)
+
+    def reset(self, *, reset_backend: bool = True):
         """重置状态机与缓冲(冷启动 / 长停顿后复位)。"""
-        self._reset_temporal_context()
+        self._reset_temporal_context(reset_backend=reset_backend)
         self._seg_seq = 0
         self._output_seq = 0
         self._seg_history = []

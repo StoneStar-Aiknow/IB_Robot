@@ -450,7 +450,8 @@ Output Core::tick(double now)
   out.sequence = ++sequence_;
   const auto action = plan_.mc_actions.find(control_.mode);
   const bool locomotion = action != plan_.mc_actions.end() &&
-    (action->second == "STAND_DEFAULT" || action->second == "LOCOMOTION_DEFAULT");
+    (action->second == "STAND_DEFAULT" || action->second == "LOCOMOTION_DEFAULT" ||
+    action->second == "LOCOMOTION_STEP");
   if (locomotion) {
     if (!twist_) {
       return out;

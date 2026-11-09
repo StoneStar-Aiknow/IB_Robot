@@ -11,13 +11,21 @@ import numpy as np
 import pytest
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.joints import LEFT_HAND
-from aimdk_grasp.omnihand import CONTACT_LAG_RAD, FINGERS, HAND_HZ, RIGHT_DUMMY, OmniHandEffector, left_touch_levels
+from aimdk_grasp.omnihand import (
+    CONTACT_LAG_RAD,
+    FINGERS,
+    GRIP_LOST_S,
+    HAND_HZ,
+    RIGHT_DUMMY,
+    OmniHandEffector,
+    left_touch_levels,
+)
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS, RELEASE
 
-from manipulation_execution.grasp_pipeline.contracts import EffectorAction
-from manipulation_execution.grasp_pipeline.ros_stream import RosStreamIO, bind_stream
-from manipulation_execution.grasp_pipeline.streaming import JointSample
+from manipulation_execution.pick.pipeline.contracts import EffectorAction
+from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, bind_stream
+from manipulation_execution.pick.pipeline.streaming import JointSample
 from robot_runtime.interface_description import build_description
 from robot_runtime.profile import load_profile
 
@@ -155,6 +163,29 @@ def test_thumb_and_one_finger_on_the_object_is_a_grip(mapping):
     contacts = outcome.report["contacts"]
     assert set(contacts) >= {"thumb", "index"} and contacts["thumb"]["by"] == "touch"
     assert outcome.confidence == pytest.approx(len(contacts) / 5)
+
+
+@pytest.mark.parametrize("touch_sensor", [True, False])
+def test_a_grip_whose_fingers_close_onto_their_command_has_lost_the_object(mapping, touch_sensor):
+    """Pressing fingers trail their frozen command (or read touch); slipped out, they reach it."""
+    hand = SimHand(mapping.preset("open"), touch_sensor=touch_sensor)
+    effector = OmniHandEffector(hand, mapping)
+    assert effector.holding() is None  # nothing gripped yet
+    close, open_hand = mapping.preset("close"), mapping.preset("open")
+    for finger in ("thumb", "middle"):
+        flex = FINGERS[finger][1]
+        hand.block(finger, open_hand[flex] + 0.4 * (close[flex] - open_hand[flex]), touch=touch_sensor)
+    assert act(effector, EffectorAction.CLOSE).held is True
+    for _ in range(20):
+        hand.wait(0.02)
+        assert effector.holding() == ""  # held: the object keeps the fingers back
+    hand.blocks.clear()
+    hand.touching.clear()  # it slips out
+    hand.wait(0.1)
+    assert effector.holding() == ""  # not lost at the first look
+    hand.wait(GRIP_LOST_S + 0.01)
+    assert "no longer press" in effector.holding()
+    assert act(effector, EffectorAction.RELEASE).succeeded and effector.holding() is None
 
 
 def test_a_close_that_touches_nothing_holds_nothing(mapping):

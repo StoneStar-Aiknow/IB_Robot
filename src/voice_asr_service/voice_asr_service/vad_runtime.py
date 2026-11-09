@@ -11,6 +11,7 @@ from inference_service.backends import RuntimeContext
 from inference_service.runtime_composition import build_runtime_dependencies
 from inference_service.unified_runtime import (
     ExecutionContext,
+    ExecutionFailureFactory,
     ModelRequest,
     ModelRuntimeHandle,
     OwnedComponent,
@@ -101,8 +102,17 @@ class ManifestVadRuntime:
             self._handle.load()
             self._stream = self._handle.open_stream(ExecutionContext("voice-asr-vad-open"))
             self._audio_context.fill(0)
-        except Exception:
-            self.close()
+        except Exception as exc:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                failure = ExecutionFailureFactory().from_exception(
+                    exc,
+                    code=getattr(exc, "code", "vad_initialization_failed"),
+                    details={"close_pending": True, "rollback_errors": (str(cleanup_error),)},
+                )
+                failure.cleanup_owner = self
+                raise failure from exc
             raise
 
     @property
@@ -139,28 +149,21 @@ class ManifestVadRuntime:
 
     def reset(self) -> None:
         if self._handle is not None and self._stream is not None:
-            self._handle.reset_stream(self._stream, ExecutionContext(f"voice-asr-vad-reset-{self._request_id}"))
+            self._handle.reset(ExecutionContext(f"voice-asr-vad-reset-{self._request_id}"))
         self._audio_context.fill(0)
 
     def close(self) -> None:
-        error = None
-        try:
-            if self._handle is not None:
-                self._handle.close()
-            elif self._session is not None:
-                self._session.close()
-        except Exception as exc:  # pragma: no cover - cleanup error is re-raised below
-            error = exc
-        finally:
-            self._handle = None
-            self._stream = None
-            self._session = None
-            self._context = None
-            if self._providers is not None:
-                self._providers.close()
-                self._providers = None
-        if error is not None:
-            raise error
+        if self._handle is not None:
+            self._handle.close()
+        elif self._session is not None:
+            self._session.close()
+        self._handle = None
+        self._stream = None
+        self._session = None
+        self._context = None
+        if self._providers is not None:
+            self._providers.close()
+            self._providers = None
 
 
 class _VadStreamExecutor:
@@ -180,6 +183,11 @@ class _VadStreamingAdapter:
 
     def reset_stream(self, _stream, _context):
         self._session.reset()
+
+    def reset_host_stream(self, _stream, _context):
+        # The Handle resets the separately owned Session once. Audio context
+        # belongs to ManifestVadRuntime and is cleared after that succeeds.
+        return None
 
     def close_stream(self, _stream, _context):
         return None

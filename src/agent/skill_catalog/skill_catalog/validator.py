@@ -9,6 +9,7 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from embodied_common.capability_presentation import presentation_errors
 from embodied_common.mirror_session_contract import COMMANDS as MIRROR_SESSION_COMMANDS
 from skill_catalog.models import (
     DELEGATED_ENDPOINT_KINDS,
@@ -102,6 +103,8 @@ CAPABILITY_FIELDS = frozenset(
     {
         "schema_version",
         "summary",
+        "display_name",
+        "tags",
         "domain",
         "moves_robot",
         "required_control_mode",
@@ -809,6 +812,14 @@ def _validate_capability(
                 source_relative_path=path,
                 field_path=f"capability.{field_name}",
             )
+    for field_name, message in presentation_errors(capability):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            message,
+            source_relative_path=path,
+            field_path=f"capability.{field_name}",
+        )
     if not isinstance(capability.get("moves_robot"), bool):
         _error(
             diagnostics,

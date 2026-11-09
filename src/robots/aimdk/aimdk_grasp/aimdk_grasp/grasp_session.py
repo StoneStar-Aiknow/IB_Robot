@@ -1,7 +1,7 @@
 """The X2 planner's goalset search over the grasp candidates (select_plan).
 
 Planner-independent ordering (approach_priority, enclosed_points) lives in
-manipulation_execution.grasp_pipeline.candidates.
+manipulation_execution.pick.pipeline.candidates.
 """
 
 import json

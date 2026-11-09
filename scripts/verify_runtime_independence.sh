@@ -73,15 +73,16 @@ LEKIWI_RUNTIME_MEMBERS=(
 # The X2 runtime is a bridge onto the vendor MC tier: no SDK, hardware adapter,
 # description or motion package of its own. aimdk_msgs is supplied by the
 # developer's AimDK overlay and is never vendored into this repository.
-AIMDK_RUNTIME_MEMBERS=(aimdk_robot)
+AIMDK_RUNTIME_MEMBERS=(aimdk_robot aimdk_dataplane aimdk_interfaces)
 AIMDK_EXTERNAL_PACKAGES=(aimdk_msgs)
-# The G1 runtime is a bridge onto the vendor DDS tier: no SDK or hardware
-# adapter of its own, but it owns the vendored message packages (unitree_hg /
-# unitree_go / unitree_api) and the vendored robot description, all in-tree —
-# no external overlay, unlike aimdk. unitree_go is a member for the vendored
-# family even though the current bridge does not link it yet.
+# The G1 runtime is a bridge onto the vendor DDS tier: it owns the official
+# vendor SDK adapter (unitree_g1_adapter, the single unitree_sdk2py boundary)
+# and the vendored robot description, all in-tree — no external overlay,
+# unlike aimdk. The vendored message packages (unitree_hg/unitree_go/
+# unitree_api) were removed in Issue #171 PR 2: the vendor frames come from
+# the official unitree_sdk2py through the adapter.
 UNITREE_RUNTIME_MEMBERS=(
-  unitree_g1_robot unitree_g1_description unitree_hg unitree_go unitree_api
+  unitree_g1_robot unitree_g1_description unitree_g1_adapter
 )
 # Third-party/vendored packages that may appear in a runtime closure without
 # being IB-Robot generic packages (they are not listed by `colcon list` in the

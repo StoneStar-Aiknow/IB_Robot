@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -12,7 +13,9 @@ def test_preprocessor_packs_host_views_only_for_npu(device):
     import torch
 
     session = LeRobotTorchModelSession(device)
-    session._torch = torch
+    session._torch = SimpleNamespace(is_tensor=torch.is_tensor, npu=SimpleNamespace(device=lambda _: nullcontext()))
+    session._context = SimpleNamespace(managed_execution=False)
+    session._device = device
     session._preprocessor = lambda batch: batch
     image = np.arange(4 * 5 * 3, dtype=np.float32).reshape(4, 5, 3).transpose(2, 0, 1)
     tensor = torch.from_numpy(image)
@@ -35,11 +38,66 @@ def test_preprocessor_packs_host_views_only_for_npu(device):
 def test_npu_device_name_uses_physical_sku() -> None:
     torch_module = SimpleNamespace(npu=SimpleNamespace(get_device_name=lambda index: f"Ascend310P{index + 1}"))
 
-    assert LeRobotTorchModelSession._npu_device_name(torch_module) == "Ascend310P1"
+    assert LeRobotTorchModelSession._npu_device_name(torch_module, 0) == "Ascend310P1"
+
+
+def test_lerobot_validation_failure_retains_acquired_policy_until_device_drain(tmp_path, monkeypatch):
+    from inference_manifest import TorchRuntimeProfile
+    from inference_service.backends import BackendState, RuntimeContext
+    from inference_service.unified_runtime import ExecutionFailure, ModelRuntimeHandle, RuntimeAssembly
+
+    calls = []
+    can_release = [False]
+    policy = object()
+    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "policy_preprocessor.json").write_text("{}")
+
+    def sync(_):
+        calls.append("sync")
+        if not can_release[0]:
+            raise RuntimeError("native completion pending")
+
+    modules = {
+        "torch": SimpleNamespace(
+            device=lambda name: name,
+            cuda=SimpleNamespace(is_available=lambda: True, synchronize=sync, current_device=lambda: 0),
+        ),
+        "lerobot.configs.policies": SimpleNamespace(
+            PreTrainedConfig=type(
+                "Config", (), {"from_pretrained": staticmethod(lambda *_args, **_kwargs: SimpleNamespace())}
+            )
+        ),
+        "lerobot.policies.factory": SimpleNamespace(
+            get_policy_class=lambda _: SimpleNamespace(from_pretrained=lambda *_args, **_kwargs: policy),
+            make_pre_post_processors=lambda *_args, **_kwargs: None,
+        ),
+        "torch_models.policy_provider": SimpleNamespace(resolve_policy_provider=lambda *_: None),
+    }
+    monkeypatch.setattr(LeRobotTorchModelSession, "_import_required", staticmethod(lambda name, _: modules[name]))
+    session = LeRobotTorchModelSession("cuda")
+    validated = SimpleNamespace(
+        deployment=SimpleNamespace(backend="torch", extra_parameters={}),
+        bundle_root=tmp_path,
+        manifest=SimpleNamespace(model=SimpleNamespace(interface="policy", model_type="act", operation="predict")),
+        top_level_identity=SimpleNamespace(interface="policy", model_type="act", operation="predict"),
+    )
+    context = RuntimeContext(
+        validated, runtime_profile=TorchRuntimeProfile(device="cuda"), runtime_options={"auto_horizon_enabled": True}
+    )
+    owner = ModelRuntimeHandle(RuntimeAssembly(runtime_executor=session, session=session, load_context=context))
+    with pytest.raises(ExecutionFailure, match="AutoHorizon") as failure:
+        owner.load()
+    assert not failure.value.details["cleanup_complete"]
+    assert session._policy is policy and session.health().state is BackendState.FAILED
+    assert calls == ["sync", "sync"]
+    can_release[0] = True
+    owner.close()
+    assert owner.closed and session._policy is None and calls == ["sync"] * 3
 
 
 def test_model_owned_input_hook_runs_before_lerobot_processor():
     session = LeRobotTorchModelSession("cpu")
+    session._context = SimpleNamespace(managed_execution=False)
     config = object()
     calls = []
     session._policy_config = config
@@ -64,7 +122,7 @@ def test_model_owned_input_hook_runs_before_lerobot_processor():
 
 def test_npu_device_name_fails_closed_without_api() -> None:
     with pytest.raises(BackendLoadError, match="does not expose get_device_name"):
-        LeRobotTorchModelSession._npu_device_name(SimpleNamespace(npu=SimpleNamespace()))
+        LeRobotTorchModelSession._npu_device_name(SimpleNamespace(npu=SimpleNamespace()), 2)
 
 
 def test_extra_parameters_are_passed_to_provider_without_mutating_manifest():
@@ -98,3 +156,12 @@ def test_provider_extra_parameters_cannot_disable_strict_weight_loading():
     provider = SimpleNamespace(resolve_load_options=lambda **kwargs: {"strict": False})
     with pytest.raises(ValueError, match="cannot replace"):
         LeRobotTorchModelSession._provider_load_options(provider, object(), {"anything": 1})
+
+
+def test_npu_name_uses_resolved_nonzero_device_index():
+    calls = []
+    torch_module = SimpleNamespace(
+        npu=SimpleNamespace(get_device_name=lambda index: calls.append(index) or "Ascend310P1")
+    )
+    assert LeRobotTorchModelSession._npu_device_name(torch_module, 2) == "Ascend310P1"
+    assert calls == [2]

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
+
+from inference_service.unified_runtime import OutcomeEvidence, OutcomeState
+from inference_service.unified_runtime.errors import execution_evidence, merge_execution_evidence
 
 if TYPE_CHECKING:
     from inference_service.pipeline.runtime_core import StageFrame
@@ -191,6 +195,30 @@ class PreprocessStage:
         frame.values.update(self.operation(frame.values))
 
 
+@contextmanager
+def _model_evidence(frame: StageFrame, session: object, phase: str, *, stateful: bool | None = None):
+    """Accumulate native progress across roles and iterations in this frame."""
+    previous = frame.evidence
+    if stateful is None:
+        stateful = bool(getattr(getattr(session, "capabilities", None), "stateful", False))
+    try:
+        yield
+    except Exception as exc:
+        evidence = execution_evidence(exc, started=True, stateful=stateful, unknown_on_error=True)
+        if evidence.outcome_known and evidence.state is not OutcomeState.NOT_STARTED:
+            # This Session already fenced its error, including earlier work.
+            frame._pending_completions.pop(id(session), None)
+        exc.evidence = merge_execution_evidence(previous, evidence)
+        frame.evidence = exc.evidence
+        raise
+    else:
+        if callable(getattr(session, "complete_failure", None)):
+            # Direct Torch success may return tensors before device completion.
+            # Keep this frame's participants, never the executor's idle Sessions.
+            frame._pending_completions[id(session)] = session
+        frame.evidence = OutcomeEvidence.completed(phase, state_mutated=previous.state_mutated or stateful)
+
+
 @dataclass(frozen=True)
 class ModelStage:
     role: str
@@ -213,7 +241,11 @@ class ModelStage:
             raise TypeError("ModelStage requires the native ExecutionContext")
         if frame.execution_frame is None:
             inputs = request.inputs if model_request is not None else frame.values
-            result = self.session.execute(ModelRequest(inputs, request.metadata), execution_context)
+            with _model_evidence(frame, self.session, f"model.{self.role}"):
+                result = self.session.execute(
+                    ModelRequest(inputs, request.metadata),
+                    execution_context,
+                )
             outputs = result.outputs if hasattr(result, "outputs") else result
             frame.values["_model_result"] = result
             frame.values.update(outputs)
@@ -248,13 +280,14 @@ class ModelStage:
         execute_role = getattr(self.session, "execute_role", None)
         if not callable(execute_role):
             raise TypeError(f"session {type(self.session).__name__} does not support role execution")
-        outputs = execute_role(
-            self.role,
-            selected_values,
-            ModelRequest(selected_values, request.metadata),
-            execution_context,
-            **options,
-        )
+        with _model_evidence(frame, self.session, f"model.{self.role}"):
+            outputs = execute_role(
+                self.role,
+                selected_values,
+                ModelRequest(selected_values, request.metadata),
+                execution_context,
+                **options,
+            )
         frame.execution_frame.finish_role(self.role, outputs)
         frame.values.update(
             {semantic: value for semantic, value in outputs.items() if not semantic.startswith("internal.")}

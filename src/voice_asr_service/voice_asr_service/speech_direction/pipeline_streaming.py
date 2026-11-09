@@ -81,7 +81,7 @@ class StreamingSpeechDirectionPipeline:
         )
         self._lock = threading.Lock()
         self._closed = False  # 关闭一旦开始即禁新推理（process/reset 见此即拒绝）
-        self._cleanup_complete = False  # 清理已尝试完毕（含失败项），重入据此返回
+        self._cleanup_complete = False  # 本对象负责的清理已终结，无待重试项；后端清理由其所有者负责
         self._output_seq = 0
         self._segment_seq = 0
         self._history: list[tuple[int, int, float, str]] = []
@@ -439,11 +439,18 @@ class StreamingSpeechDirectionPipeline:
         self._backend_reset_requested = False
         return requested
 
-    def reset(self) -> None:
+    def reset_host(self) -> None:
+        """Clear host history while Handle resets the separately owned Sessions."""
+        self.reset(reset_backend=False)
+
+    def reset(self, *, reset_backend: bool = True) -> None:
         with self._lock:
             if self._closed:
                 return
-            self._reset_temporal_context()
+            if not reset_backend:
+                self.fullnet.reset(reset_backend=False)
+                self.gate.reset(reset_backend=False)
+            self._reset_temporal_context(reset_backend=reset_backend)
             self._samples_processed = 0
             self._model_hop_count = 0
             self._output_seq = 0
@@ -453,14 +460,10 @@ class StreamingSpeechDirectionPipeline:
             self._backend_reset_requested = False
 
     def close(self, *, close_backends: bool = True) -> None:
-        """best-effort terminal 关闭：尽力释放 enhancer 与 Silero，一个失败仍继续关闭另一个，末尾汇总异常。
-
-        关闭一旦开始即禁新推理；重入只在清理已尝试完毕后才直接返回，
-        因此失败后再次调用并不会"重新执行整个关闭"——属 best-effort terminal，非可重试。
-        """
+        """关闭 Host 状态，保留底层明确标记为 pending 的资源供重试。"""
         with self._lock:
             if self._cleanup_complete:
-                # 清理已尝试完毕（含失败项），重入直接返回，避免重复释放已成功资源。
+                # 没有待重试资源，避免重复释放已成功资源。
                 return
             self._closed = True  # 禁新推理；释放动作放在锁外，避免持锁阻塞推理线程的退出
         errors = []
@@ -478,18 +481,22 @@ class StreamingSpeechDirectionPipeline:
                         else:
                             component.close(close_executor=False)
                 except Exception as exc:
-                    errors.append(str(exc) or type(exc).__name__)
+                    errors.append(exc)
         finally:
-            # 整个遍历已尝试完毕（含部分失败项），重入据此返回。
+            # Host 状态已关闭；底层仍有 pending 资源时保留重试入口。
             self._srp_history = np.zeros((0, 4), np.float32)
             self._scores = []
             self._rms = []
             self._input_pending = np.zeros((0, 4), np.float32)
             self._history = []
             self._block_latency_ms.clear()
-            self._cleanup_complete = True
+            self._cleanup_complete = not any(getattr(error, "close_pending", False) for error in errors)
         if errors:
-            raise RuntimeError("; ".join(errors))
+            from inference_service.backends.errors import BackendLifecycleError
+
+            raise BackendLifecycleError(
+                "; ".join(str(error) for error in errors), close_pending=not self._cleanup_complete
+            ) from errors[0]
 
     def get_segment_history(self) -> list[tuple[int, int, float, str]]:
         return list(self._history)

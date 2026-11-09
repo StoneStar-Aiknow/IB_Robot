@@ -143,6 +143,26 @@ ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
   "{file_path: '/tmp/voice_tts/output.wav'}"
 ```
 
+When the playback device runs at a different rate from ZipVoice (for example the 16 kHz speaker behind the AgiBot X2
+runtime), the robot config opts in to `resample_to_playback_rate`: the node converts the WAV in memory with an
+anti-aliased rational-ratio resampler (numpy polyphase FIR) before chunking. Channel count and sample width are never
+converted; a mismatch still returns `UNSUPPORTED_AUDIO_FORMAT`.
+
+Playback node parameters:
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `audio_topic` | `/audio/play` | PCM topic; injected by `robot_config` when bound to a runtime playback interface |
+| `audio_message_type` | `audio_common_msgs/msg/AudioData` | `AudioData` (local `audio_play`) or `AudioDataStamped` (runtime-owned speaker such as aimdk `audio.play`); anything else fails at startup |
+| `playback_sample_rate` / `playback_channels` | `24000` / `1` | Playback PCM contract |
+| `resample_to_playback_rate` | `false` | When `true`, WAVs at any rate are resampled to `playback_sample_rate` |
+| `chunk_ms` | `50` | Duration of each published chunk in milliseconds (20-200); taken from the bound speaker interface's `write_chunk_ms` when it declares one |
+| `prebuffer_ms` | `0` | Audio kept written ahead of the sample clock in milliseconds (0-2000), for the whole stream; taken from the bound speaker interface's `prebuffer_ms` when it declares one |
+| `timeout_sec` | `300.0` | Overall budget for one playback |
+
+The playback service returns when the last sample's playback time is reached, not when the last chunk is
+written: callers such as the Agent's voice bridge take the return as the end of the speech and resume listening.
+
 ### 4.3 Model lifecycle
 
 | Stage | Owner | Behavior |

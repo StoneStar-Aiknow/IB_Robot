@@ -104,7 +104,9 @@ def test_control_modes_name_runtime_modes_the_profile_declares(raw, profile):
 def test_no_audio_or_voice_stack_is_launched(raw):
     """The G1 runtime serves no audio contract (gate 6.1): every audio-bearing
     subsystem that would publish or subscribe against unserved endpoints stays
-    off, and speech goes through interaction.tts instead."""
-    assert raw["audio_io"]["enabled"] is False
+    off, and speech goes through interaction.tts instead. Audio devices are
+    runtime-owned, so no audio_io section is declared at all (the
+    runtime-owned-audio-io rule refuses one for this provider)."""
+    assert "audio_io" not in raw
     assert raw["voice_asr"]["enabled"] is False
     assert raw["voice_tts"]["enabled"] is False

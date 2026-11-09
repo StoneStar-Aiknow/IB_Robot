@@ -9,7 +9,7 @@ pytest.importorskip("zstandard")
 
 from aimdk_grasp import head_wire as wire  # noqa: E402
 
-from manipulation_execution.grasp_pipeline.contracts import (  # noqa: E402
+from manipulation_execution.pick.pipeline.contracts import (  # noqa: E402
     ArmSegment,
     Effect,
     EffectorAction,

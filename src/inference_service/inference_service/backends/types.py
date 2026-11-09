@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -24,6 +26,35 @@ from inference_manifest import (
 
 def _immutable_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
     return MappingProxyType(dict(value))
+
+
+_priority_scheduling_default = ContextVar("runtime_priority_scheduling_default", default=False)
+_managed_execution_default = ContextVar("runtime_managed_execution_default", default=False)
+
+
+def runtime_priority_scheduling_default() -> bool:
+    """Resolve the same scoped priority default for standalone Session construction."""
+    return _priority_scheduling_default.get()
+
+
+@contextmanager
+def runtime_context_defaults(*, priority_scheduling: bool, managed_execution: bool = False):
+    """Scope backend loading defaults to one public host's runtime assembly.
+
+    Plugins construct their ordinary RuntimeContext without inspecting host
+    configuration. Explicit context options override these ambient defaults.
+    """
+    if type(priority_scheduling) is not bool:
+        raise TypeError("priority_scheduling must be a bool")
+    if type(managed_execution) is not bool:
+        raise TypeError("managed_execution must be a bool")
+    token = _priority_scheduling_default.set(priority_scheduling)
+    managed_token = _managed_execution_default.set(managed_execution)
+    try:
+        yield
+    finally:
+        _priority_scheduling_default.reset(token)
+        _managed_execution_default.reset(managed_token)
 
 
 class BackendState(str, Enum):
@@ -153,14 +184,18 @@ class RuntimeContext:
 
     validated_manifest: ValidatedManifest
     runtime_options: Mapping[str, object] = field(default_factory=dict)
-    priority_scheduling: bool = False
+    priority_scheduling: bool = field(default_factory=_priority_scheduling_default.get)
     runtime_profile: RoleRuntimeProfile | BackendRuntimeProfile | None = None
     role: str | None = None
+    # Host admission/lifecycle ownership is independent of native priority streams.
+    managed_execution: bool = field(default_factory=_managed_execution_default.get)
     resolved_artifacts: Mapping[str, Path] = field(init=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.priority_scheduling, bool):
             raise TypeError("priority_scheduling must be a bool")
+        if type(self.managed_execution) is not bool:
+            raise TypeError("managed_execution must be a bool")
         deployment = self.validated_manifest.deployment
         selected_profile = self.runtime_profile
         if selected_profile is None:
@@ -323,4 +358,5 @@ __all__ = [
     "BackendState",
     "InferenceRequest",
     "RuntimeContext",
+    "runtime_context_defaults",
 ]

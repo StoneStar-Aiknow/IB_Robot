@@ -18,6 +18,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import struct
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,6 +48,18 @@ FRAME = "rgbd_head_front_color_optical_frame"
 
 
 class _FakeCuda:
+    @staticmethod
+    def current_device():
+        return 0
+
+    @staticmethod
+    def device(_device):
+        return nullcontext()
+
+    @staticmethod
+    def synchronize(_device):
+        return None
+
     @staticmethod
     def is_available():
         return True

@@ -37,7 +37,7 @@ from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
 
-from manipulation_execution.grasp_pipeline.contracts import (  # noqa: E402
+from manipulation_execution.pick.pipeline.contracts import (  # noqa: E402
     ArmSegment,
     Effect,
     EffectorAction,
@@ -219,7 +219,10 @@ def capture(client):
 def test_a_capture_decodes_into_an_observation_the_head_keeps(ros):
     head, client = ros
     observation = capture(client)
-    assert observation.robot_state == RemoteCapture("c1", {"wait_s": 0.01})
+    assert observation.robot_state.capture_id == "c1" and observation.report is observation.robot_state.report
+    report = observation.report  # the head's breakdown and the call around it
+    assert report["wait_s"] == 0.01 and report["rpc_s"] > 0 and report["decode_s"] >= 0
+    assert report["reply_bytes"] > 0
     assert (observation.frame_id, observation.stamp_ns, observation.base_frame) == ("optical", 123, "torso_link")
     assert observation.rgb.shape == (4, 6, 3) and observation.rgb[..., 0].mean() > 190
     np.testing.assert_allclose(observation.depth_m, 0.75)

@@ -1,0 +1,19 @@
+{
+  "version": "2026.11.04-d8768b5",
+  "prefix": "/root/rtinfer-reproduction-20261104/bundle",
+  "state": {
+    "status": "not-started-this-boot"
+  },
+  "module_loaded": false,
+  "ipc": null,
+  "device_users": [],
+  "management_device_users": [
+    1469,
+    1474,
+    1476,
+    1497,
+    1498,
+    1520
+  ],
+  "compatibility": "passed"
+}

@@ -562,6 +562,9 @@ platform_install_rosdeps() {
         feetech-servo-sdk
         pyserial
         sherpa-onnx
+        # Python engines are managed in the venv, not by system rosdep packages.
+        python3-mujoco
+        python3-onnxruntime
     )
 
     # Append platform-specific skip keys

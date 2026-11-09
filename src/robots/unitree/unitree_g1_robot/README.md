@@ -1,13 +1,71 @@
 # unitree_g1_robot — Unitree G1 runtime
 
+## Preset-only development and supervised validation
+
+`g1_29dof_arm_presets` is a separate surface for the operator-selected action
+15 (`both_hands_up`, documented as arms horizontal). It advertises one named
+motion, has no hand subscriptions, hand writers, arm-stream writer, locomotion
+commands or posture actions, and starts in idle. Physical preflight uses a loco
+client for read-only FSM queries. The corresponding application
+configuration is `unitree_g1_arm_presets`; its catalog exposes `arms_horizontal`
+through the existing `runtime_named_motion` Gateway executor. It never sends
+automatic recovery action 99.
+
+**Physical execution remains disabled by default.** An explicit per-session
+`vendor.operator_validation` profile (`confirmed`, `network_interface`,
+`expected_fsm_id`) permits operator-supervised commissioning of action 15 only.
+Launch and node enforce this boundary. Before dispatch the runtime reads service
+ownership, FSM and feedback age for each independent request. A successful RPC
+completion permits a later request; concurrent dispatch is rejected. Timeout,
+transport error or exception latches an unknown outcome and prevents further
+dispatch without claiming that the robot stopped. No automatic retry is made.
+This is not a verified software emergency stop; the on-site operator
+owns the confirmed physical stopping method.
+The offline launch requires simulated transport and explicitly binds both mock
+and runtime SDKs to loopback on domain 148. No Dex3 URDF or peripheral driver is
+launched for this surface. `runtime.stop` is not advertised as a capability:
+the stop service closes local admission but reports physical stop unverified,
+and the latch cannot be cleared. A successful mock action response is software
+integration evidence, not real-robot FSM-802 compatibility or stop acceptance.
+
+Offline entry (after environment setup and build):
+
+```bash
+source .shrc_local
+ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=1 ros2 launch unitree_g1_robot runtime.launch.py \
+  profile:=g1_29dof_arm_presets use_sim:=true network_interface:=lo
+```
+
+This launches the mock/runtime pair only. The application configuration binds
+the named action through the Gateway when the embodied stack is composed; it
+does not provide a direct-SDK shortcut. The supervised physical path above was
+used for two Gateway requests in FSM 802, both reporting success. The operator
+confirmed arms horizontal followed by automatic vendor-owned recovery; no action
+99 was sent. This observation does not establish software cancellation or stop.
+
+> Arm-control correction (2026-10-28): stream entry now uses read-only service
+> ownership and FSM checks, never `SwitchToUserCtrl` (a full-body takeover).
+> `ai_sport` must already run and `g1_arm_example` must already be stopped;
+> this runtime does not switch those services. The arm frame includes waist
+> joints. Stop/exit can publish zero weight but cannot acknowledge remote
+> handover: admission stays closed (the stop latch) and the unacknowledged
+> handover is reported — `ARM_HANDOVER_UNCONFIRMED` in `faults` and in the
+> response message. A stream→idle switch still succeeds, so the public mode
+> contract holds; `SetRuntimeMode("idle")` then clears the latch and the
+> warning, and stream re-entry always runs the full admission again.
+> Real-hardware streaming acceptance remains blocked. See `ARM_CONTROL_AUDIT.md`
+> and `test/BRIDGE_COVERAGE.md`; historical claims below are not acceptance evidence.
+
 The G1's independently deployable runtime unit: it serves the **public runtime
 contract** (`/runtime_status`, `/runtime/set_mode`, `/runtime/get_status`,
 `/runtime/stop`, `/joint_states`, `/imu/data`, the declared streaming command
-channels and `/cmd_vel`) by bridging to the **vendor DDS tier** of the Unitree
-SDK (`rt/lowstate`, `rt/arm_sdk`, `rt/dex3/*` and the `rt/api/*` RPC services)
-through pure ROS 2 messages only. Generic IB-Robot packages bind the G1 exactly
-as they bind SO-101, LeKiwi or the X2 and never see a vendor topic, api id,
-FSM id or motor index.
+channels and `/cmd_vel`) by bridging to the **vendor DDS tier** of the official
+Unitree SDK (`unitree_sdk2py`: `rt/lowstate`, `rt/arm_sdk`, `rt/dex3/*` and the
+`rt/api/*` RPC services). The SDK is reached only through the ROS-free
+`unitree_g1_adapter` package — `vendor.py` is the single module that imports a
+vendor symbol — and this node's public surface is pure ROS 2 messages. Generic
+IB-Robot packages bind the G1 exactly as they bind SO-101, LeKiwi or the X2 and
+never see a vendor topic, api id, FSM id or motor index.
 
 Planning and rationale: `openspec/changes/unitree-g1-runtime-migration/`
 (`design.md` decisions D1–D12 are referenced from the profile and this README).
@@ -34,7 +92,7 @@ package.
 
 | Public surface | Type | Platform mechanism |
 |---|---|---|
-| `/runtime/set_mode`, `/runtime/get_status`, `/runtime/stop`, `/runtime_status` | contract | `rt/api/{sport,arm,voice}/{request,response}` RPC (`SetFsmId` 7101, `GetFsmId` 7001, `SwitchToUserCtrl` 7110, `SetVelocity` 7105, …), `rt/lowstate.mode_machine` |
+| `/runtime/set_mode`, `/runtime/get_status`, `/runtime/stop`, `/runtime_status` | contract | `sport`, `arm`, `voice`, `robot_state` RPC; stream uses service/FSM queries and weight frames, not full-body takeover |
 | `/joint_states` (43 joints, URDF names and order) | `sensor_msgs/JointState` | `rt/lowstate` motor states + `rt/lf/dex3/{left,right}/state`, projected through the vendor motor-index remap |
 | `/unitree_g1/arm/commands`, `/unitree_g1/waist/commands` | `Float64MultiArray` | `rt/arm_sdk`: the shared-weight 17-joint `LowCmd` frame (weight = motor_cmd[29]'s q slot, design D4) |
 | `/unitree_g1/hand_left/commands`, `/unitree_g1/hand_right/commands` | `Float64MultiArray` | `rt/dex3/{left,right}/cmd` `HandCmd` (Dex3, 7 joints per hand) |
@@ -46,38 +104,40 @@ package.
 | `/camera/head_front/**` | `sensor_msgs/Image`, `CameraInfo` | composed `realsense2_camera` driver (design D8) |
 | `/livox/lidar`, `/livox/imu` | `PointCloud2`, `Imu` | composed `livox_ros_driver2` MID-360 driver (design D8) |
 
-### Vendor QoS is part of the endpoint contract
+## DDS: two layers, two bindings
 
-Each `rt/*` endpoint carries the reliability/durability/depth the profile
-records under `vendor.qos` (design D9). A BEST_EFFORT publisher cannot serve a
-RELIABLE subscription — ROS 2 reports the incompatibility once and then
-silently discards every message — so the QoS table is profile data, and when a
-firmware changes one, the profile is corrected rather than the code. The
-shipped values are assumptions from DDS high-rate-stream conventions, marked
-`unverified` until measured with `ros2 topic info -v` on the unit (gate 6.1).
+Two DDS layers meet in this package and they are configured separately:
 
-## DDS: CycloneDDS for the whole deployment, one interface
-
-The vendor tier speaks CycloneDDS, so **the whole deployment — this runtime
-and every application node that calls its services — must run
-`rmw_cyclonedds_cpp`**: service calls do not interoperate across RMW
-implementations (topic data flows, request/response does not), so the RMW is
-set once by the deployment, never piecemeal. The launch does not set
-`RMW_IMPLEMENTATION` itself — a runtime pinned alone would strand the
-application nodes on the ambient implementation, and an environment action
-inside an included launch leaks into whatever the parent launch does after
-the include. Instead, in **real transport** the launch verifies that the
-environment already carries `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` and fails
-closed with a named error when it does not; **simulated transport** performs
-no check (the mock serves whatever RMW the ambient environment provides).
+- **the vendor tier**, inside the official SDK. The SDK owns its own
+  cyclonedds-python participants, so that layer is independent of the ROS RMW
+  and keeps working under `rmw_cyclonedds_cpp` or `rmw_fastrtps_cpp`. The
+  launch neither sets nor verifies `RMW_IMPLEMENTATION`; it only tells both
+  nodes which domain and NIC to bind (the parameters below).
+- **the deployment's own ROS graph**, between this runtime and every node that
+  calls its services. That graph is the deployment's choice of RMW: pick one
+  implementation for all of it and keep a matching `ROS_DOMAIN_ID`, because
+  service calls do not interoperate across RMW implementations (topics flow,
+  request/response does not). The runtime serves plain ROS 2 services and
+  topics, so it works under either implementation — it only has to be the same
+  one as its callers'.
 
 The `network_interface` launch argument names the NIC the robot is wired to —
-a deployment fact, never hardcoded, and CycloneDDS configuration only:
+a deployment fact, never hardcoded. It has two separate jobs:
 
-- non-empty: the launch writes a minimal CycloneDDS XML binding DDS to that
-  one interface and points `CYCLONEDDS_URI` at it;
-- empty (default): no `CYCLONEDDS_URI` is set; CycloneDDS keeps its default
-  configuration (or one provided externally).
+- **vendor tier binding**: in real transport the launch passes the name to the
+  runtime and mock nodes as `vendor_network_interface`, and the SDK builds its
+  own CycloneDDS domain configuration from it (`Domain(id, config)`), which
+  overrides `CYCLONEDDS_URI` — so the environment variable is *not* how the
+  vendor tier is isolated. Simulated transport never uses the argument: it
+  binds vendor domain `148` on `lo`, and both nodes refuse to start unless the
+  (domain, NIC) pair is consistent — a nonzero (isolated) domain with loopback,
+  or domain `0` (the robot's production domain) with the explicit robot-facing
+  NIC. Real transport without `network_interface` therefore fails closed before
+  any vendor channel opens, instead of letting the SDK autodetermine a NIC.
+- **the deployment's own ROS participants**: when non-empty, the launch writes
+  a minimal CycloneDDS XML binding them to that one interface and points
+  `CYCLONEDDS_URI` at it; when empty, no `CYCLONEDDS_URI` is set and CycloneDDS
+  keeps its default (or an externally provided) configuration.
 
 Find the interface with `ip link` (the vendor's own `setup.sh` carries an
 `enp3s0` placeholder — do not trust it). CycloneDDS fails loudly when the named
@@ -108,31 +168,35 @@ that into the robot-facing shell.
   which is why the runtime composes the shared drivers for those two (design
   D8).
 
-## Vendored material (in-tree, no overlay)
+## Vendor material (official SDK + in-tree description, no overlay)
 
-Unlike the X2/AimDK runtime, everything vendor-side is vendored in this
-repository — there is no developer-supplied overlay to build or source, and
-the independence gate runs without external dependencies:
+Unlike the X2/AimDK runtime, everything vendor-side is available without a
+developer-supplied overlay, and the independence gate runs without external
+dependencies:
 
-| Package | Upstream | License |
+| Material | Upstream | License |
 |---|---|---|
-| `unitree_hg`, `unitree_go`, `unitree_api` | `unitree_ros2` at upstream `668d1ec5` (pure `.msg` sources, no binaries) | BSD-3-Clause |
+| `unitree_sdk2py` | `unitreerobotics/unitree_sdk2_python` pinned at `814556d1` (installed at setup time by `scripts/setup/install_unitree_sdk.sh`; not committed) | BSD-3-Clause |
 | `unitree_g1_description` | `unitree_ros` `g1_29dof_with_hand_rev_1_0`: the URDF and exactly the meshes it references | BSD 3-Clause |
 
-Each carries a `PROVENANCE.md` recording the upstream commit and any local
-rewrite (the description's mesh paths). The bridge imports vendor types only
-through `vendor_gateway`, which re-exports them and refuses to start with a
-named message when they are missing.
+The description carries a `PROVENANCE.md` recording the upstream commit and
+any local rewrite (the mesh paths). The three formerly vendored ROS message
+packages (`unitree_hg`, `unitree_go`, `unitree_api` from `unitree_ros2`) were
+removed in Issue #171 PR 2: the vendor frames now come from the official
+SDK's IDL through `unitree_g1_adapter`, and the runtime refuses to start with
+a guided error when the SDK is missing.
 
 ## Profiles
 
-| Profile | Robot | End effector | Joints |
-|---|---|---|---|
-| `profiles/g1_29dof_dex3.yaml` | G1, 29 DoF | Dex3 dexterous hands (7 joints each) | 43 observable: 12 legs, 3 waist, 14 arms, 14 fingers |
+| Profile | Surface | Robot | End effector | Joints |
+|---|---|---|---|---|
+| `profiles/g1_29dof_dex3.yaml` | full runtime contract | G1, 29 DoF | Dex3 dexterous hands (7 joints each) | 43 observable: 12 legs, 3 waist, 14 arms, 14 fingers |
+| `profiles/g1_29dof_arm_presets.yaml` | preset action 15 only | G1, 29 DoF | none (no hand, stream or base surface) | 29 observed, no command channels |
 
 The profile is the single source of runtime parameters: public joint
 projection, modes and their vendor actions, command channels, declared
-capabilities, stop policy, the vendor endpoint/QoS/api-id tables, and the
+capabilities, stop policy, the vendor endpoint/RPC/FSM tables, the arm
+admission and commissioning boundaries, the simulated-transport domain, and the
 peripheral defaults. The `mode_machine` generation (5) is checked against the
 first `LowState` at startup — a unit from another generation (15/16/18, 5010
 wrists) faults instead of running against a URDF that does not describe it
@@ -172,11 +236,12 @@ marking. Nothing unverified is silently presented as fact.
 - **Embodied primitives and skills.** `wave`, `shake_hand`, the postures and
   speech as skill primitives would change the shared primitive contract and
   the skill executor — code SO-101 and LeKiwi execute. That coordination is
-  specified in the OpenSpec change (§5); the base G1 deployment
-  (`unitree_g1.yaml`) ships with `embodied.enabled: false`, and the optional
-  `unitree_g1_skills.yaml` that would reuse `runtime_named_motion` is
-  deliberately not shipped in this stage. The capabilities themselves are
-  available now through `/motion/execute_named` and `/speech/speak`.
+  specified in the OpenSpec change (§5), so the base deployment
+  (`unitree_g1.yaml`) still ships with `embodied.enabled: false`. What does
+  ship is the fixed preset path: `config/robots/unitree_g1_arm_presets.yaml`
+  enables the embodied stack with `arm_surface: false` and one
+  `runtime_named_motion` skill (`arms_horizontal`, action 15). A generic
+  runtime-discovered catalog is not part of this change.
 - **Voice ASR/TTS services.** The vendor voice RPC carries an ASR api id, but
   no ASR surface is bridged or verified; the audio contract itself waits on
   gate 6.1.
@@ -184,15 +249,16 @@ marking. Nothing unverified is silently presented as fact.
 ## Status
 
 The runtime is implemented and tested against `unitree_vendor_mock`, which
-speaks the real vendored IDL on the topic names and with the QoS the profile
-declares. The package suite is 206 tests; the capability-scoped conformance
-suite passes 9/9 in simulated transport.
+speaks the real official-SDK IDL on the topic names the profile declares. The
+package suite is 250 tests; the capability-scoped conformance suite runs
+against the same launch (see *Tests*).
 
 **No hardware contact yet.** Everything that moves the robot — mode switches,
 the arm_sdk handover, streaming, locomotion, stop latencies — is a
 user-executed gate recorded in the OpenSpec change (tasks §6), and the profile
 values those gates will measure (ramp rates, gains, the velocity envelope, the
-stop bounds, the endpoint QoS) are placeholders, not measurements.
+stop bounds) are placeholders, not measurements. The vendor tier's QoS is the
+SDK's own, not this profile's.
 
 ## Tests
 
@@ -210,8 +276,11 @@ colcon test-result --verbose
 ## Running against the mock
 
 ```bash
-ros2 launch unitree_g1_robot runtime.launch.py profile:=g1_29dof_dex3 simulated:=true
+ros2 launch unitree_g1_robot runtime.launch.py profile:=g1_29dof_dex3 use_sim:=true
 ```
+
+`use_sim` / `sim_platform` select the transport; `simulated:=true` is the
+deprecated alias the launch still accepts with a warning.
 
 The vendor mock stands in for the robot's DDS tier and the contract layer's
 synthetic publishers stand in for the composed peripherals, so the full public
@@ -221,16 +290,15 @@ the stack on CycloneDDS and name an interface — the launch then binds
 CycloneDDS to it:
 
 ```bash
-RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
 ros2 launch unitree_g1_robot runtime.launch.py profile:=g1_29dof_dex3 \
-    simulated:=true network_interface:=lo     # DDS smoke: CYCLONEDDS_URI generated and honoured
+    use_sim:=true network_interface:=lo      # DDS smoke: CYCLONEDDS_URI generated and honoured
 ```
 
 The conformance suite runs against the mock unchanged:
 
 ```bash
 ROS_DOMAIN_ID=149 \
-CONFORMANCE_LAUNCH="ros2 launch unitree_g1_robot runtime.launch.py profile:=g1_29dof_dex3 simulated:=true" \
+CONFORMANCE_LAUNCH="ros2 launch unitree_g1_robot runtime.launch.py profile:=g1_29dof_dex3 use_sim:=true" \
 CONFORMANCE_PROFILE="$(ros2 pkg prefix unitree_g1_robot)/share/unitree_g1_robot/profiles/g1_29dof_dex3.yaml" \
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest src/robot_runtime/test/test_conformance.py -q -rs
 ```
@@ -243,27 +311,26 @@ the locomotion gate.
 
 ### 1. Network
 
-- Export the RMW first — the launch fails closed in real transport without
-  it (see *DDS* above):
+- Wire the host to the robot's Ethernet port and identify the interface
+  (`ip link`). Launch with `network_interface:=<nic>`: the launch hands that
+  NIC to the vendor tier as `vendor_network_interface` and fails closed when
+  it is missing or loopback (see *DDS* above). A wrong interface name fails
+  loudly in CycloneDDS at startup.
+- Pick one RMW for the whole deployment and export it before launching —
+  the launch does not set or check `RMW_IMPLEMENTATION` itself, but the
+  runtime and every node that calls its services must agree on it:
 
   ```bash
   export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
   ```
 
-- Wire the host to the robot's Ethernet port and identify the interface
-  (`ip link`). Launch with `network_interface:=<nic>`; confirm the nodes came
-  up with the generated `CYCLONEDDS_URI` (a bad interface name fails loudly
-  at startup).
-- `ROS_LOCALHOST_ONLY` must be unset or `0`, and every robot-facing process
-  must run `rmw_cyclonedds_cpp` (see *DDS* above).
-- Prove the link with the vendor's own topics before touching this runtime:
-
-  ```bash
-  ros2 topic list | grep '^/rt/'                          # vendor DDS graph visible
-  ros2 topic echo /rt/lowstate --qos-reliability best_effort --once
-  ```
-
-  No `/rt/*` topics means power, cable, interface or RMW — not this package.
+- `ROS_LOCALHOST_ONLY` must be unset or `0` on the robot-facing host, and
+  every robot-facing process must run that same RMW (see *DDS* above).
+- The vendor tier runs inside the SDK on its own participants, so prove the
+  vendor link from the runtime's own log first: `Startup` reaches `ACTIVE`
+  only after `rt/lowstate` and both Dex3 streams arrive, and `faults` names
+  whichever one is missing. The SDK's vendor graph is not visible to
+  `ros2 topic list` (rclpy cannot register its IDL types).
 
 - Pass the deployment peripherals fragment with the MID-360's real network
   facts (the profile's are placeholders; the stock
@@ -306,8 +373,8 @@ ros2 topic echo /imu/data --qos-reliability best_effort --once
 ros2 topic echo /runtime_status --once
 ```
 
-Gate 6.1 closes here: record the measured endpoint QoS and the real RPC topic
-names back into the profile.
+Gate 6.1 closes here: record the real RPC topic names and the vendor service
+behaviour back into the profile.
 
 ### 3. Motion, in this order (gates 6.2–6.4)
 
@@ -321,8 +388,10 @@ names back into the profile.
    publishing: the joints must hold their latched targets, not drift and not
    return to zero. Repeat for the waist and hand channels.
 3. **Stop** — `/runtime/stop HOLD` while streaming: the latch engages, `stream`
-   is refused, `idle` clears. Record `cancel_latency_s` / `idle_latency_s`.
-   `TORQUE_OFF` while standing must be refused (fail-closed to sit/squat).
+   is refused, `ARM_HANDOVER_UNCONFIRMED` stays visible in `faults`, and a
+   following `idle` clears both. Record `cancel_latency_s` / `idle_latency_s`.
+   `TORQUE_OFF` while standing must be refused (fail-closed to sit/squat); that
+   refusal closes admission too, so clear it with `idle` before the next motion.
 4. **Locomotion** — off the gantry, in `locomotion`, publish `/cmd_vel` at a
    low velocity, then stop publishing: the runtime's staleness behaviour means
    the base may continue for up to `command_duration_s` (1 s) — see known

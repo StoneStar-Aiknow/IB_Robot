@@ -388,12 +388,12 @@ def test_shipped_provider_fragments_are_byte_identical():
     effective peripheral sets are pinned by
     ``test_lekiwi_migration_effective_sets`` instead.
 
-    unitree_g1.yaml cannot load in any environment since the
-    runtime-owned-audio-io change (its audio_io section predates the rule and
-    fails validation on c8be174e already); it produces no fragment today
-    either, so it is out of the byte-identity comparison by necessity.
+    unitree_g1.yaml used to fail the runtime-owned-audio-io rule (its
+    audio_io section predates the rule); the official-SDK migration drops
+    that legacy section, so the configuration now loads and takes part in
+    the byte-identity comparison like every other provider configuration.
     """
-    known_preexisting_load_failures = {"unitree_g1.yaml"}
+    known_preexisting_load_failures = set()
     migrated_effective_set_configs = {
         "lekiwi_nav_grasp.yaml",
         "lekiwi_hybrid_switch_test.yaml",

@@ -89,6 +89,9 @@ public:
     /// Motor state inspection (torque enabled / EPROM locked).
     bool torque_enabled(std::uint8_t id) const;
     bool eprom_locked(std::uint8_t id) const;
+    /// Last byte written to a register address (0 when never written). Covers
+    /// configuration writes and the acc / goal / speed bytes of motion commands.
+    std::uint8_t register_byte(std::uint8_t id, std::uint8_t addr) const;
 
   private:
     friend class Bus;

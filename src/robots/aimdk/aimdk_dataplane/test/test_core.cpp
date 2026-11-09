@@ -316,6 +316,18 @@ TEST(Core, TheNavigationGateHoldsVelocityAtZero)
   EXPECT_EQ(core.tick(0.02).twist[0], 0.5);
 }
 
+TEST(Core, StepModeUsesTheLocomotionOutput)
+{
+  Plan step = plan();
+  step.mc_actions["walk"] = "LOCOMOTION_STEP";
+  Core core(step);
+  core.on_control(control("walk"), 0.0);
+  core.on_twist(find(core, "cmd_vel"), 0.5, 0.0, 0.0, 0.0);
+  const auto out = core.tick(0.02);
+  ASSERT_EQ(out.kind, Output::Kind::kLocomotion);
+  EXPECT_EQ(out.twist[0], 0.5);
+}
+
 TEST(Core, ANamedMotionOwnsTheArmChannelWhileItRuns)
 {
   Core core(plan());

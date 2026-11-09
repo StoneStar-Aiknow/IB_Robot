@@ -306,6 +306,14 @@ class VoiceTTSConfig:
     #: Bound to the runtime's audio.play interface (runtime-owned-audio-io);
     #: the resolved topic and playback format are written by bind_robot_interfaces.
     audio_output: dict[str, Any] | None = None
+    #: Opt-in conversion of synthesized audio to the playback sample rate; without it a
+    #: rate mismatch stays an error. Channel count and sample width are never converted.
+    resample_to_playback_rate: bool = False
+    #: Message type the playback node publishes; empty keeps audio_common AudioData. A
+    #: speaker that subscribes to AudioDataStamped (the X2 runtime's audio.play) names it
+    #: here, matching audio_output.type. Interim: once the type the ALSA speaker's audio_play
+    #: subscribes to is confirmed, the binding alone decides it.
+    audio_message_type: str = ""
 
 
 @dataclass

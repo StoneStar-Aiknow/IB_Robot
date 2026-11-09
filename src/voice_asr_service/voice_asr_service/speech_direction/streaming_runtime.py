@@ -12,7 +12,9 @@ import inspect
 import logging
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 
 import numpy as np
 
@@ -23,11 +25,16 @@ from inference_service.unified_runtime import (
     ModelRequest,
     ModelResult,
     OutcomeEvidence,
+    OutcomeState,
     RecoveryAction,
+    RecoveryRequirement,
     RecoveryScope,
     StreamHandle,
     StreamState,
 )
+from inference_service.unified_runtime.lifecycle import lifecycle_scope
+
+_CLOSED_STREAM_HISTORY_LIMIT = 128  # Retained closed identities, not active stream capacity.
 
 
 class SpeechDirectionStreamingRuntime:
@@ -62,10 +69,12 @@ class SpeechDirectionStreamingRuntime:
         self._failure_factory = failure_factory or ExecutionFailureFactory()
         self._lock = threading.RLock()
         self._stream: StreamHandle | None = None
-        self._closed_stream_ids: set[str] = set()
+        self._closed_stream_ids: deque[str] = deque(maxlen=_CLOSED_STREAM_HISTORY_LIMIT)
+        self._stream_owner = object()
         self._stream_counter = 0
         self._loaded = False
         self._closed = False
+        self._cleanup_complete = False
         self._step_active = False
 
     @property
@@ -132,17 +141,19 @@ class SpeechDirectionStreamingRuntime:
                 )
             self._stream_counter += 1
             handle = StreamHandle(f"{self._stream_id_prefix}-{self._stream_counter}")
+            handle._bind_owner(self._stream_owner)
             self._stream = handle
 
         try:
             # A newly opened stream always starts with a clean host and device
             # state.  The device state is reset in place; the Session remains
             # loaded and owned by ModelRuntimeHandle.
-            self.pipeline.reset()
+            with lifecycle_scope(context):
+                self.pipeline.reset()
         except Exception:
             with self._lock:
                 self._stream = None
-                self._closed_stream_ids.add(handle.stream_id)
+                self._closed_stream_ids.append(handle.stream_id)
             raise
         return handle
 
@@ -169,6 +180,8 @@ class SpeechDirectionStreamingRuntime:
             return active
 
     def _audio_from_request(self, request: ModelRequest) -> tuple[np.ndarray, int | None]:
+        if getattr(self.pipeline, "_closed", False):
+            raise ValueError("Speech Direction pipeline is closed")
         values = request.inputs
         audio = None
         for name in ("audio", "audio_6ch", "observation.audio_6ch", "observation.audio"):
@@ -221,9 +234,39 @@ class SpeechDirectionStreamingRuntime:
             self._step_active = True
         try:
             started = time.perf_counter()
-            # Do not catch backend/pipeline exceptions here.  ModelRuntimeHandle
-            # needs their started/unknown evidence to gate this exclusive bank.
-            hop = self.pipeline.process_block(audio, capture_start_sample=capture_start)
+            # Role adapters inherit this request's token/deadline across FB,
+            # SB and VAD without changing the host pipeline's public API.
+            with lifecycle_scope(context):
+                try:
+                    hop = self.pipeline.process_block(audio, capture_start_sample=capture_start)
+                except Exception as exc:
+                    # Host buffers and individual recurrent states advance before
+                    # the whole hop completes. Device completion is not a reset.
+                    evidence = getattr(exc, "evidence", None)
+                    if evidence is None:
+                        evidence = OutcomeEvidence.started(
+                            getattr(exc, "phase", "stream_step"),
+                            outcome_known=getattr(exc, "outcome_known", False),
+                            state_mutated=True,
+                        )
+                    else:
+                        evidence = replace(
+                            evidence,
+                            state=OutcomeState.STARTED
+                            if evidence.state is OutcomeState.NOT_STARTED
+                            else evidence.state,
+                            state_mutated=True,
+                        )
+                    recovery = getattr(exc, "recovery", None)
+                    reload_required = recovery is not None and recovery.action is RecoveryAction.RELOAD
+                    raise self._failure_factory.from_exception(
+                        exc,
+                        evidence=evidence,
+                        recovery=recovery
+                        if reload_required
+                        else RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RESET_RUNTIME),
+                        recoverable=getattr(exc, "recoverable", False) if reload_required else True,
+                    ) from exc
             enhanced = getattr(hop, "enh4", None)
             enhanced_start = getattr(hop, "enh_start_sample", None)
             if self.on_enhanced_audio is not None and enhanced is not None and enhanced_start is not None:
@@ -259,7 +302,14 @@ class SpeechDirectionStreamingRuntime:
             with self._lock:
                 self._step_active = False
 
+    def reset_host_stream(self, stream_handle: StreamHandle, context: ExecutionContext) -> None:
+        """Runtime reset clears host state; owned Sessions are reset by Handle."""
+        self._reset_stream(stream_handle, context, host_only=not self.close_backends)
+
     def reset_stream(self, stream_handle: StreamHandle, context: ExecutionContext) -> None:
+        self._reset_stream(stream_handle, context, host_only=False)
+
+    def _reset_stream(self, stream_handle: StreamHandle, context: ExecutionContext, *, host_only: bool) -> None:
         active = self._resolve_stream(stream_handle, "reset_stream")
         context.check("reset_stream")
         with self._lock:
@@ -270,11 +320,18 @@ class SpeechDirectionStreamingRuntime:
                     operation="reset_stream",
                     stream_id=active.stream_id,
                 )
-        self.pipeline.reset()
+        reset = getattr(self.pipeline, "reset_host", self.pipeline.reset) if host_only else self.pipeline.reset
+        reset()
         # Keep the same stable StreamHandle.  Only its state bank is cleared.
         del active
 
     def close_stream(self, stream_handle: StreamHandle, context: ExecutionContext) -> None:
+        if (
+            isinstance(stream_handle, StreamHandle)
+            and stream_handle._belongs_to(self._stream_owner)
+            and stream_handle.closed
+        ):
+            return
         stream_id = stream_handle.stream_id if isinstance(stream_handle, StreamHandle) else stream_handle
         with self._lock:
             if isinstance(stream_id, str) and stream_id in self._closed_stream_ids:
@@ -289,21 +346,15 @@ class SpeechDirectionStreamingRuntime:
                     operation="close_stream",
                     stream_id=active.stream_id,
                 )
-        error: BaseException | None = None
-        try:
-            # Reset before releasing the host bank.  This gives a stateful
-            # backend a deterministic final state without closing its Session.
-            self.pipeline.reset()
-        except BaseException as exc:
-            error = exc
-        finally:
-            with self._lock:
-                if self._stream is active:
-                    self._stream = None
-                    self._closed_stream_ids.add(active.stream_id)
-                active._set_state(StreamState.CLOSED)
-        if error is not None:
-            raise error
+        # The exclusive bank belongs to the runtime, not to this stream.
+        # open_stream resets it before reuse; final backend Close supplies the
+        # completion fence. Closing must not require a successful allocation
+        # or device reset merely to discard this stream's logical identity.
+        with self._lock:
+            if self._stream is active:
+                self._stream = None
+                self._closed_stream_ids.append(active.stream_id)
+            active._set_state(StreamState.CLOSED)
 
     def execute(self, _request: ModelRequest, _context: ExecutionContext) -> object:
         """Prevent request-style callers from bypassing stream admission."""
@@ -316,13 +367,13 @@ class SpeechDirectionStreamingRuntime:
 
     def close(self) -> None:
         with self._lock:
-            if self._closed:
+            if self._cleanup_complete:
                 return
             active = self._stream
             self._closed = True
             self._stream = None
             if active is not None:
-                self._closed_stream_ids.add(active.stream_id)
+                self._closed_stream_ids.append(active.stream_id)
 
         # The handle drains active steps before calling this method.  A direct
         # caller still gets best-effort host cleanup.
@@ -336,11 +387,16 @@ class SpeechDirectionStreamingRuntime:
             or "close_backends" in signature.parameters
             or any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
         )
-        if supports_ownership_flag:
-            close(close_backends=self.close_backends)
+        try:
+            if supports_ownership_flag:
+                close(close_backends=self.close_backends)
+            else:
+                close()
+        except Exception as exc:
+            self._cleanup_complete = not getattr(exc, "close_pending", False)
+            raise
         else:
-            # Keep compatibility with a pre-unified pipeline implementation.
-            close()
+            self._cleanup_complete = True
 
 
 SpeechDirectionStreamingAdapter = SpeechDirectionStreamingRuntime

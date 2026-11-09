@@ -2,8 +2,9 @@
 
 These are the rules that decide what the robot is told to do, so they are
 tested without ROS, without the vendor SDK and without a robot. Every fixture
-value is a plain Python value shaped like the vendored unitree_hg /
-unitree_api IDL the projection produces and consumes.
+value is a plain Python value shaped like the unitree_hg / unitree_api IDL
+(the official unitree_sdk2py's wire types, per Issue #171) that the projection
+produces and consumes.
 
 Regression coverage demanded by the phase-1 review:
 
@@ -176,7 +177,7 @@ def test_arm_sdk_lowcmd_rides_the_weight_in_slot_29():
     assert cmd["mode_machine"] == 5
     # The arm_sdk example never computes a CRC and the rt/lowcmd tier (which
     # requires one) stays disabled (D11).
-    assert cmd["crc"] == 0
+    assert "crc" not in cmd  # computed on the completed vendor frame
     assert cmd["reserve"] == [0, 0, 0, 0]
     assert len(cmd["motor_cmd"]) == projection.LOW_CMD_MOTOR_COUNT == 35
     weight_slot = cmd["motor_cmd"][projection.ARM_SDK_WEIGHT_INDEX]
@@ -582,27 +583,6 @@ def test_torque_off_is_refused_while_standing():
 def test_unknown_stop_policy_is_a_configuration_error():
     with pytest.raises(ProjectionError):
         projection.resolve_stop_plan("BLAH", fsm_id=500, stop_config=None)
-
-
-# --- vendor QoS ------------------------------------------------------------------------------------
-
-
-def test_vendor_qos_defaults_to_the_high_rate_stream_profile():
-    assert projection.vendor_qos(None, "low_state") == ("best_effort", "volatile", 10)
-
-
-def test_vendor_qos_resolves_from_the_profile_entry():
-    qos = {"low_state": {"reliability": "reliable", "durability": "volatile", "depth": 5}}
-    assert projection.vendor_qos(qos, "low_state") == ("reliable", "volatile", 5)
-
-
-def test_vendor_qos_rejects_unknown_reliability_durability_and_depth():
-    with pytest.raises(ProjectionError):
-        projection.vendor_qos({"low_state": {"reliability": "maybe"}}, "low_state")
-    with pytest.raises(ProjectionError):
-        projection.vendor_qos({"low_state": {"durability": "immortal"}}, "low_state")
-    with pytest.raises(ProjectionError):
-        projection.vendor_qos({"low_state": {"depth": 0}}, "low_state")
 
 
 # --- expert tier (design D11) ------------------------------------------------------------------------

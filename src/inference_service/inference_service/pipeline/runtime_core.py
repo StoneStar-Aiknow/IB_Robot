@@ -11,7 +11,7 @@ from typing import Protocol, runtime_checkable
 from inference_service.backends.types import BackendHealth, RuntimeContext
 from inference_service.codecs import ExecutionFrame, ExecutionPlan
 from inference_service.pipeline.errors import PipelineCanceledError
-from inference_service.unified_runtime import ExecutionContext, ModelRequest, RuntimeLatency
+from inference_service.unified_runtime import ExecutionContext, ModelRequest, OutcomeEvidence, RuntimeLatency
 
 
 @runtime_checkable
@@ -92,6 +92,8 @@ class StageFrame:
         self.execution_frame = ExecutionFrame(execution_plan) if execution_plan is not None else None
         self.values: dict[str, object] = dict(values or {})
         self.control = control or ExecutionControl(request_id="stage")
+        self.evidence: OutcomeEvidence = OutcomeEvidence.not_started("stage")
+        self._pending_completions: dict[int, object] = {}
         self._closed = False
 
     def close(self) -> None:
@@ -100,6 +102,7 @@ class StageFrame:
         if self.execution_frame is not None:
             self.execution_frame.close()
         self.values.clear()
+        self._pending_completions.clear()
         self._closed = True
 
 

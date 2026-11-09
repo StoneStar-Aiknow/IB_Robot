@@ -82,6 +82,30 @@ def align_inputs_to_selection(
     return aligned, delta_ns
 
 
+def normalize_action_dtype(action: object) -> object:
+    """Wire contract: distributed action chunks serialize as float32.
+
+    Mirrors the fp32 guarantee of ``PipelinePolicyNode._lerobot_to_rad`` before
+    ``TensorMsgConverter.to_variant``; backends may emit reduced precision
+    (e.g. RKNN returns float16 because the NPU has no fp32 execution mode and
+    the manifest binding records the artifact dtype). Unit conversion stays on
+    the edge (joint limits are edge-side assets); only the dtype is normalized
+    here. float16 -> float32 is an exact widening, so values are unchanged.
+    """
+    if action is None:
+        return None
+    dtype = getattr(action, "dtype", None)
+    if dtype is None or "float32" in str(dtype):
+        return action
+    cast = getattr(action, "float", None)
+    if not callable(cast):
+        return action
+    try:
+        return cast()
+    except (RuntimeError, TypeError):
+        return action
+
+
 class DistributedCloudService:
     def __init__(
         self,
@@ -216,7 +240,7 @@ class DistributedCloudService:
                         prompt=request.prompt,
                         deadline=request.deadline,
                     )
-                    action = pipeline_result.action
+                    action = normalize_action_dtype(pipeline_result.action)
                     chunk_size = pipeline_result.actual_chunk_size
                     metadata = getattr(pipeline_result, "metadata", {})
                     raw_horizon = metadata.get("execution_horizon", 0) if isinstance(metadata, Mapping) else 0

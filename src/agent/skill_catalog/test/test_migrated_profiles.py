@@ -200,16 +200,28 @@ def test_equivalent_so101_profiles_select_shared_stable_implementation_variant()
         assert all(entry["implementation"] == "so101_arm_v1" for entry in profile_config["enabled_skills"])
 
 
-def test_x2_voice_overlay_keeps_the_catalog_profile_robot_name() -> None:
+@pytest.mark.parametrize("config_name", ["aimdk_x2_voice", "aimdk_x2_voice_agent"])
+def test_x2_voice_overlay_keeps_the_catalog_profile_robot_name(config_name: str) -> None:
     # The catalog validator rejects a launch whose robot context name differs
     # from the profile's robot_name (SKILL_LIMIT_VIOLATION), which is how a
     # renaming overlay died on the real robot (2026-10-15): both skill_executor
     # and robot_skill_daemon refused to start.
-    config = load_robot_config_dict(
-        resolve_robot_config_path(config_name="aimdk_x2_voice"), defer_interface_binding=True
-    )
+    config = load_robot_config_dict(resolve_robot_config_path(config_name=config_name), defer_interface_binding=True)
     profile_name = config["embodied"]["skill_catalog_profile"]
     profile = yaml.safe_load(
         (CATALOG_ROOT / "config" / "profiles" / f"{profile_name}.yaml").read_text(encoding="utf-8")
     )
     assert config["name"] == profile["robot_name"]
+
+
+def test_x2_voice_agent_allowlist_names_only_catalog_skills() -> None:
+    # An allowlisted name the catalog profile does not enable is a gesture the Agent can never plan.
+    config = load_robot_config_dict(
+        resolve_robot_config_path(config_name="aimdk_x2_voice_agent"), defer_interface_binding=True
+    )
+    profile_name = config["embodied"]["skill_catalog_profile"]
+    profile = yaml.safe_load(
+        (CATALOG_ROOT / "config" / "profiles" / f"{profile_name}.yaml").read_text(encoding="utf-8")
+    )
+    skills = {entry["name"] for entry in profile["enabled_skills"]}
+    assert set(config["embodied"]["agent"]["test_allowlist"]) <= skills

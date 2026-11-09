@@ -1,14 +1,19 @@
 """Persistent, serialized planning service shared by local/ROS request handlers."""
 
+import os
+import pickle
+import sys
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import replace
+from pathlib import Path
 from threading import RLock
 from types import SimpleNamespace
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.candidates import (
+from manipulation_execution.pick.pipeline.candidates import (
     MIN_ENCLOSED_POINTS,
     approach_priority,
     enclosed_points,
@@ -16,7 +21,59 @@ from manipulation_execution.grasp_pipeline.candidates import (
 )
 
 from .grasp_session import SIDE_FIRST_LONGEST_APPROACH, select_plan
-from .planner import LeftArmPlanner, PlannerFault, device_fault
+from .planner import LOCKED_JOINT_ATOL, LeftArmPlanner, PlannerFault, device_fault
+
+# A directory: every plan call's inputs and outcome are pickled there (plan_replay replays them).
+PLAN_INPUTS_DIR_ENV = "IBROBOT_X2_PLAN_INPUTS_DIR"
+
+
+def save_plan_inputs(directory: Path, recorded: dict, estimate, validation_scene) -> Path:
+    """Write one plan call with its already-materialized fine scene.
+
+    The caller materializes the scene under the shared GPU lock. Recording is
+    synchronous after planning, so its scene construction and file write add to
+    the request time; the pickle keeps the validation geometry as a plain mapping.
+    """
+    recorded = dict(recorded, estimate=replace(estimate, validation_scene=dict(validation_scene)))
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"plan_{time.time_ns()}.pkl"
+    with open(path, "wb") as stream:
+        pickle.dump(recorded, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    return path
+
+
+def _report_rebuild(planner, feedback) -> None:
+    """Say on stderr why the planner is about to be rebuilt, before it costs the time.
+
+    A rebuild is the most expensive thing this service does and the only one
+    with no other trace: warmup took 47.6-49.9 s on the Orin (2026-10-26/27),
+    `_plan` cannot preempt it inside the request deadline, and the request it
+    lands in reports whatever gave up first -- a plan timeout, or an RPC
+    timeout on another head call. Live on the robot this one line named the
+    cause at once: ``hand=0.4623 <-- over`` after a failed release left the
+    hand half closed, with the right arm at 0.0017 and the head at 0.0000.
+    """
+    from .joints import HEAD, RIGHT_ARM
+
+    if planner is None:
+        print("planner rebuild: first build", file=sys.stderr, flush=True)
+        return
+    try:
+        moved = {
+            "right": np.max(np.abs(np.asarray(feedback.vector(RIGHT_ARM)) - np.asarray(planner.right))),
+            "head": np.max(np.abs(np.asarray(feedback.vector(HEAD)) - np.asarray(planner.head))),
+            "hand": np.max(
+                np.abs(np.asarray(planner.hand_mapping.check(feedback.left_hand)) - np.asarray(planner.hand))
+            ),
+        }
+    except BaseException as exc:  # noqa: BLE001 - a diagnostic must not change what the request does
+        print(f"planner rebuild: cause unavailable: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return
+    detail = ", ".join(
+        f"{group}={value:.4f}{'  <-- over' if value > LOCKED_JOINT_ATOL else ''}" for group, value in moved.items()
+    )
+    print(f"planner rebuild: locked joints moved (atol {LOCKED_JOINT_ATOL}): {detail}", file=sys.stderr, flush=True)
+
 
 # Candidates per cuRobo goalset. Screening keeps its full capacity; only the
 # final choice is limited to the best-ordered few (see select_plan).
@@ -94,6 +151,7 @@ class GraspPlanningService:
         planner_factory: Callable = LeftArmPlanner,
         planning_profile="default",
         approach_seed_policy="clear_path",
+        gpu_lock=None,
         **planner_options,
     ):
         if planning_profile not in ("default", "latency"):
@@ -119,7 +177,11 @@ class GraspPlanningService:
         self._factory = planner_factory
         self._planner = None
         self._estimate = None
-        self._lock = RLock()
+        # Every planner call runs under it. A process whose other threads also
+        # use the GPU passes one re-entrant lock they share (head_parts): cuRobo
+        # captures CUDA graphs on (re)build and first use, and any allocation or
+        # synchronization elsewhere in the process during a capture fails.
+        self._lock = RLock() if gpu_lock is None else gpu_lock
 
     def prepare(self, feedback, estimate):
         """Initialize/prewarm or replace scene buffers, preserving depth age."""
@@ -127,6 +189,7 @@ class GraspPlanningService:
             if self._planner is not None and getattr(self._planner, "_closed", False):
                 self.close()  # it closed itself after a failed scene load: rebuild now
             if self._planner is None or not self._planner.locked_joints_match(feedback):
+                _report_rebuild(self._planner, feedback)
                 if self._planner is not None:
                     self.close()
                 self._planner = self._factory(feedback, estimate, estimate.received_at, **self._options)
@@ -167,7 +230,47 @@ class GraspPlanningService:
             assert self._planner is not None
             yield self._planner
 
-    def plan(
+    def plan(self, feedback, estimate, camera_from_grasps, confidence, base_from_camera, **options):
+        """_plan, its inputs and outcome kept under $IBROBOT_X2_PLAN_INPUTS_DIR when set (plan_replay)."""
+        directory = os.environ.get(PLAN_INPUTS_DIR_ENV)
+        if not directory:
+            return self._plan(feedback, estimate, camera_from_grasps, confidence, base_from_camera, **options)
+        deadline = options.get("deadline")
+        recorded = dict(
+            feedback=feedback,
+            camera_from_grasps=np.asarray(camera_from_grasps),
+            confidence=np.asarray(confidence),
+            base_from_camera=np.asarray(base_from_camera),
+            options={key: value for key, value in options.items() if key not in ("deadline", "checkpoint")},
+            budget_s=None if deadline is None else deadline - time.perf_counter(),
+            service=dict(
+                planning_profile=self.planning_profile,
+                approach_seed_policy=self.approach_seed_policy,
+                max_goalset=self._options["max_goalset"],
+            ),
+        )
+        began = time.perf_counter()
+        try:
+            result = self._plan(feedback, estimate, camera_from_grasps, confidence, base_from_camera, **options)
+            recorded["outcome"] = dict(success=True, candidate_index=result[1].get("candidate_index"))
+            return result
+        except BaseException as exc:
+            recorded["outcome"] = dict(success=False, error=f"{type(exc).__name__}: {exc}")
+            raise
+        finally:
+            recorded["outcome"]["wall_s"] = time.perf_counter() - began
+            try:
+                from .scene_estimation import LazyScene
+
+                validation = estimate.validation_scene
+                if isinstance(validation, LazyScene):
+                    with self._lock:
+                        validation = validation.materialize()
+                save_plan_inputs(Path(directory), recorded, estimate, validation)
+            except Exception as exc:  # noqa: BLE001 - a diagnostic must never change the plan's outcome
+                print(f"plan inputs not saved: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+    def _plan(
         self,
         feedback,
         estimate,

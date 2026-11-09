@@ -12,8 +12,8 @@ from ibrobot_msgs.srv import ValidatePrimitive, ValidateSkill
 ROOT = Path(__file__).resolve().parents[3]
 
 MANIPULATION_NODE_INIT_FILES = (
-    ROOT / "src/manipulation_execution/manipulation_execution/pick_executor_node.py",
-    ROOT / "src/manipulation_execution/manipulation_execution/placement_executor_node.py",
+    ROOT / "src/manipulation_execution/manipulation_execution/pick/node.py",
+    ROOT / "src/manipulation_execution/manipulation_execution/place/node.py",
 )
 
 PUBLIC_REQUEST_IDLS = (
@@ -55,10 +55,12 @@ def test_public_request_wire_contract_preflight_accepts_current_generated_types(
     assert validate_public_request_wire_contracts() is None
 
 
-@pytest.mark.parametrize("source_path", MANIPULATION_NODE_INIT_FILES, ids=lambda path: path.stem)
+@pytest.mark.parametrize(
+    "source_path", MANIPULATION_NODE_INIT_FILES, ids=lambda path: f"{path.parent.name}/{path.stem}"
+)
 def test_manipulation_startup_wire_preflight_precedes_ros_resource_calls(source_path):
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    class_name = "PickExecutorNode" if source_path.stem == "pick_executor_node" else "PlacementExecutorNode"
+    class_name = "PickExecutorNode" if source_path.parent.name == "pick" else "PlacementExecutorNode"
     class_node = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
     init = next(node for node in class_node.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
     calls = []

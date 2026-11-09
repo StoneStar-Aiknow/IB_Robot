@@ -25,6 +25,12 @@ from inference_service.unified_runtime import (
     OwnedComponent,
     RuntimeAssembly,
 )
+from inference_service.unified_runtime.lifecycle import (
+    POLL_INTERVAL_SECONDS,
+    check_lifecycle,
+    lifecycle_budget,
+    lifecycle_remaining,
+)
 
 from .streaming_runtime import SpeechDirectionStreamingRuntime
 
@@ -414,10 +420,7 @@ class SpeechDirectionRuntime:
         if self._stream_handle is None:
             self.pipeline.reset()
             return
-        self._model_runtime_handle.reset_stream(
-            self._stream_handle,
-            ExecutionContext("speech-direction-reset"),
-        )
+        self._model_runtime_handle.reset(ExecutionContext("speech-direction-reset"))
 
     def _start_thread(self, target: Callable, name: str) -> None:
         t = threading.Thread(target=target, name=name, daemon=True)
@@ -520,7 +523,10 @@ class SpeechDirectionRuntime:
                 worker_alive = True
                 continue
             try:
-                thread.join(timeout=2.0)
+                with lifecycle_budget(2.0):
+                    while thread.is_alive():
+                        check_lifecycle()
+                        thread.join(timeout=lifecycle_remaining(POLL_INTERVAL_SECONDS))
             except Exception as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
@@ -541,6 +547,7 @@ class SpeechDirectionRuntime:
             # use-after-free。保留资源供后续 stop() 重试，直到 worker 真正退出。
             if cleanup_error is None:
                 cleanup_error = RuntimeError("SpeechDirection worker 未全部退出，pipeline 资源保留供后续 stop() 重试")
+            cleanup_error.close_pending = True
             logger.warning("SpeechDirection worker 仍未退出，跳过 pipeline.close 避免竞态")
         else:
             stream_handle = self._stream_handle
@@ -555,22 +562,29 @@ class SpeechDirectionRuntime:
                         cleanup_error = exc
                     logger.warning("关闭 speech_direction stream 失败", exc_info=True)
                 finally:
-                    self._stream_handle = None
+                    if stream_handle.closed:
+                        self._stream_handle = None
             try:
                 self._model_runtime_handle.close()
             except Exception as exc:
+                self._handle_closed = self._model_runtime_handle.closed and not getattr(exc, "close_pending", False)
                 if cleanup_error is None:
                     cleanup_error = exc
                 logger.warning("关闭 speech_direction runtime handle 失败", exc_info=True)
-            finally:
-                # Handle close is terminal even when one owned component
-                # reports a cleanup error; subsequent stop() calls are
-                # idempotent and cannot close Sessions a second time.
-                self._handle_closed = True
-                self._pipeline_closed = True
+            else:
+                self._handle_closed = self._model_runtime_handle.closed
+            self._pipeline_closed = self._handle_closed
         logger.info("SpeechDirection runtime 已停止")
         if cleanup_error is not None:
+            # The first diagnostic need not be the pending operation. Derive
+            # cleanup ownership from the final worker/Handle state instead.
+            if not getattr(cleanup_error, "close_pending", False) and (self._threads or not self._handle_closed):
+                from inference_service.backends.errors import BackendLifecycleError
+
+                raise BackendLifecycleError(str(cleanup_error), close_pending=True) from cleanup_error
             raise cleanup_error
+
+    close = stop
 
     def feed_audio(self, data) -> None:
         """离线模式外部灌入 6ch 音频(无采集设备时使用)。

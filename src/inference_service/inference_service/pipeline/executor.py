@@ -6,9 +6,16 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 
 from inference_service.backends.types import BackendHealth, BackendState, RuntimeContext
+from inference_service.pipeline.errors import PipelineCanceledError, PipelineTimeoutError
 from inference_service.pipeline.runtime_core import ExecutionControl, ExecutionError, ModelExecutor, StageFrame
 from inference_service.pipeline.stages import InferenceStage, ResultAdapter
-from inference_service.unified_runtime import ExecutionContext, ModelRequest
+from inference_service.unified_runtime import ExecutionContext, ModelRequest, OutcomeState
+from inference_service.unified_runtime.errors import (
+    CancellationRequested,
+    DeadlineExceeded,
+    execution_evidence,
+    merge_execution_evidence,
+)
 
 
 class ComponentModelExecutor(ModelExecutor):
@@ -88,11 +95,44 @@ class ComponentModelExecutor(ModelExecutor):
                 stage.execute(frame, deadline=context.deadline.expires_at)
             return self._result_adapter.adapt(frame)
         except Exception as exc:
-            if self._error_handler is not None:
-                self._error_handler(exc, bool(frame.values.get("_backend_started", False)))
+            self._record_frame_failure(frame, exc)
             raise
         finally:
             frame.close()
+
+    def _record_frame_failure(self, frame: StageFrame, exc: Exception) -> None:
+        """Sequential and staged checkpoints preserve the same native proof."""
+        if getattr(exc, "evidence", None) is None and isinstance(
+            exc, DeadlineExceeded | CancellationRequested | PipelineCanceledError | PipelineTimeoutError
+        ):
+            phase = getattr(exc, "phase", getattr(exc, "stage", "stage"))
+            evidence = frame.evidence
+            exc.evidence = evidence.with_phase(phase)
+        if isinstance(exc, PipelineCanceledError):
+            exc.recoverable = False
+        previous = frame.evidence
+        evidence = getattr(exc, "evidence", None)
+        if evidence is None and getattr(exc, "operation_started", None) is not None:
+            evidence = execution_evidence(exc, started=True, stateful=previous.state_mutated, unknown_on_error=True)
+        exc.evidence = previous if evidence is None else merge_execution_evidence(previous, evidence)
+        progress = exc.evidence
+        if progress.outcome_known and progress.state is not OutcomeState.NOT_STARTED:
+            # Direct Torch may return device tensors. A later checkpoint can
+            # discard them before the normal host-copy path proves completion.
+            completion = None
+            for component in frame._pending_completions.values():
+                complete_failure = getattr(component, "complete_failure", None)
+                if callable(complete_failure):
+                    complete_failure(exc)
+                    current = execution_evidence(
+                        exc, started=True, stateful=progress.state_mutated, unknown_on_error=True
+                    )
+                    completion = current if completion is None else merge_execution_evidence(completion, current)
+            if completion is not None:
+                exc.evidence = completion
+        if self._error_handler is not None:
+            evidence = getattr(exc, "evidence", frame.evidence)
+            self._error_handler(exc, evidence is not None and evidence.state is not OutcomeState.NOT_STARTED)
 
     def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
         supported = False

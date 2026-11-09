@@ -184,13 +184,13 @@ class SileroVadEngine:
 
         return max(0.0, min(1.0, prob))
 
-    def reset_state(self):
+    def reset_state(self, *, reset_backend: bool = True):
         """重置隐藏状态为零(段间切换 / 冷启动 / 长静音后复位)。"""
         if self._closed:
             return
         self._state = self._zero_state()
         self._context = np.zeros(self._context_size, dtype=np.float32)
-        if self._inference_runner is not None:
+        if reset_backend and self._inference_runner is not None:
             self._inference_runner.reset()
 
     def close(self, *, close_runner: bool = True) -> None:
@@ -312,9 +312,9 @@ class SpeechGate:
             sub_gray=sub_gray,
         )
 
-    def reset(self):
+    def reset(self, *, reset_backend: bool = True):
         """重置 Silero 状态(段间切换 / 冷启动 / 长静音后复位)。"""
-        self.silero.reset_state()
+        self.silero.reset_state(reset_backend=reset_backend)
 
     def close(self, *, close_silero: bool = True) -> None:
         """释放 Silero 后端资源。"""

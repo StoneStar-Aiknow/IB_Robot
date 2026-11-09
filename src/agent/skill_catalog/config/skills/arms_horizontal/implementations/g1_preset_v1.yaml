@@ -1,0 +1,8 @@
+schema_version: 1
+kind: delegated_executor
+robot: g1_preset_v1
+executor: runtime_named_motion
+binding:
+  motion: arms_horizontal
+required_args: []
+timeout_sec: 15.0

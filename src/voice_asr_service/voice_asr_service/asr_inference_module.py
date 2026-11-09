@@ -154,6 +154,7 @@ class ASRInferenceModule:
         self._language: str = "zh"
         self._last_error: str | None = None
         self._runtime_handle: ModelRuntimeHandle | None = None
+        self._pending_cleanup = None
         self._runtime_context: ExecutionContext | None = None
 
         self._lock = threading.Lock()
@@ -175,6 +176,8 @@ class ASRInferenceModule:
         Returns:
             bool: 是否初始化成功
         """
+        if self._pending_cleanup is not None or self._runtime_handle is not None:
+            self.cleanup()
         try:
             import importlib.util
 
@@ -246,17 +249,19 @@ class ASRInferenceModule:
             self.state = ASRState.READY
             return True
 
-        except ImportError:
-            self._last_error = "sherpa_onnx not installed. Install with: pip install sherpa-onnx"
-            self.state = ASRState.ERROR
-            raise RuntimeError(self._last_error) from None
         except Exception as e:
             self._recognizer = None
             self._active_stream = None
             self._pending_stream = None
             self._last_error = str(e)
             self.state = ASRState.ERROR
-            raise RuntimeError(f"Failed to initialize ASR: {e}") from e
+            error = RuntimeError(f"Failed to initialize ASR: {e}")
+            if self._pending_cleanup is not None or (
+                self._runtime_handle is not None and not self._runtime_handle.closed
+            ):
+                error.close_pending = True
+                error.cleanup_owner = self
+            raise error from e
 
     def _install_streaming_runtime(self, streaming_runtime: Any, *, state_bank_mode: str = "per_stream") -> None:
         """Wrap a streaming runtime in the unified handle.
@@ -282,26 +287,45 @@ class ASRInferenceModule:
             )
         )
         self._runtime_context = ExecutionContext.create("voice-asr")
-        self._runtime_handle.load()
+        try:
+            self._runtime_handle.load()
+        except Exception as exc:
+            if getattr(exc, "details", {}).get("cleanup_complete") is True:
+                # Load rollback leaves the lifecycle FAILED even after releasing
+                # native entries. Finish the local owner before reporting it.
+                try:
+                    self._runtime_handle.close()
+                except Exception as cleanup_error:
+                    exc.rollback_errors = (str(cleanup_error),)
+                else:
+                    self._runtime_handle = None
+                    self._runtime_context = None
+            raise
 
     def _initialize_ascend_transducer(
         self, validated: Any, role_paths: dict[str, str], encoder_profile: Any, final_tail_padding_seconds: float
     ) -> None:
         """Encoder OM on the NPU, decoder/joiner and greedy search on the host (no sherpa recognizer)."""
         from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
+        from inference_service.unified_runtime import LoadRollback
         from voice_asr_service.transducer_ascend import (
             FBANK_SAMPLE_RATE,
             AscendTransducerRuntime,
             ZipformerEncoderAclRunner,
         )
 
-        encoder = ZipformerEncoderAclRunner(
-            Path(role_paths["encoder"]),
-            validated.deployment.bindings["encoder"],
-            device_id=int(getattr(encoder_profile.profile, "device_id", 0) or 0),
-            runtime_manager=AclRuntimeManager(),
-        )
+        rollback = LoadRollback()
+        provider = AclRuntimeManager()
+        rollback.defer(provider.close)
+        self._pending_cleanup = rollback
         try:
+            encoder = ZipformerEncoderAclRunner(
+                Path(role_paths["encoder"]),
+                validated.deployment.bindings["encoder"],
+                device_id=int(getattr(encoder_profile.profile, "device_id", 0) or 0),
+                runtime_manager=provider,
+                cleanup=rollback,
+            )
             runtime = AscendTransducerRuntime(
                 encoder,
                 role_paths["decoder"],
@@ -310,9 +334,20 @@ class ASRInferenceModule:
                 decode_chunk_len=int(validated.deployment.metadata["decode_chunk_len"]),
                 final_tail_padding_seconds=final_tail_padding_seconds,
             )
-        except Exception:
-            encoder.close()
+        except Exception as exc:
+            errors = rollback.rollback()
+            if errors:
+                exc.cleanup_owner = self
+                exc.close_pending = True
+                exc.rollback_errors = tuple(str(error) for error in errors)
+            else:
+                self._pending_cleanup = None
+                exc.close_pending = False
+                if getattr(exc, "cleanup_owner", None) is rollback:
+                    del exc.cleanup_owner
             raise
+        rollback.commit()
+        self._pending_cleanup = None
         self._model_type = ModelType.STREAMING
         self._sample_rate = FBANK_SAMPLE_RATE
         self._install_streaming_runtime(runtime, state_bank_mode="runtime_exclusive")
@@ -367,6 +402,8 @@ class ASRInferenceModule:
         """创建新的识别流"""
         if self._runtime_handle is None or self._runtime_context is None:
             raise RuntimeError("streaming ASR runtime not initialized")
+        if not self._recover_runtime_locked():
+            raise RuntimeError(self._last_error)
         return self._runtime_handle.open_stream(self._runtime_context)
 
     @property
@@ -659,10 +696,12 @@ class ASRInferenceModule:
         A failed reset leaves the facade in ERROR so start_streaming() refuses
         explicitly instead of failing on each utterance.
         """
-        if self._runtime_handle is None or not self._runtime_handle.reset_required:
+        if self._runtime_handle is None:
             return True
         try:
-            self._runtime_handle.reset(self._runtime_context)
+            self._runtime_handle.retry_pending_stream_closes(self._runtime_context)
+            if self._runtime_handle.reset_required:
+                self._runtime_handle.reset(self._runtime_context)
         except Exception as e:
             self._last_error = f"ASR runtime recovery failed: {e}"
             self.state = ASRState.ERROR
@@ -699,8 +738,13 @@ class ASRInferenceModule:
             if self._runtime_handle is not None:
                 self._runtime_handle.close()
                 self._runtime_handle = None
+            if self._pending_cleanup is not None:
+                self._pending_cleanup.close()
+                self._pending_cleanup = None
             self._recognizer = None
             self.state = ASRState.IDLE
+
+    close = cleanup
 
     @property
     def sample_rate(self) -> int:

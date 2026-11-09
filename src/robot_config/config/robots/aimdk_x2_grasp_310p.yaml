@@ -20,7 +20,7 @@
 # things had to be measured first, and neither was this file's models:
 #   - the runtime's command channels queued ten targets (aimdk_robot
 #     runtime_node._COMMAND_QOS), so the platform was driven to a target the
-#     executor had sent 251 ms earlier and grasp_pipeline/streaming refused
+#     executor had sent 251 ms earlier and pick/pipeline/streaming refused
 #     every approach at its 0.2 s command_apply_s. Depth 1: 26 ms, and the
 #     approach runs;
 #   - the first request after the grasp head warms up rebuilds the cuRobo

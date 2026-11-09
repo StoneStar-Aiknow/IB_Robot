@@ -1,0 +1,15 @@
+{"model": "decode", "iteration": 1, "release_ns": 126501850770862, "start_ns": 126501850770862, "finish_ns": 126501986698127, "execute_ms": 135.927265, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 2, "release_ns": 126501996433935, "start_ns": 126501996433935, "finish_ns": 126502083930002, "execute_ms": 87.496067, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 3, "release_ns": 126502088640653, "start_ns": 126502088640653, "finish_ns": 126502169045575, "execute_ms": 80.404922, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 4, "release_ns": 126502175632763, "start_ns": 126502175632763, "finish_ns": 126502235516018, "execute_ms": 59.883255, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 5, "release_ns": 126502241980732, "start_ns": 126502241980732, "finish_ns": 126502322133336, "execute_ms": 80.152604, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 6, "release_ns": 126502326646565, "start_ns": 126502326646565, "finish_ns": 126502396055497, "execute_ms": 69.408932, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 7, "release_ns": 126502400528909, "start_ns": 126502400528909, "finish_ns": 126502587163779, "execute_ms": 186.63487, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 8, "release_ns": 126502592660602, "start_ns": 126502592660602, "finish_ns": 126502712067607, "execute_ms": 119.407005, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 9, "release_ns": 126502716662138, "start_ns": 126502716662138, "finish_ns": 126502809165133, "execute_ms": 92.502995, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 10, "release_ns": 126502814271487, "start_ns": 126502814271487, "finish_ns": 126502878864664, "execute_ms": 64.593177, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 11, "release_ns": 126502885308284, "start_ns": 126502885308284, "finish_ns": 126502956908440, "execute_ms": 71.600156, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 12, "release_ns": 126502961710107, "start_ns": 126502961710107, "finish_ns": 126503038112503, "execute_ms": 76.402396, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 13, "release_ns": 126503042894769, "start_ns": 126503042894769, "finish_ns": 126503099447790, "execute_ms": 56.553021, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 14, "release_ns": 126503103912607, "start_ns": 126503103912607, "finish_ns": 126503158785524, "execute_ms": 54.872917, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}
+{"model": "decode", "iteration": 15, "release_ns": 126503163318415, "start_ns": 126503163318415, "finish_ns": 126503217043988, "execute_ms": 53.725573, "numerical": true, "max_abs": [0.0, 0.0, 0.0]}

@@ -1,0 +1,30 @@
+controller: bmimic
+motions:
+  kuailechongbai:
+    policy: kuailechongbai1-Full2.onnx
+    start_count: 1
+    end_count: 2820
+  fan_dance:
+    policy: policy_FanDance.onnx
+    start_count: 0
+    end_count: 1170
+    frame_count: 1787
+  niuniu_dance:
+    policy: policy_niuniu_Dance.onnx
+    start_count: 0
+    # The model has 1160 reference rows, not the catalog's 1171.
+    end_count: 1159
+    frame_count: 1160
+  charleston:
+    policy: policy_dance_ces_full300.onnx
+    start_count: 0
+    end_count: 2517
+    frame_count: 6572
+  dingding:
+    policy: dingding_v5_gc.onnx
+    start_count: 0
+    end_count: 1550
+  kuailechongbai_video:
+    policy: kuailechongbai_fromvideo_inpainted.onnx
+    start_count: 1
+    end_count: 2820

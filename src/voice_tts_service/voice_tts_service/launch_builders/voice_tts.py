@@ -20,6 +20,7 @@ from robot_config.audio_contract import is_audio_io_enabled
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
+from voice_tts_service.cann_runtime import ascend_node_environment, resolve_cann_root
 
 logger = get_colored_logger("robot_config.voice_tts")
 _VOICE_TTS_MISSING_ERROR = "voice_tts.enabled=true requires the voice_tts_service package to be installed"
@@ -51,6 +52,32 @@ def resolve_voice_tts_path(path: str) -> str:
     if not workspace.is_absolute():
         raise ValueError("WORKSPACE must be absolute for a relative voice_tts.bundle_path")
     return str((workspace / candidate).resolve())
+
+
+def _ascend_node_environment(bundle_path: str, deployment: str) -> dict[str, str]:
+    """CANN paths for an Ascend deployment, chosen from the ABI its OM files were built against.
+
+    The ZipVoice OM files declare ``cann-8.1.RC1``; loading them under a different CANN runtime
+    crashes inside ACL (observed on the 310P, 2026-10-16), so the node must not inherit whichever
+    toolkit the caller sourced. Non-Ascend deployments get no extra environment.
+    """
+    from inference_manifest import load_inference_manifest
+
+    try:
+        validated = load_inference_manifest(bundle_path, deployment)
+    except Exception:  # The node validates the bundle itself and reports a usable error.
+        return {}
+    profiles = dict(validated.deployment.role_runtime_profiles or {})
+    if not profiles and validated.deployment.runtime_profile is not None:
+        profiles = {"": validated.deployment.runtime_profile}
+    ascend = [profile for profile in profiles.values() if profile.backend == "ascend"]
+    if not ascend:
+        return {}
+    abis = {profile.target.runtime_abi for profile in ascend if profile.target is not None}
+    abis.discard(None)
+    if len(abis) > 1:
+        raise ValueError(f"voice_tts deployment {deployment!r} declares conflicting CANN ABIs: {sorted(abis)}")
+    return ascend_node_environment(resolve_cann_root(next(iter(abis), None)))
 
 
 def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
@@ -110,6 +137,16 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         audio_topic = audio_output["topic"]
         playback_sample_rate = int(audio_output.get("sample_rate_hz", 24000))
         playback_channels = int(audio_output.get("channels", 1))
+        # How the speaker wants PCM written is a property of the speaker, declared on its
+        # interface; a speaker that declares nothing keeps the node's defaults.
+        speaker_pacing = {
+            parameter: int(audio_output[field])
+            for field, parameter in (("write_chunk_ms", "chunk_ms"), ("prebuffer_ms", "prebuffer_ms"))
+            if field in audio_output
+        }
+        # The publisher's QoS is the speaker's too: the runtime declares best_effort on its
+        # subscription, so publishing RELIABLE (the rclpy default) over-specifies the transport.
+        speaker_qos = audio_output.get("qos")
     else:
         audio_io = robot_config.get("audio_io", {})
         if not is_audio_io_enabled(audio_io):
@@ -117,6 +154,8 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
         audio_topic = str(audio_io.get("playback_topic", "/audio/play"))
         playback_sample_rate = int(audio_io.get("playback_sample_rate", 24000))
         playback_channels = int(audio_io.get("playback_channels", 1))
+        speaker_pacing = {}
+        speaker_qos = None
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
     return [
         Node(
@@ -125,6 +164,7 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             name=node_name,
             output="screen",
             parameters=[node_params],
+            additional_env=_ascend_node_environment(bundle_path, deployment),
         ),
         Node(
             package="voice_tts_service",
@@ -145,6 +185,14 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
                     "audio_topic": audio_topic,
                     "playback_sample_rate": playback_sample_rate,
                     "playback_channels": playback_channels,
+                    # Empty keeps the node's rclpy default (RELIABLE, depth 10). A launch parameter
+                    # cannot carry a mapping, so the bound profile travels as JSON.
+                    "audio_qos_json": json.dumps(speaker_qos, sort_keys=True) if speaker_qos else "",
+                    "resample_to_playback_rate": bool(config.get("resample_to_playback_rate", False)),
+                    # Empty keeps the node's AudioData default; robot_config checks that an
+                    # explicit type matches the bound speaker.
+                    "audio_message_type": str(config.get("audio_message_type") or "audio_common_msgs/msg/AudioData"),
+                    **speaker_pacing,
                 }
             ],
         ),

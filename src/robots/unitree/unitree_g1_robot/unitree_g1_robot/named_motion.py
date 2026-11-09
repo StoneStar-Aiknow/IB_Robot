@@ -19,8 +19,8 @@ wait for instead is a hardware question (gate 6.3); until it is answered, the
 ExecuteAction response is the completion signal.
 
 The platform has no way to cancel either mechanism: a cancel request is
-refused instead of accepted and ignored, and the caller is pointed at
-``/runtime/stop``, which does interrupt everything through the stop sequence.
+refused instead of accepted and ignored. ``/runtime/stop`` closes local
+admission but cannot prove preset interruption.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from ibrobot_msgs.action import ExecuteNamedMotion
 from robot_runtime.contract import LIFECYCLE_ACTIVE
-from unitree_g1_robot import projection
 
 #: Contract-side action endpoint; the profile's interfaces declare the same one.
 NAMED_MOTION_ACTION = "/motion/execute_named"
@@ -65,6 +64,9 @@ class NamedMotionServer:
         self._posture_timeout_s = float(config.get("posture_timeout_s", 5.0))
         self._poll_s = float(config.get("poll_s", 0.05))
         self._lock = threading.Lock()
+        # Hold across preflight and the blocking SDK call. Do not queue a second
+        # preset behind the first, even when interrupt=true was requested.
+        self._preset_dispatch_lock = threading.Lock()
         # (name, generation) of the goal currently executing; a later goal with
         # interrupt=true replaces it and the earlier wait loop notices.
         self._running: tuple[str, int] | None = None
@@ -97,12 +99,9 @@ class NamedMotionServer:
         SetFsmId is not interruptible (stopping half-way through sitting down
         is a fall), and the arm action service has no stop call. Accepting a
         cancel and then ignoring it would be a lie; the honest answer is to
-        refuse it and point at ``/runtime/stop``, which does interrupt
-        everything through the stop sequence.
+        refuse it. Local stop admission is not evidence of physical interruption.
         """
-        self._node.get_logger().warning(
-            "named motion cancel refused: the platform cannot cancel a running motion; use /runtime/stop"
-        )
+        self._node.get_logger().warning("named motion cancel refused: preset physical interruption is not verified")
         return CancelResponse.REJECT
 
     def _admission_failure(self) -> tuple[int, str] | None:
@@ -192,15 +191,47 @@ class NamedMotionServer:
     # --- vendor mechanisms --------------------------------------------------
 
     def _run_action(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
+        if not self._preset_dispatch_lock.acquire(blocking=False):
+            return False, ExecuteNamedMotion.Result.BUSY, "another preset request is in flight"
+        try:
+            return self._run_action_once(name, goal_handle, generation, epoch)
+        finally:
+            self._preset_dispatch_lock.release()
+
+    def _run_action_once(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
         """Dispatch one preset arm action through the arm RPC service."""
+        if getattr(self._node, "_preset_only", False):
+            admitted, detail = self._node.admit_preset_attempt()
+            if not admitted:
+                return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, detail
+            if self._node.runtime_state.stop_epoch != epoch:
+                return False, ExecuteNamedMotion.Result.STOP_LATCHED, "stop engaged before preset dispatch"
         action_id = self._actions[name]
-        result = self._node.rpc_call(
-            "arm",
-            projection.ARM_ACTION_API_IDS["execute_action"],
-            projection.action_id_parameter(action_id),
-            motion=True,
-        )
+        # Stop can arrive while a request waits for executor scheduling/preflight.
+        failure = self._admission_failure()
+        if failure is not None:
+            return False, *failure
+        if self._node.runtime_state.stop_epoch != epoch:
+            return False, ExecuteNamedMotion.Result.STOP_LATCHED, "stop engaged before preset dispatch"
+        try:
+            result = self._node.rpc_call("arm", "execute_action", (action_id,), motion=True)
+        except Exception as exc:
+            self._node.runtime_state.engage_stop("HOLD")
+            return (
+                False,
+                ExecuteNamedMotion.Result.INTERNAL_ERROR,
+                f"preset outcome unknown: {exc}; stop latched; not re-sent",
+            )
         if not result.ok:
+            # SDK client/transport errors do not establish a vendor rejection.
+            if result.timed_out or 3000 <= result.code < 4000:
+                self._node.runtime_state.engage_stop("HOLD")
+                return (
+                    False,
+                    ExecuteNamedMotion.Result.TIMEOUT if result.timed_out else ExecuteNamedMotion.Result.INTERNAL_ERROR,
+                    f"ExecuteAction for {name!r} (action_id {action_id}) outcome unknown "
+                    f"(vendor/client code {result.code}); stop latched; not re-sent",
+                )
             detail = "timed out; not re-sent" if result.timed_out else f"failed with vendor code {result.code}"
             return (
                 False,
@@ -221,12 +252,7 @@ class NamedMotionServer:
     def _run_posture(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
         """Switch the whole-body FSM and wait for the platform's own report."""
         fsm_id = self._postures[name]
-        result = self._node.rpc_call(
-            "loco",
-            projection.LOCO_API_IDS["set_fsm_id"],
-            projection.fsm_id_parameter(fsm_id),
-            motion=True,
-        )
+        result = self._node.rpc_call("loco", "set_fsm_id", (fsm_id,), motion=True)
         if not result.ok:
             detail = "timed out; not re-sent" if result.timed_out else f"failed with vendor code {result.code}"
             return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, f"SetFsmId({fsm_id}) for {name!r} {detail}"
@@ -238,8 +264,9 @@ class NamedMotionServer:
         deadline = time.monotonic() + self._posture_timeout_s
         while time.monotonic() < deadline:
             self._still_current(generation, epoch)
-            answer = self._node.rpc_call("loco", projection.LOCO_API_IDS["get_fsm_id"], {}, timeout_s=0.5)
-            if answer.ok and isinstance(answer.data, dict) and answer.data.get("data") == fsm_id:
+            answer = self._node.rpc_call("loco", "get_fsm_id", None, timeout_s=0.5)
+            # The SDK wrapper unwraps the vendor's {"data": id} to the bare id.
+            if answer.ok and answer.data == fsm_id:
                 return True, ExecuteNamedMotion.Result.NONE, f"posture {name!r} reached (FSM {fsm_id})"
             time.sleep(self._poll_s)
         return (

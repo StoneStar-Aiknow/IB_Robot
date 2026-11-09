@@ -413,7 +413,10 @@ class _FakePipelineManager:
         return None
 
 
-def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkeypatch, runtime_dependencies) -> None:
+@pytest.mark.parametrize("cleanup_pending", [False, True])
+def test_disabled_pipeline_materializes_only_legacy_ros_runtime(
+    tmp_path, monkeypatch, runtime_dependencies, cleanup_pending
+) -> None:
     suffix = uuid.uuid4().hex
     base = f"/scheduler_disabled/test_{suffix}"
     contract = Contract(
@@ -455,6 +458,18 @@ def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkey
         deployment=SimpleNamespace(backend="fake"),
     )
     manager = _FakePipelineManager()
+    closes = []
+
+    def close():
+        from inference_service.pipeline.errors import PipelineManagerError
+
+        closes.append("close")
+        if cleanup_pending and len(closes) == 1:
+            error = PipelineManagerError("native cleanup pending", code="shutdown_failed")
+            error.close_pending = True
+            raise error
+
+    manager.close = close
 
     def _load_contract(node, _path: str) -> None:
         node._contract = contract
@@ -468,7 +483,13 @@ def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkey
     manager_options = {}
 
     def _create_manager(*_args, **kwargs):
+        from inference_service.backends import RuntimeContext
+
         manager_options.update(kwargs)
+        manager_options["managed_execution"] = RuntimeContext(
+            SimpleNamespace(deployment=SimpleNamespace())
+        ).managed_execution
+        assert manager_options["managed_execution"] is kwargs["priority_scheduling"]
         return manager
 
     monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", _create_manager)
@@ -519,7 +540,9 @@ def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkey
             assert not hasattr(pipeline, scheduled_state)
     finally:
         pipeline.destroy_node()
+        runtime_dependencies["providers"].close()
         rclpy.shutdown()
+    assert closes == ["close"] * (2 if cleanup_pending else 1)
 
 
 def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(
@@ -581,7 +604,13 @@ def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(
     manager_options = {}
 
     def _create_manager(*_args, **kwargs):
+        from inference_service.backends import RuntimeContext
+
         manager_options.update(kwargs)
+        manager_options["managed_execution"] = RuntimeContext(
+            SimpleNamespace(deployment=SimpleNamespace())
+        ).managed_execution
+        assert manager_options["managed_execution"] is kwargs["priority_scheduling"]
         return manager
 
     monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", _create_manager)
@@ -726,7 +755,13 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(
     manager_options = {}
 
     def _create_manager(*_args, **kwargs):
+        from inference_service.backends import RuntimeContext
+
         manager_options.update(kwargs)
+        manager_options["managed_execution"] = RuntimeContext(
+            SimpleNamespace(deployment=SimpleNamespace())
+        ).managed_execution
+        assert manager_options["managed_execution"] is kwargs["priority_scheduling"]
         return manager
 
     monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", _create_manager)

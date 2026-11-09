@@ -25,6 +25,7 @@ setup(
         "console_scripts": [
             "fit_x2_torso_cover = aimdk_grasp.torso_cover:main",
             "export_x2_leg_obstacle = aimdk_grasp.leg_obstacle:main",
+            "replay_x2_plan_inputs = aimdk_grasp.plan_replay:main",
             "x2_grasp_head_node = aimdk_grasp.grasp_head:main",
         ],
     },

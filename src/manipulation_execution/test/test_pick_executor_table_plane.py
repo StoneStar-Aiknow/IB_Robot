@@ -2,8 +2,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from manipulation_execution.pick_executor_models import PlannerSceneGeometry
-from manipulation_execution.pick_executor_node import PickExecutorNode
+from manipulation_execution.pick.models import PlannerSceneGeometry
+from manipulation_execution.pick.node import PickExecutorNode
 
 
 def _point(x: float, y: float, z: float):

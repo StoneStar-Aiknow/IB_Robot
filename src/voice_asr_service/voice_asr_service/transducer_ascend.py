@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from inference_service.backends.errors import BackendLifecycleError
+from inference_service.unified_runtime.lifecycle import lifecycle_lock
 from voice_asr_service.kaldi_fbank import FRAME_LENGTH, FRAME_SHIFT, log_mel_frames, num_frames
 from voice_asr_service.kaldi_fbank import SAMPLE_RATE as FBANK_SAMPLE_RATE
 
@@ -74,16 +76,19 @@ class ZipformerEncoderAclRunner:
     them by name and alternates two dataset banks so states never leave the device.
     """
 
-    def __init__(self, model_path: Path, bindings, *, device_id: int, runtime_manager) -> None:
+    def __init__(self, model_path: Path, bindings, *, device_id: int, runtime_manager, cleanup=None) -> None:
         from inference_service.backends.ascend.model import AclModel
 
         if not model_path.is_file():
             raise FileNotFoundError(f"ASR encoder OM not found: {model_path}")
         self._lock = threading.Lock()
+        self._closed = False
         self._lease = runtime_manager.acquire(device_id)
         self._model = None
         self._bank = 0
         self._states: list[tuple[object, object]] = []
+        if cleanup is not None:
+            cleanup.defer(self.close)
         try:
             self._model = AclModel(self._lease, "encoder", model_path, bindings)
             self._model.load_descriptor()
@@ -104,35 +109,48 @@ class ZipformerEncoderAclRunner:
                 bank_b_in[input_index], bank_b_out[output_index] = second, first
             self._model.prepare_dataset_banks((bank_a_in, bank_b_in), (bank_a_out, bank_b_out), host_output_indices={0})
             self.reset()
-        except Exception:
-            self.close()
+        except Exception as exc:
+            if cleanup is not None:
+                exc.cleanup_owner = cleanup
+                exc.close_pending = True
+            else:
+                try:
+                    self.close()
+                except Exception as cleanup_error:
+                    exc.cleanup_owner = self
+                    exc.close_pending = True
+                    exc.rollback_errors = (str(cleanup_error),)
             raise
 
     def reset(self) -> None:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("ASR encoder is closed")
             for first, _ in self._states:
                 self._model.zero_device_buffer(first)
             self._bank = 0
 
     def infer(self, features: np.ndarray) -> np.ndarray:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("ASR encoder is closed")
             out = self._model.execute_bank(self._bank, {0: np.ascontiguousarray(features, dtype=np.float32)})[0]
             self._bank = 1 - self._bank
         return out.reshape(-1, out.shape[-1])
 
     def close(self) -> None:
-        errors = []
-        for resource in (self._model, self._lease):
-            if resource is None:
-                continue
-            try:
-                resource.close()
-            except Exception as exc:  # best-effort teardown, report every failure
-                errors.append(str(exc))
-        self._model = None
-        self._lease = None
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        self._closed = True
+        try:
+            with lifecycle_lock(self._lock):
+                if self._model is not None:
+                    self._model.close()
+                    self._model = None
+                    self._states.clear()
+                if self._lease is not None:
+                    self._lease.close()
+                    self._lease = None
+        except Exception as exc:
+            raise BackendLifecycleError(str(exc), close_pending=True) from exc
 
 
 @dataclass
@@ -176,6 +194,9 @@ class AscendTransducerRuntime:
 
     def load(self, _context=None) -> None:
         return None
+
+    def reset(self, _context=None) -> None:
+        self._encoder.reset()
 
     def open_stream(self, _context) -> _TransducerStream:
         self._encoder.reset()

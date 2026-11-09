@@ -75,6 +75,50 @@ assert_contains "mujoco-sim.txt documents the LIBERO exclusion" \
 assert_not_contains "ubuntu-22.04.txt no longer pins mujoco" \
     "mujoco==" "$(cat "${REPO_ROOT}/requirements/ubuntu-22.04.txt")"
 
+# Read packaging metadata without invoking setuptools or installing engines.
+if python3 - "${REPO_ROOT}" <<'PY'
+import ast
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+root = Path(sys.argv[1])
+package = root / "src/robots/aimdk/aimdk_mujoco"
+pin = next(line for line in (root / "requirements/mujoco-sim.txt").read_text().splitlines()
+           if line.startswith("mujoco=="))
+tree = ast.parse((package / "setup.py").read_text())
+setup = next(node for node in tree.body if isinstance(node, ast.Expr)
+             and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+             and node.value.func.id == "setup").value
+requirements = ast.literal_eval(next(arg.value for arg in setup.keywords if arg.arg == "install_requires"))
+assert [req for req in requirements if req.startswith("mujoco")] == [pin], requirements
+manifest = ET.parse(package / "package.xml").getroot()
+deps = {dep.text: dep for dep in manifest.findall("exec_depend")}
+assert deps["python3-mujoco"].get("version_eq") == pin.split("==")[1]
+assert "python3-onnxruntime" in deps
+PY
+then
+    ok "X2 package metadata pins the shared MuJoCo version and declares both engines"
+else
+    ko "X2 package metadata pins the shared MuJoCo version and declares both engines"
+fi
+
+PROBE_ROSDEP="$(probe '
+set +u
+source scripts/setup.sh
+platform_skip_rosdep_install() { return 1; }
+platform_pre_install_rosdeps() { :; }
+maybe_platform_post_install_rosdeps() { :; }
+setup_profile_get() { echo src; }
+run_with_live_output() { printf "%s\n" "$@"; }
+USE_SUDO=true
+platform_install_rosdeps
+')"
+assert_contains "rosdep leaves the MuJoCo engine to the venv installer" \
+    "--skip-keys=python3-mujoco" "${PROBE_ROSDEP}"
+assert_contains "rosdep leaves ONNX Runtime to the venv installer" \
+    "--skip-keys=python3-onnxruntime" "${PROBE_ROSDEP}"
+
 # ---------------------------------------------------------------------------
 # 2. mujoco_sim_pin_mode: the three install orders + the none modes
 # ---------------------------------------------------------------------------

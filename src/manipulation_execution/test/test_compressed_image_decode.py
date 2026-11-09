@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from sensor_msgs.msg import CompressedImage
 
-from manipulation_execution.compressed_image_decode import decode_compressed_bgr8, is_decodable_format
+from manipulation_execution.hri.compressed_image_decode import decode_compressed_bgr8, is_decodable_format
 from perception_service.model_contracts import validate_image_message
 
 

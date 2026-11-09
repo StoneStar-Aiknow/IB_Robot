@@ -14,7 +14,7 @@ import numpy as np
 
 from inference_manifest import TorchRuntimeProfile
 from inference_service.auto_horizon_runtime import build_action_attention_collector
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.lerobot_assets import (
     TOKENIZER_REFERENCE_KEYS,
@@ -22,7 +22,15 @@ from inference_service.lerobot_assets import (
     resolve_local_semantic_reference,
 )
 from inference_service.model_sessions.base import ModelSession
+from inference_service.model_sessions.torch_completion import (
+    drain_torch_device,
+    drain_torch_device_before_release,
+    resolve_torch_device,
+    torch_execution_scope,
+)
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from inference_service.unified_runtime.errors import CancellationRequested, DeadlineExceeded
+from inference_service.unified_runtime.lifecycle import check_lifecycle
 from robot_config.inference_runtime_options import (
     AUTO_HORIZON_RUNTIME_OPTION_DEFAULTS,
     TORCH_RUNTIME_MODEL_DTYPE_DEFAULT,
@@ -72,6 +80,7 @@ class LeRobotTorchModelSession(ModelSession):
         self._model_dtype = "native"
         self._last_metadata: dict[str, object] = {}
         self._attention_collector = None
+        self._release_drain_failures = 0
 
     @property
     def policy(self) -> Any | None:
@@ -86,6 +95,17 @@ class LeRobotTorchModelSession(ModelSession):
         return self._runtime_version(self._torch)
 
     def preprocess(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
+        with torch_execution_scope(
+            self._torch,
+            self._configured_device_name,
+            self._device,
+            complete_on_success=self._require_context().managed_execution,
+            force_completion_on_error=True,
+            stateful=self.capabilities.stateful,
+        ):
+            return self._preprocess(inputs)
+
+    def _preprocess(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         if self._preprocessor is None:
             raise BackendInferenceError("LeRobot preprocessor is not loaded", code="runtime_not_loaded")
         prepared = dict(inputs)
@@ -107,7 +127,15 @@ class LeRobotTorchModelSession(ModelSession):
     def postprocess(self, action: object) -> object:
         if self._postprocessor is None:
             raise BackendInferenceError("LeRobot postprocessor is not loaded", code="runtime_not_loaded")
-        return self._postprocessor(action)
+        with torch_execution_scope(
+            self._torch,
+            self._configured_device_name,
+            self._device,
+            complete_on_success=self._require_context().managed_execution,
+            force_completion_on_error=True,
+            stateful=self.capabilities.stateful,
+        ):
+            return self._postprocessor(action)
 
     def execution_metadata(self, request_id: str) -> Mapping[str, object]:
         if self._last_metadata.get("request_id") != request_id:
@@ -138,13 +166,14 @@ class LeRobotTorchModelSession(ModelSession):
         if profile.device == "npu":
             torch_npu_module = self._import_required("torch_npu", "torch_npu")
             self._validate_npu(torch_module)
-            device_name = self._npu_device_name(torch_module)
         try:
-            device = torch_module.device(profile.device)
+            device = resolve_torch_device(torch_module, profile.device)
         except Exception as exc:
             raise BackendLoadError(
                 f"cannot construct Torch device {profile.device!r}: {exc}", code="invalid_device"
             ) from exc
+        if profile.device == "npu":
+            device_name = self._npu_device_name(torch_module, device.index)
 
         config_type = self._import_attribute(
             "lerobot.configs.policies", "PreTrainedConfig", "LeRobot policy configuration"
@@ -183,7 +212,7 @@ class LeRobotTorchModelSession(ModelSession):
                 None, policy_config, context.validated_manifest.deployment.extra_parameters
             )
         try:
-            policy_config.device = profile.device
+            policy_config.device = str(device)
         except (AttributeError, TypeError) as exc:
             raise BackendLoadError(
                 "LeRobot policy config does not permit runtime device placement", code="incompatible_policy_config"
@@ -230,7 +259,12 @@ class LeRobotTorchModelSession(ModelSession):
         if provider is not None:
             policy_load_options.update(provider.load_options)
             policy_load_options.update(provider_options)
-        policy = policy_class.from_pretrained(
+        self._torch = torch_module
+        self._device = device
+        self._policy_config = policy_config
+        self._policy_provider = provider
+        rollback.defer(self._release)
+        self._policy = policy = policy_class.from_pretrained(
             bundle_path,
             **policy_load_options,
         )
@@ -240,12 +274,6 @@ class LeRobotTorchModelSession(ModelSession):
                 code="unsupported_auto_horizon_policy",
             )
 
-        self._torch = torch_module
-        self._device = device
-        self._policy = policy
-        self._policy_config = policy_config
-        self._policy_provider = provider
-        rollback.defer(self._release)
         moved = policy.to(device)
         if moved is not None:
             self._policy = policy = moved
@@ -294,7 +322,43 @@ class LeRobotTorchModelSession(ModelSession):
         )
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
-        context.check("backend")
+        with torch_execution_scope(
+            self._torch,
+            self._configured_device_name,
+            self._device,
+            complete_on_success=self._require_context().managed_execution,
+            stateful=self.capabilities.stateful,
+        ):
+            return self._execute_torch(request, context)
+
+    def complete_failure(self, error: Exception) -> None:
+        """Confirm direct device work when the enclosing pipeline discards a result."""
+        if not self._require_context().managed_execution:
+            from .torch_completion import complete_torch_failure
+
+            complete_torch_failure(
+                error,
+                self._torch,
+                self._configured_device_name,
+                self._device,
+                discarded_result=True,
+                stateful=self.capabilities.stateful,
+            )
+
+    def _check_completed_context(self, context: ExecutionContext, phase: str) -> None:
+        from .torch_completion import check_torch_completed_context
+
+        check_torch_completed_context(
+            context,
+            phase,
+            self._torch,
+            self._configured_device_name,
+            self._device,
+            managed=self._require_context().managed_execution,
+            stateful=self.capabilities.stateful,
+        )
+
+    def _execute_torch(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
         policy = self._policy
         torch_module = self._torch
         if policy is None or torch_module is None:
@@ -360,6 +424,9 @@ class LeRobotTorchModelSession(ModelSession):
         del values, descriptors, direction
 
     def _reset(self) -> None:
+        # Reset must not mutate policy state while failed device work is pending.
+        check_lifecycle()
+        drain_torch_device(self._torch, self._configured_device_name, self._device)
         reset = getattr(self._policy, "reset", None)
         if not callable(reset):
             super()._reset()
@@ -375,6 +442,29 @@ class LeRobotTorchModelSession(ModelSession):
     def _release(self) -> None:
         torch_module = self._torch
         device_name = self._configured_device_name
+        if torch_module is not None:
+            # A failed device drain keeps completion unknown, so the references
+            # are retained for a retry. A device stuck in a sticky error state
+            # never completes; after bounded drain failures the release abandons
+            # the wait, drops the references, and lets close terminate. Drain
+            # failures during the load's own rollback path do not count: the
+            # load error handling retries the release before any public close,
+            # and those attempts must not consume the bound.
+            try:
+                check_lifecycle()
+                drain_torch_device_before_release(
+                    torch_module,
+                    device_name,
+                    self._device,
+                    failed_attempts=self._release_drain_failures,
+                    owner="LeRobot Torch model session release",
+                )
+            except BackendLifecycleError:
+                if not self._loading:
+                    self._release_drain_failures += 1
+                raise
+            except (DeadlineExceeded, CancellationRequested) as exc:
+                raise BackendLifecycleError(str(exc), close_pending=True) from exc
         if self._attention_collector is not None:
             self._attention_collector.close()
         self._policy = None
@@ -550,12 +640,12 @@ class LeRobotTorchModelSession(ModelSession):
             )
 
     @staticmethod
-    def _npu_device_name(torch_module: Any) -> str:
+    def _npu_device_name(torch_module: Any, device_index: int) -> str:
         get_device_name = getattr(getattr(torch_module, "npu", None), "get_device_name", None)
         if not callable(get_device_name):
             raise BackendLoadError("torch.npu does not expose get_device_name", code="incompatible_dependency")
         try:
-            return str(get_device_name(0))
+            return str(get_device_name(device_index))
         except (RuntimeError, TypeError, ValueError) as exc:
             raise BackendLoadError(f"unable to identify the NPU device: {exc}", code="device_unavailable") from exc
 
@@ -584,15 +674,15 @@ class LeRobotTorchModelSession(ModelSession):
 
 class LeRobotSessionPreprocessor:
     def __init__(self, session: LeRobotTorchModelSession) -> None:
-        self._session = session
+        self.session = session
 
     def __call__(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
-        return self._session.preprocess(inputs)
+        return self.session.preprocess(inputs)
 
 
 class LeRobotSessionPostprocessor:
     def __init__(self, session: LeRobotTorchModelSession) -> None:
-        self._session = session
+        self.session = session
 
     def __call__(self, action: object) -> object:
-        return self._session.postprocess(action)
+        return self.session.postprocess(action)

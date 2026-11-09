@@ -5,10 +5,10 @@ from __future__ import annotations
 import importlib
 import threading
 from collections.abc import Callable
-from contextlib import suppress
 from typing import Any
 
-from inference_service.backends.errors import BackendLoadError
+from inference_service.backends.errors import BackendLifecycleError, BackendLoadError
+from inference_service.unified_runtime.lifecycle import check_lifecycle, lifecycle_lock
 
 ACL_STREAM_FAST_LAUNCH = 1
 _MAX_HARDWARE_PRIORITY_LEVELS = 8
@@ -29,17 +29,22 @@ class AclRuntimeLease:
         self.device_id = device_id
         self.context = context
         self._closed = False
+        self._device_released = False
         self._lock = threading.Lock()
 
     def bind_current_thread(self) -> None:
+        check_lifecycle()
         check_acl_ret(self.acl.rt.set_context(self.context), "acl.rt.set_context")
 
     def close(self) -> None:
-        with self._lock:
-            if self._closed:
-                return
-            self._closed = True
-        self._manager._release(self)
+        try:
+            with lifecycle_lock(self._lock):
+                if self._closed:
+                    return
+                self._manager._release(self)
+                self._closed = True
+        except Exception as exc:
+            raise BackendLifecycleError(str(exc), close_pending=True) from exc
 
 
 class AclPriorityStreamPool:
@@ -59,7 +64,7 @@ class AclPriorityStreamPool:
         self._closed = False
 
     @classmethod
-    def create(cls, lease: AclRuntimeLease) -> AclPriorityStreamPool:
+    def create(cls, lease: AclRuntimeLease, *, cleanup=None) -> AclPriorityStreamPool:
         lease.bind_current_thread()
         query_priority_range = getattr(lease.acl.rt, "device_get_stream_priority_range", None)
         if not callable(query_priority_range):
@@ -108,6 +113,8 @@ class AclPriorityStreamPool:
             )
         streams: dict[int, object] = {}
         pool = cls(lease, least_priority, greatest_priority, streams)
+        if cleanup is not None:
+            cleanup.defer(pool.close)
         try:
             for priority in range(greatest_priority, least_priority + 1):
                 stream, ret = create_stream(priority, ACL_STREAM_FAST_LAUNCH)
@@ -116,10 +123,14 @@ class AclPriorityStreamPool:
                     raise RuntimeError(f"acl.rt.create_stream_with_config(priority={priority}) returned no stream")
                 streams[priority] = stream
         except Exception as create_error:
+            if cleanup is not None:
+                raise
             try:
                 pool.close()
             except Exception as cleanup_error:
-                raise RuntimeError(f"{create_error}; stream rollback errors: {cleanup_error}") from create_error
+                create_error.cleanup_owner = pool
+                create_error.close_pending = True
+                create_error.rollback_errors = (str(cleanup_error),)
             raise
         return pool
 
@@ -142,26 +153,19 @@ class AclPriorityStreamPool:
         if self._closed:
             return
         self._lease.bind_current_thread()
-        self._closed = True
-        errors: list[Exception] = []
         for priority, stream in reversed(tuple(self._streams.items())):
-            try:
-                check_acl_ret(
-                    self._lease.acl.rt.synchronize_stream(stream),
-                    f"acl.rt.synchronize_stream(priority={priority})",
-                )
-            except Exception as exc:
-                errors.append(exc)
-            try:
-                check_acl_ret(
-                    self._lease.acl.rt.destroy_stream(stream),
-                    f"acl.rt.destroy_stream(priority={priority})",
-                )
-            except Exception as exc:
-                errors.append(exc)
-        self._streams.clear()
-        if errors:
-            raise RuntimeError("; ".join(str(error) for error in errors))
+            check_lifecycle()
+            check_acl_ret(
+                self._lease.acl.rt.synchronize_stream(stream),
+                f"acl.rt.synchronize_stream(priority={priority})",
+            )
+            check_lifecycle()
+            check_acl_ret(
+                self._lease.acl.rt.destroy_stream(stream),
+                f"acl.rt.destroy_stream(priority={priority})",
+            )
+            del self._streams[priority]
+        self._closed = True
 
 
 class AclRuntimeManager:
@@ -173,75 +177,71 @@ class AclRuntimeManager:
         self._acl: Any | None = None
         self._references = 0
         self._device_references: dict[int, int] = {}
+        self._pending_leases: list[AclRuntimeLease] = []
 
     def acquire(self, device_id: int) -> AclRuntimeLease:
-        with self._lock:
+        with lifecycle_lock(self._lock):
+            self._retry_pending()
             acl = self._acl or self._module_loader()
-            initialized_here = False
-            device_set_here = False
-            context: object | None = None
+            if self._acl is None:
+                check_acl_ret(acl.init(), "acl.init")
+                self._acl = acl
+            lease = AclRuntimeLease(self, acl, device_id, None)
+            lease._device_released = True
+            self._references += 1
             try:
-                if self._references == 0:
-                    ret = acl.init()
-                    check_acl_ret(ret, "acl.init")
-                    self._acl = acl
-                    initialized_here = True
-
                 if self._device_references.get(device_id, 0) == 0:
                     check_acl_ret(acl.rt.set_device(device_id), "acl.rt.set_device")
-                    device_set_here = True
-                context, ret = acl.rt.create_context(device_id)
+                self._device_references[device_id] = self._device_references.get(device_id, 0) + 1
+                lease._device_released = False
+                lease.context, ret = acl.rt.create_context(device_id)
                 check_acl_ret(ret, "acl.rt.create_context")
-            except Exception:
-                if context is not None:
-                    with suppress(Exception):
-                        acl.rt.destroy_context(context)
-                if device_set_here:
-                    with suppress(Exception):
-                        acl.rt.reset_device(device_id)
-                if initialized_here:
-                    with suppress(Exception):
-                        acl.finalize()
-                    self._acl = None
+            except Exception as exc:
+                self._pending_leases.append(lease)
+                try:
+                    self._retry_pending()
+                except Exception as cleanup_error:
+                    error = BackendLoadError(f"{exc}; ACL acquisition cleanup pending: {cleanup_error}")
+                    error.cleanup_owner = self
+                    raise error from exc
                 raise
+            return lease
 
-            self._references += 1
-            self._device_references[device_id] = self._device_references.get(device_id, 0) + 1
-            return AclRuntimeLease(self, acl, device_id, context)
+    def _retry_pending(self):
+        while self._pending_leases:
+            self._pending_leases[-1].close()
+            self._pending_leases.pop()
+
+    def close(self):
+        """Retry failed acquisitions before process providers can be released."""
+        with lifecycle_lock(self._lock):
+            self._retry_pending()
+            if self._references:
+                raise BackendLifecycleError("ACL leases are still owned by runtime handles", close_pending=True)
 
     def _release(self, lease: AclRuntimeLease) -> None:
-        with self._lock:
+        with lifecycle_lock(self._lock):
             acl = lease.acl
-            errors: list[str] = []
-            try:
+            if lease.context is not None:
+                check_lifecycle()
                 check_acl_ret(acl.rt.set_context(lease.context), "acl.rt.set_context")
+                check_lifecycle()
                 check_acl_ret(acl.rt.destroy_context(lease.context), "acl.rt.destroy_context")
-            except Exception as exc:
-                errors.append(str(exc))
-
-            device_references = self._device_references.get(lease.device_id, 0)
-            if device_references > 1:
-                self._device_references[lease.device_id] = device_references - 1
-            elif device_references == 1:
-                del self._device_references[lease.device_id]
-                try:
+                lease.context = None
+            if not lease._device_released:
+                device_references = self._device_references[lease.device_id]
+                if device_references == 1:
+                    check_lifecycle()
                     check_acl_ret(acl.rt.reset_device(lease.device_id), "acl.rt.reset_device")
-                except Exception as exc:
-                    errors.append(str(exc))
-
-            if self._references > 0:
-                self._references -= 1
-            if self._references == 0 and self._acl is not None:
-                try:
-                    check_acl_ret(acl.finalize(), "acl.finalize")
-                except Exception as exc:
-                    errors.append(str(exc))
-                finally:
-                    self._acl = None
-                    self._device_references.clear()
-
-            if errors:
-                raise RuntimeError("; ".join(errors))
+                    del self._device_references[lease.device_id]
+                else:
+                    self._device_references[lease.device_id] = device_references - 1
+                lease._device_released = True
+            if self._references == 1:
+                check_lifecycle()
+                check_acl_ret(acl.finalize(), "acl.finalize")
+                self._acl = None
+            self._references -= 1
 
     @staticmethod
     def _import_acl() -> Any:

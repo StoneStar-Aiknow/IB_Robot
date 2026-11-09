@@ -1,0 +1,32 @@
+{
+  "periodic_path": "/data/rtinfer-migration-20261104/colleague-results-20261105/periodic/alone-periodic-control.bin",
+  "high_budget_ns": 38000000,
+  "persistent_io": "1",
+  "safe_args_batch": "1",
+  "mode": "pfp",
+  "scene": "pose",
+  "hz": 18,
+  "duration": 30,
+  "trim": 5,
+  "priorities": {
+    "pose": 0,
+    "yolo": 3,
+    "tts": 3,
+    "vl": 3
+  },
+  "cpu": {
+    "pose": 13,
+    "yolo": 10,
+    "tts": 12,
+    "vl": 11,
+    "scheduler": 15
+  },
+  "prefetch": "on",
+  "deadline_ms": 55.55555555555556,
+  "drop_policy": "latest frame; all offered releases counted",
+  "output_policy": "host arrays in every path",
+  "correctness": "3 warmups, first/every100 completed calls and final output; native references",
+  "measurement_script_sha256": "ae89af41d0b36edac46397ec9bd5dd62c09dc9cb8f2f289ebabfea47892e589f",
+  "scheduler_pid": 90398,
+  "boot_id": "82eaccfb-9869-47dc-911c-19869207df07"
+}

@@ -190,20 +190,15 @@ def test_rpc_surface_matches_the_projection_convention(profile):
         "loco": projection.rpc_request_topic("sport"),
         "arm": projection.rpc_request_topic("arm"),
         "audio": projection.rpc_request_topic("voice"),
+        "robot_state": projection.rpc_request_topic("robot_state"),
     }
     assert rpc["response_topics"] == {
         "loco": projection.rpc_response_topic("sport"),
         "arm": projection.rpc_response_topic("arm"),
         "audio": projection.rpc_response_topic("voice"),
+        "robot_state": projection.rpc_response_topic("robot_state"),
     }
     assert rpc["timeout_s"] > 0.0
-
-
-def test_api_ids_match_the_vendored_sdk_headers(profile):
-    api_ids = profile["vendor"]["api_ids"]
-    assert api_ids["loco"] == projection.LOCO_API_IDS
-    assert api_ids["arm"] == projection.ARM_ACTION_API_IDS
-    assert api_ids["audio"] == projection.AUDIO_API_IDS
 
 
 def test_tts_led_and_audio_api_ids_match_the_vendored_headers(profile):
@@ -278,14 +273,6 @@ def test_joint_limits_cover_every_joint_and_bracket_their_targets(profile):
             [limits[joint]["upper"] + 1.0], channel_joints=[joint], joint_limits=limits, label="arm_stream"
         )
     assert excinfo.value.reason == "JOINT_TARGET_RANGE"
-
-
-def test_vendor_qos_entries_resolve_to_valid_profiles(profile):
-    qos = profile["vendor"]["qos"]
-    assert projection.vendor_qos(qos, "low_state") == ("best_effort", "volatile", 10)
-    assert projection.vendor_qos(qos, "rpc_request") == ("reliable", "volatile", 10)
-    for key in qos:  # every entry resolves without raising
-        projection.vendor_qos(qos, key)
 
 
 # --- stop (D5) -------------------------------------------------------------------------------
@@ -388,8 +375,9 @@ def test_peripheral_drivers_serve_the_declared_capability_topics(profile):
 
 
 def test_public_interfaces_serve_neutral_message_types(profile):
-    """No generic consumer links unitree_hg or unitree_api: every vendor-facing
-    surface is re-served with a neutral type."""
+    """No generic consumer sees a vendor type: every vendor-facing surface is
+    re-served with a neutral type (since Issue #171 PR 2 the vendor frames
+    live only behind unitree_g1_adapter and the runtime node)."""
     interfaces = build_description(profile, use_sim=True)["interfaces"]
     for name, spec in profile["interfaces"].items():
         assert spec["capability"] in profile["capabilities"], name
@@ -433,7 +421,6 @@ UNVERIFIED_LINES = [
     ("dex3_left_state: rt/lf/dex3/left/state", "dex3 state stream"),
     ("bms_state: rt/bmsstate", "battery topic"),
     ("rpc:", "rpc topic naming"),
-    ("qos:", "endpoint qos"),
     ("optical_frame_id: d435_link", "camera optical frame"),
     ("lidar_ip: 192.168.1.100", "lidar network"),
     ("weight_ramp_rate: 0.2", "arm_sdk ramp rate"),

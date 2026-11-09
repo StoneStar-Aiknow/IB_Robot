@@ -6,10 +6,11 @@ import inspect
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import Future
-from contextlib import suppress
-from dataclasses import dataclass, field
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,6 +30,7 @@ from .contracts import (
     RuntimeHealth,
     StreamState,
 )
+from .dispatch import RuntimeExecutionPolicy
 from .errors import (
     CancellationRequested,
     DeadlineExceeded,
@@ -37,8 +39,12 @@ from .errors import (
     RecoveryAction,
     RecoveryRequirement,
     RecoveryScope,
+    execution_evidence,
 )
 from .streaming import StreamDiagnostics, StreamHandle, StreamingRuntime
+
+_CLOSED_STREAM_HISTORY_LIMIT = 128
+
 
 _LEGAL_TRANSITIONS: dict[LifecycleState, frozenset[LifecycleState]] = {
     LifecycleState.CREATED: frozenset({LifecycleState.LOADING, LifecycleState.CLOSING}),
@@ -95,15 +101,31 @@ def _call_reset(resource: object, context: ExecutionContext) -> None:
     method = getattr(resource, "reset", None)
     if not callable(method):
         return
-    _compatible_call(
-        method,
-        (
-            ((context,), {}),
-            ((), {"context": context}),
-            ((), {"execution_context": context}),
-            ((), {"deadline": context.deadline}),
-            ((), {}),
-        ),
+    try:
+        _compatible_call(
+            method,
+            (
+                ((context,), {}),
+                ((), {"context": context}),
+                ((), {"execution_context": context}),
+                ((), {"deadline": context.deadline}),
+                ((), {}),
+            ),
+        )
+    except ExecutionFailure as exc:
+        if not _completed_control_failure(exc):
+            raise
+        # The hook completed. Its owner still finalizes recovery before the
+        # public result check reports this same canceled/expired context.
+
+
+def _completed_control_failure(failure: ExecutionFailure) -> bool:
+    return (
+        failure.code in {"request_canceled", "deadline_exceeded"}
+        and failure.evidence.state is OutcomeState.COMPLETED
+        and failure.evidence.outcome_known
+        and failure.recovery.action is RecoveryAction.NONE
+        and not failure.close_pending
     )
 
 
@@ -204,7 +226,7 @@ def _call_stream_control(
 ) -> None:
     method = getattr(streaming_runtime, name, None)
     if not callable(method):
-        return
+        raise TypeError(f"streaming runtime must expose {name}(stream_handle, context)")
     _compatible_call(
         method,
         (
@@ -445,21 +467,29 @@ class ModelRuntimeHandle:
         self._artifact_integrity = selected_integrity
         self._runtime_version = selected_version
         self._entries = tuple(entries)
+        self._validate_configuration()
         self._admission = (
-            NativeAdmission(provider, str(getattr(capabilities, "name", self._runtime_id)), capabilities)
+            NativeAdmission(
+                provider,
+                str(getattr(capabilities, "name", self._runtime_id)),
+                getattr(capabilities, "capabilities", capabilities),
+            )
             if provider is not None
             and callable(getattr(provider, "register_instance", None))
             and capabilities is not None
             else None
         )
 
-        self._validate_configuration()
-
         # Claim only after all handle configuration checks have succeeded.  A
         # factory can therefore release an assembly when construction fails
         # before ownership is actually transferred.
         if isinstance(assembly, RuntimeAssembly):
-            assembly.claim_ownership()
+            try:
+                assembly.claim_ownership()
+            except Exception:
+                if self._admission is not None:
+                    self._admission.close()
+                raise
 
         self._condition = threading.Condition(threading.RLock())
         self._control_lock = threading.Lock()
@@ -469,9 +499,8 @@ class ModelRuntimeHandle:
         self._active_executions = 0
         self._active_frame_executions = 0
         self._active_stream_steps = 0
+        self._execution_contexts: dict[str, list[ExecutionContext]] = {}
         self._active_threads: dict[int, int] = {}
-        self._execution_contexts: dict[str, ExecutionContext] = {}
-        self._loaded_entries: tuple[OwnedComponent, ...] = ()
         self._released_ids: set[int] = set()
         self._failure_count = 0
         self._last_failure: ExecutionFailure | None = None
@@ -479,11 +508,16 @@ class ModelRuntimeHandle:
         self._last_successful_at: datetime | None = None
         self._recovery_requirement: RecoveryRequirement | None = None
         self._recovery_available = False
-        self._close_error: ExecutionFailure | None = None
-        self._stream_owner = object()
+        # One identity for stream ownership and failure deduplication.
+        self._owner_token = object()
         self._streams: dict[str, _StreamRecord] = {}
+        self._closed_stream_ids: deque[str] = deque()
         self._stream_counter = 0
         self._stream_openings = 0
+        self._execution_policy: RuntimeExecutionPolicy | None = None
+        self._policy_authority: object | None = None
+        self._policy_close_complete = False
+        self._policy_context_provider: Callable[[ExecutionContext], ExecutionContext] | None = None
 
     @staticmethod
     def _contract_value(contract: object | None, name: str, fallback: Any) -> Any:
@@ -539,6 +573,9 @@ class ModelRuntimeHandle:
         else:
             if self._streaming_runtime is None:
                 raise ValueError("stream contracts require a StreamingRuntime")
+            required = ("open_stream", "step", "reset_stream", "close_stream")
+            if any(not callable(getattr(self._streaming_runtime, name, None)) for name in required):
+                raise TypeError(f"streaming runtime requires {', '.join(required)}")
             if self._state_bank_mode is None:
                 self._state_bank_mode = "per_stream"
             if self._state_bank_mode not in {"per_stream", "runtime_exclusive"}:
@@ -599,7 +636,28 @@ class ModelRuntimeHandle:
 
     @property
     def ready(self) -> bool:
+        # Never call a policy while holding the lifecycle condition: its
+        # controller may take that condition while publishing local readiness.
+        if not self.local_ready:
+            return False
+        policy = self._execution_policy
+        return policy is None or bool(policy.ready)
+
+    @property
+    def local_ready(self) -> bool:
+        """Backend readiness for infrastructure dispatch and host status."""
         return self.state is LifecycleState.READY
+
+    @property
+    def input_ready(self) -> bool:
+        """Whether a producer may buffer input, including a healthy reset."""
+        if self.state in {LifecycleState.CLOSING, LifecycleState.CLOSED, LifecycleState.FAILED}:
+            return False
+        policy = self._execution_policy
+        if policy is None:
+            return self.ready
+        input_ready = getattr(policy, "input_ready", None)
+        return self.ready if input_ready is None else bool(input_ready)
 
     @property
     def reset_required(self) -> bool:
@@ -658,6 +716,9 @@ class ModelRuntimeHandle:
         return context
 
     def load(self, context: object = None) -> None:
+        from .lifecycle import check_startup
+
+        check_startup()
         if context is None:
             context = getattr(self._assembly, "load_context", None)
         with self._condition:
@@ -678,23 +739,30 @@ class ModelRuntimeHandle:
                     if self._state is LifecycleState.CLOSING:
                         raise RuntimeError("runtime load was interrupted by close")
                 load_context = entry.load_context if entry.load_context is not None else context
-                _call_load(entry.resource, load_context)
+                if self._execution_policy is not None and getattr(load_context, "managed_execution", None) is False:
+                    raise ValueError("execution policy requires a managed_execution runtime context")
+                check_startup()
                 attempted.append(entry)
+                try:
+                    _call_load(entry.resource, load_context)
+                except Exception as exc:
+                    if getattr(exc, "rollback_clean", False) is True:
+                        self._released_ids.add(id(entry.resource))
+                    raise
             with self._condition:
+                check_startup()
                 if self._state is not LifecycleState.LOADING:
                     raise RuntimeError(f"runtime load ended in {self._state.value}")
                 # Some sessions discover reset support only after loading the model.
                 session_capabilities = getattr(self._assembly.session, "capabilities", None)
-                if self._assembly.retry_failed_reset:
-                    self._resettable = self._resettable or bool(getattr(session_capabilities, "resettable", False))
-                self._loaded_entries = tuple(attempted)
+                self._resettable = self._resettable or bool(getattr(session_capabilities, "resettable", False))
                 self._admission_open = True
                 self._transition_locked(LifecycleState.READY)
                 self._condition.notify_all()
         except Exception as exc:
             rollback_errors = self._release_entries(tuple(reversed(attempted)))
             evidence = OutcomeEvidence.not_started("admission", operation="load")
-            details: dict[str, object] = {"runtime_id": self.runtime_id}
+            details: dict[str, object] = {"runtime_id": self.runtime_id, "cleanup_complete": not rollback_errors}
             if rollback_errors:
                 details["rollback_errors"] = tuple(str(error) for error in rollback_errors)
             failure = self._failure_factory.from_exception(
@@ -709,8 +777,6 @@ class ModelRuntimeHandle:
             )
             with self._condition:
                 self._admission_open = False
-                if any(getattr(error, "close_pending", False) for error in rollback_errors):
-                    self._loaded_entries = tuple(attempted)
                 if self._state is not LifecycleState.CLOSED and self._state is not LifecycleState.CLOSING:
                     self._transition_locked(LifecycleState.FAILED)
                 self._record_failure_locked(failure)
@@ -735,8 +801,11 @@ class ModelRuntimeHandle:
                 )
             # Frames have one running and one pending slot; the third record
             # owns a replacement until the executor settles the old pending frame.
-            active = self._active_frame_executions if frame else self._active_executions - self._active_frame_executions
-            limit = 3 if frame else self._max_active_executions
+            if frame:
+                active, limit = self._active_frame_executions, 3
+            else:
+                active = self._active_executions - self._active_frame_executions
+                limit = self._max_active_executions
             if active >= limit:
                 raise self._failure_factory.create(
                     "admission_rejected",
@@ -744,19 +813,32 @@ class ModelRuntimeHandle:
                     evidence=OutcomeEvidence.not_started("admission"),
                     details={"active_executions": active, "limit": limit},
                 )
-            if (frame or self._active_frame_executions) and context.request_id in self._execution_contexts:
-                raise self._failure_factory.create(
-                    "request_conflict",
-                    "runtime request ID is already active",
-                    evidence=OutcomeEvidence.not_started("admission"),
-                )
             context.check("admission")
+            self._register_context_locked(context)
             self._active_executions += 1
             self._active_frame_executions += int(frame)
             if not frame:
                 thread_id = threading.get_ident()
                 self._active_threads[thread_id] = self._active_threads.get(thread_id, 0) + 1
-            self._execution_contexts[context.request_id] = context
+
+    def _register_context_locked(self, context: ExecutionContext) -> None:
+        unique_identity = self._execution_policy is not None or callable(getattr(self._executor, "submit_frame", None))
+        if unique_identity and context.request_id in self._execution_contexts:
+            raise self._failure_factory.create(
+                "request_conflict",
+                "runtime request ID is already active",
+                evidence=OutcomeEvidence.not_started("admission"),
+            )
+        self._execution_contexts.setdefault(context.request_id, []).append(context)
+
+    def _release_context_locked(self, context: ExecutionContext) -> None:
+        contexts = self._execution_contexts[context.request_id]
+        for index, active in enumerate(contexts):
+            if active is context:
+                del contexts[index]
+                break
+        if not contexts:
+            del self._execution_contexts[context.request_id]
 
     def _release_execution(self, context: ExecutionContext, *, frame: bool = False) -> None:
         with self._condition:
@@ -764,12 +846,12 @@ class ModelRuntimeHandle:
             self._active_frame_executions -= int(frame)
             if not frame:
                 thread_id = threading.get_ident()
-                count = self._active_threads.get(thread_id, 0) - 1
-                if count > 0:
+                count = self._active_threads[thread_id] - 1
+                if count:
                     self._active_threads[thread_id] = count
                 else:
-                    self._active_threads.pop(thread_id, None)
-            self._execution_contexts.pop(context.request_id, None)
+                    del self._active_threads[thread_id]
+            self._release_context_locked(context)
             self._condition.notify_all()
 
     def _execution_failure(
@@ -783,31 +865,95 @@ class ModelRuntimeHandle:
         if isinstance(exc, ExecutionFailure):
             failure = exc
         else:
-            started = bool(getattr(exc, "operation_started", started))
             failure = self._failure_factory.from_exception(
                 exc,
-                evidence=OutcomeEvidence(
-                    OutcomeState.STARTED if started else OutcomeState.NOT_STARTED,
-                    bool(getattr(exc, "outcome_known", not (started and self._stateful))),
-                    bool(getattr(exc, "state_mutated", started and self._stateful)),
-                    str(getattr(exc, "phase", "backend")),
-                ),
+                evidence=execution_evidence(exc, started=started, stateful=self._stateful, unknown_on_error=True),
                 details={"request_id": context.request_id},
             )
+        # Scheduler admission failures describe work that never reached the
+        # model. Keep them visible to callers without degrading model health,
+        # including when an inner stage already normalized the exception.
+        if self._is_unstarted_admission_rejection(failure):
+            record = False
         if record:
+            self._apply_uncertain_request_failure(failure, failure.evidence.state is not OutcomeState.NOT_STARTED)
             self._remember_failure(failure)
-            self._apply_uncertain_request_failure(failure, started)
         return failure
+
+    def _check_completed_result(self, context: ExecutionContext, phase: str) -> None:
+        try:
+            context.check(phase)
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            raise self._failure_factory.from_exception(
+                exc, evidence=OutcomeEvidence.completed(phase, state_mutated=self._stateful)
+            ) from exc
+
+    def _check_native_admission(self, record=None) -> None:
+        # Waiting requests already count as active. They must leave the queue
+        # when control revokes admission, so drain never waits on its own slots.
+        with self._condition:
+            if not self._admission_open or self._state is not LifecycleState.READY:
+                raise self._lifecycle_failure_locked("admission")
+            if record is not None and (record.closing or record.resetting):
+                raise self._failure_factory.create(
+                    "stream_reentrant",
+                    "stream admission interrupted by a control operation",
+                    evidence=OutcomeEvidence.not_started("admission"),
+                    scope=RecoveryScope.STREAM,
+                )
+
+    @staticmethod
+    def _is_unstarted_admission_rejection(failure: ExecutionFailure) -> bool:
+        return (
+            getattr(failure.cause, "admission_rejected", False)
+            and failure.evidence.state is OutcomeState.NOT_STARTED
+            and failure.evidence.outcome_known
+            and not failure.evidence.state_mutated
+        )
 
     def submit_frame(self, request: ModelRequest, context: ExecutionContext) -> Future:
         """Own a coalesced producer request until its executor completion fence."""
+        if not isinstance(request, ModelRequest):
+            raise TypeError("unified runtime frame submission requires a ModelRequest")
+        policy = self._execution_policy
+        if policy is not None:
+            if not callable(getattr(policy, "submit_frame", None)):
+                raise self._failure_factory.create(
+                    "frame_submission_unsupported",
+                    "execution policy does not support frame submission",
+                    evidence=OutcomeEvidence.not_started("admission"),
+                )
+            context = self._policy_context(context)
+            submitted = self._call_execution_policy("submit_frame", request, context=context)
+            result = Future()
+            result.set_running_or_notify_cancel()
+
+            def complete(done):
+                value = error = None
+                try:
+                    value = done.result()
+                    self._check_completed_result(context, "frame_result")
+                except Exception as exc:
+                    error = self._policy_failure("submit_frame", (), exc, context)
+                self._deliver_frame_result(result, value, error)
+
+            submitted.add_done_callback(complete)
+            return result
+        return self._submit_frame_local(request, context)
+
+    def _submit_frame_local(self, request: ModelRequest, context: ExecutionContext, *, _dispatch_key=None) -> Future:
+        if self._execution_policy is not None:
+            self._require_local_authority(_dispatch_key)
         if not isinstance(request, ModelRequest):
             raise TypeError("unified runtime frame submission requires a ModelRequest")
         context = self._context_or_type_error(context)
         submit = getattr(self._executor, "submit_frame", None)
         if not callable(submit):
             raise TypeError("runtime executor does not support frame submission")
-        self._register_execution(context, frame=True)
+        try:
+            self._register_execution(context, frame=True)
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            raise self._execution_failure(exc, context, started=False) from exc
         result: Future = Future()
         # Device work cannot be canceled by dropping the Future. cancel(request_id)
         # signals the shared context while ownership lasts until completion.
@@ -817,7 +963,7 @@ class ModelRuntimeHandle:
             value = error = None
             try:
                 value = done.result()
-                context.check("frame_result")
+                self._check_completed_result(context, "frame_result")
                 with self._condition:
                     self._last_successful_at = _now()
                     self._last_outcome = OutcomeEvidence.completed("frame_result")
@@ -831,22 +977,258 @@ class ModelRuntimeHandle:
                     error = self._execution_failure(exc, context, started=True)
             finally:
                 self._release_execution(context, frame=True)
-            if error is not None:
-                result.set_exception(error)
-            else:
-                result.set_result(value)
+            self._deliver_frame_result(result, value, error)
 
         try:
             submitted = submit(request, context=context)
         except Exception as exc:
-            failure = self._execution_failure(exc, context, started=False)
+            failure = self._execution_failure(exc, context, started=True)
             self._release_execution(context, frame=True)
-            result.set_exception(failure)
+            self._deliver_frame_result(result, error=failure)
         else:
             submitted.add_done_callback(complete)
         return result
 
-    def execute(self, request: ModelRequest, context: ExecutionContext) -> ModelResult:
+    def _deliver_frame_result(self, result: Future, value=None, error=None) -> None:
+        # Future callbacks run inline. Both policy and local delivery must
+        # reject control calls that would wait for this worker itself.
+        thread_id = threading.get_ident()
+        with self._condition:
+            self._active_threads[thread_id] = self._active_threads.get(thread_id, 0) + 1
+        try:
+            if error is not None:
+                result.set_exception(error)
+            else:
+                result.set_result(value)
+        finally:
+            with self._condition:
+                count = self._active_threads[thread_id] - 1
+                if count:
+                    self._active_threads[thread_id] = count
+                else:
+                    del self._active_threads[thread_id]
+
+    @property
+    def execution_policy_bound(self) -> bool:
+        return self._execution_policy is not None
+
+    def bind_execution_policy(
+        self,
+        policy: RuntimeExecutionPolicy,
+        *,
+        context_provider: Callable[[ExecutionContext], ExecutionContext] | None = None,
+    ) -> object:
+        """Install infrastructure dispatch once and return its local capability.
+
+        Binding happens during composition, before business work starts. The
+        returned capability authorizes private local entry points and the
+        compatible execute/step _dispatch_key argument. Calls without that
+        capability use the policy.
+        """
+        operations = ("execute", "reset", "close", "cancel")
+        if self._state_scope == "stream":
+            operations += ("open_stream", "step", "reset_stream", "close_stream")
+        if any(not callable(getattr(policy, name, None)) for name in operations):
+            raise TypeError(f"execution policy requires {', '.join(operations)}")
+        if not isinstance(getattr(policy, "ready", None), bool):
+            raise TypeError("execution policy requires a boolean ready property")
+        if context_provider is not None and not callable(context_provider):
+            raise TypeError("execution context provider must be callable")
+        with self._condition:
+            self._check_binding_locked()
+            if self._execution_policy is not None:
+                raise RuntimeError("runtime execution policy binding is immutable")
+            if any(getattr(entry.resource, "managed_execution", None) is False for entry in self._entries):
+                raise ValueError("execution policy requires Sessions loaded with managed_execution=True")
+            self._execution_policy = policy
+            self._policy_context_provider = context_provider
+            self._policy_authority = object()
+            return self._policy_authority
+
+    def _check_binding_locked(self) -> None:
+        if (
+            self._state not in {LifecycleState.CREATED, LifecycleState.READY}
+            or self._active_executions
+            or self._active_stream_steps
+            or self._stream_openings
+            or any(record.resetting or record.closing for record in self._open_stream_records())
+        ):
+            raise RuntimeError("runtime binding requires an idle created or ready runtime")
+
+    def _policy_context(self, context: ExecutionContext) -> ExecutionContext:
+        context = self._context_or_type_error(context)
+        provider = self._policy_context_provider
+        if provider is None:
+            return context
+        provided = self._context_or_type_error(provider(context))
+        if provided.request_id != context.request_id or provided.cancellation_token is not context.cancellation_token:
+            raise ValueError("context provider must preserve request ID and cancellation token")
+        from .lifecycle import lifecycle_deadline
+
+        return provided.with_deadline(lifecycle_deadline(context.deadline, provided.deadline))
+
+    def _require_local_authority(self, authority: object) -> None:
+        if authority is not None and authority is self._policy_authority:
+            return
+        raise self._failure_factory.create(
+            "dispatch_token_required",
+            "managed runtime requires policy dispatch or authorized local dispatch",
+            evidence=OutcomeEvidence.not_started("admission"),
+        )
+
+    def _call_execution_policy(self, operation, *args, context):
+        # Policy waits must not hold either lifecycle lock: the local worker
+        # needs those same locks to perform and complete the authorized work.
+        with self._condition:
+            if operation != "close" and self._state in {LifecycleState.CLOSING, LifecycleState.CLOSED}:
+                raise self._lifecycle_failure_locked(operation)
+        if operation in {"step", "reset_stream", "close_stream"}:
+            # Transport policies may serialize the handle as a string. Validate
+            # ownership here, before that conversion can discard its capability.
+            record = self._resolve_stream(args[0], operation, allow_closed=operation == "close_stream")
+            if operation == "close_stream" and record.state is StreamState.CLOSED:
+                return None
+        try:
+            if operation in {"execute", "step", "submit_frame", "open_stream"}:
+                try:
+                    context.check("policy_admission")
+                except (DeadlineExceeded, CancellationRequested) as exc:
+                    raise self._failure_factory.from_exception(
+                        exc, evidence=OutcomeEvidence.not_started("policy_admission")
+                    ) from exc
+            value = getattr(self._execution_policy, operation)(*args, context)
+            if operation in {"execute", "step"}:
+                self._check_completed_result(context, f"{operation}_result")
+            if operation == "open_stream":
+                self._check_stream_open_result(self._resolve_stream(value, "open_stream"), context)
+            return value
+        except Exception as exc:
+            failure = self._policy_failure(operation, args, exc, context)
+            if failure is exc:
+                raise
+            raise failure from exc
+
+    def _policy_failure(self, operation, args, exc, context):
+        # Local entry points already applied recovery. The marker lives on the
+        # exception, not in a growing request registry, and survives Future hops.
+        already_recorded = getattr(exc, "_runtime_failure_owner", None) is self._owner_token
+        if isinstance(exc, ExecutionFailure):
+            failure = exc
+        else:
+            failure = self._failure_factory.from_exception(
+                exc,
+                evidence=execution_evidence(exc, started=True, stateful=self._stateful, unknown_on_error=True),
+                details={"request_id": context.request_id},
+            )
+        if operation == "close" and not self._policy_close_complete and not failure.close_pending:
+            failure = self._failure_factory.from_exception(
+                failure, evidence=failure.evidence, details={"close_pending": True}
+            )
+        if already_recorded:
+            failure._runtime_failure_owner = self._owner_token
+            return failure
+        if operation in {"step", "reset_stream", "close_stream"}:
+            stream = args[0]
+            stream_id = stream.stream_id if isinstance(stream, StreamHandle) else stream
+            with self._condition:
+                record = self._streams.get(stream_id)
+                if record is not None and record.state is not StreamState.CLOSED:
+                    return self._handle_stream_failure(record, failure, failure.evidence.state is OutcomeState.STARTED)
+            # A lost close receipt must not undo confirmed local stream closure.
+            self._remember_failure(failure)
+            return failure
+        return self._execution_failure(
+            failure,
+            context,
+            started=failure.evidence.state is OutcomeState.STARTED,
+            record=not _is_superseded_frame(exc) and not _is_superseded_frame(failure.cause),
+        )
+
+    def drain_managed(self, context: ExecutionContext, *, _dispatch_key=None) -> None:
+        """Require explicit backend completion evidence for retained uncertain work."""
+        from .lifecycle import check_lifecycle
+
+        self._require_local_authority(_dispatch_key)
+        self._check_control_reentry("drain")
+        context = self._control_context(context, None)
+        with self._control_guard(self._control_lock, context):
+            with self._condition:
+                if self._state not in {LifecycleState.READY, LifecycleState.RESET_REQUIRED, LifecycleState.FAILED}:
+                    raise self._lifecycle_failure_locked("drain")
+                resources = self._native_drain_resources()
+                if not resources or any(
+                    not callable(getattr(resource, "drain_uncertain_operations", None))
+                    for resource in resources.values()
+                ):
+                    raise self._failure_factory.create(
+                        "backend_drain_unsupported",
+                        "native resources do not all support completion drain",
+                        evidence=OutcomeEvidence.not_started("device_drain"),
+                    )
+                self.mark_reset_required()
+                self._wait_quiescent_locked(context)
+            with ExitStack() as controls:
+                for record in self._open_stream_records():
+                    controls.enter_context(self._control_guard(record.control_lock, context))
+                drain_started = False
+                try:
+                    for resource in resources.values():
+                        check_lifecycle(context, phase="device_drain")
+                        drain_started = True
+                        resource.drain_uncertain_operations()
+                        check_lifecycle(context, phase="device_drain")
+                except Exception as exc:
+                    evidence = (
+                        OutcomeEvidence.started("device_drain", outcome_known=False, state_mutated=self._stateful)
+                        if drain_started
+                        else OutcomeEvidence.not_started("device_drain")
+                    )
+                    raise self._failure_factory.from_exception(exc, evidence=evidence) from exc
+                if self._admission is not None:
+                    self._admission.recovered()
+
+    def _native_drain_resources(self):
+        """Expand factory assemblies, including self links and legacy Session maps."""
+        pending, seen = [self._assembly], set()
+        resources, sessions, orchestrators = {}, set(), set()
+        while pending:
+            assembly = pending.pop()
+            if id(assembly) in seen:
+                continue
+            seen.add(id(assembly))
+            if not isinstance(assembly, RuntimeAssembly):
+                resources[id(assembly)] = assembly
+                sessions.add(id(assembly))
+                continue
+            if assembly.session is not None:
+                resources[id(assembly.session)] = assembly.session
+                sessions.add(id(assembly.session))
+            pending.extend(assembly.role_assemblies.values())
+            if assembly.session is not None or assembly.role_assemblies:
+                orchestrators.update((id(assembly.runtime_executor), id(assembly.streaming_runtime)))
+            else:
+                resources[id(assembly.runtime_executor)] = assembly.runtime_executor
+            for entry in assembly.component_entries():
+                resource = entry.resource
+                if isinstance(resource, RuntimeAssembly):
+                    pending.append(resource)
+                elif any(
+                    callable(getattr(resource, name, None))
+                    for name in ("execute", "execute_role", "drain_uncertain_operations")
+                ):
+                    resources[id(resource)] = resource
+        return {key: resource for key, resource in resources.items() if key in sessions or key not in orchestrators}
+
+    def execute(self, request: ModelRequest, context: ExecutionContext, *, _dispatch_key=None) -> ModelResult:
+        if self._execution_policy is not None and _dispatch_key is None:
+            if not isinstance(request, ModelRequest):
+                raise TypeError("unified runtime execute requires a ModelRequest")
+            return self._call_execution_policy("execute", request, context=self._policy_context(context))
+        return self._execute_local(request, context, _dispatch_key=_dispatch_key)
+
+    def _execute_local(self, request: ModelRequest, context: ExecutionContext, *, _dispatch_key=None) -> ModelResult:
+        if self._execution_policy is not None or _dispatch_key is not None:
+            self._require_local_authority(_dispatch_key)
         if not isinstance(request, ModelRequest):
             raise TypeError("unified runtime execute requires a ModelRequest")
         context = self._context_or_type_error(context)
@@ -866,15 +1248,34 @@ class ModelRuntimeHandle:
         started_at = time.perf_counter()
         try:
             context.check("request")
-            tracker.mark_started("backend", state_mutated=self._stateful, outcome_known=not self._stateful)
-            started = True
-            if self._admission is not None:
-                with self._admission.admit(context.deadline):
+            admission = (
+                self._admission.admit(
+                    context.deadline,
+                    context=context,
+                    managed=_dispatch_key is not None,
+                    check=self._check_native_admission,
+                )
+                if self._admission is not None
+                else nullcontext()
+            )
+            with admission:
+                context.check("admission")
+                tracker.mark_started("backend", state_mutated=self._stateful, outcome_known=not self._stateful)
+                started = True
+                try:
                     frame = _call_executor(self._executor, request, context)
-            else:
-                frame = _call_executor(self._executor, request, context)
-            if isinstance(frame, ExecutionFailure):
-                raise frame
+                    if isinstance(frame, ExecutionFailure):
+                        raise frame
+                except ExecutionFailure:
+                    raise
+                except Exception as exc:
+                    raise self._failure_factory.from_exception(
+                        exc,
+                        evidence=execution_evidence(
+                            exc, started=True, stateful=self._stateful, unknown_on_error=_dispatch_key is not None
+                        ),
+                        details={"request_id": context.request_id},
+                    ) from exc
             tracker.mark_completed("backend")
             try:
                 result = _call_adapter(
@@ -923,8 +1324,7 @@ class ModelRuntimeHandle:
                 self._last_outcome = result.evidence
             return result
         except ExecutionFailure as failure:
-            self._remember_failure(failure)
-            self._apply_uncertain_request_failure(failure, started)
+            self._execution_failure(failure, context, started=started)
             raise
         except (DeadlineExceeded, CancellationRequested) as exc:
             evidence = tracker.mark_failed(
@@ -938,8 +1338,8 @@ class ModelRuntimeHandle:
                 evidence=evidence,
                 details={"request_id": context.request_id},
             )
-            self._remember_failure(failure)
             self._apply_uncertain_request_failure(failure, started)
+            self._remember_failure(failure)
             raise failure from exc
         except Exception as exc:
             failure = self._execution_failure(exc, context, started=started)
@@ -953,33 +1353,73 @@ class ModelRuntimeHandle:
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("runtime cancellation requires a non-empty request_id")
         with self._condition:
-            context = self._execution_contexts.get(request_id)
-            if context is None:
-                return
+            contexts = tuple(self._execution_contexts.get(request_id, ()))
+        # Signal the shared token first. Notify the policy before an executor
+        # hook can block, and still call the hook if policy notification fails.
+        for context in contexts:
             context.cancellation_token.cancel("runtime cancellation requested")
+        policy_error = None
+        cancel = getattr(self._execution_policy, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel(request_id, deadline=deadline)
+            except Exception as exc:
+                policy_error = exc
         executor_cancel = getattr(self._executor, "cancel", None)
-        if not callable(executor_cancel):
-            return
         try:
-            executor_cancel(request_id, deadline=deadline.deadline_at if deadline is not None else None)
-        except TypeError:
-            executor_cancel(request_id)
+            if contexts and callable(executor_cancel):
+                _compatible_call(
+                    executor_cancel,
+                    (
+                        ((request_id,), {"deadline": deadline.deadline_at if deadline is not None else None}),
+                        ((request_id,), {}),
+                    ),
+                )
+        except Exception as exc:
+            if policy_error is None:
+                raise
+            # Raise outside this handler to preserve implicit context as well
+            # as an explicit cause. Python 3.10 has no add_note.
+            notes = list(getattr(policy_error, "__notes__", ()))
+            notes.append(f"executor cancellation also failed: {exc}")
+            policy_error.__notes__ = notes
+        if policy_error is not None:
+            raise policy_error
 
     def _apply_uncertain_request_failure(self, failure: ExecutionFailure, started: bool) -> None:
         evidence = failure.evidence
-        if not (started and evidence.state is OutcomeState.STARTED and not evidence.outcome_known):
+        runtime_recovery = failure.recovery.action in {RecoveryAction.RESET_RUNTIME, RecoveryAction.RELOAD} and (
+            failure.recovery.scope is not RecoveryScope.STREAM
+        )
+        if (
+            not runtime_recovery
+            and not failure.close_pending
+            and not (started and evidence.state is OutcomeState.STARTED and not evidence.outcome_known)
+        ):
             return
         with self._condition:
-            if self._state is not LifecycleState.READY:
+            if self._state not in {LifecycleState.READY, LifecycleState.RESETTING, LifecycleState.RESET_REQUIRED}:
                 return
-            if self._resettable:
-                self._recovery_requirement = RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RESET_RUNTIME)
+            recovery = (
+                failure.recovery
+                if runtime_recovery
+                else RecoveryRequirement(
+                    RecoveryScope.RUNTIME, RecoveryAction.RESET_RUNTIME if self._resettable else RecoveryAction.RELOAD
+                )
+            )
+            if self._recovery_requirement is not None and self._recovery_requirement.action is RecoveryAction.RELOAD:
+                recovery = self._recovery_requirement
+            self._recovery_requirement = recovery
+            if self._resettable and recovery.action is RecoveryAction.RESET_RUNTIME:
                 self._recovery_available = True
-                self._transition_locked(LifecycleState.RESET_REQUIRED)
+                target = LifecycleState.RESET_REQUIRED
             else:
-                self._recovery_requirement = RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RELOAD)
-                self._recovery_available = self._reloadable
-                self._transition_locked(LifecycleState.FAILED)
+                self._recovery_available = self._reloadable if recovery.action is RecoveryAction.RELOAD else False
+                target = LifecycleState.FAILED
+            failure.recovery = recovery
+            failure.recoverable = self._recovery_available
+            if self._state is not target:
+                self._transition_locked(target)
             self._admission_open = False
 
     def mark_reset_required(
@@ -995,8 +1435,14 @@ class ModelRuntimeHandle:
             RecoveryAction.RESET_RUNTIME if self._resettable else RecoveryAction.RELOAD,
         )
         with self._condition:
+            if self._recovery_requirement is not None and self._recovery_requirement.action is RecoveryAction.RELOAD:
+                selected = self._recovery_requirement
             if self._state is LifecycleState.READY:
-                target = LifecycleState.RESET_REQUIRED if self._resettable else LifecycleState.FAILED
+                target = (
+                    LifecycleState.RESET_REQUIRED
+                    if self._resettable and selected.action is RecoveryAction.RESET_RUNTIME
+                    else LifecycleState.FAILED
+                )
                 self._transition_locked(target)
             self._admission_open = False
             self._recovery_requirement = selected
@@ -1012,48 +1458,118 @@ class ModelRuntimeHandle:
             self._record_failure_locked(failure)
 
     def _record_failure_locked(self, failure: ExecutionFailure) -> None:
+        if getattr(failure, "_runtime_failure_owner", None) is self._owner_token:
+            return
+        failure._runtime_failure_owner = self._owner_token
         self._failure_count += 1
-        self._last_failure = failure
+        # Delivered failures acquire caller frames and may retain large results.
+        # All entry points keep only immutable diagnostic values here.
+        self._last_failure = self._failure_factory.create(
+            failure.code,
+            failure.message,
+            evidence=failure.evidence,
+            recovery=failure.recovery,
+            recoverable=failure.recoverable,
+            details=failure.details,
+        )
         self._last_outcome = failure.evidence
-        if failure.recovery.action is not RecoveryAction.NONE and failure.recovery.scope is not RecoveryScope.STREAM:
+        if (
+            failure.recovery.action is not RecoveryAction.NONE
+            and failure.recovery.scope is not RecoveryScope.STREAM
+            and (self._recovery_requirement is None or self._recovery_requirement.action is not RecoveryAction.RELOAD)
+        ):
             self._recovery_requirement = failure.recovery
             self._recovery_available = failure.recoverable
 
-    def _reset_failure_state(self) -> LifecycleState:
+    def _reset_failure_state(self, failure: ExecutionFailure) -> LifecycleState:
         """Scheduled pipelines may retry drain; other runtimes keep legacy failure."""
 
         return (
             LifecycleState.RESET_REQUIRED
-            if self._resettable and self._assembly.retry_failed_reset
+            if self._resettable
+            and self._assembly.retry_failed_reset
+            and failure.recovery.action is not RecoveryAction.RELOAD
             else LifecycleState.FAILED
         )
 
     def _control_context(self, context: ExecutionContext | None, deadline: Deadline | None) -> ExecutionContext:
+        from .lifecycle import lifecycle_context, lifecycle_deadline
+
         if context is not None and not isinstance(context, ExecutionContext):
             raise TypeError("control operations require an ExecutionContext")
         if context is None:
-            effective = Deadline.unbounded() if deadline is None else deadline
-            return ExecutionContext("runtime-control", effective)
-        if deadline is None:
-            return context
-        return context.with_deadline(deadline)
+            context = lifecycle_context()
+        if context is None:
+            return ExecutionContext("runtime-control", lifecycle_deadline(deadline))
+        return context.with_deadline(lifecycle_deadline(context.deadline, deadline))
 
     def _wait_quiescent_locked(self, context: ExecutionContext, *, streams: bool = True) -> None:
+        from .lifecycle import POLL_INTERVAL_SECONDS, check_lifecycle, lifecycle_deadline
+
         while (
             self._active_executions or self._loading or self._stream_openings or (streams and self._active_stream_steps)
         ):
-            context.check("control_drain")
-            remaining = context.deadline.remaining_seconds()
-            self._condition.wait(timeout=0.05 if remaining is None else min(0.05, remaining))
+            check_lifecycle(context, phase="control_drain")
+            remaining = lifecycle_deadline(context.deadline).remaining_seconds()
+            self._condition.wait(
+                timeout=POLL_INTERVAL_SECONDS if remaining is None else min(POLL_INTERVAL_SECONDS, remaining)
+            )
+
+    @contextmanager
+    def _control_guard(self, lock, context, *, closing=False):
+        from .lifecycle import lifecycle_lock, lifecycle_scope
+
+        try:
+            with lifecycle_scope(context), lifecycle_lock(lock, context):
+                yield
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            failure = self._failure_factory.from_exception(
+                exc,
+                evidence=OutcomeEvidence.not_started(exc.phase),
+                details={"runtime_id": self.runtime_id, "close_pending": closing},
+            )
+            raise failure from exc
+
+    def _check_control_reentry(self, operation: str) -> None:
+        with self._condition:
+            thread_id = threading.get_ident()
+            if thread_id in self._active_threads or any(
+                record.active_step and record.active_thread == thread_id for record in self._streams.values()
+            ):
+                raise self._failure_factory.create(
+                    "runtime_reentrant",
+                    f"cannot {operation} a runtime from its active execution",
+                    evidence=OutcomeEvidence.not_started(operation),
+                )
 
     def reset(self, context: ExecutionContext | None = None, *, deadline: Deadline | None = None) -> None:
+        self._check_control_reentry("reset")
+        if self._execution_policy is not None:
+            control_context = self._policy_context(self._control_context(context, deadline))
+            return self._call_execution_policy("reset", context=control_context)
+        return self._reset_local(context, deadline=deadline)
+
+    def _reset_local(
+        self, context: ExecutionContext | None = None, *, deadline: Deadline | None = None, _dispatch_key=None
+    ) -> None:
+        self._check_control_reentry("reset")
+        if self._execution_policy is not None:
+            self._require_local_authority(_dispatch_key)
         if not self._stateful and not self._resettable:
             with self._condition:
                 if self._state in {LifecycleState.CLOSED, LifecycleState.CLOSING}:
                     raise self._lifecycle_failure_locked("reset")
             return
         control_context = self._control_context(context, deadline)
-        with self._control_lock:
+        with self._control_guard(self._control_lock, control_context):
+            # A failed stream Close remains owned by this Handle. Finish it
+            # under the control barrier before entering RESETTING.
+            with self._condition:
+                if self._state not in {LifecycleState.READY, LifecycleState.RESET_REQUIRED}:
+                    raise self._lifecycle_failure_locked("reset")
+            for record in self._open_stream_records():
+                if record.closing:
+                    self._close_stream_record(record, control_context)
             with self._condition:
                 if self._state is LifecycleState.CLOSED or self._state is LifecycleState.CLOSING:
                     raise self._lifecycle_failure_locked("reset")
@@ -1074,8 +1590,9 @@ class ModelRuntimeHandle:
                 try:
                     self._wait_quiescent_locked(control_context)
                 except (DeadlineExceeded, CancellationRequested) as exc:
-                    self._transition_locked(previous)
-                    self._admission_open = previous is LifecycleState.READY
+                    if self._state is LifecycleState.RESETTING:
+                        self._transition_locked(previous)
+                    self._admission_open = self._state is LifecycleState.READY
                     failure = self._failure_factory.from_exception(
                         exc,
                         evidence=OutcomeEvidence.not_started("reset"),
@@ -1084,14 +1601,32 @@ class ModelRuntimeHandle:
                     self._record_failure_locked(failure)
                     raise failure from exc
 
+                # An in-flight failure can strengthen recovery while reset is
+                # waiting. Only this successful drain permits reset to proceed.
+                if self._state is LifecycleState.RESET_REQUIRED:
+                    self._transition_locked(LifecycleState.RESETTING)
+                elif self._state is not LifecycleState.RESETTING:
+                    raise self._lifecycle_failure_locked("reset")
+
             reset_started = False
+            reset_progress = False
+            native_reset_completed = False
             try:
                 control_context.check("reset")
+                native_resources = self._native_drain_resources()
+                host_only = callable(getattr(self._streaming_runtime, "reset_host_stream", None)) and any(
+                    callable(getattr(resource, "reset", None)) for resource in native_resources.values()
+                )
                 if self._state_scope == "stream":
                     for record in self._open_stream_records():
-                        self._reset_stream_record(record, control_context, from_runtime=True)
+                        reset_started = True
+                        self._reset_stream_record(record, control_context, host_only=host_only)
+                        reset_progress = True
+                        native_reset_completed = not host_only
                 for entry in reversed(self._entries):
-                    if entry.resource is self._streaming_runtime:
+                    if entry.resource is self._streaming_runtime and (
+                        native_reset_completed or not callable(getattr(entry.resource, "reset", None))
+                    ):
                         continue
                     capabilities = getattr(entry.resource, "capabilities", None)
                     if (
@@ -1101,17 +1636,38 @@ class ModelRuntimeHandle:
                         and getattr(capabilities, "stateful", None) is False
                     ):
                         continue
-                    if entry.resource is self._executor or callable(getattr(entry.resource, "reset", None)):
+                    if callable(getattr(entry.resource, "reset", None)):
                         reset_started = True
                         _call_reset(entry.resource, control_context)
-                control_context.check("reset")
+                        reset_progress = True
+                        native_reset_completed |= (
+                            entry.resource is self._streaming_runtime or id(entry.resource) in native_resources
+                        )
+                retained = self._admission is not None and self._admission.has_retained
+                if not native_reset_completed and (
+                    retained
+                    or (self._state_bank_mode == "runtime_exclusive" and self._recovery_requirement is not None)
+                ):
+                    raise self._failure_factory.create(
+                        "reset_unsupported",
+                        "recovery requires a native reset; close and rebuild the runtime",
+                        evidence=OutcomeEvidence.not_started("reset"),
+                        scope=RecoveryScope.RUNTIME,
+                        action=RecoveryAction.RELOAD,
+                        recoverable=self._reloadable,
+                    )
                 if self._assembly.reset_complete is not None:
                     self._assembly.reset_complete()
             except ExecutionFailure as failure:
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
-                        self._transition_locked(self._reset_failure_state())
-                    self._admission_open = False
+                        unstarted = (
+                            not reset_progress
+                            and failure.evidence.state is OutcomeState.NOT_STARTED
+                            and failure.recovery.action is not RecoveryAction.RELOAD
+                        )
+                        self._transition_locked(previous if unstarted else self._reset_failure_state(failure))
+                    self._admission_open = self._state is LifecycleState.READY
                     self._record_failure_locked(failure)
                 raise
             except (DeadlineExceeded, CancellationRequested) as exc:
@@ -1126,8 +1682,8 @@ class ModelRuntimeHandle:
                 )
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
-                        self._transition_locked(self._reset_failure_state())
-                    self._admission_open = False
+                        self._transition_locked(self._reset_failure_state(failure) if reset_started else previous)
+                    self._admission_open = self._state is LifecycleState.READY
                     self._record_failure_locked(failure)
                 raise failure from exc
             except Exception as exc:
@@ -1137,34 +1693,74 @@ class ModelRuntimeHandle:
                     message=f"runtime reset failed: {exc}",
                     evidence=OutcomeEvidence.started("reset", outcome_known=False, state_mutated=self._stateful),
                     scope=RecoveryScope.RUNTIME,
-                    action=RecoveryAction.RELOAD,
-                    recoverable=self._reloadable,
+                    action=RecoveryAction.RESET_RUNTIME if self._assembly.retry_failed_reset else RecoveryAction.RELOAD,
+                    recoverable=self._resettable if self._assembly.retry_failed_reset else self._reloadable,
                     details={"runtime_id": self.runtime_id},
                 )
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
-                        self._transition_locked(self._reset_failure_state())
+                        self._transition_locked(self._reset_failure_state(failure))
                     self._admission_open = False
                     self._record_failure_locked(failure)
                 raise failure from exc
             else:
+                if self._admission is not None:
+                    self._admission.recovered()
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
                         self._transition_locked(LifecycleState.READY)
-                    self._admission_open = True
+                    self._admission_open = self._state is LifecycleState.READY
                     self._recovery_requirement = None
                     self._recovery_available = False
                     self._condition.notify_all()
+                try:
+                    self._check_completed_result(control_context, "reset")
+                except ExecutionFailure as failure:
+                    self._remember_failure(failure)
+                    raise
 
     def close(self, context: ExecutionContext | None = None, *, deadline: Deadline | None = None) -> None:
+        self._check_control_reentry("close")
+        if self._execution_policy is not None:
+            control_context = self._policy_context(self._control_context(context, deadline))
+            with self._condition:
+                if self._policy_close_complete:
+                    return
+                self._admission_open = False
+                if self._state not in {LifecycleState.CLOSING, LifecycleState.CLOSED}:
+                    self._transition_locked(LifecycleState.CLOSING)
+            result = self._call_execution_policy("close", context=control_context)
+            with self._condition:
+                if self._state is not LifecycleState.CLOSED:
+                    raise self._failure_factory.create(
+                        "close_pending",
+                        "execution policy returned before local resource cleanup completed",
+                        evidence=OutcomeEvidence.started("close", outcome_known=False),
+                        details={"runtime_id": self.runtime_id, "close_pending": True},
+                    )
+                self._policy_close_complete = True
+            return result
+        return self._close_local(context, deadline=deadline)
+
+    def _close_local(
+        self, context: ExecutionContext | None = None, *, deadline: Deadline | None = None, _dispatch_key=None
+    ) -> None:
+        self._check_control_reentry("close")
+        if self._execution_policy is not None:
+            self._require_local_authority(_dispatch_key)
         control_context = self._control_context(context, deadline)
-        with self._control_lock:
+        # Close revokes admission before waiting for another control operation.
+        # A timeout cannot let a resetting owner reopen this handle.
+        with self._condition:
+            if self._state is LifecycleState.CLOSED:
+                return
+            self._admission_open = False
+            if self._state is not LifecycleState.CLOSING:
+                self._transition_locked(LifecycleState.CLOSING)
+        with self._control_guard(self._control_lock, control_context, closing=True):
             with self._condition:
                 if self._state is LifecycleState.CLOSED:
                     return
-                release_unloaded = self._state is LifecycleState.CREATED or (
-                    self._state is LifecycleState.CLOSING and not self._loading and not self._loaded_entries
-                )
                 self._admission_open = False
                 if self._state is not LifecycleState.CLOSING:
                     self._transition_locked(LifecycleState.CLOSING)
@@ -1181,18 +1777,22 @@ class ModelRuntimeHandle:
                         recoverable=self._reloadable,
                         details={"runtime_id": self.runtime_id, "close_pending": True},
                     )
-                    self._close_error = failure
                     # Keep CLOSING so a later close can retry the drain.
                     raise failure from exc
 
             errors: list[BaseException] = []
             for record in self._open_stream_records():
                 try:
-                    self._close_stream_record(record, control_context, internal=True)
+                    self._close_stream_record(record, control_context)
                 except BaseException as exc:
                     errors.append(exc)
-            entries_to_release = self._loaded_entries or (self._entries if release_unloaded else ())
-            errors.extend(self._release_entries(tuple(reversed(entries_to_release))))
+            # Assembly ownership starts at construction, including components
+            # whose load was never reached. _released_ids skips completed rollback.
+            entries_to_release = self._entries
+            # Stream cleanup can depend on its model. Keep that owner alive
+            # until every stream has positively completed Close.
+            if not errors:
+                errors.extend(self._release_entries(tuple(reversed(entries_to_release))))
             if any(getattr(error, "close_pending", False) for error in errors):
                 failure = self._failure_factory.create(
                     "close_drain_failed",
@@ -1204,15 +1804,11 @@ class ModelRuntimeHandle:
                         "errors": tuple(str(error) for error in errors),
                     },
                 )
-                with self._condition:
-                    self._loaded_entries = entries_to_release
-                    self._close_error = failure
                 raise failure
             if self._admission is not None:
                 with suppress(BaseException):
                     self._admission.close()
             with self._condition:
-                self._loaded_entries = ()
                 self._admission_open = False
                 self._transition_locked(LifecycleState.CLOSED)
                 self._condition.notify_all()
@@ -1227,11 +1823,12 @@ class ModelRuntimeHandle:
                     details={"errors": tuple(str(error) for error in errors), "runtime_id": self.runtime_id},
                 )
                 with self._condition:
-                    self._close_error = failure
                     self._record_failure_locked(failure)
                 raise failure
 
     def _release_entries(self, entries: tuple[OwnedComponent, ...]) -> tuple[BaseException, ...]:
+        from .lifecycle import check_lifecycle
+
         errors: list[BaseException] = []
         for entry in entries:
             resource_id = id(entry.resource)
@@ -1240,6 +1837,7 @@ class ModelRuntimeHandle:
                     continue
                 self._released_ids.add(resource_id)
             try:
+                check_lifecycle()
                 if entry.release is not None:
                     entry.release()
                 elif entry.release_method == "release":
@@ -1257,6 +1855,10 @@ class ModelRuntimeHandle:
                 else:
                     _call_close(entry.resource)
             except BaseException as exc:
+                if isinstance(exc, DeadlineExceeded | CancellationRequested):
+                    exc = self._failure_factory.from_exception(
+                        exc, evidence=OutcomeEvidence.not_started("native_cleanup"), details={"close_pending": True}
+                    )
                 errors.append(exc)
                 if getattr(exc, "close_pending", False):
                     with self._condition:
@@ -1327,6 +1929,13 @@ class ModelRuntimeHandle:
     # ---- Streaming boundary -------------------------------------------------
 
     def open_stream(self, context: ExecutionContext) -> StreamHandle:
+        if self._execution_policy is not None:
+            return self._call_execution_policy("open_stream", context=self._policy_context(context))
+        return self._open_stream_local(context)
+
+    def _open_stream_local(self, context: ExecutionContext, *, _dispatch_key=None) -> StreamHandle:
+        if self._execution_policy is not None:
+            self._require_local_authority(_dispatch_key)
         context = self._context_or_type_error(context)
         tracker = OutcomeEvidenceTracker()
         with self._condition:
@@ -1348,83 +1957,89 @@ class ModelRuntimeHandle:
                     action=RecoveryAction.NONE,
                     details={"max_open_streams": self._max_open_streams},
                 )
+            self._register_context_locked(context)
             self._stream_openings += 1
+            thread_id = threading.get_ident()
+            self._active_threads[thread_id] = self._active_threads.get(thread_id, 0) + 1
         try:
             try:
                 context.check("stream_admission")
+                tracker.mark_started("backend", state_mutated=self._stateful)
                 backend_handle = _call_stream_open(self._streaming_runtime, context)
-            except (DeadlineExceeded, CancellationRequested) as exc:
-                failure = self._failure_factory.from_exception(
-                    exc,
-                    evidence=tracker.mark_failed(exc.phase, state=OutcomeState.NOT_STARTED),
-                    scope=RecoveryScope.STREAM,
-                    details={"operation": "open_stream"},
-                )
-                self._remember_failure(failure)
-                raise failure from exc
             except ExecutionFailure as failure:
+                self._apply_uncertain_request_failure(failure, failure.evidence.state is OutcomeState.STARTED)
                 self._remember_failure(failure)
                 raise
             except Exception as exc:
                 failure = self._failure_factory.from_exception(
                     exc,
-                    evidence=tracker.mark_failed("backend", state=OutcomeState.NOT_STARTED),
+                    evidence=execution_evidence(
+                        exc,
+                        started=tracker.snapshot().state is not OutcomeState.NOT_STARTED,
+                        stateful=self._stateful,
+                        unknown_on_error=True,
+                    ),
                     scope=RecoveryScope.STREAM,
                     details={"operation": "open_stream"},
                 )
+                self._apply_uncertain_request_failure(failure, failure.evidence.state is OutcomeState.STARTED)
                 self._remember_failure(failure)
                 raise failure from exc
 
-            public_handle: StreamHandle
-            if isinstance(backend_handle, StreamHandle):
-                public_handle = backend_handle
-            elif isinstance(backend_handle, str) and backend_handle:
-                public_handle = StreamHandle(backend_handle)
-            elif backend_handle is None:
-                with self._condition:
-                    self._stream_counter += 1
-                    stream_id = f"stream-{self._stream_counter}"
-                public_handle = StreamHandle(stream_id)
+            # Public identities never reuse a provider's recyclable native ID.
+            # This also keeps expired closed-stream IDs from aliasing new streams.
+            with self._condition:
+                self._stream_counter += 1
+                public_handle = StreamHandle(f"stream-{self._stream_counter}")
+            public_handle._bind_owner(self._owner_token)
+            if backend_handle is None:
                 backend_handle = public_handle
-            else:
-                stream_id = getattr(backend_handle, "stream_id", None)
-                if not isinstance(stream_id, str) or not stream_id:
-                    with self._condition:
-                        self._stream_counter += 1
-                        stream_id = f"stream-{self._stream_counter}"
-                public_handle = StreamHandle(stream_id)
-
-            try:
-                public_handle._bind_owner(self._stream_owner)
-            except ValueError:
-                # A provider may return a handle it previously owned.  Preserve
-                # the provider handle internally but expose a fresh owner-bound ID.
-                public_handle = StreamHandle(public_handle.stream_id)
-                public_handle._bind_owner(self._stream_owner)
             record = _StreamRecord(public_handle, backend_handle, str(self._state_bank_mode), _now())
             with self._condition:
-                if self._state is not LifecycleState.READY or not self._admission_open:
-                    with suppress(Exception):
-                        _call_stream_control(self._streaming_runtime, "close_stream", backend_handle, context)
-                    raise self._lifecycle_failure_locked("open_stream")
-                if public_handle.stream_id in self._streams:
-                    with suppress(Exception):
-                        _call_stream_control(self._streaming_runtime, "close_stream", backend_handle, context)
-                    raise self._failure_factory.create(
-                        "stream_id_conflict",
-                        f"stream ID {public_handle.stream_id!r} is already open",
-                        evidence=OutcomeEvidence.not_started("admission"),
-                        scope=RecoveryScope.STREAM,
-                    )
                 self._streams[public_handle.stream_id] = record
                 self._condition.notify_all()
+            self._check_stream_open_result(record, context)
             return public_handle
         finally:
             with self._condition:
                 self._stream_openings -= 1
+                count = self._active_threads[thread_id] - 1
+                if count:
+                    self._active_threads[thread_id] = count
+                else:
+                    del self._active_threads[thread_id]
+                self._release_context_locked(context)
                 self._condition.notify_all()
 
-    def _resolve_stream(self, stream_handle: StreamHandle | str, operation: str) -> _StreamRecord:
+    def _check_stream_open_result(self, record: _StreamRecord, context: ExecutionContext) -> None:
+        public_handle = record.public_handle
+        try:
+            context.check("stream_open_result")
+            with self._condition:
+                if self._state is not LifecycleState.READY or not self._admission_open:
+                    raise self._lifecycle_failure_locked("open_stream")
+        except Exception as exc:
+            cleanup_errors = []
+            try:
+                self._close_stream_record(record, self._control_context(context, None))
+            except Exception as cleanup_error:
+                cleanup_errors.append(str(cleanup_error))
+            failure = self._failure_factory.from_exception(
+                exc,
+                evidence=OutcomeEvidence.completed("stream_open_result", state_mutated=self._stateful),
+                scope=RecoveryScope.STREAM,
+                details={
+                    "stream_id": public_handle.stream_id,
+                    "close_pending": bool(cleanup_errors),
+                    "cleanup_errors": cleanup_errors,
+                },
+            )
+            self._remember_failure(failure)
+            raise failure from exc
+
+    def _resolve_stream(
+        self, stream_handle: StreamHandle | str, operation: str, *, allow_closed: bool = False
+    ) -> _StreamRecord:
         stream_id = stream_handle.stream_id if isinstance(stream_handle, StreamHandle) else stream_handle
         if not isinstance(stream_id, str) or not stream_id:
             raise self._failure_factory.create(
@@ -1434,6 +2049,23 @@ class ModelRuntimeHandle:
                 scope=RecoveryScope.STREAM,
             )
         with self._condition:
+            owned_handle = isinstance(stream_handle, StreamHandle) and stream_handle._belongs_to(self._owner_token)
+            if isinstance(stream_handle, StreamHandle) and not owned_handle:
+                raise self._failure_factory.create(
+                    "stream_not_found",
+                    f"stream {stream_id!r} is not owned by this runtime",
+                    evidence=OutcomeEvidence.not_started("admission"),
+                    scope=RecoveryScope.STREAM,
+                    details={"stream_id": stream_id, "operation": operation},
+                )
+            if owned_handle and stream_handle.closed and not allow_closed:
+                raise self._failure_factory.create(
+                    "stream_closed",
+                    f"stream {stream_id!r} is closed",
+                    evidence=OutcomeEvidence.not_started("admission"),
+                    scope=RecoveryScope.STREAM,
+                    details={"stream_id": stream_id, "operation": operation},
+                )
             record = self._streams.get(stream_id)
             if record is None:
                 raise self._failure_factory.create(
@@ -1443,15 +2075,9 @@ class ModelRuntimeHandle:
                     scope=RecoveryScope.STREAM,
                     details={"stream_id": stream_id, "operation": operation},
                 )
-            if isinstance(stream_handle, StreamHandle) and not stream_handle._belongs_to(self._stream_owner):
-                raise self._failure_factory.create(
-                    "stream_not_found",
-                    f"stream {stream_id!r} is not owned by this runtime",
-                    evidence=OutcomeEvidence.not_started("admission"),
-                    scope=RecoveryScope.STREAM,
-                    details={"stream_id": stream_id, "operation": operation},
-                )
-            if record.state is StreamState.CLOSED:
+            if (
+                record.state is StreamState.CLOSED or (record.closing and operation in {"step", "reset_stream"})
+            ) and not allow_closed:
                 raise self._failure_factory.create(
                     "stream_closed",
                     f"stream {stream_id!r} is closed",
@@ -1461,12 +2087,38 @@ class ModelRuntimeHandle:
                 )
             return record
 
-    def step(self, stream_handle: StreamHandle | str, request: ModelRequest, context: ExecutionContext) -> ModelResult:
+    def step(
+        self, stream_handle: StreamHandle | str, request: ModelRequest, context: ExecutionContext, *, _dispatch_key=None
+    ) -> ModelResult:
+        if self._execution_policy is not None and _dispatch_key is None:
+            if not isinstance(request, ModelRequest):
+                raise TypeError("stream step requires a ModelRequest")
+            return self._call_execution_policy("step", stream_handle, request, context=self._policy_context(context))
+        return self._step_local(stream_handle, request, context, _dispatch_key=_dispatch_key)
+
+    def _step_local(
+        self, stream_handle: StreamHandle | str, request: ModelRequest, context: ExecutionContext, *, _dispatch_key=None
+    ) -> ModelResult:
+        if self._execution_policy is not None or _dispatch_key is not None:
+            self._require_local_authority(_dispatch_key)
         if not isinstance(request, ModelRequest):
             raise TypeError("stream step requires a ModelRequest")
         context = self._context_or_type_error(context)
         record = self._resolve_stream(stream_handle, "step")
+        try:
+            context.check("stream_step_admission")
+        except (DeadlineExceeded, CancellationRequested) as exc:
+            failure = self._failure_factory.from_exception(
+                exc,
+                evidence=OutcomeEvidence.not_started(exc.phase),
+                scope=RecoveryScope.STREAM,
+                details={"stream_id": record.public_handle.stream_id},
+            )
+            self._remember_failure(failure)
+            raise failure from exc
+
         with self._condition:
+            record = self._resolve_stream(stream_handle, "step")
             if self._state is not LifecycleState.READY or not self._admission_open:
                 raise self._lifecycle_failure_locked("step")
             if record.state is StreamState.RESET_REQUIRED:
@@ -1514,26 +2166,13 @@ class ModelRuntimeHandle:
                     scope=RecoveryScope.STREAM,
                     details={"stream_id": record.public_handle.stream_id},
                 )
-        try:
-            context.check("stream_step_admission")
-        except (DeadlineExceeded, CancellationRequested) as exc:
-            failure = self._failure_factory.from_exception(
-                exc,
-                evidence=OutcomeEvidence.not_started(exc.phase),
-                scope=RecoveryScope.STREAM,
-                details={"stream_id": record.public_handle.stream_id},
-            )
-            self._remember_failure(failure)
-            raise failure from exc
-
-        with self._condition:
-            if record.active_step or record.resetting or record.closing:
+            if self._active_stream_steps >= self._max_active_executions:
                 raise self._failure_factory.create(
-                    "stream_reentrant",
-                    f"stream {record.public_handle.stream_id!r} already has an active operation",
+                    "admission_rejected",
+                    "runtime stream execution limit is exhausted",
                     evidence=OutcomeEvidence.not_started("admission"),
-                    scope=RecoveryScope.STREAM,
                 )
+            self._register_context_locked(context)
             record.active_step = True
             record.active_thread = threading.get_ident()
             record.set_state(StreamState.STEPPING)
@@ -1543,11 +2182,34 @@ class ModelRuntimeHandle:
         started = False
         started_at = time.perf_counter()
         try:
-            tracker.mark_started("backend", state_mutated=self._stateful, outcome_known=not self._stateful)
-            started = True
-            frame = _call_stream_step(self._streaming_runtime, record.backend_handle, request, context)
-            if isinstance(frame, ExecutionFailure):
-                raise frame
+            admission = (
+                self._admission.admit(
+                    context.deadline,
+                    context=context,
+                    managed=_dispatch_key is not None,
+                    recovery_key=record.public_handle.stream_id,
+                    check=lambda: self._check_native_admission(record),
+                )
+                if self._admission is not None
+                else nullcontext()
+            )
+            with admission:
+                context.check("admission")
+                tracker.mark_started("backend", state_mutated=self._stateful, outcome_known=not self._stateful)
+                started = True
+                try:
+                    frame = _call_stream_step(self._streaming_runtime, record.backend_handle, request, context)
+                    if isinstance(frame, ExecutionFailure):
+                        raise frame
+                except ExecutionFailure:
+                    raise
+                except Exception as exc:
+                    raise self._failure_factory.from_exception(
+                        exc,
+                        evidence=execution_evidence(exc, started=True, stateful=self._stateful, unknown_on_error=True),
+                        scope=RecoveryScope.STREAM,
+                        details={"stream_id": record.public_handle.stream_id},
+                    ) from exc
             tracker.mark_completed("backend")
             try:
                 result = _call_adapter(
@@ -1575,9 +2237,13 @@ class ModelRuntimeHandle:
                     details={"stream_id": record.public_handle.stream_id},
                 )
                 raise failure from exc
-            result = result.with_evidence(
-                tracker.mark_completed("adaptation", stream_id=record.public_handle.stream_id)
-            )
+            result_evidence = tracker.mark_completed("adaptation", stream_id=record.public_handle.stream_id)
+            metadata = dict(result.metadata)
+            native_id = metadata.get("stream_id")
+            if native_id is not None and native_id != record.public_handle.stream_id:
+                metadata["native_stream_id"] = native_id
+            metadata["stream_id"] = record.public_handle.stream_id
+            result = replace(result, evidence=result_evidence, metadata=metadata)
             try:
                 context.check("stream_step_result")
             except (DeadlineExceeded, CancellationRequested) as exc:
@@ -1619,22 +2285,14 @@ class ModelRuntimeHandle:
             normalized = self._handle_stream_failure(record, failure, started)
             raise normalized from exc
         except Exception as exc:
-            started_flag = bool(getattr(exc, "operation_started", started))
-            known = bool(getattr(exc, "outcome_known", not (started_flag and self._stateful)))
-            mutated = bool(getattr(exc, "state_mutated", started_flag and self._stateful))
-            evidence = tracker.mark_failed(
-                str(getattr(exc, "phase", "backend")),
-                state=OutcomeState.STARTED if started_flag else OutcomeState.NOT_STARTED,
-                outcome_known=known,
-                state_mutated=mutated,
-            )
+            evidence = execution_evidence(exc, started=started, stateful=self._stateful)
             failure = self._failure_factory.from_exception(
                 exc,
                 evidence=evidence,
                 scope=RecoveryScope.STREAM,
                 details={"stream_id": record.public_handle.stream_id},
             )
-            normalized = self._handle_stream_failure(record, failure, started_flag)
+            normalized = self._handle_stream_failure(record, failure, started)
             raise normalized from exc
         finally:
             with self._condition:
@@ -1642,16 +2300,62 @@ class ModelRuntimeHandle:
                 record.active_thread = None
                 if record.state is StreamState.STEPPING:
                     record.set_state(StreamState.OPEN)
+                self._release_context_locked(context)
                 self._active_stream_steps -= 1
                 self._condition.notify_all()
 
     def _handle_stream_failure(
         self, record: _StreamRecord, failure: ExecutionFailure, started: bool
     ) -> ExecutionFailure:
+        if self._is_unstarted_admission_rejection(failure):
+            return failure
         evidence = failure.evidence
         uncertain = started and evidence.state is OutcomeState.STARTED and not evidence.outcome_known
-        if uncertain:
-            if record.state_bank_mode == "per_stream":
+        runtime_recovery = failure.recovery.action in {RecoveryAction.RESET_RUNTIME, RecoveryAction.RELOAD} and (
+            failure.recovery.scope is not RecoveryScope.STREAM
+        )
+        if (
+            record.closing
+            and not runtime_recovery
+            and failure.recovery.action is not RecoveryAction.RELOAD
+            and not (uncertain and record.state_bank_mode == "runtime_exclusive")
+        ):
+            recovery = RecoveryRequirement(RecoveryScope.STREAM, RecoveryAction.CLOSE_STREAM)
+            with self._condition:
+                record.set_state(StreamState.FAILED)
+                record.recovery_requirement = recovery
+                record.last_failure_code = failure.code
+            normalized = self._failure_factory.create(
+                failure.code,
+                failure.message,
+                evidence=evidence,
+                recovery=recovery,
+                recoverable=True,
+                cause=failure.cause or failure,
+                details={**dict(failure.details), "stream_id": record.public_handle.stream_id, "close_pending": True},
+            )
+        elif (
+            failure.recovery.scope is RecoveryScope.STREAM
+            and failure.recovery.action in {RecoveryAction.CLOSE_STREAM, RecoveryAction.RELOAD}
+            and not (uncertain and record.state_bank_mode == "runtime_exclusive")
+        ):
+            # A completed call can still invalidate its bank. An explicit
+            # replacement requirement cannot be weakened to reset.
+            normalized = failure
+            with self._condition:
+                record.set_state(StreamState.FAILED)
+                record.recovery_requirement = failure.recovery
+                record.last_failure_code = failure.code
+        elif (
+            uncertain
+            # A failed delivery cannot advance the caller's matching host
+            # state, even when native completion is known and capacity is free.
+            or (started and evidence.state_mutated)
+            or failure.close_pending
+            or runtime_recovery
+            or failure.recovery.action in {RecoveryAction.RESET_STREAM, RecoveryAction.RESET_RUNTIME}
+        ):
+            if record.state_bank_mode == "per_stream" and not runtime_recovery:
                 if self._resettable:
                     recovery = RecoveryRequirement(RecoveryScope.STREAM, RecoveryAction.RESET_STREAM)
                     recoverable = True
@@ -1672,7 +2376,10 @@ class ModelRuntimeHandle:
                     details={**dict(failure.details), "stream_id": record.public_handle.stream_id},
                 )
             else:
-                if self._resettable:
+                if self._resettable and failure.recovery.action not in {
+                    RecoveryAction.RELOAD,
+                    RecoveryAction.CLOSE_STREAM,
+                }:
                     recovery = RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RESET_RUNTIME)
                     recoverable = True
                     target_state = LifecycleState.RESET_REQUIRED
@@ -1680,19 +2387,6 @@ class ModelRuntimeHandle:
                     recovery = RecoveryRequirement(RecoveryScope.RUNTIME, RecoveryAction.RELOAD)
                     recoverable = self._reloadable
                     target_state = LifecycleState.FAILED
-                with self._condition:
-                    record.set_state(
-                        StreamState.RESET_REQUIRED
-                        if target_state is LifecycleState.RESET_REQUIRED
-                        else StreamState.FAILED
-                    )
-                    record.recovery_requirement = recovery
-                    record.last_failure_code = failure.code
-                    self._admission_open = False
-                    if self._state is LifecycleState.READY:
-                        self._transition_locked(target_state)
-                    self._recovery_requirement = recovery
-                    self._recovery_available = recoverable
                 normalized = self._failure_factory.create(
                     failure.code,
                     failure.message,
@@ -1702,6 +2396,17 @@ class ModelRuntimeHandle:
                     cause=failure.cause or failure,
                     details={**dict(failure.details), "stream_id": record.public_handle.stream_id},
                 )
+                with self._condition:
+                    record.set_state(
+                        StreamState.RESET_REQUIRED
+                        if target_state is LifecycleState.RESET_REQUIRED
+                        else StreamState.FAILED
+                    )
+                    record.recovery_requirement = recovery
+                    record.last_failure_code = failure.code
+                    # Runtime-scoped stream faults share request recovery,
+                    # including failures observed while reset is draining.
+                    self._apply_uncertain_request_failure(normalized, started)
         else:
             normalized = failure
             with self._condition:
@@ -1713,20 +2418,71 @@ class ModelRuntimeHandle:
         self,
         stream_handle: StreamHandle | str,
         context: ExecutionContext,
+    ) -> None:
+        with self._condition:
+            record = self._resolve_stream(stream_handle, "reset_stream")
+            self._check_stream_control_reentry(record, "reset_stream")
+        if self._execution_policy is not None:
+            return self._call_execution_policy("reset_stream", stream_handle, context=self._policy_context(context))
+        return self._reset_stream_local(stream_handle, context)
+
+    def _reset_stream_local(
+        self,
+        stream_handle: StreamHandle | str,
+        context: ExecutionContext,
         *,
         _from_runtime: bool = False,
+        _host_only: bool = False,
+        _dispatch_key=None,
     ) -> None:
-        context = self._context_or_type_error(context)
+        """Reset one stream; _from_runtime requires the runtime control lock."""
+        if self._execution_policy is not None:
+            self._require_local_authority(_dispatch_key)
+        context = self._control_context(context, None)
         record = self._resolve_stream(stream_handle, "reset_stream")
-        was_reset_required = record.state is StreamState.RESET_REQUIRED
-        runtime_resetting = False
-        with record.control_lock:
+        with self._condition:
+            self._check_stream_control_reentry(record, "reset_stream")
+        # Exclusive state still shares the runtime control barrier, but only
+        # runtime reset may recover runtime-wide work and release its slots.
+        runtime_guard = (
+            self._control_guard(self._control_lock, context)
+            if record.state_bank_mode == "runtime_exclusive" and not _from_runtime
+            else nullcontext()
+        )
+        with runtime_guard, self._control_guard(record.control_lock, context):
             with self._condition:
+                record = self._resolve_stream(stream_handle, "reset_stream")
                 if self._state in {LifecycleState.CLOSED, LifecycleState.CLOSING, LifecycleState.FAILED} or (
-                    self._state is LifecycleState.RESETTING and not _from_runtime
+                    self._state in {LifecycleState.RESETTING, LifecycleState.RESET_REQUIRED} and not _from_runtime
                 ):
                     raise self._lifecycle_failure_locked("reset_stream")
-                if record.state is StreamState.FAILED:
+                # Publish reset intent before releasing the condition to wait.
+                # A producer must not take the next step ahead of this reset.
+                record.resetting = True
+                if record.active_step:
+                    try:
+                        self._wait_for_stream_quiescence_locked(record, context)
+                    except (DeadlineExceeded, CancellationRequested) as exc:
+                        record.resetting = False
+                        failure = self._failure_factory.from_exception(
+                            exc,
+                            evidence=OutcomeEvidence.not_started("reset"),
+                            scope=RecoveryScope.STREAM,
+                            details={"stream_id": record.public_handle.stream_id},
+                        )
+                        self._remember_failure(failure)
+                        raise failure from exc
+                record = self._resolve_stream(stream_handle, "reset_stream")
+                if self._state in {LifecycleState.CLOSING, LifecycleState.CLOSED, LifecycleState.FAILED} or (
+                    self._state is LifecycleState.RESET_REQUIRED and not _from_runtime
+                ):
+                    record.resetting = False
+                    raise self._lifecycle_failure_locked("reset_stream")
+                if record.state is StreamState.FAILED or (
+                    record.recovery_requirement is not None
+                    and record.recovery_requirement.action in {RecoveryAction.CLOSE_STREAM, RecoveryAction.RELOAD}
+                ):
+                    record.resetting = False
                     recovery = record.recovery_requirement or RecoveryRequirement(
                         RecoveryScope.STREAM, RecoveryAction.RELOAD
                     )
@@ -1739,31 +2495,9 @@ class ModelRuntimeHandle:
                         scope=RecoveryScope.STREAM,
                         details={"stream_id": record.public_handle.stream_id},
                     )
-                if record.active_step:
-                    if record.active_thread == threading.get_ident():
-                        raise self._failure_factory.create(
-                            "stream_reentrant",
-                            "cannot reset a stream from its active step",
-                            evidence=OutcomeEvidence.not_started("reset"),
-                            scope=RecoveryScope.STREAM,
-                        )
-                    try:
-                        self._wait_for_stream_quiescence_locked(record, context)
-                    except (DeadlineExceeded, CancellationRequested) as exc:
-                        failure = self._failure_factory.from_exception(
-                            exc,
-                            evidence=OutcomeEvidence.not_started("reset"),
-                            scope=RecoveryScope.STREAM,
-                            details={"stream_id": record.public_handle.stream_id},
-                        )
-                        self._remember_failure(failure)
-                        raise failure from exc
+                was_reset_required = record.state is StreamState.RESET_REQUIRED
                 record.resetting = True
                 record.set_state(StreamState.RESETTING)
-                if self._state is LifecycleState.RESET_REQUIRED and record.state_bank_mode == "runtime_exclusive":
-                    self._transition_locked(LifecycleState.RESETTING)
-                    self._admission_open = False
-                    runtime_resetting = True
             if not self._resettable and self._stateful:
                 failure = self._failure_factory.create(
                     "reset_unsupported",
@@ -1776,99 +2510,100 @@ class ModelRuntimeHandle:
                     record.resetting = False
                     record.set_state(StreamState.RESET_REQUIRED if was_reset_required else StreamState.OPEN)
                     record.recovery_requirement = failure.recovery
-                    if runtime_resetting:
-                        self._transition_locked(LifecycleState.FAILED)
                 self._remember_failure(failure)
                 raise failure
             reset_started = False
             try:
                 context.check("reset")
                 reset_started = True
-                _call_stream_control(self._streaming_runtime, "reset_stream", record.backend_handle, context)
-                context.check("reset")
-            except ExecutionFailure as failure:
-                with self._condition:
-                    record.resetting = False
-                    record.set_state(StreamState.FAILED)
-                    record.recovery_requirement = RecoveryRequirement(RecoveryScope.STREAM, RecoveryAction.RELOAD)
-                    record.last_failure_code = failure.code
-                    if runtime_resetting:
-                        self._transition_locked(LifecycleState.FAILED)
-                        self._admission_open = False
-                self._remember_failure(failure)
-                raise
-            except (DeadlineExceeded, CancellationRequested) as exc:
-                evidence = OutcomeEvidence(
-                    OutcomeState.STARTED if reset_started else OutcomeState.NOT_STARTED,
-                    not reset_started,
-                    reset_started and self._stateful,
-                    "reset",
-                )
-                failure = self._failure_factory.from_exception(
-                    exc,
-                    evidence=evidence,
-                    scope=RecoveryScope.STREAM,
-                    details={"stream_id": record.public_handle.stream_id},
-                )
-                with self._condition:
-                    record.resetting = False
-                    record.set_state(StreamState.FAILED if reset_started else StreamState.RESET_REQUIRED)
-                    record.recovery_requirement = RecoveryRequirement(RecoveryScope.STREAM, RecoveryAction.RELOAD)
-                    record.last_failure_code = failure.code
-                    if runtime_resetting:
-                        self._transition_locked(LifecycleState.FAILED)
-                        self._admission_open = False
-                self._remember_failure(failure)
-                raise failure from exc
+                operation = "reset_stream"
+                if _from_runtime and _host_only:
+                    operation = "reset_host_stream"
+                try:
+                    _call_stream_control(self._streaming_runtime, operation, record.backend_handle, context)
+                except ExecutionFailure as exc:
+                    if not _completed_control_failure(exc):
+                        raise
             except Exception as exc:
+                recovery = getattr(exc, "recovery", None)
+                if recovery is None or recovery.action is RecoveryAction.NONE:
+                    recovery = RecoveryRequirement(
+                        RecoveryScope.STREAM,
+                        RecoveryAction.RELOAD if reset_started else RecoveryAction.RESET_STREAM,
+                    )
                 failure = self._failure_factory.from_exception(
                     exc,
-                    code="reset_failed",
-                    message=f"stream reset failed: {exc}",
-                    evidence=OutcomeEvidence.started("reset", outcome_known=False, state_mutated=self._stateful),
-                    scope=RecoveryScope.STREAM,
-                    action=RecoveryAction.RELOAD,
-                    recoverable=self._reloadable,
+                    code=None
+                    if isinstance(exc, ExecutionFailure | DeadlineExceeded | CancellationRequested)
+                    else "reset_failed",
+                    evidence=getattr(exc, "evidence", None)
+                    or (
+                        OutcomeEvidence.started("reset", outcome_known=False, state_mutated=self._stateful)
+                        if reset_started
+                        else OutcomeEvidence.not_started("reset")
+                    ),
+                    recovery=recovery,
+                    recoverable=(
+                        exc.recoverable
+                        if isinstance(exc, ExecutionFailure)
+                        else self._reloadable
+                        if reset_started
+                        else self._resettable
+                    ),
                     details={"stream_id": record.public_handle.stream_id},
                 )
                 with self._condition:
                     record.resetting = False
-                    record.set_state(StreamState.FAILED)
-                    record.recovery_requirement = failure.recovery
-                    record.last_failure_code = failure.code
-                    if runtime_resetting:
-                        self._transition_locked(LifecycleState.FAILED)
-                        self._admission_open = False
-                self._remember_failure(failure)
+                    failure = self._handle_stream_failure(record, failure, reset_started)
+                    self._condition.notify_all()
                 raise failure from exc
             else:
+                if self._admission is not None and not _from_runtime:
+                    self._admission.recovered(record.public_handle.stream_id)
                 with self._condition:
                     record.host_state.clear()
                     record.last_step_at = None
                     record.resetting = False
                     record.recovery_requirement = None
                     record.last_failure_code = None
-                    record.set_state(StreamState.OPEN)
-                    if runtime_resetting:
-                        self._transition_locked(LifecycleState.READY)
-                        self._admission_open = True
+                    record.set_state(StreamState.FAILED if record.closing else StreamState.OPEN)
+                    if record.closing:
+                        record.recovery_requirement = RecoveryRequirement(
+                            RecoveryScope.STREAM, RecoveryAction.CLOSE_STREAM
+                        )
                     self._condition.notify_all()
 
+                if not _from_runtime:
+                    try:
+                        self._check_completed_result(context, "reset")
+                    except ExecutionFailure as failure:
+                        self._remember_failure(failure)
+                        raise
+
     def _wait_for_stream_quiescence_locked(self, record: _StreamRecord, context: ExecutionContext) -> None:
+        from .lifecycle import POLL_INTERVAL_SECONDS, check_lifecycle, lifecycle_deadline
+
         while record.active_step:
-            context.check("control_drain")
-            remaining = context.deadline.remaining_seconds()
-            self._condition.wait(timeout=0.05 if remaining is None else min(0.05, remaining))
+            check_lifecycle(context, phase="control_drain")
+            remaining = lifecycle_deadline(context.deadline).remaining_seconds()
+            self._condition.wait(
+                timeout=POLL_INTERVAL_SECONDS if remaining is None else min(POLL_INTERVAL_SECONDS, remaining)
+            )
 
     def _reset_stream_record(
         self,
         record: _StreamRecord,
         context: ExecutionContext,
         *,
-        from_runtime: bool = False,
+        host_only: bool = False,
     ) -> None:
-        del from_runtime
-        self.reset_stream(record.public_handle, context, _from_runtime=True)
+        self._reset_stream_local(
+            record.public_handle,
+            context,
+            _from_runtime=True,
+            _host_only=host_only,
+            _dispatch_key=self._policy_authority,
+        )
 
     def close_stream(
         self,
@@ -1877,60 +2612,107 @@ class ModelRuntimeHandle:
         *,
         deadline: Deadline | None = None,
     ) -> None:
-        stream_id = stream_handle.stream_id if isinstance(stream_handle, StreamHandle) else stream_handle
-        with self._condition:
-            record = self._streams.get(stream_id) if isinstance(stream_id, str) else None
-            if record is not None and record.state is StreamState.CLOSED:
-                return
+        if (
+            isinstance(stream_handle, StreamHandle)
+            and stream_handle._belongs_to(self._owner_token)
+            and stream_handle.closed
+        ):
+            return
+        if self._execution_policy is not None:
+            with self._condition:
+                record = self._resolve_stream(stream_handle, "close_stream", allow_closed=True)
+                self._check_stream_control_reentry(record, "close_stream")
+            control_context = self._policy_context(self._control_context(context, deadline))
+            with self._condition:
+                record.closing = record.state is not StreamState.CLOSED
+            return self._call_execution_policy("close_stream", stream_handle, context=control_context)
+        return self._close_stream_local(stream_handle, context, deadline=deadline)
+
+    def _close_stream_local(
+        self,
+        stream_handle: StreamHandle | str,
+        context: ExecutionContext | None = None,
+        *,
+        deadline: Deadline | None = None,
+        _dispatch_key=None,
+    ) -> None:
+        if self._execution_policy is not None:
+            self._require_local_authority(_dispatch_key)
         control_context = self._control_context(context, deadline)
-        record = self._resolve_stream(stream_handle, "close_stream")
+        record = self._resolve_stream(stream_handle, "close_stream", allow_closed=True)
+        if record.state is StreamState.CLOSED:
+            return
         self._close_stream_record(record, control_context)
 
-    def _close_stream_record(self, record: _StreamRecord, context: ExecutionContext, *, internal: bool = False) -> None:
-        with record.control_lock:
+    def _check_stream_control_reentry(self, record: _StreamRecord, operation: str) -> None:
+        """Caller holds the condition; reject before dispatch or closing intent."""
+        if record.active_step and record.active_thread == threading.get_ident():
+            raise self._failure_factory.create(
+                "stream_reentrant",
+                f"cannot {operation.removesuffix('_stream')} a stream from its active step",
+                evidence=OutcomeEvidence.not_started(operation),
+                scope=RecoveryScope.STREAM,
+            )
+
+    def _close_stream_record(self, record: _StreamRecord, context: ExecutionContext) -> None:
+        with self._condition:
+            if record.state is StreamState.CLOSED:
+                return
+            self._check_stream_control_reentry(record, "close_stream")
+            record.closing = True
+        with self._control_guard(record.control_lock, context, closing=True):
             with self._condition:
                 if record.state is StreamState.CLOSED:
                     return
                 if record.active_step:
-                    if record.active_thread == threading.get_ident():
-                        raise self._failure_factory.create(
-                            "stream_reentrant",
-                            "cannot close a stream from its active step",
-                            evidence=OutcomeEvidence.not_started("reset"),
-                            scope=RecoveryScope.STREAM,
-                        )
                     self._wait_for_stream_quiescence_locked(record, context)
                 record.closing = True
-            close_error: BaseException | None = None
+            close_started = False
             try:
-                if not internal:
-                    context.check("close_stream")
+                context.check("close_stream")
+                close_started = True
                 _call_stream_control(self._streaming_runtime, "close_stream", record.backend_handle, context)
             except BaseException as exc:
-                close_error = exc
-            finally:
+                failure = self._failure_factory.from_exception(
+                    exc,
+                    code="stream_close_failed",
+                    message=f"stream {record.public_handle.stream_id!r} close failed: {exc}",
+                    evidence=getattr(exc, "evidence", None)
+                    or (
+                        OutcomeEvidence.started("close_stream", outcome_known=False, state_mutated=True)
+                        if close_started
+                        else OutcomeEvidence.not_started("close_stream")
+                    ),
+                    scope=RecoveryScope.STREAM,
+                    details={"stream_id": record.public_handle.stream_id, "close_pending": True},
+                )
+                with self._condition:
+                    failure = self._handle_stream_failure(record, failure, close_started)
+                    self._condition.notify_all()
+                raise failure from exc
+            else:
                 with self._condition:
                     record.host_state.clear()
+                    record.backend_handle = None
+                    # Per-stream Close owns its native bank and must drain it.
+                    # Exclusive streams may close only a logical identity.
+                    if self._admission is not None and record.state_bank_mode == "per_stream":
+                        self._admission.recovered(record.public_handle.stream_id)
                     record.closing = False
                     record.set_state(StreamState.CLOSED)
                     record.recovery_requirement = None
-                    record.last_failure_code = getattr(close_error, "code", None)
+                    record.last_failure_code = None
+                    self._closed_stream_ids.append(record.public_handle.stream_id)
+                    while len(self._closed_stream_ids) > _CLOSED_STREAM_HISTORY_LIMIT:
+                        del self._streams[self._closed_stream_ids.popleft()]
                     self._condition.notify_all()
-            if close_error is not None:
-                failure = (
-                    close_error
-                    if isinstance(close_error, ExecutionFailure)
-                    else self._failure_factory.from_exception(
-                        close_error,
-                        code="stream_close_failed",
-                        message=f"stream {record.public_handle.stream_id!r} close failed: {close_error}",
-                        evidence=OutcomeEvidence.completed("reset"),
-                        scope=RecoveryScope.STREAM,
-                        details={"stream_id": record.public_handle.stream_id},
-                    )
-                )
-                self._remember_failure(failure)
-                raise failure from close_error
+
+    def retry_pending_stream_closes(self, context: ExecutionContext | None = None) -> None:
+        """Retry owned Close operations, including streams whose caller lost its receipt."""
+        self._check_control_reentry("close_stream")
+        for record in self._open_stream_records():
+            if record.closing:
+                self.close_stream(record.public_handle, context)
 
     def _open_stream_records(self) -> tuple[_StreamRecord, ...]:
         with self._condition:

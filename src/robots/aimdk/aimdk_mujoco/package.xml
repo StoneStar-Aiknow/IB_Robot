@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>aimdk_mujoco</name>
+  <version>0.1.0</version>
+  <description>Standalone X2 MuJoCo standing and walking simulation, without the vendor runtime.</description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>action_msgs</exec_depend>
+  <exec_depend>aimdk_interfaces</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>rosgraph_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <!-- Engines are pip-managed; the MuJoCo pin matches requirements/mujoco-sim.txt. -->
+  <exec_depend version_eq="3.12.0">python3-mujoco</exec_depend>
+  <exec_depend>python3-onnxruntime</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>action_msgs</test_depend>
+  <test_depend>aimdk_interfaces</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>nav_msgs</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>std_srvs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
+  <test_depend>builtin_interfaces</test_depend>
+  <test_depend>diagnostic_msgs</test_depend>
+  <test_depend>launch</test_depend>
+  <test_depend>launch_ros</test_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

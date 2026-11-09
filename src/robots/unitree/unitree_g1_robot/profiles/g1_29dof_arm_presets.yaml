@@ -1,0 +1,96 @@
+# Arm-preset development surface. No hand, waist-stream or base command surface.
+# Physical execution is not blocked outright: it needs this profile's
+# vendor.operator_validation block plus the node's preset_operator_confirmed
+# flag, so only an operator-supervised session can dispatch.
+runtime:
+  name: unitree_g1_robot
+  version: 0.1.0
+  type: g1_29dof_arm_presets
+simulated: false
+
+# Simulated-transport deployment facts (see g1_29dof_dex3.yaml): the private
+# vendor domain on loopback, plus the FSM the mock fixture reports. FSM 802 has
+# `g1_arm_example` running (status 0) and accepts a supervised preset dispatch —
+# the preset action goes out through that running arm service. Vendor service
+# status codes: 0 = running, 1 = stopped.
+sim:
+  vendor_domain_id: 148
+  vendor_network_interface: lo
+  mock_initial_fsm_id: 802
+joint_state_topic: /joint_states
+joints:
+  - left_hip_pitch_joint
+  - left_hip_roll_joint
+  - left_hip_yaw_joint
+  - left_knee_joint
+  - left_ankle_pitch_joint
+  - left_ankle_roll_joint
+  - right_hip_pitch_joint
+  - right_hip_roll_joint
+  - right_hip_yaw_joint
+  - right_knee_joint
+  - right_ankle_pitch_joint
+  - right_ankle_roll_joint
+  - waist_yaw_joint
+  - waist_roll_joint
+  - waist_pitch_joint
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_roll_joint
+  - left_wrist_pitch_joint
+  - left_wrist_yaw_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_roll_joint
+  - right_wrist_pitch_joint
+  - right_wrist_yaw_joint
+arm_joints: []
+gripper_joints: []
+modes:
+  initial: idle
+  idle:
+    controllers: []
+    transitions: []
+command_channels: []
+capabilities:
+  joint.state: {joint_count: 29, rate_hz: 50.0}
+  motion.named:
+    names: [arms_horizontal]
+  runtime.status: {}
+  # Local admission closure only; no physical stop guarantee is advertised.
+interfaces:
+  motion.named:
+    capability: motion.named
+    kind: action
+    direction: serve
+    endpoint: /motion/execute_named
+    message_type: ibrobot_msgs/action/ExecuteNamedMotion
+teleoperation: {enabled: false}
+vendor:
+  preset_only: true
+  # Commissioning boundary for this surface: exactly one action may be exposed,
+  # and the pre-dispatch ownership read comes from the profile. Both are vendor
+  # facts (action id/name, service status), so the runtime reads them here.
+  preset_commissioning:
+    allowed_arm_actions:
+      arms_horizontal: {action_id: 15, action_name: both_hands_up}
+    required_services:
+      ai_sport: 0
+      g1_arm_example: 0
+  mode_machine: 5
+  mode_pr: 1
+  topics:
+    low_state: rt/lowstate
+  rpc:
+    timeout_s: 5.0
+  arm_actions:
+    arms_horizontal: {action_id: 15, action_name: both_hands_up}
+  postures: {}
+  named_motion:
+    allowed_modes: [idle]
+  arm_sdk:
+    feedback_staleness_s: 0.5

@@ -10,6 +10,9 @@ message libraries.
 
 The migration is incremental; this README records what has landed.
 
+To deploy the X2 `pick_object` skill and call it, see
+[the X2 grasp skill guide](../../../../docs/aimdk_x2_grasp_skill.md).
+
 ## Robot feedback
 
 `aimdk_grasp.feedback` assembles the joint pose at an image time from the three
@@ -176,8 +179,15 @@ pose the screen IK reaches, a clear grasp line, an open hand that stays 1 cm off
 target along the line, the palm not facing the robot's left, and a confidence of at
 least 0.7. Candidates are only ever moved back, never dropped, except for those coming
 down onto a tall object from above. The approach preference by target height and the
-enclosure check are `manipulation_execution.grasp_pipeline.candidates`, shared by every
+enclosure check are `manipulation_execution.pick.pipeline.candidates`, shared by every
 robot.
+
+To study planning offline, start the grasp head with `IBROBOT_X2_PLAN_INPUTS_DIR` naming
+a directory: every plan call's feedback, scene (both resolutions), candidates, camera pose,
+options and live outcome are pickled there after the call, at no cost to it.
+`replay_x2_plan_inputs <dir> --output result.json` replays them on this host's GPU with the
+head's service, every clock of a call shifted together so the age checks see what they saw
+live; `--coarse-leg-boxes SHRINK_M` replaces the coarse scene's leg boxes for comparison.
 
 ## Streaming the arm
 
