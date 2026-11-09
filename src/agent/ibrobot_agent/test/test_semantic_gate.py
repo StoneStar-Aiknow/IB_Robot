@@ -106,6 +106,18 @@ def test_naming_someone_else_in_the_room_is_not_addressed_to_the_robot():
     assert "someone else" in decision.reason
 
 
+def test_a_question_put_to_the_robot_may_carry_a_skill_word():
+    # "你怎么知道我举手了" is addressed to the robot and contains a catalog word; the remark
+    # veto would drop it, and no amount of corpus fixes the conflict between "about the
+    # action" and "asking the robot". The question shape is what separates them.
+    gate = _quiet_gate(lexicon=("举手",))
+    decision = gate.judge("你怎么知道我举手了")
+    assert decision.accepted
+    assert decision.reason == "question about the robot"
+    # A remark that only sounds like a question still loses its skill word.
+    assert gate.judge("这首歌举手的动作").rejected
+
+
 def test_a_skill_word_inside_a_remark_about_the_robot_is_not_a_command():
     # 2026-11-07 field session: "周哥举手的动作" reached the ASR as "这首歌举手的动作" -- the
     # name vanished, the catalog word did not, and the robot raised its hand for a sentence

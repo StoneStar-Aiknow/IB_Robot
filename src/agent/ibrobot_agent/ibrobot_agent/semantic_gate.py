@@ -77,6 +77,10 @@ _FRAGMENT_BODY_CHARS = 3
 #: Where a skill word may start to read as an instruction addressed to the robot: "做个鼓掌"
 #: yes, "这首歌举手的动作" (an ASR-mangled "周哥举手的动作") no. The field session of
 #: 2026-11-07 shows why the bare word is not enough: the sentence is *about* the action.
+#: A question put to the robot starts with "you" and asks something; used to let one carry a
+#: skill word ("你怎么知道我举手了") past the remark veto without opening the veto to remarks.
+_QUESTION_STARTS = ("你", "您")
+_QUESTION_MARKERS = ("什么", "怎么", "为什么", "哪", "谁", "几", "多少", "吗", "呢", "是不是", "能不能")
 _LEXICON_LEAD_CHARS = 3
 #: Verbs and request words that make a sentence imperative even when the skill word sits
 #: later: "我想看挥手" is a command, "这首歌举手的动作" is a remark about one.
@@ -276,6 +280,12 @@ class SemanticGate:
             return True
         return any(marker in body for marker in _COMMAND_MARKERS)
 
+    def _asks_about_itself(self, body: str) -> bool:
+        """Whether the sentence is a question put to the robot ("你怎么知道我举手了")."""
+        if not body.startswith(_QUESTION_STARTS):
+            return False
+        return any(marker in body for marker in _QUESTION_MARKERS)
+
     def judge(self, text: str, *, session_open: bool = False) -> SemanticDecision:
         """Decide whether ``text`` is addressed to the robot; stop/confirm never come here.
 
@@ -310,6 +320,11 @@ class SemanticGate:
             reason = "skill word"
         elif wake_prefix:
             reason = "wake prefix"
+        elif lexicon_hit and self._asks_about_itself(body):
+            # "你怎么知道我举手了" carries a skill word and a question. The veto below exists
+            # for remarks about the action ("这首歌举手的动作"), and a question put to the robot
+            # is the opposite: it can only be answered by it.
+            reason = "question about the robot"
         elif lexicon_hit:
             # The word is there but the sentence is about the action, not a request for it,
             # and a character-bag model cannot tell the two apart ("这首歌举手的动作" 1.000).
