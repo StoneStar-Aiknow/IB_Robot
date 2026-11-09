@@ -57,10 +57,12 @@ def validate_placement_execution_config(value: Any) -> list[str]:
         ):
             errors.append(f"{prefix}.backend must be package.module:callable")
         pipeline = value.get("pipeline", {})
-        if not isinstance(pipeline, dict) or set(pipeline) - {"max_attempts", "execute_reserve_s"}:
-            errors.append(f"{prefix}.pipeline supports max_attempts and execute_reserve_s only")
+        if not isinstance(pipeline, dict) or set(pipeline) - {"max_attempts", "execute_reserve_s", "verify_placement"}:
+            errors.append(f"{prefix}.pipeline supports max_attempts, execute_reserve_s and verify_placement only")
         elif type(pipeline.get("max_attempts", 2)) is not int or pipeline.get("max_attempts", 2) < 1:
             errors.append(f"{prefix}.pipeline.max_attempts must be a positive integer")
+        if isinstance(pipeline, dict) and type(pipeline.get("verify_placement", True)) is not bool:
+            errors.append(f"{prefix}.pipeline.verify_placement must be a boolean")
         if isinstance(pipeline, dict) and "execute_reserve_s" in pipeline:
             reserve = pipeline["execute_reserve_s"]
             if not isinstance(reserve, int | float) or not _finite_number(reserve) or reserve < 0:

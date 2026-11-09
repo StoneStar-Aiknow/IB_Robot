@@ -183,6 +183,8 @@ robot:
       max_attempts: 3
       max_regrasps: 1
       execute_reserve_s: 50.0
+      # Open the hand while the Orin plans (~0.6 s off every pick).
+      prefetch_preshape: true
 
   placement_execution:
     enabled: true
@@ -195,6 +197,9 @@ robot:
       box_threshold: 0.50
     pipeline:
       max_attempts: 2
+      # The summit bowl has a slide: a correctly placed fruit leaves the bowl, so
+      # "is it in the bowl" fails every good place. The confirmed release decides.
+      verify_placement: false
 
   # Local Oula text wake is enabled; speaker checking stays off by default.
   voice_asr:
@@ -223,6 +228,8 @@ robot:
         model: qwen3.8-flash-next-iq3_s
         api_key_env: X2_PLANNER_API_KEY
         enable_thinking: false
+        # Every delivery ends back at the task pose: the place stops at its retreat.
+        return_after_place: grasp_ready
         extra_body:
           chat_template_kwargs:
             enable_thinking: false

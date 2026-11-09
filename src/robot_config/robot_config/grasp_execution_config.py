@@ -89,6 +89,8 @@ _SCHEMA: dict[str, Any] = {
         "home_tolerance_rad": _POSITIVE,
         # Put the object back after every successful pick, even when the goal does not ask.
         "release_after_success": _bool(),
+        # Run the plan's PRESHAPE while planning (manipulation_execution PipelineConfig).
+        "prefetch_preshape": _bool(),
     },
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),

@@ -999,3 +999,38 @@ def test_robot_config_rejects_missing_or_invalid_delivery_fields():
     assert not _validate_planner_latency_options(
         {"fruit_delivery": {"container_name": "configured bowl", "container_label": "配置的碗"}}
     )
+
+
+def _workflow(*steps):
+    from embodied_common.workflow_contracts import CanonicalWorkflowStep
+    from ibrobot_agent.contracts import PlannerOutcome
+
+    return PlannerOutcome(
+        kind="workflow",
+        user_message="ok",
+        summary="s",
+        steps=tuple(CanonicalWorkflowStep(schema_version=1, skill_name=name, target_name="an apple") for name in steps),
+    )
+
+
+def test_a_delivery_is_finished_at_the_configured_task_pose():
+    from ibrobot_agent.planner import append_return_after_place
+
+    outcome = append_return_after_place(_workflow("pick_object", "place_in_container"), "grasp_ready")
+    assert [step.skill_name for step in outcome.steps] == ["pick_object", "place_in_container", "return_to_task_pose"]
+    assert outcome.steps[-1].target_name == "grasp_ready" and not outcome.steps[-1].arm_side
+
+
+@pytest.mark.parametrize(
+    "steps,pose",
+    [
+        (("pick_object", "place_in_container"), None),  # the deployment did not configure it
+        (("pick_object",), "grasp_ready"),  # nothing was placed
+        (("place_in_container", "return_to_task_pose"), "grasp_ready"),  # the plan already returns
+    ],
+)
+def test_other_plans_are_left_alone(steps, pose):
+    from ibrobot_agent.planner import append_return_after_place
+
+    outcome = _workflow(*steps)
+    assert append_return_after_place(outcome, pose) is outcome

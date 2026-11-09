@@ -3129,6 +3129,9 @@ def _validate_planner_latency_options(planner: dict[str, Any]) -> list[str]:
         or any(not isinstance(value, str) or not value.strip() for value in delivery.values())
     ):
         errors.append("embodied.agent.planner.fruit_delivery requires non-empty container_name and container_label")
+    returned = planner.get("return_after_place")
+    if "return_after_place" in planner and (not isinstance(returned, str) or not returned.strip()):
+        errors.append("embodied.agent.planner.return_after_place must be a task pose name")
     enable_thinking = planner.get("enable_thinking", True)
     if not isinstance(enable_thinking, bool):
         errors.append("embodied.agent.planner.enable_thinking must be a boolean")

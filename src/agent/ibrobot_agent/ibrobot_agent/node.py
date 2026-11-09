@@ -1079,6 +1079,9 @@ class IncubationAgentNode(Node):
             robot_scope=str(self.get_parameter("robot_scope").value),
             direct_commands=_direct_commands_from_config(str(self.get_parameter("planner_config_json").value)),
             fruit_delivery=json.loads(str(self.get_parameter("planner_config_json").value)).get("fruit_delivery"),
+            return_after_place=json.loads(str(self.get_parameter("planner_config_json").value)).get(
+                "return_after_place"
+            ),
             pose_preview=self._pose_preview,
             pose_memory=self._pose_preview
             if self._pose_preview is not None and self._pose_preview.has_pose_services

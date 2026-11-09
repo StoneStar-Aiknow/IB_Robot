@@ -261,6 +261,21 @@ def validate_fruit_delivery(outcome: PlannerOutcome, config: Mapping[str, str], 
             raise ValueError("fruit delivery requires the same fruit and configured container in an adjacent pair")
 
 
+def append_return_after_place(outcome: PlannerOutcome, task_pose: str | None) -> PlannerOutcome:
+    """Finish a workflow that ends with a place at ``task_pose``, when the deployment configures one.
+
+    The place itself stops at its retreat (backend_options.place.plan_return_home
+    off), so the arm would otherwise stay over the container. A failed place
+    ends the workflow before this step: only a completed place returns this way.
+    """
+    if not task_pose or outcome.kind != "workflow" or not outcome.steps:
+        return outcome
+    if outcome.steps[-1].skill_name != "place_in_container":
+        return outcome
+    step = CanonicalWorkflowStep(schema_version=1, skill_name="return_to_task_pose", target_name=task_pose)
+    return dataclasses.replace(outcome, steps=(*outcome.steps, step))
+
+
 class PlannerAdapter:
     """Adapt a model client returning ``complete()`` dictionaries to Planner."""
 
