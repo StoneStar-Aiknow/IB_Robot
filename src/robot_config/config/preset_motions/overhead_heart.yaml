@@ -1,0 +1,88 @@
+schema_version: 1
+name: overhead_heart
+units: rad
+validated: false
+motion_enabled: false
+review_state: rejected_candidate
+required_head_clearance_m: 0.2
+rejection_reasons:
+- forearm_head_gap_below_0.20_m
+- silhouette_is_not_approved_overhead_heart
+- head_motion_and_sensor_envelope_not_certified
+- entry_and_exit_paths_not_certified
+- self_and_body_collision_acceptance_not_complete
+arm_joint_names:
+- left_shoulder_pitch_joint
+- left_shoulder_roll_joint
+- left_shoulder_yaw_joint
+- left_elbow_joint
+- left_wrist_yaw_joint
+- left_wrist_pitch_joint
+- left_wrist_roll_joint
+- right_shoulder_pitch_joint
+- right_shoulder_roll_joint
+- right_shoulder_yaw_joint
+- right_elbow_joint
+- right_wrist_yaw_joint
+- right_wrist_pitch_joint
+- right_wrist_roll_joint
+arm_target_rad:
+- -1.3278765223156794
+- 0.7744912072441321
+- -0.37176086824658605
+- -1.2169350006128181
+- 1.429749772641074
+- 0.06182759033854351
+- -0.8777679169961001
+- -1.3278765223156794
+- -0.7744912072441321
+- 0.37176086824658605
+- -1.2169350006128181
+- -1.429749772641074
+- 0.06182759033854351
+- 0.8777679169961001
+hand_target_rad:
+- -0.0
+- -0.0
+- -0.0
+- -0.0
+- 0.14116171506724468
+- 0.14116171506724468
+- -0.0
+- 0.14116171506724468
+- -0.0
+- 0.14116171506724468
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- 0.14116171506724468
+- 0.14116171506724468
+- 0.0
+- 0.14116171506724468
+- 0.0
+- 0.14116171506724468
+static_metrics:
+  left_hand_head_gap_m: 0.20153020759156812
+  left_forearm_wrist_head_gap_m: 0.19750674893816686
+  right_hand_head_gap_m: 0.20216382975945799
+  right_forearm_wrist_head_gap_m: 0.19801720662939667
+  hand_hand_gap_m: 0.21613698668741307
+  palm_span_m: 0.5517347915449577
+  palm_height_m: 0.42657372922427833
+  palm_forward_m: 0.3028963261785857
+  fingertip_span_m: 0.28369722698450167
+  fingertip_height_m: 0.5331397935216262
+model_sha256:
+  src/robots/aimdk/aimdk_description/urdf/x2_ultra.urdf: f628a969aaf3d5785b8c8901611a85f358d7eb62a8b06b1216dc42291a72944e
+  src/robots/aimdk/aimdk_description/urdf/x2_ultra_omnihand_v1.4.0.urdf: 344c188605f307474456749525259ad8ca2e7b356d9ef3c50ad887f228045259
+  src/robots/aimdk/aimdk_grasp/config/x2_ultra/hand_collision_cover.json: d8f184ecfc3cf2225b3226f2ae9527959724eb9fab5cd330fb5719ac90629e17
+  src/robots/aimdk/aimdk_grasp/config/x2_ultra_right/hand_collision_cover.json: fe7994e34338f6e9cecc6c1a459a2956ed3793cd3dc98dcb8e964ccb51bc2f3c
+model_mapping:
+  palm_mount: legacy
+  thumb_mount: legacy
+  distal_coupling: aimdk_grasp.joints.DIP_FOLLOWERS
+body_policy:
+  waist: fixed
+  legs: fixed
+  head: zero_angles_only_for_this_preview

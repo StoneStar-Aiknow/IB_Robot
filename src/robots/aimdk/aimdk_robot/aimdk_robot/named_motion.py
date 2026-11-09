@@ -50,6 +50,7 @@ from typing import Any
 
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from std_msgs.msg import String
 
 from aimdk_robot import projection
 from aimdk_robot import trajectory as traj
@@ -199,6 +200,7 @@ class NamedMotionServer:
         arm = vendor.get("arm") or {}
         self._arm_limits = {str(k): (float(v[0]), float(v[1])) for k, v in (arm.get("limits") or {}).items()}
         self._display_completion = display_completion_policy(config.get("display_completion"), self._trajectories)
+        self._init_hold(config)
         if self._return_motions:
             values = [
                 self._return_timeout_s,
@@ -233,6 +235,365 @@ class NamedMotionServer:
                 callback_group=node.action_callback_group,
             )
 
+    def _init_hold(self, config: dict) -> None:
+        """Opt in bounded, leased poses without changing ordinary replay."""
+        names = config.get("hold_motions", [])
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("hold_motions must be a list of non-empty motion names")
+        if len(names) != len(set(names)):
+            raise ValueError("hold_motions must be distinct")
+        self._hold_names = frozenset(names)
+        self._executing_hold = False
+        self._hold_leases: dict[tuple[str, str], float] = {}
+        self._hold_exit_targets: dict[tuple[str, str], tuple[float, ...]] = {}
+        self._hold_lease_lock = threading.Lock()
+        self._hold_active: tuple[str, str] | None = None
+        self._hold_subscription = None
+        if not names:
+            return
+        if self._hold_names - self._trajectories.keys() or self._hold_names & self._return_motions:
+            raise ValueError("hold_motions require recordings and cannot use cancel_return_motions")
+        if self._display_completion and self._hold_names & set(self._display_completion["motions"]):
+            raise ValueError("hold_motions require measured arrival, not playback-only completion")
+        if set(projection.VENDOR_ARM_ORDER) - self._arm_limits.keys():
+            raise ValueError("hold_motions require every native arm limit")
+        for name in names:
+            recording = self._trajectories[name]
+            if not recording.hands or recording.target != "both":
+                raise ValueError("hold_motions require a both-arm recording with 20 hand joints")
+            if any(row != recording.positions[0] for row in recording.positions) or any(
+                row != recording.hands[0] for row in recording.hands
+            ):
+                raise ValueError("hold_motions must describe one fixed arm-and-hand pose")
+        self._hold_lease_timeout_s = float(config.get("hold_lease_timeout_s", 1.0))
+        self._hold_max_duration_s = float(config.get("hold_max_duration_s", 60.0))
+        self._hold_release_timeout_s = float(config.get("hold_release_timeout_s", 0.3))
+        self._hold_feedback_skew_s = float(config.get("hold_feedback_skew_s", 0.04))
+        values = [
+            self._hold_lease_timeout_s,
+            self._hold_max_duration_s,
+            self._hold_release_timeout_s,
+            self._hold_feedback_skew_s,
+            self._blend_speed,
+            self._blend_min_s,
+            self._max_speed,
+            self._rate_hz,
+        ]
+        if any(not math.isfinite(value) or value <= 0 for value in values):
+            raise ValueError("hold timing and speed values must be finite and positive")
+        if self._hold_max_duration_s > 60.0 or self._hold_lease_timeout_s > 1.0:
+            raise ValueError("hold action cap cannot exceed 60 s and lease timeout cannot exceed 1 s")
+        bands = config.get("hold_hand_limits")
+        if not isinstance(bands, list) or len(bands) != 20:
+            raise ValueError("hold_hand_limits must contain 20 native-radian limit pairs")
+        try:
+            self._hold_hand_limits = tuple((float(pair[0]), float(pair[1])) for pair in bands if len(pair) == 2)
+        except (TypeError, ValueError, IndexError) as exc:
+            raise ValueError("hold_hand_limits must contain finite ordered limit pairs") from exc
+        if len(self._hold_hand_limits) != 20 or any(
+            not math.isfinite(low) or not math.isfinite(high) or low > high for low, high in self._hold_hand_limits
+        ):
+            raise ValueError("hold_hand_limits must contain finite ordered limit pairs")
+        speeds = config.get("hold_hand_speed_radps", self._blend_speed)
+        speeds = [speeds] * 20 if isinstance(speeds, int | float) and not isinstance(speeds, bool) else speeds
+        if not isinstance(speeds, list) or len(speeds) != 20:
+            raise ValueError("hold_hand_speed_radps must be a positive scalar or 20 speeds")
+        self._hold_hand_speeds = tuple(float(speed) for speed in speeds)
+        if any(not math.isfinite(speed) or speed <= 0 for speed in self._hold_hand_speeds):
+            raise ValueError("hold_hand_speed_radps must be finite and positive")
+        topic = config.get("hold_lease_topic", "/runtime/named_motion_hold_lease")
+        if not isinstance(topic, str) or not topic.startswith("/") or any(char.isspace() for char in topic):
+            raise ValueError("hold_lease_topic must be an absolute ROS topic")
+        configure = getattr(self._node, "configure_named_hold_guard", None)
+        if configure is not None:
+            configure(config)
+        self._hold_subscription = self._node.create_subscription(
+            String, topic, self._on_hold_lease, 10, callback_group=self._node.action_callback_group
+        )
+
+    @staticmethod
+    def _hold_goal_id(goal_handle) -> str:
+        try:
+            raw = bytes(goal_handle.goal_id.uuid)
+            return uuid.UUID(bytes=raw).hex if len(raw) == 16 and any(raw) else ""
+        except (AttributeError, TypeError, ValueError):
+            return ""
+
+    def _on_hold_lease(self, message: String) -> None:
+        """Accept only a recent lease for an explicitly configured name/UUID."""
+        try:
+            value = json.loads(message.data)
+            if not isinstance(value, dict) or not {"goal_id", "motion"} <= set(value) <= {
+                "goal_id",
+                "motion",
+                "exit_target",
+            }:
+                return
+            motion = value["motion"]
+            if not isinstance(motion, str) or motion not in self._hold_names:
+                return
+            goal_id = uuid.UUID(value["goal_id"]).hex
+            if int(goal_id, 16) == 0:
+                return
+            exit_target = value.get("exit_target")
+            if exit_target is not None and (
+                not isinstance(exit_target, list)
+                or len(exit_target) != 34
+                or any(type(item) not in (int, float) or not math.isfinite(item) for item in exit_target)
+            ):
+                return
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            return
+        now = time.monotonic()
+        with self._hold_lease_lock:
+            key = (goal_id, motion)
+            self._hold_leases = {
+                item: stamp
+                for item, stamp in self._hold_leases.items()
+                if 0 <= now - stamp <= self._hold_lease_timeout_s
+            }
+            if len(self._hold_leases) >= 32 and key not in self._hold_leases:
+                oldest = min(
+                    (item for item in self._hold_leases if item != self._hold_active),
+                    key=self._hold_leases.__getitem__,
+                    default=None,
+                )
+                if oldest is None:
+                    return
+                del self._hold_leases[oldest]
+            self._hold_leases[key] = now
+            self._hold_exit_targets = {
+                item: target for item, target in self._hold_exit_targets.items() if item in self._hold_leases
+            }
+            if exit_target is not None:
+                self._hold_exit_targets[key] = tuple(float(item) for item in exit_target)
+
+    def _hold_lease_fresh(self, key: tuple[str, str], now: float) -> bool:
+        with self._hold_lease_lock:
+            stamp = self._hold_leases.get(key)
+        return stamp is not None and 0.0 <= now - stamp <= self._hold_lease_timeout_s
+
+    def _hold_limits(self, values) -> bool:
+        if len(values) != 34 or any(not math.isfinite(value) for value in values):
+            return False
+        bands = [self._arm_limits[name] for name in projection.VENDOR_ARM_ORDER] + list(self._hold_hand_limits)
+        return all(low <= value <= high for value, (low, high) in zip(values, bands, strict=True))
+
+    def _hold_duration(self, start, target) -> float:
+        speeds = [min(self._blend_speed, self._max_speed)] * 14 + list(self._hold_hand_speeds)
+        # Cosine interpolation reaches pi/2 times its mean velocity.
+        return max(
+            self._blend_min_s,
+            max(math.pi * abs(b - a) / (2 * speed) for a, b, speed in zip(start, target, speeds, strict=True)),
+        )
+
+    def _hold_validate(self, name, times, points) -> tuple[bool, str]:
+        if any(not self._hold_limits(point) for point in points):
+            return False, "named hold target violates native 34-joint limits"
+        validate = getattr(self._node, "validate_named_hold_path", None)
+        if validate is None:
+            return False, "named hold geometry guard is unavailable"
+        try:
+            answer = validate(name, times, points)
+            if not isinstance(answer, tuple) or len(answer) != 2 or type(answer[0]) is not bool:
+                return False, "invalid named hold geometry response"
+            return answer[0], str(answer[1])
+        except Exception as exc:
+            return False, f"named hold geometry failed: {exc}"
+
+    def _hold_sample(self):
+        sample = getattr(self._node, "measured_named_hold_sample", None)
+        sample = None if sample is None else sample(max_skew_s=self._hold_feedback_skew_s)
+        if sample is None or not self._hold_limits(sample[0]):
+            raise _Superseded(
+                ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
+                "named hold requires fresh simultaneous double-hand and arm feedback",
+            )
+        return list(sample[0])
+
+    def _hold_feedback(self, goal_handle, state, progress):
+        feedback = ExecuteNamedMotion.Feedback()
+        feedback.state = state
+        feedback.progress = progress
+        goal_handle.publish_feedback(feedback)
+
+    def _hold_check(self, key, mode, generation, epoch, started):
+        self._still_current(generation, epoch)
+        if self._node.current_mode() != mode or not self._node.output_admitted():
+            raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "named hold lost runtime admission")
+        now = time.monotonic()
+        if now - started >= self._hold_max_duration_s:
+            raise _Superseded(ExecuteNamedMotion.Result.TIMEOUT, "named hold reached its absolute duration limit")
+        if not self._hold_lease_fresh(key, now):
+            raise _Superseded(ExecuteNamedMotion.Result.TIMEOUT, "named hold lease expired")
+        actual = self._hold_sample()
+        ok, reason = self._hold_validate(key[1], [0.0, 1.0 / self._rate_hz], [actual, actual])
+        if not ok:
+            raise _Superseded(
+                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, f"measured named hold geometry rejected: {reason}"
+            )
+        return actual
+
+    def _hold_command(self, values, generation, epoch):
+        if not self._node.command_recorded(values[:14], values[14:], owner=generation, epoch=epoch):
+            raise _Superseded(ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "named hold output was refused")
+        sent = getattr(self, "_hold_sent", None)
+        if sent is not None:
+            now = time.monotonic()
+            sent.append((now, list(values)))
+            while len(sent) > 1 and sent[1][0] <= now - getattr(self, "_hold_lag_s", 0.05):
+                sent.popleft()
+
+    def _hold_cancel(self, name, values, goal_handle, generation, epoch):
+        # Match the ordinary replay's tracking-lag hold, retaining all hands.
+        sent = getattr(self, "_hold_sent", ())
+        hold = list(sent[0][1]) if sent else list(values)
+        actual = self._hold_sample()
+        ok, reason = self._hold_validate(name, [0.0, self._hold_duration(actual, hold)], [actual, hold])
+        if not ok:
+            raise _Superseded(
+                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, f"named hold cancel target rejected: {reason}"
+            )
+        self._hold_command(hold, generation, epoch)
+        raise _Cancelled(f"{name} canceled; complete arm-and-hand target held", "", 0.0)
+
+    def _hold_move(self, name, mode, start, target, goal_handle, key, generation, epoch, started, state):
+        duration = self._hold_duration(start, target)
+        ok, reason = self._hold_validate(name, [0.0, duration], [start, target])
+        if not ok:
+            return False, reason, list(start)
+        begin = time.monotonic()
+        current = list(start)
+        last_feedback = -math.inf
+        while True:
+            if goal_handle.is_cancel_requested:
+                self._hold_cancel(name, current, goal_handle, generation, epoch)
+            self._hold_check(key, mode, generation, epoch, started)
+            elapsed = time.monotonic() - begin
+            current = traj.blend(start, target, elapsed / duration)
+            self._hold_command(current, generation, epoch)
+            if elapsed - last_feedback >= 0.1:
+                self._hold_feedback(goal_handle, state, min(elapsed / duration, 1.0))
+                last_feedback = elapsed
+            if elapsed >= duration:
+                return True, "named hold bridge completed", list(target)
+            time.sleep(min(1.0 / self._rate_hz, max(0.0, duration - elapsed)))
+
+    def _hold_wait_arrival(self, name, mode, point, goal_handle, key, generation, epoch, started):
+        issued_at = time.monotonic()
+        deadline = issued_at + self._return_settle_s
+        while time.monotonic() < deadline:
+            if goal_handle.is_cancel_requested:
+                self._hold_cancel(name, point, goal_handle, generation, epoch)
+            self._hold_check(key, mode, generation, epoch, started)
+            self._hold_command(point, generation, epoch)
+            sample = self._node.measured_named_hold_sample(max_skew_s=self._hold_feedback_skew_s)
+            if (
+                sample is not None
+                and sample[1] >= issued_at
+                and max(abs(a - b) for a, b in zip(sample[0], point, strict=True)) <= self._return_tolerance
+            ):
+                return True
+            time.sleep(1.0 / self._rate_hz)
+        return False
+
+    def _run_hold_pose(self, name, mode, target, resume_token, goal_handle, generation, epoch):
+        """Run only an explicitly leased, geometrically certified fixed pose."""
+        if resume_token:
+            raise CommandRejected("INVALID_TARGET", "held poses cannot resume an old execution")
+        if target not in ("", "both"):
+            raise CommandRejected("INVALID_TARGET", "held poses require both arms and both hands")
+        required = str((self._node.vendor_config.get("mc_actions") or {}).get(mode, ""))
+        if required and str(self._node.platform_action()) != required:
+            return False, ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "platform action does not permit named hold"
+        if not self._node.ensure_input_source():
+            return False, ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, "named hold input source is unavailable"
+        key = (self._hold_goal_id(goal_handle), name)
+        if not key[0] or not self._hold_lease_fresh(key, time.monotonic()):
+            return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, "named hold requires its UUID-bound lease"
+        start = self._hold_sample()
+        recording = self._trajectories[name]
+        pose = list(recording.positions[0]) + list(recording.hands[0])
+        duration = self._hold_duration(start, pose)
+        ok, reason = self._hold_validate(name, [0.0, duration], [start, pose])
+        if not ok:
+            return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, reason
+        self._take_over(name, generation)
+        if not self._node.claim_arm(generation):
+            return False, ExecuteNamedMotion.Result.BUSY, "public stream has not released the arm channel"
+        with self._hold_lease_lock:
+            self._hold_active = key
+        started = time.monotonic()
+        current = start
+        self._hold_sent = deque([(started, list(start))])
+        normal_exit = canceled = False
+        failure_reason = "named hold execution failed or arrival was unconfirmed"
+        try:
+            # Claim confirmation can take several feedback cycles. Rebuild
+            # the entry from the actual state after ownership was obtained.
+            start = self._hold_sample()
+            current = start
+            ok, reason, current = self._hold_move(
+                name, mode, start, pose, goal_handle, key, generation, epoch, started, "entering"
+            )
+            if not ok:
+                return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, reason
+            if not self._hold_wait_arrival(name, mode, current, goal_handle, key, generation, epoch, started):
+                return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, "named hold arrival unconfirmed"
+            last_feedback = -math.inf
+            while True:
+                if goal_handle.is_cancel_requested:
+                    self._hold_cancel(name, current, goal_handle, generation, epoch)
+                actual = self._hold_check(key, mode, generation, epoch, started)
+                self._hold_command(current, generation, epoch)
+                now = time.monotonic()
+                if now - last_feedback >= 0.1:
+                    self._hold_feedback(goal_handle, "holding", 1.0)
+                    last_feedback = now
+                with self._hold_lease_lock:
+                    exit_target = self._hold_exit_targets.get(key)
+                if exit_target is not None:
+                    ok, reason, final = self._hold_move(
+                        name, mode, actual, list(exit_target), goal_handle, key, generation, epoch, started, "exiting"
+                    )
+                    if ok:
+                        if not self._hold_wait_arrival(name, mode, final, goal_handle, key, generation, epoch, started):
+                            return (
+                                False,
+                                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+                                "named hold exit arrival unconfirmed",
+                            )
+                        normal_exit = True
+                        return True, ExecuteNamedMotion.Result.NONE, "named hold exit completed"
+                    self._hold_feedback(goal_handle, "exit_blocked", 1.0)
+                    # Reject this request without losing the safe holding pose.
+                    with self._hold_lease_lock:
+                        self._hold_exit_targets.pop(key, None)
+                time.sleep(1.0 / self._rate_hz)
+        except _Cancelled:
+            canceled = True
+            raise
+        except Exception as exc:
+            failure_reason = str(exc)
+            raise
+        finally:
+            if not normal_exit and not canceled:
+                self._node.fail_named_hold(failure_reason)
+            with self._hold_lease_lock:
+                self._hold_active = None
+                self._hold_leases.pop(key, None)
+                self._hold_exit_targets.pop(key, None)
+            self._hold_sent = None
+            release = getattr(self._node, "release_arm_confirmed", None)
+            if release is None or not release(generation, wait_s=self._hold_release_timeout_s):
+                fail = getattr(self._node, "fail_named_hold", None)
+                if fail is not None:
+                    fail("named hold owner release was not confirmed")
+                raise _Superseded(
+                    ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE,
+                    "named hold owner release was not confirmed; output remains stopped",
+                )
+
     # --- goal handling ------------------------------------------------------
 
     def _accept(self, goal) -> GoalResponse:
@@ -242,7 +603,11 @@ class NamedMotionServer:
         # Early answer only: two goals can both pass here before either has
         # started executing. _execute makes the check that holds.
         with self._lock:
-            if self._returning or (self._executing and not bool(goal.interrupt)):
+            if (
+                self._returning
+                or getattr(self, "_executing_hold", False)
+                or (self._executing and not bool(goal.interrupt))
+            ):
                 return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
@@ -299,10 +664,17 @@ class NamedMotionServer:
         released.
         """
         request = goal_handle.request
+        is_hold = str(request.name) in getattr(self, "_hold_names", ())
         with self._lock:
-            busy = self._returning or (self._executing > 0 and not bool(request.interrupt))
+            busy = (
+                self._returning
+                or getattr(self, "_executing_hold", False)
+                or (self._executing > 0 and not bool(request.interrupt))
+            )
             if not busy:
                 self._executing += 1
+                if is_hold:
+                    self._executing_hold = True
         if busy:
             return self._fail(
                 goal_handle,
@@ -315,6 +687,8 @@ class NamedMotionServer:
         finally:
             with self._lock:
                 self._executing -= 1
+                if is_hold:
+                    self._executing_hold = False
 
     # --- joint.trajectory ---------------------------------------------------
 
@@ -835,6 +1209,8 @@ class NamedMotionServer:
         ``joint.trajectory`` goal passes its own validated plan instead.
         """
         planned = recorded is not None
+        if not planned and name in getattr(self, "_hold_names", ()):
+            return self._run_hold_pose(name, mode, target, resume_token, goal_handle, generation, epoch)
         recorded = recorded or self._trajectories.get(name)
         display = self._display_completion
         if not planned and display and name in display["motions"]:

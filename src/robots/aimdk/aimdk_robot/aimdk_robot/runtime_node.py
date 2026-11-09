@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 import rclpy
@@ -2040,6 +2041,105 @@ class AimdkRuntimeNode(Node):
                 return
             self._arm_owner = None
         self._push_control()
+
+    def configure_named_hold_guard(self, config: dict) -> None:
+        """Load only the frozen geometry declared by the opt-in hold profile."""
+        self._named_hold_guard = None
+        path = config.get("hold_geometry_file", "")
+        if not isinstance(path, str) or not path.strip():
+            return
+        from aimdk_robot.preset_geometry import load_guard
+
+        resolved = Path(path).expanduser()
+        if not resolved.is_absolute():
+            resolved = Path(str(self.get_parameter("profile").value)).parent / resolved
+        self._named_hold_guard = load_guard(resolved)
+
+    def validate_named_hold_path(self, name, times, positions) -> tuple[bool, str]:
+        """A hold cannot inherit the ordinary mirror CBF's safety claim."""
+        guard = getattr(self, "_named_hold_guard", None)
+        if guard is None:
+            return False, "named hold requires a validated complete-hand geometry artifact"
+        try:
+            speeds = getattr(guard, "speed", None)
+            if speeds is None or len(speeds) != 34:
+                return False, "named hold geometry speed bounds are unavailable"
+            for index in range(1, len(positions)):
+                dt = times[index] - times[index - 1]
+                if not math.isfinite(dt) or dt <= 0:
+                    return False, "named hold geometry times must increase"
+                if any(
+                    not math.isfinite(float(speed)) or speed <= 0 or math.pi * abs(b - a) / (2 * dt) > speed + 1e-9
+                    for a, b, speed in zip(positions[index - 1], positions[index], speeds, strict=True)
+                ):
+                    return False, "named hold cosine peak exceeds geometry speed bounds"
+            answer = guard.validate_path(name=name, times=times, positions=positions)
+            if not isinstance(answer, tuple) or len(answer) != 2 or type(answer[0]) is not bool:
+                return False, "invalid named hold geometry response"
+            return answer[0], str(answer[1])
+        except Exception as exc:
+            return False, f"named hold geometry validation failed: {exc}"
+
+    def measured_named_hold_sample(self, *, max_skew_s=0.04):
+        """A fresh, simultaneous native arm-and-double-dexterous-hand sample."""
+        if not math.isfinite(max_skew_s) or max_skew_s < 0:
+            return None
+        with self._lock:
+            now = time.monotonic()
+            report_at = self._dataplane_at
+            if not math.isfinite(report_at) or not 0 <= now - report_at <= self._feedback_window_s:
+                return None
+            types = self._dataplane.hand_types
+            if len(types) != 2 or any(vg.hand_type_family(value) != "dexterous" for value in types):
+                return None
+            arm, hands = self.measured_arm_sample(), self.measured_hand_sample()
+            if arm is None or hands is None:
+                return None
+            if any(
+                not math.isfinite(sample[1]) or not 0 <= now - sample[1] <= self._feedback_window_s
+                for sample in (arm, hands)
+            ):
+                return None
+            if abs(arm[1] - hands[1]) > max_skew_s:
+                return None
+            return list(arm[0]) + list(hands[0]), min(arm[1], hands[1])
+
+    def release_arm_confirmed(self, owner: int, *, wait_s=0.3) -> bool:
+        """Prove that the data plane applied a fresh owner-free control word."""
+        if not math.isfinite(wait_s) or wait_s <= 0 or getattr(self, "_control_pub", None) is None:
+            return False
+        with self._lock:
+            if self._arm_owner != owner:
+                return False
+            epoch = self._arm_motion_epoch
+            self._arm_owner = None
+            word = self._control_word_locked()
+            sequence = word.seq
+            self._control_pub.publish(String(data=word.encode()))
+
+            def confirmed():
+                now = time.monotonic()
+                stamp = self._dataplane.at
+                return (
+                    self._arm_owner is None
+                    and self._arm_motion_epoch == epoch
+                    and self._dataplane.control_seq >= sequence
+                    and self._dataplane.arm_owner is None
+                    and type(stamp) in (int, float)
+                    and math.isfinite(stamp)
+                    and 0 <= now - stamp <= self._feedback_window_s
+                )
+
+            return self._dataplane_seen.wait_for(confirmed, timeout=wait_s)
+
+    def fail_named_hold(self, reason: str) -> None:
+        """Close output admission when a hold's safe ownership is unproven."""
+        with self._lock:
+            if not self._state.stop_latched:
+                self._state.engage_stop("HOLD")
+        self._clear_commands()
+        self.publish_safe_command(wait_s=0.2)
+        self._set_fault("named_hold", str(reason))
 
     def command_arm(self, positions: list[float], *, owner: int, epoch: int) -> bool:
         """Set the arm target for the fixed-rate publisher, if ``owner`` still may.
