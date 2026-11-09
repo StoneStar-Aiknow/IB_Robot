@@ -49,11 +49,14 @@ class SpeakerIdNode(Node):
 
         self._values = values
         self._min_speech_seconds = float(values["min_speech_seconds"])
+        self._max_speech_seconds = float(values["max_speech_seconds"])
+        self._window_hop_seconds = float(values["window_hop_seconds"])
         self._failures = 0
         self._last_reload = -RELOAD_INTERVAL_SEC
         self._assembler = UtteranceAssembler(
             sample_rate=int(values["sample_rate"]),
             max_seconds=float(values["max_speech_seconds"]),
+            window_max_seconds=float(values["window_max_seconds"]) if self._window_hop_seconds > 0 else 0.0,
             idle_timeout_sec=float(values["idle_timeout_sec"]),
         )
         self._embedder = self._load(values)
@@ -125,15 +128,21 @@ class SpeakerIdNode(Node):
         # decides at once, instead of holding the transcript for its grace
         # period (~1.5 s on the X2).
         embedding: tuple[float, ...] = ()
+        windows: list[tuple[float, tuple[float, ...]]] = []
         if utterance.speech_seconds < self._min_speech_seconds:
             self.get_logger().debug(f"too short to embed: {utterance.speech_seconds:.2f}s")
         else:
-            embedded = self._embed(utterance.pcm)
+            # The utterance vector stays what it always was, the first max_speech_seconds,
+            # so the anchor and the calibrated threshold keep their meaning.
+            head = int(self._max_speech_seconds * int(self._values["sample_rate"])) * 2
+            embedded = self._embed(utterance.pcm[:head])
             if embedded is None:
                 return
             embedding = embedded
             if not embedding:
                 self.get_logger().warning("speaker embedding came back empty; publishing none")
+            else:
+                windows = self._embed_windows(utterance.pcm)
         out = SpeakerEmbedding()
         if utterance.header is not None:
             out.header.stamp = utterance.header.stamp
@@ -145,7 +154,27 @@ class SpeakerIdNode(Node):
         out.embedding = list(embedding)
         out.model_id = self._model_id
         out.speech_seconds = float(utterance.speech_seconds)
+        if windows:
+            from voice_asr_service.speaker_id.features import WINDOW_FRAMES
+
+            out.window_seconds = WINDOW_FRAMES / 100.0
+            out.window_starts = [float(start) for start, _vector in windows]
+            out.window_embeddings = [float(value) for _start, vector in windows for value in vector]
         self._publisher.publish(out)
+
+    def _embed_windows(self, pcm) -> list[tuple[float, tuple[float, ...]]]:
+        """Per-window voiceprints of the segment; none when turned off, too short or on failure.
+
+        They are an addition: a failure here costs the split, never the
+        utterance's own voiceprint, which is already computed.
+        """
+        if self._window_hop_seconds <= 0 or self._embedder is None:
+            return []
+        try:
+            return self._embedder.embed_windows(pcm, self._window_hop_seconds)
+        except Exception as error:  # noqa: BLE001 - the per-window vectors are optional
+            self.get_logger().warning(f"speaker_id_node: per-window embedding failed, publishing none: {error}")
+            return []
 
     def _embed(self, pcm) -> tuple[float, ...] | None:
         """The utterance's vector, or None when the model is down or failed on it."""

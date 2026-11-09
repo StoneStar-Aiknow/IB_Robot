@@ -1,0 +1,65 @@
+{
+  "bundle": {
+    "digest": {
+      "algorithm": "sha256",
+      "scope": "structure",
+      "value": "16340a34a8fc51aae92a3fdbdf04eeefcccd338f087ab8b64d7bb2bde8c40dcc"
+    },
+    "files": [
+      {
+        "path": "payload.json"
+      }
+    ],
+    "name": "typed-physical-mock-not-a-production-model",
+    "revision": 1,
+    "uuid": "123e4567-e89b-42d3-a456-426614174000"
+  },
+  "deployments": {
+    "physical_mock": {
+      "execution_contract": {
+        "cancellation_granularity": "request_boundary",
+        "execution_structure": "direct",
+        "state_scope": "request"
+      },
+      "revision": 1,
+      "runtime_profile": {
+        "backend": "ascend",
+        "profile": {
+          "device_id": 0
+        },
+        "target": {
+          "runtime": "acl",
+          "runtime_abi": "cann-8.0",
+          "soc": "Ascend310P"
+        }
+      },
+      "uuid": "123e4567-e89b-42d3-a456-426614174001"
+    }
+  },
+  "model": {
+    "inputs": [
+      {
+        "dtype": "float32",
+        "semantic": "audio",
+        "shape": [
+          1,
+          4
+        ]
+      }
+    ],
+    "interface": "tensor_model",
+    "model_type": "silero_vad",
+    "operation": "vad",
+    "outputs": [
+      {
+        "dtype": "float32",
+        "semantic": "prob",
+        "shape": [
+          1,
+          1
+        ]
+      }
+    ]
+  },
+  "schema_version": 3
+}

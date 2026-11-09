@@ -43,11 +43,52 @@ def normalize_transcript(text: str) -> str:
     return _SPACE_NEXT_TO_CJK.sub("", " ".join(text.split()))
 
 
+def token_text_ends(tokens: list[str] | tuple[str, ...], text: str) -> list[int] | None:
+    """Where each token ends in ``text``, or None when the tokens do not spell ``text``.
+
+    ``text`` is what the recognizer published: the tokens joined, word pieces'
+    "▁" turned into spaces, then ``normalize_transcript``. Normalizing every
+    prefix the same way gives each token's end offset, so a consumer can cut the
+    transcript at a token boundary without knowing the tokenizer. A mismatch
+    (another join rule, a token the normalization rewrites) returns None, and
+    the transcript is then only usable whole.
+    """
+    if not tokens:
+        return None
+    ends: list[int] = []
+    joined = ""
+    for token in tokens:
+        joined += str(token).replace("\u2581", " ")
+        prefix = normalize_transcript(joined)
+        if not text.startswith(prefix):
+            return None
+        ends.append(max(len(prefix), ends[-1] if ends else 0))
+    if ends[-1] != len(text):
+        return None
+    return ends
+
+
 class _SherpaStream:
     def __init__(self, recognizer: Any, sample_rate: int) -> None:
         self.recognizer = recognizer
         self.sample_rate = sample_rate
         self.stream = recognizer.create_stream()
+
+
+def _sherpa_token_times(recognizer: Any, stream: Any) -> dict[str, list]:
+    """Tokens and their start times (s from the stream's first sample), when the build reports them."""
+    get_all = getattr(recognizer, "get_result_all", None)
+    if get_all is None:
+        return {}
+    try:
+        result = get_all(stream)
+        tokens = [str(token) for token in getattr(result, "tokens", [])]
+        times = [float(value) for value in getattr(result, "timestamps", [])]
+    except Exception:  # noqa: BLE001 - timing is optional; the text stays authoritative
+        return {}
+    if not tokens or len(tokens) != len(times):
+        return {}
+    return {"tokens": tokens, "timestamps": times}
 
 
 class _SherpaStreamingRuntime:
@@ -86,10 +127,13 @@ class _SherpaStreamingRuntime:
             self._recognizer.decode_stream(stream.stream)
         result = self._recognizer.get_result(stream.stream)
         text = result if isinstance(result, str) else getattr(result, "text", "")
-        return {
+        outputs: dict[str, object] = {
             "text": normalize_transcript(text) if isinstance(text, str) else "",
             "is_final": bool(request.metadata.get("final", False)),
         }
+        if outputs["is_final"]:
+            outputs.update(_sherpa_token_times(self._recognizer, stream.stream))
+        return outputs
 
     def reset_stream(self, stream: _SherpaStream, _context: ExecutionContext) -> None:
         stream.stream = self._recognizer.create_stream()
@@ -509,11 +553,13 @@ class ASRInferenceModule:
                     self._runtime_context,
                 )
                 text = str(result.outputs.get("text", ""))
+                tokens = list(result.outputs.get("tokens") or []) or None
+                timestamps = list(result.outputs.get("timestamps") or []) or None
             finally:
                 self._runtime_handle.close_stream(stream, self._runtime_context)
                 self._recover_runtime_locked()
 
-            return ASRResult(text=text, is_final=True, confidence=1.0)
+            return ASRResult(text=text, is_final=True, confidence=1.0, tokens=tokens, timestamps=timestamps)
 
     def end_streaming(self) -> ASRResult:
         """结束流式识别并返回最终结果"""

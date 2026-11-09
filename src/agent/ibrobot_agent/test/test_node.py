@@ -917,6 +917,21 @@ def test_direct_commands_from_config_never_blocks_startup(raw, expected):
     assert _direct_commands_from_config(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ('{"answer_skills": ["introduce_platform", ""]}', ("introduce_platform",)),
+        ('{"answer_skills": "introduce_platform"}', ()),
+        ("{}", ()),
+        ("not json", ()),
+    ],
+)
+def test_answer_skills_from_config_never_blocks_startup(raw, expected):
+    from ibrobot_agent.node import _answer_skills_from_config
+
+    assert _answer_skills_from_config(raw) == expected
+
+
 class _CountingBridge:
     """Gateway stand-in that counts how often the snapshot is actually fetched."""
 

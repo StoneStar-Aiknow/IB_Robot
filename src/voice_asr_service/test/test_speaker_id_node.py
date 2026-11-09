@@ -35,7 +35,14 @@ class _Embedder:
     def embed(self, pcm):
         if pcm in self.failing:
             raise RuntimeError("ONNX Runtime: invalid input")
+        self.embedded = pcm
         return (1.0, 0.0, 0.0)
+
+    def embed_windows(self, pcm, hop_seconds):
+        if getattr(self, "windows_fail", False):
+            raise RuntimeError("window failed")
+        self.windowed = (pcm, hop_seconds)
+        return getattr(self, "windows", [])
 
     def initialize(self) -> None:
         pass
@@ -47,8 +54,10 @@ class _Embedder:
 def _node(embedder):
     node = speaker_node.SpeakerIdNode.__new__(speaker_node.SpeakerIdNode)
     node.get_logger = lambda: logging.getLogger("speaker-id-test")
-    node._values = {"bundle_path": "models/campplus-speaker", "deployment": "torch_cpu"}
+    node._values = {"bundle_path": "models/campplus-speaker", "deployment": "torch_cpu", "sample_rate": 16000}
     node._min_speech_seconds = 1.0
+    node._max_speech_seconds = 6.0
+    node._window_hop_seconds = 1.0
     node._failures = 0
     node._last_reload = -speaker_node.RELOAD_INTERVAL_SEC
     node._embedder = embedder
@@ -114,3 +123,21 @@ def test_a_reloaded_model_of_another_identity_is_refused(monkeypatch):
         node._publish(_utterance(b"bad", sequence))
 
     assert node._embedder is None and other.closed
+
+
+def test_the_utterance_vector_still_covers_only_the_first_max_speech_seconds():
+    """The anchor and the threshold were calibrated on it; the windows see the rest."""
+    embedder = _Embedder()
+    embedder.windows = [(0.0, (1.0, 0.0, 0.0)), (1.0, (0.0, 0.0, 1.0))]
+    node = _node(embedder)
+    node._max_speech_seconds = 0.001  # 16 samples, 32 bytes
+    pcm = bytes(range(64))
+
+    node._publish(_utterance(pcm, 3))
+
+    assert embedder.embedded == pcm[:32]
+    assert embedder.windowed == (pcm, 1.0)
+    (message,) = node._publisher.messages
+    assert message.window_seconds == pytest.approx(2.0)
+    assert list(message.window_starts) == [0.0, 1.0]
+    assert list(message.window_embeddings) == [1.0, 0.0, 0.0, 0.0, 0.0, 1.0]

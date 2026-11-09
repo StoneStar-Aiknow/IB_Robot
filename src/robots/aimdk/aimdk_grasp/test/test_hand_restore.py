@@ -13,7 +13,6 @@ from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.hand_restore import (
     FEEDBACK_MAX_AGE_S,
-    VENDOR_STIFFNESS,
     CommandBoard,
     GatewayState,
     HandPlan,
@@ -180,9 +179,14 @@ def test_long_arm_check_refreshes_owner_and_detects_live_changes_before_dispatch
     assert not ports.sent
 
 
-def test_takeover_then_left_right_and_observe_release(restore):
+@pytest.mark.parametrize(
+    "stiffness",
+    [[30, 20, 20, 50, 50, 20, 20] * 2, [100, 100, 50, 50, 30, 30, 30] * 2],
+    ids=["joint_default", "stand_default"],
+)
+def test_takeover_then_left_right_and_observe_release(restore, stiffness):
     restorer, ports, ctx, checks = restore
-    ports.board = replace(ports.board, stiffness=VENDOR_STIFFNESS, damping=np.ones(14))
+    ports.board = replace(ports.board, stiffness=stiffness, damping=np.ones(14))
     left_start, right_start = ports.hands["left"].copy(), ports.hands["right"].copy()
     prepare(restorer, ports, ctx)
     assert ports.sent[0][0] == "takeover"
@@ -201,6 +205,54 @@ def test_takeover_then_left_right_and_observe_release(restore):
     assert ports.releases == 3 and len(checks) >= 4
     left = np.stack([left_start, *(row[1] for row in left_commands)])
     assert np.max(np.abs(np.diff(left, axis=0))) <= 0.01 + 1e-12
+
+
+@pytest.mark.parametrize("fault", ["joint", "damping", "mixed"])
+def test_standing_gain_recognition_rejects_unverified_and_mixed_settings(restore, fault):
+    restorer, ports, ctx, _ = restore
+    stiffness, damping = np.array([100, 100, 50, 50, 30, 30, 30] * 2, float), np.ones(14)
+    if fault == "joint":
+        stiffness[0] = 99.0
+    elif fault == "damping":
+        damping[0] = 2.0
+    else:
+        stiffness[7:] = [30, 20, 20, 50, 50, 20, 20]
+    ports.board = replace(ports.board, stiffness=stiffness, damping=damping)
+    with pytest.raises(RestoreError) as error:
+        prepare(restorer, ports, ctx)
+    assert error.value.code == "HAND_ARM_GAINS_UNVERIFIED" and not ports.sent
+
+
+def test_standing_hold_cannot_finish_takeover_without_40_2_feedback(restore):
+    restorer, ports, ctx, _ = restore
+    stiffness = np.array([100, 100, 50, 50, 30, 30, 30] * 2, float)
+    ports.board = replace(ports.board, stiffness=stiffness, damping=np.ones(14))
+    initial = {side: values.copy() for side, values in ports.hands.items()}
+    publish = ports.publish
+
+    def publish_without_takeover(left, right):
+        publish(left, right)
+        ports.board = replace(ports.board, stiffness=stiffness, damping=np.ones(14))
+
+    ports.publish = publish_without_takeover
+    with pytest.raises(RestoreError, match="takeover gains and hand hold did not settle"):
+        prepare(restorer, ports, ctx)
+    assert ports.sent and ports.releases == 1
+    for phase, left, right in ports.sent:
+        assert phase == "takeover"
+        np.testing.assert_array_equal(left, initial["left"])
+        np.testing.assert_array_equal(right, initial["right"])
+
+
+def test_standing_gains_after_takeover_refuse_hand_opening(restore):
+    restorer, ports, ctx, _ = restore
+    prepare(restorer, ports, ctx)
+    ports.board = replace(
+        ports.board, stiffness=np.array([100, 100, 50, 50, 30, 30, 30] * 2, float), damping=np.ones(14)
+    )
+    with pytest.raises(RestoreError) as error:
+        restorer.open_hand(ctx, "left")
+    assert error.value.code == "HAND_ARM_GAINS_UNVERIFIED" and not ports.sent
 
 
 def test_already_open_uses_new_feedback_without_publishing(restore):

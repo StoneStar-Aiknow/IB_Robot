@@ -47,6 +47,12 @@ def _quiet_gate(**kwargs) -> SemanticGate:
     return SemanticGate(payload, threshold=kwargs.pop("threshold", 0.10), **kwargs)
 
 
+def _asking_gate(**kwargs) -> SemanticGate:
+    """The quiet model that also likes "怎": "你怎么知道我举手了" scores high, remarks stay near 0."""
+    payload = _payload(_weigh("挥", 6.0) + _weigh("怎", 6.0), bias=-4.0)
+    return SemanticGate(payload, threshold=kwargs.pop("threshold", 0.10), **kwargs)
+
+
 # --- format ------------------------------------------------------------------------------
 
 
@@ -104,6 +110,35 @@ def test_naming_someone_else_in_the_room_is_not_addressed_to_the_robot():
     assert decision.rejected
     assert decision.address_term == "哥"
     assert "someone else" in decision.reason
+
+
+def test_a_question_put_to_the_robot_may_carry_a_skill_word():
+    # "你怎么知道我举手了" is addressed to the robot and contains a catalog word; the remark
+    # veto would drop it, and no amount of corpus fixes the conflict between "about the
+    # action" and "asking the robot". The question shape is what separates them.
+    gate = _asking_gate(lexicon=("举手",))
+    decision = gate.judge("你怎么知道我举手了")
+    assert decision.accepted
+    assert decision.reason == "question about the robot"
+    # A remark that only sounds like a question still loses its skill word.
+    assert gate.judge("这首歌举手的动作").rejected
+
+
+def test_the_question_shape_alone_does_not_carry_a_skill_word():
+    # The question exception skips the remark veto, so it must stay narrow: remarks that
+    # end in "呢", and short questions the model flatly disagrees with, keep the veto.
+    gate = _asking_gate(lexicon=("举手", "橙子", "挥手", "照镜子", "水果"))
+    for remark in ("你看那个橙子呢", "你看他在挥手呢", "你那个照镜子的视频呢", "你刚才拿的什么水果"):
+        decision = gate.judge(remark)
+        assert decision.rejected, remark
+        assert decision.reason.startswith("mentions a skill word"), remark
+    # "你看他在挥手呢" scores high on "挥": only the dropped "呢" marker keeps it out.
+    assert gate.score("你看他在挥手呢") >= gate.threshold
+    # "你刚才拿的什么水果" asks something in 9 characters: only the model score keeps it out.
+    assert gate.score("你刚才拿的什么水果") < gate.threshold
+    assert gate.judge("你怎么知道我举手了").accepted
+    # The same question against a model that scores it near 0 is not let through on shape.
+    assert _quiet_gate(lexicon=("举手",)).judge("你怎么知道我举手了").rejected
 
 
 def test_a_skill_word_inside_a_remark_about_the_robot_is_not_a_command():
@@ -408,3 +443,57 @@ def test_the_generated_lexicon_holds_no_bare_negation():
 
     assert "不是" not in words
     assert "挥手" in words
+
+
+TRAIN_MODEL = REPO_ROOT / "tools" / "addressee" / "train_model.py"
+
+
+def _train_module():
+    pytest.importorskip("numpy")
+    if not TRAIN_MODEL.exists():
+        pytest.skip("training tool not present")
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("addressee_train_model", TRAIN_MODEL)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_training_scores_exactly_what_the_runtime_scores():
+    """The regression of addressee_zh_v1: training padded "<text>" and L2-normalised while the
+    runtime padded "<>text<>" and did not, so the CV table described a model nobody ran."""
+    import math
+
+    import numpy as np
+
+    train = _train_module()
+    texts = ["灵犀灵犀挥挥手", "今天开会讨论预算", "你用的系统是什么"]
+    vecs = [train.vectorize(text) for text in texts]
+    weights, bias = train.fit(vecs, np.array([1.0, 0.0, 1.0], dtype=np.float32), np.arange(3), epochs=5)
+    nonzero = np.nonzero(weights)[0]
+    gate = SemanticGate(
+        {
+            "schema_version": 1,
+            "feature": dict(train.FEATURE),
+            "wake_words": list(train.WAKE_WORDS),
+            "bias": float(bias),
+            "weights": [[int(index), float(weights[index])] for index in nonzero.tolist()],
+        },
+        threshold=0.1,
+    )
+    for text, (index, values) in zip(texts, vecs, strict=True):
+        logit = float(bias) + float(weights[index] @ values)
+        assert gate.score(text) == pytest.approx(1.0 / (1.0 + math.exp(-logit)), abs=1e-5)
+
+
+def test_an_artefact_without_a_vector_norm_is_scored_on_raw_values():
+    """addressee_zh_v1 has no vector_norm: it keeps scoring exactly as it was deployed."""
+    raw = _payload(_weigh("挥", 1.0))
+    normed = {**raw, "feature": {**raw["feature"], "vector_norm": "l2"}}
+    # "挥挥手": 挥 twice and 手 once -> raw value 1 + log 2 on 挥; L2 divides it by the norm.
+    assert SemanticGate(raw, threshold=0.1).score("挥挥手") > SemanticGate(normed, threshold=0.1).score("挥挥手")
+    with pytest.raises(ValueError, match="vector_norm"):
+        SemanticGate({**raw, "feature": {**raw["feature"], "vector_norm": "max"}}, threshold=0.1)

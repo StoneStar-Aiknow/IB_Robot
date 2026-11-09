@@ -11,7 +11,7 @@ from launch_ros.actions import Node
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common import pose_composer_contract as POSE_COMPOSER
-from embodied_common.motion_imitation_contract import manipulation_pause_service
+from embodied_common.motion_imitation_contract import perception_pause_settings
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
@@ -27,7 +27,11 @@ from robot_config.loader import (
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.utils import resolve_ros_path
-from robot_config.voice_contract import SPEAKER_EMBEDDING_OUTPUT_TOPIC, VOICE_TRANSCRIPT_TOPIC
+from robot_config.voice_contract import (
+    SHARED_SPEECH_CHUNK_TOPIC,
+    SPEAKER_EMBEDDING_OUTPUT_TOPIC,
+    VOICE_TRANSCRIPT_TOPIC,
+)
 from robot_runtime import contract as RUNTIME
 from skill_catalog.source import resolve_development_source_root
 
@@ -413,7 +417,9 @@ def generate_embodied_nodes(
                     ),
                 }
             )
-    common_params["motion_imitation_pause_service"] = manipulation_pause_service(robot_config)
+    pause_service, pause_scope = perception_pause_settings(robot_config)
+    common_params["motion_imitation_pause_service"] = pause_service
+    common_params["motion_imitation_pause_scope"] = pause_scope
     mirror_session = robot_config.get("mirror_session", {})
     if isinstance(mirror_session, dict) and mirror_session.get("enabled") is True:
         # The X2 mirror session's start/stop switch; robot_config launches the session node.
@@ -654,6 +660,11 @@ def generate_embodied_nodes(
         if not isinstance(agent_config, dict) or agent_config.get("enabled", True) is not True:
             raise ValueError("embodied.agent.enabled must be true for entry_mode=agent")
         planner_config = dict(agent_config.get("planner", {"mode": "rule"}))
+        voice_bridge_config = agent_config.get("voice_bridge") or {}
+        if "answer_skills" not in planner_config and isinstance(voice_bridge_config, dict):
+            # A request the voice channel admitted only as a question may still run the skills
+            # whose output is a spoken answer (a recorded clip): the channel's silent_skills, one list.
+            planner_config["answer_skills"] = list(voice_bridge_config.get("silent_skills", []))
         if (robot_config.get("mirror_session") or {}).get("enabled") is True:
             planner_config["direct_commands"] = {
                 **planner_config.get("direct_commands", {}),
@@ -1017,9 +1028,12 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "speaker_min_similarity",
         "speaker_max_age_sec",
         "speaker_merge_margin",
+        "speaker_split_owner_similarity",
+        "speaker_split_other_similarity",
         "measurement_grace_sec",
         "semantic_gate_threshold",
         "semantic_gate_model_only_threshold",
+        "semantic_gate_followup_sec",
     ):
         if field_name in voice_bridge:
             params[field_name] = float(voice_bridge[field_name])
@@ -1032,6 +1046,8 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
     chunk_topic = str(audio_input.get("topic", ""))
     if voice_asr.get("input_mode") == "external_vad" and chunk_topic:
         params["speech_chunk_topic"] = chunk_topic
+    elif pairs_by_segment:
+        params["speech_chunk_topic"] = SHARED_SPEECH_CHUNK_TOPIC
     if pairs_by_segment or params.get("speech_chunk_topic"):
         # The gate pairs each transcript with its segment's voiceprint and wake
         # event, so the bridge reads the segment-tagged copy the ASR publishes;
@@ -1058,8 +1074,11 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "mute_asr_during_tts",
         "tts_keep_english",
         "speaker_check_enabled",
+        "require_verified_speech",
         "speaker_reject_short",
+        "speaker_split_enabled",
         "semantic_gate_fail_open",
+        "semantic_gate_conversation",
     ):
         if field_name in voice_bridge:
             params[field_name] = bool(voice_bridge[field_name])
@@ -1080,6 +1099,10 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         params["speech_messages_json"] = json.dumps(voice_bridge["speech_messages"], ensure_ascii=False)
     if "text_corrections" in voice_bridge:
         params["text_corrections_json"] = json.dumps(dict(voice_bridge["text_corrections"]), ensure_ascii=False)
+    if "text_rewrites" in voice_bridge:
+        params["text_rewrites_json"] = json.dumps(
+            [list(pair) for pair in voice_bridge["text_rewrites"]], ensure_ascii=False
+        )
     composer = robot_config.get("pose_composer") or {}
     if "free_pose" in agent_config.get("test_allowlist", []) and composer.get("mode") == "fixed":
         from robot_runtime.task_poses import pose_catalog

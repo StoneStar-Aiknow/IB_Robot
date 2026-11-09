@@ -126,6 +126,7 @@ from manipulation_execution.mirror_session.hooks import HookContext, UpperBodyCo
 from manipulation_execution.mirror_session.inputs import InputCollector
 from manipulation_execution.mirror_session.mock_playback import MockPlaybackHooks
 from manipulation_execution.mirror_session.runtime import RuntimeObservation, release_to_idle
+from manipulation_execution.perception_pause_follower import PausableSubscription
 
 
 def observation_from_status(status: RuntimeStatus, now_ns: int) -> RuntimeObservation:
@@ -479,7 +480,6 @@ class MirrorSessionNode(Node):
         for name, message_type, callback in (
             ("pear_frame_topic", PearFrame, self._inputs.pear),
             ("actor_state_topic", ActorState, self._preset_actor if self._preset is not None else self._inputs.actor),
-            ("camera_topic", CompressedImage, self._inputs.camera),
         ):
             if input_topics[name]:
                 self.create_subscription(
@@ -488,6 +488,16 @@ class MirrorSessionNode(Node):
         if preset_settings is not None:
             self.create_subscription(
                 String, preset_settings["match_state_topic"], self._on_preset_state, 10, callback_group=inputs_group
+            )
+        self.camera_reader = None
+        if input_topics["camera_topic"]:
+            # The cover input follows the stream's pause; the session is in WAIT whenever a skill pauses it.
+            self.camera_reader = PausableSubscription(
+                self,
+                CompressedImage,
+                input_topics["camera_topic"],
+                self._inputs.camera,
+                qos_profile_sensor_data,
             )
         if self._mock is not None:
             self._play_client = self.create_client(SetBool, mock_play, callback_group=ReentrantCallbackGroup())

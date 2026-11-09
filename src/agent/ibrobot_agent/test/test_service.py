@@ -1270,3 +1270,112 @@ def test_summit_service_refuses_unpaired_pick_before_proposal(tmp_path, delivery
             )
     finally:
         service.close()
+
+
+class ContextRecordingPlanner(FakePlanner):
+    def plan(self, request, context, catalog, cancel_token, *, on_preview=None):
+        self.context = dict(context)
+        return super().plan(request, context, catalog, cancel_token, on_preview=on_preview)
+
+
+def _conversation_request(text: str) -> AgentRequest:
+    return replace(_request(text=text), admission="conversation")
+
+
+def _wave_outcome() -> PlannerOutcome:
+    return PlannerOutcome(
+        kind="workflow",
+        user_message="准备挥手",
+        summary="wave_hello",
+        steps=(CanonicalWorkflowStep(1, "wave_hello"),),
+    )
+
+
+def test_a_conversation_only_request_is_answered_even_when_the_planner_proposes_motion(tmp_path):
+    """Admitted on the shape of a question, it may be answered but never executed."""
+    from ibrobot_agent.service import CONVERSATION_ONLY_MESSAGE
+
+    events = Events()
+    planner = ContextRecordingPlanner(_wave_outcome())
+    service = AgentService(
+        planner=planner,
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=events,
+    )
+    request = _conversation_request("你能不能动一动")
+    try:
+        assert service.send_message(request).accepted
+        _wait_for_event(events, "conversation")
+        record = service.get_request(request.to_key())
+        capped = service._store.latest_event_detail(request.to_key(), "admission_capped")
+    finally:
+        service.close()
+
+    assert planner.context["admission"] == "conversation"
+    assert record.state == "ANSWERED"
+    assert [event.user_message for event in events.items if event.event_type == "conversation"] == [
+        CONVERSATION_ONLY_MESSAGE
+    ]
+    assert capped["proposed"]["kind"] == "workflow"
+
+
+def test_a_configured_direct_command_still_runs_for_a_conversation_only_request(tmp_path):
+    """ "你是谁" is a question and also the deployment's own exact phrase for a skill."""
+    planner = FakePlanner(PlannerOutcome(kind="conversation", user_message="unused"))
+    service = AgentService(
+        planner=planner,
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=Events(),
+        direct_commands={"你是谁": "wave_hello"},
+    )
+    try:
+        assert service.send_message(_conversation_request("你是谁")).accepted
+        identity = _proposal_identity(service)
+    finally:
+        service.close()
+
+    assert planner.calls == 0
+    assert identity["route"] == "direct_command"
+
+
+def test_an_ordinary_request_is_not_told_about_admission(tmp_path):
+    planner = ContextRecordingPlanner(_wave_outcome())
+    service = AgentService(
+        planner=planner,
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=Events(),
+    )
+    try:
+        assert service.send_message(_request(text="挥个手")).accepted
+        _proposal_identity(service)
+    finally:
+        service.close()
+
+    assert "admission" not in planner.context
+
+
+def test_a_conversation_only_request_may_run_an_answer_skill(tmp_path):
+    """On the summit "你的芯片是什么" is answered by introduce_platform, a recorded clip: the
+    local rig run of 2026-11-09 replaced that correct plan with the conversation-only line."""
+    planner = ContextRecordingPlanner(_wave_outcome())
+    service = AgentService(
+        planner=planner,
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=Events(),
+        answer_skills=("wave_hello",),
+    )
+    request = _conversation_request("你的芯片是什么")
+    try:
+        assert service.send_message(request).accepted
+        identity = _proposal_identity(service)
+        capped = service._store.latest_event_detail(request.to_key(), "admission_capped")
+    finally:
+        service.close()
+
+    assert identity["route"] == "fake"
+    assert capped is None
+    assert planner.context["answer_skills"] == ["wave_hello"]

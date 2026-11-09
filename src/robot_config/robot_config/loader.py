@@ -2281,6 +2281,12 @@ def validate_speaker_embedding_config(robot_config: dict[str, Any]) -> list[str]
         errors.append(f"{prefix}.max_speech_seconds must not be below min_speech_seconds")
     if not isinstance(config.get("exit_on_init_failure", True), bool):
         errors.append(f"{prefix}.exit_on_init_failure must be a boolean")
+    hop = config.get("window_hop_seconds", 0.0)
+    if isinstance(hop, bool) or not isinstance(hop, int | float) or not math.isfinite(hop) or not 0 <= hop <= 2.0:
+        errors.append(f"{prefix}.window_hop_seconds must be in [0, 2] (0 turns per-window voiceprints off)")
+    span = config.get("window_max_seconds", 10.0)
+    if isinstance(span, bool) or not isinstance(span, int | float) or not math.isfinite(span) or span <= 0:
+        errors.append(f"{prefix}.window_max_seconds must be finite and positive")
 
     agent = robot_config.get("embodied", {})
     agent = agent.get("agent", {}) if isinstance(agent, dict) else {}
@@ -2332,7 +2338,7 @@ def validate_voice_bridge_segment_inputs(robot_config: dict[str, Any]) -> list[s
     errors: list[str] = []
     voice_asr = robot_config.get("voice_asr", {})
     voice_asr = voice_asr if isinstance(voice_asr, dict) else {}
-    if voice_asr.get("input_mode", VoiceASRConfig.input_mode) != "external_vad":
+    if session and voice_asr.get("input_mode", VoiceASRConfig.input_mode) != "external_vad":
         errors.append(
             f"{prefix}.speaker_check_enabled and addressee_trigger=vendor_session pair transcripts by speech "
             "segment and need voice_asr.input_mode=external_vad; only a segmenting source names its segments"
@@ -3245,7 +3251,9 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         "tts_enabled",
         "mute_asr_during_tts",
         "speaker_check_enabled",
+        "require_verified_speech",
         "speaker_reject_short",
+        "speaker_split_enabled",
     ):
         if field_name in voice_bridge and not isinstance(voice_bridge[field_name], bool):
             errors.append(f"{prefix}.{field_name} must be a boolean")
@@ -3255,6 +3263,18 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
     margin = voice_bridge.get("speaker_merge_margin", 0.1)
     if isinstance(margin, bool) or not isinstance(margin, int | float) or not 0 <= margin < 1:
         errors.append(f"{prefix}.speaker_merge_margin must be in [0, 1)")
+    split_owner = voice_bridge.get("speaker_split_owner_similarity", 0.45)
+    split_other = voice_bridge.get("speaker_split_other_similarity", 0.25)
+    for field_name, value in (
+        ("speaker_split_owner_similarity", split_owner),
+        ("speaker_split_other_similarity", split_other),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int | float) or not 0 <= value <= 1:
+            errors.append(f"{prefix}.{field_name} must be in [0, 1]")
+    if isinstance(split_owner, int | float) and isinstance(split_other, int | float) and split_other > split_owner:
+        errors.append(f"{prefix}.speaker_split_other_similarity must not exceed speaker_split_owner_similarity")
+    if voice_bridge.get("speaker_split_enabled") is True and voice_bridge.get("speaker_check_enabled") is not True:
+        errors.append(f"{prefix}.speaker_split_enabled requires speaker_check_enabled: it splits by the owner's voice")
     grace = voice_bridge.get("measurement_grace_sec", 0.4)
     if isinstance(grace, bool) or not isinstance(grace, int | float) or not math.isfinite(grace) or grace < 0:
         errors.append(f"{prefix}.measurement_grace_sec must be finite and not negative")
@@ -3292,6 +3312,8 @@ def _validate_agent_voice_bridge(voice_bridge: Any) -> list[str]:
         # consumes its wake word, so a phrase list rejects every utterance.
         errors.append(f"{prefix}.addressee_trigger=vendor_session must not set wake_phrases")
     gate_is_on = trigger == "vendor_session" or bool(voice_bridge.get("wake_phrases"))
+    if voice_bridge.get("require_verified_speech") is True and voice_bridge.get("speaker_check_enabled") is not True:
+        errors.append(f"{prefix}.require_verified_speech requires speaker_check_enabled=true")
     if voice_bridge.get("speaker_check_enabled") is True and not gate_is_on:
         # The anchor is only ever captured from the utterance that proves
         # itself. With the gate off nothing captures one and the check would
@@ -3336,6 +3358,32 @@ def _validate_semantic_gate(voice_bridge: dict[str, Any], prefix: str) -> list[s
     log_path = voice_bridge.get("semantic_gate_log_path", "")
     if not isinstance(log_path, str):
         errors.append(f"{prefix}.semantic_gate_log_path must be a string path")
+    if "semantic_gate_conversation" in voice_bridge and not isinstance(
+        voice_bridge["semantic_gate_conversation"], bool
+    ):
+        errors.append(f"{prefix}.semantic_gate_conversation must be a boolean")
+    followup = voice_bridge.get("semantic_gate_followup_sec", 20.0)
+    if (
+        isinstance(followup, bool)
+        or not isinstance(followup, int | float)
+        or not math.isfinite(followup)
+        or followup < 0
+    ):
+        errors.append(f"{prefix}.semantic_gate_followup_sec must be finite and not negative")
+    if voice_bridge.get("semantic_gate_conversation") is True and mode == "off":
+        errors.append(f"{prefix}.semantic_gate_conversation needs semantic_gate_mode shadow or enforce")
+    rewrites = voice_bridge.get("text_rewrites", [])
+    if not isinstance(rewrites, list):
+        errors.append(f"{prefix}.text_rewrites must be a list of [pattern, replacement] pairs")
+    else:
+        for item in rewrites:
+            if not isinstance(item, list) or len(item) != 2 or not all(isinstance(part, str) for part in item):
+                errors.append(f"{prefix}.text_rewrites entries must be [pattern, replacement] string pairs")
+                continue
+            try:
+                re.compile(item[0])
+            except re.error as error:
+                errors.append(f"{prefix}.text_rewrites pattern {item[0]!r} is invalid: {error}")
     return errors
 
 

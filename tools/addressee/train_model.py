@@ -14,7 +14,15 @@ Corpus format: one example per line, either ``<text> 是`` / ``<text> 不是``
 Cross-validation groups near-duplicate examples (character 3-gram Jaccard >=
 0.7) so paraphrases cannot leak across folds. Full-corpus training follows the
 same seeds, which is why the shipped artefact and the CV numbers agree.
+
+Features come from the runtime module itself (``SemanticGate.features``), so the
+model is trained on exactly what the bridge scores. Until 2026-11-09 this file
+kept its own copy, which padded ``<text>`` where the runtime pads ``<>text<>``
+and L2-normalised the vector where the runtime does not: the CV table described
+a model the bridge never ran, and a sentence's runtime score drifted with its
+length (``addressee_zh_v1.json`` was trained that way).
 """
+
 from __future__ import annotations
 
 import argparse
@@ -26,62 +34,98 @@ import re
 import sys
 import time
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
+
+
+def _load_gate_module():
+    """Import ``semantic_gate`` by path: the agent package __init__ pulls in ROS-side deps."""
+    import importlib.util
+    from pathlib import Path
+
+    path = (
+        Path(__file__).resolve().parents[2] / "src" / "agent" / "ibrobot_agent" / "ibrobot_agent" / "semantic_gate.py"
+    )
+    spec = importlib.util.spec_from_file_location("ibrobot_semantic_gate", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_gate_module = _load_gate_module()
 
 DIM = 1 << 16
 NGRAMS = (1, 2, 3)
 WAKE_WORDS = (
-    "灵犀灵犀灵犀", "灵犀灵犀", "灵犀灵溪", "灵犀", "灵溪", "林夕", "林星",
-    "小欧小欧", "小欧", "小鸥", "小猴", "小猫", "小小",
+    "灵犀灵犀灵犀",
+    "灵犀灵犀",
+    "灵犀灵溪",
+    "灵犀",
+    "灵溪",
+    "林夕",
+    "林星",
+    "小欧小欧",
+    "小欧",
+    "小鸥",
+    "小猴",
+    "小猫",
+    "小小",
+    # The summit wake phrase (aimdk_x2_voice_mirror_grasp.yaml wake_phrases).
+    "欧拉欧拉",
+    "欧拉欧啦",
+    "欧拉鸥拉",
+    "欧拉偶拉",
+    "欧啦欧拉",
+    "欧啦欧啦",
 )
-PUNCT = re.compile(r"[\s，。！？、,.!?~～\"'“”‘’()（）\[\]【】:：;；\-—…]+")
 
 
-def fnv1a32(text: str) -> int:
-    h = 0x811C9DC5
-    for byte in text.encode("utf-8"):
-        h ^= byte
-        h = (h * 0x01000193) & 0xFFFFFFFF
-    return h
+PAD = "<>"
+#: Feature section of the exported artefact; the runtime reads exactly these fields.
+FEATURE = {
+    "ngrams": list(NGRAMS),
+    "dim": DIM,
+    "hash": "fnv1a32",
+    "pad": PAD,
+    "normalize": "lower+strip-punct",
+    # Scored on unit-length vectors: same recall, fewer chatter accepts than raw values.
+    "vector_norm": "l2",
+}
+#: A weightless model in the artefact format: only its ``features`` is used, so training sees
+#: the runtime's normalisation, wake-word stripping, padding and hashing, never a copy of them.
+_FEATURIZER = _gate_module.SemanticGate(
+    {"schema_version": 1, "feature": FEATURE, "wake_words": list(WAKE_WORDS), "bias": 0.0, "weights": []},
+    threshold=0.5,
+)
 
 
 def normalize(text: str) -> str:
-    return PUNCT.sub("", text.strip().lower())
+    return _gate_module.normalize_text(text)
 
 
 def strip_wake(text: str) -> str:
-    for _ in range(2):
-        for wake in WAKE_WORDS:
-            if text.startswith(wake) and len(text) > len(wake):
-                text = text[len(wake):]
-                break
-        else:
-            break
-    return text
+    return _gate_module.strip_wake_words(text, WAKE_WORDS)
 
 
 def features(text: str) -> Counter[int]:
-    body = normalize(strip_wake(normalize(text)))
-    padded = f"<{body}>"
-    out: Counter[int] = Counter()
-    for n in NGRAMS:
-        for i in range(len(padded) - n + 1):
-            out[fnv1a32(padded[i:i + n]) % DIM] += 1
-    return out
+    return _FEATURIZER.features(text)
 
 
 def vectorize(text: str) -> tuple[np.ndarray, np.ndarray]:
-    counts = features(text)
-    idx = np.array(list(counts.keys()), dtype=np.int64)
-    val = np.array([1.0 + math.log(c) for c in counts.values()], dtype=np.float32)
-    val /= math.sqrt(float((val ** 2).sum())) or 1.0
+    """Gram indices and values exactly as the runtime weighs them (``SemanticGate.vector``)."""
+    values = _FEATURIZER.vector(text)
+    idx = np.array(list(values.keys()), dtype=np.int64)
+    val = np.array(list(values.values()), dtype=np.float32)
     return idx, val
 
 
 def load_corpus(path: str) -> list[tuple[str, int]]:
     rows: list[tuple[str, int]] = []
-    for raw in open(path, encoding="utf-8"):
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    for raw in lines:
         line = raw.strip()
         if not line:
             continue
@@ -99,7 +143,7 @@ def near_duplicate_clusters(texts: list[str], threshold: float = 0.7) -> list[in
     sets = []
     for text in texts:
         body = normalize(strip_wake(normalize(text)))
-        sets.append({body[i:i + 3] for i in range(max(1, len(body) - 2))})
+        sets.append({body[i : i + 3] for i in range(max(1, len(body) - 2))})
     parent = list(range(len(texts)))
 
     def find(x: int) -> int:
@@ -162,7 +206,10 @@ def metrics(scores, labels, thr: float) -> dict:
         "recall": round(tp / max(1, tp + fn), 4),
         "precision": round(tp / max(1, tp + fp), 4),
         "specificity": round(tn / max(1, tn + fp), 4),
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
     }
 
 
@@ -194,7 +241,7 @@ def main() -> int:
 
     np.savez_compressed(args.out + ".cv.npz", scores=scores, labels=labels, fold=fold)
     table = {f"{t:.2f}": metrics(scores, labels, t) for t in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7)}
-    print(f"corpus={len(rows)} pos={int(labels.sum())} neg={int(len(labels)-labels.sum())} clusters={len(unique)}")
+    print(f"corpus={len(rows)} pos={int(labels.sum())} neg={int(len(labels) - labels.sum())} clusters={len(unique)}")
     for key, row in table.items():
         print(f"  thr={key} " + json.dumps(row, ensure_ascii=False))
 
@@ -203,20 +250,24 @@ def main() -> int:
     payload = {
         "schema_version": 1,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "feature": {"ngrams": list(NGRAMS), "dim": DIM, "hash": "fnv1a32", "pad": "<>", "normalize": "lower+strip-punct"},
+        "feature": dict(FEATURE),
         "wake_words": list(WAKE_WORDS),
         "bias": round(float(bias), 6),
         "weights": [[int(i), round(float(w[i]), 6)] for i in nz.tolist()],
         "training": {
-            "epochs": args.epochs, "seed": args.seed, "folds": args.folds,
-            "corpus_sha256": hashlib.sha256(open(args.corpus, "rb").read()).hexdigest(),
-            "n": len(rows), "pos": int(labels.sum()), "neg": int(len(labels) - labels.sum()),
+            "epochs": args.epochs,
+            "seed": args.seed,
+            "folds": args.folds,
+            "corpus_sha256": hashlib.sha256(Path(args.corpus).read_bytes()).hexdigest(),
+            "n": len(rows),
+            "pos": int(labels.sum()),
+            "neg": int(len(labels) - labels.sum()),
         },
         "cross_validation": table,
     }
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1)
-    print(f"wrote {args.out} weights={len(nz)} bias={bias:.4f} size={len(json.dumps(payload))/1024:.0f}KB")
+    print(f"wrote {args.out} weights={len(nz)} bias={bias:.4f} size={len(json.dumps(payload)) / 1024:.0f}KB")
     return 0
 
 

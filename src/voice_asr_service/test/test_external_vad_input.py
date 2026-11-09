@@ -46,8 +46,10 @@ class Node:
 
 
 class Result:
-    def __init__(self, text=""):
+    def __init__(self, text="", tokens=None, timestamps=None):
         self.text = text
+        self.tokens = tokens
+        self.timestamps = timestamps
 
 
 class Asr:
@@ -61,6 +63,7 @@ class Asr:
         self.fail_reset = False
         self.active = False
         self.completed_audio = []
+        self.final = Result("final text")
 
     def start_streaming(self):
         if self.fail_start:
@@ -85,7 +88,7 @@ class Asr:
             raise RuntimeError("final failed")
         self.completed_audio.append(np.concatenate(self.fed[-1]) if self.fed[-1] else np.array([]))
         self.active = False
-        return Result("final text")
+        return self.final
 
     def reset(self):
         self.reset_calls += 1
@@ -154,7 +157,22 @@ def test_the_final_names_the_segment_its_begin_opened(message_module):
         input_._subscription(message)
 
     assert final == ["final text"]
-    assert segment_finals == [("final text", ("a", 7))]
+    # No token timing from this recognizer: the alignment is empty, never guessed.
+    assert segment_finals == [("final text", ("a", 7), ((), ()))]
+
+
+def test_the_final_carries_where_each_token_starts_and_ends(message_module):
+    """The alignment maps time to text, so a consumer can keep part of a segment."""
+    segment_finals = []
+    input_, _node, asr, _final, _partial, _states = make(
+        min_samples=1, on_segment_final=lambda *item: segment_finals.append(item)
+    )
+    asr.final = Result("你好OK", tokens=["你", "好", "\u2581OK"], timestamps=[0.2, 0.44, 1.0])
+    input_.enabled = True
+    for message in (chunk("a", 7, 1, b"\x01\x00"), chunk("a", 8, 3, b"\x01\x00")):
+        input_._subscription(message)
+
+    assert segment_finals == [("你好OK", ("a", 7), ((0.2, 0.44, 1.0), (1, 2, 4)))]
 
 
 def test_a_discarded_segment_names_nothing(message_module):

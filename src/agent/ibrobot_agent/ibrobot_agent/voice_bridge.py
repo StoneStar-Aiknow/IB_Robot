@@ -43,7 +43,14 @@ from ibrobot_agent.contracts import ASYNC_PRESENTATION_MODE, TERMINAL_REQUEST_ST
 from ibrobot_agent.execution_feedback import FeedbackTracker, execution_reply
 from ibrobot_agent.gift_workflow import GiftWorkflowSpeech
 from ibrobot_agent.presentation import presentation_digest
-from ibrobot_agent.semantic_gate import SEMANTIC_GATE_MODES, SemanticGate
+from ibrobot_agent.semantic_gate import (
+    GRADE_CONVERSATION,
+    SEMANTIC_GATE_MODES,
+    SemanticDecision,
+    SemanticGate,
+    correct_manipulation_transcript,
+)
+from ibrobot_agent.speaker_split import SpeakerSplit, TokenAlignment, WindowVoiceprints
 from ibrobot_agent.speech_pipeline import SpeechPipeline
 from ibrobot_agent.speech_policy import GraspSpeechPolicy, MirrorSpeechPolicy
 
@@ -100,6 +107,8 @@ class VoiceBridgeConfig:
     #: ``wake_phrases``: the anchor is the utterance that said one. Requires
     #: ``voice_asr.speaker_embedding.enabled`` to be publishing measurements.
     speaker_check_enabled: bool = False
+    # Require a paired voiceprint for every utterance, including stop/confirmation.
+    require_verified_speech: bool = False
     #: Cosine below which a follow-up is treated as somebody else's. The
     #: default is the value the X2 was tested at (2026-10-24, campplus, >=2 s
     #: segments): other speakers against the anchor scored 0.28-0.56, the
@@ -123,6 +132,17 @@ class VoiceBridgeConfig:
     #: The cost is the user's own short commands: they need a few more words.
     #: A voiceprint that never arrives (the node is down) still fails open.
     speaker_reject_short: bool = False
+    #: One VAD segment can hold two voices: a bystander's remark and the owner's
+    #: request said without a pause long enough for the VAD. With per-window
+    #: voiceprints (``speaker_id_node``) and token times (the ASR), keep only the
+    #: owner's words of such a segment (``speaker_split.py``). Off: the windows
+    #: are still compared and logged, the transcript is used whole.
+    speaker_split_enabled: bool = False
+    #: A window at or above this is the owner, below the other line someone else,
+    #: between them undecided. 2 s windows score lower than whole utterances, so
+    #: both are calibrated on their own (see the package README).
+    speaker_split_owner_similarity: float = 0.45
+    speaker_split_other_similarity: float = 0.25
     #: How long to hold a transcript for its own segment's measurement, when
     #: any check is enabled. Publisher ordering cannot be relied on: both the
     #: ASR and the voiceprint node finalize on the same END or the same stall,
@@ -151,6 +171,10 @@ class VoiceBridgeConfig:
     busy_message: str = "我正在执行上一个任务，请稍等。"
     # Domain term -> homophones the ASR model prefers (e.g. 夹爪 jiā zhǎo is heard as 家找/家长).
     text_corrections: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    #: ``(pattern, replacement)`` regular expressions applied after ``text_corrections``, for
+    #: misrecognitions a plain substring would over-correct: "作为一个挥手的动作" is "做一个
+    #: 挥手的动作", but "作为一个机器人你……" is not, so the rewrite is anchored to the shape.
+    text_rewrites: tuple[tuple[str, str], ...] = ()
     #: Semantic gate (``semantic_gate.py``): the L3 decision the wake/voiceprint gate cannot
     #: make -- whether the words were meant for the robot at all. ``off`` keeps the bridge
     #: behaving exactly as before it existed; ``shadow`` judges and records into
@@ -184,6 +208,14 @@ class VoiceBridgeConfig:
     #: A model that will not load disables the gate instead of failing the launch. The gate
     #: can only drop utterances it is confident about, so running without it is the safe side.
     semantic_gate_fail_open: bool = True
+    #: Conversation admission (see ``semantic_gate``): inside a session, a second-person
+    #: question, a reply inside the follow-up window and the trailing question of a glued
+    #: segment are admitted without a skill word, as ``conversation``-graded requests the
+    #: Agent answers and never executes. Off: the gate behaves as before it existed.
+    semantic_gate_conversation: bool = False
+    #: How long after the robot last spoke (its own speech ended, or a request of this
+    #: channel finished) a reply-shaped sentence counts as an answer to it.
+    semantic_gate_followup_sec: float = 20.0
 
     def __post_init__(self) -> None:
         GraspSpeechPolicy(self.speech_mode, json.loads(self.speech_messages_json))
@@ -208,6 +240,8 @@ class VoiceBridgeConfig:
             raise ValueError("speaker_merge_margin must be in [0, 1)")
         if not float(self.measurement_grace_sec) >= 0:
             raise ValueError("measurement_grace_sec must not be negative")
+        if not 0.0 <= float(self.speaker_split_other_similarity) <= float(self.speaker_split_owner_similarity) <= 1.0:
+            raise ValueError("speaker split thresholds need 0 <= other_similarity <= owner_similarity <= 1")
         for name in ("confirm_timeout_sec", "session_idle_sec", "request_timeout_sec"):
             if not float(getattr(self, name)) > 0:
                 raise ValueError(f"{name} must be positive")
@@ -228,6 +262,8 @@ class VoiceBridgeConfig:
             # itself. With the gate off nothing ever captures one, and the check
             # would silently do nothing.
             raise ValueError("speaker_check_enabled requires an enabled gate: set wake_phrases or addressee_trigger")
+        if self.require_verified_speech and not self.speaker_check_enabled:
+            raise ValueError("require_verified_speech requires speaker_check_enabled")
         if any(phrase in _normalize(self.busy_message) for phrase in self.stop_phrases):
             raise ValueError("busy_message must not contain a stop phrase: the bridge would stop its own request")
         corrections = []
@@ -238,6 +274,19 @@ class VoiceBridgeConfig:
                 raise ValueError("text_corrections entries need a term and at least one misrecognized variant")
             corrections.append((term, variants))
         object.__setattr__(self, "text_corrections", tuple(corrections))
+        rewrites = []
+        for item in self.text_rewrites:
+            if not isinstance(item, tuple | list) or len(item) != 2:
+                raise ValueError("text_rewrites entries must be [pattern, replacement] pairs")
+            pattern, replacement = str(item[0]), str(item[1])
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f"text_rewrites pattern {pattern!r} is invalid: {error}") from error
+            rewrites.append((pattern, replacement))
+        object.__setattr__(self, "text_rewrites", tuple(rewrites))
+        if not float(self.semantic_gate_followup_sec) >= 0:
+            raise ValueError("semantic_gate_followup_sec must not be negative")
         if self.semantic_gate_mode not in SEMANTIC_GATE_MODES:
             raise ValueError(f"semantic_gate_mode must be one of {SEMANTIC_GATE_MODES}")
         if self.semantic_gate_mode != "off" and not str(self.semantic_gate_model_path).strip():
@@ -280,7 +329,9 @@ class VoiceBridgeConfig:
         )
         for variant, term in pairs:
             text = text.replace(variant, term)
-        return text
+        for pattern, replacement in self.text_rewrites:
+            text = re.sub(pattern, replacement, text)
+        return correct_manipulation_transcript(text, wake_phrases=self.wake_phrases + self.semantic_gate_wake_prefixes)
 
 
 @dataclass(frozen=True)
@@ -353,6 +404,8 @@ class _HeldTranscript:
     #: Routed by then even if the measurement never arrives (fail-open).
     deadline: float
     segment: Segment | None
+    #: Token times of the transcript, for keeping one speaker's part of it.
+    alignment: TokenAlignment | None = None
 
 
 #: Request ids remembered for event/response matching. One id per utterance, so this bounds
@@ -460,6 +513,7 @@ class VoiceBridgeCore:
         self._announced_requests: set[str] = set()
         self._id_factory = id_factory or (lambda: f"voice-{uuid.uuid4().hex[:12]}")
         self._gate = AddresseeGate(
+            require_measurements=config.require_verified_speech,
             trigger=config.addressee_trigger,
             wake_phrases=config.wake_phrases,
             wake_window_sec=config.wake_window_sec,
@@ -474,6 +528,12 @@ class VoiceBridgeCore:
         self._recent_speech: deque[tuple[str, float]] = deque(maxlen=16)
         self._speech_windows: deque[list[float]] = deque(maxlen=16)
         self._echo_segments: OrderedDict[Segment, None] = OrderedDict()
+        #: When the robot last finished a turn (its speech ended or a request finished): the
+        #: start of the follow-up window conversation admission answers within.
+        self._last_robot_turn = float("-inf")
+        #: The per-window verdict of each recent segment (``_split_speakers``), for judging a
+        #: question rescued from the end of that segment after the speaker check consumed it.
+        self._splits: OrderedDict[Segment, SpeakerSplit] = OrderedDict()
 
     def on_mirror_state(self, payload: dict[str, Any], now: float, *, source_now: float) -> list[Action]:
         """Convert ROS source age to monotonic expiry without comparing clock domains."""
@@ -585,6 +645,7 @@ class VoiceBridgeCore:
     def note_speech(self, text: str, now: float, *, finished: bool = False) -> None:
         self._recent_speech.append((_normalize(text), now))
         if finished:
+            self._last_robot_turn = max(self._last_robot_turn, now)
             if self._speech_windows:
                 self._speech_windows[-1][1] = now + 1.0
         else:
@@ -658,7 +719,9 @@ class VoiceBridgeCore:
         """True when ``text`` contains a stop keyword (after the domain corrections)."""
         return self._contains_stop(_normalize(self.config.correct(str(text).strip())))
 
-    def on_heard(self, text: str, now: float, segment: Segment | None = None) -> list[Action]:
+    def on_heard(
+        self, text: str, now: float, segment: Segment | None = None, alignment: TokenAlignment | None = None
+    ) -> list[Action]:
         """Route a final transcript now, or hold it until the measurement it will be judged by lands.
 
         ``segment`` is the speech segment the transcript came from
@@ -677,7 +740,7 @@ class VoiceBridgeCore:
         """
         if self.config.feedback_only:
             return []
-        if (
+        if not self.config.require_verified_speech and (
             self.is_stop_text(text)
             or self._speech_interrupt(text) is not None
             or _normalize(text) in {"不玩了", "再见"}
@@ -685,9 +748,10 @@ class VoiceBridgeCore:
             cancelled = self._cancel_held(f"stop keyword in {str(text).strip()!r}")
             return [*cancelled, *self.on_transcript(text, now, segment=segment, cancels_held=bool(cancelled))]
         if self._held or self.should_hold(text, now, segment):
-            self._held.append(_HeldTranscript(str(text), now, now + self.config.measurement_grace_sec, segment))
+            deadline = now + self.config.measurement_grace_sec
+            self._held.append(_HeldTranscript(str(text), now, deadline, segment, alignment))
             return self.release_held(now)
-        return self.on_transcript(text, now, segment=segment)
+        return self.on_transcript(text, now, segment=segment, alignment=alignment)
 
     def release_held(self, now: float) -> list[Action]:
         """Route held transcripts, in order, as soon as each no longer needs to wait."""
@@ -697,7 +761,9 @@ class VoiceBridgeCore:
             if now < held.deadline and self.should_hold(held.text, held.heard_at, held.segment):
                 break
             self._held.pop(0)
-            actions += self.on_transcript(held.text, now, heard_at=held.heard_at, segment=held.segment)
+            actions += self.on_transcript(
+                held.text, now, heard_at=held.heard_at, segment=held.segment, alignment=held.alignment
+            )
         return actions
 
     def on_transcript(
@@ -708,6 +774,7 @@ class VoiceBridgeCore:
         heard_at: float | None = None,
         segment: Segment | None = None,
         cancels_held: bool = False,
+        alignment: TokenAlignment | None = None,
     ) -> list[Action]:
         """Route one final transcript.
 
@@ -722,7 +789,7 @@ class VoiceBridgeCore:
         if self.is_recent_echo(text, now):
             return [Log(f"ignored recent playback echo: {text!r}")]
         stopped_by_partial, self._state.utterance_stopped = self._state.utterance_stopped, False
-        heard = str(text).strip()
+        heard, split_log = self._split_speakers(str(text).strip(), segment, alignment, heard_at)
         raw = self.config.correct(heard)
         normalized = _normalize(raw)
         # Every transcript, before any branch below can return: the segment a wake
@@ -731,8 +798,8 @@ class VoiceBridgeCore:
         # and the wake is spent on it instead of passing to whoever speaks next.
         session_opened = self._gate.open_if_new_session(now, heard_at=heard_at, segment=segment)
         if not normalized:
-            return []
-        corrected = [Log(f"corrected transcript {heard!r} -> {raw!r}")] if raw != heard else []
+            return split_log
+        corrected = split_log + ([Log(f"corrected transcript {heard!r} -> {raw!r}")] if raw != heard else [])
         if stopped_by_partial and self._contains_stop(normalized) and not self._speech_interrupt(raw):
             # Once the stop has finished the request, this sentence would otherwise reach the
             # Agent as a new command and occupy the channel ("帮我停一下" -> busy for "继续").
@@ -742,6 +809,68 @@ class VoiceBridgeCore:
         )
         return corrected + actions if actions else corrected
 
+    def _split_speakers(
+        self, heard: str, segment: Segment | None, alignment: TokenAlignment | None, heard_at: float
+    ) -> tuple[str, list[Action]]:
+        """Keep the owner's words of a segment that holds two voices; returns the text and its log.
+
+        The windows are compared and logged whenever they exist, so a deployment
+        can see how often segments mix before turning ``speaker_split_enabled``
+        on. Only then is the transcript cut: to the owner's tokens, or to
+        nothing when none of the owner's words were transcribed. A segment that
+        is all the owner, or has no owner window at all, is left to the usual
+        speaker check.
+        """
+        split = self._gate.split_owner(
+            heard,
+            segment,
+            alignment,
+            heard_at=heard_at,
+            owner_similarity=float(self.config.speaker_split_owner_similarity),
+            other_similarity=float(self.config.speaker_split_other_similarity),
+            apply=bool(self.config.speaker_split_enabled),
+        )
+        if split is None:
+            return heard, []
+        if segment is not None:
+            self._splits[segment] = split
+            while len(self._splits) > 32:
+                self._splits.popitem(last=False)
+        similarities = " ".join(f"{value:.2f}" for value in split.similarities)
+        if split.kind != "mixed":
+            return heard, [Log(f"speaker windows [{similarities}] -> {split.kind}: {heard!r}")]
+        verdict = (
+            f"speaker windows [{similarities}] -> mixed, owner {max(split.span[0], 0.0):.1f}-{split.span[1]:.1f}s: "
+            f"kept {split.text!r}, dropped {split.dropped!r}"
+        )
+        if not self.config.speaker_split_enabled:
+            return heard, [Log(f"{verdict} (split off; using the whole transcript)")]
+        return split.text, [Log(verdict)]
+
+    def _tail_rejection(self, segment: Segment | None) -> str:
+        """Why a question rescued from the end of ``segment`` is not the owner's; empty when it may be.
+
+        Judged by the segment's per-window voiceprints (``_split_speakers`` keeps their
+        verdict): a segment already cut to the owner's words is the owner's; otherwise the
+        last window must not be clearly someone else. No windows, no anchor or a wake
+        utterance: nothing to judge by, which accepts like every other missing measurement.
+        """
+        split = self._splits.pop(segment, None) if segment is not None else None
+        if split is None or not split.similarities:
+            return ""
+        if split.kind == "mixed":
+            # Split on, the transcript is already the owner's words. Split off, the question
+            # at the end is the owner's only when the owner's stretch runs to the end.
+            if self.config.speaker_split_enabled or split.span[1] == math.inf:
+                return ""
+            return f"speaker windows: the owner stops at {split.span[1]:.1f}s, before the question"
+        if split.kind == "absent":
+            return "speaker windows: no window is the owner's"
+        last = split.similarities[-1]
+        if last < float(self.config.speaker_split_other_similarity):
+            return f"speaker windows: last window {last:.2f} < {self.config.speaker_split_other_similarity:.2f}"
+        return ""
+
     def on_partial(self, text: str, now: float) -> list[Action]:
         """Stop as soon as a partial transcript contains a stop keyword; ignore everything else.
 
@@ -750,6 +879,10 @@ class VoiceBridgeCore:
         every transcript still held for its measurement (see ``on_heard``); when
         that is all it stopped, its final transcript belongs to it as well.
         """
+        # Plain partials have no segment identity or final voiceprint. They cannot
+        # authorize a stop when every voice command requires a verified speaker.
+        if self.config.require_verified_speech:
+            return []
         if self.config.feedback_only or not self._is_stop_partial(text) or self._state.utterance_stopped:
             return []
         if self._may_become_speech_interrupt(text):
@@ -792,7 +925,10 @@ class VoiceBridgeCore:
         (see ``AddresseeGate.needs_wait``).
         """
         normalized = _normalize(self.config.correct(str(text).strip()))
-        if not normalized or self._contains_stop(normalized) or self._state.pending is not None:
+        if not normalized or (
+            not self.config.require_verified_speech
+            and (self._contains_stop(normalized) or self._state.pending is not None)
+        ):
             return False
         return self._gate.needs_wait(normalized, now, segment)
 
@@ -801,19 +937,16 @@ class VoiceBridgeCore:
         return [Log(f"{reason}: cancelled {held.text!r}, held for its measurement") for held in cancelled]
 
     def _is_stop_partial(self, text: str) -> bool:
-        """A partial that is itself a stop keyword, or a prefix on its way to one.
+        """A partial that is itself a complete configured stop keyword.
 
         Partial matching must not be "contains": "停止照镜子" grows through the
         partial "停止", and stopping on that cancels the very request that stops
         the mirror. Keyword matching still applies to the final transcript,
-        after tail padding.
+        after tail padding. Do not match unfinished prefixes either: "好" can
+        precede "好了我结束了" or an ordinary acknowledgement during a pick.
         """
         normalized = _normalize(self.config.correct(str(text).strip()))
-        if not normalized:
-            return False
-        if normalized in self.config.stop_phrases:
-            return True
-        return any(phrase.startswith(normalized) for phrase in self.config.stop_phrases)
+        return bool(normalized) and normalized in self.config.stop_phrases
 
     def _silent(self, request_id: str) -> bool:
         return bool(request_id) and request_id == self._state.silent_request_id
@@ -840,25 +973,49 @@ class VoiceBridgeCore:
         # Accepted trade-off: an utterance like "不停地挥手" also stops the robot.
         return any(phrase in normalized for phrase in self.config.stop_phrases)
 
-    def _judge_semantics(self, raw: str, normalized: str, now: float, *, session_opened: bool) -> list[Action] | None:
-        """Run the L3 gate; returns the actions that stop the utterance, or None to let it through.
+    def _judge_semantics(
+        self,
+        raw: str,
+        normalized: str,
+        now: float,
+        *,
+        session_opened: bool,
+        segment: Segment | None,
+        addressed: bool = False,
+    ) -> tuple[list[Action] | None, SemanticDecision | None]:
+        """Run the L3 gate; returns the actions that stop the utterance (or None) and the verdict.
 
         Shadow mode records the verdict and returns None, which is what makes the log a
         labelled sample rather than a sample of rejections only: its false negatives (a
         command the gate would have dropped) are exactly what the next threshold has to
-        account for.
+        account for. The verdict is returned only when it is enforced, because only then
+        do its grade and admitted text shape the request.
         """
         gate = self._semantic
         if gate is None:
-            return None
+            return None, None
         # A session the addressee gate opened (wake word or vendor wake event) is what
         # lets a bare fragment through: "怎么" alone is a person mid-conversation, but
         # only the session says which conversation it belongs to.
         session_open = bool(self._state.session_id) and (
             now - self._state.last_activity <= self.config.session_idle_sec
         )
-        decision = gate.judge(raw, session_open=session_open)
+        # A wake-only utterance opens L1/L2 before there is an Agent session ID.
+        # Only the caller's successful addressee verdict supplies that evidence;
+        # merely configuring a wake phrase must not enable shape-based admission.
+        session_open = session_open or (
+            addressed and (bool(self.config.wake_phrases) or self.config.addressee_trigger == "vendor_session")
+        )
+        conversation = self.config.semantic_gate_conversation
+        followup_open = conversation and now - self._last_robot_turn <= self.config.semantic_gate_followup_sec
+        decision = gate.judge(raw, session_open=session_open, followup_open=followup_open, conversation=conversation)
         mode = self.config.semantic_gate_mode
+        if not decision.rejected and decision.admitted_text:
+            # The rescued question is the end of the segment, so the segment's voiceprint (its
+            # first seconds) does not speak for it; the segment's last window does.
+            tail_rejection = self._tail_rejection(segment)
+            if tail_rejection:
+                decision = dataclasses.replace(decision, rejected=True, reason=f"{decision.reason}; {tail_rejection}")
         gate.record(
             decision,
             self.config.semantic_gate_log_path,
@@ -867,13 +1024,16 @@ class VoiceBridgeCore:
             after_wake=bool(session_opened),
             active_request=bool(self._state.active_request_id),
             normalized=normalized,
+            followup_open=bool(followup_open),
         )
-        if not decision.rejected or mode != "enforce":
-            return None
+        if mode != "enforce":
+            return None, None
+        if not decision.rejected:
+            return None, decision
         # Same wording as the addressee verdict on purpose: "not addressed to me" is one
         # concept, whichever layer decided it, and the shadow log carries the score for
         # the ones that only look that way.
-        return [Log(f"not addressed to me (semantic {decision.score:.2f}: {decision.reason}); ignored {raw!r}")]
+        return [Log(f"not addressed to me (semantic {decision.score:.2f}: {decision.reason}); ignored {raw!r}")], None
 
     def _route_transcript(
         self,
@@ -885,8 +1045,26 @@ class VoiceBridgeCore:
         *,
         session_opened: bool,
         cancels_held: bool = False,
+        admitted: bool = False,
     ) -> list[Action]:
         state = self._state
+        heard_raw = raw
+        verdict = None
+        if self.config.require_verified_speech and not admitted:
+            verdict = self._gate.judge(
+                raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
+            )
+            if not verdict.addressed:
+                return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
+            raw, normalized = verdict.raw, verdict.normalized
+            # An exact stop is an explicit control intent. A longer sentence
+            # merely mentioning STOP must also pass the enabled intent gate.
+            if self._contains_stop(normalized) and normalized not in self.config.stop_phrases:
+                semantic_block, _ = self._judge_semantics(
+                    heard_raw, normalized, now, session_opened=session_opened, segment=segment, addressed=True
+                )
+                if semantic_block is not None:
+                    return semantic_block
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
         remainder = self._speech_interrupt(raw)
@@ -906,7 +1084,13 @@ class VoiceBridgeCore:
                 return [
                     *actions,
                     *self._route_transcript(
-                        remainder, _normalize(remainder), now, heard_at, segment, session_opened=session_opened
+                        remainder,
+                        _normalize(remainder),
+                        now,
+                        heard_at,
+                        segment,
+                        session_opened=session_opened,
+                        admitted=self.config.require_verified_speech,
                     ),
                 ]
             return actions
@@ -920,20 +1104,22 @@ class VoiceBridgeCore:
         if (self._contains_stop(normalized) or normalized == "不玩了") and stops_something:
             # With nothing to interrupt, a sentence that merely contains a keyword is a command.
             # Checked before the wake gate on purpose: a stop must never need addressing.
-            return self._stop(now, reason=f"stop keyword in {raw!r}")
+            held = self._cancel_held(f"verified stop keyword in {raw!r}") if self.config.require_verified_speech else []
+            return [*held, *self._stop(now, reason=f"stop keyword in {raw!r}")]
         if self._unsafe_request_id or state.timed_out_request_id or self._ending_session:
             return [Log("previous request has no safe terminal; new intent held back")]
         if state.pending is not None:
             return self._answer_confirmation(normalized, raw, now)
-        verdict = self._gate.judge(
-            raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
-        )
-        if not verdict.addressed:
+        if verdict is None and not admitted:
+            verdict = self._gate.judge(
+                raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
+            )
+        if verdict is not None and not verdict.addressed:
             return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
         # The intent gate judges the sentence as heard: the addressee gate strips the wake
         # phrase, and a woken sentence must keep the gate's wake-prefix exemption.
-        heard_raw = raw
-        raw, normalized = verdict.raw, verdict.normalized
+        if verdict is not None:
+            raw, normalized = verdict.raw, verdict.normalized
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
@@ -972,12 +1158,23 @@ class VoiceBridgeCore:
                     )
                 )
             return actions
-        semantic_block = self._judge_semantics(heard_raw, normalized, now, session_opened=session_opened)
+        semantic_block, semantic = self._judge_semantics(
+            heard_raw,
+            normalized,
+            now,
+            session_opened=session_opened,
+            segment=segment,
+            addressed=verdict is not None and verdict.addressed,
+        )
         if semantic_block is not None:
             # Vetoed as not meant for the robot, yet it passed the wake and voiceprint checks:
             # the woken speaker is still talking, so the window stays open as for a request.
             self._gate.note_handled(heard_at)
             return semantic_block
+        admission_log: list[Action] = []
+        if semantic is not None and semantic.admitted_text:
+            admission_log.append(Log(f"admitted the trailing question {semantic.admitted_text!r} of {raw!r}"))
+            raw, normalized = semantic.admitted_text, _normalize(semantic.admitted_text)
         if len(normalized) < self.config.min_text_chars:
             return [Log(f"ignored short utterance {raw!r}")]
         self._gate.note_handled(heard_at)
@@ -1002,13 +1199,22 @@ class VoiceBridgeCore:
         if state.clarification_request_id:
             payload["reply_to_request_id"] = state.clarification_request_id
             state.clarification_request_id = ""
+        if semantic is not None and semantic.grade == GRADE_CONVERSATION:
+            # Admitted as a question or a reply only: the Agent may answer it, never execute it.
+            payload["admission"] = GRADE_CONVERSATION
         state.active_request_id = request_id
         state.task_label = _spoken_label(raw)
         state.last_busy_at = float("-inf")
         state.active_since = now
         state.last_activity = now
         state.known_request_ids.add(request_id)
-        return [*invalidation, Log(f"request {request_id}: {raw!r}"), PublishRequest(payload)]
+        admitted = f" ({semantic.reason}, conversation only)" if "admission" in payload and semantic else ""
+        return [
+            *admission_log,
+            *invalidation,
+            Log(f"request {request_id}: {raw!r}{admitted}"),
+            PublishRequest(payload),
+        ]
 
     def on_response(self, payload: dict[str, Any], now: float) -> list[Action]:
         if self.config.feedback_only:
@@ -1088,6 +1294,9 @@ class VoiceBridgeCore:
         previewed = self._take_preview(request_id)
         if not self._finish(request_id):
             return []
+        # A recorded clip (the fruit menu) never passes through this bridge's speech, so its
+        # request's end is the robot's end of turn; spoken replies move it on again.
+        self._last_robot_turn = max(self._last_robot_turn, now)
         if request_id in self._speech_suppressed:
             return [Log(f"suppressed terminal speech for {request_id}")]
         if event_type == "needs_clarification":
@@ -1681,6 +1890,8 @@ def node_parameter_defaults() -> dict[str, Any]:
             defaults[f"{item.name}_json"] = json.dumps(list(item.default), ensure_ascii=False)
         elif item.name == "text_corrections":
             defaults["text_corrections_json"] = json.dumps(dict(item.default), ensure_ascii=False)
+        elif item.name == "text_rewrites":
+            defaults["text_rewrites_json"] = json.dumps([list(pair) for pair in item.default], ensure_ascii=False)
         elif item.name == "confirm_mode":
             # Empty: resolve_confirm_mode derives it from tts_enabled.
             defaults["confirm_mode"] = ""
@@ -1705,10 +1916,14 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         session_gap_sec=float(values["session_gap_sec"]),
         wake_window_sec=float(values["wake_window_sec"]),
         speaker_check_enabled=bool(values["speaker_check_enabled"]),
+        require_verified_speech=bool(values["require_verified_speech"]),
         speaker_min_similarity=float(values["speaker_min_similarity"]),
         speaker_max_age_sec=float(values["speaker_max_age_sec"]),
         speaker_merge_margin=float(values["speaker_merge_margin"]),
         speaker_reject_short=bool(values["speaker_reject_short"]),
+        speaker_split_enabled=bool(values["speaker_split_enabled"]),
+        speaker_split_owner_similarity=float(values["speaker_split_owner_similarity"]),
+        speaker_split_other_similarity=float(values["speaker_split_other_similarity"]),
         measurement_grace_sec=float(values["measurement_grace_sec"]),
         confirm_timeout_sec=float(values["confirm_timeout_sec"]),
         session_idle_sec=float(values["session_idle_sec"]),
@@ -1725,6 +1940,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         feedback_only=bool(values["feedback_only"]),
         busy_message=str(values["busy_message"]),
         text_corrections=_corrections(values.get("text_corrections_json", "{}")),
+        text_rewrites=_rewrites(values.get("text_rewrites_json", "[]")),
         semantic_gate_mode=str(values["semantic_gate_mode"]),
         semantic_gate_model_path=str(values["semantic_gate_model_path"]),
         semantic_gate_threshold=float(values["semantic_gate_threshold"]),
@@ -1738,7 +1954,17 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         ),
         semantic_gate_log_path=str(values["semantic_gate_log_path"]),
         semantic_gate_fail_open=bool(values["semantic_gate_fail_open"]),
+        semantic_gate_conversation=bool(values["semantic_gate_conversation"]),
+        semantic_gate_followup_sec=float(values["semantic_gate_followup_sec"]),
     )
+
+
+def _rewrites(value: Any) -> tuple[tuple[str, str], ...]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, list) or any(not isinstance(item, list) or len(item) != 2 for item in value):
+        raise ValueError("text_rewrites must be a list of [pattern, replacement] pairs")
+    return tuple((str(pattern), str(replacement)) for pattern, replacement in value)
 
 
 def _corrections(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
@@ -2020,7 +2246,11 @@ def _build_node_class():
             self._hear(message.data, None)
 
         def _on_segment_transcript(self, message: Any) -> None:
-            self._hear(str(message.text), (str(message.source_id), int(message.segment_sequence)))
+            text = str(message.text)
+            alignment = TokenAlignment.build(
+                getattr(message, "token_starts", ()), getattr(message, "token_ends", ()), text
+            )
+            self._hear(text, (str(message.source_id), int(message.segment_sequence)), alignment)
 
         def _on_audio_chunk(self, message: Any) -> None:
             source = str(message.source_id)
@@ -2038,11 +2268,11 @@ def _build_node_class():
             if message.state == message.STATE_END:
                 self._active_audio_segments.pop(source, None)
 
-        def _hear(self, text: str, segment: Segment | None) -> None:
+        def _hear(self, text: str, segment: Segment | None, alignment: TokenAlignment | None = None) -> None:
             if self._core.config.feedback_only:
                 return
             # The core holds a transcript that is still waiting for its measurement.
-            self._run(lambda now: self._core.on_heard(text, now, segment))
+            self._run(lambda now: self._core.on_heard(text, now, segment, alignment))
 
         def _on_partial(self, message: String) -> None:
             self._run(lambda now: self._core.on_partial(message.data, now))
@@ -2081,7 +2311,13 @@ def _build_node_class():
             # if held, may now be decidable. The model identity travels with the
             # vector: only voiceprints of one model_id are compared.
             embedding = tuple(float(value) for value in message.embedding)
-            voiceprint = Voiceprint(embedding, str(message.model_id)) if embedding else None
+            windows = WindowVoiceprints.from_flat(
+                float(getattr(message, "window_seconds", 0.0)),
+                getattr(message, "window_starts", ()),
+                getattr(message, "window_embeddings", ()),
+                len(embedding),
+            )
+            voiceprint = Voiceprint(embedding, str(message.model_id), windows) if embedding else None
             segment = (str(message.source_id), int(message.segment_sequence))
             self._run(lambda now: self._core.on_measurement("speaker", voiceprint, now, segment))
 

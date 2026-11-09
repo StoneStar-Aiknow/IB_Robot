@@ -598,8 +598,7 @@ def test_speaker_embedding_node_is_given_the_bundle_and_deployment(monkeypatch, 
     assert parameters["deployment"] == "torch_cpu"
 
 
-def test_speaker_embedding_needs_the_external_vad_input(monkeypatch, tmp_path):
-    """Only that path carries SpeechAudioChunk, so only it has utterance boundaries."""
+def test_speaker_embedding_uses_the_shared_audio_local_vad_segments(monkeypatch, tmp_path):
     monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
     config = _robot_config_dict(
         voice_asr_overrides={
@@ -609,8 +608,8 @@ def test_speaker_embedding_needs_the_external_vad_input(monkeypatch, tmp_path):
         }
     )
 
-    with pytest.raises(ValueError, match="requires voice_asr.input_mode=external_vad"):
-        voice_asr.generate_voice_asr_nodes(config)
+    nodes = voice_asr.generate_voice_asr_nodes(config)
+    assert _parameters(nodes[1])["chunk_topic"] == "/voice_asr/speech_chunk"
 
 
 def test_speaker_embedding_rejects_an_unknown_key(monkeypatch, tmp_path):

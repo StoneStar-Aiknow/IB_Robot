@@ -81,6 +81,22 @@ def test_request_key_and_request_hash_are_canonical() -> None:
     assert request_hash_text(request) == sha256_text(to_canonical_json(request_hash_preimage(request)))
 
 
+def test_admission_is_hashed_only_when_set() -> None:
+    """Every request hash recorded before the field existed must still match."""
+    request = _request()
+    answer_only = replace(request, admission="conversation")
+
+    assert "admission" not in request_hash_preimage(request)
+    assert request_hash_preimage(answer_only)["admission"] == "conversation"
+    assert request_hash_text(answer_only) != request_hash_text(request)
+    assert answer_only.to_dict()["admission"] == "conversation"
+
+
+def test_an_unknown_admission_is_refused() -> None:
+    with pytest.raises(ValueError, match="admission"):
+        replace(_request(), admission="command")
+
+
 @pytest.mark.parametrize("character", ["x", "挥"])
 def test_request_text_limit_rejects_without_truncation(character):
     text = character * MAX_REQUEST_TEXT_LENGTH

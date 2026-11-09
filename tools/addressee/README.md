@@ -16,18 +16,25 @@ Design, measurements and rollout plan:
 
 ## Artefact
 
-`models/addressee/addressee_zh_v1.json` — plain JSON, ~200 KB, standard library only
+`models/addressee/addressee_zh_v2.json` (the summit's model since 2026-11-09; v1
+is still read and scored as before) — plain JSON, ~150 KB, standard library only
 at runtime. The repository ignores `models/` (model bundles are deployed, not
 committed), so the artefact travels with the deployment: train it from the corpus
 with the commands below, or copy it to the board path named in the profile.
 
 | field | meaning |
 | --- | --- |
-| `feature.ngrams` / `dim` / `hash` / `pad` | char 1–3 grams, dim 65536, FNV-1a 32, `<text>` padding |
+| `feature.ngrams` / `dim` / `hash` / `pad` | char 1–3 grams, dim 65536, FNV-1a 32, `<>text<>` padding |
+| `feature.vector_norm` | `l2` (v2): the `1 + log(count)` values are scored as a unit vector; absent (v1): raw values |
 | `wake_words` | wake spellings stripped before scoring (training and runtime share this list) |
 | `bias`, `weights` | sparse `[[index, weight], …]` logistic regression |
 | `training` | epochs, seed, corpus SHA-256, class counts |
 | `cross_validation` | the threshold table measured with grouped 5-fold CV |
+
+Training computes its features with the runtime module (`SemanticGate.vector`), and
+`test_semantic_gate.py` checks that a trained model scores the same on both sides. v1
+was trained with a private copy that padded `<text>` and normalised the vector while the
+runtime did neither, so v1's CV table below describes a model the bridge never ran.
 
 FNV-1a is part of the format because Python's `hash()` is randomised per
 process: a model exported with it scores 0 everywhere in the loading process.
@@ -74,6 +81,29 @@ python3 tools/addressee/score_text.py --model models/addressee/addressee_zh_v1.j
 (`--lexicon` overrides the catalog-derived list; without it the list comes from
 the skill catalog, which is what the bridge uses.)
 
+Complete manipulation commands also have a session-scoped grammar exception:
+`把<物体>抓进<容器>里`, `把<物体>放进<容器>里`, and
+`抓取<物体>然后放进<容器>里` (including polite forms). It matches the whole
+sentence, bounds the noun slots, and excludes quoted/question forms and clauses
+hidden inside the slots. It supplies command admission only after the bridge's
+wake/voiceprint gate has admitted the utterance. The thresholds and the
+planner/Gateway execution checks remain in force. The bridge corrects `抓紧`
+to `抓进` only in this complete transfer shape; `抓紧苹果不要松手` is unchanged.
+An explicit negation, quotation, conditional, reported or completed transfer remains vetoed
+even if a retrained model scores it highly or it includes a wake prefix. Questions
+can still receive conversation admission, which permits answers only.
+Perfective particles at a verb boundary (`放进了`) and adjacent past adverbs
+(`已经`, `刚刚`) describe completed work; noun slots must not hide them. These
+reports are also excluded from homophone correction. Aspect characters inside
+a noun (`知了玩具`) do not by themselves mark a completed action.
+
+`data/x2_manipulation_20261110.jsonl` contains five intended commands and two
+discussion utterances from the X2 field test/operator report. Append these rows
+to the original labelled corpus when training a candidate model; retain the
+original corpus and evaluate grouped CV and chatter false positives before
+replacing a deployed model. Synthetic contrast sentences belong in regression
+tests rather than being silently mixed into this field-only training set.
+
 `emit_lexicon.py` regenerates the `semantic_gate_lexicon` list from
 `src/agent/skill_catalog/config/skills/*/manifest.yaml` (`description.aliases_zh`,
 minus ordinary dialogue such as 是的 / 同意, which as an override would only
@@ -106,6 +136,26 @@ with a model trained on that corpus, so treat it as an upper bound -- the
 out-of-fold estimate is the 0.89 / 0.95 row above. The remaining misses are
 sentences the ASR destroyed beyond recognition (回不少 / 我走 / 因此道听者);
 they need the acoustic model, not this one.
+
+## Results of v2 (739 sentences, 290 addressed / 449 chatter)
+
+Corpus: the 639 field sentences plus the 100 of the 2026-11-09 local rig session
+(`x2_addressee_v2_train.txt` in the dataset directory; the three glued two-speaker
+segments are labelled 不是, because the gate's trailing-question rule handles them).
+Grouped 5-fold CV, model alone, features exactly as at runtime:
+
+| threshold | accuracy | command recall | chatter dropped |
+| --- | --- | --- | --- |
+| 0.10 | 0.8972 | 0.8724 | 0.9131 |
+| 0.50 | 0.9107 | 0.8414 | 0.9555 |
+
+The same corpus without `vector_norm: l2` drops 0.904 of the chatter at 0.50 instead of
+0.948 (equal recall). Adding the 4600 LLM-generated sentences lifted recall on them but
+cut field chatter dropped to 0.834 at 0.10, so v2 is trained on field speech only.
+
+Questions put to the robot ("你用的系统是什么"), replies ("是不是真的") and glued segments
+are not this model's job any more: the gate's conversation admission
+(`semantic_gate_conversation`, see the design note §8) admits them as answer-only requests.
 
 ## Limits
 

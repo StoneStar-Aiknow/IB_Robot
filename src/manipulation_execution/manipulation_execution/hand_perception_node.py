@@ -43,6 +43,7 @@ from sensor_msgs.msg import CompressedImage
 from ibrobot_msgs.msg import HandFrame, HandObservation, PearFrame
 
 from .hand_perception import dump, npu_hands
+from .perception_pause_follower import PausableSubscription
 
 SIDES = ("left", "right")
 CAMERA_QOS = QoSProfile(
@@ -122,8 +123,8 @@ class Stats:
 
 
 class HandPerceptionNode(Node):
-    def __init__(self):
-        super().__init__("hand_perception")
+    def __init__(self, parameter_overrides=None):
+        super().__init__("hand_perception", parameter_overrides=parameter_overrides)
         p = {k: self.declare_parameter(k, v).value for k, v in PARAMS.items()}
         p["calib_path"] = p["calib_path"] or str(npu_hands.extern_path(p["extern_dir"], npu_hands.CALIB_MEDIAPIPE_JSON))
         self.p = p
@@ -158,7 +159,9 @@ class HandPerceptionNode(Node):
 
         self.pub = self.create_publisher(HandFrame, p["frame_topic"], FRAME_QOS)
         self.create_subscription(PearFrame, p["pear_frame_topic"], self._on_pear, qos_profile_sensor_data)
-        self.create_subscription(CompressedImage, p["camera_topic"], self._on_image, CAMERA_QOS)
+        self.camera = PausableSubscription(
+            self, CompressedImage, p["camera_topic"], self._on_image, CAMERA_QOS, on_change=self._on_camera_paused
+        )
         self.worker = threading.Thread(target=self._run, name="hand-npu", daemon=True)
         self.worker.start()
         self.get_logger().info(
@@ -179,6 +182,11 @@ class HandPerceptionNode(Node):
         with self._boxes_lock:
             self._boxes.append(box)
 
+    def _on_camera_paused(self, paused: bool):
+        if paused:  # A parked frame would be stale by the time the camera returns.
+            with self._slot_lock:
+                self._slot = None
+
     def _on_image(self, msg: CompressedImage):
         stamp = stamp_ns(msg.header)
         with self._slot_lock:
@@ -194,7 +202,10 @@ class HandPerceptionNode(Node):
     def _run(self):
         try:
             self.backend = npu_hands.NpuHands(
-                self.p["model_dir"], self.p["extern_dir"], int(self.p["device"]), bool(self.p["rule_labels"]),
+                self.p["model_dir"],
+                self.p["extern_dir"],
+                int(self.p["device"]),
+                bool(self.p["rule_labels"]),
                 self.p["backend"],
             )
         except Exception as e:  # noqa: BLE001
@@ -278,8 +289,16 @@ class HandPerceptionNode(Node):
         self.pub.publish(out)
         if self.dump is not None:
             found, pick, rect = self._found or (None, None, None)
-            self.dump.add(stamp_ns=stamp, frame_id=out.frame_id, valid=bool(valid), box=box,
-                          crop_rect=rect, found=found, pick=pick, img=img)
+            self.dump.add(
+                stamp_ns=stamp,
+                frame_id=out.frame_id,
+                valid=bool(valid),
+                box=box,
+                crop_rect=rect,
+                found=found,
+                pick=pick,
+                img=img,
+            )
         self.frame_count += 1
         self._account(out, valid, (time.time_ns() - stamp) / 1e6)
 

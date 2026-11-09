@@ -468,7 +468,8 @@ ros2 param get /agent_voice_bridge resume_settle_sec
 ### 14.6 展会语音交互的行为（2026-11-09）
 
 本节说明 `aimdk_x2_summit` 的语音交互规则。本机验证使用真实的 Agent、语音桥、ASR、TTS 和 X2 runtime，
-只把机器人动作换成厂商 Mock。310P 上尚未部署。
+只把机器人动作换成厂商 Mock。310P 上尚未部署。本机验证环境的实现和用法见
+[`aimdk_x2_local_voice_rig_zh.md`](aimdk_x2_local_voice_rig_zh.md)。
 
 **受理与播报**
 
@@ -498,13 +499,14 @@ Agent 只等约 5 s 的取消确认，超时后请求记为 UNKNOWN，机器人�
 - 带唤醒词的语句一律通过意图识别。语音桥的 `wake_phrases` 自动加入意图识别的唤醒前缀。
 - 展会配置在继承的技能词表后追加展会技能别名和柠檬、苹果、橙子、橘子、水果。
 - planner 的直达命令列为对话请求，意图识别不拒绝这些命令。
-- 意图模型路径为 `$(env WORKSPACE)/models/addressee/addressee_zh_v1.json`。
+- 意图模型路径为 `$(env WORKSPACE)/models/addressee/addressee_zh_v2.json`。
+- 对话放行：会话内，问机器人的问句、追问窗口内的回答和长句末尾的问句也能通过。Agent 只用文字或讲解录音回答这类请求，不执行其他动作。规则见语义闸门设计文档第 8 节。
 - `semantic_gate_fail_open: false`。如果模型缺失，语音桥启动失败。
 - 声纹使用 `models/campplus-speaker`，在 CPU 上运行。
 
 部署前，在部署目录的 `models/` 下放好以下文件：
 
-1. 放入 `addressee/addressee_zh_v1.json`。
+1. 放入 `addressee/addressee_zh_v2.json`。
 2. 放入 `campplus-speaker/` 目录。
 
 **会话窗口**

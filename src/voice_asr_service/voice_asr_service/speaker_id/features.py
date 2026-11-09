@@ -22,6 +22,7 @@ __all__ = [
     "fbank",
     "global_mean_normalized",
     "num_frames",
+    "sliding_windows",
     "utterance_windows",
 ]
 
@@ -76,3 +77,35 @@ def utterance_windows(features: np.ndarray, window: int = WINDOW_FRAMES) -> list
     if starts[-1] + window < frames:
         starts.append(frames - window)
     return [features[start : start + window] for start in starts]
+
+
+#: Feature frames per second (the fbank's 10 ms shift).
+FRAMES_PER_SECOND = 100
+
+
+def sliding_windows(features: np.ndarray, hop: int, window: int = WINDOW_FRAMES) -> list[tuple[int, np.ndarray]]:
+    """Overlapping windows over one segment's raw fbank, each normalized on its own.
+
+    These answer a different question from ``utterance_windows``: not "who is
+    this utterance" but "who is speaking when", so a segment that holds two
+    voices (one person stops, another starts without a pause long enough for
+    the VAD) can be told apart from one voice. Each window subtracts its own
+    mean, as if it were an utterance by itself: a mean over a mixed segment
+    belongs to neither speaker.
+
+    Windows start every ``hop`` frames; one more is aligned to the end when the
+    hops do not reach it, so the last words are always covered. A segment too
+    short for two windows has nothing to compare and returns none. ``features``
+    is the un-normalized fbank; each item is (start frame, window).
+    """
+    features = np.asarray(features, dtype=np.float32)
+    window, hop = int(window), int(hop)
+    if window <= 0 or hop <= 0:
+        raise ValueError("window and hop must be positive")
+    frames = features.shape[0]
+    if frames < window + hop:
+        return []
+    starts = list(range(0, frames - window + 1, hop))
+    if starts[-1] + window < frames:
+        starts.append(frames - window)
+    return [(start, global_mean_normalized(features[start : start + window])) for start in starts]

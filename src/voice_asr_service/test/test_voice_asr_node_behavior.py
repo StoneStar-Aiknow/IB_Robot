@@ -208,6 +208,46 @@ def make_node(
     return node
 
 
+def test_shared_audio_publishes_matching_pcm_boundaries_and_final_segment():
+    from builtin_interfaces.msg import Time
+
+    node = make_node(vad_state=VADState.SPEAKING)
+    chunks, transcripts = [], []
+    node._pub_speech_chunk = SimpleNamespace(publish=chunks.append)
+    node._shared_source, node._shared_sequence, node._shared_segment = "shared-test", 0, None
+    node._pub_transcript = SimpleNamespace(publish=transcripts.append)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=Time))
+    node._audio_capture.chunks.extend([np.zeros(512, dtype=np.float32), np.ones(512, dtype=np.float32) * 0.5])
+
+    node._process_audio()
+    node._process_audio()
+    result = node._end_streaming("test_silence")
+
+    assert [m.state for m in chunks] == [1, 2, 2, 3]
+    assert [m.sequence for m in chunks] == [1, 2, 3, 4]
+    assert len(chunks[1].audio_data) == 1024
+    assert transcripts[0].source_id == "shared-test"
+    assert transcripts[0].segment_sequence == 1
+    assert transcripts[0].text == result.text
+    assert node._shared_segment is None
+
+
+def test_reset_closes_shared_segment_without_reusing_it_for_the_next_transcript():
+    from builtin_interfaces.msg import Time
+
+    node = make_node()
+    chunks, transcripts = [], []
+    node._pub_speech_chunk = SimpleNamespace(publish=chunks.append)
+    node._shared_source, node._shared_sequence, node._shared_segment = "shared-test", 0, None
+    node._pub_transcript = SimpleNamespace(publish=transcripts.append)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=Time))
+    node._publish_shared_chunk(1, np.zeros(512))
+    node._reset_recognition_runtime()
+    node._end_streaming("after_reset")
+    assert [m.state for m in chunks] == [1, 3]
+    assert not transcripts
+
+
 def test_recognize_file_maps_results_timestamps_and_durations():
     node = make_node()
     created = []
