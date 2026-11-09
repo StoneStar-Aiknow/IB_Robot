@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -88,8 +89,12 @@ class TestTheBlock:
         assert settings.look is not None
 
     def test_it_is_written_at_the_contract_s_defaults(self, config):
-        """The defaults stand in for a bad item, so they must be what is deployed."""
-        assert contract.normalize(config["internvl_voice"])[0] == contract.Settings()
+        """The defaults stand in for a bad item, so they must be what is deployed.
+
+        Except asr: feat/x2-retarget-tune deploys "session", the mode that stopped the
+        STANDBY/MIRRORING stalls on the robot.
+        """
+        assert contract.normalize(config["internvl_voice"])[0] == replace(contract.Settings(), asr="session")
 
     def test_its_table_is_the_installed_one(self, config):
         """``$(find robot_config)`` against the source tree, laid out as the share dir is."""
