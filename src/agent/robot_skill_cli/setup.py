@@ -29,7 +29,7 @@ setup(
         ),
         ("share/" + package_name + "/hermes/adapter", ["resource/hermes/adapter/robot_control.py"]),
     ],
-    install_requires=["setuptools", "pyyaml"],
+    install_requires=["setuptools", "pyyaml", "robot_client"],
     extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
@@ -39,7 +39,7 @@ setup(
     entry_points={
         "console_scripts": [
             "robot-skill = robot_skill_cli.cli:main",
-            "robot-skill-daemon = robot_skill_cli.bridge_daemon:main",
+            "robot-skill-daemon = robot_skill_cli.daemon_cli:main",
             "robot-skill-closed-loop = robot_skill_cli.closed_loop_runner:main",
             "hermes-robot = robot_skill_cli.hermes_launcher:main",
             "hermes-robot-configure = robot_skill_cli.hermes_configure:main",

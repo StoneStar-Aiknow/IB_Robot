@@ -88,6 +88,10 @@
   <!-- The E2E's sim-clock subscription and the reach test read /clock
        (review r1 item 12). -->
   <test_depend>rosgraph_msgs</test_depend>
+  <!-- The interface-startup suite passes voice_asr_realtime_pre_roll_seconds
+       and expects the voice_asr launch-builder hook to apply it; that hook
+       registers from this package. -->
+  <test_depend>voice_asr_service</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

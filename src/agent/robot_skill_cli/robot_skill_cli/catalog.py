@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +12,45 @@ from embodied_common.dispatch_binding import delegated_executor_identity, load_d
 from embodied_common.mirror_session_contract import SESSION_SERVICE as MIRROR_SESSION_SERVICE
 from embodied_common.primitive_contracts import primitive_contract_for_version
 from embodied_common.visual_game_contracts import build_visual_game_capability_view
+
+# Neutral online projection and helper functions are owned by robot_client and
+# must not drift from the public client implementation.
+from robot_client.catalog import (
+    UnknownGameError as UnknownGameError,
+)
+from robot_client.catalog import (
+    UnknownSkillError as UnknownSkillError,
+)
+from robot_client.catalog import (
+    capability_view_from_snapshot as capability_view_from_snapshot,
+)
+from robot_client.catalog import (
+    describe_game as describe_game,
+)
+from robot_client.catalog import (
+    describe_skill as describe_skill,
+)
+from robot_client.catalog import (
+    list_games as list_games,
+)
+from robot_client.catalog import (
+    list_poses as list_poses,
+)
+from robot_client.catalog import (
+    list_skills as list_skills,
+)
+from robot_client.catalog import (
+    planner_catalog_view as planner_catalog_view,
+)
+from robot_client.catalog import (
+    require_enabled_game as require_enabled_game,
+)
+from robot_client.transport import (
+    GatewayTransport as GatewayTransport,
+)
+from robot_client.transport import (
+    gateway_transport as gateway_transport,
+)
 from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import (
     get_effective_visual_game_policies,
@@ -25,12 +62,6 @@ from robot_config.loader import (
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
-from skill_catalog.digest import (
-    derive_capability_digest,
-    derive_provenance_digest,
-    derive_registry_digest,
-    to_canonical_json,
-)
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
 from skill_catalog.source import (
     AmentShareSkillSource,
@@ -47,53 +78,10 @@ _LIST_CAPABILITY_FIELDS = (
 )
 
 
-class UnknownSkillError(ValueError):
-    """Raised when a catalog query names a skill that is not enabled."""
-
-    code = "UNKNOWN_SKILL"
-
-    def __init__(self, skill_name: str) -> None:
-        self.skill_name = skill_name
-        super().__init__(f"unknown skill: {skill_name}")
-
-
-class UnknownGameError(ValueError):
-    """Raised when a visual game is absent or disabled in robot_config."""
-
-    code = "UNKNOWN_GAME"
-
-    def __init__(self, game_name: str) -> None:
-        self.game_name = game_name
-        super().__init__(f"unknown or disabled visual game: {game_name}")
-
-
 @dataclass(frozen=True)
 class CatalogContext:
     view: dict[str, Any]
     game_view: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class GatewayTransport:
-    status_service: str
-    validate_skill_service: str
-    skill_action_name: str
-    primitive_action_name: str = "/embodied/execute_primitive"
-    validate_primitive_service: str = "/embodied/validate_primitive"
-    snapshot_service: str = "/embodied/get_skill_snapshot"
-    reload_service: str = "/embodied/reload_skill_catalog"
-    plan_service: str = "/embodied/plan_agent_command"
-    validate_plan_service: str = "/embodied/validate_agent_plan"
-    confirm_plan_service: str = "/embodied/confirm_agent_plan"
-    execute_plan_action: str = "/embodied/execute_agent_plan"
-    start_visual_game_service: str = "/embodied/start_visual_game"
-    get_visual_game_result_service: str = "/embodied/get_visual_game_result"
-    execute_program_action: str = "/embodied/execute_program"
-    get_execution_service: str = "/embodied/get_execution"
-    get_execution_events_service: str = "/embodied/get_execution_events"
-    cancel_execution_service: str = "/embodied/cancel_execution"
-    robot_id: str = ""
-    caller_scope: str = "robot_skill_cli"
 
 
 def _game_view(robot_config: dict[str, Any], timeout_policy: dict[str, float]) -> dict[str, Any]:
@@ -151,6 +139,57 @@ def load_runtime_context(
     )
 
 
+#: Gateway commands whose handlers read only ``view["timeout_policy"]`` — the
+#: local skill catalog is compiled for none of them. Ledger queries and
+#: cancellation must not depend on local robot resources being intact, which
+#: is the same guarantee the online CLI path already gives these commands.
+TRANSPORT_ONLY_COMMANDS = frozenset(
+    {
+        "status",
+        "cancel",
+        "reload-catalog",
+        "plan-workflow",
+        "run-workflow",
+        "validate-plan",
+        "confirm-plan",
+        "execute-plan",
+        "cancel-plan",
+    }
+)
+
+
+def load_transport_context(
+    *,
+    config_name: str | None = None,
+    config_path: str | Path | None = None,
+) -> tuple[CatalogContext, GatewayTransport]:
+    """Load the Gateway transport and timeout policy WITHOUT compiling a catalog.
+
+    The compatibility path's ledger and workflow commands (see
+    :data:`TRANSPORT_ONLY_COMMANDS`) need the bound endpoints and the timeout
+    policy, never a compiled skill view: a missing or broken local catalog
+    must not block status, cancellation or plan execution against a Gateway
+    that is serving them fine. Mirrors the visual-game loader's split between
+    metadata and motion dependencies.
+    """
+    resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
+    robot_config = load_robot_config_dict(resolved_path)
+    embodied = robot_config.get("embodied", {})
+    timeout_policy = resolve_embodied_timeout_policy(embodied)
+    return (
+        CatalogContext(
+            # The same projection the full context's view carries, so the
+            # timeout fields these commands read are identical.
+            view={
+                "robot_name": robot_config.get("name", ""),
+                "timeout_policy": project_capability_timeout_policy(timeout_policy),
+            },
+            game_view=_game_view(robot_config, timeout_policy),
+        ),
+        _gateway_transport(embodied, robot_id=str(robot_config.get("name", ""))),
+    )
+
+
 def load_visual_game_context(
     *,
     config_name: str | None = None,
@@ -184,29 +223,7 @@ def _visual_game_context(robot_config: dict[str, Any]) -> CatalogContext:
 
 
 def _gateway_transport(embodied: dict[str, Any], *, robot_id: str = "") -> GatewayTransport:
-    return GatewayTransport(
-        status_service=embodied.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
-        snapshot_service=embodied.get("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot"),
-        reload_service=embodied.get("skill_catalog_reload_service", "/embodied/reload_skill_catalog"),
-        validate_skill_service=embodied.get("validate_skill_service", "/embodied/validate_skill"),
-        skill_action_name=embodied.get("skill_action_name", "/embodied/execute_skill"),
-        primitive_action_name=embodied.get("primitive_action_name", "/embodied/execute_primitive"),
-        validate_primitive_service=embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
-        plan_service=embodied.get("plan_service", "/embodied/plan_agent_command"),
-        validate_plan_service=embodied.get("validate_plan_service", "/embodied/validate_agent_plan"),
-        confirm_plan_service=embodied.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
-        execute_plan_action=embodied.get("execute_plan_action", "/embodied/execute_agent_plan"),
-        start_visual_game_service=embodied.get("start_visual_game_service", "/embodied/start_visual_game"),
-        get_visual_game_result_service=embodied.get(
-            "get_visual_game_result_service", "/embodied/get_visual_game_result"
-        ),
-        execute_program_action=embodied.get("execute_program_action", "/embodied/execute_program"),
-        get_execution_service=embodied.get("get_execution_service", "/embodied/get_execution"),
-        get_execution_events_service=embodied.get("get_execution_events_service", "/embodied/get_execution_events"),
-        cancel_execution_service=embodied.get("cancel_execution_service", "/embodied/cancel_execution"),
-        robot_id=robot_id,
-        caller_scope="robot_skill_cli",
-    )
+    return gateway_transport(embodied, robot_id=robot_id, robot_name=robot_id)
 
 
 def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
@@ -387,206 +404,3 @@ def load_capability_catalog(
 ) -> dict[str, Any]:
     """Load the normalized config and return its public capability view."""
     return load_catalog_context(config_name=config_name, config_path=config_path).view
-
-
-def capability_view_from_snapshot(snapshot: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
-    """Verify one exact Gateway snapshot and return its public catalog view."""
-    expected_identity = (
-        status["registry_epoch"],
-        int(status["registry_generation"]),
-        status["registry_digest"],
-    )
-    actual_identity = (
-        snapshot["registry_epoch"],
-        int(snapshot["generation"]),
-        snapshot["registry_digest"],
-    )
-    if not snapshot["success"] or actual_identity != expected_identity:
-        raise ValueError("SKILL_REGISTRY_VERSION_MISMATCH: snapshot identity does not match Gateway status")
-    try:
-        payload = json.loads(snapshot["snapshot_json"])
-    except (TypeError, json.JSONDecodeError) as exc:
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: snapshot payload is not valid JSON") from exc
-    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: snapshot schema is invalid")
-    if to_canonical_json(payload) != snapshot["snapshot_json"]:
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: snapshot payload is not canonical")
-    registry_preimage = payload.get("registry_preimage")
-    capability_preimage = payload.get("capability_preimage")
-    provenance_preimage = payload.get("provenance_preimage")
-    if not all(isinstance(value, dict) for value in (registry_preimage, capability_preimage, provenance_preimage)):
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: snapshot preimages are invalid")
-    if derive_registry_digest(registry_preimage) != snapshot["registry_digest"]:
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: registry digest does not match")
-    if derive_capability_digest(capability_preimage) != snapshot["capability_digest"]:
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: capability digest does not match")
-    if derive_provenance_digest(provenance_preimage) != snapshot["provenance_digest"]:
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: provenance digest does not match")
-    capability_mapping = capability_preimage.get("capability_view")
-    if not isinstance(capability_mapping, dict):
-        raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: capability view is invalid")
-    planner_visible_names = {str(name) for name in capability_preimage.get("planner_visible_skill_names", [])}
-    semantic_levels = {
-        str(entry["name"]): str(entry["semantic_level"])
-        for entry in registry_preimage.get("skills", [])
-        if isinstance(entry, dict) and "name" in entry and "semantic_level" in entry
-    }
-    timeout_caps = {
-        str(entry["name"]): float(entry["template"]["timeout_sec"])
-        for entry in registry_preimage.get("skills", [])
-        if isinstance(entry, dict) and isinstance(entry.get("template"), dict) and "timeout_sec" in entry["template"]
-    }
-    skills = [copy.deepcopy(capability_mapping[name]) for name in sorted(capability_mapping)]
-    for skill in skills:
-        skill["planner_visible"] = skill["name"] in planner_visible_names
-        skill["semantic_level"] = semantic_levels.get(skill["name"], "")
-        if skill["name"] in timeout_caps:
-            skill["timeout_sec"] = timeout_caps[skill["name"]]
-    return {
-        "robot_name": capability_preimage["robot_name"],
-        "skills": skills,
-        "pose_names": list(capability_preimage["named_pose_names"]),
-        "timeout_policy": project_capability_timeout_policy(capability_preimage["timeout_policy"]),
-        "capability_digest": snapshot["capability_digest"],
-        "profile_name": capability_preimage["profile_name"],
-    }
-
-
-def _skill_entry(view: dict[str, Any], skill_name: str) -> dict[str, Any]:
-    normalized_name = skill_name.strip()
-    for skill in view["skills"]:
-        if skill["name"] == normalized_name:
-            return skill
-    raise UnknownSkillError(normalized_name)
-
-
-#: Fields a planner needs to choose a skill and fill its parameters. Everything
-#: else in a capability entry exists for validation and execution, which happen
-#: locally against the full view after the model answers.
-_PLANNER_SKILL_FIELDS = (
-    "summary",
-    "domain",
-    "semantic_level",
-    "moves_robot",
-    "required_control_mode",
-    "parameters",
-    "schema_version",
-)
-
-
-def planner_catalog_view(view: dict[str, Any]) -> dict[str, Any]:
-    """Return the smallest catalog a planner prompt needs.
-
-    Every planning turn serializes this into the request body, so its size is
-    paid in prompt tokens and in time-to-first-token on each turn. Two things
-    are dropped: skills the planner is not allowed to choose (they were sent
-    with ``planner_visible: false``, which only invited the model to try them),
-    and per-skill fields that exist for local validation and execution.
-
-    This is a prompt-shaping view only. Workflow validation and the read-only
-    answers must keep using the full view, which is the authority on what the
-    robot can actually do.
-
-    The view may be empty: with the Gateway offline the Agent still plans
-    against ``{}`` so a conversation can be answered, and only a workflow is
-    refused afterwards. So no field is required here.
-    """
-    skills = [
-        {
-            "name": skill["name"],
-            **{field: copy.deepcopy(skill[field]) for field in _PLANNER_SKILL_FIELDS if field in skill},
-        }
-        for skill in view.get("skills", [])
-        if skill.get("planner_visible", True)
-    ]
-    projected = {
-        "robot_name": view.get("robot_name", ""),
-        "skills": skills,
-        "pose_names": list(view.get("pose_names", [])),
-        "capability_digest": view.get("capability_digest", ""),
-    }
-    # Control-plane state changes what the planner may propose right now, so it
-    # stays even though it is not part of the skill list.
-    for field in ("control_plane_ready", "active_control_mode", "motion_authorized"):
-        if field in view:
-            projected[field] = view[field]
-    return projected
-
-
-def list_skills(view: dict[str, Any]) -> dict[str, Any]:
-    skills = []
-    for skill in view["skills"]:
-        entry = {
-            "name": skill["name"],
-            "contract_schema_version": int(skill.get("schema_version", 1)),
-            **{field: copy.deepcopy(skill[field]) for field in _LIST_CAPABILITY_FIELDS},
-        }
-        skills.append(entry)
-    return {
-        "robot_name": view["robot_name"],
-        "config_digest": view["capability_digest"],
-        "skills": skills,
-    }
-
-
-def describe_skill(view: dict[str, Any], skill_name: str) -> dict[str, Any]:
-    skill = _skill_entry(view, skill_name)
-    result = {
-        "robot_name": view["robot_name"],
-        "name": skill["name"],
-        "schema_version": int(skill.get("schema_version", 1)),
-        **{field: copy.deepcopy(skill[field]) for field in _LIST_CAPABILITY_FIELDS},
-        "parameters": copy.deepcopy(skill["parameters"]),
-        "recovery_policy": copy.deepcopy(skill["recovery_policy"]),
-        "timeout_policy": copy.deepcopy(view["timeout_policy"]),
-        "config_digest": view["capability_digest"],
-    }
-    if "timeout_sec" in skill:
-        result["timeout_sec"] = float(skill["timeout_sec"])
-    return result
-
-
-def list_poses(view: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "robot_name": view["robot_name"],
-        "config_digest": view["capability_digest"],
-        "poses": list(view["pose_names"]),
-    }
-
-
-def list_games(game_view: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "robot_name": game_view["robot_name"],
-        "config_digest": game_view["config_digest"],
-        "games": [
-            {
-                "name": game["name"],
-                "summary": game["summary"],
-                "result_field": game["result_schema"]["field"],
-            }
-            for game in game_view["games"]
-        ],
-    }
-
-
-def require_enabled_game(game_view: dict[str, Any], game_name: str) -> dict[str, Any]:
-    normalized_name = game_name.strip()
-    for game in game_view["games"]:
-        if game["name"] == normalized_name:
-            return copy.deepcopy(game)
-    raise UnknownGameError(normalized_name)
-
-
-def describe_game(game_view: dict[str, Any], game_name: str) -> dict[str, Any]:
-    game = require_enabled_game(game_view, game_name)
-    return {
-        "robot_name": game_view["robot_name"],
-        "name": game["name"],
-        "summary": game["summary"],
-        "required_inputs": game["required_inputs"],
-        "result_schema": game["result_schema"],
-        "timeout_sec": game_view["timeout_sec"],
-        "result_retention_sec": game_view["result_retention_sec"],
-        "result_capacity": game_view["result_capacity"],
-        "config_digest": game_view["config_digest"],
-    }

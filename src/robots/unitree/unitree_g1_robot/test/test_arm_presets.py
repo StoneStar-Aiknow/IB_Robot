@@ -100,7 +100,8 @@ def test_preset_io_creates_no_hand_or_motion_writer(monkeypatch):
     params = {"vendor_domain_id": domain_id, "vendor_network_interface": "lo"}
     node.get_parameter = lambda name: SimpleNamespace(value=params[name])
     sdk = Mock()
-    monkeypatch.setattr(runtime_node, "UnitreeSdk", Mock(return_value=sdk))
+    # The injectable facade seam replaces the module-level constructor patch.
+    node._sdk_factory = lambda: sdk
     monkeypatch.setattr(runtime_node.vg, "require_vendor", lambda: None)
     node._setup_vendor_io()
     sdk.command_writer.assert_not_called()

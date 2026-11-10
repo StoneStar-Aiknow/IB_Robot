@@ -19,6 +19,45 @@
 
 ## 环境与配置
 
+### 部署配置绑定
+
+在线命令的目标由部署配置决定，不做发现、选择或凭证配对。
+按 `robot_config` 的既有优先级解析：`--config-path` > `--config-name` >
+`ROBOT_CONFIG` > `ROBOT_NAME`；四者都没有时以退出码 2 报错，不连接任何机器人。
+
+```bash
+source .shrc_local
+robot-skill --config-name unitree_g1 status
+robot-skill --config-path /tmp/ibrobot_interfaces_xxx/robot.yaml list-skills
+ROBOT_CONFIG=unitree_g1 robot-skill status
+```
+
+同一个配置解析出的 endpoint、robot 身份和当前 ROS 环境共同决定请求目标；
+换了配置或 ROS 域就是另一个目标，保存的执行引用不会跨目标复用。
+配置绑定不代表运动已获授权，Gateway 的 `authorize_motion` 仍是唯一运行期授权边界。
+`--offline` 只用于显式检查本地开发目录，仍需配置选择器。
+
+不再支持 `robot-skill discover`、`robot-skill connect`、`robot-skill disconnect`
+和 `--target`：目标切换属于旧的发现/选择流程，已移出本仓库客户端（Issue #238）。
+视觉游戏命令同样使用上述配置选择器。
+简易 Web 入口见 [robot-skill-web](../robot_skill_web/README.md)。
+
+### 状态与技能列表显示
+
+`status` 和 `list-skills` 在交互终端中默认输出摘要和表格；重定向或管道默认
+保持原有 JSON envelope。Hermes managed 环境默认保持 JSON。可在子命令后显式选择：
+
+```bash
+robot-skill --config-path "$CONFIG" status --human
+robot-skill --config-path "$CONFIG" list-skills --human
+robot-skill --config-path "$CONFIG" status --json
+robot-skill --config-path "$CONFIG" list-skills --json
+```
+
+人工显示保留未就绪原因和技能说明；完整 digest、registry identity 等字段通过
+`--json` 查看。Gateway 的 ready 不等于真机验收或厂商所有前置条件已经满足。
+错误退出码不变；其他命令（包括 run-workflow 的展示与终态事件）仍输出 JSON。
+
 在工作区根目录加载环境：
 
 ```bash
@@ -46,7 +85,7 @@ bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链
 `ib_trace` 的阶段字段与 `[bind]` 标识符经过有界清洗；日志用的清洗不会改写请求幂等键或
 提交给 Gateway 的 plan/task identity。
 
-每个命令可用 `--config-name NAME` 选择配置，或用 `--config-path PATH` 指向 YAML；两个 flag 在 CLI 中互斥。
+兼容入口可用 `--config-name NAME` 选择配置，或用 `--config-path PATH` 指向 YAML；两个 flag 在 CLI 中互斥。
 配置解析完全复用 `robot_config.resolve_robot_config_path()`，CLI 不维护第二套路径优先级：底层选择顺序是
 显式 path、显式 name、`ROBOT_CONFIG`、`ROBOT_NAME`、默认 `so101_single_arm`。按名称先查安装目录，再查
 源码 `config/robots/`；显式 path 必须存在。
@@ -97,12 +136,15 @@ bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链
 
 | 命令 | ROS | 用途 |
 |---|---:|---|
-| `list-skills` | 否 | 列出所有启用的高层技能及公开描述 |
+| `list-skills` | 是 | 列出服务端启用的高层技能及公开描述 |
 | `list-games` | 否 | 列出配置中已启用且允许 Agent 触发的视觉游戏 |
 | `describe-game GAME` | 否 | 查看视觉游戏输入、结果 schema、timeout 和配置摘要 |
-| `describe SKILL` | 否 | 查看参数 schema、单位、语义描述和 timeout policy |
-| `list-poses` | 否 | 列出公开命名位姿 |
+| `describe SKILL` | 是 | 查看在线参数 schema、单位、语义描述和 timeout policy |
+| `list-poses` | 是 | 列出服务端公开命名位姿 |
 | `status` | 是 | 读取 Gateway 授权、控制模式、readiness、busy 和 ledger 状态 |
+| `execution-status --reference FILE` | 是 | 按保存的 Program 引用查询，不加载目录 |
+| `execution-events --reference FILE` | 是 | 读取执行事件，识别重复和缺口 |
+| `cancel-execution --reference FILE` | 是 | 校验目标后请求取消，不加载目录 |
 | `validate SKILL` | 是 | 本地 schema 检查后调用 Gateway 安全校验，不执行动作 |
 | `execute SKILL --task-id ID` | 是 | 通过 `SkillCommand` 执行高层技能 |
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
@@ -143,7 +185,10 @@ source/field allowlist 限制可读取的感知量，通过 `ros2 topic echo --o
 消费时可能已经过期。该字面量在 `plan-workflow` 时冻结进 plan digest，后续按 frozen plan 语义审计；
 执行结果以真实运动为准，不自动重试或修正。
 
-catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
+默认在线目录命令通过 `RobotClient` 读取服务端快照。
+`--offline` 或显式旧配置下的目录命令才读取本地配置。
+离线目录命令不初始化 `rclpy`。
+runtime 命令只访问 Gateway status、
 `ValidateSkill`、`SkillCommand`、`ValidatePrimitive`、`PrimitiveCommand`、Agent plan services/actions 和标准
 `CancelGoal` 接口；视觉游戏 runtime 命令只访问 start/result 服务。Hermes 启动前会先验证四个版本化
 Skill/Primitive 公共接口，再检查 Gateway/Agent 接口。
@@ -216,14 +261,17 @@ robot-skill --config-name lekiwi_nav_grasp validate imitate_human_motion \
 
 ### 公开 catalog 字段
 
-`list-skills` 输出 `robot_name`、`config_digest` 和技能数组；每个技能只含 `name`、`summary`、`domain`、
+兼容入口的 `list-skills` 输出 `robot_name`、`config_digest` 和技能数组；每个技能包含 `name`、`summary`、`domain`、
 `moves_robot`、`required_control_mode`。`describe SKILL` 在这些字段之外输出该技能的 `parameters`、
 `recovery_policy`、运动能力 `timeout_policy` 和 `config_digest`。`list-poses` 只输出命名位姿名称，不输出坐标。
 primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 CLI catalog。
 
+默认在线入口还返回参数契约、就绪原因和规划可见性。
+客户端复用同一快照补充字段，不合并本地技能资源。
+
 `list-games` 只公开已启用游戏的 `name`、`summary`、`result_field` 和视觉游戏 `config_digest`；
 四个视觉游戏命令使用独立的轻量配置上下文，不编译运动 Skill catalog，也不要求运动服务或
-机器人 description 包才能完成发现、启动和查询。
+机器人 description 包才能完成启动和查询。
 `describe-game` 进一步公开 required inputs、结果 schema、timeout、retention 与 ledger capacity。视觉游戏不属于运动 capability，因此不进入
 `list-skills`、`ValidateSkill` 或 `SkillCommand`。
 

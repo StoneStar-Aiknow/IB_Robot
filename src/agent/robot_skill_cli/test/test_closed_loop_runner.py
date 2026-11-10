@@ -56,10 +56,36 @@ def _install_runner(monkeypatch, terminals):
         validate_plan_service="validate_plan",
         confirm_plan_service="confirm_plan",
         execute_plan_action="execute_plan",
+        # bridge_kwargs reads the identity fields too; the runner pins
+        # robot_id="" itself so the wire shape stays unchanged.
+        robot_id="robot-under-test",
+        caller_scope="robot_skill_cli",
     )
     monkeypatch.setattr(closed_loop_runner, "load_runtime_context", lambda **_kwargs: (context, transport))
     monkeypatch.setattr(closed_loop_runner, "RosBridge", _Bridge)
     monkeypatch.setattr(closed_loop_runner, "InteractiveController", _Controller)
+    return transport
+
+
+def test_runner_builds_the_bridge_from_the_shared_transport_mapping(monkeypatch):
+    """The driver must not re-enumerate endpoint names by hand (drift risk)."""
+    _install_runner(monkeypatch, [{"state": "succeeded"}])
+    seen_kwargs = {}
+
+    class _RecordingBridge(_Bridge):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            seen_kwargs.update(kwargs)
+
+    monkeypatch.setattr(closed_loop_runner, "RosBridge", _RecordingBridge)
+
+    exit_code = closed_loop_runner.main(["--raw-command", "点头", "--skill", "nod_yes"])
+
+    assert exit_code == 0
+    assert seen_kwargs["status_service"] == "status"
+    assert seen_kwargs["skill_action"] == "skill"
+    assert seen_kwargs["robot_id"] == "", "the driver keeps the empty robot_id it has always sent"
+    assert seen_kwargs["caller_scope"] == "robot_skill_cli"
 
 
 def test_runner_suppresses_feedback_after_terminal(monkeypatch, capsys):

@@ -33,6 +33,7 @@ import argparse
 import threading
 from typing import Any
 
+from robot_client.connection import bridge_kwargs
 from robot_skill_cli.catalog import load_runtime_context
 from robot_skill_cli.interactive_control import (
     InteractiveControlError,
@@ -128,17 +129,12 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     context, transport = load_runtime_context(config_name=args.config_name, config_path=args.config_path)
-    bridge = RosBridge(
-        status_service=transport.status_service,
-        snapshot_service=transport.snapshot_service,
-        reload_service=transport.reload_service,
-        validate_skill_service=transport.validate_skill_service,
-        skill_action=transport.skill_action_name,
-        plan_service=transport.plan_service,
-        validate_plan_service=transport.validate_plan_service,
-        confirm_plan_service=transport.confirm_plan_service,
-        execute_plan_action=transport.execute_plan_action,
-    )
+    # The shared converter from robot_client maps the bound GatewayTransport
+    # onto the RosBridge endpoints (this driver used to enumerate a subset by
+    # hand, which drifted from every other consumer). robot_id is pinned empty
+    # so the wire shape this driver has always sent does not change.
+    endpoints = {**bridge_kwargs(transport), "robot_id": ""}
+    bridge = RosBridge(**endpoints)
     if not bridge.start():
         print(
             json_dumps(

@@ -16,8 +16,9 @@ Capabilities may include optional `display_name` (localized text, 1-120
 characters without control characters) and `tags` (up to eight unique lowercase
 identifiers, each at most 32 characters). These display fields are included in
 the capability snapshot and its digest; they never replace the stable skill
-`name` or alter execution bindings. A runtime provider may own display metadata
-and classification (`preset` is rendered as a separate badge).
+`name` or alter execution bindings. A motion provider owns display metadata and
+classification through its own catalog entry (`preset` is rendered as a separate
+badge); the compiler never invents them.
 The catalog compiler and clients do not maintain vendor-specific translations.
 Older manifests without these fields remain valid. Display labels are not
 physical validation or motion-authorization claims.

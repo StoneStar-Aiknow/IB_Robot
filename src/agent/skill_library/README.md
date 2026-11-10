@@ -72,6 +72,21 @@ authentication contract. `execution_caller_scopes` is injected by the
 scope. The token authenticates transport requests and is not included in the
 canonical Program digest or durable execution payload.
 
+The embodied launch builder automatically generates the `robot_skill_cli`
+operator scope. For that standard operator scope, the Gateway configures an
+empty token entry and ignores stale environment or configured operator tokens.
+The Web and CLI default connection uses the trusted ROS graph with this scope
+and an empty token. Other configured scopes retain their configured token
+policy. No launch key or secret environment file is generated.
+
+Connection discovery exposes the observed instance ID, boot ID, descriptor
+revision and endpoint map. The client re-probes and verifies that identity
+before constructing or replacing a transport. Duplicate instances, conflicting
+routes and stale identities fail closed. This verification routes requests; it
+does not authenticate an operator, plan, admit motion or write the execution
+ledger. Use a trusted ROS network or SROS2; a ROS domain ID is not a security
+boundary. Motion authorization remains explicit.
+
 The execution ledger defaults to the persistent user state path
 `~/.ros/ibrobot/executions.sqlite3`; deployments may override it with the
 `embodied.execution_store_path` configuration key. The override must point to

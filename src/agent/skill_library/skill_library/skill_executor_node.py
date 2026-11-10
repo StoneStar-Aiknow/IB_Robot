@@ -633,6 +633,14 @@ class SkillExecutorNode(Node):
         self.declare_parameter("cancel_execution_service", "/embodied/cancel_execution")
         self.declare_parameter("execution_event_topic", "/embodied/execution_events")
         self.declare_parameter("execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3"))
+        self.declare_parameter("agent_plan_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("plan_service", "/embodied/plan_agent_command")
+        self.declare_parameter("prepare_plan_service", "/embodied/prepare_agent_plan")
+        self.declare_parameter("validate_plan_service", "/embodied/validate_agent_plan")
+        self.declare_parameter("confirm_plan_service", "/embodied/confirm_agent_plan")
+        self.declare_parameter("execute_plan_action", "/embodied/execute_agent_plan")
+        self.declare_parameter("start_visual_game_service", "/embodied/start_visual_game")
+        self.declare_parameter("get_visual_game_result_service", "/embodied/get_visual_game_result")
         self.declare_parameter("execution_caller_scopes_json", '["robot_skill_cli"]')
         self.declare_parameter("execution_caller_tokens_json", "{}")
         raw_scopes = self.get_parameter("execution_caller_scopes_json").value
@@ -645,6 +653,10 @@ class SkillExecutorNode(Node):
         self._execution_caller_tokens = {
             str(scope).strip(): str(token) for scope, token in raw_tokens.items() if str(scope).strip() and str(token)
         }
+        # The local operator uses the trusted ROS graph, not a deployment key.
+        # An explicit empty entry also prevents stale shell tokens from enabling authentication.
+        if "robot_skill_cli" in self._execution_caller_scopes:
+            self._execution_caller_tokens["robot_skill_cli"] = ""
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value
@@ -791,6 +803,13 @@ class SkillExecutorNode(Node):
         )
         self._skill_registry_event_topic = (
             self.get_parameter("skill_registry_event_topic").get_parameter_value().string_value
+        )
+        self._get_execution_service = self.get_parameter("get_execution_service").get_parameter_value().string_value
+        self._get_execution_events_service = (
+            self.get_parameter("get_execution_events_service").get_parameter_value().string_value
+        )
+        self._cancel_execution_service = (
+            self.get_parameter("cancel_execution_service").get_parameter_value().string_value
         )
         self._skill_catalog_source_mode = (
             self.get_parameter("skill_catalog_source_mode").get_parameter_value().string_value.strip().lower()

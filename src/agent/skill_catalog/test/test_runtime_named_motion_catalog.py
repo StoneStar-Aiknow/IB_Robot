@@ -183,6 +183,25 @@ def test_display_metadata_changes_capability_digest_not_execution_binding(tmp_pa
     assert list(after.capability_view["handshake"]["tags"]) == ["preset"]
 
 
+def test_a_provider_label_alone_does_not_add_a_preset_tag(tmp_path):
+    """A display label stays presentation; classification is never inferred.
+
+    A motion provider declares its own ``display_name``; the compiler must not
+    read that label as a preset classification, so a manifest without ``tags``
+    keeps the label and exposes no tags at all.
+    """
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config/skills/handshake/manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["capability"]["display_name"] = "vendor_new_motion"
+    manifest_path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
+
+    snapshot = _compile(tmp_path)
+
+    assert snapshot.capability_view["handshake"]["display_name"] == "vendor_new_motion"
+    assert "tags" not in snapshot.capability_view["handshake"]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

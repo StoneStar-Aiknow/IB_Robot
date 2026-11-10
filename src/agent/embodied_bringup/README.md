@@ -38,6 +38,7 @@ direction 订阅同一音频采集 topic（provider 部署绑定 runtime `audio.
   `manipulation_execution/pick_executor_node`。
 - 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为
   ROS 参数传给业务节点。
+- 启动 Gateway 时保留 `robot_skill_cli` 标准操作员作用域；Gateway 将该作用域的令牌固定为空值。
 - 无 `runtime.provider` 的旧式配置里，当 `robot.grasp_execution.ik.worker_count>0` 时，包含
   `grasp_execution.ik.workers_launch` 指定的机器人套件 launch（如
   `$(find so101_motion)/launch/ik_workers.launch.py`），为 Hermes 启动与监督式抓取脚本相同的并行候选

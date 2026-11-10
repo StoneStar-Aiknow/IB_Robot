@@ -94,17 +94,39 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(prog="robot-skill", description="Inspect and execute IB-Robot capabilities.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     config_group = parser.add_mutually_exclusive_group()
-    config_group.add_argument("--config-name", help="robot_config name")
-    config_group.add_argument("--config-path", help="explicit robot_config YAML path")
+    config_group.add_argument("--config-name", help="robot_config name of the deployed robot (or use ROBOT_CONFIG)")
+    config_group.add_argument("--config-path", help="explicit robot_config YAML path of the deployed robot")
+    parser.add_argument("--offline", action="store_true", help="explicit local catalog inspection (development only)")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("list-skills", help="list enabled high-level skills")
+    for name in ("execution-status", "execution-events", "cancel-execution"):
+        execution_parser = subparsers.add_parser(name, help="access a Program execution without loading a catalog")
+        execution_parser.add_argument("--reference", required=True, help="saved execution reference JSON file")
+        if name == "execution-events":
+            execution_parser.add_argument("--after-sequence", type=int, default=0)
+    list_parser = subparsers.add_parser("list-skills", help="list enabled high-level skills")
     subparsers.add_parser("list-games", help="list enabled visual games")
     describe_game_parser = subparsers.add_parser("describe-game", help="describe one enabled visual game")
     describe_game_parser.add_argument("game")
     describe_parser = subparsers.add_parser("describe", help="describe one enabled skill")
     describe_parser.add_argument("skill")
     subparsers.add_parser("list-poses", help="list configured named poses")
-    subparsers.add_parser("status", help="query Capability Gateway status")
+    status_parser = subparsers.add_parser("status", help="query Capability Gateway status")
+    for output_parser in (list_parser, status_parser):
+        output_group = output_parser.add_mutually_exclusive_group()
+        output_group.add_argument(
+            "--json",
+            dest="output_format",
+            action="store_const",
+            const="json",
+            help="emit the unchanged JSON envelope for scripts",
+        )
+        output_group.add_argument(
+            "--human",
+            dest="output_format",
+            action="store_const",
+            const="human",
+            help="show a readable summary and table",
+        )
     validate_parser = subparsers.add_parser("validate", help="validate one skill without executing it")
     validate_parser.add_argument("skill")
     _add_skill_parameters(validate_parser)
@@ -204,27 +226,9 @@ def bridge_kwargs(transport) -> dict[str, Any]:
     ``robot-skill-daemon --config-path`` uses the same function to pre-open the
     bridge a later ``robot-skill`` call will ask for.
     """
-    return {
-        "status_service": transport.status_service,
-        "snapshot_service": transport.snapshot_service,
-        "reload_service": transport.reload_service,
-        "validate_skill_service": transport.validate_skill_service,
-        "skill_action": transport.skill_action_name,
-        "primitive_action": transport.primitive_action_name,
-        "validate_primitive_service": transport.validate_primitive_service,
-        "plan_service": transport.plan_service,
-        "validate_plan_service": transport.validate_plan_service,
-        "confirm_plan_service": transport.confirm_plan_service,
-        "execute_plan_action": transport.execute_plan_action,
-        "execute_program_action": transport.execute_program_action,
-        "get_execution_service": transport.get_execution_service,
-        "get_execution_events_service": transport.get_execution_events_service,
-        "cancel_execution_service": transport.cancel_execution_service,
-        "caller_scope": transport.caller_scope,
-        "robot_id": transport.robot_id,
-        "start_visual_game_service": transport.start_visual_game_service,
-        "get_visual_game_result_service": transport.get_visual_game_result_service,
-    }
+    from robot_client.connection import bridge_kwargs as client_bridge_kwargs
+
+    return client_bridge_kwargs(transport)
 
 
 def _create_bridge(transport):
@@ -233,10 +237,7 @@ def _create_bridge(transport):
     # in-process RosBridge whenever the daemon cannot be used.
     from robot_skill_cli.bridge_daemon import ResidentBridge
 
-    return ResidentBridge(
-        **bridge_kwargs(transport),
-        caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", ""),
-    )
+    return ResidentBridge(**bridge_kwargs(transport), caller_token="")
 
 
 def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
@@ -337,7 +338,7 @@ def _prepare_request(
     args: argparse.Namespace, context, bridge
 ) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]:
     from embodied_common.skill_request import canonical_skill_payload, skill_payload_hash
-    from robot_skill_cli.catalog import capability_view_from_snapshot, describe_skill
+    from robot_client.catalog import capability_view_from_snapshot, describe_skill
 
     status = bridge.get_status(
         task_id="",
@@ -1386,17 +1387,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = _build_parser()
     command = "unknown"
+    human_output = False
     try:
         args = parser.parse_args(argv)
         command = args.command
+        from robot_skill_cli.human_output import use_human_output
+
+        human_output = use_human_output(command, getattr(args, "output_format", None))
         if os.environ.get("IBROBOT_HERMES_MANAGED_REQUIRED") == "1" and command in {
             "execute-plan",
             "confirm-plan",
         }:
             raise _CliArgumentError("Hermes motion requires the managed run-workflow entry")
+        if args.offline and command not in {"list-skills", "describe", "list-poses", "list-games", "describe-game"}:
+            raise _CliArgumentError("--offline is only valid for local catalog inspection")
         from robot_skill_cli.catalog import (
+            TRANSPORT_ONLY_COMMANDS,
             load_catalog_context,
             load_runtime_context,
+            load_transport_context,
             load_visual_game_context,
             load_visual_game_runtime_context,
         )
@@ -1404,6 +1413,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command in {"list-games", "describe-game"}:
             context = load_visual_game_context(config_name=args.config_name, config_path=args.config_path)
             data = _run_catalog_command(args, context)
+            if args.offline:
+                data = {**data, "offline": True, "catalog_source": "local_development_not_connected"}
         elif command in {"start-game", "game-result"}:
             context, transport = load_visual_game_runtime_context(
                 config_name=args.config_name,
@@ -1413,8 +1424,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif command in {"list-skills", "describe", "list-poses"}:
             context = load_catalog_context(config_name=args.config_name, config_path=args.config_path)
             data = _run_catalog_command(args, context)
+            if args.offline:
+                data = {**data, "offline": True, "catalog_source": "local_development_not_connected"}
         else:
-            context, transport = load_runtime_context(config_name=args.config_name, config_path=args.config_path)
+            # The ledger and workflow commands read only the timeout policy:
+            # they skip the local catalog compile, so cancellation and status
+            # stay available when the local robot resources are not.
+            context_loader = load_transport_context if command in TRANSPORT_ONLY_COMMANDS else load_runtime_context
+            context, transport = context_loader(config_name=args.config_name, config_path=args.config_path)
             if command == "execute" and os.environ.get("IBROBOT_HERMES_MANAGED_REQUIRED") == "1":
                 capability = next((item for item in context.view["skills"] if item["name"] == args.skill), {})
                 if capability.get("moves_robot", True):
@@ -1422,25 +1439,39 @@ def main(argv: Sequence[str] | None = None) -> int:
             data = _run_runtime_command(args, context, transport)
     except _CommandError as exc:
         record_admission_error(exc.code, str(exc))
-        print(json_dumps(error_envelope(command, exc.code, str(exc))))
+        _print_query_envelope(error_envelope(command, exc.code, str(exc)), human_output)
         return exc.exit_code
     except (_CliArgumentError, FileNotFoundError, ValueError) as exc:
         record_admission_error(getattr(exc, "code", "INVALID_ARGUMENT"), str(exc))
-        print(json_dumps(error_envelope(command, getattr(exc, "code", "INVALID_ARGUMENT"), str(exc))))
+        _print_query_envelope(error_envelope(command, getattr(exc, "code", "INVALID_ARGUMENT"), str(exc)), human_output)
         return EXIT_INVALID_INPUT
     except Exception as exc:
+        from robot_client.errors import ClientError
         from robot_skill_cli.ros_bridge import BridgeError
 
+        if isinstance(exc, ClientError):
+            record_admission_error(exc.code, str(exc))
+            _print_query_envelope(error_envelope(command, exc.code, str(exc)), human_output)
+            return EXIT_ROS_UNAVAILABLE if exc.code == "ROS_UNAVAILABLE" else EXIT_GATEWAY_REJECTED
         if isinstance(exc, BridgeError):
             record_admission_error(exc.code, str(exc))
-            print(json_dumps(error_envelope(command, exc.code, str(exc))))
+            _print_query_envelope(error_envelope(command, exc.code, str(exc)), human_output)
             return exc.exit_code
         raise
 
     if isinstance(data, _CommandExit):
         return data.exit_code
-    print(json_dumps(success_envelope(command, data)))
+    _print_query_envelope(success_envelope(command, data), human_output)
     return EXIT_SUCCESS
+
+
+def _print_query_envelope(envelope, human_output):
+    if human_output:
+        from robot_skill_cli.human_output import render
+
+        print(render(envelope))
+    else:
+        print(json_dumps(envelope))
 
 
 if __name__ == "__main__":

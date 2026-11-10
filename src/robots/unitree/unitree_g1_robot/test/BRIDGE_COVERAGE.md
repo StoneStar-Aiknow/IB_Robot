@@ -147,3 +147,55 @@ This does not verify physical movement, FSM-802 action compatibility, physical
 stop/cancellation, or transport-failure handling through the full Gateway.
 Physical preset launch remains disabled. All test processes were stopped; the
 saved snapshot and registry identity describe this completed run only.
+
+## Lifecycle reliability increment — 2026-11-02 (g1-reliability-client)
+
+Batch `g1-reliability-client` (G1-11) added process-level lifecycle coverage
+and fixed what it found. The batch first ran on its own base (270 passed, zero
+skipped; robot_skill_cli 502 passed with 6 profile-availability skips, run
+`log/test_2026-11-02_15-21-11`); these are the results of the integrated tree,
+formal `colcon test` (venv `python3 -m colcon`, sequential, merge-install):
+
+- `unitree_g1_robot`: 255 tests, 0 errors, 0 failures, 0 skipped (the merged
+  base carries its own larger suite, so the count is not comparable with the
+  batch's).
+- `robot_skill_cli`: 510 tests, 0 errors, 0 failures, 8 skips — all
+  pre-existing profile-availability skips.
+
+New coverage and the fixes it pinned:
+
+- `test_runtime_process.py` (subprocess mock and subprocess runtime, the
+  launch composition; the domain is the workspace conftest's per-process one,
+  not a literal): repeated startup (ACTIVE → SIGTERM → exit 0, twice), a
+  refused vendor DDS binding at startup (exit 1 with the binding's guidance
+  naming the interface, no traceback, rclpy context released), and sustained
+  traffic (50 Hz vendor streams + six sequential preset executions, then a
+  bounded exit-0 SIGTERM).
+- `test_runtime_bridge.py` additions: a wiring failure after `initialize()`
+  closes the facade and still allows a fresh start in the same process, and
+  a dispatcher held past the client timeout refuses NEW commands within a
+  bound (nothing dispatched, no thread torn down, no fake completion).
+- Found and fixed by these tests: the SIGTERM `rclpy.shutdown()` races the
+  executor's wait-set rebuild and escaped `main()` as an uncaught `RCLError`
+  (traceback + nonzero exit) in BOTH the runtime and the vendor mock — the
+  mock's SIGTERM exit code had never been asserted before. Both `main()`s
+  now take the ordinary teardown path when the context is already down.
+  Teardown order in `runtime_node.main()` also changed to executor → SDK
+  channels → `destroy_node()` → `rclpy.shutdown()`, matching the harness
+  and the mock's `close_vendor_tier` ordering.
+
+Environment notes, recorded as such: formal runs must use the venv's
+`python3 -m colcon` (`/usr/bin/colcon` runs under the system python and
+cannot import the editable-installed vendor SDK, silently skipping these
+suites). Cross-batch interference is real and was observed on this host: the
+g1-experience batch's bridge suite also pins domain 148, and two batches
+running their mocks on 148 simultaneously answer each other's action servers
+("There may be more than one action server"), producing timing failures in
+both that pass on a quiet host — the 2026-11-02 15:21 formal run (270/0/0)
+was taken after the parallel agents' 148 usage ended. No hardware motion was
+issued; offline mock evidence only.
+
+Integration resolved the collision: the bridge, vendor-mock and process
+suites now read `vendor_test_domain()` (the workspace conftest's
+`IBROBOT_TEST_ROS_DOMAIN_ID`), so no suite carries a domain literal and two
+batches no longer meet on one vendor graph.

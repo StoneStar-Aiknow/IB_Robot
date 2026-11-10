@@ -342,6 +342,14 @@ def generate_embodied_nodes(
         "execution_store_path": embodied_config.get(
             "execution_store_path", str(Path.home() / ".ros" / "ibrobot" / "executions.sqlite3")
         ),
+        "agent_plan_enabled": entry_mode == "agent",
+        "plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+        "prepare_plan_service": embodied_config.get("prepare_plan_service", "/embodied/prepare_agent_plan"),
+        "validate_plan_service": embodied_config.get("validate_plan_service", "/embodied/validate_agent_plan"),
+        "confirm_plan_service": embodied_config.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
+        "execute_plan_action": embodied_config.get("execute_plan_action", "/embodied/execute_agent_plan"),
+        "start_visual_game_service": start_visual_game_service,
+        "get_visual_game_result_service": get_visual_game_result_service,
     }
     if runtime_motion:
         common_params.update(

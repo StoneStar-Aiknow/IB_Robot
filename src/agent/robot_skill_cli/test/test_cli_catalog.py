@@ -1336,6 +1336,93 @@ def test_status_command_uses_hardware_discovery_timeout_floor(monkeypatch, capsy
     assert bridge.status_timeouts == [30.0]
 
 
+@pytest.fixture
+def _no_local_catalog(monkeypatch):
+    """Fail the test if a legacy command compiles the local skill catalog."""
+    from robot_skill_cli import catalog
+
+    monkeypatch.setattr(
+        catalog,
+        "compile_local_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("a transport-only command compiled the local skill catalog"),
+    )
+
+
+def test_transport_context_matches_the_full_context_without_compiling(monkeypatch):
+    from robot_skill_cli import catalog
+    from robot_skill_cli.catalog import load_runtime_context, load_transport_context
+
+    full_context, full_transport = load_runtime_context(config_path=CONFIG_PATH)
+
+    monkeypatch.setattr(
+        catalog,
+        "compile_local_snapshot",
+        lambda *_args, **_kwargs: pytest.fail("the transport-only loader compiled the local skill catalog"),
+    )
+    light_context, light_transport = load_transport_context(config_path=CONFIG_PATH)
+
+    assert light_context.view["timeout_policy"] == full_context.view["timeout_policy"]
+    assert light_context.view["robot_name"] == full_context.view["robot_name"]
+    assert light_transport == full_transport
+    assert "skills" not in light_context.view, "the light context must not carry a compiled catalog"
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_call"),
+    [
+        (["status"], "status"),
+        (["reload-catalog", "--request-id", "reload-1"], "reload"),
+        (["cancel", "--task-id", "task-1"], "already_terminal"),
+        (["validate-plan", "--plan-token", "plan-1"], "validate_plan"),
+    ],
+)
+def test_ledger_commands_do_not_compile_the_local_catalog(
+    arguments, expected_call, monkeypatch, capsys, _no_local_catalog
+):
+    """status/cancel/reload/plan commands must survive a missing local catalog.
+
+    These handlers read only the timeout policy, so the compatibility path
+    must not gate them on compiling the local skill catalog — cancellation in
+    particular must stay available when local robot resources are broken.
+    """
+
+    class _PlanBridge(_FakeBridge):
+        def __init__(self):
+            status = _ready_status("legacy-digest")
+            status["request_state"] = "terminal"
+            super().__init__(status)
+            self.plan_validations = []
+            # A pre-set snapshot keeps the fake's lazy snapshot builder (which
+            # compiles a local catalog) out of these commands entirely.
+            self._snapshot = SimpleNamespace(
+                registry_digest="registry-1",
+                capability_digest="capability-1",
+                provenance_digest="provenance-1",
+                snapshot_json="{}",
+            )
+
+        def validate_agent_plan(self, **kwargs):
+            self.plan_validations.append(kwargs)
+            return {"success": True, "plan_id": "plan-1", "error_code": "", "message": "validated"}
+
+    from robot_skill_cli import cli
+
+    bridge = _PlanBridge()
+    monkeypatch.setattr(cli, "_create_bridge", lambda _transport: bridge)
+
+    assert cli.main(["--config-path", str(CONFIG_PATH), *arguments]) == 0
+
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    if expected_call == "status":
+        assert bridge.calls == ["start", "status", "close"]
+    elif expected_call == "reload":
+        assert bridge.reload_requests and bridge.reload_requests[0]["request_id"] == "reload-1"
+    elif expected_call == "already_terminal":
+        assert bridge.calls == ["start", "status", "close"]
+    else:
+        assert bridge.plan_validations and bridge.plan_validations[0]["plan_token"] == "plan-1"
+
+
 def test_reload_catalog_command_uses_bound_gateway_source(monkeypatch, capsys):
     from robot_skill_cli import cli
 

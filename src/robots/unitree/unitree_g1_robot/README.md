@@ -1,5 +1,8 @@
 # unitree_g1_robot — Unitree G1 runtime
 
+Operator runbook: [宇树 G1 启动与操作命令](../../../../docs/unitree_g1_operation_commands.md)
+archives the supervised Gateway/Web startup, Gateway discovery, CLI use, and timeout boundaries.
+
 ## Preset-only development and supervised validation
 
 `g1_29dof_arm_presets` is a separate surface for the operator-selected action
@@ -413,9 +416,23 @@ expects them to stay there.
 
 - **Process signals do not stop the robot.** SIGINT/SIGTERM exit the spin
   loop without running the stop sequence — no zero velocity, no weight ramp
-  — and the rclpy teardown occasionally prints an `RCLError` while executor
-  threads are still inside callbacks. The process still exits; the message is
-  noise, not a failed stop. `/runtime/stop` is the supported stop.
+  — and `/runtime/stop` is the supported stop. The signal path exits
+  cleanly and bounded after a successful teardown (exit code 0; when the
+  signal's `rclpy.shutdown()` races the executor's wait-set rebuild the
+  resulting `RCLError` is logged as one line instead of a traceback — the
+  process-level tests pin this). A supervisor restart is not a substitute
+  for the stop service.
+- **A failed teardown exits 3, not 0.** The signal path waits at most 2 s
+  for callbacks already executing. If that wait expires, the SDK close
+  raises, or `destroy_node` raises, the runtime leaves the remaining
+  resources open (a failed close does not destroy the node; its handlers may
+  still be reached by the SDK reader threads), prints one diagnostic naming
+  the failed step, and exits with status 3 instead of reporting a completed
+  cleanup. A supervisor must treat 3 as a failed teardown and restart the
+  process; the process exit is the isolation boundary, not a physical stop.
+  If the vendor library holds the GIL (Issue #207), even that bounded exit
+  cannot run, so run the runtime under a supervisor that escalates to SIGKILL
+  after its own timeout. The vendor mock follows the same contract in tests.
 - **A quiet `/cmd_vel` is not zeroed explicitly.** When the Twist stream stops
   the bridge stops re-issuing, but the last `SetVelocity` keeps its effect for
   its own duration, so the base may keep moving for up to `command_duration_s`

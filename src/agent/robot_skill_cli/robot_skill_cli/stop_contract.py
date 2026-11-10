@@ -1,4 +1,8 @@
-"""ROS-free stop vocabulary shared with the installed Hermes adapter."""
+"""ROS-free stop vocabulary shared with the installed Hermes adapter.
+
+This module is intentionally self-contained in its installed Hermes copy. Do
+not import robot_client here: Hermes plugins run without the IB-Robot packages.
+"""
 
 try:
     from .control_phrases import STOP_PHRASES as _STOP_PHRASES

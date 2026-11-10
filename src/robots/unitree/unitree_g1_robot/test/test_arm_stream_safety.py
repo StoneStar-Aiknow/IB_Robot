@@ -83,6 +83,9 @@ def bridge():
     node._arm_sdk_kd = 1.5
     node._mode_pr = 1
     node._mode_machine_expected = 5
+    # rpc_call bounds its dispatcher wait by the profile's call timeout, so a
+    # partial node needs the value the real constructor reads from the profile.
+    node._rpc_timeout_s = 5.0
     node._velocity_inflight = False
     node._locomotion_requested = False
     node._startup_fault = None
@@ -304,6 +307,7 @@ def test_rpc_call_bounds_a_single_call_with_its_own_timeout():
     node = object.__new__(UnitreeG1RuntimeNode)
     node._rpc = {"loco": loco}
     node._rpc_dispatchers = {"loco": threading.Lock()}
+    node._rpc_timeout_s = 5.0
 
     result = node.rpc_call("loco", "get_fsm_id", None, timeout_s=0.5)
 
