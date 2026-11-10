@@ -443,6 +443,8 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
             "max_moved_replans": 1,
             "home_tolerance_rad": 0.02,
             "release_after_success": True,
+            "prefetch_perception": True,
+            "prefetch_max_age_s": 6.0,
         },
     }
     assert validate_grasp_execution_config(valid) == []
@@ -464,6 +466,8 @@ def test_grasp_execution_config_names_a_backend_and_its_pipeline_settings() -> N
         (lambda c: c["pipeline"].update(home_tolerance_rad=0.0), "home_tolerance_rad"),
         (lambda c: c["pipeline"].update(retries=3), "retries"),
         (lambda c: c["pipeline"].update(release_after_success="yes"), "release_after_success"),
+        (lambda c: c["pipeline"].update(prefetch_perception="yes"), "prefetch_perception"),
+        (lambda c: c["pipeline"].update(prefetch_max_age_s=0), "prefetch_max_age_s"),
     ):
         config = {**valid, "pipeline": dict(valid["pipeline"])}
         mutate(config)

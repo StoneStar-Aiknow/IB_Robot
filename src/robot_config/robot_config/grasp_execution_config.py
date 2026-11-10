@@ -91,6 +91,10 @@ _SCHEMA: dict[str, Any] = {
         "release_after_success": _bool(),
         # Run the plan's PRESHAPE while planning (manipulation_execution PipelineConfig).
         "prefetch_preshape": _bool(),
+        # Perceive the pick's target (and a following place's container) while the
+        # task-pose preparation runs; the Gateway starts it (manipulation_execution PipelineConfig).
+        "prefetch_perception": _bool(),
+        "prefetch_max_age_s": _POSITIVE,
     },
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),

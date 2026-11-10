@@ -37,6 +37,16 @@ class ContainerProposer:
     def __init__(self, services, *, models=None, settings=PerceptionSettings()):
         self.services, self.models, self.settings = services, models, settings
 
+    def from_mask(self, observation, mask, query, held, *, deadline, cancelled):
+        """The container of an already detected ``mask`` (a prefetched one), as :meth:`propose` builds it."""
+        if cancelled() or time.monotonic() >= deadline:
+            raise GraspFailure("CANCELED" if cancelled() else "SKILL_TIMEOUT", "container estimation interrupted")
+        mask = np.asarray(mask, bool)
+        if self.models is None:
+            return DetectedContainer(mask, query)
+        settings = replace(self.settings, scene=replace(self.settings.scene, arm_side=held.arm_side))
+        return estimate_container(observation, mask, held, self.models[held.arm_side], settings)
+
     def propose(self, observation, query, held, *, deadline, cancelled):
         failure = GraspFailure("CONTAINER_NOT_FOUND", "no container mask was detected", retryable=True)
         for mask in detect_masks(self.services, observation, query, cancelled=cancelled, settings=self.settings):

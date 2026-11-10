@@ -36,7 +36,13 @@ from .contracts import (
     Proposals,
 )
 from .outcome_message import failure_action
+from .prefetch import PerceptionPrefetch
 from .sequence import GraspSequence, PhaseCallback
+
+
+def _same(value):
+    """The already prefetched result of an observe or perceive step."""
+    return value
 
 
 class PickMode(enum.Enum):
@@ -65,9 +71,16 @@ class PipelineConfig:
     #: (1.8-2.9 s), supervised as in the sequence. Its outcome is recorded as the plan's
     #: first PRESHAPE step; a failed or unfinished one is run there again.
     prefetch_preshape: bool = False
+    #: Accept a capture and its proposals started before the goal (``prefetch_perception``
+    #: below, while the task-pose preparation runs): the first attempt uses them for the same
+    #: target when they are at most ``prefetch_max_age_s`` old and the robot's posture
+    #: (``GraspBackends.posture``) has not changed since. Retries always observe again. The
+    #: age is short because the planner's budget (10 s on the X2) counts from the capture.
+    prefetch_perception: bool = False
+    prefetch_max_age_s: float = 4.0
 
     def __post_init__(self):
-        for name in ("release_after_success", "prefetch_preshape"):
+        for name in ("release_after_success", "prefetch_preshape", "prefetch_perception"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         for name in ("max_attempts", "max_moved_replans", "max_regrasps"):
@@ -77,6 +90,9 @@ class PipelineConfig:
         reserve = self.execute_reserve_s
         if isinstance(reserve, bool) or not isinstance(reserve, int | float) or not 0 <= reserve < float("inf"):
             raise ValueError("execute_reserve_s must be a finite non-negative number of seconds")
+        age = self.prefetch_max_age_s
+        if isinstance(age, bool) or not isinstance(age, int | float) or not 0 < age < float("inf"):
+            raise ValueError("prefetch_max_age_s must be a finite positive number of seconds")
 
 
 @dataclass
@@ -115,6 +131,23 @@ class GraspPipeline:
         self._backends = backends
         self._config = config
         self._clock = clock
+        self._prefetch = (
+            PerceptionPrefetch(
+                capture=backends.observation.capture,
+                propose=backends.proposer.propose,
+                posture=backends.posture,
+                detect_container=backends.container_detector,
+                max_age_s=config.prefetch_max_age_s,
+                clock=clock,
+            )
+            if config.prefetch_perception and backends.posture is not None
+            else None
+        )
+
+    @property
+    def prefetch(self) -> PerceptionPrefetch | None:
+        """Started by the pick node's prefetch request; None when not configured or not offered."""
+        return self._prefetch
 
     @property
     def config(self) -> PipelineConfig:
@@ -224,15 +257,26 @@ class GraspPipeline:
                 budget = {"deadline": deadline, "cancelled": stop}
                 steps: dict[str, float] = {}
                 try:
-                    observation = self._step("observe", phase, steps, backends.observation.capture, **budget)
-                    outcome.report["observe"] = dict(observation.report)
-                    self._check_budget(cancelled, deadline)
-                    if mode is PickMode.OBSERVE_ONLY:
-                        outcome.success = True
-                        return outcome
-                    proposals = self._step(
-                        "perceive", phase, steps, backends.proposer.propose, observation, query, **budget
-                    )
+                    taken = None
+                    if self._prefetch is not None and outcome.attempts == 1 and mode is not PickMode.OBSERVE_ONLY:
+                        taken, outcome.report["perception_prefetch"] = self._prefetch.take(
+                            query, deadline=deadline, cancelled=stop
+                        )
+                    if taken is not None:
+                        # Started before the goal: recorded as this attempt's observe and perceive.
+                        observation = self._step("observe", phase, steps, _same, taken.observation)
+                        outcome.report["observe"] = dict(observation.report)
+                        proposals = self._step("perceive", phase, steps, _same, taken.proposals)
+                    else:
+                        observation = self._step("observe", phase, steps, backends.observation.capture, **budget)
+                        outcome.report["observe"] = dict(observation.report)
+                        self._check_budget(cancelled, deadline)
+                        if mode is PickMode.OBSERVE_ONLY:
+                            outcome.success = True
+                            return outcome
+                        proposals = self._step(
+                            "perceive", phase, steps, backends.proposer.propose, observation, query, **budget
+                        )
                     self._check_budget(cancelled, deadline)
                     preshape = self._prefetch_preshape(stop) if mode is PickMode.EXECUTE else None
                     try:

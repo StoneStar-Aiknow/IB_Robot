@@ -10,7 +10,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -203,6 +203,7 @@ class AgentService:
         pose_preview: PosePreviewPort | None = None,
         pose_skills: frozenset[str] = frozenset({"free_pose"}),
         pose_memory: PoseMemoryPort | None = None,
+        workflow_planned: Callable[[tuple], None] | None = None,
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -233,6 +234,9 @@ class AgentService:
         # Remembered poses: a confirmed one is recalled without planning, and the
         # user's save intent is interpreted by the existing planner.
         self._pose_memory = pose_memory
+        # Told the steps of a workflow as soon as they are validated, before the
+        # Gateway is asked; only for work that never moves the robot (pick_prefetch).
+        self._workflow_planned = workflow_planned
         self._pose_memory_identity = PlannerIdentity(
             route="pose_memory",
             returned_model="none",
@@ -618,6 +622,7 @@ class AgentService:
             self._validate_workflow(outcome, catalog)
             outcome = self._bind_step_schema_versions(outcome, catalog)
             outcome = self._bind_summary_to_catalog_names(outcome, catalog, pose_skills=self._pose_skills)
+            self._notify_workflow_planned(request.request_id, outcome.steps)
             if not self._preview_pose(key, record.planning_generation, request, outcome):
                 return
             if cancel_token.is_set():
@@ -998,6 +1003,14 @@ class AgentService:
         remaining = len(values) - len(visible)
         suffix = f"，另有 {remaining} 项。" if remaining else "。"
         return f"{prefix}：{'、'.join(visible)}{suffix}"
+
+    def _notify_workflow_planned(self, request_id: str, steps) -> None:
+        if self._workflow_planned is None:
+            return
+        try:
+            self._workflow_planned(tuple(steps))
+        except Exception:  # noqa: BLE001 - an optimisation only; the plan goes on
+            _LOGGER.exception("workflow_planned hook failed for %s", request_id)
 
     @staticmethod
     def _bind_catalog_targets(outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> PlannerOutcome:

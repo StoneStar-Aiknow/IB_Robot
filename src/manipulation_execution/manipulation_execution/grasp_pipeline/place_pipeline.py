@@ -10,6 +10,7 @@ from embodied_common.execution_detail import ExecutionDetail, place_execution_de
 
 from .contracts import GraspFailure
 from .place_sequence import PlaceSequence
+from .prefetch import container_change
 
 
 @dataclass
@@ -52,7 +53,10 @@ class PlacePipeline:
             raise ValueError("verify_placement must be a boolean")
         self.verify_placement = verify_placement
 
-    def run(self, held, query, *, deadline, cancelled, on_phase=lambda *_: None):
+    def run(self, held, query, *, deadline, cancelled, on_phase=lambda *_: None, prefetched=None):
+        """``prefetched`` (prefetch.PrefetchedContainer): the container the pick detected on its capture.
+        The first attempt uses its mask when the place's capture shows the same camera and an
+        unchanged container region (prefetch.container_change); otherwise it detects as always."""
         result, starts = PlaceOutcome(), {}
         execution_started = False
         planning_deadline = deadline - self.execute_reserve_s
@@ -160,14 +164,32 @@ class PlacePipeline:
                     )
                     result.report["observe"] = dict(observation.report)
                     require_handover()
-                    container = call(
-                        "perceive_container",
-                        backends.proposer.propose,
-                        observation,
-                        query,
-                        held,
-                        operation_deadline=planning_deadline,
-                    )
+                    reuse = None
+                    if prefetched is not None and attempt == 0:
+                        reason, measures = container_change(prefetched, observation, query)
+                        if reason or getattr(backends.proposer, "from_mask", None) is None:
+                            reason = reason or "the container proposer cannot take a mask"
+                        result.report["container_prefetch"] = {"used": not reason, "reason": reason, **measures}
+                        reuse = None if reason else prefetched.mask
+                    if reuse is not None:
+                        container = call(
+                            "perceive_container",
+                            backends.proposer.from_mask,
+                            observation,
+                            reuse,
+                            query,
+                            held,
+                            operation_deadline=planning_deadline,
+                        )
+                    else:
+                        container = call(
+                            "perceive_container",
+                            backends.proposer.propose,
+                            observation,
+                            query,
+                            held,
+                            operation_deadline=planning_deadline,
+                        )
                     require_handover()
                     plan = call(
                         "plan_place",

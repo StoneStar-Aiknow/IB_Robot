@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from skill_library.carry_handover import retains_for_place
+from skill_library.carry_handover import place_container_after, retains_for_place
 
 
 def step(skill, target="a red apple", container="the green bowl"):
@@ -26,6 +26,13 @@ def test_same_target_place_retains_the_pick():
 )
 def test_other_sequences_preserve_the_standalone_pick_policy(steps):
     assert not retains_for_place(steps, 0)
+
+
+def test_only_a_retained_pick_names_its_places_container():
+    assert place_container_after([step("pick_object"), step("place_in_container")], 0) == "the green bowl"
+    assert place_container_after([step("pick_object")], 0) == ""
+    assert place_container_after([step("pick_object"), step("place_in_container", "a lemon")], 0) == ""
+    assert place_container_after([step("pick_object"), step("wave"), step("place_in_container")], 0) == ""
 
 
 @pytest.mark.parametrize("version", [1, 2])

@@ -188,6 +188,8 @@ robot:
       execute_reserve_s: 50.0
       # Open the hand while the Orin plans (~0.6 s off every pick).
       prefetch_preshape: true
+      # Perceive during the task-pose preparation, the place's container on the same capture.
+      prefetch_perception: true
 
   placement_execution:
     enabled: true

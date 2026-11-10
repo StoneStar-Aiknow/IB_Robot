@@ -28,7 +28,7 @@ class HeldObjectClient:
         )
         self.claim_client = node.create_client(ClaimHeldObject, CLAIM, callback_group=self.group)
         self.return_client = node.create_client(ReturnHeldObject, RETURN, callback_group=self.group)
-        self.token, self.held = "", None
+        self.token, self.held, self.container = "", None, None
 
     def _receive(self, message):
         self.latest = message
@@ -61,6 +61,15 @@ class HeldObjectClient:
         )
         response = self._call(self.claim_client, request, deadline, cancelled)
         self.token, self.held = response.claim_token, held_from_msg(response.held_object)
+        self.container = None
+        message = getattr(response, "container", None)
+        if message is not None and message.query:
+            from .grasp_pipeline.prefetch import container_from_msg, decode_mask
+
+            try:
+                self.container = container_from_msg(message, decode_mask=decode_mask)
+            except Exception:  # noqa: BLE001 - the place detects the container itself
+                self.container = None
         return self.held
 
     def returned(self, outcome, reason=""):

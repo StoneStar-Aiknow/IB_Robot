@@ -100,6 +100,7 @@ from ibrobot_msgs.srv import (
     GetSkillSnapshot,
     MoveToConfiguration,
     PlayAudioFile,
+    PrefetchGrasp,
     ReloadSkillCatalog,
     SetPerceptionPaused,
     SetRuntimeMode,
@@ -114,7 +115,12 @@ from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
-from skill_library.carry_handover import HELD_CUSTODY_STATES, motion_stop_is_unknown, retains_for_place
+from skill_library.carry_handover import (
+    HELD_CUSTODY_STATES,
+    motion_stop_is_unknown,
+    place_container_after,
+    retains_for_place,
+)
 from skill_library.execution_store import (
     ExecutionBusyError,
     ExecutionConflictError,
@@ -1163,6 +1169,15 @@ class SkillExecutorNode(Node):
             self._pick_action_name,
             callback_group=MutuallyExclusiveCallbackGroup(),
             feedback_sub_qos_profile=QoSProfile(depth=256),
+        )
+        # Only a pipeline configured to take a prefetched capture is asked for one.
+        pipeline_options = self._grasp_execution.get("pipeline") or {}
+        self._pick_prefetch_client = (
+            self.create_client(
+                PrefetchGrasp, f"{self._pick_action_name.rstrip('/')}/prefetch", callback_group=callback_group
+            )
+            if isinstance(pipeline_options, dict) and pipeline_options.get("prefetch_perception") is True
+            else None
         )
         self._place_client = ActionClient(self, PlaceObject, self._place_action_name, callback_group=callback_group)
         self._imitate_human_motion_client = ActionClient(
@@ -2722,6 +2737,34 @@ class SkillExecutorNode(Node):
         goal_handle.succeed()
         return result
 
+    def _request_pick_prefetch(self, goal) -> None:
+        """Ask the pick executor to start perceiving during the preparation; the goal never waits for this.
+
+        The target (and, for a pick the plan follows with a place, its container)
+        comes from the admitted workflow. A prefetch that is not started, refused
+        or cannot be used only means the goal observes as it always did.
+        """
+        client = getattr(self, "_pick_prefetch_client", None)
+        if client is None or not client.service_is_ready():
+            return
+        try:
+            workflow = getattr(self, "_active_workflow", None)
+            placement = getattr(self, "_placement_execution", {})
+            container = (
+                place_container_after(workflow.workflow_steps, int(goal.dispatch_binding.workflow_step_index))
+                if placement.get("backend") and workflow is not None
+                else ""
+            )
+            client.call_async(
+                PrefetchGrasp.Request(
+                    dispatch_binding=copy_binding(goal.dispatch_binding),
+                    target_query=goal.target_name,
+                    container_query=container,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - only an optimisation
+            self.get_logger().warning(f"pick prefetch not requested: {type(exc).__name__}: {exc}")
+
     def _execute_prepared_pick_skill(self, goal_handle, template, *, effective_timeout_sec=None):
         """A declared preparation phase within the admitted pick, never nested admission.
 
@@ -2744,6 +2787,7 @@ class SkillExecutorNode(Node):
         ready, reason = self._ensure_skill_capabilities(RETURN_TASK_POSE)
         if not ready:
             return self._abort_skill(SkillCommand.Result(), goal_handle, [], "CAPABILITY_MISSING", reason)
+        self._request_pick_prefetch(goal_handle.request)
         child = _DeferredTerminalGoalHandle(goal_handle)
         feedback = SkillCommand.Feedback()
         feedback.state, feedback.detail = "preparing", f"task_pose:{name}"

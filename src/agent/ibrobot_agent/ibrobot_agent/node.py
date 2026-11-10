@@ -48,6 +48,7 @@ from ibrobot_agent.contracts import (
 )
 from ibrobot_agent.conversation_store import SQLiteConversationStore
 from ibrobot_agent.deployment_lock import DeploymentLock
+from ibrobot_agent.pick_prefetch import RosPickPrefetch
 from ibrobot_agent.planner import PlannerAdapter, RulePlanner, build_planner_messages
 from ibrobot_agent.presentation import PresentationGate
 from ibrobot_agent.request_store import SQLiteRequestStore
@@ -957,6 +958,8 @@ class IncubationAgentNode(Node):
         self.declare_parameter("gateway_caller_scope", "agent_incubation:local_operator")
         self.declare_parameter("gateway_caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR")
         self.declare_parameter("gateway_caller_token", "")
+        # The pick executor's PrefetchGrasp service ('' = off): perception starts at plan time.
+        self.declare_parameter("pick_prefetch_service", "")
         # ibrobot_msgs/srv/ComposeArmPose; empty: arm poses are composed only when they run.
         self.declare_parameter("pose_compose_service", "")
         self.declare_parameter("pose_compose_timeout_sec", 90.0)
@@ -1062,6 +1065,8 @@ class IncubationAgentNode(Node):
             if pose_service
             else None
         )
+        prefetch_service = str(self.get_parameter("pick_prefetch_service").value).strip()
+        self._pick_prefetch = RosPickPrefetch(self, prefetch_service) if prefetch_service else None
         self._service = AgentService(
             planner=active_planner,
             catalog=catalog,
@@ -1087,6 +1092,7 @@ class IncubationAgentNode(Node):
             pose_memory=self._pose_preview
             if self._pose_preview is not None and self._pose_preview.has_pose_services
             else None,
+            workflow_planned=self._pick_prefetch,
         )
         self._request_subscription = self.create_subscription(
             String,

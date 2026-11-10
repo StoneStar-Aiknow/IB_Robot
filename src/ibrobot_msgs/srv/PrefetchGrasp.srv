@@ -1,0 +1,10 @@
+# Start a pick's capture and perception before its PickObject goal (while the
+# task-pose preparation runs). Fire and forget: the goal uses the result only for
+# the same target, when the robot has not moved since the capture; otherwise it
+# observes again. container_query, when set, also detects the place's container.
+DispatchBinding dispatch_binding
+string target_query
+string container_query
+---
+bool accepted
+string reason

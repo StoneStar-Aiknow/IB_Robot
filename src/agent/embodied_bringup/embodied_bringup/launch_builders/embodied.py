@@ -57,6 +57,12 @@ def delegated_grasp_execution(robot_config: dict[str, Any]) -> dict[str, Any]:
                 "duration_sec": motion.get("place_duration_sec", 5.0),
                 "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
             }
+        perception = placement_execution.get("perception")
+        pipeline = grasp_execution.get("pipeline")
+        if isinstance(perception, dict) and isinstance(pipeline, dict) and pipeline.get("prefetch_perception") is True:
+            # A prefetching pick detects the place's container as the place would.
+            grasp_execution = dict(grasp_execution)
+            grasp_execution["container_perception"] = dict(perception)
     return grasp_execution
 
 
@@ -128,6 +134,18 @@ def apply_planner_base_url(robot_config: dict[str, Any], planner_base_url: str) 
     if not isinstance(planner, dict):
         return
     planner["base_url"] = url
+
+
+def _pick_prefetch_service(robot_config: dict) -> str:
+    """The pick executor's PrefetchGrasp service when its pipeline prefetches perception, else ''."""
+    if not runs_grasp_pipeline(robot_config):
+        return ""
+    grasp_execution = robot_config["grasp_execution"]
+    pipeline = grasp_execution.get("pipeline")
+    if not isinstance(pipeline, dict) or pipeline.get("prefetch_perception") is not True:
+        return ""
+    # manipulation_execution.grasp_pipeline_node.prefetch_service_name, beside the pick action.
+    return f"{str(grasp_execution.get('action_name', '/manipulation/execute_pick')).rstrip('/')}/prefetch"
 
 
 def _pose_memory_agent_params(robot_config: dict, common_params: dict) -> dict:
@@ -731,6 +749,8 @@ def generate_embodied_nodes(
                             "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
                         ),
                         "gateway_caller_token": agent_config.get("caller_token", ""),
+                        # Perceive the pick's target as soon as the plan names it (PrefetchGrasp).
+                        "pick_prefetch_service": _pick_prefetch_service(robot_config),
                         # Compose arm poses while the plan is prepared, so the presented pose is the one run.
                         "pose_compose_service": POSE_COMPOSER.COMPOSE_SERVICE
                         if common_params.get("pose_composer_enabled")
