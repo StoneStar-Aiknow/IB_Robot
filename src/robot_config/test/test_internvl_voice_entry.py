@@ -89,20 +89,35 @@ class TestTheBlock:
         """The defaults stand in for a bad item, so they must be what is deployed.
 
         Except asr: feat/x2-retarget-tune deploys "session", the mode that stopped the
-        STANDBY/MIRRORING stalls on the robot.
+        STANDBY/MIRRORING stalls on the robot. And zll (11-10) turned the key actions on,
+        with the v2 table that has their lines.
         """
-        assert contract.normalize(config["internvl_voice"])[0] == replace(contract.Settings(), asr="session")
+        settings = contract.normalize(config["internvl_voice"])[0]
+        defaults = contract.Settings()
+        look = replace(defaults.look, key_actions=replace(defaults.look.key_actions, enabled=True))
+
+        assert settings == replace(
+            defaults,
+            asr="session",
+            clips_table="$(find robot_config)/config/mirror_voice/x2_clips_v2.yaml",
+            clip_dir="assets/audio/x2_mirror_clips_v2",
+            look=look,
+        )
 
     def test_its_table_is_the_installed_one(self, config):
         """``$(find robot_config)`` against the source tree, laid out as the share dir is."""
+        shipped = str(PACKAGE / "config" / "mirror_voice" / "x2_clips_v2.yaml")
         default = str(PACKAGE / "config" / "mirror_voice" / "x2_clips_v1.yaml")
 
         bundle = contract.build_bundle(config["internvl_voice"], "/root/tree", default, lambda package: str(PACKAGE))
 
         assert bundle.warnings == ()
-        assert bundle.settings.clips_table == default
-        assert len(bundle.table.clips) == 61
-        assert bundle.clip_dirs == ("/root/tree/assets/audio/x2_mirror_clips_v1",)
+        assert bundle.settings.clips_table == shipped
+        assert len(bundle.table.clips) == 64
+        assert bundle.clip_dirs == (
+            "/root/tree/assets/audio/x2_mirror_clips_v2",
+            "/root/tree/assets/audio/x2_mirror_clips_v1",
+        )
 
 
 class TestNothingElseChanges:

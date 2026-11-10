@@ -1,4 +1,4 @@
-"""The X2 mirror clip table: 61 prerecorded lines, text only, installed with robot_config.
+"""The X2 mirror clip tables: v1 (61 lines) and v2 (v1 plus 3 for open arms), text only.
 
 The WAVs are recordings of these exact texts, so the table is generated from
 the release's clips.tsv and never edited by hand. What the mirror relies on is
@@ -20,7 +20,8 @@ from embodied_common import internvl_voice_contract as contract
 from robot_config.loader import _load_robot_section
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
-TABLE = CONFIG_DIR / "mirror_voice" / "x2_clips_v1.yaml"
+# version -> (wav suffix, lines); v2 is the one the entry ships.
+TABLES = {1: ("_v1.wav", 61), 2: ("_v2.wav", 64)}
 HOTWORDS = CONFIG_DIR / "hotwords" / "x2_commands.txt"
 ENTRY = CONFIG_DIR / "robots" / "aimdk_x2_voice_mirror_all.yaml"
 # src/robot_config/test/ -> src/
@@ -56,9 +57,13 @@ ALLOWED_TRIGGER_LINES = {
 ASR_MODES_DEAF_DURING_PLAYBACK = ("mute", "off", "session")
 
 
-@pytest.fixture(scope="module")
-def parsed():
-    return contract.parse_clip_table(yaml.safe_load(TABLE.read_text(encoding="utf-8")))
+def _path(version: int) -> Path:
+    return CONFIG_DIR / "mirror_voice" / f"x2_clips_v{version}.yaml"
+
+
+@pytest.fixture(scope="module", params=sorted(TABLES), ids=lambda version: f"v{version}")
+def parsed(request):
+    return contract.parse_clip_table(yaml.safe_load(_path(request.param).read_text(encoding="utf-8")))
 
 
 @pytest.fixture(scope="module")
@@ -89,18 +94,33 @@ ROBOT = _load_robot_section(ENTRY)[1]
 TRIGGERS = _triggers()
 
 
+def _read(version: int):
+    return contract.parse_clip_table(yaml.safe_load(_path(version).read_text(encoding="utf-8")))[0]
+
+
+# v2 holds every v1 line with the same text (checked below), so checking v2's lines checks both.
+SHIPPED = _read(max(TABLES))
+
+
 def _spoken_unprompted():
     """Ids of the lines the mirror says by itself: look lines and standby words."""
-    table, _ = contract.parse_clip_table(yaml.safe_load(TABLE.read_text(encoding="utf-8")))
-    return [clip_id for clip_id in table.clips if not table.pool_of(clip_id).startswith("evt.")]
+    return [clip_id for clip_id in SHIPPED.clips if not SHIPPED.pool_of(clip_id).startswith("evt.")]
 
 
 def test_it_parses_without_a_warning(parsed):
     assert parsed[1] == []
 
 
-def test_it_is_version_1_of_61_lines(table):
-    assert (table.version, table.wav_suffix, len(table.clips)) == (1, "_v1.wav", 61)
+def test_its_version_suffix_and_size(table):
+    assert (table.wav_suffix, len(table.clips)) == TABLES[table.version]
+
+
+def test_v2_is_v1_plus_the_open_arms_lines():
+    """The 61 v1 lines are the same recordings under v2's names, so their text must not move."""
+    v1, v2 = _read(1), _read(2)
+
+    assert {k: v for k, v in v2.clips.items() if k in v1.clips} == dict(v1.clips)
+    assert sorted(set(v2.clips) - set(v1.clips)) == ["big_open_02", "big_open_03", "big_open_04"]
 
 
 @pytest.mark.parametrize("pool", contract.REQUIRED_POOLS)
@@ -126,8 +146,8 @@ def test_the_triggers_were_found():
 
 
 @pytest.mark.parametrize("clip_id", _spoken_unprompted())
-def test_no_unprompted_line_contains_a_command(table, clip_id):
-    text = table.clips[clip_id]
+def test_no_unprompted_line_contains_a_command(clip_id):
+    text = SHIPPED.clips[clip_id]
     hits = {phrase: source for phrase, source in TRIGGERS.items() if phrase in text}
     allowed = ALLOWED_TRIGGER_LINES.get(clip_id, set())
 

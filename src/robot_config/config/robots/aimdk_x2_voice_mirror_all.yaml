@@ -418,8 +418,8 @@ robot:
   # Deployment: src/robot_config/config/mirror_voice/README.md
   internvl_voice:
     enabled: true
-    clips_table: $(find robot_config)/config/mirror_voice/x2_clips_v1.yaml
-    clip_dir: assets/audio/x2_mirror_clips_v1   # relative to $WORKSPACE
+    clips_table: $(find robot_config)/config/mirror_voice/x2_clips_v2.yaml
+    clip_dir: assets/audio/x2_mirror_clips_v2   # relative to $WORKSPACE
     # feat/x2-retarget-tune: ASR stopped through STANDBY and MIRRORING (was mute).
     # Suspected: the ASR resuming after a clip stalls the board mid-mirroring. WAIT
     # still listens, so voice can start mirroring; it cannot stop it.
@@ -449,7 +449,7 @@ robot:
       latest_start_sec: 2.0
       dump_dir: ""
       key_actions:               # a choice question every look; a confident key action is answered at once
-        enabled: false           # false = the look above, unchanged
+        enabled: true            # zll 11-10: on with thumb, wave, open; false = the look above, unchanged
         frames: 1                # 1 = newest frame; 4 = spread over the last 0.75 s
         calibrate: none          # none | blank = divide by the scores on a grey picture
         smooth: 3                # average each action's score over this many looks
