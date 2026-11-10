@@ -1,0 +1,5 @@
+{
+  "model_type": "graspgenx",
+  "gripper_name": "local_mock_omnihand",
+  "gripper_assets_dir": "assets"
+}

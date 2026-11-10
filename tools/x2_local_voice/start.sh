@@ -55,6 +55,8 @@ CONFIG="$ROBOTS/aimdk_x2_summit_local_voice.yaml"
 "$HERE/rig_env.sh" python3 "$HERE/make_config.py" --models "$MODELS" --state "$AGENT" --out "$CONFIG" \
     --catalog-out "$PROFILES/aimdk_x2_summit_local_voice.yaml" "${OPTIONS[@]}" || exit 1
 
+# A failed startup must not leave another microphone reader behind.
+trap '"$HERE/stop.sh" >/dev/null 2>&1' EXIT
 setsid "$HERE/rig_env.sh" ros2 launch embodied_bringup embodied_pipeline.launch.py \
     config_path:="$CONFIG" control_mode:=moveit_planning with_moveit:=false use_sim:=true authorize_motion:=true \
     > "$LOGS/pipeline_$STAMP.log" 2>&1 < /dev/null &
@@ -67,9 +69,22 @@ ln -sfn "$LOGS/audio_hal_$STAMP.log" "$LOGS/audio_hal_latest.log"
 
 echo "starting (${OPTIONS[*]:-defaults}); logs: $LOGS"
 for _ in $(seq 1 180); do
-    grep -q "ASR deployment loaded" "$LOGS/pipeline_$STAMP.log" 2>/dev/null && break
+    if grep -qE "process has died|Runtime interface binding failed" "$LOGS/pipeline_$STAMP.log" 2>/dev/null; then
+        echo "pipeline startup failed; see $LOGS/pipeline_$STAMP.log" >&2
+        exit 1
+    fi
+    if grep -q "ASR deployment loaded" "$LOGS/pipeline_$STAMP.log" 2>/dev/null && \
+        grep -q "voice bridge ready:" "$LOGS/pipeline_$STAMP.log" 2>/dev/null && \
+        grep -q "pose executor ready" "$LOGS/pipeline_$STAMP.log" 2>/dev/null && \
+        grep -q "local audio HAL ready:" "$LOGS/audio_hal_$STAMP.log" 2>/dev/null; then
+        break
+    fi
     if ! pgrep -g "$(cat "$RUN/pipeline.pgid")" >/dev/null; then
         echo "pipeline exited; see $LOGS/pipeline_$STAMP.log" >&2
+        exit 1
+    fi
+    if ! pgrep -g "$(cat "$RUN/audio.pgid")" >/dev/null; then
+        echo "audio HAL exited; see $LOGS/audio_hal_$STAMP.log" >&2
         exit 1
     fi
     sleep 1
@@ -78,10 +93,14 @@ if grep -q "process has died" "$LOGS/pipeline_$STAMP.log"; then
     echo "a node died during startup; see $LOGS/pipeline_$STAMP.log" >&2
     exit 1
 fi
-if grep -q "ASR deployment loaded" "$LOGS/pipeline_$STAMP.log"; then
+if grep -q "ASR deployment loaded" "$LOGS/pipeline_$STAMP.log" && \
+    grep -q "voice bridge ready:" "$LOGS/pipeline_$STAMP.log" && \
+    grep -q "pose executor ready" "$LOGS/pipeline_$STAMP.log" && \
+    grep -q "local audio HAL ready:" "$LOGS/audio_hal_$STAMP.log"; then
     echo "ready. Say \"欧拉欧拉\" and a request into the microphone."
 else
-    echo "ASR not loaded after 180 s; see $LOGS/pipeline_$STAMP.log" >&2
+    echo "ASR, voice bridge, pose executor or audio HAL not ready after 180 s; see $LOGS" >&2
     exit 1
 fi
+trap - EXIT
 echo "watch: $HERE/watch.sh    type instead of speaking: $HERE/say.sh \"欧拉欧拉，自我介绍\"    stop: $HERE/stop.sh"

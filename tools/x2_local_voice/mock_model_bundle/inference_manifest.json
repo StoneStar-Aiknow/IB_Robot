@@ -3,15 +3,21 @@
     "digest": {
       "algorithm": "sha256",
       "scope": "structure",
-      "value": "16340a34a8fc51aae92a3fdbdf04eeefcccd338f087ab8b64d7bb2bde8c40dcc"
+      "value": "476f7fabc23b015d0cd0de651f0d1ea8a0ca9bfc2e515a0b15e30ab62f3fb991"
     },
     "files": [
       {
         "path": "payload.json"
+      },
+      {
+        "path": "assets/adapter.json"
+      },
+      {
+        "path": "assets/x_grippers/local_mock_omnihand/config.json"
       }
     ],
     "name": "typed-physical-mock-not-a-production-model",
-    "revision": 1,
+    "revision": 2,
     "uuid": "123e4567-e89b-42d3-a456-426614174000"
   },
   "deployments": {

@@ -1,0 +1,45 @@
+{
+  "links": [
+    "R_palm",
+    "R_thumb_roll",
+    "R_thumb_abad",
+    "R_thumb_mcp",
+    "R_thumb_pip",
+    "R_thumb_dip",
+    "R_index_abad",
+    "R_index_pip",
+    "R_index_dip",
+    "R_middle_pip",
+    "R_middle_dip",
+    "R_ring_abad",
+    "R_ring_pip",
+    "R_ring_dip",
+    "R_pinky_abad",
+    "R_pinky_pip",
+    "R_pinky_dip"
+  ],
+  "open": {
+    "R_thumb_roll_joint": 0.129,
+    "R_thumb_abad_joint": -1.54,
+    "R_thumb_mcp_joint": 0.255,
+    "R_index_abad_joint": 0,
+    "R_index_pip_joint": 0,
+    "R_middle_pip_joint": 0,
+    "R_ring_abad_joint": 0,
+    "R_ring_pip_joint": 0,
+    "R_pinky_abad_joint": 0,
+    "R_pinky_pip_joint": 0
+  },
+  "close": {
+    "R_thumb_roll_joint": 0.43,
+    "R_thumb_abad_joint": -1.4,
+    "R_thumb_mcp_joint": 0.85,
+    "R_index_abad_joint": 0.0,
+    "R_index_pip_joint": 1.48,
+    "R_middle_pip_joint": 1.48,
+    "R_ring_abad_joint": 0.0,
+    "R_ring_pip_joint": 1.48,
+    "R_pinky_abad_joint": 0.0,
+    "R_pinky_pip_joint": 1.48
+  }
+}
