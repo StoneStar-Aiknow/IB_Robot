@@ -26,7 +26,7 @@ ROUND = ("session-1", "local_operator", "voice_asr", "aimdk_x2_summit")
 
 
 def _rules(**overrides):
-    config = {"once_per_round": True, "lines": LINES, "repeat_skills": {"answer_price": "answer_body_price"}}
+    config = {"lines": LINES, "repeat_skills": {"answer_price": "answer_body_price"}}
     config.update(overrides)
     return AnswerRules(config, container_name="an orange bowl", rng=lambda options: "an apple")
 
@@ -58,18 +58,11 @@ def test_wanting_both_games_is_not_two_fruits(text):
     assert _rules().before_planning(ROUND, text, replying=False) is None
 
 
-def test_a_second_pick_after_a_delivery_is_answered_and_a_new_round_may_pick():
-    rules = _rules()
-    rules.delivered(ROUND)
-    assert rules.after_planning(ROUND, "再给我拿个苹果", PICK, replying=False).user_message == LINES["already_given"]
-    other = ("session-2", *ROUND[1:])
-    assert rules.after_planning(other, "我要一个苹果", PICK, replying=False) is PICK
-
-
-def test_a_failed_delivery_does_not_count():
+def test_answer_rules_leave_gift_eligibility_to_agent_state():
     rules = _rules()
     assert rules.after_planning(ROUND, "我要一个苹果", PICK, replying=False) is PICK
-    assert not rules.has_delivered(ROUND)
+    rules.proposed(ROUND, PICK)
+    assert rules.after_planning(ROUND, "再给我拿个苹果", PICK, replying=False) is PICK
 
 
 # ---- 1.4 an ability question is asked back; a polite request is not -----------------------------
@@ -344,10 +337,12 @@ def test_a_no_to_the_hand_over_drops_the_held_pick():
     assert rules.before_planning(ROUND, "好的", replying=True) is None
 
 
-def test_a_hand_over_after_a_delivery_is_the_already_given_answer():
+def test_hand_over_confirmation_does_not_store_gift_eligibility():
     rules = _delivery_rules()
-    rules.delivered(ROUND)
-    assert rules.before_planning(ROUND, "把苹果扔给我", replying=False).user_message == LINES["already_given"]
+    first = rules.before_planning(ROUND, "把苹果扔给我", replying=False)
+    second = rules.before_planning(ROUND, "把苹果扔给我", replying=False)
+    assert first.kind == second.kind == "needs_clarification"
+    assert first.user_message == second.user_message == DELIVERY
 
 
 def test_a_planned_hand_over_is_held_too_and_why_questions_are_planned():

@@ -37,6 +37,9 @@ def test_local_catalog_and_config_keep_fixed_pose_skills(tmp_path):
     assert config["pose_composer"]["enabled"] and config["pose_composer"]["mode"] == "fixed"
     assert config["pose_composer"]["blocked_task_poses"] == []
     assert config["embodied"]["agent"]["planner"]["return_after_place"] == "grasp_ready"
+    assert config["embodied"]["agent"]["gift_state"]["enabled"] is True
+    assert config["embodied"]["agent"]["gift_state"]["path"] == str(tmp_path / "gift_state.sqlite3")
+    assert "once_per_round" not in config["embodied"]["agent"]["planner"]["answer_rules"]
 
 
 def test_speech_enhancements_reach_the_bridge_from_robot_config():
@@ -52,3 +55,27 @@ def test_speech_enhancements_reach_the_bridge_from_robot_config():
     assert values["pending_sentence_sec"] == 10.0
     assert values["gift_release_is_delivery"] is True
     assert json.loads(values["speech_clips_json"])
+    assert values["gift_reset_on_wake"] is True
+
+
+def test_mock_executor_can_start_another_goal_after_hand_over(monkeypatch):
+    import numpy as np
+
+    spec = importlib.util.spec_from_file_location(
+        "local_voice_mock", ROOT / "tools/x2_local_voice/mock_manipulation.py"
+    )
+    mock = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mock)
+    monkeypatch.setattr(mock, "FRAME_S", 0.0)
+    executor = mock._SlowExecutor()
+    executor.position = np.array([0.6, 0.3, 0.2])
+    executor.finish()
+    from manipulation_execution.grasp_pipeline.contracts import ArmSegment, MotionState, SegmentKind
+
+    target = np.array([0.2, 0.1, 0.3])
+    segment = ArmSegment(
+        "next_approach", SegmentKind.TARGET, mock.JOINTS, np.stack([executor.measured(mock.JOINTS), target])
+    )
+    outcome = executor.execute(segment, carrying=False, halted=lambda: False, cancelled=lambda: False)
+    assert outcome.state is MotionState.SUCCEEDED
+    assert np.allclose(executor.measured(mock.JOINTS), target)

@@ -76,6 +76,8 @@ def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> d
     # Ledgers of this rig only; start.sh empties them, so a quarantine lasts one run.
     embodied["execution_store_path"] = str(state / "executions.sqlite3")
     agent = embodied["agent"]
+    if (agent.get("gift_state") or {}).get("enabled") is True:
+        agent["gift_state"]["path"] = str(state.parent / "gift_state.sqlite3")
     agent["ledger_path"] = str(state / "requests.sqlite3")
     agent["conversation_path"] = str(state / "conversation.sqlite3")
     agent["deployment_lock_path"] = str(state / "agent.lock")

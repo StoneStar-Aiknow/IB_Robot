@@ -47,6 +47,8 @@ robot:
         motions: [wave, raise_hand, blow_kiss, clap]
     skill_catalog_profile: aimdk_x2_summit
     agent:
+      gift_state:
+        enabled: true
       test_allowlist:
       - wave_hand
       - raise_hand
@@ -121,7 +123,7 @@ robot:
         - 代码仓库：扫旁边的二维码。
         - 机器人基于 openEuler 开发（openEuler Embedded），openEuler 是基于 Linux 的发行版；芯片是昇腾 310P。
         - 照镜子：通过头部摄像头识别人体姿态，实时跟随手臂动作，只学手臂，学不了腿；体验中会自动留图，结束后自己选。
-        - 礼物：柠檬、苹果、橙子三选一，礼物藏在水果里；每轮只能领一份，重复要不重复给；水果放进碗里，顺着滑道滑到领取盒，由参观者自己拿；不能扔，不能递到手里；没确认送到之前先别取。
+        - 礼物：柠檬、苹果、橙子三选一，礼物藏在水果里；每次有效唤醒欧拉欧拉开始新领取轮次，每轮送一份，重新唤醒可以再领；水果放进碗里，顺着滑道滑到领取盒，由参观者自己拿；不能扔，不能递到手里；没确认送到之前先别取。
         - 现场的水果是道具，不能吃。
         - 机器人主要说中文。
         - 安全：不做不会伤害人这类保证，请按现场提示互动。
@@ -135,9 +137,8 @@ robot:
           fruit_name: 要柠檬、苹果还是橙子呀？
           confirm_pick: 可以呀，现在就给你拿吗？
           recommend: 每个都有礼物哦，要我帮你挑吗？
-        # One gift per round (a voice session, until the staff's "下一位"); see answer_rules.py.
+        # Wording rules only; Agent gift_state owns eligibility and wake resets.
         answer_rules:
-          once_per_round: true
           # Explicit safety replies; synthesize until matching recordings are installed.
           contact_replies:
           - 出于安全考虑，我暂时不支持这类肢体接触哦。
@@ -149,7 +150,7 @@ robot:
           unsupported_skill: decline_unsupported
           lines:
             only_one: 嘿嘿，这轮只能选一份哦～
-            already_given: 这轮已经领过啦，下次再来哦～
+            already_given: 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。
             confirm_pick: 可以呀，现在就给你拿吗？
             recommend: 每个都有礼物哦，要我帮你挑吗？
             random_pick: 每个都有礼物，我帮你挑一个！

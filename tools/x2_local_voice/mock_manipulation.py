@@ -65,10 +65,8 @@ class _SlowExecutor(Executor):
 
     def finish(self):
         # Custody handed the arm to placement, which ends with the arm back home.
-        self.handed_over = True
-
-    def measured(self, joint_names):
-        return HOME.copy() if getattr(self, "handed_over", False) else super().measured(joint_names)
+        # Keep the executor's next segment start consistent with its measured pose.
+        self.position = HOME.copy()
 
 
 class _SlowEffector(Effector):

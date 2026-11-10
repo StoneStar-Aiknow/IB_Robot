@@ -12,6 +12,7 @@ import copy
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -48,6 +49,7 @@ from ibrobot_agent.contracts import (
 )
 from ibrobot_agent.conversation_store import SQLiteConversationStore
 from ibrobot_agent.deployment_lock import DeploymentLock
+from ibrobot_agent.gift_state import GiftStateError, SQLiteGiftStateStore
 from ibrobot_agent.pick_prefetch import RosPickPrefetch
 from ibrobot_agent.planner import PlannerAdapter, RulePlanner, build_planner_messages
 from ibrobot_agent.presentation import PresentationGate
@@ -929,6 +931,8 @@ class IncubationAgentNode(Node):
         self.declare_parameter("control_topic", "/agent/control")
         self.declare_parameter("ledger_path", "")
         self.declare_parameter("conversation_path", "")
+        self.declare_parameter("gift_state_enabled", False)
+        self.declare_parameter("gift_state_path", "")
         self.declare_parameter("deployment_lock_path", "")
         self.declare_parameter("execution_enabled", False)
         self.declare_parameter("max_session_turns", 12)
@@ -1089,6 +1093,12 @@ class IncubationAgentNode(Node):
                 "return_after_place"
             ),
             answer_rules=json.loads(str(self.get_parameter("planner_config_json").value)).get("answer_rules"),
+            gift_state=SQLiteGiftStateStore(
+                str(self.get_parameter("gift_state_path").value).strip()
+                or Path(ledger_path).with_name("gift_state.sqlite3")
+            )
+            if self.get_parameter("gift_state_enabled").value
+            else None,
             pose_preview=self._pose_preview,
             pose_memory=self._pose_preview
             if self._pose_preview is not None and self._pose_preview.has_pose_services
@@ -1139,6 +1149,7 @@ class IncubationAgentNode(Node):
                 received_at=datetime.now(timezone.utc),
                 reply_to_request_id=payload.get("reply_to_request_id"),
                 admission=payload.get("admission"),
+                gift_wake_id=payload.get("gift_wake_id"),
             )
             with trace_scope(request.request_id), trace_stage(_trace, "agent.admit", request_id=request.request_id):
                 response = self._service.send_message(request)
@@ -1157,10 +1168,33 @@ class IncubationAgentNode(Node):
             self.get_logger().error(f"invalid Agent request: {exc}")
 
     def _control_callback(self, message: String) -> None:
+        payload = {}
         try:
             payload = json.loads(message.data)
-            if not isinstance(payload, dict) or payload.get("operation") not in {"stop", "presentation_rendered"}:
-                raise ValueError("control request must be stop or presentation_rendered")
+            if not isinstance(payload, dict):
+                raise ValueError("control request must be an object")
+            if payload.get("operation") in {"get_gift_state", "reset_gift_round"}:
+                scope = (
+                    str(self.get_parameter("robot_scope").value),
+                    str(self.get_parameter("channel_id").value),
+                    str(self.get_parameter("principal_id").value),
+                )
+                state = (
+                    self._service.get_gift_state(scope)
+                    if payload["operation"] == "get_gift_state"
+                    else self._service.reset_gift_round(scope, payload["wake_id"])
+                )
+                self._publish_response(
+                    {
+                        "operation": payload["operation"],
+                        "wake_id": payload.get("wake_id"),
+                        "accepted": True,
+                        "gift_state": state,
+                    }
+                )
+                return
+            if payload.get("operation") not in {"stop", "presentation_rendered"}:
+                raise ValueError("unsupported Agent control operation")
             key = RequestKey(
                 robot_scope=str(self.get_parameter("robot_scope").value),
                 channel_id=str(self.get_parameter("channel_id").value),
@@ -1195,11 +1229,21 @@ class IncubationAgentNode(Node):
                     "message": receipt.message,
                 }
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError, GiftStateError, sqlite3.Error) as exc:
+            current_gift = None
+            if isinstance(payload, dict) and payload.get("operation") == "reset_gift_round":
+                with contextlib.suppress(Exception):
+                    current_gift = self._service.get_gift_state(scope)
             self._publish_response(
                 {
+                    "operation": payload.get("operation") if isinstance(payload, dict) else None,
+                    "wake_id": payload.get("wake_id") if isinstance(payload, dict) else None,
+                    "accepted": False,
+                    "gift_state": current_gift,
                     "requested": False,
-                    "reason_code": "REQUEST_SCHEMA_INVALID",
+                    "reason_code": "STORAGE_UNAVAILABLE"
+                    if isinstance(exc, sqlite3.Error)
+                    else getattr(exc, "code", "REQUEST_SCHEMA_INVALID"),
                     "message": str(exc),
                 }
             )

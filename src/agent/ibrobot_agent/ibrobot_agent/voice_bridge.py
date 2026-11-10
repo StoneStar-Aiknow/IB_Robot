@@ -166,6 +166,7 @@ class VoiceBridgeConfig:
     confirm_timeout_sec: float = 20.0
     session_idle_sec: float = 120.0
     persistent_session: bool = False
+    gift_reset_on_wake: bool = False
     mirror_session_enabled: bool = False
     min_text_chars: int = 2
     request_timeout_sec: float = 180.0
@@ -252,7 +253,7 @@ class VoiceBridgeConfig:
 
     def __post_init__(self) -> None:
         GraspSpeechPolicy(self.speech_mode, json.loads(self.speech_messages_json))
-        for name in ("persistent_session", "mirror_session_enabled"):
+        for name in ("persistent_session", "mirror_session_enabled", "gift_reset_on_wake"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if not str(self.robot_scope).strip():
@@ -539,6 +540,10 @@ class VoiceBridgeCore:
     ) -> None:
         self.config = config
         self._state = _BridgeState()
+        self._gift_wake_id = ""
+        self._gift_local_wakes: OrderedDict[str, None] = OrderedDict()
+        self._gift_revision = -1
+        self._gift_wake_segments: OrderedDict[Segment, str] = OrderedDict()
         self._feedback = FeedbackTracker()
         self._mirror_speech_policy = MirrorSpeechPolicy()
         self._speech_policy = GraspSpeechPolicy(config.speech_mode, json.loads(config.speech_messages_json))
@@ -907,9 +912,12 @@ class VoiceBridgeCore:
             # Once the stop has finished the request, this sentence would otherwise reach the
             # Agent as a new command and occupy the channel ("帮我停一下" -> busy for "继续").
             return [*corrected, Log(f"final transcript {raw!r} of a stop already sent from its partial")]
+        previous_wake = self._gift_wake_id
         actions = self._route_transcript(
             raw, normalized, now, heard_at, segment, session_opened=session_opened, cancels_held=cancels_held
         )
+        if self._gift_wake_id != previous_wake:
+            actions = [PublishControl({"operation": "reset_gift_round", "wake_id": self._gift_wake_id}), *actions]
         return corrected + actions if actions else corrected
 
     def _split_speakers(
@@ -1232,6 +1240,29 @@ class VoiceBridgeCore:
         # phrase, and a woken sentence must keep the gate's wake-prefix exemption.
         if verdict is not None:
             raw, normalized = verdict.raw, verdict.normalized
+        if (
+            self.config.gift_reset_on_wake
+            and verdict is not None
+            and (verdict.explicit_wake or session_opened)
+            and not state.active_request_id
+            and state.pending is None
+            and self._mirror_idle(now)
+        ):
+            wake_id = self._gift_wake_segments.get(segment) if segment is not None else None
+            if wake_id is None:
+                wake_id = "wake-" + uuid.uuid4().hex
+                if segment is not None:
+                    self._gift_wake_segments[segment] = wake_id
+                    while len(self._gift_wake_segments) > _REMEMBERED_REQUEST_IDS:
+                        self._gift_wake_segments.popitem(last=False)
+            self._gift_wake_id = wake_id
+            self._gift_local_wakes[wake_id] = None
+            while len(self._gift_local_wakes) > _REMEMBERED_REQUEST_IDS:
+                self._gift_local_wakes.popitem(last=False)
+            if not normalized:
+                return [
+                    *(self._say(self._lines["wake_ack"]) if self._lines.get("wake_ack") else []),
+                ]
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
@@ -1341,6 +1372,8 @@ class VoiceBridgeCore:
             "session_id": state.session_id,
             "text": raw,
         }
+        if self.config.gift_reset_on_wake and self._gift_wake_id:
+            payload["gift_wake_id"] = self._gift_wake_id
         if state.clarification_request_id:
             payload["reply_to_request_id"] = state.clarification_request_id
             state.clarification_request_id = ""
@@ -1368,6 +1401,41 @@ class VoiceBridgeCore:
 
     def on_response(self, payload: dict[str, Any], now: float) -> list[Action]:
         if self.config.feedback_only:
+            return []
+        if payload.get("operation") == "reset_gift_round":
+            wake_id = payload.get("wake_id")
+            if payload.get("accepted") is not True and wake_id == self._gift_wake_id:
+                state = payload.get("gift_state")
+                if (
+                    isinstance(state, dict)
+                    and isinstance(state.get("round_id"), str)
+                    and all(
+                        state.get(name) == getattr(self.config, name)
+                        for name in ("robot_scope", "channel_id", "principal_id")
+                    )
+                ):
+                    self._gift_wake_id = state["round_id"]
+                return [
+                    Log("gift round reset rejected: " + str(payload.get("reason_code", "unknown"))),
+                    *self._say("当前任务状态还没确认，暂时不能开始新一轮。"),
+                ]
+            state = payload.get("gift_state")
+            if (
+                payload.get("accepted") is True
+                and isinstance(state, dict)
+                and all(
+                    state.get(name) == getattr(self.config, name)
+                    for name in ("robot_scope", "channel_id", "principal_id")
+                )
+                and isinstance(wake_id, str)
+                and state.get("round_id") == wake_id
+                and type(state.get("revision")) is int
+                and state["revision"] >= self._gift_revision
+                and (wake_id == self._gift_wake_id or wake_id not in self._gift_local_wakes)
+            ):
+                self._gift_wake_id = wake_id
+                self._gift_revision = state["revision"]
+                return [Log("gift round reset: " + wake_id)]
             return []
         request_id = str(payload.get("request_id", ""))
         if request_id not in self._state.known_request_ids:
@@ -2179,6 +2247,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         confirm_timeout_sec=float(values["confirm_timeout_sec"]),
         session_idle_sec=float(values["session_idle_sec"]),
         persistent_session=bool(values["persistent_session"]),
+        gift_reset_on_wake=bool(values["gift_reset_on_wake"]),
         mirror_session_enabled=bool(values["mirror_session_enabled"]),
         min_text_chars=int(values["min_text_chars"]),
         request_timeout_sec=float(values["request_timeout_sec"]),

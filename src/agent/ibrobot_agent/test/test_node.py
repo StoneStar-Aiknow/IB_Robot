@@ -1148,9 +1148,7 @@ def test_node_applies_deployment_gift_rules_before_planning(tmp_path):
             Parameter("robot_scope", value="mock_x2"),
             Parameter(
                 "planner_config_json",
-                value=json.dumps(
-                    {"mode": "rule", "answer_rules": {"once_per_round": True, "lines": {"only_one": line}}}
-                ),
+                value=json.dumps({"mode": "rule", "answer_rules": {"lines": {"only_one": line}}}),
             ),
         ],
     )
@@ -1170,5 +1168,42 @@ def test_node_applies_deployment_gift_rules_before_planning(tmp_path):
         assert record.state == "ANSWERED"
         assert record.terminal.message == line
     finally:
+        node.destroy_node()
+        context.shutdown()
+
+
+def test_node_exposes_agent_gift_state_read_and_reset_interfaces(tmp_path):
+    context = Context()
+    rclpy.init(context=context)
+    node = IncubationAgentNode(
+        catalog_port=FakeCatalog(),
+        context=context,
+        parameter_overrides=[
+            Parameter("ledger_path", value=str(tmp_path / "requests.sqlite3")),
+            Parameter("conversation_path", value=str(tmp_path / "conversation.sqlite3")),
+            Parameter("deployment_lock_path", value=str(tmp_path / "agent.lock")),
+            Parameter("gift_state_enabled", value=True),
+            Parameter("gift_state_path", value=str(tmp_path / "gift.sqlite3")),
+            Parameter("robot_scope", value="mock_x2"),
+            Parameter("planner_config_json", value='{"mode":"rule"}'),
+        ],
+    )
+    responses = []
+    node._publish_response = responses.append
+    try:
+        for payload in [
+            {"operation": "reset_gift_round", "wake_id": "wake-1"},
+            {"operation": "get_gift_state"},
+            {"operation": "reset_gift_round", "wake_id": "wake-2"},
+        ]:
+            node._control_callback(String(data=json.dumps(payload)))
+            assert responses[-1]["accepted"] is True
+        assert responses[0]["gift_state"]["round_id"] == responses[1]["gift_state"]["round_id"] == "wake-1"
+        assert responses[2]["gift_state"]["round_id"] == "wake-2"
+        assert responses[2]["gift_state"]["robot_scope"] == "mock_x2"
+        node._control_callback(String(data='{"operation":"reset_gift_round","wake_id":{}}'))
+        assert responses[-1]["accepted"] is False
+    finally:
+        node.close()
         node.destroy_node()
         context.shutdown()

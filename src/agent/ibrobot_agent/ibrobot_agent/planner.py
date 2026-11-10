@@ -532,6 +532,18 @@ def build_planner_messages(
             "and arm_side, and container_name copied verbatim from deployment.fruit_delivery. "
             "Never confuse a container color with a fruit target. If it is missing, do not pick a gift. "
         )
+    if isinstance(context.get("gift_state"), Mapping):
+        system += (
+            " conversation.gift_state is the Agent's authoritative CURRENT gift round, independent of chat history. "
+            "Its status overrides earlier messages about gift eligibility: available means a gift can be requested "
+            "in this round, even if an earlier round delivered one or an earlier answer refused another. "
+            "For an explicit request for one supported fruit, including '再给我一个苹果', plan the normal delivery "
+            "when status is available; do not repeat an earlier already-given answer. When status is delivered, "
+            "copy conversation.gift_state.already_given_message verbatim as user_message for a repeat gift request. "
+            "That recorded reply is exempt from the short-answer length limit; never shorten or paraphrase it. "
+            "For in_progress or uncertain, do not "
+            "propose another pick. Never claim to reset state yourself or invent delivery results. "
+        )
     deployment: dict[str, Any] = {"fruit_delivery": dict(fruit_delivery or {})}
     if deployment_facts:
         deployment["facts"] = list(deployment_facts)

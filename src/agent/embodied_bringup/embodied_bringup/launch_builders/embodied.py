@@ -728,6 +728,10 @@ def generate_embodied_nodes(
                         "principal_id": agent_config.get("principal_id", "local_operator"),
                         "ledger_path": agent_config.get("ledger_path", ""),
                         "conversation_path": agent_config.get("conversation_path", ""),
+                        "gift_state_enabled": (agent_config.get("gift_state") or {}).get("enabled") is True,
+                        "gift_state_path": str(resolve_ros_path(agent_config["gift_state"]["path"]))
+                        if (agent_config.get("gift_state") or {}).get("path")
+                        else "",
                         "deployment_lock_path": agent_config.get("deployment_lock_path", ""),
                         "execution_enabled": agent_config.get("execution_enabled", False),
                         "max_session_turns": agent_config.get("max_session_turns", 12),
@@ -1029,6 +1033,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "response_topic": agent_config.get("response_topic", "/agent/response"),
         "event_topic": agent_config.get("event_topic", "/agent/event"),
         "control_topic": agent_config.get("control_topic", "/agent/control"),
+        "gift_reset_on_wake": (agent_config.get("gift_state") or {}).get("enabled") is True,
         "channel_id": agent_config.get("channel_id", "agent_incubation"),
         "principal_id": agent_config.get("principal_id", "local_operator"),
         "robot_scope": str(robot_config.get("name", "unknown")),

@@ -558,3 +558,43 @@ typed Program 路径不产生 `presentation_rendered`。
 这可避免短唤醒残留成为无效锚点。
 
 这是 ASR 文本触发，不是专用 KWS；短首句无锚点和缺失测量的 fail-open 边界保持不变。
+
+### Agent 领取状态与唤醒轮次
+
+展会配置启用 `embodied.agent.gift_state.enabled`。Agent 将领取状态保存到 SQLite。
+`gift_state.path` 可指定路径；未指定时，使用请求账本同目录下的 `gift_state.sqlite3`。
+本机 mock 使用状态目录下的同名文件，启动时保留该文件。
+
+每次有效的“欧拉欧拉”唤醒开始一个新领取轮次，并保留原聊天会话和上下文。
+同一轮只能送出一份礼物。再次唤醒可开始下一轮，不按访客身份跨轮次限领。
+旧的 `AnswerRules.once_per_round` 和会话内 `delivered` 标记已移除。
+
+Agent 提供两个读写接口，通过配置的 Agent 控制话题接收 JSON，在响应话题返回结果：
+
+```json
+{"operation": "get_gift_state"}
+```
+
+```json
+{"operation": "reset_gift_round", "wake_id": "unique-event-id"}
+```
+
+响应包含 `accepted` 和 `gift_state`。状态包含 `round_id`、`status`、`request_id`、
+`revision` 以及机器人、通道、调用方范围。每次重置使用不同的事件编号。
+同一事件重复到达不会再次重置，旧轮次事件不能覆盖当前轮次。
+控制接口绑定当前 Agent 的范围，不从请求正文采纳其他身份范围。
+该接口没有新增工作人员身份认证；可使用当前 Agent 控制通道的客户端可查询或重置。
+
+| 事件 | 状态变化 |
+|------|----------|
+| 空闲时有效唤醒，或成功调用重置接口 | 新轮次为 `available` |
+| 接受抓取执行 | `available` → `in_progress` |
+| 放置步骤成功 | `in_progress` → `delivered` |
+| 未送出且确认收尾完成 | `in_progress` → `available` |
+| 结果未知、未确认收尾或执行中断后重启 | `in_progress` → `uncertain` |
+
+执行器结果是送出状态的写入依据。放置成功后的归位失败不退还领取资格。
+唤醒、重置接口和大模型回复都不会解除持物保护或执行隔离。
+`in_progress` 和 `uncertain` 状态不能开始新轮次。
+唤醒语音片段去重；请求携带对应事件编号，Agent 在规划前完成状态重置。
+模型通过上下文读取领取状态，实际写入由 Agent 的状态接口和执行结果处理代码完成。

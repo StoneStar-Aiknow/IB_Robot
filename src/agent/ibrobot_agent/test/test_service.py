@@ -1404,7 +1404,6 @@ def test_an_ability_question_about_a_pick_is_asked_back_and_never_planned_twice(
         store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
         event_sink=events,
         answer_rules={
-            "once_per_round": True,
             "lines": {"confirm_pick": "可以呀，现在就给你拿吗？", "only_one": "这轮只能选一份哦"},
         },
     )

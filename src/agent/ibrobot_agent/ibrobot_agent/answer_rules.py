@@ -1,12 +1,9 @@
-"""Deployment answer rules that hold whatever the planner says: one gift per round, ask before a guess.
+"""Deployment answer rules that hold whatever the planner says: ask before a guess.
 
-The X2 summit gives each visitor (a "round": one voice session, from the wake word to the
-staff's "下一位") one fruit. The planner proposes motion from words; these rules decide, from
-the session's own history, when a proposal must become an answer instead:
+Gift eligibility is owned by the Agent gift state store, independently of dialogue
+sessions. These wording rules decide when a proposal becomes an answer instead:
 
 - ``only_one``: a request for two fruits, or all of them, is answered and nothing is picked;
-- ``already_given``: once a fruit reached the box this round, another pick is answered. A
-  failed or cut-short delivery does not count;
 - ``confirm_pick``: "你可以抓苹果吗" asks about an ability. The pick is held and the visitor
   asked; a yes runs exactly the held plan, without a second planning call. A polite request
   ("你能给我拿个橙子吗") and a choice right after the fruit menu are not asked again;
@@ -119,7 +116,6 @@ def _picks(outcome: PlannerOutcome) -> bool:
 
 @dataclass
 class _Round:
-    delivered: bool = False
     menu_open: bool = False
     held: tuple[str, PlannerOutcome | None] | None = None
     played: set[str] | None = None
@@ -155,7 +151,6 @@ class AnswerRules:
         self.non_fruit_skill = str(config.get("non_fruit_skill", "") or "")
         self.unavailable_fruit_skill = str(config.get("unavailable_fruit_skill", "") or "")
         self.unsupported_skill = str(config.get("unsupported_skill", "") or "")
-        self.once_per_round = bool(config.get("once_per_round", False))
         self.container_name = container_name
         self._rng = rng or random.choice
         self._choose_line = choose_line or random.choice
@@ -168,7 +163,6 @@ class AnswerRules:
         return bool(
             self.lines
             or self.repeat_skills
-            or self.once_per_round
             or self.non_fruit_skill
             or self.unavailable_fruit_skill
             or self.unsupported_skill
@@ -244,9 +238,8 @@ class AnswerRules:
 
     def _hold_delivery(self, item: _Round, outcome: PlannerOutcome | None) -> PlannerOutcome | None:
         """Ask how the gift arrives before a pick the visitor wants handed over."""
-        guarded = self._gift_guard(item, outcome)
-        if guarded is not outcome or outcome is None:
-            return guarded
+        if outcome is None:
+            return None
         item.held = ("confirm_delivery", outcome)
         return self._answer("confirm_delivery", "needs_clarification", ("confirmation",))
 
@@ -261,9 +254,9 @@ class AnswerRules:
             if replying and held is not None and _YES.match(folded):
                 kind, outcome = held
                 if kind in {"confirm_pick", "confirm_delivery"} and outcome is not None:
-                    return self._gift_guard(item, outcome)
+                    return outcome
                 if kind == "recommend":
-                    return self._gift_guard(item, self._random_delivery())
+                    return self._random_delivery()
             if self.contact_replies and _asks(folded, _CONTACT):
                 return self._contact_answer(item)
             named = _named_fruit(folded)
@@ -285,7 +278,7 @@ class AnswerRules:
                     return self._hold_delivery(item, self._random_delivery())
                 return None  # Which fruit is not said yet: the planner asks, or explains the rule.
             if not named and "random_pick" in self.lines and _RANDOM_PICK.search(folded):
-                return self._gift_guard(item, self._random_delivery())
+                return self._random_delivery()
             if not named and "recommend" in self.lines and _RECOMMEND.search(folded):
                 item.held = ("recommend", None)
                 return self._answer("recommend", "needs_clarification", ("fruit",))
@@ -342,7 +335,7 @@ class AnswerRules:
                 ):
                     item.held = ("confirm_pick", outcome)
                     return self._answer("confirm_pick", "needs_clarification", ("confirmation",))
-                return self._gift_guard(item, outcome)
+                return outcome
             return outcome
 
     def unsupported(self, catalog: Mapping[str, Any], outcome: PlannerOutcome) -> PlannerOutcome:
@@ -358,11 +351,6 @@ class AnswerRules:
         if self.unsupported_skill not in visible or all(step.skill_name in visible for step in outcome.steps):
             return outcome
         return self.skill_answer(self.unsupported_skill)
-
-    def _gift_guard(self, item: _Round, outcome: PlannerOutcome | None) -> PlannerOutcome | None:
-        if outcome is not None and _picks(outcome) and self.once_per_round and item.delivered:
-            return self._answer("already_given") if "already_given" in self.lines else outcome
-        return outcome
 
     def proposed(self, session: tuple[str, ...], outcome: PlannerOutcome) -> None:
         """The outcome is going to the robot: remember what the round has been told and shown."""
@@ -380,13 +368,3 @@ class AnswerRules:
             return
         with self._lock:
             self._round(session).menu_open = False
-
-    def delivered(self, session: tuple[str, ...]) -> None:
-        """A fruit reached the box this round (the place step succeeded)."""
-        with self._lock:
-            self._round(session).delivered = True
-
-    def has_delivered(self, session: tuple[str, ...]) -> bool:
-        with self._lock:
-            item = self._rounds.get(session)
-            return bool(item and item.delivered)

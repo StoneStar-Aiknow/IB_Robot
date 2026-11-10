@@ -31,6 +31,7 @@ from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
     CATALOG_SKILL_NAMES_ZH,
     CONVERSATION_ADMISSION,
+    TERMINAL_REQUEST_STATES,
     AgentEvent,
     AgentRequest,
     CatalogPort,
@@ -53,6 +54,7 @@ from ibrobot_agent.contracts import (
     request_hash_text,
 )
 from ibrobot_agent.execution_feedback import execution_reply
+from ibrobot_agent.gift_state import GiftStateError, SQLiteGiftStateStore
 from ibrobot_agent.gift_workflow import fruit_label_zh
 from ibrobot_agent.planner import (
     _HYPOTHETICAL_MARKERS,
@@ -206,6 +208,7 @@ class AgentService:
         pose_memory: PoseMemoryPort | None = None,
         workflow_planned: Callable[[tuple], None] | None = None,
         answer_rules: Mapping[str, Any] | None = None,
+        gift_state: SQLiteGiftStateStore | None = None,
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -221,7 +224,10 @@ class AgentService:
         self._robot_scope = robot_scope
         self._fruit_delivery = fruit_delivery_from_config({"fruit_delivery": fruit_delivery})
         self._return_after_place = return_after_place
-        #: Round rules the planner cannot break (one gift per round, ask before a guess).
+        self._gift_state = gift_state
+        if gift_state is not None:
+            gift_state.recover_interrupted(robot_scope)
+        #: Wording and clarification policy; gift eligibility belongs to Agent state.
         self._rules = AnswerRules(answer_rules, container_name=self._fruit_delivery.get("container_name", ""))
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
@@ -307,6 +313,34 @@ class AgentService:
             raise RuntimeError("Agent planning worker did not stop")
         self._conversation.close()
         self._store.close()
+        if self._gift_state is not None:
+            self._gift_state.close()
+
+    @staticmethod
+    def _gift_scope(request) -> tuple[str, str, str]:
+        return request.robot_scope, request.channel_id, request.principal_id
+
+    def get_gift_state(self, scope: tuple[str, str, str]) -> dict:
+        if self._gift_state is None:
+            raise GiftStateError("GIFT_STATE_DISABLED", "gift state is not enabled")
+        if scope[0] != self._robot_scope:
+            raise GiftStateError("UNSUPPORTED_ROBOT", "robot scope is not bound")
+        return self._gift_state.get(scope)
+
+    def _gift_already_given_message(self) -> str:
+        return self._rules.lines.get("already_given", "这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。")
+
+    def reset_gift_round(self, scope: tuple[str, str, str], wake_id: str) -> dict:
+        with self._queue_condition:
+            current = self.get_gift_state(scope)
+            if current["round_id"] == wake_id:
+                return current
+            busy = any(
+                self._store.get_request(key).state not in TERMINAL_REQUEST_STATES for key in self._queued_or_active
+            )
+            if self._quarantined or busy:
+                raise GiftStateError("BUSY", "an active or unresolved request prevents a new gift round")
+            return self._gift_state.reset(scope, wake_id)
 
     def get_request(self, key: RequestKey):
         return self._store.get_request(key)
@@ -341,9 +375,19 @@ class AgentService:
             elif self._queued_or_active:
                 rejection = ("BUSY", "BUSY", "robot scope has an active request")
             else:
-                self._queued_or_active.add(key)
-                self._queue.append(request)
-                self._queue_condition.notify()
+                try:
+                    if self._gift_state is not None and request.gift_wake_id:
+                        self._gift_state.reset(self._gift_scope(request), request.gift_wake_id)
+                except GiftStateError as error:
+                    if error.code != "GIFT_STATE_UNRESOLVED":
+                        rejection = (error.code, "FAILED", str(error))
+                except Exception:
+                    self._quarantined = True
+                    rejection = ("GIFT_STATE_UNAVAILABLE", "UNKNOWN", "gift state storage is unavailable")
+                if rejection is None:
+                    self._queued_or_active.add(key)
+                    self._queue.append(request)
+                    self._queue_condition.notify()
         if rejection is not None:
             reason_code, state, message = rejection
             try:
@@ -424,6 +468,7 @@ class AgentService:
 
     def _plan_one_traced(self, request: AgentRequest) -> None:
         key = request.to_key()
+        gift_round = None
         try:
             record = self._store.begin_planning(key, expected_generation=0)
             cancel_token = threading.Event()
@@ -470,6 +515,11 @@ class AgentService:
                 "clarification": clarification,
                 "pending_pose_save": pending_save if pending_save.get("pose_id") else None,
             }
+            if self._gift_state is not None:
+                planner_context["gift_state"] = {
+                    **self.get_gift_state(self._gift_scope(request)),
+                    "already_given_message": self._gift_already_given_message(),
+                }
             if request.admission == CONVERSATION_ADMISSION:
                 # The planner is told, so it answers instead of proposing motion; the check
                 # after planning holds even when it does not listen.
@@ -596,6 +646,21 @@ class AgentService:
             if gateway_error is None and replayed is None:
                 # A skill this catalog does not offer is refused aloud, not failed in silence.
                 outcome = self._rules.unsupported(catalog, outcome)
+            if self._gift_state is not None and outcome.kind == "workflow":
+                picks = sum(step.skill_name == "pick_object" for step in outcome.steps)
+                state = self.get_gift_state(self._gift_scope(request))
+                if picks > 1:
+                    outcome = PlannerOutcome(
+                        kind="conversation",
+                        user_message=self._rules.lines.get("only_one", "每轮只能选一份，请选一个水果。"),
+                    )
+                elif picks and state["status"] != "available":
+                    text = (
+                        self._gift_already_given_message()
+                        if state["status"] == "delivered"
+                        else "上一份礼物的状态还没有确认，请先完成当前任务。"
+                    )
+                    outcome = PlannerOutcome(kind="conversation", user_message=text)
             if (
                 request.admission == CONVERSATION_ADMISSION
                 and outcome.kind == "workflow"
@@ -685,10 +750,14 @@ class AgentService:
             if not self._execution_enabled or self._execution is None:
                 self._finish_plan_without_execution(key, record.planning_generation, outcome.user_message)
                 return
+            if self._gift_state is not None and any(step.skill_name == "pick_object" for step in outcome.steps):
+                scope = self._gift_scope(request)
+                state = self.get_gift_state(scope)
+                gift_round = self._gift_state.reserve(scope, state["round_id"], request.request_id)
             record = self._store.mark_preparing(key, expected_generation=record.planning_generation)
             observe_progress = getattr(self._execution, "set_progress_callback", None)
             if observe_progress is not None:
-                observe_progress(lambda detail: self._execution_progress(key, detail, session=session))
+                observe_progress(lambda detail: self._execution_progress(key, detail, gift_round=gift_round))
             with trace_stage(_trace, "agent.execution", request_id=request.request_id):
                 execution_result = self._execution.execute(
                     proposal,
@@ -702,6 +771,22 @@ class AgentService:
                     stop_event=cancel_token,
                     continues_from_execution_id=resume_execution_id(planner_context.get("continuation"), outcome.steps),
                 )
+            if gift_round is not None:
+                facts = execution_result.detail.get("execution_detail") or {}
+                delivered = execution_result.status == "succeeded" and any(
+                    step.skill_name == "place_in_container" for step in outcome.steps
+                )
+                safe_failure = (
+                    execution_result.status in {"failed", "cancelled"}
+                    and facts.get("recovery_state") in {"NOT_NEEDED", "COMPLETED"}
+                    and execution_result.detail.get("current_skill") != "return_to_task_pose"
+                )
+                self._gift_state.finish(
+                    self._gift_scope(request),
+                    gift_round["round_id"],
+                    request.request_id,
+                    "delivered" if delivered else "available" if safe_failure else "uncertain",
+                )
             if execution_result.status == "unknown":
                 current = self._store.get_request(key)
                 self._finish_unknown(
@@ -711,10 +796,6 @@ class AgentService:
                     detail=execution_result.detail,
                 )
             else:
-                if execution_result.status == "succeeded" and any(
-                    step.skill_name == "place_in_container" for step in outcome.steps
-                ):
-                    self._rules.delivered(session)
                 self._store.finish(key, expected_generation=record.planning_generation, result=execution_result)
                 terminal_detail = {**execution_result.detail, "error_code": execution_result.error_code}
                 terminal_message = execution_reply(self._request_state_for_result(execution_result), terminal_detail)
@@ -755,6 +836,14 @@ class AgentService:
                 self._quarantined = True
                 _LOGGER.exception("Could not persist Agent request failure for %s", request.request_id)
         finally:
+            if gift_round is not None:
+                try:
+                    self._gift_state.finish(
+                        self._gift_scope(request), gift_round["round_id"], request.request_id, "uncertain"
+                    )
+                except Exception:
+                    self._quarantined = True
+                    _LOGGER.exception("Could not persist gift execution state")
             with self._active_lock:
                 self._active.pop(key, None)
             with self._queue_condition:
@@ -1237,10 +1326,10 @@ class AgentService:
         )
         self._emit(key, "failed", "FAILED", message)
 
-    def _execution_progress(self, key: RequestKey, detail: Mapping, *, session: tuple[str, ...] = ()) -> None:
-        if session and detail.get("current_skill") == "place_in_container" and detail.get("state") == "SUCCEEDED":
+    def _execution_progress(self, key: RequestKey, detail: Mapping, *, gift_round: dict | None = None) -> None:
+        if gift_round and detail.get("current_skill") == "place_in_container" and detail.get("state") == "SUCCEEDED":
             # The gift is in the box even if a later step (the return to the task pose) fails.
-            self._rules.delivered(session)
+            self._gift_state.finish(self._gift_scope(key), gift_round["round_id"], key.request_id, "delivered")
         current = self._store.get_request(key)
         if current.terminal is not None:
             return
