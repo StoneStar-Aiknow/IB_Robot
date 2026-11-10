@@ -200,19 +200,30 @@ class FixedBackend:
         return self.prepare_execution(self._joint_candidate(start, frames, holds), check_geometry=False)
 
     def _joint_candidate(self, start, frames, holds):
-        if len(frames) != 1 or len(holds) != 1 or holds[0] != 0:
-            raise ValueError("fixed backend accepts one joint target without a hold")
-        target = frames[0]
-        for q in (start, target):
+        if not frames or len(frames) > 33 or len(frames) != len(holds) or any(hold != 0 for hold in holds):
+            raise ValueError("fixed backend accepts 1..33 joint targets without holds")
+        for q in (start, *frames):
+            self.guard()
             if self.limit_violations(q):
                 return Plan(Trajectory([], []), False, [], Report(False, notes=["invalid start/target"]))
-        a, b = (np.array([q[n] for n in JOINTS]) for q in (start, target))
-        duration = max(1.0, 1.875 * float(np.max(np.abs(b - a))) / MAX_SPEED)
-        times = np.linspace(0, duration, max(2, int(np.ceil(duration * 25))) + 1)
-        s = times[:, None] / duration
-        rows = a + (b - a) * (10 * s**3 - 15 * s**4 + 6 * s**5)
-        rows[0], rows[-1] = a, b
-        return Plan(Trajectory(times, rows), True, [], Report(True))
+        # Each segment stops at its waypoint (zero endpoint velocity and acceleration).
+        # Drop duplicate seam samples so the combined timebase is strictly increasing.
+        all_times, all_rows, elapsed = [], [], 0.0
+        a = np.array([start[n] for n in JOINTS])
+        for target in frames:
+            self.guard()
+            b = np.array([target[n] for n in JOINTS])
+            duration = max(1.0, 1.875 * float(np.max(np.abs(b - a))) / MAX_SPEED)
+            times = np.linspace(0, duration, max(2, int(np.ceil(duration * 25))) + 1)
+            s = times[:, None] / duration
+            rows = a + (b - a) * (10 * s**3 - 15 * s**4 + 6 * s**5)
+            rows[0], rows[-1] = a, b
+            first = 0 if not all_times else 1
+            all_times.extend(times[first:] + elapsed)
+            all_rows.extend(rows[first:])
+            elapsed += duration
+            a = b
+        return Plan(Trajectory(np.asarray(all_times), np.asarray(all_rows)), True, [], Report(True))
 
     def prepare_execution(self, plan, rate_hz=25.0, *, check_geometry=True):
         if not plan.ok:

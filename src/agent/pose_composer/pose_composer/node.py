@@ -65,6 +65,7 @@ class PoseComposerNode(Node):
         p("path_validation_json", "{}", descriptor=startup_only)
         p("display_completion_json", "{}", descriptor=startup_only)
         p("task_pose_simulation", False, descriptor=startup_only)
+        p("blocked_task_poses", [""], descriptor=startup_only)
         # Runtime description, grasp_execution and Gateway status service for poses that open hands; "{}" disables.
         p("hand_restore_json", "{}", descriptor=startup_only)
         p("trajectory_action", "/arm_trajectory_controller/follow_joint_trajectory")
@@ -123,6 +124,7 @@ class PoseComposerNode(Node):
 
         from pose_composer.task_poses import TaskPoseRunner
 
+        self._blocked_task_poses = frozenset(name for name in param("blocked_task_poses") if name)
         self._task_pose_runner = TaskPoseRunner(
             json.loads(param("task_poses_json")),
             simulation=param("task_pose_simulation"),
@@ -469,6 +471,13 @@ class PoseComposerNode(Node):
 
     def _execute_task_pose(self, goal_handle, result, name, digest, mode):
         """One HOME preparation path for named requests and both-arm seed anchors."""
+        if name in getattr(self, "_blocked_task_poses", ()):
+            return self._fail(
+                goal_handle,
+                result,
+                "TASK_POSE_ROUTE_NOT_APPROVED",
+                "side-entry route not commissioned; direct path disabled",
+            )
         request = goal_handle.request
 
         def read_state():

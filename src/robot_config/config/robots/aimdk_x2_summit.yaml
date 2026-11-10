@@ -13,6 +13,9 @@ robot:
   - moveit_planning
   - named_motion
   pose_composer:
+    # Old direct grasp_ready path is disabled until the side-entry route is commissioned.
+    # Preserve the existing compiled snapshot so other display skills can still start.
+    blocked_task_poses: [grasp_ready]
     display_completion:
       pose_ids: [arms_forward, arms_up, arms_out, arms_v, flex, surrender, right_forward, left_forward]
       mode: playback_only

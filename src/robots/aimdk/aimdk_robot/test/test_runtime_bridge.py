@@ -3354,3 +3354,39 @@ def test_the_takeover_start_is_the_platforms_target_only_when_it_describes_this_
     node._arm_command_echo = (commanded, received - age_s)
     assert clock.monotonic() >= received - age_s
     assert AimdkRuntimeNode.arm_takeover_start(node, measured) == ([offset] * count if expect_commanded else measured)
+
+
+@pytest.mark.parametrize("motion", ["short_wave", "invite", "self_intro", "explain"])
+def test_restored_summit_recording_uses_ros_vendor_mock(tmp_path, motion):
+    import yaml
+    from action_msgs.msg import GoalStatus
+    from rclpy.action import ActionClient
+
+    path = OMNIHAND_PROFILE.parent / "x2_ultra_omnihand_summit.yaml"
+    profile = yaml.safe_load(path.read_text())
+    config = profile["vendor"]["named_motion"]
+    config["trajectories"] = {name: str(path.parent / value) for name, value in config["trajectories"].items()}
+    target = tmp_path / "profile.yaml"
+    target.write_text(yaml.safe_dump(profile))
+    harness = Harness(target, hand_type="none", right_hand_type="dexterous")
+    try:
+        harness.wait_active()
+        assert harness.set_mode("policy_stream").success
+        harness.wait_for(lambda: harness.platform_action() == "UPPERBODY_REMOTE_SPLIT", "vendor stream mode")
+        harness.wait_for(lambda: harness.status().lifecycle == "ACTIVE", "active after mode switch")
+        harness.wait_for(lambda: harness.runtime.measured_hand_sample(), "hand feedback")
+        before = harness.mock.upper_body_count
+        client = ActionClient(harness.node, ExecuteNamedMotion, "/motion/execute_named")
+        assert client.wait_for_server(timeout_sec=TIMEOUT_S)
+        pending = client.send_goal_async(ExecuteNamedMotion.Goal(name=motion))
+        harness.wait_for(pending.done, "motion admission")
+        handle = pending.result()
+        assert handle.accepted
+        future = handle.get_result_async()
+        harness.wait_for(future.done, "motion terminal", timeout_s=30)
+        terminal = future.result()
+        assert terminal.status == GoalStatus.STATUS_SUCCEEDED, terminal.result.message
+        assert terminal.result.success
+        assert harness.mock.upper_body_count > before
+    finally:
+        harness.shutdown()

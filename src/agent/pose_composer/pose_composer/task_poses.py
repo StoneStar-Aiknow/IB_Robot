@@ -31,8 +31,9 @@ class TaskPoseRunner:
         if self.snapshot and tuple(self.snapshot["joint_names"]) != tuple(self.backend.model.ARM_JOINTS):
             raise ValueError("task-pose joint order does not match X2 backend")
         for pose in self.snapshot.get("poses", {}).values():
-            if not self.backend.safety.check_pose(pose["joint_positions"]).ok:
-                raise ValueError("configured task pose violates X2 target safety")
+            for q in [pose["joint_positions"], *pose.get("transition_route", {}).get("waypoints", [])]:
+                if not self.backend.safety.check_pose(q).ok:
+                    raise ValueError("configured task pose/route violates X2 target safety")
 
     def execute(self, *args, **kwargs):
         """Keep timing and partial completion evidence on success, cancellation and failure."""
@@ -111,8 +112,31 @@ class TaskPoseRunner:
         deadline = self.clock() + min(pose["timeout_sec"], timeout_sec or pose["timeout_sec"])
         target = pose["joint_positions"]
         arrival_tolerance = pose["position_tolerance_rad"]
-        if not self.verify_arrival and sides:
-            raise ComposeError("TASK_POSE_CONFIG_MISMATCH", "hand preparation requires verified functional arrival")
+        if not self.verify_arrival and (
+            sides or name == "grasp_ready" or name in self.snapshot["skill_entry_poses"].values()
+        ):
+            raise ComposeError("TASK_POSE_CONFIG_MISMATCH", "functional preparation requires verified arrival")
+        route = pose.get("transition_route")
+        frames = [*(route["waypoints"] if route else []), target]
+        holds = [0.0] * len(frames)
+        self.report["transition_route"] = {
+            "configured": route is not None,
+            "hardware_approved": route["hardware_approved"] if route else None,
+            "source": route["source"] if route else None,
+            "task_poses_digest": digest,
+        }
+
+        def check_route(start, skipped):
+            if skipped or route is None:
+                return
+            if not self.simulation and not route["hardware_approved"]:
+                raise ComposeError("TASK_POSE_ROUTE_NOT_APPROVED", "transition route is not approved for hardware")
+            if not any(
+                max(abs(start[j] - anchor["joint_positions"][j]) for j in target) <= anchor["tolerance_rad"]
+                for anchor in route["supported_starts"]
+            ):
+                raise ComposeError("TASK_POSE_ROUTE_START_UNSUPPORTED", "measured start is outside the route entry set")
+
         observed_stamp = 0.0
 
         def check():
@@ -143,6 +167,7 @@ class TaskPoseRunner:
 
         start = check()
         skipped = self.verify_arrival and at_target(start)
+        check_route(start, skipped)
         restorer = None
         context = hand_seconds = None
         if sides:
@@ -161,6 +186,7 @@ class TaskPoseRunner:
             # Takeover may have taken time. Always plan from a new measured arm pose.
             start = check()
             skipped = self.verify_arrival and at_target(start)
+            check_route(start, skipped)
             if not skipped:
                 with self._stage("hand_preflight_after_takeover", progress):
                     self._hand_call(lambda: restorer.preflight(context, sides, arm_target=target, arm_must_move=True))
@@ -173,13 +199,22 @@ class TaskPoseRunner:
                 if hasattr(self.backend, "guard"):
                     previous_guard, self.backend.guard = self.backend.guard, check
                     try:
-                        plan = planner(start, [target], [0.0])
+                        plan = planner(start, frames, holds)
                     finally:
                         self.backend.guard = previous_guard
                 else:
-                    plan = planner(start, [target], [0.0])
+                    plan = planner(start, frames, holds)
             if not plan.ok:
                 raise ComposeError("POSE_NO_SAFE_PATH", "no safe path to configured task pose")
+            if route and "table_bounds" in route:
+                validate_route = getattr(self.backend, "validate_transition_route", None)
+                if validate_route is None:
+                    raise ComposeError(
+                        "TASK_POSE_ROUTE_GEOMETRY_UNAVAILABLE", "table bounds need a route geometry validator"
+                    )
+                # Extension must validate the complete final candidate, not just waypoints.
+                validate_route(plan, route, guard=check)
+                check()
             reason = self.backend.check_displacement(plan, start, *motion_limits)
             if reason:
                 raise ComposeError("POSE_MOTION_LIMIT", reason)
@@ -199,26 +234,34 @@ class TaskPoseRunner:
             self.report["stages"]["arm_settling"]["reason"] = "display final pose not verified"
             return skipped
         with self._stage("arm_settling", progress):
-            q = check()
-            worst_joint = max(target, key=lambda joint: abs(q[joint] - target[joint]))
-            error = abs(q[worst_joint] - target[worst_joint])
-            self.report["arrival_check"] = {
-                "policy": "single_sample",
-                "stable_window_verified": False,
-                "worst_joint": worst_joint,
-                "max_error_rad": error,
-                "tolerance_rad": arrival_tolerance,
-            }
-            if error > arrival_tolerance:
-                raise ComposeError(
-                    "TASK_POSE_NOT_REACHED",
-                    f"trajectory finished but arrival not confirmed: {worst_joint} error={error:.6f} rad "
-                    f"exceeds {arrival_tolerance:.6f} rad",
-                )
-            safe = self.backend.safety.check_pose(q).ok
-            check()  # Observe cancellation/deadline and feedback age after the synchronous check.
-            if not safe:
-                raise ComposeError("TASK_POSE_UNSAFE_STATE", "measured arrival failed the pose safety check")
+            settle_started = self.clock()
+            settle_deadline = min(deadline, settle_started + pose.get("arrival_wait_sec", 2.0))
+            while True:
+                q = check()
+                worst_joint = max(target, key=lambda joint: abs(q[joint] - target[joint]))
+                error = abs(q[worst_joint] - target[worst_joint])
+                self.report["arrival_check"] = {
+                    "policy": "bounded_convergence",
+                    "stable_window_verified": False,
+                    "worst_joint": worst_joint,
+                    "max_error_rad": error,
+                    "tolerance_rad": arrival_tolerance,
+                    "waited_sec": self.clock() - settle_started,
+                    "feedback_stamp": observed_stamp,
+                }
+                if error <= arrival_tolerance:
+                    safe = self.backend.safety.check_pose(q).ok
+                    check()  # Observe cancellation/deadline and age after the synchronous check.
+                    if not safe:
+                        raise ComposeError("TASK_POSE_UNSAFE_STATE", "measured arrival failed the pose safety check")
+                    break
+                if self.clock() >= settle_deadline:
+                    raise ComposeError(
+                        "TASK_POSE_NOT_REACHED",
+                        f"arrival not confirmed after {self.clock() - settle_started:.3f}s: "
+                        f"{worst_joint} error={error:.6f} rad exceeds {arrival_tolerance:.6f} rad",
+                    )
+                self.pause(min(0.02, settle_deadline - self.clock()))
         if restorer is None:
             return skipped
 
