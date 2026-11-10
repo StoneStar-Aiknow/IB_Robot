@@ -266,7 +266,12 @@ def deployment_facts_from_config(config: Mapping[str, Any]) -> tuple[list[str], 
 
 
 def validate_fruit_delivery(outcome: PlannerOutcome, config: Mapping[str, str], *, required: bool) -> None:
-    """Reject incomplete gift plans before proposal; never silently append a place step."""
+    """Validate the paired gift workflow; the configured container is only a default.
+
+    Container interpretation belongs to the planner, including color and location
+    qualifiers. An explicit user destination must not be rejected for differing
+    from the deployment default, or silently replaced with that default.
+    """
     if not required and not config:
         return
     for index, step in enumerate(outcome.steps):
@@ -284,9 +289,9 @@ def validate_fruit_delivery(outcome: PlannerOutcome, config: Mapping[str, str], 
             or pick.target_name not in {"a lemon", "an apple", "an orange"}
             or pick.target_name != place.target_name
             or pick.arm_side != place.arm_side
-            or place.container_name != config["container_name"]
+            or not place.container_name.strip()
         ):
-            raise ValueError("fruit delivery requires the same fruit and configured container in an adjacent pair")
+            raise ValueError("fruit delivery requires the same fruit and a named container in an adjacent pair")
 
 
 def append_return_after_place(outcome: PlannerOutcome, task_pose: str | None) -> PlannerOutcome:
@@ -527,10 +532,19 @@ def build_planner_messages(
     )
     if fruit_delivery:
         system += (
-            " Deployment fruit_delivery is authoritative: every supported fruit choice requires a single "
+            " Every supported fruit choice requires a single "
             "workflow with adjacent pick_object then place_in_container, identical canonical target_name "
-            "and arm_side, and container_name copied verbatim from deployment.fruit_delivery. "
-            "Never confuse a container color with a fruit target. If it is missing, do not pick a gift. "
+            "and arm_side. For container_name, the user's explicitly requested destination takes priority "
+            "over deployment.fruit_delivery: translate it into a short English visual query preserving its "
+            "color, material and position qualifiers (for example 绿色的碗 -> a green bowl). "
+            "deployment.fruit_delivery.container_name is ONLY the default when the user does not specify "
+            "a destination. Never replace an explicit or unresolved destination with the default, even if "
+            "it was not found or an earlier attempt failed. For ambiguous references such as '那个碗', "
+            "ask which container using kind=needs_clarification and missing_fields=['container_name']; "
+            "do not invent a color or choose the default. If resuming or confirming an existing workflow, "
+            "preserve its chosen container unless the user explicitly changes it. "
+            "Never confuse a container color with a fruit target. If the default configuration is missing, "
+            "do not pick a gift. "
         )
     if isinstance(context.get("gift_state"), Mapping):
         system += (

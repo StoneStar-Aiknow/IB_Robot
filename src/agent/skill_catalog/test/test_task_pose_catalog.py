@@ -87,6 +87,9 @@ def test_voice_mirror_grasp_preserves_skills_and_compiles_preparation_budget():
     assert pick["implementation_identity"].endswith("#aimdk_x2_summit_fruit")
     assert pick["executor"] == "grasp_pipeline"
     assert pick["timeout_sec"] == 150.0
+    assert "explicitly named container" in str(snapshot.capability_view["pick_object"])
+    assert "only when no destination was specified" in str(snapshot.capability_view["pick_object"])
+    assert "explicitly requested container takes priority" in str(snapshot.capability_view["place_in_container"])
     assert snapshot.templates["place_in_container"]["executor"] == "placement_pipeline"
     assert snapshot.templates["mirror_start"]["executor"] == "mirror_session"
     assert snapshot.templates["self_introduction"]["executor"] == "runtime_play_audio"

@@ -941,7 +941,7 @@ def test_model_adapter_preserves_generated_fruit_pair_and_prompt(target):
     assert outcome.steps[0].target_name == outcome.steps[1].target_name == target
 
 
-@pytest.mark.parametrize("change", ["single", "wrong_target", "wrong_container", "interleaved", "arm", "missing"])
+@pytest.mark.parametrize("change", ["single", "wrong_target", "empty_container", "interleaved", "arm", "missing"])
 def test_fruit_delivery_rejects_incomplete_or_mismatched_model_plans(change):
     from ibrobot_agent.planner import validate_fruit_delivery
 
@@ -959,8 +959,8 @@ def test_fruit_delivery_rejects_incomplete_or_mismatched_model_plans(change):
         steps.pop()
     elif change == "wrong_target":
         steps[1]["target_name"] = "an apple"
-    elif change == "wrong_container":
-        steps[1]["container_name"] = "invented bowl"
+    elif change == "empty_container":
+        steps[1]["container_name"] = "   "
     elif change == "interleaved":
         steps.insert(1, {"schema_version": 1, "skill_name": "nod_yes"})
     elif change == "arm":
@@ -973,6 +973,60 @@ def test_fruit_delivery_rejects_incomplete_or_mismatched_model_plans(change):
     with pytest.raises(ValueError):
         validate_fruit_delivery(outcome, delivery, required=True)
     validate_fruit_delivery(outcome, {}, required=False)  # Non-exhibition pick is unchanged.
+
+
+@pytest.mark.parametrize(
+    "text,container",
+    [
+        ("把苹果放进绿色的碗", "a green bowl"),
+        ("把苹果放进左边的金属碗", "the metal bowl on the left"),
+        ("Put the apple into the red basket", "the red basket"),
+        ("给我一个苹果", "a black bowl"),
+    ],
+)
+def test_fruit_container_uses_the_request_with_the_deployment_only_as_default(text, container):
+    from ibrobot_agent.planner import validate_fruit_delivery
+
+    delivery = {"container_name": "a black bowl", "container_label": "黑色的碗"}
+
+    class Model:
+        def complete(self, messages, **kwargs):
+            system = messages[0]["content"]
+            payload = json.loads(messages[1]["content"])
+            assert payload["request"]["text"] == text
+            assert payload["deployment"]["fruit_delivery"] == delivery
+            assert "explicitly requested destination takes priority" in system
+            assert "ONLY the default when the user does not specify" in system
+            assert "Never replace an explicit or unresolved destination" in system
+            assert "missing_fields=['container_name']" in system
+            return {
+                "status": "ok",
+                "content": json.dumps(
+                    {
+                        "kind": "workflow",
+                        "user_message": "好。",
+                        "summary": "放置苹果",
+                        "steps": [
+                            {"schema_version": 1, "skill_name": "pick_object", "target_name": "an apple"},
+                            {
+                                "schema_version": 1,
+                                "skill_name": "place_in_container",
+                                "target_name": "an apple",
+                                "container_name": container,
+                            },
+                        ],
+                    }
+                ),
+            }
+
+    planner = PlannerAdapter(
+        Model(),
+        prompt_builder=lambda **kwargs: build_planner_messages(**kwargs, fruit_delivery=delivery),
+        planner_identity=RulePlanner.identity,
+    )
+    outcome = planner.plan(_request(text), {}, {}, threading.Event())
+    validate_fruit_delivery(outcome, delivery, required=True)
+    assert outcome.steps[1].container_name == container
 
 
 @pytest.mark.parametrize("config", [{}, {"container_name": ""}, {"container_name": "bowl", "container_label": 3}])

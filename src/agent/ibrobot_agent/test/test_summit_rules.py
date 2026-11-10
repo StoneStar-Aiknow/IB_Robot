@@ -337,6 +337,47 @@ def test_a_no_to_the_hand_over_drops_the_held_pick():
     assert rules.before_planning(ROUND, "好的", replying=True) is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "帮我随便挑一个水果，放进绿色的碗里",
+        "帮我随便挑一个放进左边的金属碗",
+        "帮我随便挑一个，放进那个碗",
+        "帮我随便挑一个，放在这边",
+        "帮我随便挑一个，put it into the green bowl",
+        "把苹果直接给我，放进绿色的碗",
+    ],
+)
+def test_destination_requests_bypass_default_only_shortcuts(text):
+    assert _delivery_rules().before_planning(ROUND, text, replying=False) is None
+
+
+def test_a_confirmed_plan_keeps_its_requested_container():
+    from ibrobot_agent.planner import planner_outcome_from_payload
+
+    outcome = planner_outcome_from_payload(
+        {
+            "kind": "workflow",
+            "user_message": "好的。",
+            "summary": "放进绿色碗",
+            "steps": [
+                {"schema_version": 1, "skill_name": "pick_object", "target_name": "an apple"},
+                {
+                    "schema_version": 1,
+                    "skill_name": "place_in_container",
+                    "target_name": "an apple",
+                    "container_name": "a green bowl",
+                },
+            ],
+        }
+    )
+    rules = _rules()
+    asked = rules.after_planning(ROUND, "你可以抓苹果放进绿色的碗吗", outcome, replying=False)
+    assert asked.kind == "needs_clarification"
+    confirmed = rules.before_planning(ROUND, "好的", replying=True)
+    assert confirmed.steps[1].container_name == "a green bowl"
+
+
 def test_hand_over_confirmation_does_not_store_gift_eligibility():
     rules = _delivery_rules()
     first = rules.before_planning(ROUND, "把苹果扔给我", replying=False)

@@ -1278,6 +1278,62 @@ class ContextRecordingPlanner(FakePlanner):
         return super().plan(request, context, catalog, cancel_token, on_preview=on_preview)
 
 
+def test_requested_container_reaches_prefetch_and_execution_instead_of_the_default(tmp_path):
+    from ibrobot_agent.pick_prefetch import first_pick
+
+    class FruitCatalog(FakeCatalog):
+        def get_catalog(self, status):
+            return {
+                "skills": [
+                    {"name": name, "planner_visible": True, "semantic_level": "skill"}
+                    for name in ("pick_object", "place_in_container")
+                ]
+            }
+
+    class CaptureExecution(FakeExecution):
+        def execute(self, proposal, **kwargs):
+            self.steps = proposal.outcome.steps
+            return super().execute(proposal, **kwargs)
+
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="放进绿色的碗。",
+        summary="放置苹果",
+        steps=(
+            CanonicalWorkflowStep(1, "pick_object", target_name="an apple"),
+            CanonicalWorkflowStep(1, "place_in_container", target_name="an apple", container_name="a green bowl"),
+        ),
+    )
+    events, execution, prefetched = RenderedEvents(), CaptureExecution(), []
+    planner = FakePlanner(outcome)
+    service = AgentService(
+        planner=planner,
+        catalog=FruitCatalog(),
+        store=SQLiteRequestStore(tmp_path / "container.db"),
+        execution=execution,
+        event_sink=events,
+        presentation=events.gate,
+        execution_enabled=True,
+        allowed_skills={"pick_object", "place_in_container"},
+        robot_scope="aimdk_x2_summit",
+        fruit_delivery={"container_name": "a black bowl", "container_label": "黑色的碗"},
+        answer_rules={"lines": {"random_pick": "我帮你挑一个！"}},
+        workflow_planned=lambda steps: prefetched.append(first_pick(steps)),
+    )
+    try:
+        request = replace(_request(text="帮我随便挑一个水果，放进绿色的碗"), robot_scope="aimdk_x2_summit")
+        assert service.send_message(request).accepted
+        record = _wait_state(service, request.to_key(), {"SUCCEEDED", "FAILED", "UNKNOWN"})
+        assert record.state == "SUCCEEDED", record.terminal
+        assert planner.calls == 1
+        assert prefetched == [("an apple", "a green bowl")]
+        assert execution.steps[1].container_name == "a green bowl"
+        snapshot = service._store.latest_event_detail(request.to_key(), "proposal_snapshot")
+        assert snapshot["outcome"]["steps"][1]["container_name"] == "a green bowl"
+    finally:
+        service.close()
+
+
 def _conversation_request(text: str) -> AgentRequest:
     return replace(_request(text=text), admission="conversation")
 

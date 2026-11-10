@@ -82,6 +82,13 @@ _NEGATED = re.compile(r"不要|不用|别|不想|不需要|不必|甭")
 #: Telling about something, not asking for it.
 _NARRATION = re.compile(r"昨天|刚才|刚刚|以前|上次|已经|他|她|那个人")
 _WHY = re.compile(r"为什么|为何|怎么")
+# A conservative routing guard, not a parser/translator. Destination wording must
+# reach the full planner intact instead of taking a default-only fruit shortcut.
+_DESTINATION = re.compile(
+    r"碗|盆|盘|篮|盒|箱|桶|杯|容器|放|送到|送进|装进"
+    r"|\b(?:bowls?|basins?|plates?|trays?|baskets?|boxes|box|bins?|buckets?|cups?|containers?|put|place|into|inside)\b",
+    re.IGNORECASE,
+)
 
 
 def _folded(text: str) -> str:
@@ -271,6 +278,10 @@ class AnswerRules:
                 and not _GAME_WORDS.search(folded)
             ):
                 return self._answer("only_one")
+            if _DESTINATION.search(text):
+                # Preserve explicit containers, ambiguous references and changes
+                # to a held plan. The planner sees the whole utterance/context.
+                return None
             if "confirm_delivery" in self.lines and _delivery_request(folded):
                 if named:
                     return self._hold_delivery(item, self._delivery(named, "好的。"))

@@ -561,6 +561,12 @@ typed Program 路径不产生 `presentation_rendered`。
 
 ### Agent 领取状态与唤醒轮次
 
+水果抓放工作流优先使用用户明确指定的容器，并将颜色、材质和方位保留在英文视觉查询中。
+例如“把苹果放进绿色的碗”使用 `container_name: a green bowl`。
+`embodied.agent.planner.fruit_delivery.container_name` 仅在用户未指定目的容器时作为默认值。
+“那个碗”等无法确定的指代需要澄清；指定容器未检测到时反馈失败，不改用默认容器。
+带容器描述的请求进入完整语义规划；确认或续执行保留已选择的容器。
+
 展会配置启用 `embodied.agent.gift_state.enabled`。Agent 将领取状态保存到 SQLite。
 `gift_state.path` 可指定路径；未指定时，使用请求账本同目录下的 `gift_state.sqlite3`。
 本机 mock 使用状态目录下的同名文件，启动时保留该文件。

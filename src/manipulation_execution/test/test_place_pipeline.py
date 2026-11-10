@@ -114,6 +114,24 @@ def test_no_plan_returns_custody_without_releasing_or_moving():
     assert not backends.executor.log and not backends.effector.log
 
 
+def test_missing_requested_container_retries_the_same_query_without_motion_or_release():
+    held, backends = fixture()
+    queries = []
+
+    def missing_container(observation, query, held, **kwargs):
+        queries.append(query)
+        raise GraspFailure("CONTAINER_NOT_FOUND", "no green bowl", retryable=True)
+
+    backends = replace(backends, proposer=SimpleNamespace(propose=missing_container))
+    outcome = PlacePipeline(backends, max_attempts=2).run(
+        held, "a green bowl", deadline=float("inf"), cancelled=lambda: False
+    )
+    assert not outcome.success and outcome.reason_code == "CONTAINER_NOT_FOUND"
+    assert queries == ["a green bowl", "a green bowl"]
+    assert outcome.custody_outcome == "held" and outcome.release_status == "not_released"
+    assert not backends.executor.log and not backends.effector.log
+
+
 def test_unconfirmed_release_stops_before_retreat():
     held, backends = fixture(release_confirmed=False)
     outcome = run(held, backends)

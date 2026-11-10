@@ -53,8 +53,10 @@ description_variants:
       Pick the fruit gift the visitor chose. Today only 柠檬, 苹果 and 橙子 are available:
       target_name must be exactly "a lemon", "an apple" or "an orange".
       For every fruit choice, plan pick_object immediately followed by place_in_container
-      in the SAME workflow with the SAME target_name. Use the configured fruit_delivery.container_name
-      from the deployment context for the place step; never pick alone or invent a container.
+      in the SAME workflow with the SAME target_name. Use the visitor's explicitly named container,
+      preserving its color and location in a short English visual query. Use fruit_delivery.container_name
+      from the deployment context only when no destination was specified. Ask about an ambiguous
+      container; never substitute the default for an explicit destination or pick alone.
       The X2 retains the fruit only for this adjacent paired place step, then verifies placement.
       For any other fruit reply 今天可以选柠檬、苹果和橙子，你想要哪一种？ without using this skill.
       For a personal belonging or a request to hand something over reply 今天只抓取展台上的水果礼物。你想选哪一种？
