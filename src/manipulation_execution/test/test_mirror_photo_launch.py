@@ -117,7 +117,9 @@ class TestOn:
         assert parameters["pear_frame_topic"] == "/stream/pear"
         assert parameters["hand_frame_topic"] == ""  # no retarget player following hands here
         assert parameters["status_period_sec"] == 1.0
-        section = from_json(json.dumps(parameters["photo_json"]))
+        # A string as the node gets it; the shared helper YAML-loads it into a dict where the launch_ros leaves a tuple.
+        raw = parameters["photo_json"]
+        section = from_json(raw if isinstance(raw, str) else json.dumps(raw))
         assert section == parse_photo_section(PHOTO)
 
     def test_the_parameters_are_the_ones_the_node_declares(self):

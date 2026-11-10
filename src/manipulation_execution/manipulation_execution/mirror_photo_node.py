@@ -44,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import signal
 import threading
 import time
 from collections.abc import Mapping
@@ -294,6 +295,9 @@ def main(args=None) -> None:
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # A stop brings SIGINT more than once (the terminal's process group and the launch's own). The
+        # first ends the spin; a later one must not break off the cleanup that queues the last round.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         if node is not None:
             node.finish()
             executor.remove_node(node)

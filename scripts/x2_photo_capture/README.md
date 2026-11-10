@@ -2,11 +2,12 @@
 
 照镜子每一轮（进 MIRRORING 到出 MIRRORING）挑一张最好的照片，连同人框发给上位机（现场是跑 AIGC 的 Windows 电脑，开发时是 Ubuntu 笔记本）。拍照是一个单独的节点 `mirror_photo`，镜像不等它：上位机不在线、网断了、盘满了，镜像照常。
 
-本目录三样东西：
+本目录四样东西：
 
 - `receiver.py`：上位机上跑的接收端。只用 Python ≥ 3.8 标准库，Windows 和 Ubuntu 同一份。
 - `photo_target.sh`：.5 上改上位机地址。
 - `send_test.py`：.5 上不起 ROS、发合成测试图，查通不通。
+- `review.py`：上位机上把收到的照片做成一页网页，画出人框，逐张检查选图。
 
 ---
 
@@ -66,6 +67,8 @@ ledger.jsonl           账本：每收到一次一行（包括重发），--disc
 先写 `.json` 再写 `.jpg`，两个都是写临时文件再改名。所以盯着 `*.jpg` 的工作流看到图时，元数据一定已经在了。
 
 `quality` 字段：`normal` 正常挑出的；`fallback` 本轮没有候选、或挑选出错，用的是兜底帧；`recovered` .5 上的节点崩过，重启后补发的上一轮；`test` 是 `send_test.py` 发的合成图，AIGC 应跳过。
+
+看照片：`python3 review.py <inbox>` 在 inbox 里生成 `review.html`，用浏览器打开。每张图上用红框画出人框，旁边列出本轮怎么选的（来源/手势、分数、本轮时长、候选数和各来源个数）。它不改、不复制照片。
 
 ---
 
