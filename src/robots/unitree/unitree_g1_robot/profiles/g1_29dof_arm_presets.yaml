@@ -2,8 +2,9 @@
 # Physical execution is not blocked outright: it needs the per-run launch
 # arguments preset_operator_confirmed=true and a robot-facing
 # runtime_network_interface, plus an explicit or audited expected FSM id, so
-# only an operator-supervised session can dispatch. The launch builds a
-# run-scoped profile internally; do not persist `confirmed: true` here.
+# only an operator-supervised session can dispatch. The launch passes those
+# values to the node as per-run ROS parameters; do not persist `confirmed: true`
+# here and do not write a temporary confirmed profile.
 #
 # The 23 preset actions below are the operator's GET-only GetActionList report
 # from 2026-11-07/09. The keys are the public skill names; every action_name is
@@ -15,6 +16,14 @@
 # robot. That is operator-reported verification, not an Agent/automated
 # real-robot test result; no Agent dispatch or SDK ExecuteAction was performed
 # for this change.
+#
+# Operator on-site confirmation on 2026-11-10 (not a camera recording and not an
+# Agent real-robot test): ID 15 `arms_horizontal` (firmware `both_hands_up`, both
+# hands raised to the chest) keeps its 双臂平举 display and its ID 15 mapping.
+# ID 17 is a two-hand applause gesture. Its public skill key is `clap`, matching
+# the already-published full dex3 profile; the firmware token `clamp` stays the
+# exact action_name verified by GetActionList. Renaming only the public map key
+# leaves id 17, the firmware string and filtered dispatch unchanged.
 runtime:
   name: unitree_g1_robot
   version: 0.1.0
@@ -83,7 +92,7 @@ capabilities:
       - blow_kiss_with_left_hand
       - blow_kiss_with_right_hand
       - arms_horizontal
-      - clamp
+      - clap
       - high_five
       - hug
       - make_heart_with_both_hands
@@ -134,7 +143,7 @@ vendor:
       blow_kiss_with_left_hand: {action_id: 12, action_name: blow_kiss_with_left_hand}
       blow_kiss_with_right_hand: {action_id: 13, action_name: blow_kiss_with_right_hand}
       arms_horizontal: {action_id: 15, action_name: both_hands_up}
-      clamp: {action_id: 17, action_name: clamp}
+      clap: {action_id: 17, action_name: clamp}
       high_five: {action_id: 18, action_name: high_five}
       hug: {action_id: 19, action_name: hug}
       make_heart_with_both_hands: {action_id: 20, action_name: make_heart_with_both_hands, mode_machine: [5, 6]}

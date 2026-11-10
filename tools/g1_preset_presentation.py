@@ -1,4 +1,4 @@
-"""Project this profile's vendor action numbers into catalog display metadata.
+"""Project the profile's vendor action numbers into catalog display metadata.
 
 The runtime profile (``profiles/<name>.yaml``) is the only source of the
 vendor firmware action numbers: ``vendor.arm_actions.<skill>.action_id`` is
@@ -6,7 +6,7 @@ what the runtime sends to the firmware and what admission checks. The catalog
 manifests (``src/agent/skill_catalog/config/skills/<skill>/manifest.yaml``)
 are the only source the Gateway compiles and the CLI/Web display.
 
-This module is the single bridge between the two, and it is deliberately
+This offline tool is the single bridge between the two, and it is deliberately
 *display only*:
 
 * it writes one optional entry into the manifest's existing
@@ -16,14 +16,17 @@ This module is the single bridge between the two, and it is deliberately
 * it never writes an execution field, a binding, a recovery policy or an
   admission rule, and nothing in the tag is an execution entry point.
 
-The package test ``test_catalog_action_id_presentation.py`` runs the same
-projection with ``write=False``, so a profile id change (for example
-``arms_horizontal: 15 -> 16``) fails until the manifests are regenerated.
+The tool lives in ``tools/`` on purpose: the robot package publishes the
+profile, the catalog owns its manifests, and neither imports the other. The
+robot package must never write a cross-package asset, and the publisher/vendor
+code must not import a catalog compiler. ``tools/test_g1_preset_presentation.py``
+runs the same projection with ``write=False``, so a profile id change (for
+example ``arms_horizontal: 15 -> 16``) fails until the manifests are regenerated.
 
 Usage::
 
-    python3 -m unitree_g1_robot.preset_presentation --check
-    python3 -m unitree_g1_robot.preset_presentation --write
+    python3 tools/g1_preset_presentation.py --check
+    python3 tools/g1_preset_presentation.py --write
 """
 
 from __future__ import annotations

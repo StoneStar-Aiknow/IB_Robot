@@ -1,16 +1,19 @@
 schema_version: 1
-name: clamp
+name: clap
 version: 1.0.0
 semantic_level: skill
 description:
-  summary: Run the G1 clamp preset gesture; no automatic recovery.
+  summary: Clap both hands to applaud using the G1 preset; no automatic recovery.
   category: social_interaction
   when_to_use:
-  - request the clamp preset gesture
+  - applaud or celebrate with both hands
+  - request the G1 applause preset
   aliases_zh:
-  - 夹紧动作
+  - 鼓掌
+  - 拍手
   aliases_en:
-  - clamp
+  - clap
+  - applaud
   motion_scope:
   - arm
   anchor_pose: none
@@ -19,8 +22,8 @@ description:
   requires_motion_params: false
 capability:
   schema_version: 1
-  summary: Run the G1 clamp preset (action 17); no automatic recovery.
-  display_name: 夹紧动作
+  summary: Clap both hands to applaud with the G1 preset (action 17); no automatic recovery.
+  display_name: 鼓掌
   tags:
   - preset
   - unitree_action_id_17

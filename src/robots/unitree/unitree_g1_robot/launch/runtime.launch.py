@@ -13,9 +13,9 @@ transport — the in-repo vendor mock that stands in for the robot's own stack.
 The arm-preset physical path additionally requires ``preset_operator_confirmed:=true``,
 a non-loopback ``runtime_network_interface`` and an expected FSM id (explicitly,
 or an audited ``vendor.operator_validation.expected_fsm_id`` in the profile).
-Those values are assembled into a run-scoped profile for the node (and removed
-when the launch process exits); the source profile is never rewritten and no
-``confirmed: true`` deployment file is required or produced.
+The confirmation, NIC and FSM are passed to the node as ROS parameters for this
+run only: no temporary or deployment profile is written, and the source profile
+never carries ``confirmed: true``.
 
 DDS (design D2, revised by Issue #171 PR 2): the vendor tier speaks
 CycloneDDS **inside the official SDK**, which binds its own cyclonedds-python
@@ -65,15 +65,10 @@ synthetic publishers stand in for them on exactly the declared endpoints.
 
 from __future__ import annotations
 
-import atexit
-import contextlib
-import copy
 import json
-import os
 import tempfile
 from pathlib import Path
 
-import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
@@ -233,39 +228,6 @@ def _preset_run_binding(profile: dict, context) -> tuple[str, int]:
     )
 
 
-def _remove_run_profile(path: str) -> None:
-    with contextlib.suppress(FileNotFoundError):
-        os.unlink(path)
-
-
-def _write_preset_run_profile(profile: dict, *, network_interface: str, expected_fsm_id: int) -> str:
-    """Write the run-scoped profile the node reads; never touch the source file.
-
-    The node's preflight reads ``vendor.operator_validation.expected_fsm_id``
-    from its profile, so the per-run value is merged into a temporary copy. The
-    file is removed when the launch process exits and is never a deployment
-    artifact: the shipped profile stays without ``confirmed: true``.
-    """
-    run_profile = copy.deepcopy(profile)
-    vendor = run_profile.setdefault("vendor", {})
-    validation = dict(vendor.get("operator_validation") or {})
-    validation.update(
-        {
-            "confirmed": True,
-            "network_interface": network_interface,
-            "expected_fsm_id": expected_fsm_id,
-        }
-    )
-    vendor["operator_validation"] = validation
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", prefix="unitree_g1_preset_run_", delete=False, encoding="utf-8"
-    ) as handle:
-        yaml.safe_dump(run_profile, handle, default_flow_style=False, sort_keys=False)
-        path = handle.name
-    atexit.register(_remove_run_profile, path)
-    return path
-
-
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("unitree_g1_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
@@ -289,19 +251,18 @@ def _launch_setup(context, *_args, **_kwargs):
             if peripherals_file:
                 raise RuntimeError("preset commissioning has conflicting network/peripheral overrides")
             description = build_description(profile, use_sim=False)
-            run_profile_path = _write_preset_run_profile(
-                profile, network_interface=nic, expected_fsm_id=expected_fsm_id
-            )
             return [
                 Node(
                     package="unitree_g1_robot",
                     executable="runtime_node",
                     parameters=[
                         {
-                            "profile": run_profile_path,
+                            "profile": str(profile_path),
                             "initial_mode": initial_mode,
                             "preset_operator_confirmed": True,
                             "preset_test_transport": False,
+                            "runtime_network_interface": nic,
+                            "preset_expected_fsm_id": expected_fsm_id,
                             "vendor_domain_id": 0,
                             "vendor_network_interface": nic,
                             "interface_description_json": json.dumps(description),

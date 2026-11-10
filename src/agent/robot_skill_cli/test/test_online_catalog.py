@@ -278,7 +278,7 @@ def test_offline_catalog_keeps_the_strict_local_loader(monkeypatch, capsys):
     assert "runtime.interface_description" in payload["error"]["message"]
 
 
-def test_g1_preset_projection_reports_applause_for_action_17():
+def test_g1_preset_projection_uses_clap_for_action_17():
     """The offline projection is the planner/CLI view, not just a Web label."""
     from robot_config.loader import load_robot_config_dict
 
@@ -287,15 +287,18 @@ def test_g1_preset_projection_reports_applause_for_action_17():
         load_robot_config_dict(config_path, defer_interface_binding=True),
         config_path,
     )
-    entry = snapshot.capability_view["clamp"]
+    entry = snapshot.capability_view["clap"]
     assert entry["display_name"] == "鼓掌"
     summary = entry["summary"].lower()
     assert "clap" in summary or "applaud" in summary
     assert not any(word in summary for word in ("clamp", "clamping", "夹紧", "hard grip", "hardgrip"))
     assert tuple(entry["tags"]) == ("preset", "unitree_action_id_17")
     assert entry["recovery_policy"] == "never_retry"
-    assert "clamp" in snapshot.planner_visible_skill_names
-    # The stable key and execution binding are unchanged by the semantic fix.
-    assert snapshot.templates["clamp"]["binding"] == {"motion": "clamp"}
+    assert "clap" in snapshot.planner_visible_skill_names
+    # The public key and execution binding are clap; the firmware action_name
+    # clamp stays in the runtime profile and is not duplicated in the manifest.
+    assert snapshot.templates["clap"]["binding"] == {"motion": "clap"}
+    assert "clamp" not in snapshot.enabled_skill_names
+    assert "clamp" not in snapshot.templates
     # ID 15 is operator-confirmed correct and must not be renamed here.
     assert snapshot.capability_view["arms_horizontal"]["display_name"] == "双臂平举"

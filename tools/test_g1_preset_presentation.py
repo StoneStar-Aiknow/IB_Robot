@@ -9,11 +9,14 @@ and no skill outside this profile may display a vendor action number.
 
 import re
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
 import yaml
-from unitree_g1_robot.preset_presentation import (
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from g1_preset_presentation import (  # noqa: E402
     ACTION_ID_TAG_PREFIX,
     CONTROL_OWNERSHIP_ACTIONS,
     CONTROL_OWNERSHIP_TAG,
@@ -24,9 +27,8 @@ from unitree_g1_robot.preset_presentation import (
     vendor_action_ids,
 )
 
-PACKAGE = Path(__file__).resolve().parents[1]
-PROFILE = PACKAGE / "profiles" / "g1_29dof_arm_presets.yaml"
-REPOSITORY = Path(__file__).resolve().parents[5]
+REPOSITORY = Path(__file__).resolve().parents[1]
+PROFILE = REPOSITORY / "src/robots/unitree/unitree_g1_robot/profiles/g1_29dof_arm_presets.yaml"
 CATALOG_ROOT = REPOSITORY / "src" / "agent" / "skill_catalog" / "config"
 SKILLS_ROOT = CATALOG_ROOT / "skills"
 CATALOG_PROFILE = CATALOG_ROOT / "profiles" / "unitree_g1_arm_presets.yaml"

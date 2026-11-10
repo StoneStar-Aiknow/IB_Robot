@@ -98,6 +98,7 @@ from robot_runtime.state import RuntimeState
 from unitree_g1_robot import projection
 from unitree_g1_robot import vendor_gateway as vg
 from unitree_g1_robot.named_motion import NamedMotionServer
+from unitree_g1_robot.preset_commissioning import resolve_preset_commissioning
 from unitree_g1_robot.projection import CommandRejected, ProjectionError
 from unitree_g1_robot.teardown import (
     TEARDOWN_FAILURE_EXIT_CODE,
@@ -261,12 +262,34 @@ class UnitreeG1RuntimeNode(Node):
         self._preset_only = self._vendor.get("preset_only") is True
         self.declare_parameter("preset_test_transport", False)
         self.declare_parameter("preset_operator_confirmed", False)
+        self.declare_parameter("runtime_network_interface", "")
+        self.declare_parameter("preset_expected_fsm_id", 0)
+        # The vendor DDS binding belongs to the same run. Declare it here so
+        # the commissioning gate can refuse a confirmation whose NIC is not
+        # the NIC the SDK will actually bind.
+        self.declare_parameter("vendor_domain_id", 0)
+        self.declare_parameter("vendor_network_interface", "")
         self._preset_physical = self._preset_only and self.get_parameter("preset_test_transport").value is not True
-        # Explicit, operator-supervised commissioning. The shipped
-        # profile stays disabled; simulation still requires loopback isolation.
+        self._preset_expected_fsm_id: int | None = None
+        # Explicit, operator-supervised commissioning. The shipped profile
+        # stays disabled; simulation still requires loopback isolation. The
+        # node repeats the launch-side gate because a direct `ros2 run` must
+        # not be able to skip it by pointing at a stale, confirmed profile.
         if self._preset_only:
-            if self._preset_physical and self.get_parameter("preset_operator_confirmed").value is not True:
-                raise RuntimeError("PRESET_HARDWARE_DISABLED: on-site operator confirmation required")
+            if self._preset_physical:
+                declared_fsm = self.get_parameter("preset_expected_fsm_id").value
+                try:
+                    _nic, self._preset_expected_fsm_id = resolve_preset_commissioning(
+                        self._profile,
+                        confirmed=self.get_parameter("preset_operator_confirmed").value,
+                        runtime_network_interface=self.get_parameter("runtime_network_interface").value,
+                        # 0 is the declared "not supplied" default; an audited
+                        # profile FSM may fill it. There is no auto selection.
+                        expected_fsm_id=None if declared_fsm == 0 else declared_fsm,
+                        vendor_network_interface=self.get_parameter("vendor_network_interface").value,
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(str(exc)) from exc
             if self._profile.get("command_channels") or self._vendor.get("postures"):
                 raise RuntimeError("preset-only profile cannot expose streams or postures")
             allowed = (self._vendor.get("preset_commissioning") or {}).get("allowed_arm_actions")
@@ -334,8 +357,6 @@ class UnitreeG1RuntimeNode(Node):
         # on the robot's production domain (domain 0, any NIC), and
         # ``CYCLONEDDS_URI`` cannot constrain the result because the SDK hands
         # its own configuration to ``Domain(id, config)``, which overrides it.
-        self.declare_parameter("vendor_domain_id", 0)
-        self.declare_parameter("vendor_network_interface", "")
         self._vendor_domain_id, self._vendor_network_interface = self._vendor_dds_binding()
 
         # --- shared mutable state (guarded by _lock) -------------------------
@@ -1727,7 +1748,11 @@ class UnitreeG1RuntimeNode(Node):
                 ):
                     return False, f"{name} is not confirmed running"
             fsm = self.rpc_call("loco", "get_fsm_id", None)
-            expected = (self._vendor.get("operator_validation") or {}).get("expected_fsm_id")
+            # The expected FSM is the per-run commissioning input resolved at
+            # startup, not a profile field a stale confirmed profile could
+            # carry. A bare node (tests, an old caller) has no resolved value
+            # and therefore fails closed instead of guessing.
+            expected = getattr(self, "_preset_expected_fsm_id", None)
             if not fsm.ok or type(expected) is not int or type(fsm.data) is not int or fsm.data != expected:
                 return False, "FSM changed or unavailable; no automatic mode switch"
             with self._lock:

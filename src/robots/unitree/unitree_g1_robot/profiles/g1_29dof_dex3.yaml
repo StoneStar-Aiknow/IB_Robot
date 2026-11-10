@@ -329,8 +329,11 @@ vendor:
     squat: {fsm_id: 2}
     stand_up: {fsm_id: 4}
   # motion.named names -> `arm` service actions (SDK action_map). The keys are
-  # this profile's public skill names, not translations of the firmware strings
-  # (for example `clap` binds the firmware `clamp`); action_name is the exact
+  # this profile's public skill names, not translations of the firmware strings.
+  # ID 17 is the operator-confirmed two-hand applause gesture: the public key
+  # `clap` is its semantic name, while firmware token `clamp` is historical and
+  # stays the exact action_name (2026-11-10 on-site confirmation, not a camera
+  # recording or an Agent real-robot test). action_name is the exact
   # firmware string from the operator's GET-only GetActionList report on
   # 2026-11-07/09 (ID 12 is the left-hand kiss and ID 13 the right-hand kiss).
   # GetActionList is queried at startup and compared by exact id+name (D7,

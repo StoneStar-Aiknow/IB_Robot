@@ -3,7 +3,7 @@
 归档日期：2026-10-30。
 
 > **2026-11-07 适用范围补充。** 源码中的 `g1_29dof_arm_presets` 已扩展为 23 个
-> 静态数字 ID 预设（目录/planner 可见 23 项，`arms_horizontal` 仍绑定 ID 15，
+> 静态数字 ID 预设（静态目录/planner 可见 23 项，运行时可见数另计；`arms_horizontal` 仍绑定 ID 15，
 > `release_arm` 为 ID 99）。本页 2026-10-30 的命令、示例和单动作版本仍只描述
 > 当时部署的 action 15 路径；23 项目录需要新 profile、catalog/runtime 安装更新，
 > 并在授权窗口内重启会话语义后才能生效。不能覆盖正在使用的 install 或现场
@@ -15,6 +15,23 @@
 > 并给出原因。
 > 固件命名边界：动作名以 2026-11-07/09 只读 GetActionList 报告为准，按 ID+名称
 > 精确匹配；固件改名时该动作不会被 ID 兜底启用，需用新的只读报告更新 profile。
+>
+> **2026-11-10 操作员现场确认（ID 15／ID 17）。** ID 15 `arms_horizontal`
+> （固件 `both_hands_up`，双手平举到胸前）的中文展示「双臂平举」经现场确认正确，
+> 本次不改名。ID 17 的固件字符串是 `clamp`，实际动作是双手鼓掌；此前中文展示
+> 「夹紧动作」属于语义错误。当时只修展示/语义元数据：固件 `action_name` `clamp`、
+> 动作 ID 17、执行绑定和准入规则都不变，`display_name` 改为「鼓掌」，摘要和别名
+> 按鼓掌描述。证据来源是操作员现场确认，不是相机录制，也不是 Agent 独立真机实测；
+> 当时没有启动、停止或重启真机、Gateway、Web 或 SDK 命令。
+>
+> **公开键名统一（ID 17）。** 后续补丁把公开技能键从 `clamp` 改为 `clap`：
+> manifest 目录、`capabilities.motion.named.names`、`vendor.arm_actions` 的公开
+> 键、catalog profile、实现绑定和能力名都使用 `clap`，与 full dex3 已有的 `clap`
+> 一致。固件 `action_name` 仍是精确的 `clamp`，动作 ID 仍是 17，厂商
+> GetActionList fixture 不变。旧工作流中的 `skill_name: clamp` 必须改成
+> `skill_name: clap`，本轮不保留 alias。改名会更新 registry digest：旧 preview
+> 会被拒绝，必须重载/重建 registry 后重新 prepare，不能复用旧 goal，也不能为了
+> 应用改名而执行任何动作。ID 15 的映射和展示不变。
 
 本页归档本次 Ubuntu 工作区的真机预置动作流程。
 操作入口包括 Web 和命令行界面（CLI）。
@@ -170,8 +187,11 @@ Gateway 只为未显式配置 `robot_skill_cli` 令牌的部署填入空值；�
 禁止为同一机器人同时启动 2 套 runtime。
 
 启动日志应显示运行时就绪和预置动作目录生成。
-2026-10-30 的会话发现了 23 个预置动作。
-动作数量随机器人返回的目录变化，不是固定验收值。
+预置动作有 3 个数量口径，不能混用。
+`g1_29dof_arm_presets` 的静态集合固定为 23 个数字 ID（profile 允许表，不是运行时发现结果）。
+完整 profile `g1_29dof_dex3` 仍只有既有 9 条 `vendor.arm_actions` 映射，不随静态集合扩展。
+运行时 `RuntimeStatus` 只发布固件 `GetActionList` 的确认子集；该子集可能少于 23，查询超时、失败或固件不返回某动作时也可以为空。
+确认子集为空不是回退到 23，也不表示 23 项可用。
 
 完整技能链路入口为 `embodied_bringup embodied_pipeline.launch.py`。
 该入口包含 Gateway 和 runtime。

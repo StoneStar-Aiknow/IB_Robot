@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import tempfile
 from pathlib import Path
 
 import launch
@@ -257,7 +258,11 @@ def test_arm_preset_physical_rejects_an_unparseable_confirmation():
         )
 
 
-def test_arm_preset_physical_uses_a_run_scoped_profile():
+def test_arm_preset_physical_passes_per_run_parameters_without_a_profile_file(monkeypatch):
+    def _no_temp_profile(*_args, **_kwargs):
+        raise AssertionError("physical preset commissioning must not write a profile file")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", _no_temp_profile)
     actions = _render_preset(
         preset_operator_confirmed="true",
         runtime_network_interface="eth9",
@@ -266,17 +271,14 @@ def test_arm_preset_physical_uses_a_run_scoped_profile():
     runtime = next(node for node in actions if isinstance(node, Node))
     params = _node_params(runtime)
     assert params["preset_operator_confirmed"] is True
+    assert params["runtime_network_interface"] == "eth9"
+    assert params["preset_expected_fsm_id"] == 802
     assert params["vendor_network_interface"] == "eth9"
     assert params["vendor_domain_id"] == 0
     assert params["preset_test_transport"] is False
-    assert params["profile"] != str(_PRESET_PROFILE)
-    run_profile = yaml.safe_load(Path(params["profile"]).read_text(encoding="utf-8"))
-    assert run_profile["vendor"]["operator_validation"] == {
-        "confirmed": True,
-        "network_interface": "eth9",
-        "expected_fsm_id": 802,
-    }
-    # The source profile is still the audited template, never a confirmed one.
+    # The node reads the audited source profile; the per-run values ride as
+    # ROS parameters, so no run-scoped or confirmed profile exists anywhere.
+    assert params["profile"] == str(_PRESET_PROFILE)
     source_profile = yaml.safe_load(_PRESET_PROFILE.read_text(encoding="utf-8"))
     assert "operator_validation" not in source_profile["vendor"]
 
@@ -289,8 +291,8 @@ def test_arm_preset_physical_accepts_an_audited_profile_fsm(tmp_path):
         runtime_network_interface="eth9",
     )
     params = _node_params(next(node for node in actions if isinstance(node, Node)))
-    run_profile = yaml.safe_load(Path(params["profile"]).read_text(encoding="utf-8"))
-    assert run_profile["vendor"]["operator_validation"]["expected_fsm_id"] == 500
+    assert params["profile"] == str(profile)
+    assert params["preset_expected_fsm_id"] == 500
 
 
 def test_arm_preset_physical_rejects_conflicting_overrides(tmp_path):

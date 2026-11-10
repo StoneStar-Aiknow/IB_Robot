@@ -23,11 +23,10 @@ def test_supervised_preset_rechecks_each_request_without_changing_fsm(fsm, expec
     node._lock = threading.RLock()
     node._state = SimpleNamespace(stop_latched=False)
     # The ownership check the preflight runs is the profile's own declaration;
-    # only the operator's expected FSM is per-session.
-    node._vendor = {
-        **load_profile(PROFILE)["vendor"],
-        "operator_validation": {"expected_fsm_id": 802},
-    }
+    # the expected FSM is the per-run commissioning value, never a profile
+    # field that a stale confirmed profile could carry.
+    node._vendor = load_profile(PROFILE)["vendor"]
+    node._preset_expected_fsm_id = 802
     node._lowstate_stamp = time.monotonic()
     node._feedback_window_s = 0.5
     node.rpc_call = Mock(
@@ -58,7 +57,7 @@ EXPECTED_ACTIONS = {
     "blow_kiss_with_left_hand": (12, "blow_kiss_with_left_hand"),
     "blow_kiss_with_right_hand": (13, "blow_kiss_with_right_hand"),
     "arms_horizontal": (15, "both_hands_up"),
-    "clamp": (17, "clamp"),
+    "clap": (17, "clamp"),
     "high_five": (18, "high_five"),
     "hug": (19, "hug"),
     "make_heart_with_both_hands": (20, "make_heart_with_both_hands"),

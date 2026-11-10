@@ -103,10 +103,29 @@ def test_a_subset_report_shrinks_to_the_reported_actions():
     assert _confirm(_bare_node(PRESET_PROFILE), response) == {"arms_horizontal", "release_arm"}
 
 
+def test_preset_clap_key_keeps_the_saved_firmware_action_name_for_id_17():
+    actions = load_profile(PRESET_PROFILE)["vendor"]["arm_actions"]
+    assert actions["clap"] == {"action_id": 17, "action_name": "clamp"}
+    assert "clamp" not in actions
+    # ID 15 is not part of this rename.
+    assert actions["arms_horizontal"] == {"action_id": 15, "action_name": "both_hands_up"}
+
+
+def test_preset_clap_key_does_not_match_a_renamed_firmware_token():
+    response = _saved_response()
+    response[0] = [item for item in response[0] if item["id"] != 17]
+    response[0].append({"id": 17, "name": "clap"})
+    served = _confirm(_bare_node(PRESET_PROFILE), response)
+    assert "clap" not in served
+    assert "arms_horizontal" in served
+
+
 def test_a_renamed_or_unreported_action_stays_unadvertised():
     response = _saved_response()
     response[0] = [item for item in response[0] if item["id"] not in {17, 20}]
-    response[0].append({"id": 17, "name": "clap"})  # same id as clamp, old alias
+    # Same ID, different firmware name: the public key `clap` must not satisfy
+    # exact matching against the firmware token `clamp`.
+    response[0].append({"id": 17, "name": "clap"})
     served = _confirm(_bare_node(DEX3_PROFILE), response)
     assert "heart" not in served
     assert "clap" not in served

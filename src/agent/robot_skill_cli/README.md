@@ -209,6 +209,11 @@ runtime 命令只访问 Gateway status、
 `CancelGoal` 接口；视觉游戏 runtime 命令只访问 start/result 服务。Hermes 启动前会先验证四个版本化
 Skill/Primitive 公共接口，再检查 Gateway/Agent 接口。
 
+G1 预置 ID 17 的公开键名已从 `clamp` 改为 `clap`。旧 `workflow_json` 中的
+`"skill_name": "clamp"` 必须改成 `"clap"`，本轮不提供 alias。改名会更新 registry digest，
+旧 preview 会被拒绝；重载/重建 registry 后必须重新 prepare，不能复用旧 goal。仅改键名
+不需要执行任何动作。
+
 ```bash
 robot-skill --config-name so101_single_arm list-skills
 robot-skill --config-name so101_single_arm describe move_relative_ee

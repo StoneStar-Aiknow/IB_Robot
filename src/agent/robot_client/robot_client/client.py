@@ -156,6 +156,9 @@ class RobotClient:
         from .catalog import capability_view_from_snapshot
 
         bridge = self._bridge_for_operations()
+        # status and snapshot are separate read-only reads; a registry restart or reload
+        # can land between them. Only SKILL_SNAPSHOT_NOT_FOUND, SKILL_REGISTRY_EPOCH_MISMATCH
+        # and SKILL_REGISTRY_NOT_READY retry once with a fresh status read; others final, no physical retry.
         for attempt in range(2):
             status = self.get_status()
             if not status.get("control_plane_ready"):

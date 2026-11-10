@@ -10,26 +10,50 @@ firmware preset actions requested by the operator (IDs 1, 11–13, 15, 17–30, 
 34, 36 and 99). It has no hand subscriptions, hand writers, arm-stream writer,
 locomotion commands or posture actions, and starts in idle. Physical preflight
 uses a loco client for read-only FSM queries. The application configuration is
-`unitree_g1_arm_presets`; its catalog exposes 23 `runtime_named_motion` skills
-with stable names, Chinese `display_name` and `tags: [preset,
-unitree_action_id_<N>]` (`release_arm` also carries `control_ownership`).
-`arms_horizontal` keeps its existing ID 15 binding (`both_hands_up`);
-`release_arm` is ID 99.
+`unitree_g1_arm_presets`; its catalog exposes the 23 static
+`runtime_named_motion` skills with stable names, Chinese `display_name` and
+`tags: [preset, unitree_action_id_<N>]` (`release_arm` also carries
+`control_ownership`). `arms_horizontal` keeps its existing ID 15 binding
+(`both_hands_up`); `release_arm` is ID 99. These 23 are the static preset set:
+the full `g1_29dof_dex3` profile keeps its existing 9 `vendor.arm_actions`
+mappings, and the runtime advertises only the `GetActionList`-confirmed subset,
+which may be smaller or empty.
 
-The catalog display tags are generated from this profile, not hand-written:
-`python3 -m unitree_g1_robot.preset_presentation --check` (add `--write` to
-regenerate) rewrites only `capability.tags` in
+Operator on-site confirmation on 2026-11-10 covers two labels in that table. ID
+15 `arms_horizontal` (firmware `both_hands_up`, both hands raised to the chest)
+keeps its existing `双臂平举` display and its ID 15 mapping. ID 17 is a two-hand
+applause gesture: the public skill key is `clap` (matching the full dex3
+profile), while the firmware string `clamp` remains the exact `action_name` and
+`action_id` 17, so exact `GetActionList` matching and filtered dispatch do not
+change. Only the catalog display metadata describes applause: `display_name:
+鼓掌`, and the summaries/aliases use clap/applaud instead of clamp/hard grip, so
+a planner never receives the old clamping meaning. Workflows written against the
+old preview must replace `skill_name: clamp` with `clap`. This rename changes the
+registry digest; old previews are rejected, so reload the registry and prepare a
+new preview instead of reusing the old goal. This record is operator-reported
+on-site confirmation, not a camera recording and not an Agent real-robot test; no
+G1, Gateway, Web, or SDK process was started, stopped, or restarted to change
+these labels, and no action was dispatched.
+
+The catalog display tags are generated from this profile, not hand-written.
+The offline tool lives outside this package because the robot package must not
+write an agent asset: `python3 tools/g1_preset_presentation.py --check` (add
+`--write` to regenerate) rewrites only `capability.tags` in
 `src/agent/skill_catalog/config/skills/<skill>/manifest.yaml`. The profile's
 `vendor.arm_actions` stays the only source of the numbers, and
-`test/test_catalog_action_id_presentation.py` fails when a profile id and the
-shipped tag drift apart. The tags are display-only: they change no binding,
-recovery policy, FSM rule or admission result, and the CLI/Web show them as
-badges without ever selecting a firmware action from a number.
+`tools/test_g1_preset_presentation.py` fails when a profile id and the shipped
+tag drift apart. The tags are display-only: they change no binding, recovery
+policy, FSM rule or admission result, and the CLI/Web show them as badges
+without ever selecting a firmware action from a number.
 
 **Catalog visibility is not readiness or admission.** The catalog lists all 23
-so the Web UI and planner can describe them, but the current Gateway/catalog
-contract has no per-action `ready` flag. The runtime enforces the two firmware
-limits reported by the operator's GET-only query before `ExecuteAction`:
+static entries so the Web UI and planner can describe them, but the current
+Gateway/catalog contract has no per-action `ready` flag. The runtime advertises
+only the `GetActionList`-confirmed subset; it can be smaller than 23 and can be
+empty when the query times out, fails, or the firmware omits an action. An empty
+subset never falls back to the 23-entry static table. The runtime enforces the
+two firmware limits reported by the operator's GET-only query before
+`ExecuteAction`:
 
 - ID 1 `turn_back_wave` requires FSM 500/501. The current deployment's
   `expected_fsm_id` is 802, so admission rejects it with
@@ -72,10 +96,11 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 `preset_operator_confirmed` defaults to `false` and fails closed. The launch
 requires a non-empty, non-loopback `runtime_network_interface` and an expected
 FSM id (the explicit argument, or an audited
-`vendor.operator_validation.expected_fsm_id` in the profile). It assembles a
-run-scoped profile internally and deletes it on exit; the source profile is
-never rewritten, and the user never passes a temporary profile path. Launch and
-node enforce the boundary. Before
+`vendor.operator_validation.expected_fsm_id` in the profile). It passes those
+three facts to the node as ROS parameters for this run only: no temporary or
+run-scoped profile is written, and the node re-checks the same gate so a stale
+`confirmed: true` profile cannot bypass the per-run confirmation. The source
+profile is never rewritten. Launch and node enforce the boundary. Before
 dispatch the runtime reads service ownership, FSM, fresh feedback and the
 per-action limit for each independent request. A successful RPC completion
 permits a later request; concurrent dispatch is rejected. Timeout, transport
@@ -264,8 +289,8 @@ a guided error when the SDK is missing.
 
 | Profile | Surface | Robot | End effector | Joints |
 |---|---|---|---|---|
-| `profiles/g1_29dof_dex3.yaml` | full runtime contract | G1, 29 DoF | Dex3 dexterous hands (7 joints each) | 43 observable: 12 legs, 3 waist, 14 arms, 14 fingers |
-| `profiles/g1_29dof_arm_presets.yaml` | 23 static preset actions (IDs 1, 11–13, 15, 17–30, 33, 34, 36, 99); the deployed profile still exposes only action 15 | G1, 29 DoF | none (no hand, stream or base surface) | 29 observed, no command channels |
+| `profiles/g1_29dof_dex3.yaml` | full runtime contract; existing 9 `vendor.arm_actions` mappings | G1, 29 DoF | Dex3 dexterous hands (7 joints each) | 43 observable: 12 legs, 3 waist, 14 arms, 14 fingers |
+| `profiles/g1_29dof_arm_presets.yaml` | 23 static preset actions (IDs 1, 11–13, 15, 17–30, 33, 34, 36, 99); the runtime publishes only the `GetActionList`-confirmed subset (possibly empty, no fallback); the deployed profile still exposes only action 15 | G1, 29 DoF | none (no hand, stream or base surface) | 29 observed, no command channels |
 
 The profile is the single source of runtime parameters: public joint
 projection, modes and their vendor actions, command channels, declared

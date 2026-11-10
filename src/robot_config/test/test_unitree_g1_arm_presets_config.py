@@ -13,7 +13,7 @@ EXPECTED_ACTIONS = (
     "blow_kiss_with_left_hand",
     "blow_kiss_with_right_hand",
     "arms_horizontal",
-    "clamp",
+    "clap",
     "high_five",
     "hug",
     "make_heart_with_both_hands",
@@ -81,6 +81,9 @@ def test_preset_surface_is_one_static_23_action_contract():
 
     assert actions["arms_horizontal"]["action_id"] == 15
     assert actions["arms_horizontal"]["action_name"] == "both_hands_up"
+    # Public key clap; the exact firmware token stays clamp and ID 17 is unchanged.
+    assert actions["clap"] == {"action_id": 17, "action_name": "clamp"}
+    assert "clamp" not in actions
     assert actions["turn_back_wave"].get("fsm_ids") == [500, 501]
     for name in MODE_MACHINE_LIMITED:
         assert actions[name].get("mode_machine") == [5, 6]

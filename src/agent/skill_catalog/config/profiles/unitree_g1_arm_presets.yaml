@@ -24,7 +24,7 @@ enabled_skills:
 - name: arms_horizontal
   implementation: g1_preset_v1
   planner_visible: true
-- name: clamp
+- name: clap
   implementation: g1_preset_v1
   planner_visible: true
 - name: high_five

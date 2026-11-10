@@ -23,10 +23,23 @@ The catalog compiler and clients do not maintain vendor-specific translations.
 Older manifests without these fields remain valid. Display labels are not
 physical validation or motion-authorization claims.
 
+A stable `name` is the public skill key. The G1 preset entry for firmware action
+17 is `clap`: its manifest directory, implementation binding, profile entry and
+capability name all use `clap`, matching the already-published full dex3 profile.
+The runtime profile still owns the exact firmware `action_name` `clamp` and
+`action_id` 17, so exact `GetActionList` matching and filtered dispatch do not
+change. The old public key `clamp` is not kept as an alias: not-yet-merged
+workflows must change `skill_name: clamp` to `skill_name: clap`. Renaming the
+skill changes the registry digest, so an old preview is rejected; reload or
+re-materialize the registry, then prepare a new preview. Never reuse the old
+goal, and do not dispatch any action just to apply a naming change.
+
 A vendor firmware action number travels in the same optional `tags` list as a
 `<vendor>_action_id_<N>` tag (for example `unitree_action_id_99`), never as a
 core capability field. The owning provider derives it from its runtime profile
-(`vendor.arm_actions`) and a provider-side consistency test fails when the
+(`vendor.arm_actions`); the offline bridge lives in `tools/` so the robot
+package never writes this catalog and the catalog compiler never imports robot
+publisher/vendor code. `tools/test_g1_preset_presentation.py` fails when the
 profile number and the shipped tag drift; `control_ownership` marks
 `release_arm` as a control-ownership operation for display. Neither tag adds an
 execution entry point, and clients treat both as opaque display strings: the

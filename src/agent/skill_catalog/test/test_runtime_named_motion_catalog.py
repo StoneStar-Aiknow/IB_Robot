@@ -158,7 +158,7 @@ G1_PRESET_NAMES = (
     "blow_kiss_with_left_hand",
     "blow_kiss_with_right_hand",
     "arms_horizontal",
-    "clamp",
+    "clap",
     "high_five",
     "hug",
     "make_heart_with_both_hands",
@@ -178,14 +178,18 @@ G1_PRESET_NAMES = (
 )
 
 
-def test_g1_preset_catalog_exposes_all_23_operator_reported_presets():
+def _g1_preset_snapshot():
     context = _context()
     context = replace(context, robot=replace(context.robot, robot_name="unitree_g1_arm_presets"))
-    snapshot = compile_skill_catalog(
+    return compile_skill_catalog(
         DevelopmentStagingSkillSource(Path(__file__).resolve().parents[1]),
         profile_name="unitree_g1_arm_presets",
         context=context,
     )
+
+
+def test_g1_preset_catalog_exposes_all_23_operator_reported_presets():
+    snapshot = _g1_preset_snapshot()
     assert len(snapshot.enabled_skill_names) == len(G1_PRESET_NAMES)
     assert set(snapshot.enabled_skill_names) == set(G1_PRESET_NAMES)
     assert set(snapshot.planner_visible_skill_names) == set(G1_PRESET_NAMES)
@@ -208,6 +212,59 @@ def test_g1_preset_catalog_exposes_all_23_operator_reported_presets():
         assert list(snapshot.capability_view[name]["required_capabilities"]) == ["motion.named"]
     assert snapshot.capability_view["release_arm"]["display_name"] == "释放手臂控制"
     assert snapshot.semantic_levels["release_arm"] == "atomic_operator"
+
+
+def test_g1_action_17_public_key_is_clap_and_keeps_firmware_clamp():
+    """Operator-confirmed ID 17 is public ``clap``; the firmware token stays ``clamp``.
+
+    The public key, manifest directory, profile capability name and execution
+    binding are ``clap`` so this preset surface matches the already-published
+    full dex3 profile. The runtime profile, not this manifest, owns the exact
+    firmware ``action_name`` ``clamp`` and its id 17 for GetActionList matching.
+    """
+    snapshot = _g1_preset_snapshot()
+    capability = snapshot.capability_view["clap"]
+    assert capability["name"] == "clap"
+    assert snapshot.templates["clap"]["binding"] == {"motion": "clap"}
+    assert capability["display_name"] == "鼓掌"
+    summary = capability["summary"].lower()
+    assert "clap" in summary or "applaud" in summary
+    assert not any(word in summary for word in ("clamp", "clamping", "hard grip", "hardgrip", "夹紧"))
+    assert capability["domain"] == "social"
+    assert capability["recovery_policy"] == "never_retry"
+    assert tuple(capability["tags"]) == ("preset", "unitree_action_id_17")
+    assert "clap" in snapshot.planner_visible_skill_names
+    # The old public key is gone; no compatibility alias re-exposes it.
+    assert "clamp" not in snapshot.enabled_skill_names
+    assert "clamp" not in snapshot.planner_visible_skill_names
+    assert "clamp" not in snapshot.templates
+
+    manifest_path = Path(__file__).resolve().parents[1] / "config/skills/clap/manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    description = manifest["description"]
+    assert manifest["name"] == "clap"
+    assert manifest["implementations"] == {"g1_preset_v1": "implementations/g1_preset_v1.yaml"}
+    assert tuple(description["motion_scope"]) == ("arm",)
+    assert description["intensity"] == "moderate"
+    assert description["duration_sec_estimate"] == 10.0
+    assert set(description["aliases_zh"]) == {"鼓掌", "拍手"}
+    assert "clamp" not in {alias.lower() for alias in description["aliases_en"]}
+    semantic_text = " ".join(
+        [
+            description["summary"],
+            *description["when_to_use"],
+            *description["aliases_zh"],
+            *description["aliases_en"],
+        ]
+    ).lower()
+    assert "clap" in semantic_text or "applaud" in semantic_text
+    assert "夹紧" not in semantic_text
+    assert "hardgrip" not in semantic_text and "hard grip" not in semantic_text
+
+    # ID 15 is operator-confirmed correct; this change does not rename it.
+    arms_horizontal = snapshot.capability_view["arms_horizontal"]
+    assert arms_horizontal["display_name"] == "双臂平举"
+    assert snapshot.templates["arms_horizontal"]["binding"] == {"motion": "arms_horizontal"}
 
 
 def test_display_metadata_changes_capability_digest_not_execution_binding(tmp_path):
