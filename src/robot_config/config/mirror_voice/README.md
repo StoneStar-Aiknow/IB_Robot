@@ -30,7 +30,7 @@ wav 和模型都不进 git，按下面放到板上。
 
 ## 2. 从哪里拿 wav
 
-发布目录（本机）：`/mnt/oee/WEDDINGPRESENT/VOICE/x2_mirror_clips_v2/`，里面有 64 个 wav、
+发布目录（本机）：`<本机发布目录>/x2_mirror_clips_v2/`，里面有 64 个 wav、
 `clips.tsv`（id、句池、时长、文本）、`SHA256SUMS` 和它自己的 `README.md`。给别人时打成一个包：
 
     tar czf x2_mirror_clips_v2.tar.gz x2_mirror_clips_v2
