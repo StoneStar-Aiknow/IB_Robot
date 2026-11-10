@@ -803,6 +803,16 @@ dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` 
 V3 同时携带 V1 操作 primitive 与 V2 导航 primitive，并在 digest preimage 中加入
 `supported_control_modes`，防止与旧 snapshot 混用。
 
+### 运行时 provider 的按次操作员确认参数
+
+`robot.launch.py`（以及 `embodied_pipeline.launch.py`）声明三个按次参数：
+`runtime_network_interface`、`preset_operator_confirmed`（默认 `false`）、
+`preset_expected_fsm_id`（默认空）。参数只转发给明确声明支持的 provider
+（当前为 `unitree_g1_robot`）；其他 provider 不会收到未知参数。G1 preset
+物理路径要求确认值为 `true`、NIC 非空且非 `lo`、FSM 显式或来自已审
+profile；冲突的重叠取值直接拒绝。确认值只存在于本次启动，不写入配置或
+profile 文件。
+
 ### `base_navigation` 控制模式
 
 `base_navigation` 是 V2/V3 context 授权导航 primitive 的控制模式。它在 `control_modes` 中声明

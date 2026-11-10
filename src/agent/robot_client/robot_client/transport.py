@@ -10,7 +10,7 @@ canonical identity every request is scoped to.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any
 
 from embodied_common.canon import sha256_text, to_canonical_json
@@ -39,8 +39,35 @@ ENDPOINT_TYPES = {
     "get_visual_game_result_service": "ibrobot_msgs/srv/GetVisualGameResult",
 }
 
+#: ``embodied`` configuration keys read by :func:`gateway_transport`. They are
+#: literal endpoint strings in the robot configuration; the transport refuses
+#: a non-string value instead of silently falling back to a default endpoint.
+ENDPOINT_CONFIG_KEYS: tuple[str, ...] = (
+    "skill_gateway_status_service",
+    "skill_catalog_snapshot_service",
+    "skill_catalog_reload_service",
+    "validate_skill_service",
+    "skill_action_name",
+    "primitive_action_name",
+    "validate_primitive_service",
+    "plan_service",
+    "prepare_plan_service",
+    "validate_plan_service",
+    "confirm_plan_service",
+    "execute_plan_action",
+    "execute_program_action",
+    "get_execution_service",
+    "get_execution_events_service",
+    "cancel_execution_service",
+    "start_visual_game_service",
+    "get_visual_game_result_service",
+)
+
 #: ``bridge_kwargs`` parameter names that differ from the transport field name.
 _ENDPOINT_ALIASES = {"skill_action": "skill_action_name", "primitive_action": "primitive_action_name"}
+
+#: The single source of truth from a contract key to its transport field.
+_ENDPOINT_FIELDS = {key: _ENDPOINT_ALIASES.get(key, key) for key in ENDPOINT_TYPES}
 
 
 @dataclass(frozen=True)
@@ -55,6 +82,7 @@ class GatewayTransport:
     snapshot_service: str = "/embodied/get_skill_snapshot"
     reload_service: str = "/embodied/reload_skill_catalog"
     plan_service: str = "/embodied/plan_agent_command"
+    prepare_plan_service: str = "/embodied/prepare_agent_plan"
     validate_plan_service: str = "/embodied/validate_agent_plan"
     confirm_plan_service: str = "/embodied/confirm_agent_plan"
     execute_plan_action: str = "/embodied/execute_agent_plan"
@@ -71,11 +99,7 @@ class GatewayTransport:
     @property
     def endpoints(self) -> dict[str, str]:
         """Return the normalized endpoint map used for identity and bridging."""
-        return {
-            key: getattr(self, _ENDPOINT_ALIASES.get(key, key))
-            for key in ENDPOINT_TYPES
-            if hasattr(self, _ENDPOINT_ALIASES.get(key, key))
-        }
+        return {key: getattr(self, field) for key, field in _ENDPOINT_FIELDS.items()}
 
     @property
     def target_name(self) -> str:
@@ -102,6 +126,16 @@ class GatewayTransport:
         )
 
 
+_ENDPOINT_FIELD_NAMES = frozenset(field.name for field in fields(GatewayTransport))
+_MISSING_ENDPOINT_FIELDS = sorted(
+    f"{key} -> {field_name}" for key, field_name in _ENDPOINT_FIELDS.items() if field_name not in _ENDPOINT_FIELD_NAMES
+)
+if _MISSING_ENDPOINT_FIELDS:
+    raise RuntimeError(
+        "GatewayTransport is missing fields declared by ENDPOINT_TYPES: " + ", ".join(_MISSING_ENDPOINT_FIELDS)
+    )
+
+
 def gateway_transport(
     embodied: Mapping[str, Any] | None,
     *,
@@ -116,6 +150,12 @@ def gateway_transport(
     the same ones the launch files use for the Gateway nodes.
     """
     values = dict(embodied or {})
+    for key in ENDPOINT_CONFIG_KEYS:
+        if key not in values:
+            continue
+        value = values[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"embodied.{key} must be a non-empty endpoint string")
     return GatewayTransport(
         status_service=values.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
         snapshot_service=values.get("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot"),
@@ -125,6 +165,7 @@ def gateway_transport(
         primitive_action_name=values.get("primitive_action_name", "/embodied/execute_primitive"),
         validate_primitive_service=values.get("validate_primitive_service", "/embodied/validate_primitive"),
         plan_service=values.get("plan_service", "/embodied/plan_agent_command"),
+        prepare_plan_service=values.get("prepare_plan_service", "/embodied/prepare_agent_plan"),
         validate_plan_service=values.get("validate_plan_service", "/embodied/validate_agent_plan"),
         confirm_plan_service=values.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
         execute_plan_action=values.get("execute_plan_action", "/embodied/execute_agent_plan"),

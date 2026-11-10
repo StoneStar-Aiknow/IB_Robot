@@ -6,7 +6,16 @@ transport — the in-repo vendor mock that stands in for the robot's own stack.
 
     ros2 launch unitree_g1_robot runtime.launch.py profile:=<path-or-name> \
         [simulated:=true] [instance_id:=<id>] [initial_mode:=<mode>] \
-        [network_interface:=<nic>] [peripherals:=<fragment.yaml>]
+        [network_interface:=<nic>] [peripherals:=<fragment.yaml>] \
+        [runtime_network_interface:=<nic>] [preset_operator_confirmed:=true] \
+        [preset_expected_fsm_id:=<fsm-id>]
+
+The arm-preset physical path additionally requires ``preset_operator_confirmed:=true``,
+a non-loopback ``runtime_network_interface`` and an expected FSM id (explicitly,
+or an audited ``vendor.operator_validation.expected_fsm_id`` in the profile).
+Those values are assembled into a run-scoped profile for the node (and removed
+when the launch process exits); the source profile is never rewritten and no
+``confirmed: true`` deployment file is required or produced.
 
 DDS (design D2, revised by Issue #171 PR 2): the vendor tier speaks
 CycloneDDS **inside the official SDK**, which binds its own cyclonedds-python
@@ -56,10 +65,15 @@ synthetic publishers stand in for them on exactly the declared endpoints.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
+import copy
 import json
+import os
 import tempfile
 from pathlib import Path
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, SetEnvironmentVariable
@@ -142,6 +156,116 @@ def _cyclonedds_uri(network_interface: str) -> str:
         return f"file://{handle.name}"
 
 
+_PRESET_DISABLED = "PRESET_HARDWARE_DISABLED"
+
+
+def _parse_preset_confirmation(raw: str) -> bool:
+    """Strict boolean for the per-run confirmation flag (default false)."""
+    text = str(raw or "").strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("", "0", "false", "no", "off"):
+        return False
+    raise RuntimeError(f"preset_operator_confirmed must be a boolean, got {raw!r}")
+
+
+def _parse_expected_fsm_id(raw: object, *, source: str) -> int:
+    """Parse a positive vendor FSM id, naming the argument on failure."""
+    text = str(raw or "").strip()
+    try:
+        fsm_id = int(text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{source} must be a positive integer FSM id, got {raw!r}") from exc
+    if fsm_id <= 0:
+        raise RuntimeError(f"{source} must be a positive integer FSM id, got {raw!r}")
+    return fsm_id
+
+
+def _preset_run_binding(profile: dict, context) -> tuple[str, int]:
+    """Resolve the per-run (NIC, expected FSM) binding for the preset path.
+
+    The confirmation is per launch invocation and never read from a persisted
+    ``confirmed: true`` profile. The FSM may come from the explicit argument or
+    an audited profile field; two disagreeing values are a conflict.
+    """
+    validation = (profile.get("vendor") or {}).get("operator_validation") or {}
+    if not isinstance(validation, dict):
+        raise RuntimeError("vendor.operator_validation must be a mapping")
+    if not _parse_preset_confirmation(context.launch_configurations.get("preset_operator_confirmed", "false")):
+        raise RuntimeError(
+            f"{_PRESET_DISABLED}: on-site operator confirmation required (preset_operator_confirmed:=true)"
+        )
+    nic = str(context.launch_configurations.get("runtime_network_interface", "") or "").strip()
+    if not nic or nic == "lo":
+        raise RuntimeError(
+            f"{_PRESET_DISABLED}: runtime_network_interface must name the robot-facing NIC (non-empty, not loopback)"
+        )
+    profile_nic = str(validation.get("network_interface", "") or "").strip()
+    if profile_nic and profile_nic != nic:
+        raise RuntimeError(
+            "preset commissioning has conflicting network interface overrides: "
+            f"runtime_network_interface={nic!r}, vendor.operator_validation.network_interface={profile_nic!r}"
+        )
+    configured_nic = str(context.launch_configurations.get("network_interface", "") or "").strip()
+    if configured_nic and configured_nic != nic:
+        raise RuntimeError(
+            "preset commissioning has conflicting network interface overrides: "
+            f"network_interface={configured_nic!r}, runtime_network_interface={nic!r}"
+        )
+    explicit_fsm = str(context.launch_configurations.get("preset_expected_fsm_id", "") or "").strip()
+    profile_fsm = validation.get("expected_fsm_id")
+    if explicit_fsm:
+        expected_fsm = _parse_expected_fsm_id(explicit_fsm, source="preset_expected_fsm_id")
+        if profile_fsm not in (None, ""):
+            audited_fsm = _parse_expected_fsm_id(profile_fsm, source="vendor.operator_validation.expected_fsm_id")
+            if audited_fsm != expected_fsm:
+                raise RuntimeError(
+                    "preset commissioning has conflicting expected FSM ids: "
+                    f"preset_expected_fsm_id={expected_fsm}, "
+                    f"vendor.operator_validation.expected_fsm_id={audited_fsm}"
+                )
+        return nic, expected_fsm
+    if profile_fsm not in (None, ""):
+        return nic, _parse_expected_fsm_id(profile_fsm, source="vendor.operator_validation.expected_fsm_id")
+    raise RuntimeError(
+        f"{_PRESET_DISABLED}: preset_expected_fsm_id is required (or an audited "
+        "vendor.operator_validation.expected_fsm_id in the profile)"
+    )
+
+
+def _remove_run_profile(path: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+
+
+def _write_preset_run_profile(profile: dict, *, network_interface: str, expected_fsm_id: int) -> str:
+    """Write the run-scoped profile the node reads; never touch the source file.
+
+    The node's preflight reads ``vendor.operator_validation.expected_fsm_id``
+    from its profile, so the per-run value is merged into a temporary copy. The
+    file is removed when the launch process exits and is never a deployment
+    artifact: the shipped profile stays without ``confirmed: true``.
+    """
+    run_profile = copy.deepcopy(profile)
+    vendor = run_profile.setdefault("vendor", {})
+    validation = dict(vendor.get("operator_validation") or {})
+    validation.update(
+        {
+            "confirmed": True,
+            "network_interface": network_interface,
+            "expected_fsm_id": expected_fsm_id,
+        }
+    )
+    vendor["operator_validation"] = validation
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".yaml", prefix="unitree_g1_preset_run_", delete=False, encoding="utf-8"
+    ) as handle:
+        yaml.safe_dump(run_profile, handle, default_flow_style=False, sort_keys=False)
+        path = handle.name
+    atexit.register(_remove_run_profile, path)
+    return path
+
+
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("unitree_g1_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
@@ -161,20 +285,20 @@ def _launch_setup(context, *_args, **_kwargs):
 
     if (profile.get("vendor") or {}).get("preset_only") is True:
         if not simulated:
-            validation = profile["vendor"].get("operator_validation") or {}
-            nic = str(validation.get("network_interface", "")).strip()
-            if validation.get("confirmed") is not True or not nic or nic == "lo":
-                raise RuntimeError("PRESET_HARDWARE_DISABLED: explicit operator validation profile required")
-            if peripherals_file or (network_interface and network_interface != nic):
+            nic, expected_fsm_id = _preset_run_binding(profile, context)
+            if peripherals_file:
                 raise RuntimeError("preset commissioning has conflicting network/peripheral overrides")
             description = build_description(profile, use_sim=False)
+            run_profile_path = _write_preset_run_profile(
+                profile, network_interface=nic, expected_fsm_id=expected_fsm_id
+            )
             return [
                 Node(
                     package="unitree_g1_robot",
                     executable="runtime_node",
                     parameters=[
                         {
-                            "profile": str(profile_path),
+                            "profile": run_profile_path,
                             "initial_mode": initial_mode,
                             "preset_operator_confirmed": True,
                             "preset_test_transport": False,
@@ -428,6 +552,23 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="",
                 description="Deployment peripherals fragment {peripherals: [...], fast_lio: {...}} "
                 "(overrides profile defaults by (type, name))",
+            ),
+            DeclareLaunchArgument(
+                "runtime_network_interface",
+                default_value="",
+                description="Robot-facing NIC for the physical arm-preset commissioning path "
+                "(non-empty and not loopback; never persisted)",
+            ),
+            DeclareLaunchArgument(
+                "preset_operator_confirmed",
+                default_value="false",
+                description="Per-run operator confirmation for physical arm-preset dispatch; false fails closed",
+            ),
+            DeclareLaunchArgument(
+                "preset_expected_fsm_id",
+                default_value="",
+                description="Expected vendor FSM id for the physical arm-preset session; "
+                "empty uses an audited vendor.operator_validation.expected_fsm_id",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

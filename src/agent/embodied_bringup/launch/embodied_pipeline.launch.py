@@ -195,6 +195,9 @@ def launch_setup(context, *_args, **_kwargs):
         "nav_stage": nav_stage,
         "with_moveit": requested_moveit,
         "moveit_display": context.launch_configurations.get("moveit_display", "false"),
+        "runtime_network_interface": context.launch_configurations.get("runtime_network_interface", ""),
+        "preset_operator_confirmed": context.launch_configurations.get("preset_operator_confirmed", "false"),
+        "preset_expected_fsm_id": context.launch_configurations.get("preset_expected_fsm_id", ""),
         "with_embodied": "false",
         "with_perception": "false",
     }
@@ -414,6 +417,21 @@ def generate_launch_description():
             DeclareLaunchArgument("moveit_display", default_value="false"),
             DeclareLaunchArgument("with_embodied", default_value=""),
             DeclareLaunchArgument("with_perception", default_value=""),
+            DeclareLaunchArgument(
+                "runtime_network_interface",
+                default_value="",
+                description="Robot-facing NIC for the runtime provider's physical commissioning path",
+            ),
+            DeclareLaunchArgument(
+                "preset_operator_confirmed",
+                default_value="false",
+                description="Per-run operator confirmation for physical preset dispatch; false fails closed",
+            ),
+            DeclareLaunchArgument(
+                "preset_expected_fsm_id",
+                default_value="",
+                description="Expected vendor FSM id for the physical preset session; empty uses an audited profile",
+            ),
             DeclareLaunchArgument("entry_mode", default_value=""),
             DeclareLaunchArgument("authorize_motion", default_value="false"),
             OpaqueFunction(function=launch_setup),

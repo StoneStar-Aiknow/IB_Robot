@@ -391,6 +391,36 @@ def _include_arguments(robot_config, **kwargs):
     return {text(key): text(value) for key, value in include.launch_arguments}
 
 
+_OPERATOR_ARGUMENTS = {
+    "runtime_network_interface": "eth9",
+    "preset_operator_confirmed": "true",
+    "preset_expected_fsm_id": "802",
+}
+
+
+def _stub_provider_launch(monkeypatch, tmp_path):
+    from robot_config.launch_builders import runtime as runtime_module
+
+    provider_launch = tmp_path / "runtime.launch.py"
+    provider_launch.write_text("# construction-only provider entry\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "resolve_runtime_launch", lambda _provider: str(provider_launch))
+
+
+def test_g1_provider_receives_the_operator_commissioning_arguments(monkeypatch, tmp_path):
+    _stub_provider_launch(monkeypatch, tmp_path)
+    config = _provider_config()
+    config["runtime"] = {**config["runtime"], "provider": "unitree_g1_robot"}
+    arguments = _include_arguments(config, use_sim=False, launch_arguments=_OPERATOR_ARGUMENTS)
+    for name, value in _OPERATOR_ARGUMENTS.items():
+        assert arguments[name] == value
+
+
+def test_non_g1_provider_never_receives_unknown_commissioning_arguments(monkeypatch, tmp_path):
+    _stub_provider_launch(monkeypatch, tmp_path)
+    arguments = _include_arguments(_provider_config(), use_sim=False, launch_arguments=_OPERATOR_ARGUMENTS)
+    assert not set(_OPERATOR_ARGUMENTS) & set(arguments)
+
+
 def test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias():
     hardware = _include_arguments(_provider_config(), use_sim=False)
     assert hardware["use_sim"] == "false"

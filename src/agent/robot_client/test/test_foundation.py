@@ -71,8 +71,11 @@ def test_legacy_ros_bridge_and_interactive_control_shims() -> None:
     assert interactive_control.InteractiveController is workflow.InteractiveController
 
 
-def test_stop_contract_exit_codes() -> None:
+def test_stop_contract_exit_codes_are_owned_by_embodied_common() -> None:
+    from embodied_common import exit_codes
     from robot_client.stop_contract import EXIT_ROS_UNAVAILABLE, EXIT_TIMEOUT
 
     assert EXIT_ROS_UNAVAILABLE == 4
     assert EXIT_TIMEOUT == 124
+    assert EXIT_ROS_UNAVAILABLE == exit_codes.EXIT_ROS_UNAVAILABLE
+    assert EXIT_TIMEOUT == exit_codes.EXIT_TIMEOUT

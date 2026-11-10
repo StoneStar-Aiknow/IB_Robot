@@ -172,6 +172,15 @@ class Browser:
         return result
 
 
+def wait_for_submission(server, preview_id):
+    """Wait on the worker's own completion condition instead of a fixed sleep."""
+    worker = server.state.submission_workers.get(preview_id)
+    if worker is None:
+        return
+    with worker["ready"]:
+        assert worker["ready"].wait_for(lambda: worker["done"], timeout=5), "submission worker did not finish"
+
+
 @pytest.fixture
 def web(tmp_path):
     with socket.socket() as sock:
@@ -366,11 +375,11 @@ def test_http_duplicate_submit_reuses_reference_and_keeps_session(web):
     assert replies[0][1]["execution"] == replies[1][1]["execution"]
     ref = replies[0][1]["execution"]
     assert ref["target_key"]
+    wait_for_submission(server, prepared["preview_id"])
     restored = browser.request("GET", "/api/session")[1]
     assert restored["session_active"] is True
     assert restored["connection"] == session
     assert restored["unresolved_executions"][0]["reference"] == ref
-    time.sleep(0.1)
     assert robot.submissions == 1
     assert server.state.submissions.get(prepared["preview_id"])["reference"] == ref
     assert browser.request("POST", "/api/session", {"candidate_id": "candidate-1"})[0] == 400
@@ -444,7 +453,6 @@ def test_restart_restores_original_target_without_resending(web):
         "POST", "/api/executions", {"preview_id": prepared["preview_id"], "connection_version": 1}
     )
     assert status == 202
-    time.sleep(0.1)
     from robot_skill_web.serialization import SubmissionStore
     from robot_skill_web.server import WebState
 
@@ -467,3 +475,23 @@ def test_restart_restores_original_target_without_resending(web):
     assert browser.request("GET", path)[1]["execution"]["state"] == "ACTIVE"
     assert robot.submissions == 1
     assert browser.request("POST", path + "/cancel", {"connection_version": session["connection_version"]})[0] == 202
+
+
+def test_a_gateway_transport_error_keeps_its_code_and_is_retryable(web, monkeypatch):
+    """A started bridge that loses the Gateway is a transport state, not a 500."""
+    browser, robot, _server = web
+    from robot_client.stop_contract import EXIT_ROS_UNAVAILABLE
+
+    def offline():
+        raise BridgeError(
+            "SERVER_UNAVAILABLE",
+            "service unavailable: /embodied/get_skill_gateway_status",
+            exit_code=EXIT_ROS_UNAVAILABLE,
+        )
+
+    monkeypatch.setattr(robot, "get_status", offline)
+    browser.connect()
+    status, body = browser.request("GET", "/api/status")
+    assert status == 503
+    assert body["error"]["code"] == "SERVER_UNAVAILABLE"
+    assert "service unavailable" in body["error"]["message"]

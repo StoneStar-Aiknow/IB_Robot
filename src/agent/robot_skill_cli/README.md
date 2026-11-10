@@ -34,8 +34,21 @@ ROBOT_CONFIG=unitree_g1 robot-skill status
 
 同一个配置解析出的 endpoint、robot 身份和当前 ROS 环境共同决定请求目标；
 换了配置或 ROS 域就是另一个目标，保存的执行引用不会跨目标复用。
+
+传输绑定只读取配置公开的 `embodied` 契约（endpoint、robot 身份、timeout），
+不要求 `runtime.interface_description` 快照，不编译本地技能，不读取模型目录，也不启动
+runtime provider 或查询厂商 SDK。声明了逻辑 runtime 接口的仓库配置（例如
+`unitree_g1_arm_presets` 的 `motion.named`）可以直接用 `--config-name` /
+`ROBOT_CONFIG` 驱动 `status`、在线 `list-skills` / `describe` / `list-poses`、取消、账本和
+`*workflow` 命令。在线目录命令向绑定的 Gateway 查询 status 和 skill snapshot，按
+epoch/generation/digest 校验快照身份后只投影服务端数据；没有可达 Gateway 时返回
+`SERVER_UNAVAILABLE`（exit 4），不会退化成 `description_required`。
+`--offline` 的目录检查、`list-games`、`describe-game`、`validate`、`execute`、
+`start-game`、`game-result` 仍要求接口已解析：使用 launch 打印的 consumer snapshot
+（`/tmp/ibrobot_interfaces_*/robot.yaml`），或本身不含逻辑接口的配置。`--config-path`
+用于带部署 endpoint 覆盖的稳定文件。
 配置绑定不代表运动已获授权，Gateway 的 `authorize_motion` 仍是唯一运行期授权边界。
-`--offline` 只用于显式检查本地开发目录，仍需配置选择器。
+`--offline` 只用于显式检查本地开发目录，仍需配置选择器，并保持严格本地校验。
 
 不再支持 `robot-skill discover`、`robot-skill connect`、`robot-skill disconnect`
 和 `--target`：目标切换属于旧的发现/选择流程，已移出本仓库客户端（Issue #238）。
@@ -185,9 +198,8 @@ source/field allowlist 限制可读取的感知量，通过 `ros2 topic echo --o
 消费时可能已经过期。该字面量在 `plan-workflow` 时冻结进 plan digest，后续按 frozen plan 语义审计；
 执行结果以真实运动为准，不自动重试或修正。
 
-默认在线目录命令通过 `RobotClient` 读取服务端快照。
-`--offline` 或显式旧配置下的目录命令才读取本地配置。
-离线目录命令不初始化 `rclpy`。
+默认在线目录命令从配置绑定的 Gateway 读取 status 与 skill snapshot。
+`--offline` 才读取本地配置并编译本地目录；离线目录命令不初始化 `rclpy`。
 runtime 命令只访问 Gateway status、
 `ValidateSkill`、`SkillCommand`、`ValidatePrimitive`、`PrimitiveCommand`、Agent plan services/actions 和标准
 `CancelGoal` 接口；视觉游戏 runtime 命令只访问 start/result 服务。Hermes 启动前会先验证四个版本化

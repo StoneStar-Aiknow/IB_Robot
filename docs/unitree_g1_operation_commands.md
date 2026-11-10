@@ -34,10 +34,10 @@
 
 ## 2. 已清理的临时部署
 
-以下目录已删除，仅保留路径用于识别历史会话：
+以下会话目录已删除，仅保留目录名用于识别历史会话：
 
 ```text
-/home/lhj/orca/tmp-sdk-verify/web-authorized-g1-20261029-tiklbnw2
+web-authorized-g1-<日期>-<随机后缀>（历史会话目录名，已删除；本页不保留主机绝对路径）
 ```
 
 删除范围包括以下内容：
@@ -86,7 +86,7 @@ DDS 指数据分发服务。
 2. 检查当前 DDS 配置。
 
 ```bash
-cd /home/lhj/orca/workspaces/IB_Robot/unitree-runtime-migration-171 &&
+cd <IB_Robot 工作区> &&
 export ROS_DOMAIN_ID=146 ROS_LOCALHOST_ONLY=0 &&
 source .shrc_local &&
 dds-config show
@@ -134,7 +134,7 @@ embodied 启动入口会应用原有的 Fast DDS UDPv4 处理。
 
 ```bash
 (
-cd /home/lhj/orca/workspaces/IB_Robot/unitree-runtime-migration-171 || exit
+cd <IB_Robot 工作区> || exit
 source .shrc_local || exit
 export ROS_DOMAIN_ID=146 ROS_LOCALHOST_ONLY=0
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
@@ -187,7 +187,7 @@ Web 在启动时按部署配置绑定目标机器人。
 3. 启动 Web 服务。
 
 ```bash
-cd /home/lhj/orca/workspaces/IB_Robot/unitree-runtime-migration-171 &&
+cd <IB_Robot 工作区> &&
 export ROS_DOMAIN_ID=146 ROS_LOCALHOST_ONLY=0 &&
 source .shrc_local &&
 ros2 run robot_skill_web robot-skill-web --config-name unitree_g1 --port 8765
@@ -195,6 +195,9 @@ ros2 run robot_skill_web robot-skill-web --config-name unitree_g1 --port 8765
 
 `--config-name` 必须指向本次部署使用的配置；也可改用 `--config-path` 或
 `ROBOT_CONFIG`，规则与 `robot-skill` 相同。四者都没有时 Web 以退出码 2 退出。
+声明逻辑 runtime 接口的配置（例如 `unitree_g1_arm_presets`）也可以直接用
+`--config-name`/`ROBOT_CONFIG` 启动：Web 只解析 `embodied` 传输契约，状态、目录和执行
+数据来自 Gateway，不需要 `/tmp/ibrobot_interfaces_*/robot.yaml` 快照或模型目录。
 Web 启动只读取本地配置，不连接 Gateway，也不发送动作。
 Web 启动不再引用本次会话目录。
 本工作区的 Web 可执行文件位于 ROS 包目录。
@@ -249,8 +252,8 @@ CLI 与 Web 是 2 个操作入口。
 两者复用同一个 Gateway，不要同时提交动作。
 
 旧 CLI 配置和密钥文件已删除。
-CLI 直接发现并连接目标。
-发现和连接不需要本地机器人资源。
+CLI 由部署配置直接绑定目标，不做发现、选择或连接握手。
+绑定目标不需要本地机器人资源。
 标准连接不加载密钥或凭证文件。
 连接验证不代表操作员身份验证。
 连接验证也不代表运动授权。
@@ -262,7 +265,7 @@ CLI 直接发现并连接目标。
 3. 用部署配置绑定目标，再查询状态和目录。
 
 ```bash
-cd /home/lhj/orca/workspaces/IB_Robot/unitree-runtime-migration-171 &&
+cd <IB_Robot 工作区> &&
 export ROS_DOMAIN_ID=146 ROS_LOCALHOST_ONLY=0 &&
 source .shrc_local &&
 robot-skill --config-name unitree_g1 status &&
@@ -271,6 +274,9 @@ robot-skill --config-name unitree_g1 describe g1_wave_above_head
 ```
 
 `--config-name` 必须与本次部署一致；也可用 `--config-path` 或 `ROBOT_CONFIG`。
+`status`、取消、账本和 `*workflow` 命令只解析传输契约，声明逻辑 runtime 接口时无需快照；
+`list-skills`、`describe`、`list-poses`、`validate`、`execute` 和视觉游戏命令仍使用本地
+配置，需要 launch 打印的 consumer snapshot 或本身不含逻辑接口的配置。
 不再支持 `robot-skill discover` / `connect` / `disconnect` 和 `--target`；
 目标在启动时由配置确定，换目标就是换配置与 ROS 域。
 配置绑定不会创建凭证绑定，也不会恢复已删除的配置。

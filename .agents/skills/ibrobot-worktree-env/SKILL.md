@@ -15,12 +15,15 @@ This skill handles the **mixed-environment trap** that appears when working insi
 
 ## Core Problem
 
-IB_Robot's `.shrc_local` uses **two different path resolution bases**, which is what makes the worktree environment tricky:
+`.shrc_local` resolves `WORKSPACE`, `PYTHONPATH`, `install/setup.sh` **and** the default `venv/`
+from the script's own location, so a worktree uses its own code and build artifacts. The venv
+must be selected explicitly: a worktree created with `git worktree add` has no `venv/`, so
+without a selector it silently runs on system Python, where venv-only packages
+(`unitree_sdk2py`, `jsonschema>=4`, ...) are missing and `ros2 launch` fails while loading the
+launch file.
 
-- `venv/bin/activate` → resolved relative to the **caller's PWD** (the command is `source venv/bin/activate` with no path prefix, so it depends on where you run `source .shrc_local`)
-- `WORKSPACE`, `PYTHONPATH`, `install/setup.sh` → resolved relative to `.shrc_local`'s **file location** (via `BASH_SOURCE` / `%x`), so they always point to the directory containing the sourced `.shrc_local`
-
-If you source the **main repo's** `.shrc_local` from a worktree, you get a **mixed environment**: the venv activation depends on your PWD, but `WORKSPACE` / `PYTHONPATH` / `install/setup.sh` all point to the main repo. This silently makes you test the wrong branch.
+Use the `IBROBOT_VENV` selector described below; do not source another checkout's `.shrc_local`
+and do not hand-assemble `PYTHONPATH`.
 
 ## ❌ Wrong Approach — Do NOT Source Main Repo's .shrc_local
 
@@ -31,10 +34,7 @@ source /path/to/main/IB_Robot/.shrc_local   # ❌ WRONG
 
 Why this is wrong:
 
-- `.shrc_local` activates `venv/bin/activate` **relative to the current directory** — so it may activate the worktree's own venv (if present) or fail.
-- `WORKSPACE` is computed from `.shrc_local`'s file location — so it points to the **main repo**, not the worktree.
-- `PYTHONPATH` points to the **main repo's** `libs/lerobot/src` and venv site-packages path.
-- The loaded `install/setup.sh` is the **main repo's** build artifacts.
+- The venv, `WORKSPACE`, `PYTHONPATH` and the loaded `install/setup.sh` are all resolved from the **main repo** — not the worktree.
 
 Result: "worktree's Python venv + main repo's source code and ROS build artifacts". You will test the wrong branch without any visible error.
 
@@ -43,8 +43,9 @@ Result: "worktree's Python venv + main repo's source code and ROS build artifact
 Do not repair an already-loaded main-repo/worktree environment by sourcing another
 `.shrc_local`. Activation scripts prepend paths; they do not reliably remove the old
 `PYTHONPATH`, ROS overlay, or CMake prefix. If `VIRTUAL_ENV`, `PYTHONPATH`,
-`AMENT_PREFIX_PATH`, `CMAKE_PREFIX_PATH`, or `COLCON_PREFIX_PATH` is already set,
-refuse to initialize the shared-venv flow in that shell and open this clean child shell:
+`AMENT_PREFIX_PATH`, `CMAKE_PREFIX_PATH`, or `COLCON_PREFIX_PATH` is already set, prefer this
+clean child shell: the venv selector can replace an active venv, but it cannot remove stale
+ROS/Python path prefixes.
 
 ```bash
 env -i \
@@ -55,18 +56,13 @@ env -i \
   bash --noprofile --norc
 ```
 
-At the new prompt, initialize the worktree before activating the shared venv:
+At the new prompt, select the shared venv with the `IBROBOT_VENV` selector and source the
+worktree's `.shrc_local`:
 
 ```bash
 MAIN_REPO=/path/to/main/IB_Robot
 WORKTREE=/path/to/worktree
 cd "$WORKTREE"
-
-# A local venv would take over when .shrc_local is sourced. Fail closed.
-if [[ -e venv ]]; then
-  echo "Refusing shared-venv setup: $WORKTREE/venv already exists" >&2
-  exit 1
-fi
 
 # This is the only setup.sh mode allowed in the shared-venv flow. It initializes
 # missing submodules and verifies/applies the managed LeRobot patch stack, but
@@ -78,21 +74,21 @@ test -e libs/lerobot/.git
 test -f libs/lerobot/src/lerobot/__init__.py
 git -C libs/lerobot rev-parse --is-inside-work-tree
 
-source "$MAIN_REPO/venv/bin/activate"
-# ros2 CLI entry points use a hardcoded `#!/usr/bin/python3` shebang, so they
-# run under the SYSTEM python regardless of venv activation. The main repo's
-# .shrc_local exposes its venv site-packages to that system python via
-# PYTHONPATH; the worktree's .shrc_local instead points at the worktree's own
-# (nonexistent) venv path, which drops the shared venv's packages. Prepend the
-# shared venv site-packages explicitly, or `ros2 launch` fails with e.g.
-# `ImportError: cannot import name 'model_validator' from 'pydantic'
-# (/usr/lib/python3/dist-packages/pydantic/__init__.py)` and similar
-# venv-only-symbol errors before the launch file even loads.
-_PY_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
-export PYTHONPATH="$MAIN_REPO/venv/lib/${_PY_VER}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
-unset _PY_VER
+# One selector + one source. .shrc_local activates the shared venv, derives the
+# venv site-packages from VIRTUAL_ENV (so the system-python `ros2` CLI sees them
+# too), and adds this worktree's own source/build paths. Do not prepend
+# PYTHONPATH by hand.
+export IBROBOT_VENV="$MAIN_REPO/venv"
 source "$WORKTREE/.shrc_local"
 ```
+
+`IBROBOT_VENV` may live in your shell profile (for example an Orca worktree
+environment entry); agents must not edit a user's dotfiles. When the variable is unset,
+`.shrc_local` keeps the previous behaviour and uses `${WORKSPACE}/venv`. An invalid value
+(missing directory, plain file, or no readable `bin/activate`) prints an error and returns
+non-zero **before** changing any environment variable, so the shell never falls back to system
+Python or a different venv. If another venv is already active, the selector deactivates it
+first, so no foreign `PATH` entry survives into the worktree environment.
 
 Do not set `IBR_LEROBOT_FORCE_REBUILD=1` for routine initialization. That escape
 hatch may discard local `libs/lerobot` changes. A successful `--only-patch` run is
@@ -102,8 +98,8 @@ Why this works:
 
 1. `env -i` prevents a previous checkout's Python and ROS paths from surviving as fallbacks.
 2. `--only-patch` makes a fresh worktree's `libs/lerobot` importable without modifying the shared venv.
-3. The first `source` reuses the main repo's installed dependencies.
-4. The worktree's `.shrc_local` resolves `WORKSPACE`, `libs/lerobot/src`, and `install/setup.sh` from the current worktree.
+3. `IBROBOT_VENV` makes the worktree reuse the main repo's installed dependencies, and `.shrc_local` derives the venv site-packages from `VIRTUAL_ENV`, so both `python3` and the system-python `ros2` CLI see them.
+4. The worktree's `.shrc_local` resolves `WORKSPACE`, `libs/lerobot/src`, `install/setup.sh`, and the default local `venv/` from the current worktree (script location), not from the caller's PWD.
 
 ## Verification Snippet
 
@@ -179,15 +175,16 @@ for source, value in path_entries:
             break
 
 # ros2 CLI entry points use a hardcoded system-python shebang; they only see
-# venv-provided packages when PYTHONPATH exposes the active venv site-packages.
-# In the shared-venv flow the worktree's .shrc_local cannot do this (it points
-# at the worktree's own nonexistent venv path), so the caller must prepend it.
+# venv-provided packages because .shrc_local puts VIRTUAL_ENV's site-packages on
+# PYTHONPATH in the shared-venv flow. A missing entry means the shell was built
+# without the IBROBOT_VENV selector (or with an old .shrc_local).
 venv_site = shared_venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
 pythonpath_entries = [resolve_path(v) for v in os.environ.get("PYTHONPATH", "").split(os.pathsep) if v]
 if resolve_path(os.environ.get("VIRTUAL_ENV", "")) == shared_venv and venv_site not in pythonpath_entries:
     problems.append(
         "PYTHONPATH does not expose the shared venv site-packages, so ros2 CLI "
-        f"(system python shebang) cannot import venv packages: add {venv_site}"
+        "(system python shebang) cannot import venv packages: re-source the "
+        f"worktree .shrc_local with IBROBOT_VENV={shared_venv}"
     )
 
 if problems:
@@ -207,13 +204,14 @@ shared venv's `.pth` files or continue with a fallback-prone environment.
 
 ## Known Limitations of the Shared-venv Workaround
 
-This workaround is a **manual stopgap**, not a full solution. Be aware of:
+This workaround keeps one venv for several checkouts; it does not make the
+dependencies branch-independent. Be aware of:
 
 - **Requirements drift across branches**: if branches have incompatible `requirements/*.txt`, the shared venv may be missing packages or have wrong versions. Symptom: `ModuleNotFoundError` or version-mismatch errors in one worktree but not another.
 - **Concurrent setup contamination**: a full `./scripts/setup.sh` run mutates or creates a venv. In the shared-venv flow, only `./scripts/setup.sh --only-patch` is allowed, and it must run before shared-venv activation.
 - **LeRobot patch / extras mismatch**: source code comes from the current worktree, but LeRobot's installed dependencies (e.g. `pip install -e '.[extras]'` extras) still come from the shared venv. If patch levels or extras differ across branches, runtime errors may appear.
 - **Editable source leakage**: an absolute editable-install `.pth` in the shared venv may expose the main repo's source. The verification snippet rejects this; use a dedicated worktree venv instead of relying on import order.
-- **Local venv takeover**: once a worktree has its own `venv/bin/activate`, its `.shrc_local` switches to the local venv. The shared-venv flow therefore refuses to start when `venv/` already exists.
+- **Local venv vs selector**: with `IBROBOT_VENV` unset, a worktree's own `venv/` is the default target. The explicit selector wins over a local venv and over an already-active venv (the old one is deactivated first), so unset `IBROBOT_VENV` when you intentionally want the local venv.
 - **Absolute paths in pre-commit / entry scripts**: `.git/hooks/pre-commit` and similar entry scripts may contain absolute paths captured at venv-creation time. Usually fine as long as the main repo is not moved on disk; breaks if the main repo is relocated.
 - **Empty install/ in fresh worktrees**: a fresh shared-venv worktree has no build
   artifacts. `build.sh --packages-up-to <pkg>` covers only that package's
@@ -228,12 +226,12 @@ This workaround is a **manual stopgap**, not a full solution. Be aware of:
 ```
 Inside a worktree and need to run Python / ROS 2 / build?
 │
-├── Does the worktree have its own venv/?
-│   ├── YES → use the local venv; do not layer the main venv over it.
-│   └── NO  → follow the shared-venv flow:
+├── Do you want the worktree's own venv/ (when it exists)?
+│   ├── YES → leave IBROBOT_VENV unset and source .shrc_local.
+│   └── NO / no local venv → shared-venv flow:
 │             1. open an env-cleared child shell
 │             2. run ./scripts/setup.sh --only-patch --yes
-│             3. activate the main repo venv
+│             3. export IBROBOT_VENV="$MAIN_REPO/venv"
 │             4. source the worktree's .shrc_local
 │             5. run the fail-closed verification snippet
 │                └── failure → use a dedicated worktree venv
@@ -258,4 +256,8 @@ If the user is **not** inside a worktree, defer to `ibrobot-env`. Only invoke th
 
 ## Issue Tracker Reference
 
-The underlying fragility of this manual flow is tracked in **Issue #98**. The issue proposes formalizing the workaround with compatibility checks and concurrency guards. Until that issue is resolved, shared-venv reuse is supported only when the fail-closed checks above pass; otherwise use a dedicated worktree venv.
+The shared-venv flow is no longer hand-assembled: `.shrc_local` selects the venv with
+`IBROBOT_VENV` and derives the venv site-packages from `VIRTUAL_ENV`. Formalizing the rest
+(compatibility checks and concurrency guards) is tracked in **Issue #98**. Until that issue is
+resolved, shared-venv reuse is supported only when the fail-closed checks above pass; otherwise
+use a dedicated worktree venv.

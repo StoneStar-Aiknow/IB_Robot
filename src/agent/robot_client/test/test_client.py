@@ -34,6 +34,12 @@ class Bridge:
         self.robot_name = "g1"
         self.closed = False
         self.closed_count = 0
+        self.start_error = ""
+        self.started = 0
+
+    def start(self):
+        self.started += 1
+        return True
 
     def close(self):
         self.closed = True
@@ -118,6 +124,22 @@ def test_session_is_bound_to_the_resolved_deployment(client):
     assert session["caller_scope"] == "robot_skill_cli"
     assert session["connection_version"] == 1
     assert session["target_key"].endswith(client.transport.identity_digest())
+
+
+def test_the_first_operation_starts_the_transport_exactly_once():
+    instance = RobotClient(transport(), transport_factory=Bridge)
+    try:
+        # Binding is local-only: the transport is not built until an operation
+        # needs it, so constructing a client never initializes ROS.
+        assert instance._bridge is None
+        assert instance.get_status()["robot_name"] == "g1"
+        bridge = instance._bridge
+        assert bridge.started == 1
+        instance.get_status()
+        assert instance._bridge_for_operations() is bridge
+        assert bridge.started == 1
+    finally:
+        instance.close()
 
 
 def test_bridge_receives_the_resolved_endpoints_without_a_catalog(client):

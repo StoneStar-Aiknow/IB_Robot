@@ -69,8 +69,13 @@ def _agent_error_exit_code(error_code: str) -> int:
     return 13
 
 
-class _CliArgumentError(ValueError):
-    pass
+class CliArgumentError(ValueError):
+    """Caller-supplied argument or configuration is invalid (exit 2)."""
+
+
+# Historical internal name kept for existing imports inside this package and
+# its tests; new adapters should use CliArgumentError.
+_CliArgumentError = CliArgumentError
 
 
 class _CommandError(RuntimeError):
@@ -238,6 +243,61 @@ def _create_bridge(transport):
     from robot_skill_cli.bridge_daemon import ResidentBridge
 
     return ResidentBridge(**bridge_kwargs(transport), caller_token="")
+
+
+def _gateway_catalog_view(context, bridge) -> dict[str, Any]:
+    """Return the verified public view of the exact snapshot the Gateway serves."""
+    from robot_client.catalog import capability_view_from_snapshot
+
+    status = bridge.get_status(
+        task_id="",
+        payload_hash="",
+        timeout_sec=_status_preflight_timeout(context),
+    )
+    if not status.get("control_plane_ready", False):
+        code = str(status.get("control_plane_error_code") or "CONTROL_PLANE_NOT_READY")
+        state = str(status.get("control_plane_state") or "NOT_READY")
+        raise _CommandError(
+            code,
+            f"Gateway control plane is not ready: {state}",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    snapshot = bridge.get_skill_snapshot(
+        registry_epoch=status["registry_epoch"],
+        generation=status["registry_generation"],
+        timeout_sec=status["rpc_timeout_sec"],
+    )
+    if not snapshot.get("success"):
+        raise _CommandError(
+            str(snapshot.get("error_code") or "SNAPSHOT_UNAVAILABLE"),
+            str(snapshot.get("message") or "Gateway skill snapshot is unavailable"),
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    try:
+        return capability_view_from_snapshot(snapshot, status)
+    except ValueError as exc:
+        code, _separator, message = str(exc).partition(":")
+        raise _CommandError(
+            code or "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+            message.strip() or str(exc),
+            exit_code=EXIT_GATEWAY_REJECTED,
+        ) from exc
+
+
+def _run_online_catalog_command(args: argparse.Namespace, context, transport) -> dict[str, Any]:
+    """Inspect the catalog the bound Gateway serves, without a local compile."""
+    from dataclasses import replace
+
+    from robot_skill_cli.ros_bridge import BridgeError
+
+    bridge = _create_bridge(transport)
+    if not bridge.start():
+        raise BridgeError("ROS_UNAVAILABLE", "failed to initialize ROS bridge", exit_code=EXIT_ROS_UNAVAILABLE)
+    try:
+        runtime_view = _gateway_catalog_view(context, bridge)
+        return _run_catalog_command(args, replace(context, view=runtime_view))
+    finally:
+        bridge.close()
 
 
 def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1402,6 +1462,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.offline and command not in {"list-skills", "describe", "list-poses", "list-games", "describe-game"}:
             raise _CliArgumentError("--offline is only valid for local catalog inspection")
         from robot_skill_cli.catalog import (
+            ONLINE_CATALOG_COMMANDS,
             TRANSPORT_ONLY_COMMANDS,
             load_catalog_context,
             load_runtime_context,
@@ -1421,11 +1482,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 config_path=args.config_path,
             )
             data = _run_runtime_command(args, context, transport)
-        elif command in {"list-skills", "describe", "list-poses"}:
-            context = load_catalog_context(config_name=args.config_name, config_path=args.config_path)
-            data = _run_catalog_command(args, context)
+        elif command in ONLINE_CATALOG_COMMANDS:
             if args.offline:
+                # Explicit local development inspection keeps the strict loader:
+                # a local tree must be fully valid before it is shown.
+                context = load_catalog_context(config_name=args.config_name, config_path=args.config_path)
+                data = _run_catalog_command(args, context)
                 data = {**data, "offline": True, "catalog_source": "local_development_not_connected"}
+            else:
+                # Online inspection reads the exact snapshot the bound Gateway
+                # serves; only the transport contract is required locally.
+                context, transport = load_transport_context(
+                    config_name=args.config_name,
+                    config_path=args.config_path,
+                )
+                data = _run_online_catalog_command(args, context, transport)
         else:
             # The ledger and workflow commands read only the timeout policy:
             # they skip the local catalog compile, so cancellation and status
@@ -1446,13 +1517,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_query_envelope(error_envelope(command, getattr(exc, "code", "INVALID_ARGUMENT"), str(exc)), human_output)
         return EXIT_INVALID_INPUT
     except Exception as exc:
+        from embodied_common.exit_codes import client_error_exit_code
         from robot_client.errors import ClientError
         from robot_skill_cli.ros_bridge import BridgeError
 
         if isinstance(exc, ClientError):
             record_admission_error(exc.code, str(exc))
             _print_query_envelope(error_envelope(command, exc.code, str(exc)), human_output)
-            return EXIT_ROS_UNAVAILABLE if exc.code == "ROS_UNAVAILABLE" else EXIT_GATEWAY_REJECTED
+            return client_error_exit_code(exc.code)
         if isinstance(exc, BridgeError):
             record_admission_error(exc.code, str(exc))
             _print_query_envelope(error_envelope(command, exc.code, str(exc)), human_output)

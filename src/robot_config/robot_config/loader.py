@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -2092,6 +2093,92 @@ def load_robot_config_dict(
         require_local_model_artifacts=require_local_model_artifacts,
     )
     return robot_config
+
+
+#: ``embodied`` keys that make up the public consumer transport contract.
+#: They are robot_config keys (the neutral ``robot_client.transport`` contract
+#: maps the same set to message types), so they stay literal endpoint strings
+#: and are never resolved through the runtime interface description.
+TRANSPORT_ENDPOINT_KEYS: tuple[str, ...] = (
+    "skill_gateway_status_service",
+    "skill_catalog_snapshot_service",
+    "skill_catalog_reload_service",
+    "validate_skill_service",
+    "skill_action_name",
+    "primitive_action_name",
+    "validate_primitive_service",
+    "plan_service",
+    "prepare_plan_service",
+    "validate_plan_service",
+    "confirm_plan_service",
+    "execute_plan_action",
+    "execute_program_action",
+    "get_execution_service",
+    "get_execution_events_service",
+    "cancel_execution_service",
+    "start_visual_game_service",
+    "get_visual_game_result_service",
+)
+
+
+@dataclass(frozen=True)
+class TransportRobotConfig:
+    """Transport-only projection of one robot configuration.
+
+    This is deliberately **not** a validated robot configuration. It carries
+    the robot name, the public ``embodied`` mapping and the provenance of the
+    file chain, and nothing else. Logical runtime interfaces are not resolved,
+    no local catalog is compiled, no model or vendor artifact is read, and no
+    provider is started. Consumers that need capability metadata (catalog,
+    plan, direct skill execution) must keep using :func:`load_robot_config_dict`
+    or the launch-resolved consumer snapshot.
+    """
+
+    name: str
+    embodied: dict[str, Any]
+    config_path: str
+    config_sources: tuple[str, ...]
+    interfaces_deferred: bool = True
+
+
+def load_transport_robot_config(
+    *,
+    config_name: str | None = None,
+    config_path: str | Path | None = None,
+) -> TransportRobotConfig:
+    """Load the consumer transport projection of a robot configuration.
+
+    Precedence and file normalization are the loader's own: ``config_path`` >
+    ``config_name`` > ``ROBOT_CONFIG`` > ``ROBOT_NAME``, with ``base_config``
+    inheritance, relative-path resolution and the ordered ``_config_sources``
+    chain handled by the same functions :func:`load_robot_config_dict` uses.
+    Only the projection is returned; interface descriptions are never required
+    and are never claimed. This function does not validate the rest of the
+    robot configuration, so it must not be used as a validation substitute.
+    """
+    resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
+    resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(resolved_path)
+    robot_data = _resolve_nav_stage(copy.deepcopy(robot_data), "")
+    name = robot_data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"robot.name must be a non-empty string: {resolved_config_path}")
+    embodied = robot_data.get("embodied")
+    if embodied is None:
+        embodied = {}
+    if not isinstance(embodied, dict):
+        raise ValueError(f"robot.embodied must be a mapping: {resolved_config_path}")
+    for key in TRANSPORT_ENDPOINT_KEYS:
+        if key not in embodied:
+            continue
+        value = embodied[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"embodied.{key} must be a non-empty endpoint string: {resolved_config_path}")
+    return TransportRobotConfig(
+        name=name.strip(),
+        embodied=dict(embodied),
+        config_path=str(resolved_config_path),
+        config_sources=tuple(str(path) for path in config_sources),
+    )
 
 
 def validate_runtime_owned_audio_config(robot_config: dict[str, Any]) -> list[str]:

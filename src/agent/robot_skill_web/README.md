@@ -20,6 +20,13 @@ Web 启动时不加载密钥文件，也不读取本地凭证文件。
 
 配置解析顺序与 `robot-skill` 一致：
 `--config-path` > `--config-name` > `ROBOT_CONFIG` > `ROBOT_NAME`。
+
+启动绑定只读取部署配置公开的 `embodied` 传输契约（endpoint、robot 身份、timeout），
+不要求 `runtime.interface_description` 快照、不编译本地技能、不读取模型目录，也不启动
+runtime provider。页面上的状态、技能目录和执行数据全部来自 Gateway；因此
+`--config-name unitree_g1_arm_presets` 或 `ROBOT_CONFIG=unitree_g1_arm_presets` 可以
+直接启动 Web。`--config-path` 用于带部署 endpoint 覆盖的稳定文件，不需要复制
+`/tmp/ibrobot_interfaces_*/robot.yaml` 运行期快照。
 四者都没有时，Web 以退出码 2 报错，不启动服务，也不连接任何机器人。
 
 ```bash
@@ -148,6 +155,8 @@ Web 重启后仍是启动配置绑定的同一目标，不会重新发现。
 刷新页面或重启 Web 不会删除记录。
 
 其他部署写入的记录不会出现在当前目标的列表中。
+目标标识变化（部署配置或 ROS 作用域变化）后，旧作用域的记录不迁移到新目标，
+也不会被自动执行或重放。
 历史只覆盖本机 Web 提交的命令，不包含 CLI 或其他客户端的命令。
 仅准备计划、尚未点击执行的操作不会写入历史。
 旧记录缺少技能名称、说明或参数时，界面明确提示缺失。

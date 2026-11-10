@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVariable, SetLaunchConfiguration
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
@@ -867,6 +867,75 @@ def test_authorize_motion_launch_argument_defaults_to_false():
     )
 
     assert authorize_motion.default_value[0].text == "false"
+
+
+def test_fresh_launch_arguments_are_declared_with_fail_closed_defaults():
+    module = _load_launch_module()
+    description = module.generate_launch_description()
+    defaults = {
+        entity.name: entity.default_value[0].text
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument)
+    }
+    assert defaults["preset_operator_confirmed"] == "false"
+    assert defaults["runtime_network_interface"] == ""
+    assert defaults["preset_expected_fsm_id"] == ""
+
+
+def test_fresh_launch_arguments_reach_the_provider_path(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    (tmp_path / "launch").mkdir()
+    (tmp_path / "launch" / "robot.launch.py").write_text(
+        "def launch_setup(context, loaded_config=None):\n    return []\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+    monkeypatch.setattr(
+        module,
+        "_load_config",
+        lambda *_args, **_kwargs: {
+            "name": "unitree_g1_arm_presets",
+            "runtime": {"provider": "unitree_g1_robot", "profile": "g1_29dof_arm_presets"},
+            "default_control_mode": "named_motion",
+            "embodied": {"enabled": False, "perception": {"enabled": False}},
+            "_config_path": str(tmp_path / "unitree_g1_arm_presets.yaml"),
+        },
+    )
+
+    actions = module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "unitree_g1_arm_presets",
+                "use_sim": "false",
+                "runtime_network_interface": "eth9",
+                "preset_operator_confirmed": "true",
+                "preset_expected_fsm_id": "802",
+            }
+        )
+    )
+
+    def text(value):
+        return "".join(item.text for item in value)
+
+    forwarded = {
+        text(action.name): text(action.value)
+        for action in actions[0]._GroupAction__actions
+        if isinstance(action, SetLaunchConfiguration)
+    }
+    assert forwarded["runtime_network_interface"] == "eth9"
+    assert forwarded["preset_operator_confirmed"] == "true"
+    assert forwarded["preset_expected_fsm_id"] == "802"
+
+    # Execute the SetLaunchConfiguration actions the launch service would run
+    # before the base OpaqueFunction: the base context must see the same values.
+    from launch import LaunchContext
+
+    base_context = LaunchContext()
+    for action in actions[0]._GroupAction__actions:
+        if isinstance(action, SetLaunchConfiguration):
+            action.execute(base_context)
+    assert base_context.launch_configurations["runtime_network_interface"] == "eth9"
+    assert base_context.launch_configurations["preset_operator_confirmed"] == "true"
+    assert base_context.launch_configurations["preset_expected_fsm_id"] == "802"
 
 
 def test_navigation_stage_launch_argument_is_declared_and_forwarded(monkeypatch, tmp_path):

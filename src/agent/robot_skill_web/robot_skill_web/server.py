@@ -41,15 +41,18 @@ def bound_client(*, config_name: str | None = None, config_path: str | None = No
     Only local files are read: resolving the configuration never contacts the
     Gateway, so starting the server cannot send an action. The resulting
     neutral transport is the single target every request is scoped to.
+
+    The binding needs only the public ``embodied`` transport contract, so it
+    uses the transport projection: a deployment that declares logical runtime
+    interfaces (and therefore has no interface snapshot yet) still binds the
+    same Gateway endpoints as its launch. This is not a full configuration
+    validation; catalog and execution data always come from the Gateway.
     """
     from robot_client.transport import gateway_transport
-    from robot_config.config_path import resolve_robot_config_path
-    from robot_config.loader import load_robot_config_dict
+    from robot_config.loader import load_transport_robot_config
 
-    resolved = resolve_robot_config_path(config_name=config_name, config_path=config_path)
-    robot_config = load_robot_config_dict(resolved)
-    robot_name = str(robot_config.get("name", ""))
-    transport = gateway_transport(robot_config.get("embodied", {}), robot_id=robot_name, robot_name=robot_name)
+    projection = load_transport_robot_config(config_name=config_name, config_path=config_path)
+    transport = gateway_transport(projection.embodied, robot_id=projection.name, robot_name=projection.name)
     return RobotClient(transport)
 
 

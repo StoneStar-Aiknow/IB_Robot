@@ -55,6 +55,7 @@ from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import (
     get_effective_visual_game_policies,
     load_robot_config_dict,
+    load_transport_robot_config,
     robot_config_digest,
     robot_context_schema_version,
     robot_execution_endpoints,
@@ -68,13 +69,6 @@ from skill_catalog.source import (
     DevelopmentStagingSkillSource,
     DirectoryReleaseSkillSource,
     resolve_development_source_root,
-)
-
-_LIST_CAPABILITY_FIELDS = (
-    "summary",
-    "domain",
-    "moves_robot",
-    "required_control_mode",
 )
 
 
@@ -158,6 +152,14 @@ TRANSPORT_ONLY_COMMANDS = frozenset(
 )
 
 
+#: Catalog inspection commands that read the live Gateway snapshot in online
+#: mode. They bind only the public transport contract (never the local skill
+#: catalog or the runtime interface description) and project the exact snapshot
+#: the Gateway serves. ``--offline`` deliberately keeps the strict local loader
+#: so development trees are still validated before use.
+ONLINE_CATALOG_COMMANDS = frozenset({"list-skills", "describe", "list-poses"})
+
+
 def load_transport_context(
     *,
     config_name: str | None = None,
@@ -166,27 +168,31 @@ def load_transport_context(
     """Load the Gateway transport and timeout policy WITHOUT compiling a catalog.
 
     The compatibility path's ledger and workflow commands (see
-    :data:`TRANSPORT_ONLY_COMMANDS`) need the bound endpoints and the timeout
-    policy, never a compiled skill view: a missing or broken local catalog
-    must not block status, cancellation or plan execution against a Gateway
-    that is serving them fine. Mirrors the visual-game loader's split between
-    metadata and motion dependencies.
+    :data:`TRANSPORT_ONLY_COMMANDS`) and the online catalog commands (see
+    :data:`ONLINE_CATALOG_COMMANDS`) need the bound endpoints and the timeout
+    policy, never a locally compiled skill view. They also must not depend on
+    the runtime interface description, a local model directory or a launch
+    snapshot: only the public ``embodied`` transport contract is read
+    (``load_transport_robot_config``). A deployment with logical runtime
+    interfaces therefore binds the same Gateway endpoints as its launch.
+    Mirrors the visual-game loader's split between metadata and motion
+    dependencies; offline catalog inspection, direct-skill and visual-game
+    commands keep the strict loader.
     """
-    resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
-    robot_config = load_robot_config_dict(resolved_path)
-    embodied = robot_config.get("embodied", {})
+    projection = load_transport_robot_config(config_name=config_name, config_path=config_path)
+    embodied = projection.embodied
     timeout_policy = resolve_embodied_timeout_policy(embodied)
     return (
         CatalogContext(
             # The same projection the full context's view carries, so the
             # timeout fields these commands read are identical.
             view={
-                "robot_name": robot_config.get("name", ""),
+                "robot_name": projection.name,
                 "timeout_policy": project_capability_timeout_policy(timeout_policy),
             },
-            game_view=_game_view(robot_config, timeout_policy),
+            game_view=_game_view({"name": projection.name, "embodied": embodied}, timeout_policy),
         ),
-        _gateway_transport(embodied, robot_id=str(robot_config.get("name", ""))),
+        _gateway_transport(embodied, robot_id=projection.name),
     )
 
 

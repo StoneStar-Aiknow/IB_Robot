@@ -12,6 +12,7 @@ import copy
 import threading
 import time
 import uuid
+from contextlib import suppress
 
 from .connection import bridge_kwargs, ros_environment_scope
 from .errors import ClientError
@@ -72,8 +73,40 @@ class RobotClient:
     def _bridge_for_operations(self):
         with self._lock:
             if self._bridge is None:
-                self._bridge = self._factory(**bridge_kwargs(self._transport))
+                self._bridge = self._start_bridge()
             return self._bridge
+
+    def _start_bridge(self):
+        """Build and start the one transport this client operates through.
+
+        The transport is created on the first operation, never when the client
+        is bound, so constructing a client (the Web server startup path) does not
+        initialize ROS or contact the Gateway. ``start()`` belongs to the
+        transport contract: a transport that was never started answers every
+        read with ``ROS_UNAVAILABLE`` (``ROS bridge is not started``) instead of
+        the Gateway's status, and the Web adapter reports that as an internal
+        error. A failed start is reported as the same ``ROS_UNAVAILABLE`` the CLI
+        exits with, carries the transport's ``start_error`` diagnostic, and
+        leaves no half-started bridge behind; the next operation retries.
+        """
+        bridge = self._factory(**bridge_kwargs(self._transport))
+        target = self._transport.target_name or "the bound Gateway"
+        try:
+            started = bridge.start()
+        except Exception as exc:
+            with suppress(Exception):
+                bridge.close()
+            raise ClientError(
+                "ROS_UNAVAILABLE",
+                f"failed to initialize the ROS bridge for {target}: {type(exc).__name__}: {exc}",
+            ) from exc
+        if not started:
+            detail = str(getattr(bridge, "start_error", "") or "").strip()
+            with suppress(Exception):
+                bridge.close()
+            message = f"failed to initialize the ROS bridge for {target}"
+            raise ClientError("ROS_UNAVAILABLE", f"{message}: {detail}" if detail else message)
+        return bridge
 
     def _check_robot_name(self, value) -> None:
         expected = self._transport.target_name

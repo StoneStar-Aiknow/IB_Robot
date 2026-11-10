@@ -11,6 +11,9 @@
   <depend>robot_config</depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>nodejs</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>embodied_common</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

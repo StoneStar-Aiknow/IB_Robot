@@ -20,6 +20,7 @@
 | `tests/test_openeuler_cv_bridge_abi.sh` | 验证 openEuler 安装匹配 OpenCV 4.13 的 `cv_bridge` RPM。 |
 | `tests/test_setup_profile_training.sh` | 验证 `--profile training` 不触发 ROS 2 / rosdep / colcon，且 `full` / `inference` 行为不变。 |
 | `tests/test_mujoco_sim_pin.sh` | 验证 MuJoCo 仿真钉的三种安装顺序、benchmark `mujoco<3.9` 约束、inference 跳过与未构建工作区的 stdlib 校验（issue #190）。 |
+| `tests/test_shrc_local_venv.sh` | 验证 `.shrc_local` 的 `IBROBOT_VENV` 选择器：本地 venv 默认、显式覆盖、非法值 fail-closed、重复 source 幂等，Bash + Zsh（临时 fixture，不碰共享 venv）。 |
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 

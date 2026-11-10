@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,20 @@ from robot_config.logger_utils import get_colored_logger
 logger = get_colored_logger("robot_config.runtime")
 
 RUNTIME_LAUNCH_FILE = "runtime.launch.py"
+
+#: Per-run operator commissioning arguments forwarded by name only to the
+#: provider entries that declare them. The generic base always declares the
+#: CLI surface (so ``--show-args`` and direct ``robot.launch.py`` entry points
+#: are uniform), but a provider never receives an argument its own launch file
+#: does not know: the table is the explicit support declaration for that
+#: boundary.
+PROVIDER_COMMISSIONING_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "unitree_g1_robot": (
+        "runtime_network_interface",
+        "preset_operator_confirmed",
+        "preset_expected_fsm_id",
+    ),
+}
 
 
 def runtime_provider(robot_config: dict[str, Any]) -> str:
@@ -136,6 +151,7 @@ def generate_runtime_provider_actions(
     display: bool = False,
     readiness_timeout_s: float = 60.0,
     description_output: str | None = None,
+    launch_arguments: Mapping[str, str] | None = None,
 ) -> tuple[list, Node]:
     """Return (provider launch include, wait_for_runtime readiness/reconciliation node).
 
@@ -178,6 +194,13 @@ def generate_runtime_provider_actions(
     include_arguments["use_sim"] = "true" if use_sim else "false"
     if use_sim:
         include_arguments["sim_platform"] = str(sim_platform).lower()
+    if launch_arguments is not None:
+        # Operator commissioning stays per-run and is forwarded only to the
+        # provider that declares the matching launch arguments; other providers
+        # keep their exact include surface.
+        for name in PROVIDER_COMMISSIONING_ARGUMENTS.get(provider, ()):
+            if name in launch_arguments:
+                include_arguments[name] = str(launch_arguments[name])
     platform = str(sim_platform).lower() if use_sim else ""
     if use_sim and platform != "sdk":
         # sim-platform-registry D5/D3: the world owner hands the provider the

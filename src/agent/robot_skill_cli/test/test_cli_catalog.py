@@ -789,7 +789,7 @@ def test_catalog_requires_an_explicit_profile(tmp_path):
 def test_unknown_skill_has_stable_error_and_exit_code(capsys):
     from robot_skill_cli.cli import main
 
-    exit_code = main(["--config-path", str(CONFIG_PATH), "describe", "missing"])
+    exit_code = main(["--offline", "--config-path", str(CONFIG_PATH), "describe", "missing"])
 
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
@@ -802,7 +802,7 @@ def test_catalog_commands_emit_one_json_document(capsys):
     from robot_skill_cli.cli import main
 
     for arguments in (["list-skills"], ["list-games"], ["describe", "move_relative_ee"], ["list-poses"]):
-        exit_code = main(["--config-path", str(CONFIG_PATH), *arguments])
+        exit_code = main(["--offline", "--config-path", str(CONFIG_PATH), *arguments])
         captured = capsys.readouterr()
 
         assert exit_code == 0

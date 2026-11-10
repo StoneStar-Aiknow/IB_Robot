@@ -11,6 +11,7 @@ from typing import Any
 
 from robot_client.connection import read_private_json, write_private_json
 from robot_client.errors import ClientError
+from robot_client.transports.ros_bridge import BridgeError
 
 MAX_JSON_BYTES = 128 * 1024
 MAX_NESTING = 16
@@ -103,6 +104,13 @@ def error_payload(exc: Exception) -> tuple[int, dict[str, Any]]:
     if isinstance(exc, PermissionError):
         status = 429 if "too many" in str(exc) else 401
         return status, {"error": {"code": "SESSION_REQUIRED" if status == 401 else "RATE_LIMITED", "message": str(exc)}}
+    if isinstance(exc, BridgeError):
+        # A started bridge can still lose the Gateway (a service that is not
+        # discovered in time, a timed-out reply). That is a transport condition,
+        # not an internal defect, so report its own stable code and a retryable
+        # status instead of collapsing it into "internal adapter error".
+        status = 409 if exc.code == "SKILL_SCHEMA_INVALID" else 503
+        return status, {"error": {"code": exc.code, "message": str(exc)}}
     if isinstance(exc, ClientError):
         status = 409
         if exc.code in {"NOT_CONNECTED", "TARGET_NOT_FOUND"}:

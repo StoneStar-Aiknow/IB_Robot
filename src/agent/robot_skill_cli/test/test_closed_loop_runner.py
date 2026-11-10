@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+from robot_client.transport import GatewayTransport
 from robot_skill_cli import closed_loop_runner
 
 
@@ -46,7 +47,7 @@ class _Controller:
 def _install_runner(monkeypatch, terminals):
     _Controller.terminals = list(terminals)
     context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}})
-    transport = SimpleNamespace(
+    transport = GatewayTransport(
         status_service="status",
         snapshot_service="snapshot",
         reload_service="reload",
@@ -56,8 +57,8 @@ def _install_runner(monkeypatch, terminals):
         validate_plan_service="validate_plan",
         confirm_plan_service="confirm_plan",
         execute_plan_action="execute_plan",
-        # bridge_kwargs reads the identity fields too; the runner pins
-        # robot_id="" itself so the wire shape stays unchanged.
+        # The runner reads the identity fields too; it pins robot_id="" itself
+        # so the wire shape stays unchanged.
         robot_id="robot-under-test",
         caller_scope="robot_skill_cli",
     )

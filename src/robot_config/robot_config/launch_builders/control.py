@@ -664,6 +664,7 @@ def build_control(context: LaunchBuildContext) -> BuildResult:
             readiness_timeout_s=readiness_attribute("resolve_controller_startup_timeout")(
                 robot_config, use_sim, context.sim_platform
             ),
+            launch_arguments=context.arguments,
         )
         actions.extend(provider_actions)
         logger.info(f"Added runtime provider include for {provider_name}")

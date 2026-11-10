@@ -27,6 +27,12 @@ class Bridge:
         self.accepted = True
         self.closed = 0
         self.canceled = []
+        self.start_error = ""
+        self.started = 0
+
+    def start(self):
+        self.started += 1
+        return True
 
     def close(self):
         self.closed += 1

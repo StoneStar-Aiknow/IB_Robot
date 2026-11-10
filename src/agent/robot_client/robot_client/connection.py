@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 from .errors import ClientError
-from .transport import ENDPOINT_TYPES, GatewayTransport
+from .transport import GatewayTransport
 
 #: Environment variables that decide which ROS graph a client can see. Two
 #: deployments with identical endpoints on different graphs are different
@@ -85,12 +85,11 @@ def write_private_json(path: Path, value: dict) -> None:
 
 
 def bridge_kwargs(transport: GatewayTransport) -> dict:
-    """Return the ROS bridge parameters for one bound transport."""
-    result = {}
-    aliases = {"skill_action": "skill_action_name", "primitive_action": "primitive_action_name"}
-    for key in ENDPOINT_TYPES:
-        source = aliases.get(key, key)
-        if hasattr(transport, source):
-            result[key] = getattr(transport, source)
+    """Return the ROS bridge parameters for one bound transport.
+
+    ``GatewayTransport.endpoints`` owns the endpoint names, aliases and the
+    contract key set, so the bridge cannot drift from the identity digest.
+    """
+    result = dict(transport.endpoints)
     result.update(robot_id=transport.robot_id, caller_scope=transport.caller_scope)
     return result

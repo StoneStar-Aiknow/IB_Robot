@@ -32,31 +32,25 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import pytest as _pytest
 import rclpy
+import yaml
+from mock_process import MockProcess, vendor_test_domain
 from rclpy.action import ActionClient
 from rclpy.executors import MultiThreadedExecutor
 from unitree_g1_robot import vendor_gateway as _vg
 
-if not _vg.VENDOR_AVAILABLE:
-    # The runtime and the mock speak the vendor tier, which only exists with
-    # the official SDK installed (setup full profile). Skip the module at
-    # collection instead of failing it — mirrors the bridge suite's skip.
-    _pytest.skip("unitree_sdk2py is not installed", allow_module_level=True)
+from ibrobot_msgs.action import ExecuteNamedMotion
+from ibrobot_msgs.msg import RuntimeStatus
+from robot_runtime.contract import STATUS_TOPIC
 
-from mock_process import (  # noqa: E402 - the module-level vendor-defect skip must run first
-    MockProcess,
-    vendor_test_domain,
+# The runtime and the mock speak the vendor tier, which only exists with the
+# official SDK installed (setup full profile). Skip per test instead of at
+# collection: a module-level skip reports ``collected 0 items``, which colcon
+# treats as success (docs/testing.md §5).
+requires_vendor = pytest.mark.skipif(
+    not _vg.VENDOR_AVAILABLE,
+    reason="unitree_sdk2py is not installed",
 )
-
-from ibrobot_msgs.action import ExecuteNamedMotion  # noqa: E402
-from ibrobot_msgs.msg import RuntimeStatus  # noqa: E402
-from robot_runtime.contract import STATUS_TOPIC  # noqa: E402
-
-#: The vendor DDS domain this pytest process owns (see the workspace conftest):
-#: the observer node, the mock subprocess and every spawned runtime share it, so
-#: a parallel suite cannot meet their publishers or vendor participants.
-TEST_DOMAIN_ID = vendor_test_domain()
 
 #: Bounded waits: cold DDS matching plus the startup checks, and the teardown
 #: bound a SIGTERM exit must fit inside.
@@ -127,19 +121,29 @@ class RuntimeProcess:
             return "<no log>"
 
 
+@pytest.fixture(scope="module")
+def domain_id() -> int:
+    """The vendor DDS domain this pytest process owns (see the workspace conftest).
+
+    Resolved lazily so collection still works on an SDK-less host: the vendor
+    tests are skipped there and never ask for a domain.
+    """
+    return vendor_test_domain()
+
+
 @pytest.fixture(scope="module", autouse=True)
-def ros_context():
+def ros_context(domain_id):
     """Own the ROS context on this suite's private domain, if nothing else does."""
     owned = not rclpy.ok()
     if owned:
-        rclpy.init(domain_id=TEST_DOMAIN_ID)
+        rclpy.init(domain_id=domain_id)
     yield
     if owned and rclpy.ok():
         rclpy.shutdown()
 
 
 @pytest.fixture(scope="module")
-def mock_process():
+def mock_process(domain_id):
     """One vendor mock subprocess for the module, as the bridge suite runs it."""
     spawner = rclpy.create_node("g1_process_mock_spawner")
     spin_executor = rclpy.executors.SingleThreadedExecutor()
@@ -148,7 +152,7 @@ def mock_process():
     handle = MockProcess(
         node=spawner,
         profile=PACKAGE_ROOT / "profiles" / "g1_29dof_dex3.yaml",
-        domain_id=TEST_DOMAIN_ID,
+        domain_id=domain_id,
         records_file=Path(tempfile.gettempdir()) / f"g1_process_mock_{os.getpid()}.jsonl",
     )
     handle.wait_ready()
@@ -238,14 +242,16 @@ def _preset_mock_baseline(mock_process):
     """Point the shared mock at the preset profile's vendor action table.
 
     The mock subprocess runs the dex3 profile, so its baseline GetActionList
-    answers the dex3 table; the preset runtime only arms the action its own
+    answers the dex3 table; the preset runtime only arms the actions its own
     profile names, and startup drops anything the vendor does not report
-    (design D7), so the mock must report the preset profile's name.
+    (design D7), so the mock must report the preset profile's full table.
     """
-    mock_process.apply({"action_list": ["both_hands_up"]})
+    vendor = yaml.safe_load(PRESET_PROFILE.read_text(encoding="utf-8"))["vendor"]
+    mock_process.apply({"action_list": [str(entry["action_name"]) for entry in vendor["arm_actions"].values()]})
 
 
-def test_repeated_process_startup_and_clean_sigterm_exit(mock_process, observer):
+@requires_vendor
+def test_repeated_process_startup_and_clean_sigterm_exit(mock_process, observer, domain_id):
     """Two sequential runtime processes: ACTIVE, SIGTERM, exit 0 — twice.
 
     A runtime that left DDS participants or vendor-tier readers behind would
@@ -255,7 +261,7 @@ def test_repeated_process_startup_and_clean_sigterm_exit(mock_process, observer)
     """
     _preset_mock_baseline(mock_process)
     for attempt in (1, 2):
-        runtime = RuntimeProcess(domain_id=TEST_DOMAIN_ID)
+        runtime = RuntimeProcess(domain_id=domain_id)
         observer.reset()  # only THIS process's status may satisfy the wait
         assert runtime.alive(), f"attempt {attempt}: the runtime process died at spawn"
         status = observer.wait_active()
@@ -264,7 +270,8 @@ def test_repeated_process_startup_and_clean_sigterm_exit(mock_process, observer)
         assert runtime.sigterm() == 0, f"attempt {attempt}: unclean exit; log tail: {runtime._log_tail()}"
 
 
-def test_startup_failure_exits_nonzero_with_guidance():
+@requires_vendor
+def test_startup_failure_exits_nonzero_with_guidance(domain_id):
     """A refused vendor binding must fail as one bounded nonzero exit.
 
     The constructor closes its facade and destroys its half-built node; main()
@@ -276,7 +283,7 @@ def test_startup_failure_exits_nonzero_with_guidance():
     that adapter message stays covered by ``unitree_g1_adapter``.
     """
     runtime = RuntimeProcess(
-        domain_id=TEST_DOMAIN_ID,
+        domain_id=domain_id,
         extra_overrides={
             "profile": str(PACKAGE_ROOT / "profiles" / "g1_29dof_dex3.yaml"),
             "preset_test_transport": False,
@@ -292,7 +299,8 @@ def test_startup_failure_exits_nonzero_with_guidance():
     assert "Traceback" not in tail, "an initialization failure must not surface as a traceback"
 
 
-def test_sustained_vendor_traffic_then_clean_exit(mock_process, observer):
+@requires_vendor
+def test_sustained_vendor_traffic_then_clean_exit(mock_process, observer, domain_id):
     """Continuous vendor streams plus repeated preset executions, then SIGTERM.
 
     The mock publishes the 50 Hz vendor state stream the whole time; six
@@ -303,7 +311,7 @@ def test_sustained_vendor_traffic_then_clean_exit(mock_process, observer):
     """
     watermark = mock_process.seq_snapshot()
     _preset_mock_baseline(mock_process)
-    runtime = RuntimeProcess(domain_id=TEST_DOMAIN_ID)
+    runtime = RuntimeProcess(domain_id=domain_id)
     try:
         observer.wait_active()
         client = observer.action_client()

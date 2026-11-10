@@ -14,11 +14,9 @@ def main(argv=None):
     kwargs = None
     if args.config_path or args.config_name:
         from robot_client.connection import bridge_kwargs
-        from robot_config.config_path import resolve_robot_config_path
-        from robot_config.loader import load_robot_config_dict
+        from robot_config.loader import load_transport_robot_config
         from robot_skill_cli.catalog import _gateway_transport
 
-        path = resolve_robot_config_path(config_name=args.config_name, config_path=args.config_path)
-        config = load_robot_config_dict(path)
-        kwargs = bridge_kwargs(_gateway_transport(config.get("embodied", {}), robot_id=config.get("name", "")))
+        projection = load_transport_robot_config(config_name=args.config_name, config_path=args.config_path)
+        kwargs = bridge_kwargs(_gateway_transport(projection.embodied, robot_id=projection.name))
     return serve(remaining, prewarm_kwargs=kwargs)
