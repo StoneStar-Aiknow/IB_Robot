@@ -5,24 +5,87 @@ archives the supervised Gateway/Web startup, Gateway discovery, CLI use, and tim
 
 ## Preset-only development and supervised validation
 
-`g1_29dof_arm_presets` is a separate surface for the operator-selected action
-15 (`both_hands_up`, documented as arms horizontal). It advertises one named
-motion, has no hand subscriptions, hand writers, arm-stream writer, locomotion
-commands or posture actions, and starts in idle. Physical preflight uses a loco
-client for read-only FSM queries. The corresponding application
-configuration is `unitree_g1_arm_presets`; its catalog exposes `arms_horizontal`
-through the existing `runtime_named_motion` Gateway executor. It never sends
-automatic recovery action 99.
+`g1_29dof_arm_presets` is a separate surface for the 23 statically listed G1
+firmware preset actions requested by the operator (IDs 1, 11–13, 15, 17–30, 33,
+34, 36 and 99). It has no hand subscriptions, hand writers, arm-stream writer,
+locomotion commands or posture actions, and starts in idle. Physical preflight
+uses a loco client for read-only FSM queries. The application configuration is
+`unitree_g1_arm_presets`; its catalog exposes 23 `runtime_named_motion` skills
+with stable names, Chinese `display_name` and `tags: [preset,
+unitree_action_id_<N>]` (`release_arm` also carries `control_ownership`).
+`arms_horizontal` keeps its existing ID 15 binding (`both_hands_up`);
+`release_arm` is ID 99.
 
-**Physical execution remains disabled by default.** An explicit per-session
-`vendor.operator_validation` profile (`confirmed`, `network_interface`,
-`expected_fsm_id`) permits operator-supervised commissioning of action 15 only.
-Launch and node enforce this boundary. Before dispatch the runtime reads service
-ownership, FSM and feedback age for each independent request. A successful RPC
-completion permits a later request; concurrent dispatch is rejected. Timeout,
-transport error or exception latches an unknown outcome and prevents further
-dispatch without claiming that the robot stopped. No automatic retry is made.
-This is not a verified software emergency stop; the on-site operator
+The catalog display tags are generated from this profile, not hand-written:
+`python3 -m unitree_g1_robot.preset_presentation --check` (add `--write` to
+regenerate) rewrites only `capability.tags` in
+`src/agent/skill_catalog/config/skills/<skill>/manifest.yaml`. The profile's
+`vendor.arm_actions` stays the only source of the numbers, and
+`test/test_catalog_action_id_presentation.py` fails when a profile id and the
+shipped tag drift apart. The tags are display-only: they change no binding,
+recovery policy, FSM rule or admission result, and the CLI/Web show them as
+badges without ever selecting a firmware action from a number.
+
+**Catalog visibility is not readiness or admission.** The catalog lists all 23
+so the Web UI and planner can describe them, but the current Gateway/catalog
+contract has no per-action `ready` flag. The runtime enforces the two firmware
+limits reported by the operator's GET-only query before `ExecuteAction`:
+
+- ID 1 `turn_back_wave` requires FSM 500/501. The current deployment's
+  `expected_fsm_id` is 802, so admission rejects it with
+  `NAMED_MOTION_PLATFORM_NOT_READY` and the reason before dispatch; the runtime
+  never calls `SetFsmId` to make it available.
+- IDs 20/21/28/29/30/36 report `mode_machine` 5/6. Admission reads the newest
+  LowState `mode_machine` and rejects when the observed value is outside that
+  list or feedback is stale.
+
+No other firmware limit is encoded. The actionable "not available now" signal is
+the pre-submit rejection and its reason, not a catalog `ready=false`.
+
+**Evidence scope.** The operator reports having manually exercised all 23
+firmware actions (operator-reported). The Agent has one earlier software-path
+success for action 15; the camera was disconnected at that time, so physical
+completion was not confirmed. This README/catalog does not claim Agent
+real-robot validation of the 23 actions.
+
+**Firmware naming boundary.** The `action_name` strings are the exact names the
+operator's 2026-11-07/09 GET-only `GetActionList` returned. Startup matches
+id+name exactly, so a different firmware that renames an action advertises
+fewer motions (fail-closed); refresh the profile from a new report rather than
+matching by id.
+
+**Physical execution remains disabled by default.** The per-run confirmation is
+a launch argument, not a persisted profile file. The shipped profile and the
+currently running deployment still carry the earlier single-action (15)
+profile; do not change the global `expected_fsm_id` just to make
+`turn_back_wave` admissible. From the source workspace:
+
+```bash
+source .shrc_local
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=unitree_g1_arm_presets use_sim:=false \
+  runtime_network_interface:=<robot-facing-nic> \
+  preset_operator_confirmed:=true \
+  preset_expected_fsm_id:=<observed-fsm-id>
+```
+
+`preset_operator_confirmed` defaults to `false` and fails closed. The launch
+requires a non-empty, non-loopback `runtime_network_interface` and an expected
+FSM id (the explicit argument, or an audited
+`vendor.operator_validation.expected_fsm_id` in the profile). It assembles a
+run-scoped profile internally and deletes it on exit; the source profile is
+never rewritten, and the user never passes a temporary profile path. Launch and
+node enforce the boundary. Before
+dispatch the runtime reads service ownership, FSM, fresh feedback and the
+per-action limit for each independent request. A successful RPC completion
+permits a later request; concurrent dispatch is rejected. Timeout, transport
+error or exception latches an unknown outcome and prevents further dispatch
+without claiming that the robot stopped. No automatic retry is made.
+`release_arm` (99) is a control-ownership operation, not a normal gesture; it is
+not inserted automatically into recovery/finishing and is sent only on an
+explicit workflow request. Its `never_retry` policy and description are
+operational guidance, not a provable semantic guarantee that a planner cannot
+propose it. This is not a verified software emergency stop; the on-site operator
 owns the confirmed physical stopping method.
 The offline launch requires simulated transport and explicitly binds both mock
 and runtime SDKs to loopback on domain 148. No Dex3 URDF or peripheral driver is
@@ -40,11 +103,13 @@ ROS_DOMAIN_ID=42 ROS_LOCALHOST_ONLY=1 ros2 launch unitree_g1_robot runtime.launc
 ```
 
 This launches the mock/runtime pair only. The application configuration binds
-the named action through the Gateway when the embodied stack is composed; it
-does not provide a direct-SDK shortcut. The supervised physical path above was
-used for two Gateway requests in FSM 802, both reporting success. The operator
-confirmed arms horizontal followed by automatic vendor-owned recovery; no action
-99 was sent. This observation does not establish software cancellation or stop.
+the named actions through the Gateway when the embodied stack is composed; it
+does not provide a direct-SDK shortcut. The supervised physical path was used
+for one Gateway request for action 15 that reported software success; the camera
+was disconnected, so physical completion was not confirmed. A later
+operator-reported statement covers all 23 actions, but it is not Agent
+real-robot evidence. No action 99 was sent by this Agent. This observation does
+not establish software cancellation, stop, or physical completion of any preset.
 
 > Arm-control correction (2026-10-28): stream entry now uses read-only service
 > ownership and FSM checks, never `SwitchToUserCtrl` (a full-body takeover).
@@ -142,6 +207,12 @@ a deployment fact, never hardcoded. It has two separate jobs:
   `CYCLONEDDS_URI` at it; when empty, no `CYCLONEDDS_URI` is set and CycloneDDS
   keeps its default (or an externally provided) configuration.
 
+For the arm-preset physical path the launch takes the robot-facing NIC from the
+per-run `runtime_network_interface` argument instead (non-empty, not `lo`); a
+disagreeing `network_interface` or profile
+`vendor.operator_validation.network_interface` is rejected as a conflict.
+`network_interface` keeps its existing driver meaning everywhere else.
+
 Find the interface with `ip link` (the vendor's own `setup.sh` carries an
 `enp3s0` placeholder — do not trust it). CycloneDDS fails loudly when the named
 interface does not exist, so a typo names itself at startup.
@@ -194,7 +265,7 @@ a guided error when the SDK is missing.
 | Profile | Surface | Robot | End effector | Joints |
 |---|---|---|---|---|
 | `profiles/g1_29dof_dex3.yaml` | full runtime contract | G1, 29 DoF | Dex3 dexterous hands (7 joints each) | 43 observable: 12 legs, 3 waist, 14 arms, 14 fingers |
-| `profiles/g1_29dof_arm_presets.yaml` | preset action 15 only | G1, 29 DoF | none (no hand, stream or base surface) | 29 observed, no command channels |
+| `profiles/g1_29dof_arm_presets.yaml` | 23 static preset actions (IDs 1, 11–13, 15, 17–30, 33, 34, 36, 99); the deployed profile still exposes only action 15 | G1, 29 DoF | none (no hand, stream or base surface) | 29 observed, no command channels |
 
 The profile is the single source of runtime parameters: public joint
 projection, modes and their vendor actions, command channels, declared
@@ -242,9 +313,11 @@ marking. Nothing unverified is silently presented as fact.
   specified in the OpenSpec change (§5), so the base deployment
   (`unitree_g1.yaml`) still ships with `embodied.enabled: false`. What does
   ship is the fixed preset path: `config/robots/unitree_g1_arm_presets.yaml`
-  enables the embodied stack with `arm_surface: false` and one
-  `runtime_named_motion` skill (`arms_horizontal`, action 15). A generic
-  runtime-discovered catalog is not part of this change.
+  enables the embodied stack with `arm_surface: false` and a static
+  `runtime_named_motion` catalog of 23 preset skills (including
+  `arms_horizontal`, action 15, and `release_arm`, action 99). A generic
+  runtime-discovered catalog is not part of this change; the catalog is a static
+  allow table, never a discovery result.
 - **Voice ASR/TTS services.** The vendor voice RPC carries an ASR api id, but
   no ASR surface is bridged or verified; the audio contract itself waits on
   gate 6.1.
@@ -253,15 +326,19 @@ marking. Nothing unverified is silently presented as fact.
 
 The runtime is implemented and tested against `unitree_vendor_mock`, which
 speaks the real official-SDK IDL on the topic names the profile declares. The
-package suite is 250 tests; the capability-scoped conformance suite runs
+package suite is 268 tests; the capability-scoped conformance suite runs
 against the same launch (see *Tests*).
 
-**No hardware contact yet.** Everything that moves the robot — mode switches,
-the arm_sdk handover, streaming, locomotion, stop latencies — is a
-user-executed gate recorded in the OpenSpec change (tasks §6), and the profile
-values those gates will measure (ramp rates, gains, the velocity envelope, the
-stop bounds) are placeholders, not measurements. The vendor tier's QoS is the
-SDK's own, not this profile's.
+**Hardware evidence is limited and must be read with the preset scope above.**
+For the full Dex3 runtime, everything that moves the robot — mode switches, the
+arm_sdk handover, streaming, locomotion, stop latencies — is a user-executed
+gate recorded in the OpenSpec change (tasks §6), and the profile values those
+gates will measure (ramp rates, gains, the velocity envelope, the stop bounds)
+are placeholders, not measurements. For the preset surface, the operator
+reports having manually exercised all 23 actions (operator-reported); the Agent
+has one earlier action-15 software-path success with the camera disconnected
+and physical completion unconfirmed. The vendor tier's QoS is the SDK's own,
+not this profile's.
 
 ## Tests
 

@@ -632,6 +632,13 @@ test("a genuine sequence gap retains the warning and terminal result", async () 
   assert.doesNotMatch(output, /事件查询失败/);
 });
 
+test("workbench has a persistent readiness-scope note", () => {
+  const note = html.match(/<p id="verification-note">([\s\S]*?)<\/p>/);
+  assert.ok(note, "verification note is missing");
+  assert.match(note[1], /就绪/);
+  assert.match(note[1], /真机验收/);
+});
+
 test("compact skill rows show the supplied title, preset tag and readiness with technical details in the tooltip", () => {
   const { run, nodes } = harness({renderSkillList: true});
   run(`
@@ -904,4 +911,78 @@ test("observing a terminal task refreshes history without resubmission", async (
   assert.equal(run("calls.every(call => call.method === 'GET')"), true);
   assert.match(resultText(nodes.get("history-list")), /成功/);
   assert.equal(nodes.get("cancel").disabled, true);
+});
+
+const VENDOR_SKILLS = [
+  {name: "release_arm", display_name: "释放手臂控制", summary: "action 99 control ownership",
+    tags: ["preset", "control_ownership", "unitree_action_id_99"], ready: true},
+  {name: "arms_horizontal", display_name: "双臂平举", summary: "both hands up",
+    tags: ["preset", "unitree_action_id_15"], ready: true},
+  {name: "wave_hand", display_name: "挥手", summary: "播放 99 次提示", ready: true},
+];
+
+test("compact rows show the vendor action id and the control-ownership badge", () => {
+  const { run, nodes } = harness({renderSkillList: true});
+  run(`state.skills = ${JSON.stringify(VENDOR_SKILLS)}; renderSkills();`);
+  const rows = nodes.get("skill-list").children;
+  const release = rows[0].children[0];
+  assert.deepEqual(release.children.map(node => node.textContent),
+    ["释放手臂控制", "预置", "控制权操作", "ID99", "就绪"]);
+  assert.equal(release.children[1].className, "skill-tag");
+  assert.equal(release.children[2].className, "skill-tag");
+  assert.equal(release.children[3].className, "skill-tag vendor-action-id");
+  assert.match(release.children[3].title, /宇树动作ID：99/);
+  assert.match(release.children[3].title, /不是列表序号、请求 ID 或工作流步骤/);
+  const arms = rows[1].children[0];
+  assert.deepEqual(arms.children.map(node => node.textContent), ["双臂平举", "预置", "ID15", "就绪"]);
+  assert.deepEqual(rows[2].children[0].children.map(node => node.textContent), ["挥手", "就绪"]);
+});
+
+test("skill detail names the vendor action id and calls it display-only", async () => {
+  const { run, nodes } = harness();
+  run(`api = async () => (${JSON.stringify(VENDOR_SKILLS[1])});`);
+  await run('selectSkill({name: "arms_horizontal"})');
+  const detail = resultText(nodes.get("skill-detail"));
+  assert.match(detail, /宇树动作ID：15/);
+  assert.match(detail, /厂商固件动作编号/);
+  assert.match(detail, /不是列表序号、请求 ID 或工作流步骤/);
+  assert.equal(nodes.get("skill-detail").children.length >= 2, true);
+});
+
+test("digit searches match the vendor action id exactly instead of unrelated numbers", () => {
+  const { run, nodes } = harness({renderSkillList: true});
+  run(`state.skills = ${JSON.stringify(VENDOR_SKILLS)}; renderSkills();`);
+  const search = nodes.get("skill-search");
+  const names = () => nodes.get("skill-list").children.map(row => row.children[0].children[0].textContent);
+  search.value = "99";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["释放手臂控制"]);
+  search.value = "15";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["双臂平举"]);
+  search.value = "9";
+  run("renderSkills()");
+  assert.match(resultText(nodes.get("skill-list")), /没有匹配技能/);
+  search.value = "015";
+  run("renderSkills()");
+  assert.match(resultText(nodes.get("skill-list")), /没有匹配技能/);
+  search.value = "平举";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["双臂平举"]);
+  search.value = "ownership";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["释放手臂控制"]);
+});
+
+test("skills without a vendor action id show no id badge or id line", async () => {
+  const { run, nodes } = harness({renderSkillList: true});
+  run(`
+    state.skills = [{name: "wave_hand", display_name: "挥手", summary: "挥手致意", tags: ["preset"], ready: false}];
+    renderSkills();
+    api = async () => ({name: "wave_hand", display_name: "挥手", summary: "挥手致意", tags: ["preset"]});
+  `);
+  await run('selectSkill({name: "wave_hand"})');
+  assert.doesNotMatch(resultText(nodes.get("skill-list")), /ID\d/);
+  assert.doesNotMatch(resultText(nodes.get("skill-detail")), /动作ID/);
+  assert.doesNotMatch(resultText(nodes.get("skill-detail")), /厂商固件动作编号/);
 });

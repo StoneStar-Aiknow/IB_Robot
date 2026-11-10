@@ -1,5 +1,16 @@
 # Runtime bridge coverage
 
+> **Scope note (2026-11-07).** Sections dated before this note (including
+> "Preset-only follow-up — 2026-10-28") are historical: they describe the
+> earlier single-action-15 surface and their test counts must not be read as
+> the current 23-preset result. The current source statically lists 23 preset
+> actions; the running deployment and its copied profile still expose only
+> action 15 until a new profile/install is created in an authorized window.
+> The operator reports having manually exercised all 23 actions
+> (operator-reported). The Agent has one earlier software-path success for
+> action 15 only; the camera was disconnected, so physical completion was not
+> confirmed. No Agent real-robot validation of the 23 actions is claimed.
+
 ## Pre-commit verification of supervised commissioning changes
 
 The final implementation was rerun through `colcon test` on 2026-10-28:
@@ -65,7 +76,7 @@ exit status 0 after sourcing this worktree's `.shrc_local`.
 These are offline package results. No hardware motion, firmware compatibility,
 remote handover, or dual-platform Docker acceptance is claimed.
 
-## Preset-only follow-up — 2026-10-28
+## Historical preset-only follow-up — 2026-10-28 (single action 15)
 
 After adding the operator-selected `arms_horizontal` catalog entry and separate
 `g1_29dof_arm_presets` runtime profile, formal `colcon test` results are:
@@ -198,3 +209,57 @@ Integration resolved the collision: the bridge, vendor-mock and process
 suites now read `vendor_test_domain()` (the workspace conftest's
 `IBROBOT_TEST_ROS_DOMAIN_ID`), so no suite carries a domain literal and two
 batches no longer meet on one vendor graph.
+
+
+## 23 static presets — 2026-11-07
+
+The `g1_29dof_arm_presets` surface now statically lists 23 firmware actions
+(IDs 1, 11–13, 15, 17–30, 33, 34, 36, 99). `vendor.arm_actions`,
+`vendor.preset_commissioning.allowed_arm_actions` (same mapping via a YAML
+anchor) and `capabilities.motion.named.names` carry the same 23 names;
+`arms_horizontal` keeps its ID 15 binding (`both_hands_up`) and `release_arm`
+is ID 99. The catalog has 23 `runtime_named_motion` manifests/implementations
+and a 23-entry profile. Every catalog entry has a Chinese `display_name`,
+`tags: [preset]`, `planner_visible: true`; `release_arm` is
+`semantic_level: atomic_operator`, `recovery_policy: never_retry`, and its
+description states control ownership, not a normal gesture, and no automatic
+recovery/finishing insertion.
+
+Current test results from the final source state (formal `colcon test
+--merge-install`; no full rerun was needed for the documentation-only tail):
+
+- `unitree_g1_robot`: **268 passed, 0 skipped, exit 0**.
+- `skill_catalog`: **142 passed, 4 skipped, exit 0**.
+- `robot_config` targeted profile test: **2 passed, exit 0**.
+- `ruff 0.11.8` on changed Python files: check/format clean.
+
+Catalog visibility was checked separately from readiness: a static compile plus
+`RobotClient.list_skills`/`describe_skill` shows 23 skills and
+`release_arm` with `display_name=释放手臂控制`, `planner_visible=true`,
+`tags=[preset]`; `planner_catalog_view` includes `release_arm` with
+`semantic_level=atomic_operator`. No `ExecuteAction` request was sent for this
+check. The Web `/api/skills` filter only keeps `planner_visible` entries; all 23
+pass.
+
+**Catalog visibility is not per-action readiness.** The current catalog/Gateway
+contract has no per-action `ready` flag. The runtime checks these firmware
+limits immediately before `ExecuteAction` using fresh LowState feedback:
+
+- ID 1 `turn_back_wave` requires FSM 500/501. The current deployment's
+  `expected_fsm_id=802` makes it unavailable in this session; admission rejects
+  it with `NAMED_MOTION_PLATFORM_NOT_READY` and the reason before dispatch.
+  The runtime never calls `SetFsmId` to satisfy the limit, and the global
+  expected FSM must not be changed just to enable it.
+- IDs 20/21/28/29/30/36 report `mode_machine` 5/6. Admission reads the observed
+  mode_machine from fresh LowState and rejects when it is outside that list or
+  feedback is stale.
+
+No other firmware limit is asserted. Unknown limits are not fabricated. The
+actionable "not available now" signal is the pre-submit rejection and its
+reason, not a catalog `ready=false`.
+
+The current running deployment was not modified: it still uses the earlier
+single-action profile/install, and its temporary physical acceptance directory
+was left untouched. Deployment of the 23 static presets requires a new
+deployment profile plus a catalog/runtime install update and a session restart
+in an authorized window.

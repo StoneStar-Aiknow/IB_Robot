@@ -201,6 +201,13 @@ class NamedMotionServer:
     def _run_action_once(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
         """Dispatch one preset arm action through the arm RPC service."""
         if getattr(self._node, "_preset_only", False):
+            constraint_check = getattr(self._node, "preset_constraint_failure", None)
+            constraint = constraint_check(name) if callable(constraint_check) else ""
+            if constraint:
+                # The platform is not in a state this firmware action requires;
+                # the public error stays PLATFORM_NOT_READY and the message names
+                # the limit. No FSM/mode switch is attempted.
+                return False, ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE, constraint
             admitted, detail = self._node.admit_preset_attempt()
             if not admitted:
                 return False, ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM, detail

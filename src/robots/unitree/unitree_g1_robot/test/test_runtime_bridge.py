@@ -79,6 +79,14 @@ PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "g1_29dof_dex3.yaml
 with open(PROFILE) as _handle:
     _PROFILE: dict[str, Any] = yaml.safe_load(_handle)
 _VENDOR: dict[str, Any] = _PROFILE["vendor"]
+_PRESET_PROFILE = PROFILE.with_name("g1_29dof_arm_presets.yaml")
+with open(_PRESET_PROFILE) as _handle:
+    _PRESET_VENDOR: dict[str, Any] = yaml.safe_load(_handle)["vendor"]
+# The mock intentionally echoes the profile's own table; it exercises the
+# confirmation mechanism, not the firmware facts. test_firmware_action_names.py
+# pins that table to the saved 2026-11-07/09 GET-only report, so this derived
+# fixture is not the authority for the name strings.
+_PRESET_ACTION_NAMES = [str(entry["action_name"]) for entry in _PRESET_VENDOR["arm_actions"].values()]
 _TOPICS: dict[str, str] = _VENDOR["topics"]
 _CHANNELS = {str(entry["channel"]): entry for entry in _PROFILE["command_channels"]}
 JOINTS = [str(joint) for joint in _PROFILE["joints"]]
@@ -479,13 +487,13 @@ def harness(make_harness):
 # --- startup (design D10) --------------------------------------------------------
 
 
-def test_preset_only_reaches_active_without_hands_and_dispatches_only_15(make_harness):
+def test_preset_only_reaches_active_without_hands_and_enforces_firmware_limits(make_harness):
     harness = make_harness(
         runtime_profile=PROFILE.with_name("g1_29dof_arm_presets.yaml"),
         preset_test_transport=True,
         hand_missing="both",
         initial_fsm_id=802,
-        action_list=["both_hands_up"],
+        action_list=_PRESET_ACTION_NAMES,
     )
     status = harness.wait_active()
     assert status.active_mode == "idle"
@@ -493,22 +501,40 @@ def test_preset_only_reaches_active_without_hands_and_dispatches_only_15(make_ha
     assert "base.cmd_vel" not in status.capabilities
     assert "runtime.stop" not in status.capabilities
     client = _named_client(harness)
-    goal = _send_goal(harness, client, "arms_horizontal")
-    assert goal.accepted
-    future = goal.get_result_async()
-    harness.wait_until(future.done, "preset result")
-    assert future.result().result.success
+
+    def dispatch(name: str):
+        goal = _send_goal(harness, client, name)
+        assert goal.accepted, f"{name!r} was not advertised"
+        future = goal.get_result_async()
+        harness.wait_until(future.done, f"{name} result")
+        return future.result().result
+
+    assert dispatch("arms_horizontal").success
     assert harness.mock.record("last_action_id") == 15
+    # ID 99 is a control-ownership operation, but the user explicitly opened it.
+    assert dispatch("release_arm").success
+    assert harness.mock.record("last_action_id") == 99
+    # Action 1 reports FSM 500/501 only; FSM 802 is read-only, so admission
+    # rejects it with the reason instead of switching FSM.
+    blocked = dispatch("turn_back_wave")
+    assert not blocked.success
+    assert blocked.error_code == ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE
+    assert "FSM [500, 501]" in blocked.message
+    assert "FSM feedback is unavailable" in blocked.message
+    assert "preset not dispatched" in blocked.message
+    assert harness.mock.record("last_action_id") == 99  # rejected before dispatch
+    # Mode-machine 5 is one of the two generations the firmware reports.
+    assert dispatch("make_heart_with_both_hands").success
+    assert harness.mock.record("last_action_id") == 20
     assert harness.arm_sdk_count() == 0
     assert harness.mock.record("last_velocity") is None
     assert harness.loco_requests(projection.LOCO_API_IDS["set_fsm_id"]) == 0
     assert harness.loco_requests(projection.LOCO_API_IDS["switch_to_user_ctrl"]) == 0
-    assert not _send_goal(harness, client, "release_arm").accepted
     assert not harness.set_mode("stream").success
     stopped = harness.stop("HOLD")
     assert not stopped.success and stopped.idle_latency_s == -1.0
     assert not harness.set_mode("idle").success
-    assert harness.mock.record("last_action_id") == 15  # no automatic recovery
+    assert harness.mock.record("last_action_id") == 20  # no automatic recovery
     client.destroy()
 
 

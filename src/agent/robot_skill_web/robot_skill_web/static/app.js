@@ -22,6 +22,37 @@ bindElements();
 function text(value) { return value == null ? "" : String(value); }
 function short(value) { return text(value).slice(0, 8); }
 function skillDisplayName(skill) { return text(skill.display_name).trim() || text(skill.name); }
+// A vendor firmware action number arrives as an optional catalog display tag
+// (for example "unitree_action_id_99"). This page only formats it: the number
+// never selects a firmware action, and it is not a list index, request id or
+// workflow step.
+const VENDOR_ACTION_TAG = /^([a-z][a-z0-9]*)_action_id_([0-9]{1,6})$/;
+const TAG_LABELS = {preset: "预置", control_ownership: "控制权操作"};
+const VENDOR_LABELS = {unitree: "宇树"};
+function vendorAction(skill) {
+  for (const tag of Array.isArray(skill.tags) ? skill.tags : []) {
+    const match = VENDOR_ACTION_TAG.exec(text(tag));
+    if (match) return {vendor: VENDOR_LABELS[match[1]] || match[1], id: match[2]};
+  }
+  return null;
+}
+function tagLabel(tag) {
+  if (TAG_LABELS[tag]) return TAG_LABELS[tag];
+  const match = VENDOR_ACTION_TAG.exec(tag);
+  return match ? `ID${match[2]}` : tag;
+}
+function vendorActionText(action) { return `${action.vendor}动作ID：${action.id}`; }
+function skillMatchesQuery(skill, query) {
+  if (!query) return true;
+  // A digits-only search matches the vendor action id exactly. Unrelated
+  // numbers in a summary must never match, so the free-text haystack is not
+  // consulted for that form.
+  if (/^[0-9]+$/.test(query)) {
+    const action = vendorAction(skill);
+    return action !== null && action.id === query;
+  }
+  return `${skillDisplayName(skill)} ${skill.name} ${skill.summary || ""}`.toLowerCase().includes(query);
+}
 function element(tag, className, content) {
   const node = document.createElement(tag);
   if (className) node.className = className;
@@ -303,13 +334,24 @@ async function refreshStatus() {
 }
 function appendSkillPresentation(container, skill, titleTag = "div", compact = false) {
   const title = skillDisplayName(skill);
+  const action = vendorAction(skill);
   const heading = element("div", "skill-heading");
   heading.append(element(titleTag, "skill-name", title));
   for (const tag of Array.isArray(skill.tags) ? skill.tags : []) {
-    heading.append(element("span", "skill-tag", tag === "preset" ? "预置" : tag));
+    const match = VENDOR_ACTION_TAG.exec(text(tag));
+    const badge = element("span", match ? "skill-tag vendor-action-id" : "skill-tag", tagLabel(tag));
+    if (match) {
+      const label = `${VENDOR_LABELS[match[1]] || match[1]}动作ID：${match[2]}`;
+      badge.title = `${label}（厂商固件动作编号，不是列表序号、请求 ID 或工作流步骤）`;
+    }
+    heading.append(badge);
   }
   container.append(heading);
   if (!compact && title !== skill.name) container.append(element("div", "meta skill-id", skill.name));
+  if (!compact && action) {
+    container.append(element("div", "meta vendor-action-id",
+      `${vendorActionText(action)}（厂商固件动作编号，不是列表序号、请求 ID 或工作流步骤）`));
+  }
   const summary = text(skill.summary).trim();
   if (!compact && summary && summary !== title) container.append(element("p", "meta skill-summary", summary));
   return heading;
@@ -319,12 +361,14 @@ function renderSkills() {
   const previousScroll = query === (elements["skill-list"].dataset.query || "") ? elements["skill-list"].scrollTop || 0 : 0;
   elements["skill-list"].replaceChildren();
   for (const skill of state.skills) {
-    if (query && !`${skillDisplayName(skill)} ${skill.name} ${skill.summary || ""}`.toLowerCase().includes(query)) continue;
+    if (!skillMatchesQuery(skill, query)) continue;
     const item = element("button", "skill-item");
     item.type = "button";
     item.setAttribute("role", "option");
     item.setAttribute("aria-selected", String(state.skill && state.skill.name === skill.name));
-    item.title = [...new Set([skillDisplayName(skill), skill.name, skill.summary].filter(Boolean))].join("\n");
+    const action = vendorAction(skill);
+    item.title = [...new Set([skillDisplayName(skill), skill.name, skill.summary,
+      action ? vendorActionText(action) : null].filter(Boolean))].join("\n");
     const heading = appendSkillPresentation(item, skill, "span", true);
     heading.append(element("span", `status ${skill.ready ? "ready" : "not-ready"}`, skill.ready ? "就绪" : "未就绪"));
     item.onclick = () => selectSkill(skill);

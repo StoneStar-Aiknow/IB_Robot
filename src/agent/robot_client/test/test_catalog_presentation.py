@@ -57,3 +57,19 @@ def test_display_metadata_does_not_change_planner_contract(view):
     assert planned["summary"] == "双手飞吻"
     assert "display_name" not in planned
     assert "tags" not in planned
+
+
+def test_a_vendor_action_id_tag_stays_opaque_presentation(view):
+    """The neutral client copies the tag verbatim and derives no action id."""
+    view["skills"][0]["tags"] = ["preset", "control_ownership", "unitree_action_id_99"]
+
+    for projected in (list_skills(view)["skills"][0], describe_skill(view, "vendor_kiss")):
+        assert projected["tags"] == ["preset", "control_ownership", "unitree_action_id_99"]
+        assert projected["display_name"] == "双手飞吻"
+        assert "action_id" not in projected
+        assert "vendor_action_id" not in projected
+
+    planned = planner_catalog_view(view)["skills"][0]
+    assert "tags" not in planned
+    assert "display_name" not in planned
+    assert "action_id" not in planned

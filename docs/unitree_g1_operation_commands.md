@@ -2,6 +2,20 @@
 
 归档日期：2026-10-30。
 
+> **2026-11-07 适用范围补充。** 源码中的 `g1_29dof_arm_presets` 已扩展为 23 个
+> 静态数字 ID 预设（目录/planner 可见 23 项，`arms_horizontal` 仍绑定 ID 15，
+> `release_arm` 为 ID 99）。本页 2026-10-30 的命令、示例和单动作版本仍只描述
+> 当时部署的 action 15 路径；23 项目录需要新 profile、catalog/runtime 安装更新，
+> 并在授权窗口内重启会话语义后才能生效。不能覆盖正在使用的 install 或现场
+> profile。ID 1 `turn_back_wave` 需要 FSM 500/501，当时部署的 `expected_fsm_id=802`
+> 下不可执行；不得为此修改全局 expected FSM，也不得自动切 FSM/重试。
+> 证据口径：操作员报告 23 项已人工验证通过；作者保存了验收日志；相机中断未形成
+> 物理完成证据。Agent 未对 23 项做真机验证。目录可列出不等于逐动作 ready；当前
+> 契约没有逐动作 ready 字段，运行时在发送前按已知 FSM/mode_machine 限制明确拒绝
+> 并给出原因。
+> 固件命名边界：动作名以 2026-11-07/09 只读 GetActionList 报告为准，按 ID+名称
+> 精确匹配；固件改名时该动作不会被 ID 兜底启用，需用新的只读报告更新 profile。
+
 本页归档本次 Ubuntu 工作区的真机预置动作流程。
 操作入口包括 Web 和命令行界面（CLI）。
 调用顺序为操作入口 → Gateway → G1 runtime → 官方软件开发工具包（SDK）。

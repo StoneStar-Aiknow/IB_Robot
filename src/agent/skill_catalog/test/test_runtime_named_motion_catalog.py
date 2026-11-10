@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from embodied_common.catalog_digest import to_canonical_json
 from embodied_common.dispatch_binding import delegated_executor_identity
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from skill_catalog.compiler import compile_skill_catalog
@@ -150,7 +151,34 @@ def test_bound_named_motion_skill_compiles_without_arguments(tmp_path):
     assert list(snapshot.capability_view["handshake"]["required_capabilities"]) == ["motion.named"]
 
 
-def test_g1_preset_catalog_exposes_only_horizontal_arms_without_recovery():
+G1_PRESET_NAMES = (
+    "release_arm",
+    "turn_back_wave",
+    "blow_kiss_with_both_hands",
+    "blow_kiss_with_left_hand",
+    "blow_kiss_with_right_hand",
+    "arms_horizontal",
+    "clamp",
+    "high_five",
+    "hug",
+    "make_heart_with_both_hands",
+    "make_heart_with_right_hand",
+    "refuse",
+    "right_hand_up",
+    "ultraman_ray",
+    "wave_under_head",
+    "wave_above_head",
+    "shake_hand",
+    "box_left_hand_win",
+    "box_right_hand_win",
+    "box_both_hand_win",
+    "right_hand_on_heart",
+    "both_hands_up_deviate_right",
+    "forward_push",
+)
+
+
+def test_g1_preset_catalog_exposes_all_23_operator_reported_presets():
     context = _context()
     context = replace(context, robot=replace(context.robot, robot_name="unitree_g1_arm_presets"))
     snapshot = compile_skill_catalog(
@@ -158,11 +186,28 @@ def test_g1_preset_catalog_exposes_only_horizontal_arms_without_recovery():
         profile_name="unitree_g1_arm_presets",
         context=context,
     )
-    assert snapshot.enabled_skill_names == ("arms_horizontal",)
-    assert snapshot.planner_visible_skill_names == ("arms_horizontal",)
-    assert snapshot.templates["arms_horizontal"]["binding"] == {"motion": "arms_horizontal"}
-    assert snapshot.templates["arms_horizontal"]["executor"] == "runtime_named_motion"
-    assert snapshot.capability_view["arms_horizontal"]["recovery_policy"] == "never_retry"
+    assert len(snapshot.enabled_skill_names) == len(G1_PRESET_NAMES)
+    assert set(snapshot.enabled_skill_names) == set(G1_PRESET_NAMES)
+    assert set(snapshot.planner_visible_skill_names) == set(G1_PRESET_NAMES)
+    for name in G1_PRESET_NAMES:
+        assert snapshot.templates[name]["binding"] == {"motion": name}
+        assert snapshot.templates[name]["executor"] == "runtime_named_motion"
+        assert snapshot.capability_view[name]["recovery_policy"] == "never_retry"
+        assert snapshot.capability_view[name]["display_name"]
+        tags = list(snapshot.capability_view[name]["tags"])
+        assert tags[0] == "preset"
+        assert tags.count("control_ownership") == (1 if name == "release_arm" else 0)
+        # The vendor number is display data carried in the tag, never a core field.
+        action_tags = [tag for tag in tags if tag.startswith("unitree_action_id_")]
+        assert len(action_tags) == 1
+        assert action_tags[0].removeprefix("unitree_action_id_").isdigit()
+        view_entry = snapshot.capability_view[name]
+        assert not [key for key in view_entry if "action_id" in key or "vendor" in key]
+        core_fields = to_canonical_json({key: value for key, value in view_entry.items() if key != "tags"})
+        assert action_tags[0] not in core_fields
+        assert list(snapshot.capability_view[name]["required_capabilities"]) == ["motion.named"]
+    assert snapshot.capability_view["release_arm"]["display_name"] == "释放手臂控制"
+    assert snapshot.semantic_levels["release_arm"] == "atomic_operator"
 
 
 def test_display_metadata_changes_capability_digest_not_execution_binding(tmp_path):
@@ -181,6 +226,51 @@ def test_display_metadata_changes_capability_digest_not_execution_binding(tmp_pa
     assert after.templates == before.templates
     assert after.capability_view["handshake"]["display_name"] == "握手"
     assert list(after.capability_view["handshake"]["tags"]) == ["preset"]
+
+
+def test_a_vendor_action_id_tag_changes_only_the_display_digest(tmp_path):
+    """A firmware action number stays presentation: admission never reads it.
+
+    The tag is the only carrier, so the capability digest (which the Gateway
+    publishes) covers the number, while the execution binding, the recovery
+    policy and the planner-visible contract stay byte-identical.
+    """
+    _write_catalog(tmp_path)
+    before = _compile(tmp_path)
+    manifest_path = tmp_path / "config/skills/handshake/manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["capability"].update(display_name="握手", tags=["preset", "unitree_action_id_99"])
+    manifest_path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
+
+    after = _compile(tmp_path)
+
+    assert after.templates == before.templates
+    assert after.capability_digest != before.capability_digest
+    assert after.registry_digest != before.registry_digest
+    assert list(after.capability_view["handshake"]["tags"]) == ["preset", "unitree_action_id_99"]
+    assert "action_id" not in after.capability_view["handshake"]
+    assert after.capability_view["handshake"]["recovery_policy"] == "never_retry"
+
+
+def test_an_unknown_action_id_tag_grants_no_execution_entry(tmp_path):
+    """A tag the compiler does not recognise stays inert display text."""
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config/skills/handshake/manifest.yaml"
+    manifest = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    manifest["capability"].update(tags=["preset", "unitree_action_id_00", "control_ownership"])
+    manifest_path.write_text(yaml.safe_dump(manifest, allow_unicode=True), encoding="utf-8")
+
+    snapshot = _compile(tmp_path)
+
+    assert snapshot.templates["handshake"]["binding"] == {"motion": "handshake"}
+    assert snapshot.templates["handshake"]["executor"] == "runtime_named_motion"
+    assert "unitree_action_id_00" not in to_canonical_json(snapshot.templates["handshake"])
+    assert list(snapshot.capability_view["handshake"]["tags"]) == [
+        "preset",
+        "unitree_action_id_00",
+        "control_ownership",
+    ]
+    assert not [key for key in snapshot.capability_view["handshake"] if key.startswith(("action_id", "vendor"))]
 
 
 def test_a_provider_label_alone_does_not_add_a_preset_tag(tmp_path):

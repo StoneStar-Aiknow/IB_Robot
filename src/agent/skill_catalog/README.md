@@ -23,6 +23,15 @@ The catalog compiler and clients do not maintain vendor-specific translations.
 Older manifests without these fields remain valid. Display labels are not
 physical validation or motion-authorization claims.
 
+A vendor firmware action number travels in the same optional `tags` list as a
+`<vendor>_action_id_<N>` tag (for example `unitree_action_id_99`), never as a
+core capability field. The owning provider derives it from its runtime profile
+(`vendor.arm_actions`) and a provider-side consistency test fails when the
+profile number and the shipped tag drift; `control_ownership` marks
+`release_arm` as a control-ownership operation for display. Neither tag adds an
+execution entry point, and clients treat both as opaque display strings: the
+compiler and the neutral client do not parse vendor names or numbers.
+
 The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
 `lekiwi_handeye_realsense_grasp_lidar`,

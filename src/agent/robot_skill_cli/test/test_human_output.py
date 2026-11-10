@@ -1,4 +1,5 @@
 import json
+import re
 from unittest.mock import Mock
 
 import pytest
@@ -39,6 +40,7 @@ def test_cli_uses_format_without_changing_data_or_exit(monkeypatch, capsys, comm
     monkeypatch.setattr(catalog, "load_catalog_context", Mock(return_value=object()))
     monkeypatch.setattr(catalog, "load_transport_context", Mock(return_value=(object(), object())))
     monkeypatch.setattr(cli, "_run_catalog_command", Mock(return_value=data))
+    monkeypatch.setattr(cli, "_run_online_catalog_command", Mock(return_value=data))
     monkeypatch.setattr(cli, "_run_runtime_command", Mock(return_value=data))
     assert cli.main([command, flag]) == 0
     output = capsys.readouterr().out
@@ -72,3 +74,81 @@ def test_tables_keep_unicode_reasons_and_remove_terminal_controls():
 def test_empty_table_and_missing_boolean_are_not_reported_ready():
     text = human_output.render({"ok": True, "command": "status", "data": {}})
     assert "（无条目）" in text and "就绪：未知" in text
+
+
+def _preset_skills():
+    return {
+        "robot_name": "unitree_g1_arm_presets",
+        "skills": [
+            {
+                "name": "release_arm",
+                "display_name": "释放手臂控制",
+                "tags": ["preset", "control_ownership", "unitree_action_id_99"],
+                "required_control_mode": "named_motion",
+                "summary": "Release arm control; a control-ownership operation, not a gesture.",
+            },
+            {
+                "name": "arms_horizontal",
+                "display_name": "双臂平举",
+                "tags": ["preset", "unitree_action_id_15"],
+                "required_control_mode": "named_motion",
+                "summary": "Extend both arms horizontally.",
+            },
+            {
+                "name": "wave_hand",
+                "display_name": "挥手",
+                "required_control_mode": "joint_trajectory",
+                "summary": "挥手致意",
+            },
+        ],
+    }
+
+
+def test_list_skills_shows_chinese_name_vendor_action_id_and_badges(monkeypatch, capsys):
+    monkeypatch.setattr(catalog, "load_transport_context", Mock(return_value=(object(), object())))
+    monkeypatch.setattr(cli, "_run_online_catalog_command", Mock(return_value=_preset_skills()))
+    assert cli.main(["list-skills", "--human"]) == 0
+    output = capsys.readouterr().out
+
+    assert "双臂平举（arms_horizontal）" in output
+    assert "ID15" in output
+    assert "释放手臂控制（release_arm）" in output
+    assert "ID99" in output
+    assert "控制权操作" in output
+    assert "预置" in output
+    # The number is labelled as a vendor action id, not a sequence or request id.
+    assert "厂商动作编号" in output
+    assert "不是列表序号、请求 ID 或工作流步骤" in output
+    assert "不会自动执行、恢复或收尾" in output
+
+
+def test_list_skills_hides_vendor_ids_for_non_vendor_skills(monkeypatch, capsys):
+    skills = {
+        "robot_name": "so101",
+        "skills": [{"name": "wave_hand", "display_name": "挥手", "summary": "挥手致意"}],
+    }
+    monkeypatch.setattr(catalog, "load_transport_context", Mock(return_value=(object(), object())))
+    monkeypatch.setattr(cli, "_run_online_catalog_command", Mock(return_value=skills))
+    assert cli.main(["list-skills", "--human"]) == 0
+    output = capsys.readouterr().out
+
+    assert "挥手（wave_hand）" in output
+    assert not re.search(r"ID\d", output)
+    assert "厂商动作编号" not in output
+    assert "控制权操作" not in output
+
+
+def test_list_skills_json_keeps_display_tags_machine_readable(monkeypatch, capsys):
+    data = _preset_skills()
+    monkeypatch.setattr(catalog, "load_transport_context", Mock(return_value=(object(), object())))
+    monkeypatch.setattr(cli, "_run_online_catalog_command", Mock(return_value=data))
+    assert cli.main(["list-skills", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["data"] == data
+    skills = {skill["name"]: skill for skill in payload["data"]["skills"]}
+    assert skills["arms_horizontal"]["display_name"] == "双臂平举"
+    assert "unitree_action_id_15" in skills["arms_horizontal"]["tags"]
+    assert "control_ownership" in skills["release_arm"]["tags"]
+    # The tag is traceable display data; the adapter adds no execution field.
+    assert "action_id" not in skills["arms_horizontal"]

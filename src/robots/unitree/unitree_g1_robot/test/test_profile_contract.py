@@ -224,8 +224,8 @@ def test_named_motions_map_onto_unique_vendor_action_ids(profile):
     actions = vendor["arm_actions"]
     assert set(actions) == set(profile["capabilities"]["motion.named"]["names"])
     ids = [entry["action_id"] for entry in actions.values()]
-    # The vendor's own action table carries a duplicate id 12; the shipped
-    # subset must not.
+    # The 2026-11-07/09 firmware report maps 12 to the left-hand kiss and 13 to
+    # the right-hand kiss; this profile's subset must still keep unique ids.
     assert len(ids) == len(set(ids))
 
 

@@ -45,7 +45,7 @@
       <div id="work-layout" class="work-layout">
         <div class="skills-column">
           <label for="skill-search">搜索技能</label>
-          <input id="skill-search" type="search" autocomplete="off">
+          <input id="skill-search" type="search" autocomplete="off" placeholder="名称、中文名或厂商动作 ID（如 99）">
           <div id="skill-list" role="listbox" aria-label="可规划技能" tabindex="0"></div>
         </div>
         <div class="editor-column">
@@ -87,6 +87,7 @@
 
   <footer>
     <p>启动时绑定部署配置 → 建立本机会话 → 准备并确认计划。会话有效期为 8 小时；过期后刷新页面即可，目标不会改变。会话不会取消或重发已提交任务。取消按钮不是硬件急停。</p>
+    <p id="verification-note">技能就绪状态来自在线技能目录，只表示 Gateway 当前报告该能力就绪，不代表已完成真机验收。真机验证记录见操作归档。</p>
   </footer>
   <script src="/app.js"></script>
 </body>

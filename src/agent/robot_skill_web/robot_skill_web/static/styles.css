@@ -107,6 +107,8 @@ code { font-family: var(--mono); color: var(--amber-hot); overflow-wrap: anywher
 .skill-item .skill-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .875rem; }
 .skill-item .skill-tag, .skill-item .status { flex: 0 0 auto; }
 .skill-tag { padding: .12rem .45rem; border: 1px solid var(--line); border-radius: 999px; color: var(--graphite); background: #f0e2c6; font-size: .72rem; }
+.skill-tag.vendor-action-id { background: #e7eefb; border-color: #b8c9e6; font-family: var(--mono); }
+.meta.vendor-action-id { font-family: var(--mono); }
 .skill-id { font-family: var(--mono); }
 .skill-summary { margin: .2rem 0; }
 .meta { color: var(--muted); font-size: .8rem; }

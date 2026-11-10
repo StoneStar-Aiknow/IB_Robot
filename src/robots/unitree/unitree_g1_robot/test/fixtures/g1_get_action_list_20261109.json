@@ -1,0 +1,33 @@
+{
+  "captured_at": "2026-11-07/2026-11-09",
+  "source": "operator GET-only arm.GetActionList; the 2026-11-07 run used the single-action-15 profile, the 2026-11-09 run recorded the 23-action profile",
+  "evidence": "tmp/g1-physical-acceptance-20261109/profile.yaml (operator-saved run profile, 23 allowed_arm_actions with the same pairs)",
+  "response": [
+    [
+      {"id": 99, "name": "release_arm"},
+      {"id": 1, "name": "turn_back_wave"},
+      {"id": 11, "name": "blow_kiss_with_both_hands"},
+      {"id": 12, "name": "blow_kiss_with_left_hand"},
+      {"id": 13, "name": "blow_kiss_with_right_hand"},
+      {"id": 15, "name": "both_hands_up"},
+      {"id": 17, "name": "clamp"},
+      {"id": 18, "name": "high_five"},
+      {"id": 19, "name": "hug"},
+      {"id": 20, "name": "make_heart_with_both_hands"},
+      {"id": 21, "name": "make_heart_with_right_hand"},
+      {"id": 22, "name": "refuse"},
+      {"id": 23, "name": "right_hand_up"},
+      {"id": 24, "name": "ultraman_ray"},
+      {"id": 25, "name": "wave_under_head"},
+      {"id": 26, "name": "wave_above_head"},
+      {"id": 27, "name": "shake_hand"},
+      {"id": 28, "name": "box_left_hand_win"},
+      {"id": 29, "name": "box_right_hand_win"},
+      {"id": 30, "name": "box_both_hand_win"},
+      {"id": 33, "name": "right_hand_on_heart"},
+      {"id": 34, "name": "both_hands_up_deviate_right"},
+      {"id": 36, "name": "forward_push"}
+    ],
+    []
+  ]
+}

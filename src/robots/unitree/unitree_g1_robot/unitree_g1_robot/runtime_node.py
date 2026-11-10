@@ -65,7 +65,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -273,6 +273,11 @@ class UnitreeG1RuntimeNode(Node):
             if not allowed or self._vendor.get("arm_actions") != allowed:
                 raise RuntimeError(
                     "preset-only commissioning permits only the profile's preset_commissioning.allowed_arm_actions"
+                )
+            named = ((self._profile.get("capabilities") or {}).get("motion.named") or {}).get("names")
+            if not isinstance(named, list) or set(named) != set(allowed):
+                raise RuntimeError(
+                    "preset-only profile capabilities.motion.named.names must match the allowed action table"
                 )
         projection.expert_tier_gate(bool((self._vendor.get("expert_joint_tier") or {}).get("enabled", False)))
 
@@ -1632,11 +1637,66 @@ class UnitreeG1RuntimeNode(Node):
 
     # --- accessors used by helper modules -------------------------------------------
 
-    def admit_preset_attempt(self) -> tuple[bool, str]:
+    def preset_constraint_failure(self, motion: str) -> str:
+        """Return the local reason a firmware action is unavailable, or ``""``.
+
+        Only limits the profile records are enforced here. Both the live
+        lowstate freshness and the observed ``mode_machine`` come from the
+        newest LowState; the FSM comes from the vendor's own ``GetFsmId``.
+        The check is read-only: it never calls ``SetFsmId`` and never invents a
+        limit for an action the profile does not constrain.
+        """
+        if not motion:
+            return ""
+        actions = self._vendor.get("arm_actions") or {}
+        entry = actions.get(motion) if isinstance(actions, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return ""
+        allowed_modes = entry.get("mode_machine")
+        fsm_ids = entry.get("fsm_ids")
+        if not allowed_modes and not fsm_ids:
+            return ""
+        with self._lock:
+            lowstate_fresh = projection.is_fresh(self._lowstate_stamp, time.monotonic(), self._feedback_window_s)
+            observed_mode = self._mode_machine_observed
+        if not lowstate_fresh:
+            return (
+                f"firmware constraint: preset {motion!r} needs fresh lowstate feedback to verify "
+                "its FSM/mode_machine limit; feedback is stale; preset not dispatched"
+            )
+        if allowed_modes and (type(observed_mode) is not int or observed_mode not in allowed_modes):
+            return (
+                f"firmware constraint: preset {motion!r} requires mode_machine {allowed_modes}; "
+                f"observed mode_machine is {observed_mode}; preset not dispatched"
+            )
+        if fsm_ids:
+            try:
+                current_fsm = self._reported_fsm_id()
+            except Exception:  # noqa: BLE001 - a missing/raising FSM probe fails closed
+                current_fsm = None
+            if current_fsm is None:
+                return (
+                    f"firmware constraint: preset {motion!r} requires FSM {fsm_ids}; "
+                    "FSM feedback is unavailable; preset not dispatched"
+                )
+            if current_fsm not in fsm_ids:
+                return (
+                    f"firmware constraint: preset {motion!r} requires FSM {fsm_ids}; "
+                    f"current FSM is {current_fsm}; the runtime will not switch FSM"
+                )
+        return ""
+
+    def admit_preset_attempt(self, motion: str = "") -> tuple[bool, str]:
         """Read-only preflight for each independent request; dispatch is serialized."""
         with self._lock:
             if self._state.stop_latched:
                 return False, "preset stop latched or prior outcome unknown; no dispatch"
+        constraint = ""
+        if motion:
+            checker = getattr(self, "preset_constraint_failure", None)
+            constraint = checker(motion) if callable(checker) else ""
+        if constraint:
+            return False, constraint
         if not self._preset_physical:
             return True, "mock transport"
         try:

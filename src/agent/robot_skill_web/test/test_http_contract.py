@@ -217,6 +217,33 @@ def test_static_assets_do_not_reuse_cached_ui(web, method, path):
     assert robot.submissions == 0
 
 
+def test_http_passes_vendor_action_tags_through_unchanged(web):
+    browser, robot, _server = web
+    browser.connect()
+
+    tagged = {
+        "name": "wave_hand",
+        "display_name": "挥手",
+        "tags": ["preset", "control_ownership", "unitree_action_id_99"],
+        "summary": "挥手",
+        "planner_visible": True,
+        "ready": True,
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }
+    robot.describe_skill = lambda name: dict(tagged, name=name)
+    robot.list_skills = lambda: {"robot_name": "mock_g1", "skills": [dict(tagged)]}
+
+    status, listing = browser.request("GET", "/api/skills")
+    assert status == 200
+    status, detail = browser.request("GET", "/api/skills/wave_hand")
+    assert status == 200
+    for skill in (listing["skills"][0], detail):
+        assert skill["tags"] == ["preset", "control_ownership", "unitree_action_id_99"]
+        assert "action_id" not in skill
+        assert "vendor" not in skill
+    assert robot.submissions == 0
+
+
 def test_http_preserves_chinese_labels_without_changing_execution_id(web):
     browser, robot, _server = web
     browser.connect()
