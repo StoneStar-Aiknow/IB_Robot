@@ -41,6 +41,7 @@ _MESSAGE_KEYS = {
     "held_recovery_required",
     "recovery_failed",
     "cancelled",
+    "completed",
     "ended",
 }
 
@@ -432,6 +433,10 @@ class GiftWorkflowSpeech:
                 key, text = "placed", f"物体已放到{item.containers[pick_index]}，请工作人员确认后领取。"
             else:
                 key, text = "place_ended", "放置步骤已结束，请工作人员确认现场状态。"
+        elif state == "SUCCEEDED" and not in_pair:
+            # The Gateway confirms the whole workflow, including a trailing return.
+            # This says the task is complete, without inventing placement evidence.
+            key, text = "completed", "好啦，这次任务完成啦！"
         else:
             key, text = "ended", "任务已结束，请工作人员确认现场状态。"
         # Step-failure narration must not suppress the request's authoritative terminal.

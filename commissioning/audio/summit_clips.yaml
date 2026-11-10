@@ -458,20 +458,21 @@ codes:
     - file: Q01_03.wav
       text: 贪心啦，这轮只能选一个哦～
       sha256: 8e99e5fa40e90ebac4b89b566d9399b02f0cd226ac377616620b5483febe0e33
+  # Generated 2026-11-11 on default 310P (10.42.0.251), ZipVoice ascend_310p.
   Q02:
     clip: fruit_already_given
     mode: random
     consumer: speech
     lines:
-    - file: Q02_01.wav
-      text: 这轮已经领过啦，下次再来哦～
-      sha256: fcca19a32f62086ffcba6088fac2c40efdbe30bf388251a19bee40b312f6dba8
-    - file: Q02_02.wav
-      text: 嘿嘿，这轮的礼物给过你啦！
-      sha256: b0dcf0aa5ab53e116cf6a6ca49ef46fa87171afb5524b6f417ec966aa756fdfd
-    - file: Q02_03.wav
-      text: 哎呀，这轮已经领过一份啦～
-      sha256: 462dbf910b3bee1fd9f28182a42bab9442e88cede231233a57f762c2653bfcf6
+    - file: Q02_wake_01.wav
+      text: 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。
+      sha256: 882c4d32b07bf9041f8a7893f199dea2ced105f676305d61902c76c725a99367
+    - file: Q02_wake_02.wav
+      text: 嘿嘿，这轮已经送过啦！再叫声欧拉欧拉，咱们就能再选一份哦。
+      sha256: 8a6e45e411ad71452cfefe82e8517a4d7f1cbd9912027c0ce6475908f2868bea
+    - file: Q02_wake_03.wav
+      text: 还想要呀？这轮已经送过啦，再喊欧拉欧拉，咱们再来一轮吧！
+      sha256: 5cdbe6b4786ce9c650828669d80097191fb01edc330c834dcb490e782529bc09
   Q03A:
     clip: fruit_recommend
     mode: random
@@ -1126,3 +1127,32 @@ codes:
     - file: F04C_01.wav
       text: 不能直接递给你哦，我放进碗里，滑到领取盒你自己拿，可以吗？
       sha256: 0522cdd97ff50669b3f498a14da64fb331b1536025dee029c8660c8b4b4af5e3
+  # Generated on default 310P with ZipVoice ascend_310p, 2026-11-11.
+  F18:
+    clip: gift_task_completed
+    mode: random
+    consumer: speech
+    lines:
+    - file: F18_01.wav
+      text: 好啦，这次任务完成啦！
+      sha256: 446921da7a18d89e38cb848c3a0fb16e535cb078e7c0fd4763f12ba2b54d7d7e
+    - file: F18_02.wav
+      text: 搞定啦，我准备好陪你继续玩啦。
+      sha256: df2e5eec77ccf1d79f7ba13646870d8f2988f12dff7c0bc88eb246ec12ce7292
+    - file: F18_03.wav
+      text: 这次动作做完啦，咱们接着聊吧。
+      sha256: 21f2799f0ae152e6b5db791c750a5294eb2696179021ae123ab260303d8f5564
+  F19:
+    clip: gift_task_ended
+    mode: random
+    consumer: speech
+    lines:
+    - file: F19_01.wav
+      text: 任务已结束，请工作人员确认现场状态。
+      sha256: 5ee15b551fb971fe59fbc9865d370a829617694b152c1922cedebb95e0b38266
+    - file: F19_02.wav
+      text: 这次任务结束啦，请工作人员帮我确认一下现场。
+      sha256: ddf6a36dbd6c55e416242528c0a07c9f482cb756717ca2a5fdba589c33e88159
+    - file: F19_03.wav
+      text: 我这边结束啦，现场情况请工作人员再检查一下。
+      sha256: ccab2b99fbe1113a3b0e5341fcadd8e11bfb16cc64b289471a3ac9b437e56017

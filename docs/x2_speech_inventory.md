@@ -82,10 +82,12 @@
 | F14 | 已经在拿啦，这次改不了哦～ | `spoken_lines.busy_pick` |
 | F16 | 还是没成功，请工作人员帮我一下。 | `gift_messages.pick_failed/place_failed`、`speech_messages.failed/reason_*` |
 | F17 | 我再确认一下，稍等。 | `gift_messages.verifying`（只在检查碗内时出现；展会 `verify_placement: false`，现在不会触发） |
+| F18 | 好啦，这次任务完成啦！ | `gift_messages.completed`（任务确认成功，最后一步为归位或其他非抓放步骤） |
+| F19 | 任务已结束，请工作人员确认现场状态。 | `gift_messages.ended`（通用结束提示，未确认任务成功） |
 | E02 | 已经停下了。请先走出体验区。 | `gift_messages.cancelled`、`speech_messages.canceled` |
 | E06 | 请先别靠近，工作人员正在处理。 | `gift_messages.E06`、`speech_messages.unknown/recovery_failed`（恢复失败或状态不明时） |
 | Q01 | 嘿嘿，这轮只能选一份哦～ | `answer_rules.lines.only_one` |
-| Q02 | 这轮已经领过啦，下次再来哦～ | `answer_rules.lines.already_given` |
+| Q02 | 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。 | `answer_rules.lines.already_given`；3 条录音随机播放，不连续重复 |
 | Q03A | 每个都有礼物哦，要我帮你挑吗？ | `answer_rules.lines.recommend`、`clarification_lines.recommend` |
 | Q03B | 每个都有礼物，我帮你挑一个！ | `answer_rules.lines.random_pick`（代选送水果前先说） |
 | Q06 | 可以呀，现在就给你拿吗？ | `answer_rules.lines.confirm_pick`、`clarification_lines.confirm_pick` |
@@ -127,7 +129,6 @@
 | 执行反馈 | 已停止。 |
 | 执行反馈 | 任务已取消，尚未开始执行。 |
 | 执行反馈 | 执行结果未知，请操作员确认机器人状态。 |
-| 水果交付 ended | 任务已结束，请工作人员确认现场状态。 |
 | 水果交付 recovery_failed | 自动收尾未完成，请工作人员检查机器人和物体。 |
 | 单独抓取 start | 好，我这就去拿，请稍等。 |
 | 单独抓取 success | 成功拿到啦！小礼物请找旁边的工作人员领取。 |
@@ -161,3 +162,41 @@
 音频自动检查不代替人工试听。
 
 Summit 默认不再启用握手技能；保留底层资源和其他部署，避免影响后续人工启用。
+
+## 7. 重新唤醒的领取提示（2026-11-11）
+
+Q02 替换为 3 条支持重新唤醒的文案。原句保持为匹配入口。
+运行时随机播放一条录音，避免连续重复；缺失时沿用实时合成。
+
+| 文件 | 文案 |
+|------|------|
+| `Q02_wake_01.wav` | 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。 |
+| `Q02_wake_02.wav` | 嘿嘿，这轮已经送过啦！再叫声欧拉欧拉，咱们就能再选一份哦。 |
+| `Q02_wake_03.wav` | 还想要呀？这轮已经送过啦，再喊欧拉欧拉，咱们再来一轮吧！ |
+
+音频使用默认 310P（`10.42.0.251`）的 ZipVoice `ascend_310p` 节点生成。
+每条文案调用 3 次；默认模型同一文案的输出一致，保留其中 1 份。
+3 份音频均为 24 kHz、单声道、16 位 WAV，SHA256 记录在录音清单中。
+本机 ASR 回检与文案逐字一致（忽略标点）。生成记录和回检结果位于
+`log/gift_audio_310p_20261111/`。音频文件位于 `commissioning/audio/summit/Q02_wake_*.wav`。
+
+## 8. 任务收尾录音（2026-11-11）
+
+F18 和 F19 各有 3 条录音。运行时随机播放，避免连续重复。
+Gateway 确认整个任务成功，且最后一步是归位或其他非抓放步骤时，语音桥使用 F18。
+F18 只说明任务完成，不补充物体放置或领取结论。
+放置缺少确认、恢复失败和执行状态未知时，语音桥保留各自的检查提示。
+通用结束分支使用 F19，保留人工确认的含义。
+
+| 文件 | 文案 |
+|------|------|
+| `F18_01.wav` | 好啦，这次任务完成啦！ |
+| `F18_02.wav` | 搞定啦，我准备好陪你继续玩啦。 |
+| `F18_03.wav` | 这次动作做完啦，咱们接着聊吧。 |
+| `F19_01.wav` | 任务已结束，请工作人员确认现场状态。 |
+| `F19_02.wav` | 这次任务结束啦，请工作人员帮我确认一下现场。 |
+| `F19_03.wav` | 我这边结束啦，现场情况请工作人员再检查一下。 |
+
+音频使用默认 310P（`10.42.0.251`）的 ZipVoice `ascend_310p` 节点生成。
+文件格式为 24 kHz、单声道、16 位 WAV，SHA256 记录在录音清单中。
+生成记录和 ASR 回检结果位于 `log/gift_completion_audio_310p_20261111/`。

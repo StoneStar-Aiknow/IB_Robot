@@ -204,5 +204,32 @@ def test_successful_return_placeholder_is_not_a_physical_recovery_fault():
     payload["detail"].update(current_skill="return_to_task_pose", workflow_step_index=2)
     payload["detail"]["execution_detail"] = ExecutionDetail().to_dict()
     (done,) = policy().accept(payload, 1)
-    assert done.token.startswith("ended:")
+    assert done.token.startswith("completed:")
+    assert done.text == "好啦，这次任务完成啦！"
     assert "领取" not in done.text
+
+
+@pytest.mark.parametrize(
+    ("state", "facts", "key"),
+    [
+        ("UNKNOWN", {}, "E06"),
+        ("FAILED", {}, "pick_failed"),
+        ("CANCELED", {}, "cancelled"),
+        ("SUCCEEDED", {"schema_version": 2, "recovery_state": "UNKNOWN"}, "E06"),
+        ("SUCCEEDED", {"schema_version": 2, "recovery_state": "FAILED"}, "recovery_failed"),
+        ("ACTIVE", {}, "ended"),
+    ],
+)
+def test_return_without_confirmed_workflow_success_keeps_caution(state, facts, key):
+    payload = event(terminal=True, root=state)
+    payload["detail"].update(current_skill="return_to_task_pose", workflow_step_index=2, execution_detail=facts)
+    (notice,) = policy().accept(payload, 1)
+    assert notice.token.startswith(f"{key}:")
+    assert "完成啦" not in notice.text and "领取" not in notice.text
+
+
+def test_completed_override_does_not_replace_unconfirmed_placement():
+    speech = policy(messages={"completed": "好啦，这次任务完成啦！"})
+    (notice,) = speech.accept(event(terminal=True, release_status="RELEASED", verification_status="UNCERTAIN"), 1)
+    assert notice.token.startswith("place_ended:")
+    assert "工作人员" in notice.text

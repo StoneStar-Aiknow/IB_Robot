@@ -217,7 +217,7 @@ robot:
           speech_stopped: 好嘞～
           wake_ack: 我在呢！
           wake_hint: 要找我，先叫欧拉欧拉哦～
-        # Fruit-delivery narration as recorded lines (F05A-C by fruit, F08, F12, F17, F09, F10, F16, E06, E02).
+        # Recorded fruit-delivery narration, including F18 success and F19 unconfirmed task endings.
         gift_messages:
           F05: 好嘞，给你拿{fruit}！
           F08: 拿到了，我把它送到领取盒。
@@ -229,6 +229,8 @@ robot:
           place_failed: 还是没成功，请工作人员帮我一下。
           E06: 请先别靠近，工作人员正在处理。
           cancelled: 已经停下了。请先走出体验区。
+          completed: 好啦，这次任务完成啦！
+          ended: 任务已结束，请工作人员确认现场状态。
         # A question asked while the robot answers is judged when the answer ends.
         pending_sentence_sec: 10.0
         # The 310P ZipVoice has no English front end: these words are read in Chinese.
