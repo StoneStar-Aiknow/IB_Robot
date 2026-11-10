@@ -51,12 +51,33 @@ from robot_config.placement_execution_config import validate_placement_execution
 from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.voice_contract import SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC, SPEAKER_EMBEDDING_OUTPUT_TOPIC
-from robot_runtime import contract as RUNTIME
 
 from .config_path import resolve_robot_config_path
-from .utils import resolve_calibration_paths_from_config, resolve_ros_path
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_ros_path(path):
+    """Resolve ROS-style path substitutions, importing the shared helper lazily.
+
+    ``robot_config.utils`` imports the joint-conversion contract from
+    ``robot_runtime`` at module scope. Importing it here would make every
+    consumer of this module pull in ``robot_runtime``, which breaks the
+    transport-only projection (:func:`load_transport_robot_config`). Resolve
+    the helper on first use so the strict loaders keep importing it exactly
+    when they run, while transport consumers stay free of the runtime layer.
+    """
+    from robot_config.utils import resolve_ros_path as _resolve_ros_path
+
+    return _resolve_ros_path(path)
+
+
+def resolve_calibration_paths_from_config(robot_config: dict[str, Any]) -> list[str]:
+    """Return resolved calibration paths, importing the shared helper lazily."""
+    from robot_config.utils import resolve_calibration_paths_from_config as _resolve_calibration_paths
+
+    return _resolve_calibration_paths(robot_config)
+
 
 # Controlled vocabularies for the skill `description` contract exposed to Agent callers.
 _VALID_MOTION_SCOPES = {"base", "shoulder", "elbow", "wrist", "gripper", "arm"}
@@ -670,6 +691,11 @@ def robot_supported_control_modes(robot_config: dict[str, Any]) -> tuple[str, ..
 
 def robot_execution_endpoints(robot_config: dict[str, Any]) -> dict[str, Any]:
     """Return the closed endpoint set for the selected robot context schema."""
+    # The endpoint default below is the only reason this module needs the
+    # runtime contract; import it per call so importing ``loader`` for the
+    # transport projection (or config introspection) stays runtime-free.
+    from robot_runtime import contract as RUNTIME
+
     embodied = robot_config.get("embodied", {})
     if not isinstance(embodied, dict):
         embodied = {}

@@ -133,15 +133,18 @@ def load_runtime_context(
     )
 
 
-#: Gateway commands whose handlers read only ``view["timeout_policy"]`` — the
-#: local skill catalog is compiled for none of them. Ledger queries and
-#: cancellation must not depend on local robot resources being intact, which
-#: is the same guarantee the online CLI path already gives these commands.
+#: Gateway commands that read the live Gateway status/snapshot and the
+#: projected timeout policy, never a locally compiled skill view. Ledger
+#: queries and cancellation must not depend on local robot resources being
+#: intact; prepare/execute validate the live snapshot's schema and identity, so
+#: they must not fail locally with ``description_required`` either.
 TRANSPORT_ONLY_COMMANDS = frozenset(
     {
         "status",
         "cancel",
         "reload-catalog",
+        "validate",
+        "execute",
         "plan-workflow",
         "run-workflow",
         "validate-plan",
@@ -167,17 +170,17 @@ def load_transport_context(
 ) -> tuple[CatalogContext, GatewayTransport]:
     """Load the Gateway transport and timeout policy WITHOUT compiling a catalog.
 
-    The compatibility path's ledger and workflow commands (see
-    :data:`TRANSPORT_ONLY_COMMANDS`) and the online catalog commands (see
-    :data:`ONLINE_CATALOG_COMMANDS`) need the bound endpoints and the timeout
-    policy, never a locally compiled skill view. They also must not depend on
-    the runtime interface description, a local model directory or a launch
-    snapshot: only the public ``embodied`` transport contract is read
-    (``load_transport_robot_config``). A deployment with logical runtime
-    interfaces therefore binds the same Gateway endpoints as its launch.
-    Mirrors the visual-game loader's split between metadata and motion
-    dependencies; offline catalog inspection, direct-skill and visual-game
-    commands keep the strict loader.
+    The compatibility path's ledger, prepare/execute and workflow commands
+    (see :data:`TRANSPORT_ONLY_COMMANDS`) and the online catalog commands (see
+    :data:`ONLINE_CATALOG_COMMANDS`) need the bound endpoints, the timeout
+    policy and the live Gateway status/snapshot, never a locally compiled
+    skill view. They also must not depend on the runtime interface description,
+    a local model directory or a launch snapshot: only the public ``embodied``
+    transport contract is read (``load_transport_robot_config``). A deployment
+    with logical runtime interfaces therefore binds the same Gateway endpoints
+    as its launch. Mirrors the visual-game loader's split between metadata and
+    motion dependencies; ``--offline`` catalog inspection and the visual-game
+    commands keep their own strict loaders.
     """
     projection = load_transport_robot_config(config_name=config_name, config_path=config_path)
     embodied = projection.embodied

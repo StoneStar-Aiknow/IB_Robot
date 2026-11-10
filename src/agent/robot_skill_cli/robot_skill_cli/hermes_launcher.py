@@ -19,7 +19,7 @@ from ament_index_python.packages import get_package_share_directory
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from robot_config.config_path import resolve_robot_config_path
 from robot_config.loader import get_effective_visual_game_policies, load_robot_config_dict
-from robot_skill_cli.catalog import load_runtime_context, load_visual_game_runtime_context
+from robot_skill_cli.catalog import load_transport_context
 from robot_skill_cli.cli import _create_bridge
 from robot_skill_cli.ros_bridge import BridgeError
 
@@ -289,8 +289,10 @@ def _resolve_preflight_mode(mode: str, config_path: Path) -> str:
 def _check_robot_runtime(config_name: str | None, config_path: str | None, mode: str = "auto") -> Path:
     resolved = resolve_robot_config_path(config_name=config_name, config_path=config_path)
     preflight_mode = _resolve_preflight_mode(mode, resolved)
-    context_loader = load_visual_game_runtime_context if preflight_mode == "visual-games" else load_runtime_context
-    context, transport = context_loader(config_name=config_name, config_path=config_path)
+    # Preflight only probes the bound Gateway interfaces and needs the
+    # projected timeout policy; compiling the local skill catalog here made the
+    # managed workflow depend on an interface snapshot it never reads.
+    context, transport = load_transport_context(config_name=config_name, config_path=config_path)
     timeout_sec = max(float(context.view["timeout_policy"]["rpc_timeout_sec"]), _PREFLIGHT_TIMEOUT_FLOOR_SEC)
     last_bridge_error = None
     for attempt in range(_PREFLIGHT_ATTEMPTS):

@@ -431,14 +431,15 @@ def test_daemon_drops_private_environment_it_inherited(monkeypatch) -> None:
     assert os.environ["ROS_DOMAIN_ID"] == "52"
 
 
-def test_operator_bridge_does_not_forward_stale_environment_keys(monkeypatch) -> None:
+def test_operator_bridge_forwards_only_the_explicit_caller_token(monkeypatch) -> None:
     from robot_skill_cli import cli
 
-    monkeypatch.setenv("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", "obsolete-operator-token")
+    monkeypatch.setenv("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", "configured-operator-token")
+    monkeypatch.setenv("IBROBOT_STOP_FILE", "/not-a-bridge-argument")
     monkeypatch.setattr(cli, "bridge_kwargs", lambda _: {"status_service": "/status"})
     monkeypatch.setattr(bridge_daemon, "ResidentBridge", _FakeBridge)
     bridge = cli._create_bridge(object())
-    assert bridge.kwargs == {"status_service": "/status", "caller_token": ""}
+    assert bridge.kwargs == {"status_service": "/status", "caller_token": "configured-operator-token"}
 
 
 def test_peer_without_credentials_is_refused() -> None:

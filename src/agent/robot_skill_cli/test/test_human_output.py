@@ -95,6 +95,13 @@ def _preset_skills():
                 "summary": "Extend both arms horizontally.",
             },
             {
+                "name": "clamp",
+                "display_name": "鼓掌",
+                "tags": ["preset", "unitree_action_id_17"],
+                "required_control_mode": "named_motion",
+                "summary": "Clap both hands to applaud with the G1 preset (action 17); no automatic recovery.",
+            },
+            {
                 "name": "wave_hand",
                 "display_name": "挥手",
                 "required_control_mode": "joint_trajectory",
@@ -116,6 +123,12 @@ def test_list_skills_shows_chinese_name_vendor_action_id_and_badges(monkeypatch,
     assert "ID99" in output
     assert "控制权操作" in output
     assert "预置" in output
+    # Operator-confirmed ID 17 is applause: display text says so while the
+    # stable key stays `clamp` for dispatch and exact firmware matching.
+    assert "鼓掌（clamp）" in output
+    assert "ID17" in output
+    assert "Clap both hands" in output
+    assert "夹紧" not in output
     # The number is labelled as a vendor action id, not a sequence or request id.
     assert "厂商动作编号" in output
     assert "不是列表序号、请求 ID 或工作流步骤" in output
@@ -149,6 +162,10 @@ def test_list_skills_json_keeps_display_tags_machine_readable(monkeypatch, capsy
     skills = {skill["name"]: skill for skill in payload["data"]["skills"]}
     assert skills["arms_horizontal"]["display_name"] == "双臂平举"
     assert "unitree_action_id_15" in skills["arms_horizontal"]["tags"]
+    assert skills["clamp"]["display_name"] == "鼓掌"
+    assert "unitree_action_id_17" in skills["clamp"]["tags"]
+    assert "clap" in skills["clamp"]["summary"].lower()
+    assert "夹紧" not in skills["clamp"]["summary"]
     assert "control_ownership" in skills["release_arm"]["tags"]
     # The tag is traceable display data; the adapter adds no execution field.
     assert "action_id" not in skills["arms_horizontal"]

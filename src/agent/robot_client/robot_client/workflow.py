@@ -1,7 +1,7 @@
 """Interactive closed-loop controller for the IB-Robot Capability Gateway.
 
 This module is a pure-Python, ROS-free reference implementation of the interactive
-closed loop (catalog discovery, out-of-catalog rejection, in-process workflow
+closed loop (bound catalog loading, out-of-catalog rejection, in-process workflow
 prepare/execute, ``stop`` to a definite terminal, and safe fresh-state continuation).
 It depends only on an injected ``RosBridge``-like object and the shared
 catalog/workflow helpers, so it is unit-testable without a ROS stack.
@@ -57,7 +57,7 @@ INTENT_UNKNOWN = "unknown"
 # Controller states.
 IDLE = "idle"
 STARTING = "starting"
-DISCOVERED = "discovered"
+CATALOG_LOADED = "catalog_loaded"
 PREPARED = "prepared"
 CONFIRMED = "confirmed"
 EXECUTING = "executing"
@@ -227,8 +227,8 @@ class InteractiveController:
     def _rpc(self) -> float:
         return self._rpc_timeout_sec
 
-    def discover(self) -> dict[str, Any]:
-        """Feature 1: read-only query of the current runtime catalog and identity."""
+    def load_catalog(self) -> dict[str, Any]:
+        """Feature 1: read-only load of the bound target's catalog and identity."""
         status = self._bridge.get_status(task_id="", payload_hash="", timeout_sec=self._status_timeout_sec)
         if not status.get("control_plane_ready"):
             raise InteractiveControlError("SERVER_UNAVAILABLE", "Gateway control plane is not ready")
@@ -252,7 +252,7 @@ class InteractiveController:
             if self._stop_requested_now():
                 self._state = STOPPING
             elif self._state != STARTING:
-                self._state = DISCOVERED
+                self._state = CATALOG_LOADED
         return {
             "robot_name": view["robot_name"],
             "registry_identity": {
@@ -284,7 +284,7 @@ class InteractiveController:
         """Feature 2: reject any step whose skill is not planner-visible in the catalog."""
         catalog_view = view if view is not None else self._fresh_view
         if catalog_view is None:
-            raise IllegalStateError("ILLEGAL_STATE", "discover() must run before catalog rejection")
+            raise IllegalStateError("ILLEGAL_STATE", "load_catalog() must run before catalog rejection")
         visible = planner_visible_names(catalog_view)
         for step in steps:
             skill_name = str(step.get("skill_name", "")).strip()
@@ -301,7 +301,7 @@ class InteractiveController:
     ) -> dict[str, Any]:
         """Feature 3 (create + present): plan one workflow and bind the pending plan in-session."""
         if self._fresh_view is None:
-            raise IllegalStateError("ILLEGAL_STATE", "discover() must run before prepare_workflow()")
+            raise IllegalStateError("ILLEGAL_STATE", "load_catalog() must run before prepare_workflow()")
         self.reject_out_of_catalog(steps)
         normalized = [step.to_dict() for step in normalize_workflow_steps(steps)]
         request_id = request_id.strip() if isinstance(request_id, str) else self._id_factory()
@@ -532,7 +532,7 @@ class InteractiveController:
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
         submission_guard=None,
     ) -> dict[str, Any]:
-        """No-gate one-shot flow: discover → prepare → auto confirm_plan → execute.
+        """No-gate one-shot flow: load_catalog → prepare → auto confirm_plan → execute.
 
         Removes the user-facing ``确认`` gate: the plan is validated and confirmed
         internally so execution starts immediately after presentation. The user
@@ -540,10 +540,10 @@ class InteractiveController:
         during execution. Callable from ``IDLE`` or any definite terminal.
         """
         with self._state_lock:
-            if self._state not in {IDLE, DISCOVERED, STOPPED, SUCCEEDED, FAILED}:
+            if self._state not in {IDLE, CATALOG_LOADED, STOPPED, SUCCEEDED, FAILED}:
                 raise IllegalStateError("ILLEGAL_STATE", f"cannot run from state {self._state}")
-            reuse_discovery = self._state == DISCOVERED
-            if not reuse_discovery:
+            reuse_catalog = self._state == CATALOG_LOADED
+            if not reuse_catalog:
                 self._fresh_status = None
                 self._fresh_view = None
                 self._fresh_identity = None
@@ -565,7 +565,7 @@ class InteractiveController:
                 self._state = STOPPING
         if self._fresh_view is None:
             try:
-                self.discover()
+                self.load_catalog()
             except Exception:
                 with self._state_lock:
                     self._clear_operation()
@@ -574,7 +574,7 @@ class InteractiveController:
         if expected_registry_identity is not None and self._fresh_identity != expected_registry_identity:
             with self._state_lock:
                 self._clear_operation()
-                self._state = DISCOVERED if self._fresh_view is not None else IDLE
+                self._state = CATALOG_LOADED if self._fresh_view is not None else IDLE
             raise InteractiveControlError(
                 "SKILL_SNAPSHOT_DIGEST_MISMATCH",
                 "planning and execution registry identities differ",
@@ -584,7 +584,7 @@ class InteractiveController:
         except Exception:
             with self._state_lock:
                 self._clear_operation()
-                self._state = DISCOVERED if self._fresh_view is not None else IDLE
+                self._state = CATALOG_LOADED if self._fresh_view is not None else IDLE
             raise
         try:
             presentation_callback(presentation)
@@ -1158,7 +1158,7 @@ class InteractiveController:
             self._stop_requested.clear()
             self._state = STARTING
         try:
-            self.discover()
+            self.load_catalog()
             presentation = self.prepare_workflow(raw_command, steps_to_plan)
         except Exception:
             with self._state_lock:

@@ -653,10 +653,14 @@ class SkillExecutorNode(Node):
         self._execution_caller_tokens = {
             str(scope).strip(): str(token) for scope, token in raw_tokens.items() if str(scope).strip() and str(token)
         }
-        # The local operator uses the trusted ROS graph, not a deployment key.
-        # An explicit empty entry also prevents stale shell tokens from enabling authentication.
+        # The local operator uses the trusted ROS graph, not a deployment key,
+        # so an unconfigured operator scope keeps the historical empty token.
+        # Fill that default only when the deployment did not configure the
+        # scope: an explicit ``execution_caller_tokens_json`` entry must never
+        # be disabled here. The empty entry still prevents a stale shell token
+        # from starting to authenticate a scope the launch left unconfigured.
         if "robot_skill_cli" in self._execution_caller_scopes:
-            self._execution_caller_tokens["robot_skill_cli"] = ""
+            self._execution_caller_tokens.setdefault("robot_skill_cli", "")
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value

@@ -1,7 +1,7 @@
 """Functional-verification driver for the interactive closed loop.
 
 Drives ``InteractiveController`` against the live Capability Gateway (real
-``RosBridge``) to prove the closed loop end to end: discover,
+``RosBridge``) to prove the closed loop end to end: load the bound catalog,
 reject-out-of-catalog, present then execute immediately, ``别动`` stop to a
 definite terminal, and ``继续`` fresh-state continuation.
 
@@ -34,7 +34,7 @@ import threading
 from typing import Any
 
 from robot_client.connection import bridge_kwargs
-from robot_skill_cli.catalog import load_runtime_context
+from robot_skill_cli.catalog import load_transport_context
 from robot_skill_cli.interactive_control import (
     InteractiveControlError,
     InteractiveController,
@@ -128,7 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    context, transport = load_runtime_context(config_name=args.config_name, config_path=args.config_path)
+    context, transport = load_transport_context(config_name=args.config_name, config_path=args.config_path)
     # The shared converter from robot_client maps the bound GatewayTransport
     # onto the RosBridge endpoints (this driver used to enumerate a subset by
     # hand, which drifted from every other consumer). robot_id is pinned empty
@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
             _emit(label, payload)
 
     try:
-        emit("discover", controller.discover())
+        emit("load_catalog", controller.load_catalog())
         if args.steps:
             first_steps = [_workflow_step(args, s.strip()) for s in args.steps.split(",") if s.strip()]
         elif args.skill:

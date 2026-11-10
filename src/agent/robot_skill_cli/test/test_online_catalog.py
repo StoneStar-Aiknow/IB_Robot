@@ -207,6 +207,21 @@ def test_online_catalog_rejects_a_snapshot_identity_mismatch(monkeypatch, capsys
     assert bridge.closed is True
 
 
+def test_online_catalog_rejects_a_gateway_for_another_robot(monkeypatch, capsys, strict_loader_forbidden):
+    snapshot = _snapshot()
+    status = _status(snapshot)
+    status["robot_name"] = "unitree_g1"
+    bridge = _FakeBridge(snapshot, status=status)
+    _bind_fake_bridge(monkeypatch, bridge)
+
+    assert cli.main(["--config-name", "unitree_g1_arm_presets", "list-skills"]) == 3
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "TARGET_IDENTITY_CHANGED"
+    assert bridge.snapshot_requests == []
+    assert bridge.closed is True
+
+
 def test_online_catalog_reports_an_unready_control_plane(monkeypatch, capsys, strict_loader_forbidden):
     snapshot = _snapshot()
     _bind_fake_bridge(monkeypatch, _FakeBridge(snapshot, status=_status(snapshot, ready=False)))
@@ -261,3 +276,26 @@ def test_offline_catalog_keeps_the_strict_local_loader(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["error"]["code"] == "description_required"
     assert "runtime.interface_description" in payload["error"]["message"]
+
+
+def test_g1_preset_projection_reports_applause_for_action_17():
+    """The offline projection is the planner/CLI view, not just a Web label."""
+    from robot_config.loader import load_robot_config_dict
+
+    config_path = Path(__file__).resolve().parents[4] / "src/robot_config/config/robots/unitree_g1_arm_presets.yaml"
+    snapshot = catalog.compile_local_snapshot(
+        load_robot_config_dict(config_path, defer_interface_binding=True),
+        config_path,
+    )
+    entry = snapshot.capability_view["clamp"]
+    assert entry["display_name"] == "鼓掌"
+    summary = entry["summary"].lower()
+    assert "clap" in summary or "applaud" in summary
+    assert not any(word in summary for word in ("clamp", "clamping", "夹紧", "hard grip", "hardgrip"))
+    assert tuple(entry["tags"]) == ("preset", "unitree_action_id_17")
+    assert entry["recovery_policy"] == "never_retry"
+    assert "clamp" in snapshot.planner_visible_skill_names
+    # The stable key and execution binding are unchanged by the semantic fix.
+    assert snapshot.templates["clamp"]["binding"] == {"motion": "clamp"}
+    # ID 15 is operator-confirmed correct and must not be renamed here.
+    assert snapshot.capability_view["arms_horizontal"]["display_name"] == "双臂平举"

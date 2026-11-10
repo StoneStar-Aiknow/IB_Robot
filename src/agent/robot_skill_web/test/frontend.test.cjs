@@ -918,6 +918,9 @@ const VENDOR_SKILLS = [
     tags: ["preset", "control_ownership", "unitree_action_id_99"], ready: true},
   {name: "arms_horizontal", display_name: "双臂平举", summary: "both hands up",
     tags: ["preset", "unitree_action_id_15"], ready: true},
+  {name: "clamp", display_name: "鼓掌",
+    summary: "Clap both hands to applaud with the G1 preset (action 17); no automatic recovery.",
+    tags: ["preset", "unitree_action_id_17"], ready: true},
   {name: "wave_hand", display_name: "挥手", summary: "播放 99 次提示", ready: true},
 ];
 
@@ -935,7 +938,12 @@ test("compact rows show the vendor action id and the control-ownership badge", (
   assert.match(release.children[3].title, /不是列表序号、请求 ID 或工作流步骤/);
   const arms = rows[1].children[0];
   assert.deepEqual(arms.children.map(node => node.textContent), ["双臂平举", "预置", "ID15", "就绪"]);
-  assert.deepEqual(rows[2].children[0].children.map(node => node.textContent), ["挥手", "就绪"]);
+  // Operator-confirmed ID 17 is applause. The row renders the display label,
+  // never the historical `clamp` firmware token as the motion meaning.
+  const applause = rows[2].children[0];
+  assert.deepEqual(applause.children.map(node => node.textContent), ["鼓掌", "预置", "ID17", "就绪"]);
+  assert.match(applause.children[2].title, /宇树动作ID：17/);
+  assert.deepEqual(rows[3].children[0].children.map(node => node.textContent), ["挥手", "就绪"]);
 });
 
 test("skill detail names the vendor action id and calls it display-only", async () => {
@@ -949,6 +957,18 @@ test("skill detail names the vendor action id and calls it display-only", async 
   assert.equal(nodes.get("skill-detail").children.length >= 2, true);
 });
 
+test("ID 17 detail keeps the historical key visible but renders applause semantics", async () => {
+  const { run, nodes } = harness();
+  run(`api = async () => (${JSON.stringify(VENDOR_SKILLS[2])});`);
+  await run('selectSkill({name: "clamp"})');
+  const detail = resultText(nodes.get("skill-detail"));
+  assert.match(detail, /鼓掌/);
+  assert.match(detail, /clamp/);
+  assert.match(detail, /宇树动作ID：17/);
+  assert.match(detail, /Clap both hands/);
+  assert.doesNotMatch(detail, /夹紧/);
+});
+
 test("digit searches match the vendor action id exactly instead of unrelated numbers", () => {
   const { run, nodes } = harness({renderSkillList: true});
   run(`state.skills = ${JSON.stringify(VENDOR_SKILLS)}; renderSkills();`);
@@ -960,6 +980,19 @@ test("digit searches match the vendor action id exactly instead of unrelated num
   search.value = "15";
   run("renderSkills()");
   assert.deepEqual(names(), ["双臂平举"]);
+  search.value = "17";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["鼓掌"]);
+  search.value = "鼓掌";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["鼓掌"]);
+  // The stable key stays searchable even though the display meaning changed.
+  search.value = "clamp";
+  run("renderSkills()");
+  assert.deepEqual(names(), ["鼓掌"]);
+  search.value = "夹紧";
+  run("renderSkills()");
+  assert.match(resultText(nodes.get("skill-list")), /没有匹配技能/);
   search.value = "9";
   run("renderSkills()");
   assert.match(resultText(nodes.get("skill-list")), /没有匹配技能/);

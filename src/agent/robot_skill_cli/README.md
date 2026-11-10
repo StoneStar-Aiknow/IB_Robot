@@ -39,19 +39,23 @@ ROBOT_CONFIG=unitree_g1 robot-skill status
 不要求 `runtime.interface_description` 快照，不编译本地技能，不读取模型目录，也不启动
 runtime provider 或查询厂商 SDK。声明了逻辑 runtime 接口的仓库配置（例如
 `unitree_g1_arm_presets` 的 `motion.named`）可以直接用 `--config-name` /
-`ROBOT_CONFIG` 驱动 `status`、在线 `list-skills` / `describe` / `list-poses`、取消、账本和
-`*workflow` 命令。在线目录命令向绑定的 Gateway 查询 status 和 skill snapshot，按
-epoch/generation/digest 校验快照身份后只投影服务端数据；没有可达 Gateway 时返回
-`SERVER_UNAVAILABLE`（exit 4），不会退化成 `description_required`。
-`--offline` 的目录检查、`list-games`、`describe-game`、`validate`、`execute`、
-`start-game`、`game-result` 仍要求接口已解析：使用 launch 打印的 consumer snapshot
-（`/tmp/ibrobot_interfaces_*/robot.yaml`），或本身不含逻辑接口的配置。`--config-path`
-用于带部署 endpoint 覆盖的稳定文件。
+`ROBOT_CONFIG` 驱动 `status`、在线 `list-skills` / `describe` / `list-poses`、`validate` /
+`execute`、取消、账本和 `*workflow` 命令。在线目录、`validate` 和 `execute` 向绑定的
+Gateway 查询 status 和 skill snapshot，按 epoch/generation/digest 校验快照身份后只投影
+服务端数据；没有可达 Gateway 时返回 `SERVER_UNAVAILABLE`（exit 4），不会退化成
+`description_required`。
+`--offline` 的目录检查仍是唯一的严格本地编译路径；`list-games`、`describe-game`、
+`start-game`、`game-result` 仍使用视觉游戏配置加载器，要求接口已解析：使用 launch 打印的
+consumer snapshot（`/tmp/ibrobot_interfaces_*/robot.yaml`），或本身不含逻辑接口的配置。
+`--config-path` 用于带部署 endpoint 覆盖的稳定文件。
 配置绑定不代表运动已获授权，Gateway 的 `authorize_motion` 仍是唯一运行期授权边界。
 `--offline` 只用于显式检查本地开发目录，仍需配置选择器，并保持严格本地校验。
 
 不再支持 `robot-skill discover`、`robot-skill connect`、`robot-skill disconnect`
 和 `--target`：目标切换属于旧的发现/选择流程，已移出本仓库客户端（Issue #238）。
+`run-workflow` 的展示事件名由 `discover` 改为 `load_catalog`，控制器状态字符串由
+`discovered` 改为 `catalog_loaded`；两者只表示读取已绑定目标的目录，不表示重新
+发现或选择目标，旧值不再输出。
 视觉游戏命令同样使用上述配置选择器。
 简易 Web 入口见 [robot-skill-web](../robot_skill_web/README.md)。
 
@@ -158,8 +162,8 @@ bridge 的兼容路径；旧 Agent Plan 接口不再是生产 Agent 主调用链
 | `execution-status --reference FILE` | 是 | 按保存的 Program 引用查询，不加载目录 |
 | `execution-events --reference FILE` | 是 | 读取执行事件，识别重复和缺口 |
 | `cancel-execution --reference FILE` | 是 | 校验目标后请求取消，不加载目录 |
-| `validate SKILL` | 是 | 本地 schema 检查后调用 Gateway 安全校验，不执行动作 |
-| `execute SKILL --task-id ID` | 是 | 通过 `SkillCommand` 执行高层技能 |
+| `validate SKILL` | 是 | 读取 Gateway 当前 snapshot 后做 schema 检查并调用 Gateway 安全校验，不执行动作 |
+| `execute SKILL --task-id ID` | 是 | 读取 Gateway 当前 snapshot 后通过 `SkillCommand` 执行高层技能 |
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
 | `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 旧协议诊断入口：提交 typed AgentPlan |

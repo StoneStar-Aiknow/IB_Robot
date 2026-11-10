@@ -164,7 +164,7 @@ class StubController:
         self.bridge = bridge
         self.plans = 0
 
-    def discover(self):
+    def load_catalog(self):
         pass
 
     def prepare_workflow(self, _raw, steps, *, request_id):

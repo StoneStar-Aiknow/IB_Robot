@@ -22,17 +22,21 @@ from robot_client.transports.ros_bridge import BridgeError
 from .security import CSRF_COOKIE, HTTP_SESSION_COOKIE, SessionStore
 from .serialization import (
     RequestError,
-    SubmissionStore,
     error_payload,
     parse_json_body,
     require_object,
     validate_connection_version,
     validate_id,
 )
+from .submission_store import PendingSubmissionStore
 
 MUTATING_METHODS = {"POST", "DELETE"}
 STATIC_ROOT = files(__package__).joinpath("static")
 SKILL_PATH = re.compile(r"/api/skills/([^/]+)\Z")
+#: How long a submit response waits for a receipt before returning the durable
+#: pending reference.  The reference is recorded before the client can send,
+#: so the browser can always query instead of polling the session forever.
+SUBMISSION_RESPONSE_TIMEOUT_SEC = 5.0
 
 
 def bound_client(*, config_name: str | None = None, config_path: str | None = None) -> RobotClient:
@@ -66,6 +70,15 @@ def serialized_mutation(method):
     return invoke
 
 
+def _text_value(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _request_id(reference: Any) -> str:
+    """Read the immutable request identity from a saved or incoming reference."""
+    return _text_value(reference.get("request_id")) if isinstance(reference, dict) else ""
+
+
 class WebState:
     def __init__(
         self,
@@ -75,12 +88,13 @@ class WebState:
     ) -> None:
         self.client = client
         self.sessions = SessionStore()
-        self.submissions = SubmissionStore(submission_directory)
+        self.submissions = PendingSubmissionStore(submission_directory)
         self.lock = threading.RLock()
         self.connection_id: str | None = None
         self.previews: dict[str, dict[str, Any]] = {}
         self.submission_workers: dict[str, dict[str, Any]] = {}
         self.worker_lock = threading.Lock()
+        self.recover_unsent()
 
     def require_connection(self, connection_version: Any = None) -> dict[str, Any]:
         with self.lock:
@@ -97,14 +111,93 @@ class WebState:
                 self.connection_id = session["connection_id"]
             return session
 
-    def active_or_unknown(self) -> bool:
-        if self.submissions.unresolved():
-            return True
+    def blocking_submission(self) -> dict[str, Any] | None:
+        """Return the saved submission that owns admission, if any.
+
+        A durable pending record is enough to block a second goal: the worker
+        map is process-local and disappears on restart, while the record is
+        the single source of truth for "one motion at a time".  The oldest
+        unresolved record is returned so a caller can query its exact saved
+        reference instead of guessing which task is active.
+
+        Web admission lives here because this store is durable while the worker
+        map is process-local.  The client lock is restored separately for
+        observation only, and both a terminal snapshot and an unambiguous
+        terminal event page release it, so recovery never leaves a permanent
+        client lock behind.
+        """
+        unresolved = self.submissions.unresolved()
+        if unresolved:
+            return min(unresolved, key=lambda record: record.get("submitted_at", 0))
         with self.worker_lock:
-            return any(not worker["done"] for worker in self.submission_workers.values())
+            for worker in self.submission_workers.values():
+                if not worker["done"] and worker["reference"].get("target_key"):
+                    return {
+                        "preview_id": "",
+                        "phase": "submitting",
+                        "state": "unknown",
+                        "reference": copy.deepcopy(worker["reference"]),
+                    }
+        return None
 
     def unresolved_executions(self) -> list[dict[str, Any]]:
         return self.submissions.unresolved()
+
+    def live_request_ids(self) -> set[str]:
+        """Return the request identities this process still owns a worker for."""
+        with self.worker_lock:
+            workers = list(self.submission_workers.values())
+        return {
+            _request_id(worker.get("reference"))
+            for worker in workers
+            if not worker["done"] and _request_id(worker.get("reference"))
+        }
+
+    def recover_unsent(self) -> list[str]:
+        """Release only the startup intents this process provably never sent.
+
+        The worker map is empty when this runs at startup, so a live worker can
+        only appear on a repeated call; it is passed as the exclusion set so a
+        second recovery pass can never release an intent whose worker is still
+        before the send boundary.  A corrupt or unreadable state directory is
+        left to the usual fail-closed path on first use instead of being
+        silently rewritten here.
+        """
+        try:
+            session = self.client.session
+            target_key = _text_value(session.get("target_key")) if isinstance(session, dict) else ""
+            if not target_key:
+                return []
+            return self.submissions.recover_unsent(
+                target_key=target_key,
+                exclude_request_ids=self.live_request_ids(),
+            )
+        except (AttributeError, TypeError, OSError, ClientError):
+            return []
+
+    def restore_submission(self, reference: dict[str, Any]) -> bool:
+        """Adopt a durable reference into the client's explicit admission lock.
+
+        ``RobotClient.get_execution`` is read-only and never turns a foreign
+        reference into a lock.  A Web process that recovers its own persisted
+        record may adopt it explicitly, but only while the record is still
+        unresolved and possibly sent, and only after the store lock proves that
+        a concurrent rejection did not already finalize it.  A request this
+        process still owns a live worker for is never adopted a second time:
+        that client submission adds the same lock itself and removes it when
+        the goal is rejected, so re-adding it here could revive a rejected
+        request.  Client doubles without ``restore_ref`` keep relying on the
+        Web store alone.
+        """
+        if _request_id(reference) in self.live_request_ids():
+            return False
+
+        def adopt(stored: dict[str, Any]) -> None:
+            restore = getattr(self.client, "restore_ref", None)
+            if restore is not None:
+                restore(copy.deepcopy(stored))
+
+        return self.submissions.adopt_if_unresolved(reference, adopt)
 
     def close(self) -> None:
         self.client.close()
@@ -347,6 +440,15 @@ class _RequestHandler(SimpleHTTPRequestHandler):
                 "unresolved tasks belong to another deployment; observe them there before using this one",
                 status=409,
             )
+        for record in unresolved:
+            try:
+                self.state.restore_submission(record["reference"])
+            except ClientError as exc:
+                self.state.sessions.record_connection_failure()
+                raise RequestError(
+                    "a saved unresolved task cannot be adopted by this session; observe it in its original scope",
+                    status=409,
+                ) from exc
         token = self.state.sessions.issue_session()
         csrf = self.state.sessions.lookup(token).csrf
         self.send_json(
@@ -397,8 +499,14 @@ class _RequestHandler(SimpleHTTPRequestHandler):
             optional={"request_id"},
         )
         self.state.require_connection(value["connection_version"])
-        if self.state.active_or_unknown():
-            raise RequestError("observe the current task before preparing another", status=409)
+        blocking = self.state.blocking_submission()
+        if blocking is not None:
+            self.state.restore_submission(blocking["reference"])
+            raise ClientError(
+                "EXECUTION_UNRESOLVED",
+                "observe the current task before preparing another",
+                reference=copy.deepcopy(blocking["reference"]),
+            )
         skill_name = validate_id(value["skill_name"], "skill_name")
         raw_command = value["raw_command"]
         if not isinstance(raw_command, str) or not raw_command.strip() or len(raw_command) > 4000:
@@ -435,50 +543,131 @@ class _RequestHandler(SimpleHTTPRequestHandler):
         session = self.state.require_connection(value["connection_version"])
         preview_id = validate_id(value["preview_id"], "preview_id")
         durable = self.state.submissions.get(preview_id)
+        preview = self.state.previews.get(preview_id)
         if durable is not None:
             ref = durable["reference"]
-            if ref["target_key"] != session["target_key"] or ref["caller_scope"] != session["caller_scope"]:
+            if (
+                ref.get("target_key") != session["target_key"]
+                or ref.get("caller_scope") != session.get("caller_scope", "")
+                or ref.get("robot_id") != session["robot_id"]
+            ):
                 raise RequestError("submission belongs to another target or caller", status=409)
-            self.send_json(202, {"execution": durable["reference"], "already_submitted": True})
+            if preview is not None and preview.get("request_id") != ref.get("request_id"):
+                raise ClientError(
+                    "EXECUTION_IDENTITY_CONFLICT",
+                    "preview request_id conflicts with the saved submission",
+                    reference=copy.deepcopy(ref),
+                )
+            if not (
+                durable.get("state") in {"REJECTED", "SUCCEEDED", "FAILED", "CANCELED"}
+                or (durable.get("state") == "UNKNOWN" and durable.get("reconciled") is True)
+            ):
+                self.state.restore_submission(ref)
+            if durable.get("state") == "REJECTED":
+                failure = durable.get("failure") if isinstance(durable.get("failure"), dict) else {}
+                self.send_json(
+                    200,
+                    {
+                        "execution": durable["reference"],
+                        "already_submitted": True,
+                        "state": durable.get("state"),
+                        "submission_rejected": True,
+                        "error": {
+                            "code": failure.get("code", "GOAL_REJECTED"),
+                            "message": failure.get("message") or "Gateway explicitly rejected the submitted goal",
+                        },
+                    },
+                )
+                return
+            self.send_json(
+                202,
+                {
+                    "execution": durable["reference"],
+                    "already_submitted": True,
+                    "state": durable.get("state"),
+                    "phase": durable.get("phase"),
+                },
+            )
             return
-        preview = self.state.previews.get(preview_id)
         if preview is None:
             raise RequestError("preview is stale; generate a new plan", status=409)
+        preview_request_id = preview.get("request_id")
+        if not isinstance(preview_request_id, str) or not preview_request_id:
+            raise RequestError("preview has no request identity; generate a new plan", status=409)
+        # A repeated request identity is the same submission even when the UI
+        # generated a fresh preview after a reload.  Return its saved reference
+        # instead of replaying the goal.
+        same_request = self.state.submissions.find_by_request(
+            preview_request_id,
+            target_key=session["target_key"],
+            robot_id=session["robot_id"],
+            caller_scope=session.get("caller_scope", ""),
+        )
+        if same_request is not None:
+            self.send_json(
+                202,
+                {
+                    "execution": same_request["reference"],
+                    "already_submitted": True,
+                    "state": same_request.get("state"),
+                    "phase": same_request.get("phase"),
+                },
+            )
+            return
         with self.state.worker_lock:
             existing = self.state.submission_workers.get(preview_id)
         if existing is not None:
             self._send_submission(existing, already_submitted=True)
             return
-        if self.state.active_or_unknown():
-            raise RequestError("another task is active or unobserved", status=409)
-        worker_ref = {
-            "target_key": "",
+        blocking = self.state.blocking_submission()
+        if blocking is not None:
+            self.state.restore_submission(blocking["reference"])
+            raise ClientError(
+                "EXECUTION_UNRESOLVED",
+                "another task is active or unobserved; query the saved execution before submitting again",
+                reference=copy.deepcopy(blocking["reference"]),
+            )
+
+        # Record the request identity before the client starts its pre-goal
+        # checks.  If the receipt response is lost (or this process dies before
+        # the client calls back), the browser still has a durable reference to
+        # query, and a restart cannot silently send a second goal.
+        intent = {
+            "target_key": session["target_key"],
             "robot_id": session["robot_id"],
             "caller_scope": session.get("caller_scope", ""),
-            "request_id": preview["request_id"],
+            "request_id": preview_request_id,
             "execution_id": "",
             "legacy_task_id": "",
         }
+        record = self.state.submissions.reserve_intent(
+            preview_id,
+            session["connection_id"],
+            intent,
+            command=preview.get("command"),
+        )
         ready = threading.Condition()
         with self.state.worker_lock:
             worker: dict[str, Any] = {
                 "state": "submitting",
-                "reference": worker_ref,
+                "reference": copy.deepcopy(record["reference"]),
                 "result": None,
                 "error": None,
+                "accepted": False,
                 "done": False,
                 "ready": ready,
             }
             self.state.submission_workers[preview_id] = worker
 
         def run() -> None:
+            persist_called = False
             try:
 
                 def persist(reference: dict[str, Any]) -> None:
-                    record = self.state.submissions.reserve(
-                        preview_id, session["connection_id"], reference, command=preview.get("command")
-                    )
-                    worker["reference"] = copy.deepcopy(record["reference"])
+                    nonlocal persist_called
+                    updated = self.state.submissions.mark_goal_may_be_sent(preview_id, reference)
+                    worker["reference"] = copy.deepcopy(updated["reference"])
+                    persist_called = True
                     with ready:
                         ready.notify_all()
 
@@ -487,19 +676,37 @@ class _RequestHandler(SimpleHTTPRequestHandler):
                     presenter=presentation_complete,
                     persist_reference=persist,
                 )
-                worker["state"] = "accepted"
                 if isinstance(worker.get("result"), dict):
                     worker["reference"] = copy.deepcopy(worker["result"])
+                self.state.submissions.mark_accepted(preview_id, worker.get("result"))
+                worker["accepted"] = True
+                worker["state"] = "accepted"
             except ClientError as exc:
-                worker["state"] = "unknown" if exc.observation_unknown else "rejected"
-                worker["error"] = {"code": exc.code, "message": str(exc), "reference": copy.deepcopy(exc.reference)}
+                goal_may_be_sent = persist_called or bool(exc.observation_unknown)
+                rejected = (not goal_may_be_sent) or exc.code == "GOAL_REJECTED"
+                worker["state"] = "rejected" if rejected else "unknown"
+                worker["error"] = {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "reference": copy.deepcopy(exc.reference),
+                }
                 if exc.reference is not None:
                     worker["reference"] = copy.deepcopy(exc.reference)
-                if exc.code == "GOAL_REJECTED" and exc.reference is not None:
-                    self.state.submissions.resolve(preview_id, "REJECTED")
+                self.state.submissions.mark_failure(
+                    preview_id,
+                    error_code=exc.code,
+                    message=str(exc),
+                    rejected=rejected,
+                )
             except Exception:
                 worker["state"] = "unknown"
                 worker["error"] = {"code": "INTERNAL_ERROR", "message": "submission outcome is unknown"}
+                self.state.submissions.mark_failure(
+                    preview_id,
+                    error_code="INTERNAL_ERROR",
+                    message="submission outcome is unknown",
+                    rejected=False,
+                )
             finally:
                 worker["done"] = True
                 with ready:
@@ -509,36 +716,77 @@ class _RequestHandler(SimpleHTTPRequestHandler):
         self._send_submission(worker, already_submitted=False)
 
     def _send_submission(self, worker, *, already_submitted):
-        # Wait only for the pre-goal durable reference, never for task completion.
-        ready = worker["ready"]
-        with ready:
-            ready.wait_for(lambda: worker["reference"].get("target_key") or worker["done"], timeout=5.0)
-        if not worker["reference"].get("target_key"):
-            if worker["error"] is not None:
-                status, payload = error_payload(ClientError(worker["error"]["code"], worker["error"]["message"]))
-                self.send_json(status, payload)
-                return
+        # Wait for a receipt, not for task completion.  The durable intent is
+        # already stored, so even a timeout returns a reference the browser can
+        # query; it never turns into an unbounded session-polling loop.
+        if not already_submitted:
+            ready = worker["ready"]
+            with ready:
+                ready.wait_for(
+                    lambda: worker.get("accepted") or worker["done"],
+                    timeout=SUBMISSION_RESPONSE_TIMEOUT_SEC,
+                )
+        reference = copy.deepcopy(worker["reference"])
+        if worker.get("accepted") or already_submitted:
+            self.send_json(
+                202,
+                {
+                    "execution": reference,
+                    "already_submitted": already_submitted,
+                    "state": worker.get("state"),
+                },
+            )
+            return
+        if worker["done"] and worker["state"] == "rejected" and worker["error"] is not None:
+            error = worker["error"]
+            status, payload = error_payload(ClientError(error["code"], error["message"]))
+            self.send_json(status, payload)
+            return
+        if not reference.get("target_key"):
+            # Only possible if the local intent record disappeared; never
+            # claim a submittable reference in that state.
             self.send_json(
                 503,
                 {"error": {"code": "SUBMISSION_PENDING", "message": "submission reference is not yet observable"}},
             )
             return
-        self.send_json(202, {"execution": worker["reference"], "already_submitted": already_submitted})
+        self.send_json(
+            503,
+            {
+                "error": {
+                    "code": "SUBMISSION_PENDING",
+                    "message": "submission receipt is not observable yet; query without replay",
+                },
+                "execution": reference,
+                "observation_unknown": True,
+            },
+        )
 
     def _get_execution(self, path: str) -> None:
         decoded = decode_execution(path[len("/api/executions/") :])
         session = self.state.require_connection()
         if decoded.get("target_key") != session["target_key"] or decoded.get("caller_scope") != session["caller_scope"]:
             raise RequestError("execution belongs to a different target or caller", status=409)
-        durable = self.state.submissions.by_request(decoded.get("request_id", ""), reference=decoded)
-        if durable and durable["reference"] == decoded and durable.get("state") == "REJECTED":
+        # Match by immutable request identity, not by the mutable execution_id
+        # association: a browser keeps the reference it received at submit time
+        # even after the ledger links an execution id to it.  This GET is an
+        # observation only: it may release an existing client lock when the
+        # read-only ledger proves a terminal result, but it must never adopt a
+        # new one.  Adopting here would let a poll that read a nonterminal
+        # record re-add the client lock after the worker already cleared it on
+        # GOAL_REJECTED, reviving a rejected request for the rest of the
+        # process lifetime.
+        durable = self.state.submissions.find_for_reference(decoded)
+        if durable is not None and durable.get("state") == "REJECTED":
+            failure = durable.get("failure") if isinstance(durable.get("failure"), dict) else {}
             self.send_json(
                 200,
                 {
                     "execution": {
                         "found": False,
                         "submission_rejected": True,
-                        "message": "Gateway explicitly rejected the submitted goal",
+                        "error_code": failure.get("code", ""),
+                        "message": failure.get("message") or "Gateway explicitly rejected the submitted goal",
                     },
                     "events": {"events": []},
                 },
@@ -553,19 +801,64 @@ class _RequestHandler(SimpleHTTPRequestHandler):
                 raise RequestError("after_sequence must be an integer") from exc
             if after < 0:
                 raise RequestError("after_sequence must be nonnegative")
-        result = self.state.client.get_execution(decoded)
-        if result.get("found"):
-            state = result.get("state", "")
-            if durable is not None and (
-                state in {"SUCCEEDED", "FAILED", "CANCELED"} or (state == "UNKNOWN" and result.get("reconciled"))
-            ):
-                self.state.submissions.resolve(durable["preview_id"], state, reconciled=bool(result.get("reconciled")))
+
+        # Query the two read-only sources independently.  A snapshot timeout
+        # must not prevent the durable ledger event page from associating a
+        # pending submission or from reporting its terminal state.
+        execution_error: ClientError | BridgeError | None = None
+        try:
+            result = self.state.client.get_execution(decoded)
+        except (ClientError, BridgeError) as exc:
+            execution_error = exc
+            result = {
+                "found": False,
+                "observation_unknown": True,
+                "error_code": exc.code,
+                "message": str(exc),
+            }
         try:
             events = self.state.client.get_execution_events(decoded, after_sequence=after)
         except (ClientError, BridgeError) as exc:
             events = {"events": [], "unavailable": True, "error_code": exc.code, "message": str(exc)}
-        if durable is not None and durable["reference"] == decoded:
-            self.state.submissions.observe(durable["preview_id"], result, events)
+
+        if durable is not None:
+            reconciliation = self.state.submissions.reconcile(
+                durable["preview_id"],
+                result,
+                events,
+                reference=decoded,
+            )
+            if reconciliation.get("conflict"):
+                raise ClientError(
+                    "EXECUTION_IDENTITY_CONFLICT",
+                    str(reconciliation["conflict"]),
+                    reference=copy.deepcopy(durable["reference"]),
+                )
+            if reconciliation.get("terminal"):
+                # The saved terminal observation is authoritative for a late
+                # or unavailable snapshot; it must not downgrade the result.
+                # Keep the response shape equal to the already cached raw
+                # observation whenever the snapshot itself was terminal.
+                if not result.get("found"):
+                    result = {
+                        **result,
+                        "found": True,
+                        "state": reconciliation["state"],
+                        "observation_unknown": False,
+                    }
+                elif result.get("state") != reconciliation["state"]:
+                    result = {**result, "state": reconciliation["state"]}
+                if reconciliation.get("execution_id") and not result.get("execution_id"):
+                    result["execution_id"] = reconciliation["execution_id"]
+                if reconciliation["state"] == "UNKNOWN":
+                    result["reconciled"] = bool(reconciliation.get("reconciled"))
+                # Cache the same synthesized terminal view that the response
+                # returns, so history and the next client poll agree even when
+                # the terminal state came only from the ledger event page.
+                self.state.submissions.observe(durable["preview_id"], result, events)
+                execution_error = None
+        if execution_error is not None:
+            raise execution_error
         self.send_json(200, {"execution": result, "events": events})
 
     @serialized_mutation

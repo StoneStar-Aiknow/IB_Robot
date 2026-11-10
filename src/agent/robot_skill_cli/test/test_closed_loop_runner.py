@@ -25,8 +25,8 @@ class _Controller:
     def __init__(self, bridge, **_kwargs):
         self.bridge = bridge
 
-    def discover(self):
-        return {"state": "discovered"}
+    def load_catalog(self):
+        return {"state": "catalog_loaded"}
 
     def prepare_workflow(self, _raw_command, _steps):
         return {"state": "prepared"}
@@ -62,10 +62,22 @@ def _install_runner(monkeypatch, terminals):
         robot_id="robot-under-test",
         caller_scope="robot_skill_cli",
     )
-    monkeypatch.setattr(closed_loop_runner, "load_runtime_context", lambda **_kwargs: (context, transport))
+    monkeypatch.setattr(closed_loop_runner, "load_transport_context", lambda **_kwargs: (context, transport))
     monkeypatch.setattr(closed_loop_runner, "RosBridge", _Bridge)
     monkeypatch.setattr(closed_loop_runner, "InteractiveController", _Controller)
     return transport
+
+
+def test_runner_binds_the_transport_without_compiling_the_local_catalog(monkeypatch):
+    """The online driver must work when the local skill source is absent."""
+
+    def forbidden(**_kwargs):
+        raise AssertionError("closed-loop runner compiled the local catalog")
+
+    _install_runner(monkeypatch, [{"state": "succeeded"}])
+    monkeypatch.setattr(closed_loop_runner, "load_runtime_context", forbidden, raising=False)
+
+    assert closed_loop_runner.main(["--raw-command", "点头", "--skill", "nod_yes"]) == 0
 
 
 def test_runner_builds_the_bridge_from_the_shared_transport_mapping(monkeypatch):

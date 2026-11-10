@@ -588,12 +588,12 @@ def _set_root_identity(rig, binding) -> None:
         }
         for tokens in (
             {"integration": "integration-test-token"},
-            {"robot_skill_cli": "obsolete-operator-token", "integration": "integration-test-token"},
+            {"robot_skill_cli": "", "integration": "integration-test-token"},
         )
     ],
     indirect=True,
 )
-def test_keyless_operator_keeps_scope_and_motion_admission_checks(gateway_rig, monkeypatch):
+def test_unconfigured_operator_keeps_scope_and_motion_admission_checks(gateway_rig, monkeypatch):
     monkeypatch.setenv("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", "obsolete-environment-token")
     node = gateway_rig.executor_node
     assert node._execution_auth_ok(SimpleNamespace(caller_scope="robot_skill_cli", caller_token=""))
@@ -602,6 +602,87 @@ def test_keyless_operator_keeps_scope_and_motion_admission_checks(gateway_rig, m
     assert node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token="integration-test-token"))
 
     assert not _get_status(gateway_rig).motion_authorized
+    dispatched = []
+    monkeypatch.setattr(node._primitive_client, "send_goal_async", lambda goal: dispatched.append(goal))
+    result = _send_skill(gateway_rig)
+    assert not result.success
+    assert result.error_code == "MOTION_NOT_AUTHORIZED"
+    assert dispatched == []
+    assert gateway_rig.downstream_goals == []
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [
+        {
+            "_task_executor": True,
+            "execution_caller_scopes_json": '["robot_skill_cli", "integration"]',
+            "execution_caller_tokens_json": json.dumps(
+                {
+                    "robot_skill_cli": "configured-operator-token",
+                    "integration": "integration-test-token",
+                }
+            ),
+        }
+    ],
+    indirect=True,
+)
+def test_configured_operator_token_is_enforced(gateway_rig, monkeypatch):
+    # A stale shell token must not replace or weaken the deployment token.
+    monkeypatch.setenv("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", "obsolete-environment-token")
+    node = gateway_rig.executor_node
+    assert node._execution_caller_tokens["robot_skill_cli"] == "configured-operator-token"
+
+    def authorized(token: str) -> bool:
+        return node._execution_auth_ok(SimpleNamespace(caller_scope="robot_skill_cli", caller_token=token))
+
+    assert authorized("configured-operator-token")
+    assert not authorized("")
+    assert not authorized("obsolete-environment-token")
+    assert not authorized("wrong-token")
+    # Other scopes keep their own configured token independently.
+    assert node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token="integration-test-token"))
+    assert not node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token=""))
+
+    missing_token = _program_goal(gateway_rig, request_id="configured-token-missing")
+    assert missing_token.caller_token == ""
+    denied = _send_program(gateway_rig, missing_token)
+    assert denied.success is False
+    assert denied.state == "FAILED"
+    assert denied.error_code == "EXECUTION_SCOPE_DENIED"
+    assert gateway_rig.downstream_goals == []
+
+    wrong_token = _program_goal(gateway_rig, request_id="configured-token-wrong")
+    wrong_token.caller_token = "wrong-token"
+    denied = _send_program(gateway_rig, wrong_token)
+    assert denied.success is False
+    assert denied.error_code == "EXECUTION_SCOPE_DENIED"
+
+    valid_token = _program_goal(gateway_rig, request_id="configured-token-valid")
+    valid_token.caller_token = "configured-operator-token"
+    accepted = _send_program(gateway_rig, valid_token)
+    assert accepted.success is True
+    assert accepted.state == "SUCCEEDED"
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [
+        {
+            "motion_authorized": False,
+            "execution_caller_scopes_json": '["robot_skill_cli"]',
+            "execution_caller_tokens_json": json.dumps({"robot_skill_cli": "configured-operator-token"}),
+        }
+    ],
+    indirect=True,
+)
+def test_configured_operator_token_does_not_bypass_motion_admission(gateway_rig, monkeypatch):
+    node = gateway_rig.executor_node
+    assert node._execution_auth_ok(
+        SimpleNamespace(caller_scope="robot_skill_cli", caller_token="configured-operator-token")
+    )
+    assert not _get_status(gateway_rig).motion_authorized
+
     dispatched = []
     monkeypatch.setattr(node._primitive_client, "send_goal_async", lambda goal: dispatched.append(goal))
     result = _send_skill(gateway_rig)

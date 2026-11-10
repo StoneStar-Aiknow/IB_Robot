@@ -82,7 +82,7 @@ class Controller:
         self.bridge = bridge
         self.stopped = False
 
-    def discover(self):
+    def load_catalog(self):
         pass
 
     def prepare_workflow(self, raw, steps, *, request_id):

@@ -240,9 +240,34 @@ def _create_bridge(transport):
     # The resident bridge keeps one ROS participant alive across invocations so
     # a command does not wait for DDS discovery; it falls back to an
     # in-process RosBridge whenever the daemon cannot be used.
+    #
+    # A deployment that explicitly configures this operator token must keep
+    # authenticating it. The token comes only from the documented environment
+    # variable and never enters the transport identity or a saved reference.
     from robot_skill_cli.bridge_daemon import ResidentBridge
 
-    return ResidentBridge(**bridge_kwargs(transport), caller_token="")
+    return ResidentBridge(
+        **bridge_kwargs(transport),
+        caller_token=os.environ.get("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", ""),
+    )
+
+
+def _verify_gateway_identity(status: dict[str, Any], context) -> None:
+    """Refuse a Gateway that reports a different robot than the bound config.
+
+    The transport projection already fixes the endpoint set and robot id; the
+    status call is the first live identity-bearing reply. A mismatch means the
+    bound config and the running Gateway describe different robots, so every
+    later snapshot/plan would belong to the wrong target.
+    """
+    expected = str(context.view.get("robot_name") or "").strip()
+    observed = str(status.get("robot_name") or "").strip()
+    if expected and observed != expected:
+        raise _CommandError(
+            "TARGET_IDENTITY_CHANGED",
+            "the Gateway reports a different robot than the bound configuration; check --config-name/--config-path",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
 
 
 def _gateway_catalog_view(context, bridge) -> dict[str, Any]:
@@ -254,6 +279,7 @@ def _gateway_catalog_view(context, bridge) -> dict[str, Any]:
         payload_hash="",
         timeout_sec=_status_preflight_timeout(context),
     )
+    _verify_gateway_identity(status, context)
     if not status.get("control_plane_ready", False):
         code = str(status.get("control_plane_error_code") or "CONTROL_PLANE_NOT_READY")
         state = str(status.get("control_plane_state") or "NOT_READY")
@@ -405,6 +431,7 @@ def _prepare_request(
         payload_hash="",
         timeout_sec=_status_preflight_timeout(context),
     )
+    _verify_gateway_identity(status, context)
     snapshot = bridge.get_skill_snapshot(
         registry_epoch=status["registry_epoch"],
         generation=status["registry_generation"],
@@ -492,11 +519,11 @@ def _prepare_request(
             validation["reason"],
             exit_code=EXIT_GATEWAY_REJECTED,
         )
-    return payload, skill_payload_hash(payload), status, validation
+    return payload, skill_payload_hash(payload), status, validation, skill
 
 
 def _run_validate(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
-    payload, payload_hash, _status, validation = _prepare_request(args, context, bridge)
+    payload, payload_hash, _status, validation, _skill = _prepare_request(args, context, bridge)
     return {
         "allowed": True,
         "reason": validation["reason"],
@@ -585,6 +612,7 @@ def _run_confirm_plan(args: argparse.Namespace, context, bridge) -> dict[str, An
         raise _CliArgumentError("task_id must be non-empty")
     timeout_sec = _status_preflight_timeout(context)
     status = bridge.get_status(task_id="", payload_hash="", timeout_sec=timeout_sec)
+    _verify_gateway_identity(status, context)
     task_budget_sec = status["task_budget_sec"] if args.timeout_sec is None else args.timeout_sec
     if not math.isfinite(task_budget_sec) or task_budget_sec <= 0.0 or task_budget_sec > status["task_budget_sec"]:
         raise _CliArgumentError("timeout_sec must be finite, positive, and within the Gateway task budget")
@@ -1010,7 +1038,12 @@ def _run_execute(args: argparse.Namespace, context, bridge) -> _CommandExit:
     task_id = args.task_id.strip()
     if not task_id:
         raise _CliArgumentError("task_id must be non-empty")
-    payload, payload_hash, status, _validation = _prepare_request(args, context, bridge)
+    payload, payload_hash, status, _validation, skill = _prepare_request(args, context, bridge)
+    if os.environ.get("IBROBOT_HERMES_MANAGED_REQUIRED") == "1" and skill.get("moves_robot", True):
+        # The direct execute path is not the managed run-workflow entry. The
+        # Gateway snapshot is authoritative for ``moves_robot``; a local view
+        # is no longer compiled, so this guard must use the live skill entry.
+        raise _CliArgumentError("Hermes motion requires the managed run-workflow entry")
     payload["_registry_epoch"] = status.get("registry_epoch", "")
     payload["_registry_generation"] = status.get("registry_generation", 0)
     payload["_registry_digest"] = status.get("registry_digest", "")
@@ -1082,6 +1115,7 @@ def _run_execute(args: argparse.Namespace, context, bridge) -> _CommandExit:
             },
         )
         return _CommandExit(EXIT_GATEWAY_REJECTED)
+    _verify_gateway_identity(identity_status, context)
     if not bridge.wait_for_skill_server(timeout_sec=rpc_timeout):
         raise _CommandError("SERVER_UNAVAILABLE", "skill action server unavailable", exit_code=EXIT_ROS_UNAVAILABLE)
 
@@ -1412,7 +1446,9 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
         raise BridgeError("ROS_UNAVAILABLE", "failed to initialize ROS bridge", exit_code=EXIT_ROS_UNAVAILABLE)
     try:
         if args.command == "status":
-            return bridge.get_status(timeout_sec=_status_preflight_timeout(context))
+            status = bridge.get_status(timeout_sec=_status_preflight_timeout(context))
+            _verify_gateway_identity(status, context)
+            return status
         if args.command == "reload-catalog":
             return _run_reload_catalog(args, context, bridge)
         if args.command == "validate":
@@ -1498,15 +1534,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 data = _run_online_catalog_command(args, context, transport)
         else:
-            # The ledger and workflow commands read only the timeout policy:
-            # they skip the local catalog compile, so cancellation and status
-            # stay available when the local robot resources are not.
+            # Prepare/execute, ledger and workflow commands read the live
+            # Gateway status/snapshot and the projected timeout policy. They
+            # skip the local catalog compile, so a reachable Gateway is not
+            # blocked by a missing local interface/model/skill source.
             context_loader = load_transport_context if command in TRANSPORT_ONLY_COMMANDS else load_runtime_context
             context, transport = context_loader(config_name=args.config_name, config_path=args.config_path)
-            if command == "execute" and os.environ.get("IBROBOT_HERMES_MANAGED_REQUIRED") == "1":
-                capability = next((item for item in context.view["skills"] if item["name"] == args.skill), {})
-                if capability.get("moves_robot", True):
-                    raise _CliArgumentError("Hermes motion requires the managed run-workflow entry")
             data = _run_runtime_command(args, context, transport)
     except _CommandError as exc:
         record_admission_error(exc.code, str(exc))

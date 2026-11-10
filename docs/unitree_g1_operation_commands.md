@@ -159,8 +159,10 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 ```
 
 本次流程不生成密钥。
-Gateway 将 `robot_skill_cli` 标准操作员令牌固定为空值。
-如果启动环境有旧的执行令牌，该值不会增加权限。
+Gateway 只为未显式配置 `robot_skill_cli` 令牌的部署填入空值；部署通过
+`execution_caller_tokens_json` 配置的非空令牌仍会校验，CLI 按会话转发
+`IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI`。
+未配置令牌时，启动环境里的旧执行令牌不会增加权限。
 密钥和令牌不写入配置、ROS 参数或 launch 日志。
 
 只读检查使用 `authorize_motion:=false`。
@@ -364,7 +366,7 @@ Gateway 记录的执行时长约为 7.30 秒。
 
 | 现象 | 检查或处理 |
 | --- | --- |
-| Web 无法发现 G1 | 确认 Gateway 已就绪，核对各终端的 ROS 域和 `dds-config show` 输出 |
+| Web 无法连接绑定的 Gateway（Gateway 不可达） | Web 不做发现或选择；确认配置的目标可解析并核对各终端的 ROS 域和 `dds-config show` 输出 |
 | Web 连接失败 | 核对目标身份、Gateway 状态和 ROS 通信配置 |
 | `MOTION_NOT_AUTHORIZED` | 核对启动参数；运动授权必须来自现场操作员 |
 | `PRESET_HARDWARE_DISABLED` | 核对本次 operator profile，禁止关闭准入检查绕过错误 |

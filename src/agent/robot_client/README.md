@@ -38,8 +38,12 @@ security and trusted network boundary.
 
 The standard local operator uses the trusted ROS graph without a credential file
 or token environment variable: `caller_scope="robot_skill_cli"`, an empty caller
-token, and `read_only=false`. The Gateway pins this scope to its empty token, so
-stale operator environment tokens do not grant additional access.
+token, and `read_only=false`. When the deployment leaves
+`execution_caller_tokens_json` without a `robot_skill_cli` entry, the Gateway
+keeps the empty token for this scope, so stale operator environment tokens do
+not grant additional access. If the deployment configures an explicit
+`robot_skill_cli` token, the Gateway keeps enforcing it and the CLI forwards the
+documented `IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI` value per session.
 
 Integrations that need a different caller scope pass one explicitly to
 `gateway_transport(caller_scope=...)` and rely on the Gateway's configured

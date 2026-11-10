@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import hmac
 import secrets
 import threading
 import time
@@ -17,7 +16,6 @@ CONNECTION_WINDOW_SEC = 60.0
 
 @dataclass
 class Session:
-    token_hash: str
     csrf: str
     expires_at: float
 
@@ -54,21 +52,22 @@ class SessionStore:
         """Issue a browser session for the deployment the server is bound to."""
         with self._lock:
             token = secrets.token_urlsafe(32)
-            session = Session(self._hash(token), secrets.token_urlsafe(32), self._now() + SESSION_TTL_SEC)
-            # A new browser session replaces browser access, not the bound target or its tasks.
-            self._sessions = {token: session}
+            session = Session(secrets.token_urlsafe(32), self._now() + SESSION_TTL_SEC)
+            # A new browser session replaces browser access, including other tabs,
+            # not the bound target or its tasks. Retain only the token digest.
+            self._sessions = {self._hash(token): session}
             return token
 
     def lookup(self, token: str) -> Session:
         with self._lock:
             now = self._now()
             self._sessions = {key: value for key, value in self._sessions.items() if value.expires_at > now}
-            session = self._sessions.get(token)
-            if session is None or not hmac.compare_digest(session.token_hash, self._hash(token)):
+            session = self._sessions.get(self._hash(token))
+            if session is None:
                 raise PermissionError("browser session is not active")
             return session
 
     def close(self, token: str | None) -> None:
         with self._lock:
             if token is not None:
-                self._sessions.pop(token, None)
+                self._sessions.pop(self._hash(token), None)

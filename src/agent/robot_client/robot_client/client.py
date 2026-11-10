@@ -29,6 +29,30 @@ _GATEWAY_IDENTITY_FIELDS = (
     "capability_digest",
 )
 
+#: Execution states that release the local admission lock once observed. An
+#: ``UNKNOWN`` state releases it only when the Gateway also reports that the
+#: physical outcome has been reconciled.
+_TERMINAL_EXECUTION_STATES = frozenset({"SUCCEEDED", "FAILED", "CANCELED"})
+
+
+def _observes_terminal(result) -> bool:
+    state = result.get("state")
+    return bool(result.get("found")) and (
+        state in _TERMINAL_EXECUTION_STATES or (state == "UNKNOWN" and bool(result.get("reconciled")))
+    )
+
+
+def _terminal_event_state(events) -> str:
+    """Return the one terminal state a ledger event page proves, if unambiguous.
+
+    An event page may be queried after a reconnect and can contain a terminal
+    event without a Gateway snapshot.  Only states the public event contract
+    can actually express are accepted; a second, different terminal state is
+    contradictory evidence and must not release admission.
+    """
+    states = {event.get("state") for event in events if event.get("state") in _TERMINAL_EXECUTION_STATES}
+    return states.pop() if len(states) == 1 else ""
+
 
 def _transport_factory(**kwargs):
     from .transports.resident import ResidentBridge
@@ -217,7 +241,7 @@ class RobotClient:
                     raise ClientError("EXECUTION_UNRESOLVED", "observe the current task before preparing another")
                 connection_id = self._connection_id
             controller = InteractiveController(bridge, timeout_policy={}, execution_mode=IMMEDIATE_AFTER_PRESENTATION)
-            controller.discover()
+            controller.load_catalog()
             plan = controller.prepare_workflow(raw, request["workflow_steps"], request_id=request_id)
             preview = {
                 "preview_id": uuid.uuid4().hex,
@@ -289,6 +313,7 @@ class RobotClient:
                 if handle is None or not handle.accepted:
                     with self._lock:
                         self._unresolved.pop(ref["request_id"], None)
+                        self._submitted.pop(preview_id, None)
                     raise ClientError("GOAL_REJECTED", "Gateway rejected the request", reference=ref)
             except ClientError:
                 raise
@@ -324,6 +349,22 @@ class RobotClient:
             raise ClientError("INVALID_REFERENCE", "execution scope or identifier kind does not match")
         return {key: ref[key] for key in allowed if key in ref}
 
+    def restore_ref(self, ref):
+        """Adopt a reference this deployment persisted before a restart.
+
+        A read-only :meth:`get_execution` never creates an admission lock, so a
+        caller that recovers saved state (for example the Web submission store)
+        must make that recovery explicit here first. The saved reference is
+        validated against the bound deployment, which keeps a record from
+        another target from being adopted; this target scope is routing
+        evidence, not authentication. Observation still releases the lock at
+        the usual terminal or reconciled state.
+        """
+        checked = self._reference(ref)
+        with self._lock:
+            self._unresolved.setdefault(checked["request_id"], copy.deepcopy(checked))
+        return copy.deepcopy(checked)
+
     def get_execution(self, ref):
         bridge = self._bridge_for_operations()
         checked = self._reference(ref)
@@ -333,19 +374,29 @@ class RobotClient:
             timeout_sec=5.0,
         )
         with self._lock:
-            if result.get("found") and (
-                result.get("state") in {"SUCCEEDED", "FAILED", "CANCELED"}
-                or (result.get("state") == "UNKNOWN" and result.get("reconciled"))
-            ):
+            if _observes_terminal(result):
                 self._unresolved.pop(checked["request_id"], None)
                 for submitted in self._submitted.values():
                     if submitted["request_id"] == checked["request_id"]:
                         submitted["execution_id"] = result.get("execution_id", "")
-            else:
-                self._unresolved[checked["request_id"]] = copy.deepcopy(checked)
+            # Observation never authorizes admission: only a local submission
+            # or an explicit restore_ref may add an unresolved reference. An
+            # in-flight poll that returns after a rejection therefore cannot
+            # revive the lock.
         return {**result, "observation_unknown": not bool(result.get("found"))}
 
     def get_execution_events(self, ref, after_sequence=0):
+        """Read authoritative ledger events and release a proven terminal lock.
+
+        The event page is a read-only observation: it may release an admission
+        entry this client already adopted or submitted, but it never creates
+        one.  A terminal event for the same execution identity is the
+        events-only counterpart of a terminal snapshot; without it a Web layer
+        that recovered a durable reference would leave the client locked after
+        the Web record already reached a terminal state.  A contradictory page
+        (no single terminal state, no execution identity, or a different
+        identity than the reference) leaves every lock in place.
+        """
         bridge = self._bridge_for_operations()
         checked = self._reference(ref)
         if type(after_sequence) is not int or after_sequence < 0:
@@ -400,6 +451,17 @@ class RobotClient:
         result["events"] = [unique_events[sequence] for sequence in ordered]
         last_returned = ordered[-1] if ordered else after_sequence
         result["event_gap"] = gap or (last_event_sequence > last_returned and not has_more)
+        terminal_state = _terminal_event_state(result["events"])
+        if (
+            terminal_state
+            and execution_id
+            and (not checked.get("execution_id") or checked["execution_id"] == execution_id)
+        ):
+            with self._lock:
+                self._unresolved.pop(checked["request_id"], None)
+                for submitted in self._submitted.values():
+                    if submitted["request_id"] == checked["request_id"]:
+                        submitted["execution_id"] = execution_id
         return result
 
     def cancel_execution(self, ref):

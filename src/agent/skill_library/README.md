@@ -73,11 +73,13 @@ scope. The token authenticates transport requests and is not included in the
 canonical Program digest or durable execution payload.
 
 The embodied launch builder automatically generates the `robot_skill_cli`
-operator scope. For that standard operator scope, the Gateway configures an
-empty token entry and ignores stale environment or configured operator tokens.
-The Web and CLI default connection uses the trusted ROS graph with this scope
-and an empty token. Other configured scopes retain their configured token
-policy. No launch key or secret environment file is generated.
+operator scope. When the deployment does not configure a token for that scope,
+the Gateway keeps the historical empty token, so a stale environment token does
+not start authenticating it. When `execution_caller_tokens_json` explicitly
+configures `robot_skill_cli`, the Gateway keeps that token and enforces it; the
+CLI forwards `IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI` for the session. Other
+configured scopes retain their configured token policy. No launch key or secret
+environment file is generated.
 
 Connection discovery exposes the observed instance ID, boot ID, descriptor
 revision and endpoint map. The client re-probes and verifies that identity

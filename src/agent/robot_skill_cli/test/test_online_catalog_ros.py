@@ -45,8 +45,12 @@ def _gateway_snapshot():
 
 
 class _FakeCatalogGateway:
-    def __init__(self, snapshot, *, suffix):
+    def __init__(self, snapshot, *, suffix, robot_name=None):
         self.snapshot = snapshot
+        # The fake serves the repository preset's bound business identity; the
+        # snapshot payload itself comes from the offline fixture because that
+        # is the only catalog compilable without a launch interface snapshot.
+        self.robot_name = robot_name or snapshot.robot_name
         self.node = rclpy.create_node(f"online_catalog_gateway_{suffix}")
         self.status_requests = []
         self.snapshot_requests = []
@@ -56,7 +60,7 @@ class _FakeCatalogGateway:
     def _status(self, request, response):
         self.status_requests.append(request)
         response.schema_version = 1
-        response.robot_name = self.snapshot.robot_name
+        response.robot_name = self.robot_name
         response.motion_authorized = False
         response.active_control_mode = ""
         response.busy = False
@@ -90,7 +94,7 @@ def test_online_catalog_commands_read_a_real_gateway_snapshot(monkeypatch, capsy
     rclpy.init()
     snapshot = _gateway_snapshot()
     suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
-    gateway = _FakeCatalogGateway(snapshot, suffix=suffix)
+    gateway = _FakeCatalogGateway(snapshot, suffix=suffix, robot_name="unitree_g1_arm_presets")
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(gateway.node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)

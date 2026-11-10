@@ -60,3 +60,13 @@ def test_closed_session_allows_a_new_session():
     with pytest.raises(PermissionError):
         store.lookup(token)
     assert store.lookup(store.issue_session())
+
+
+def test_lookup_requires_the_exact_session_token():
+    store = SessionStore()
+    token = store.issue_session()
+    with pytest.raises(PermissionError):
+        store.lookup(token + "x")
+    with pytest.raises(PermissionError):
+        store.lookup("")
+    assert store.lookup(token)

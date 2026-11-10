@@ -58,7 +58,8 @@ ros2 run robot_skill_web robot-skill-web --config-name unitree_g1
 换目标要重启 Web 并传入另一个部署配置。
 页面没有「切换机器人」或「断开连接」入口。
 浏览器会话有效期为 8 小时，过期后刷新页面即可重新建立同类会话。
-重新建立会话会替换浏览器访问，但不会改变目标、取消任务或重发任务。
+新建会话会使此前签发的会话失效：同一浏览器的其他标签页需要刷新并重新建立会话。
+这不会改变目标、取消任务或重发任务。
 
 `POST /api/session` 只接受空对象；旧登录字段（`deployment_key`、
 `startup_code`、`caller_token` 等）会被拒绝。
@@ -74,8 +75,16 @@ Web 重启后仍是启动配置绑定的同一目标，不会重新发现。
 ## 凭证边界
 
 标准 Web 和 CLI 使用受信 ROS 图，不使用凭证文件。
-调用方作用域由部署配置决定，浏览器不能覆盖。
+Web 的调用方作用域固定为 `robot_skill_cli`，浏览器不能覆盖。
 目标标识是路由身份，不是密码学认证。
+
+Web 当前没有显式 caller token 配置通路：启动只读取部署配置的 `embodied` 传输端点，
+`caller_scope` 固定为 `robot_skill_cli`，传给 bridge 的 `caller_token` 为空。
+Gateway 为该作用域配置非空令牌时，需要调用方授权的执行接口会拒绝 Web 请求（fail closed）；
+Web 不会让浏览器传令牌，也不依赖 Gateway 清空已配置令牌。
+配置了非空令牌的部署请使用支持显式凭据的 CLI；默认未配置令牌的受信部署行为不变。
+浏览器不能传入 `caller_token`；正常请求日志只记录方法和去掉 query 的路径，
+不记录 cookie、session 或 `target_key`。
 
 宇树 G1 的 Web 操作和历史验证记录见[启动与操作归档](../../../docs/unitree_g1_operation_commands.md)。
 旧临时部署目录已清理，禁止复活该目录。
@@ -128,6 +137,19 @@ Web 重启后仍是启动配置绑定的同一目标，不会重新发现。
 刷新页面会恢复执行引用，不重放动作。
 存在活动或未知任务时，后端禁止新的提交。
 目录不可用时，查询和取消不加载技能目录。
+技能目录读取是只读操作：Gateway 的 registry epoch 在读取期间变化时，客户端最多重试一次。
+物理动作提交不重试。
+同一私有状态目录只允许一个 Web 进程写入；多个 Web 进程共享记录会破坏单动作准入。
+账本事件只有明确的 SUCCEEDED、FAILED 或 CANCELED 才释放锁；事件为 UNKNOWN 且没有
+`reconciled` 时保持未知，不重放，也不自动解锁。
+发 goal 之前进程崩溃或退出时，记录停在 submitting。
+Web 重启后先做一次启动恢复：只有本部署、显式 `phase=submitting`、`goal_may_be_sent` 为布尔
+`False`、且本进程没有对应 worker 的记录，才能证明 goal 未发送；这类记录标为既有的
+`REJECTED` 终态并带 `NOT_SENT` 原因，释放准入，历史里可查看。该结果不是物理取消，也不重发。
+`goal_may_be_sent` 缺失、旧版本缺省、非布尔值或目标不同都算证据不足，继续按保守锁处理。
+已经落盘 `goal_may_be_sent=True` 的记录即使 goal 可能没真正发出，也保持未知和锁定，不自动推断。
+观察和查询只读：普通 GET 只观察或清理已有锁，不会新增、恢复或复活客户端锁；
+会话建立只采纳真实未决且可能已发送的记录，已终态记录不采纳。
 
 警告：「请求取消」不是硬件急停。
 
@@ -220,4 +242,6 @@ colcon test-result --test-result-base build/robot_skill_web --verbose
 测试也覆盖过期重建、任务恢复和访问边界。
 HTTP 测试通过真实本地服务验证访问边界。
 测试也覆盖重复提交和重启恢复。
+测试覆盖启动恢复只在 fsync 的未发送证据成立时释放、写入前崩溃保持锁定，
+以及普通 GET 在拒绝竞态中不复活客户端锁。
 测试不发送真实机器人动作。
