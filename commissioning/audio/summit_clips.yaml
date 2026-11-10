@@ -1,0 +1,1128 @@
+schema_version: 1
+sample_rate: 24000
+codes:
+  W01:
+    clip: greeting
+    mode: random
+    consumer: skill:greet_visitor
+    lines:
+    - file: W01_01.wav
+      text: 嗨，我是欧拉！想做动作，还是选个水果礼物呀？
+      sha256: 110bbcfbdfcd4b92218e7fd4142399a60e2aa0e08f632eda5f4ef577c7737050
+    - file: W01_02.wav
+      text: 哇，有朋友来啦！我是欧拉，想玩点啥呀？
+      sha256: 3f6d44096928579830a7966d6579ee1943b36a0ce4b17247e17cf163e9c3e28d
+    - file: W01_03.wav
+      text: 你好呀，我是欧拉！一起做动作，还是领个小礼物？
+      sha256: d907cff28a75c857a71a048420226c4a2d6c4e794bd3bb8ba33a0b2fe2babd71
+  W02:
+    clip: mirror_chosen
+    mode: random
+    consumer: file_only
+    lines:
+    - file: W02_01.wav
+      text: 好，我们来玩动作模仿。
+      sha256: 5e740046de36978104002945c74f27be2127e7dc4809911f8e6aa27ad2d5ba84
+  W03:
+    clip: not_heard
+    mode: random
+    consumer: speech
+    lines:
+    - file: W03_01.wav
+      text: 啊？没听清，玩模仿还是选水果呀？
+      sha256: 90021a4170cd48102ef9723fe6897e4677022fdbfdb8ee621778588406ca3888
+    - file: W03_02.wav
+      text: 唔，再说一次嘛，模仿还是水果？
+      sha256: c2137abb177c542bd3c67644f2b0b3dd6c53d1bfe0a2619a9be45667dd28ece9
+  W04:
+    clip: invitation
+    mode: random
+    consumer: skill:invite_visitor
+    lines:
+    - file: W04_01.wav
+      text: 想动就玩模仿，想要礼物就选水果哦！
+      sha256: b5742f8e93a0bc52090b62f87a8d8cba2726241788607b0d6129794d203d4463
+    - file: W04_02.wav
+      text: 嘿嘿，模仿和水果，你挑一个呀～
+      sha256: be9120211e088805cd5977f4a52182b3fb65e351e815eb6d867ebf8fbb4d2913
+  W05:
+    clip: no_reply_bye
+    mode: random
+    consumer: file_only
+    lines:
+    - file: W05_01.wav
+      text: 没关系，想玩的时候再来找我。
+      sha256: b3a2fa5d5ae203b57e0a2b685f8b960e0f53352f9a22e6078220e0ff54d7e432
+  W06:
+    clip: one_game_at_a_time
+    mode: random
+    consumer: skill:one_game_at_a_time
+    lines:
+    - file: W06_01.wav
+      text: 都想玩呀？这轮先选一个嘛～
+      sha256: 69ab7cc8dc70beca0935191c3a67f5198b66ee81c23334218fa3ce44539fec99
+    - file: W06_02.wav
+      text: 嘿嘿，一次玩一个，先挑哪个？
+      sha256: 7393a24256493146451c2c00e9b2eae97fa57e25a420d77e6998fda642e65c1a
+  W09:
+    clip: cannot_do
+    mode: random
+    consumer: skill:decline_unsupported
+    lines:
+    - file: W09_01.wav
+      text: 哎呀，这个我还不会呢～
+      sha256: 0cce2a90463189efaeb8f8c9949e2f0f9346abe4fb8604fe9955563e2a4799a4
+    - file: W09_02.wav
+      text: 呜，这个我还没学会哦！
+      sha256: c41fade9cbeabf731a579ac6979b7de8441d76d31999b576cfd9767ecf96be9e
+    - file: W09_03.wav
+      text: 嘿嘿，这个难倒我啦！
+      sha256: 8ebf52c70101b7a111a30d05ca6ae2643495065cb76f6c65681b381301e46138
+  C01:
+    clip: round_end
+    mode: random
+    consumer: file_only
+    lines:
+    - file: C01_01.wav
+      text: 谢谢你陪我玩！想再来就重新排队哦～
+      sha256: e9cff6b303b14a7f456a3e58289c4244773a20313bba3077a677d09b7585f648
+    - file: C01_02.wav
+      text: 玩得开心！请先走出体验区呀～
+      sha256: 9f9d31e81891100531b33882db5a9307f73e962fba75a9d25330152ba798a45a
+  I01:
+    clip: self_intro
+    mode: random
+    consumer: skill:self_introduction
+    lines:
+    - file: I01_01.wav
+      text: 嗨，我是欧拉！能听懂你说话，陪你做动作，还能送你水果礼物哦～
+      sha256: 159f211f94ca51b6f0d573f72e1522c5c9d86fff6983118e2079326f9b51d09c
+    - file: I01_02.wav
+      text: 嘿嘿，我叫欧拉，是个具身智能机器人，陪你玩、送礼物都行！
+      sha256: f2dbc6e3ac16c4f364d55d923c44aa1349203878287d897edc607f5d620d3b6f
+    - file: I01_03.wav
+      text: 我是欧拉呀，会听你说话、陪你做动作，还会送礼物呢！
+      sha256: f318a9438579d2ccb1184e19b17a11fbb0e3eb388820d54fa83d0b662698c734
+  I02:
+    clip: intro_platform
+    mode: random
+    consumer: skill:introduce_platform
+    lines:
+    - file: I02_01.wav
+      text: 我用昇腾 310P 算力，跑的是 openEuler Embedded 系统哦！
+      tts_text: 我用昇腾三一零皮算力，跑的是欧喷欧拉嗯贝迪德系统哦！
+      sha256: bf90673685b7562dea5dd7dda6a51f563a73bf29b35d25503e4b1cb8f5da988e
+    - file: I02_02.wav
+      text: 嘿嘿，昇腾 310P 加 openEuler，再用 IB-Robot 框架把技能串起来！
+      tts_text: 嘿嘿，昇腾三一零皮加欧喷欧拉，再用爱比肉波特框架把技能串起来！
+      sha256: f1ac89c578e51cc180153c0630347f40992be1855c4de8a2bf66120aff745bca
+  I03:
+    clip: intro_mirror_how
+    mode: random
+    consumer: skill:explain_mirror_how
+    lines:
+    - file: I03_01.wav
+      text: 我用摄像头看你手臂的姿势，再变成我的关节动作，跟着你动哦！
+      sha256: d90b1b8b343b4a639db7b7ca9b06b30e089979e9522641794eaba3cfcf58dd4d
+    - file: I03_02.wav
+      text: 嘿嘿，眼睛盯着你的手臂，你怎么动，我就怎么学～
+      sha256: 5b53a2d1ec7afb5f9a546b2d3d550bca5d781cc9ef19fb74288c95feefa39227
+  I04:
+    clip: intro_pick_how
+    mode: random
+    consumer: skill:explain_pick_how
+    lines:
+    - file: I04_01.wav
+      text: 先听你要哪个水果，再找到它在哪，抓起来送到领取盒哦！
+      sha256: 9973ab938c0ab89991990f38c9826c7816b404b3cd41f12fa5a9c14651f89919
+    - file: I04_02.wav
+      text: 嗯嗯，看准位置再伸手，抓稳了就送到领取盒～
+      sha256: 561c3657542e2fe362a693c773063031302ab08e3c4c329abfd1ec19f88243f9
+  I05:
+    clip: intro_agent
+    mode: random
+    consumer: skill:introduce_agent
+    lines:
+    - file: I05_01.wav
+      text: 嘿嘿，我的 Agent 由大模型驱动，能听懂你的话，帮你把事情办好哦！
+      tts_text: 嘿嘿，我的艾振特由大模型驱动，能听懂你的话，帮你把事情办好哦！
+      sha256: 0a684e5fc1bff1ec959ebe09ec00301d99c77f086e5549d7e3850c7e682f9da0
+    - file: I05_02.wav
+      text: 我的 Agent 靠大模型驱动，你用平常的话说需求，它就拆成步骤帮你办好呀～
+      tts_text: 我的艾振特靠大模型驱动，你用平常的话说需求，它就拆成步骤帮你办好呀～
+      sha256: e0bc64ddae878576d968ba663bd876cd886924f6cbc8592f659c479259c52312
+    - file: I05_03.wav
+      text: 嗯嗯，大模型是我的大脑，听懂你想要啥，我就自己安排技能去完成！
+      sha256: 550f46b3a62d6bba9b2ea1165aba255955e4519812c18539c7aaebe682916579
+  I06:
+    clip: intro_detail
+    mode: random
+    consumer: skill:introduce_in_detail
+    lines:
+    - file: I06_01.wav
+      text: 我是欧拉，跑在昇腾 310P 和 openEuler 上，大模型 Agent 听懂你，陪你模仿、帮你拿水果哦！
+      tts_text: 我是欧拉，跑在昇腾三一零皮和欧喷欧拉上，大模型艾振特听懂你，陪你模仿、帮你拿水果哦！
+      sha256: c618ccf6b087f86552ebdf82531827149a357ca6ff072741f1019fdab9177e5c
+    - file: I06_02.wav
+      text: 嘿嘿，我叫欧拉！昇腾 310P 给算力，openEuler 做系统，大模型 Agent 听懂你，调技能帮你办事～
+      tts_text: 嘿嘿，我叫欧拉！昇腾三一零皮给算力，欧喷欧拉做系统，大模型艾振特听懂你，调技能帮你办事～
+      sha256: d636df880ba5c683e9675a5106cb3c6e9cf9f01c8400b80025606d86e28ec6c5
+  I07:
+    clip: which_game
+    mode: random
+    consumer: file_only
+    lines:
+    - file: I07_01.wav
+      text: 想先试哪个游戏？
+      sha256: fd5a3ef77983763ee6db9ad95b6afcd5ea85915462afa45c58bcb3807c11cd00
+  I08:
+    clip: explain_later
+    mode: random
+    consumer: file_only
+    lines:
+    - file: I08_01.wav
+      text: 可以，等这一步结束，我再详细介绍。
+      sha256: f12031bfaacebfe1d8fe9bf899f84a123aaee2b43b49ef012090fe74899d8714
+  I09:
+    clip: explain_more
+    mode: random
+    consumer: file_only
+    lines:
+    - file: I09_01.wav
+      text: 还想听刚才的原理吗？
+      sha256: a5893ca1009565dde5c7f8ebe38f3a7097a11748b8f7eed6587d314cffefeea9
+  I10:
+    clip: pick_scope
+    mode: random
+    consumer: skill:explain_pick_scope
+    lines:
+    - file: I10_01.wav
+      text: 今天只能抓现场的水果礼物哦！
+      sha256: af0bfc1e6e6d47469a582d89d484698be1cc17001fa472ce44af88a7fd79f401
+    - file: I10_02.wav
+      text: 嘿嘿，只抓柠檬、苹果和橙子呢～
+      sha256: eb39471f3688698df600438d37f5aa10f6e348f790239cb67461dadbd1db775e
+  F01:
+    clip: fruit_menu
+    mode: random
+    consumer: skill:offer_fruit_menu
+    lines:
+    - file: F01_01.wav
+      text: 有柠檬、苹果和橙子哦，选一个吧！
+      sha256: 649e9462d00d1c93b49c51d204a546e07d1a38da58eb677c92a627ce0ed5371f
+    - file: F01_02.wav
+      text: 柠檬苹果橙子，你想要哪个呀？
+      sha256: 7d1e2338a47e7684a85f1eddb880f311ed8575e07ff790d3f33a7cf586542d87
+    - file: F01_03.wav
+      text: 嘿嘿，柠檬、苹果、橙子，挑一个吧～
+      sha256: 2c7fa118416eb5ebb669cbee8af1dfa291ec8e47dd2115a52f94a2c7597858b2
+  F02:
+    clip: fruit_ask_name
+    mode: random
+    consumer: speech
+    lines:
+    - file: F02_01.wav
+      text: 要柠檬、苹果还是橙子呀？
+      sha256: 94fd99ba3161741bf1fa45f838c91d1c54dd6ed843a4c56f9e4127690f6fef49
+    - file: F02_02.wav
+      text: 唔，说一下水果名字嘛～
+      sha256: 2f62875553d12e27134fd33157afcd0ce96904cb8f37aba51177026442a08d3f
+  F03:
+    clip: fruit_not_available
+    mode: random
+    consumer: skill:fruit_not_available
+    lines:
+    - file: F03_01.wav
+      text: 哎呀，这个没有呢，换一个吧～
+      sha256: ad8eb88a3465610b1452e89b2f6140edd35696c9638318f85ad847aabca1315f
+    - file: F03_02.wav
+      text: 唔，今天只有柠檬苹果橙子哦！
+      sha256: 57cbbf13871e6409575b4319eddb10d322950f35be35079c29d2b71865863f22
+    - file: F03_03.wav
+      text: 这个真没有，挑别的吧～
+      sha256: 0c7b53c275f3da138f592e3c057c9e5e0604adc9c2652268311711095ff854c7
+    - file: F03_04.wav
+      text: 我只抓台上的水果哦～
+      sha256: ddc3df91e98af055731a0efee97f476c31c81f21cc0e5af6dafb59aec3c6a36d
+  F04A:
+    clip: item_unsupported
+    mode: random
+    consumer: skill:decline_personal_item
+    lines:
+    - file: F04A_01.wav
+      text: 你的东西我不碰哦，收好啦～
+      sha256: d60b2c70a98d6be0c2967a739eee71bd8c6d8d8c4dde39ba3c45442daef687aa
+    - file: F04A_02.wav
+      text: 嘿嘿，我只拿水果礼物哦！
+      sha256: 2a5d871c49b88c5d4e40d00ebb477e1266ca0c84fdc73bd8e57b26c98b39239b
+    - file: F04A_03.wav
+      text: 唔，这个不能抓，我只拿水果哦～
+      sha256: d2f7118cef499e4d8e8d82c656c077b72c349a95e52facfc9bedb3bca9ffb9f5
+  F04B:
+    clip: delivery_unsupported
+    mode: random
+    consumer: skill:explain_delivery_rule
+    lines:
+    - file: F04B_01.wav
+      text: 不能扔也不能递哦，我放领取盒里～
+      tts_text: 不能扔，也不能递哦，我放领取盒里～
+      sha256: 1ad7548ac9a5b21312751398fc5f1eb9e7a7ed3eb59530987fe2eaf79e4b15c8
+    - file: F04B_02.wav
+      text: 哎呀，递不了，我放领取盒，你自己拿哦！
+      sha256: 2103baadb3d3f242c525ee6766025f4af596564b662d32906cadc42382225c3e
+    - file: F04B_03.wav
+      text: 我只放进领取盒，你去拿哦～
+      sha256: 580891e6a221a904f380e80bb509d02f2d33d3df92f14ada96990e02db89710a
+  F05A:
+    clip: pick_start_lemon
+    mode: random
+    consumer: speech
+    lines:
+    - file: F05A_01.wav
+      text: 好嘞，给你拿柠檬！
+      sha256: 3966f1967d76faa5e6c420981d9120d80dbd44afbd2a07dc373f9b196ac1c3ab
+    - file: F05A_02.wav
+      text: 收到，柠檬马上来！
+      sha256: 23927b14c430ca74bd2c7c0661c8030094d4ec0d213712c58b1b835e8666528f
+    - file: F05A_03.wav
+      text: 嗯嗯，这就去拿柠檬～
+      sha256: e3d91f74c72a0a07ffeb8356899895974d7cd831f3bc8fe3f6a58062a6aead9a
+  F05B:
+    clip: pick_start_apple
+    mode: random
+    consumer: speech
+    lines:
+    - file: F05B_01.wav
+      text: 好嘞，给你拿苹果！
+      sha256: a441de38c29efc4e3a8a14891711d80496da8cc56933f708057767ecb331a35e
+    - file: F05B_02.wav
+      text: 收到，苹果马上来！
+      sha256: 8a8c24098ed3170b98728d0105bddf6aa083e80b8559b01b3d3a5611a469e82b
+    - file: F05B_03.wav
+      text: 嗯嗯，这就去拿苹果～
+      sha256: 9c89344217f7b3d16aa473cd92e5799cbcbbb1064786642b392425989d93c920
+  F05C:
+    clip: pick_start_orange
+    mode: random
+    consumer: speech
+    lines:
+    - file: F05C_01.wav
+      text: 好嘞，给你拿橙子！
+      sha256: b6f1711912ccbe7df9669fb4bb23cbe59dcd50b90cbae9318f0d845db0572d4d
+    - file: F05C_02.wav
+      text: 收到，橙子马上来！
+      sha256: 38f59899b45faa1bd2f1583dda4eabce148e8da256be5442d186f568dc41bb78
+    - file: F05C_03.wav
+      text: 嗯嗯，这就去拿橙子～
+      sha256: aeb2d48192ef7f63b1d2e21debc8a63521fea4d446a47bf717571b6f62cc6741
+  F06:
+    clip: pick_locating
+    mode: random
+    consumer: speech
+    lines:
+    - file: F06_01.wav
+      text: 我在找它呢，别动桌子哦～
+      sha256: eb12f6ad401cce9bb3829bf02b85a466bab232e11c242aac68439571ad60077f
+    - file: F06_02.wav
+      text: 稍等稍等，瞄一下位置！
+      sha256: 45094f2a30ed53e63a24556ac791c5020b87c5448ae820aeb3a1aa4f28ee7921
+  F07:
+    clip: pick_target_moved
+    mode: random
+    consumer: speech
+    lines:
+    - file: F07_01.wav
+      text: 水果的位置变了，我重新确认一下。
+      sha256: f2f1c3c0a877d81d921437a5197870a9e2ac7673d065152115d8d12bea0f60af
+  F08:
+    clip: pick_carrying
+    mode: random
+    consumer: speech
+    lines:
+    - file: F08_01.wav
+      text: 拿到了，我把它送到领取盒。
+      sha256: 3394b40e9fae791a1f63f8f6363f84d73dce4b41076cfbc90ee555698dd73775
+  F09:
+    clip: pick_delivered
+    mode: random
+    consumer: speech
+    lines:
+    - file: F09_01.wav
+      text: 耶，礼物到啦！去领取盒拿吧～
+      sha256: cf92be52a7916fb197d86c36563c9ea777703f63b55b22a6b8f07c617d771c4e
+    - file: F09_02.wav
+      text: 哇，送到啦，打开看看吧！
+      sha256: c371d876b29474eababc3ee5a77eb5395e26887760541e562c4b864a0d4fe287
+    - file: F09_03.wav
+      text: 搞定！快去领取盒拿哦～
+      sha256: 06bcd1672ea2f9531dbd1084ef24657b0e404031265d2971eb01c0f21518a8dd
+  F10:
+    clip: pick_not_arrived
+    mode: random
+    consumer: speech
+    lines:
+    - file: F10_01.wav
+      text: 礼物还没到，先别取，工作人员来帮忙。
+      sha256: b74ab930ca89e53ff5b60f00825300097b8b4e8788a4514657a97772077b122a
+  F12:
+    clip: pick_retry
+    mode: random
+    consumer: speech
+    lines:
+    - file: F12_01.wav
+      text: 哎呀，这次没成功，我再试一下。
+      sha256: b0eca874466fa3aea071d39572acd2edafb8c60391012824aa86408b34e97c3c
+  F14:
+    clip: pick_no_change
+    mode: random
+    consumer: speech
+    lines:
+    - file: F14_01.wav
+      text: 已经在拿啦，这次改不了哦～
+      sha256: ca78bce0ab8cb889ad00443e2f0ef465ab8075150354c5c4df49009fa8f07dce
+  F16:
+    clip: pick_give_up
+    mode: random
+    consumer: speech
+    lines:
+    - file: F16_01.wav
+      text: 还是没成功，请工作人员帮我一下。
+      sha256: c02eb034be2a1eddc5462608fd4d59bcad34ec67170cf0f3349a3d5a6319a741
+  F17:
+    clip: pick_checking
+    mode: random
+    consumer: speech
+    lines:
+    - file: F17_01.wav
+      text: 我再确认一下，稍等。
+      sha256: ff6f5adeb65a53b57544f69e1a1b23aab17db89af43fdb8c036ede696b1a3ed6
+  E02:
+    clip: stopped
+    mode: random
+    consumer: speech
+    lines:
+    - file: E02_01.wav
+      text: 已经停下了。请先走出体验区。
+      sha256: 416994dcbf16aefba5573194173cb67ac8fb7079d435cd70f7420258067d6a6c
+  E04:
+    clip: safety_step_back
+    mode: random
+    consumer: file_only
+    lines:
+    - file: E04_01.wav
+      text: 请退到等候线外，工作人员要检查。
+      sha256: 156e3c66057bf3bc0de8afe1347548dd89a29c86a73b1db266b7e579566962b7
+  E06:
+    clip: state_unconfirmed
+    mode: random
+    consumer: speech
+    lines:
+    - file: E06_01.wav
+      text: 请先别靠近，工作人员正在处理。
+      sha256: 03e2c2abe6f6725b9c8ffb94388ec9e9888c09e21cab822ee6551161f299fba4
+  E08:
+    clip: recovered
+    mode: random
+    consumer: file_only
+    lines:
+    - file: E08_01.wav
+      text: 好啦，准备好了！重新进来玩吧～
+      sha256: 5980eec268f4445a48c9c20b9e3a8e3b30f5614e5b63520ae4daf8d011876ee7
+  E09:
+    clip: start_directly
+    mode: random
+    consumer: file_only
+    lines:
+    - file: E09_01.wav
+      text: 好，我们直接开始。
+      sha256: c66821aa39762a94cfd43be2cbe4e0125828c6292503c1bfab0d33a9e2860309
+  E11:
+    clip: stop_first
+    mode: random
+    consumer: file_only
+    lines:
+    - file: E11_01.wav
+      text: 收到，我先处理停止。
+      sha256: 1c35c9f6ce3e79ee55c69e2088038aaeba52e1e7bc314d941bf8f11bf6ac81a7
+  Q01:
+    clip: fruit_only_one
+    mode: random
+    consumer: speech
+    lines:
+    - file: Q01_01.wav
+      text: 嘿嘿，这轮只能选一份哦～
+      sha256: 18acc237ed5ace809c1de0b296ff37bffd4aecace9f503307d1f456a11eebea2
+    - file: Q01_02.wav
+      text: 不行哦，一轮只能挑一个呢！
+      sha256: ba56f92e8df359a2bf582faa2e01d9258ac624ae5c0985e5401ca2b95025e683
+    - file: Q01_03.wav
+      text: 贪心啦，这轮只能选一个哦～
+      sha256: 8e99e5fa40e90ebac4b89b566d9399b02f0cd226ac377616620b5483febe0e33
+  Q02:
+    clip: fruit_already_given
+    mode: random
+    consumer: speech
+    lines:
+    - file: Q02_01.wav
+      text: 这轮已经领过啦，下次再来哦～
+      sha256: fcca19a32f62086ffcba6088fac2c40efdbe30bf388251a19bee40b312f6dba8
+    - file: Q02_02.wav
+      text: 嘿嘿，这轮的礼物给过你啦！
+      sha256: b0dcf0aa5ab53e116cf6a6ca49ef46fa87171afb5524b6f417ec966aa756fdfd
+    - file: Q02_03.wav
+      text: 哎呀，这轮已经领过一份啦～
+      sha256: 462dbf910b3bee1fd9f28182a42bab9442e88cede231233a57f762c2653bfcf6
+  Q03A:
+    clip: fruit_recommend
+    mode: random
+    consumer: speech
+    lines:
+    - file: Q03A_01.wav
+      text: 每个都有礼物哦，要我帮你挑吗？
+      sha256: e69edd263227fb1fee228b7ec6e4449b6c92af2781946ce4e646b4b393b1f715
+    - file: Q03A_02.wav
+      text: 嘿嘿，都不错！要我替你选一个吗？
+      sha256: 03178049c673a5ec42f0d98905a0959b400c7d23427c0fafca30cbeec379aa94
+  Q03B:
+    clip: fruit_random_pick
+    mode: random
+    consumer: speech
+    lines:
+    - file: Q03B_01.wav
+      text: 每个都有礼物，我帮你挑一个！
+      sha256: 930098603c919e994a29df6fcd957554e1e03baa62b8b4bf2af33d289245d62b
+    - file: Q03B_02.wav
+      text: 嘿嘿，那我随便拿一个啦～
+      sha256: f7b49d770d118d3a58eb6f68029ae4157789ee7b1b8ba748e12e83ff7abaa6cb
+    - file: Q03B_03.wav
+      text: 闭眼选也不亏，看我的！
+      sha256: 6943f05fd0e814488097c52e12915be12e30610f714c4def93fde32ba80218bc
+  Q04:
+    clip: gift_what
+    mode: random
+    consumer: skill:explain_gift
+    lines:
+    - file: Q04_01.wav
+      text: 嘘，礼物藏在水果里哦！
+      sha256: c8c22759e4d84ce5272b3d16984638420e10786fe8031322469ed9480b1ab079
+    - file: Q04_02.wav
+      text: 每个水果里都藏着礼物哦！
+      sha256: 7b1ce9ce68b77f5693ff22a5cea345e4abc233a16e7c202724541efdf5732155
+    - file: Q04_03.wav
+      text: 嘿嘿，礼物在水果里，打开就知道啦！
+      sha256: 18299ddd6e401974bba5b6623935338b5e8672c5eea2c1cd6591ec72aa7365d9
+    - file: Q04_04.wav
+      text: 是盲盒哦，礼物藏在水果里！
+      sha256: 451f8feea208cae6034da49e4937ba1a93dfe14a35dbd7692e39731189e54bff
+  Q05:
+    clip: gift_where
+    mode: random
+    consumer: skill:explain_pickup
+    lines:
+    - file: Q05_01.wav
+      text: 我放进碗里，它会滑到领取盒！
+      sha256: 81a5ea23c6a7707db89401415bfdd1a3c6d7342c2edc54d0eb4e8bae61de96ef
+    - file: Q05_02.wav
+      text: 放进碗里滑下去，你去领取盒拿哦！
+      sha256: 393838070c5a00e89400f7733ed1eba4f430bca1d9ea63d47e06ab8d6f52a6e2
+  Q06:
+    clip: pick_confirm
+    mode: random
+    consumer: speech
+    lines:
+    - file: Q06_01.wav
+      text: 可以呀，现在就给你拿吗？
+      sha256: 5f91dd865060164177e49cd7ca126f643192e2232586e9bc457fecb25eabc317
+    - file: Q06_02.wav
+      text: 能哦，要我马上拿一个吗？
+      sha256: 0bfe85f4ef4d8abfbcc7b28f86f0f2ea4086be01ef40119e7730aec78decb999
+    - file: Q06_03.wav
+      text: 当然啦，现在拿给你？
+      sha256: d3c9a8b35782baf81de16ce6cf214fbb892a284a2cf3328ade0bd1c3f65133db
+  Q07:
+    clip: gift_wait
+    mode: random
+    consumer: skill:ask_wait_for_delivery
+    lines:
+    - file: Q07_01.wav
+      text: 先别取，等确认送到再拿哦～
+      sha256: 47c0fe243a2a31f8ffbd8468058cfd4961295ebf41bf8b0d408a0d302908f787
+    - file: Q07_02.wav
+      text: 还没好呢，送到了再拿哦！
+      sha256: b4fc3e91e063bc9dcb1d9cf9df408f215e473b7d2b12bf634226718830bb2cd1
+  Q08:
+    clip: fruit_prop
+    mode: random
+    consumer: skill:explain_fruit_prop
+    lines:
+    - file: Q08_01.wav
+      text: 这是水果道具，不能吃哦！
+      sha256: 134aac16399143fa250139bcf6cb4d86c7af826c8aa0abfe2804efd37b7b1634
+    - file: Q08_02.wav
+      text: 嘿嘿，是道具水果，可不能吃哦～
+      sha256: 4617a466a75d1ebdae4692a2db2a781c4bf2f802c02f2c7553646a4a5ae7528f
+  Q10:
+    clip: robot_name
+    mode: random
+    consumer: skill:tell_name
+    lines:
+    - file: Q10_01.wav
+      text: 嗯哼，我叫欧拉呀！
+      sha256: ea3e445fca96ae1008e73a6cb607559dc398b0fcf08ab8095e706273e20bbdca
+    - file: Q10_02.wav
+      text: 嘿嘿，我就是欧拉～
+      sha256: 2d820d66f2ba5350ec616213303caeee7518b642bf854161b8ed8afdcf11af71
+    - file: Q10_03.wav
+      text: 我叫欧拉，和 openEuler 同名哦！
+      tts_text: 我叫欧拉，和欧喷欧拉同名哦！
+      sha256: 4d483e510bdeccb372c5be50996ea3eb9c091f95fe4685c913c7ff04c4a737f8
+  Q11:
+    clip: ib_robot_meaning
+    mode: random
+    consumer: skill:explain_ib_robot
+    lines:
+    - file: Q11_01.wav
+      text: 是 Intelligence BooM Robot 哦！
+      tts_text: 是因特利真斯布姆肉波特哦！
+      sha256: 9af1f60bae24d03a83a17458e9c8b59c0f6002458c01fdfe6fe32ee1c61d818f
+    - file: Q11_02.wav
+      text: 嘿嘿，Intelligence BooM Robot 的缩写呀！
+      tts_text: 嘿嘿，因特利真斯布姆肉波特的缩写呀！
+      sha256: e77421d95e3705ce27d10a83e22b1f63f8e391405276422752aee19a463bcc03
+  Q12:
+    clip: who_made
+    mode: random
+    consumer: skill:tell_origin
+    lines:
+    - file: Q12_01.wav
+      text: 嘿嘿，这是 openEuler 开源社区开发的软件，能跑在很多机器人上哦！
+      tts_text: 嘿嘿，这是欧喷欧拉开源社区开发的软件，能跑在很多机器人上哦！
+      sha256: 63bf4d2dfec5d66e0b70a5d50c9c679e0e297ae0aa8a896594eca26d49396999
+    - file: Q12_02.wav
+      text: 我们展示的是 openEuler 开源社区的软件，很多机器人都能用呀～
+      tts_text: 我们展示的是欧喷欧拉开源社区的软件，很多机器人都能用呀～
+      sha256: 09c85f741e189bbc3de7f40e5efa35ff8bb337e2135782fe6da801935838084e
+  Q13:
+    clip: open_source
+    mode: random
+    consumer: skill:explain_open_source
+    lines:
+    - file: Q13_01.wav
+      text: 嗯嗯，软件是开源的，可以下载，装到很多机器人上哦！
+      sha256: b4ab60398756c7458ff82b17a28d35900c5f02664035b6c0de21b341ca4339d1
+    - file: Q13_02.wav
+      text: 开源的呀，下载下来能运行在很多机器人上～
+      sha256: 5f3c027eb5fd320f37250855aeb95053e54b454424fc88b934468d26bb0f01ad
+  Q14:
+    clip: code_repo
+    mode: random
+    consumer: skill:tell_code_repo
+    lines:
+    - file: Q14_01.wav
+      text: 扫旁边二维码，就能看到代码仓库哦！
+      sha256: 52d3d810319a707b903d80e429fb4e86f5b855ce8d6c67605c4baff68a422134
+    - file: Q14_02.wav
+      text: 欢迎参与呀，扫码进代码仓库看看～
+      sha256: 6292f5d55e1d397d28098cd43e3171ed8e6497b80a28bcdb15ef57ae81237095
+  Q15:
+    clip: summit_name
+    mode: random
+    consumer: skill:tell_event
+    lines:
+    - file: Q15_01.wav
+      text: 这里是 OpenEuler Summit 操作系统大会哦！
+      tts_text: 这里是欧喷欧拉萨米特操作系统大会哦！
+      sha256: 82a7fcb7c21636a37316f70b76ab0ba08caae0bbbecd9046cb5daa89524d645f
+    - file: Q15_02.wav
+      text: 嘿嘿，是 OpenEuler Summit 操作系统大会呀～
+      tts_text: 嘿嘿，是欧喷欧拉萨米特操作系统大会呀～
+      sha256: e19a54204886e1a87350c9d7f8622f6d7197ce1f65bdc9f1bd41dff3914c6914
+  Q16:
+    clip: venue
+    mode: random
+    consumer: skill:tell_venue
+    lines:
+    - file: Q16_01.wav
+      text: 我在北京中关村国际创新中心哦！
+      sha256: 0cd615de899366c3cf97b658cb3e1c6f30f0c626432d951676bdfe36fa409556
+    - file: Q16_02.wav
+      text: 嘿嘿，在北京中关村国际创新中心呀～
+      sha256: 3bd7f2892f9c88660c744a663385bb37b835ab677a0fbb4463ddc9eb68f1d61b
+  Q17A:
+    clip: price_first
+    mode: sequence
+    consumer: skill:answer_price
+    lines:
+    - file: Q17A_01.wav
+      text: 嘿嘿，我们展示的是开源软件，能下载用在很多机器人上哦！
+      sha256: 831a8608b4e71abd7397e6efd5465e17e83062e6e8a5e99e4a1ed8d5cac99c71
+    - file: Q17A_02.wav
+      text: 扫旁边的代码仓库二维码看看哦～
+      sha256: 10011ef698b11a8534fca3ee408ca054c08e5ebe4e0f970f9f6efe8987bb4741
+  Q17B:
+    clip: price_body
+    mode: random
+    consumer: skill:answer_body_price
+    lines:
+    - file: Q17B_01.wav
+      text: 本体是社区伙伴提供的，价格我们也不清楚哦～
+      sha256: d3b4d66a0dd9b74ba9bc980ee6cbb5c5a9641e33d283b9f05aae9a926b90fb08
+    - file: Q17B_02.wav
+      text: 嗯，本体来自社区伙伴，具体多少钱我们也不知道呢～
+      sha256: 32c7a2d7e526b4796e277e13fd2afc2183b94f281c095b1997fbf17c762d1df4
+  Q20:
+    clip: linux_based
+    mode: random
+    consumer: skill:answer_linux
+    lines:
+    - file: Q20_01.wav
+      text: 我是基于 openEuler 开发的，openEuler 是基于 Linux 的发行版哦！
+      tts_text: 我是基于欧喷欧拉开发的，欧喷欧拉是基于林纳克斯的发行版哦！
+      sha256: ee9041beadd758a8b93ee840da53db4c7ae9abb34759f9cff4f76c3c677c86ea
+    - file: Q20_02.wav
+      text: 嗯嗯，我基于 openEuler 开发，它是一个 Linux 发行版呀～
+      tts_text: 嗯嗯，我基于欧喷欧拉开发，它是一个林纳克斯发行版呀～
+      sha256: 525fe21cbeee174c7dfd962d440739974a3611476805db1c29551257f3cfc67e
+  Q21:
+    clip: robot_eyes
+    mode: random
+    consumer: skill:explain_eyes
+    lines:
+    - file: Q21_01.wav
+      text: 我头上有摄像头哦，看得见你！
+      sha256: e53ba3f3d7b0742853691108b95af499c41733186ee470564f133176b018e2b8
+    - file: Q21_02.wav
+      text: 嘿嘿，靠头上的摄像头看你呀～
+      sha256: 8cff52b1effb608fcdd0645d3e48c8a1a83b312838ef76e64b808728c80f5d02
+  Q22:
+    clip: robot_ears
+    mode: random
+    consumer: skill:explain_ears
+    lines:
+    - file: Q22_01.wav
+      text: 我有麦克风呀，耳朵灵着呢！
+      sha256: 9be19696745ab98d414decb2fcf243b87cadc9cf7984838b99094fb18ba071f1
+  Q23:
+    clip: self_planning
+    mode: random
+    consumer: skill:explain_planning
+    lines:
+    - file: Q23_01.wav
+      text: 对呀，听懂了我自己安排哦！
+      sha256: 0c192bdb5815292e55841b421c98002141db3c7e1c18a8086d709e25355770e6
+  Q30:
+    clip: capabilities
+    mode: random
+    consumer: skill:list_capabilities
+    lines:
+    - file: Q30_01.wav
+      text: 我会打招呼、做动作，还能送礼物哦！
+      sha256: 0efadf8e8ea26bd567494f8f964d96757064922bcb2dee886b08b9921ef5abe5
+    - file: Q30_02.wav
+      text: 嘿嘿，能陪你照镜子，还能送水果！
+      sha256: 64f231e0680977243f3d9dc71dcbbdbd835add3086decdfb4a3254617742673d
+  Q32:
+    clip: arms_only
+    mode: random
+    consumer: skill:explain_arms_only
+    lines:
+    - file: Q32_01.wav
+      text: 我只能学手臂动作哦～
+      sha256: f21a0b19930016ff02680488facf74b7429064b8da27a775b136a4871b099bf5
+    - file: Q32_02.wav
+      text: 腿学不了，手臂可以呀！
+      tts_text: 腿，学不了，手臂可以呀！
+      sha256: 68f436ebbc84ad34a0e50b72c8104ba511a5282e66404a7303e06129c0d0bcba
+  Q33:
+    clip: photo
+    mode: random
+    consumer: skill:explain_photo
+    lines:
+    - file: Q33_01.wav
+      text: 体验中会自动留图，结束后自己选哦！
+      sha256: 38a068172869be26a45be4150c25ba5aeafbc5304bd607daa7119544956665c6
+    - file: Q33_02.wav
+      text: 嘿嘿，玩的时候自动留图，玩完自己挑～
+      sha256: ed4ce6de4fe6a8711e24e93250420a05090dbc62cde4d5ed1afff3c6434e8ad7
+  Q34:
+    clip: language
+    mode: random
+    consumer: skill:answer_language
+    lines:
+    - file: Q34_01.wav
+      text: 我现在主要说中文哦～
+      sha256: c4091913e7cbaa4700a6c8509db3ecd57d85b34f3d2063cc05bea8ee37833b78
+    - file: Q34_02.wav
+      text: 嘿嘿，我主要说中文呢！
+      sha256: e2e408a6bf3b16fa827375e547a162902bf62450e8f096ed3944737c1c875141
+  Q35:
+    clip: safety_interact
+    mode: random
+    consumer: skill:answer_safety
+    lines:
+    - file: Q35_01.wav
+      text: 请按现场提示和我互动哦。
+      sha256: 0b0eb37b08149ef4eb1a433df23171b9025cb8a306cb85c95c78307871aea4d0
+    - file: Q35_02.wav
+      text: 跟着现场提示和我玩就好哦。
+      sha256: 9ae31da8a4e570098f65f0e6892b17a82f36f96876555a922e582a3130fc3021
+  Q36:
+    clip: cannot_lookup
+    mode: random
+    consumer: skill:answer_unknown_info
+    lines:
+    - file: Q36_01.wav
+      text: 唔，这个我暂时查不到哦～
+      sha256: fcc3f9d4e5cfbb03b309fac186be8ff8366a4202bd595eb7fce636688785c8b4
+    - file: Q36_02.wav
+      text: 哎呀，这个我暂时查不到呢！
+      sha256: 03a603342604bd2ddcb0c5b6e76f67bacd05279a56aa551275dfef983b3e55de
+  Q37:
+    clip: mirror_howto
+    mode: random
+    consumer: skill:explain_mirror_game
+    lines:
+    - file: Q37_01.wav
+      text: 你做动作，我跟着学哦！
+      sha256: 424f9e49d9c6b0090eebf346b4b0d966a0de846540b02560e8bf7686b07a1620
+    - file: Q37_02.wav
+      text: 来呀，你举手我也举手！
+      sha256: 9a4438609bd3563b39b541d0f766db2b0ca4ed327cdde3279b09f2dd614433bd
+  S01:
+    clip: chat_thanks
+    mode: random
+    consumer: skill:chat_thanks
+    lines:
+    - file: S01_01.wav
+      text: 嘿嘿，谢谢夸奖！
+      sha256: be736a9bb1a9141d4bd16e427f7ca1dcea92ac75ef3867e6dc51aaf9f439ff98
+    - file: S01_02.wav
+      text: 哇，你真会说话！
+      sha256: ecf6bae0b14b3962be250d3240485d47ce7ee25cdfd11002c094dc547e059151
+    - file: S01_03.wav
+      text: 嘻嘻，被你发现啦～
+      sha256: dfd9824d0202911509dfbe6742f5358d35875699f3e1ffc689674e9817361d21
+  S02:
+    clip: chat_tease
+    mode: random
+    consumer: skill:chat_tease
+    lines:
+    - file: S02_01.wav
+      text: 呜，我还在努力学习呢！
+      sha256: 77e6225c79d2702bb2070383ebcc5bc8d0ca95f5252229b6271ed5d235fdbea6
+    - file: S02_02.wav
+      text: 哼哼，我会变聪明的！
+      sha256: ddd685c3ddef384d87329f77caf9ed9b234a55ae6ed88c065e8cab0d606670ba
+    - file: S02_03.wav
+      text: 嘿嘿，多教教我嘛～
+      sha256: f5669ba2c1d8eaea019aea81cfd3e235b0ec6beff5b291613599f25f07917a0c
+  S03:
+    clip: chat_slow
+    mode: random
+    consumer: skill:chat_slow
+    lines:
+    - file: S03_01.wav
+      text: 抱歉抱歉，我想了一下下～
+      sha256: fc9ae666b3d628b5f07bdb5b8b7400db6c2cc0b79012adbdae399895f0285757
+  S04:
+    clip: chat_tired
+    mode: random
+    consumer: skill:chat_tired
+    lines:
+    - file: S04_01.wav
+      text: 不累不累，我是机器人呀！
+      sha256: ebd83bbeebe09dea4012393db2149fe5f92c3d77e89bf028c1739c43512c2ca5
+  S05:
+    clip: chat_food
+    mode: random
+    consumer: skill:chat_food
+    lines:
+    - file: S05_01.wav
+      text: 我不用吃饭哦，充电就行！
+      sha256: 10d89acaf1599df4e33716f2a7f5b0cadf4dfe30d84e0712fa9a516609c16d11
+  S06:
+    clip: chat_present
+    mode: random
+    consumer: skill:chat_present
+    lines:
+    - file: S06_01.wav
+      text: 我在呢我在呢！
+      sha256: d989117829d0ffb45a233d194a57497d92f8742b2596a41306b1dded0f712679
+    - file: S06_02.wav
+      text: 嗯嗯，一直都在哦～
+      sha256: f5f200b64b87283b77fd0ecb2caccd8bcef88e3a3d754d7184e406f91e25a5c8
+  S07:
+    clip: chat_not_understood
+    mode: random
+    consumer: skill:chat_not_understood
+    lines:
+    - file: S07_01.wav
+      text: 唔，这个我没听懂呢！
+      sha256: d2045fb94bf1ec1863c4b2acf0cc428d84ec2e533fc546da503a961130d8dcc7
+    - file: S07_02.wav
+      text: 你能换个说法吗？
+      sha256: 168feec4be120ace720bd6b938e2c51c86eb63f029f3347fec8f389ba4fbf6b8
+  S08:
+    clip: chat_dont_know
+    mode: random
+    consumer: skill:chat_dont_know
+    lines:
+    - file: S08_01.wav
+      text: 哎呀，这个我不知道呢～
+      sha256: 0bdcb10e0b48c8912d278475c9d3717001b3046ae7cabe6a8a6ca046bb5fb520
+  X01:
+    clip: gesture_start
+    mode: random
+    consumer: speech
+    lines:
+    - file: X01_01.wav
+      text: 好呀，看我的！
+      sha256: 4b4e131ff0708c77fba76152046aae6efe5682c0cf9312b0dc51d8b9639e2b5f
+    - file: X01_02.wav
+      text: 嘿嘿，来啦！
+      sha256: 8e4d16dabac22784a633e373875efc725b298dbe9f63ede7ccda18c19b194671
+    - file: X01_03.wav
+      text: 没问题～
+      sha256: 7379334e578cc03277acc2b2609e2d0a14276f11d9a286cf7d6fbf3457495829
+  X02:
+    clip: gesture_done
+    mode: random
+    consumer: speech
+    lines:
+    - file: X02_01.wav
+      text: 搞定啦！
+      sha256: d494a8486db1270ed81438783c1ccf6ec219726647f4c98216c3de8a4b94f7ed
+    - file: X02_02.wav
+      text: 嘿嘿，好啦！
+      sha256: 63f2cf360501050e116965433854800bd44e6b940a58116148ed6ebd5292b08d
+  X03:
+    clip: busy
+    mode: random
+    consumer: speech
+    lines:
+    - file: X03_01.wav
+      text: 等一下下，我还在忙呢～
+      sha256: 49065214d7106639c83d2ae88bfdcb965b04b3c1bf6d543b657a4fb15580ddfb
+  X04:
+    clip: speech_stopped
+    mode: random
+    consumer: speech
+    lines:
+    - file: X04_01.wav
+      text: 好嘞～
+      sha256: 9716537a6b9eb40ff1bb6ffed1b46eafa6dbc54a509f0dc5e6a506831ca882d7
+    - file: X04_02.wav
+      text: 嗯嗯，不说啦！
+      sha256: b108ac7ea349580346416ba21ac13eb4721d7c150fbf52d59b2e7de6a7ff7ec9
+  X05:
+    clip: wake_ack
+    mode: random
+    consumer: speech
+    lines:
+    - file: X05_01.wav
+      text: 我在呢！
+      sha256: 723dacf1b143195df72dc6b3b449a4664a2e12a16ef8657112023d70a8d75d75
+    - file: X05_02.wav
+      text: 嗯嗯，你说～
+      tts_text: 嗯嗯，你说吧～
+      sha256: 4a4608748d9f45d3ea62942cc6cec824a58575bea1467af439700f62ee97a1b1
+  X06:
+    clip: wake_hint
+    mode: random
+    consumer: speech
+    lines:
+    - file: X06_01.wav
+      text: 要找我，先叫欧拉欧拉哦～
+      sha256: 03a0266465a7a6b128dda81e1a2b3f5fe65432fb623b37f9f32eb2ce56612474
+    - file: X06_02.wav
+      text: 嘿，先喊我欧拉欧拉嘛！
+      sha256: 2e29bf3c9f2b914c873a7c06fb723d152cf21091020b323e905488cfecd8c8af
+    - file: X06_03.wav
+      text: 叫声欧拉欧拉，我就来啦～
+      sha256: 108743bac8db09cadcf4d6b6ba8d5be4d8d6005f60b4ba3a65d7fb7aa45fe271
+  T01:
+    clip: busy_mirror_tts
+    mode: random
+    consumer: speech
+    lines:
+    - file: T01_01.wav
+      text: 模仿功能还在运行或状态待确认，请稍等。
+      sha256: a879e7172fd319e4f000a127c5c473cc5564ead1250d1310042f05d2c4a81a04
+  T02:
+    clip: receipt_tts
+    mode: random
+    consumer: speech
+    lines:
+    - file: T02_01.wav
+      text: 好呀，我在准备了，稍等一下。
+      sha256: 868f50e0d9632b5f8329eff20cc326531d03d9e180fb406d6a8e01c16434d6f5
+  T03:
+    clip: stop_unconfirmed
+    mode: random
+    consumer: speech
+    lines:
+    - file: T03_01.wav
+      text: 停止状态尚未确认，请工作人员检查机器人和物体。
+      sha256: 64e0fdc60c0d94a4465aecdfb46dc5a1e82529423bdffdb32425ae426f9f0258
+  T04:
+    clip: conversation_only
+    mode: random
+    consumer: speech
+    lines:
+    - file: T04_01.wav
+      text: 要我做动作的话，请直接说出动作，比如“挥挥手”。
+      sha256: 540637b223fb846968b6337fa7d12f26f4b86a2f0be8ca698d9df411178e19b2
+  T05:
+    clip: clarification_expired
+    mode: random
+    consumer: speech
+    lines:
+    - file: T05_01.wav
+      text: 澄清上下文已过期或不属于当前会话，请重新说明完整请求。
+      sha256: d57316d00cdaf4a7367f2fde0fae4a2260b3a1e2da8d825023eda1308ad9c824
+  T06:
+    clip: held_object_unconfirmed
+    mode: random
+    consumer: speech
+    lines:
+    - file: T06_01.wav
+      text: 上一次任务的持物状态尚未确认，需要先恢复后才能执行动作。
+      sha256: 4bf9458da20ca285f32e640371bbc73058b77a2269c50b4359c1f043b50f2830
+  T07:
+    clip: place_failed_recovered
+    mode: random
+    consumer: speech
+    lines:
+    - file: T07_01.wav
+      text: 这次没能完成放置，已完成收尾，可以重新下达指令。
+      sha256: 626271c7de8c8cc9aa513ce243e4e86ee08b19a4cc5bbf7cd7bcf0a789b1466a
+  T08:
+    clip: released_unverified
+    mode: random
+    consumer: speech
+    lines:
+    - file: T08_01.wav
+      text: 物体已经松开，但还没确认放置成功，请工作人员检查。
+      sha256: a1b58d007653846945bc5b0e81edf0ba44dea5c1c78b50f79afe3c8ee26fdb81
+  T09:
+    clip: released_unfinished
+    mode: random
+    consumer: speech
+    lines:
+    - file: T09_01.wav
+      text: 物体已经松开，动作还未全部完成，请先别靠近。
+      sha256: c9c4f34f41e47592d958edc1b836b8df10a4c8957633649679fe2fd1c3db27d0
+  T10:
+    clip: pick_waiting
+    mode: random
+    consumer: speech
+    lines:
+    - file: T10_01.wav
+      text: 我正在确认水果的位置，请先别移动桌上的物品。
+      sha256: 038cad76e1bbc6912647eccc5b3ebe0b924311e69d40acb688ac7767984c5b40
+  T11:
+    clip: target_not_visible
+    mode: random
+    consumer: speech
+    lines:
+    - file: T11_01.wav
+      text: 我没看到这个水果，请工作人员帮我看看。
+      sha256: 46c76a2be369a62369b3ef3fe4a305d8ead649d791e93951c00be3ad807183c0
+  T12:
+    clip: mirror_busy
+    mode: random
+    consumer: speech
+    lines:
+    - file: T12_01.wav
+      text: 照镜子正在进行，本次动作未执行，也不会排队。请结束照镜子后重新下达指令。
+      sha256: 9c7dd271810ecf3e71f5839a7c9d9ce80861b1746759427484587332a38ce94a
+  P01:
+    clip: prepare_start
+    mode: random
+    consumer: speech
+    lines:
+    - file: P01_01.wav
+      text: 好呀，我先准备一下。
+      sha256: 1701ecbb0d14131f80f9a5b8fe655dc104ce3cf0c401614ea741e11d3f14f4fd
+    - file: P01_02.wav
+      text: 收到，我先摆好姿势。
+      sha256: 76a39b899c14f8ad72694b7069cd70487a5e4be4b974e3548a6ff7371ca5d3b0
+    - file: P01_03.wav
+      text: 好嘞，我准备一下。
+      sha256: f6d0ce8feb52ad89748544143a9335f4dfd43ca0cf2967e14e74b0b451d8f546
+  P02:
+    clip: prepare_done
+    mode: random
+    consumer: speech
+    lines:
+    - file: P02_01.wav
+      text: 准备好啦！
+      sha256: a17c34daa85f6a4f97b7d8b86ce433059aa5e4b5094096d53d4bf3ed0d9a5e4e
+    - file: P02_02.wav
+      text: 好啦，可以开始啦！
+      sha256: e9b5efc5cbd95e91f3e4fbeb5fbc66cfe761472a328f3a06e7fa1e73886ad98c
+    - file: P02_03.wav
+      text: 就位啦！
+      sha256: b5035fd90b034b3df0cf5c8e6776a5a1fc3d10ac58c056a9ba9d946f62fb5f8e
+  P03:
+    clip: display_done
+    mode: random
+    consumer: speech
+    lines:
+    - file: P03_01.wav
+      text: 好啦，动作做完啦！
+      sha256: 0cf79c7ca0c30a36567850037edfda303341118f753e1f0d3f250ba357319ef2
+    - file: P03_02.wav
+      text: 好啦，这个姿势怎么样？
+      sha256: 04dfc65af999916b7daac2ba30b3868d3c3e0faf5a638f60e10b4ee1b10b4f31
+    - file: P03_03.wav
+      text: 摆好啦，看看怎么样！
+      sha256: 9a809f382a598eab11f3224c816c3379c6689a93969c9325e10e4707a91ad44d
+  P04:
+    clip: pose_not_reached
+    mode: random
+    consumer: speech
+    lines:
+    - file: P04_01.wav
+      text: 这次没做好，请工作人员看看。
+      sha256: 69aa9167dacd0948c38517eb473bb647a15aa45a03b8afed435de7697f19a02c
+    - file: P04_02.wav
+      text: 这个动作没完成，请工作人员帮忙。
+      sha256: 92349ba7362c472b979039de19ff7c416ce5435fe0d2b1fc3022f01b2f271593
+    - file: P04_03.wav
+      text: 还没准备好，请工作人员看看。
+      sha256: af854ea5f14baf2234f9607c28e482a8ec21bf3c8c4a209f395c9cda3aaa5f6a
+  # Generated 2026-11-10 on 310P (ZipVoice ascend_310p, production bundle);
+  # Synthesis time: X07A 3.72s (3413ms), X07B 3.74s (3073ms), X07C 3.39s (4942ms), F04C 4.76s (7357ms).
+  X07A:
+    clip: contact_refused_a
+    mode: random
+    consumer: speech
+    lines:
+    - file: X07A_01.wav
+      text: 出于安全考虑，我暂时不支持这类肢体接触哦。
+      sha256: 69f6fd48665eb76c656e58c58b4e581351621fd7889e3591a847ad49de2f246b
+  X07B:
+    clip: contact_refused_b
+    mode: random
+    consumer: speech
+    lines:
+    - file: X07B_01.wav
+      text: 为了安全，这类身体接触的互动暂时还不支持哦。
+      sha256: d58c088936aae3fcf70cdace7b9a0cf0bffee85d39754c8263ae7d3797887c33
+  X07C:
+    clip: contact_refused_c
+    mode: random
+    consumer: speech
+    lines:
+    - file: X07C_01.wav
+      text: 这类接触互动暂时不支持，我们可以聊聊天。
+      sha256: ca584f848de10e6ada59b6880a130e13d695c6ac673c55a9fabc6bc559691642
+  F04C:
+    clip: delivery_confirm
+    mode: random
+    consumer: speech
+    lines:
+    - file: F04C_01.wav
+      text: 不能直接递给你哦，我放进碗里，滑到领取盒你自己拿，可以吗？
+      sha256: 0522cdd97ff50669b3f498a14da64fb331b1536025dee029c8660c8b4b4af5e3

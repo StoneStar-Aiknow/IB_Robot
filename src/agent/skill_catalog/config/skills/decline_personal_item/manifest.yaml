@@ -1,0 +1,40 @@
+# Generated from commissioning/audio/summit_clips.yaml (F04A); edit the aliases here.
+schema_version: 1
+name: decline_personal_item
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot only picks the fruit gifts, not the visitor's belongings.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks the robot to pick their phone, bag or any object that is not one of the fruit gifts
+  do_not_use:
+  - condition: the visitor names lemon, apple or orange
+    instead_use: pick_object
+  aliases_zh:
+  - 帮我拿手机
+  - 把我的包拿过来
+  - 抓我的手机
+  - 帮我拿一下杯子
+  - 把那个瓶子拿给我
+  aliases_en:
+  - grab my phone
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 3.1
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot only picks the fruit gifts, not the visitor's belongings. Use for 帮我拿手机.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

@@ -1,0 +1,39 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q17B); edit the aliases here.
+schema_version: 1
+name: answer_body_price
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: 'Answer the price of the robot body with a recorded reply: a community partner provides it and we do not know its price.'
+  category: social_interaction
+  when_to_use:
+  - the visitor asks the price of the robot body or hardware, or asks the price again after the open source answer
+  do_not_use:
+  - condition: the visitor asks the price for the first time without naming the body
+    instead_use: answer_price
+  aliases_zh:
+  - 本体多少钱
+  - 这台机器人多少钱
+  - 硬件多少钱
+  - 机器人本身多少钱
+  aliases_en:
+  - how much is the robot body
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 4.6
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: 'Answer the price of the robot body with a recorded reply: a community partner provides it and we do not know its price. Use for 本体多少钱.'
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

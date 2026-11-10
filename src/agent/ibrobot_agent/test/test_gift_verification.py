@@ -6,8 +6,8 @@ from embodied_common.execution_detail import ExecutionDetail
 from ibrobot_agent.gift_workflow import GiftWorkflowSpeech
 
 
-def policy():
-    speech = GiftWorkflowSpeech(container_name="an orange bowl", container_label="橙色的碗")
+def policy(**options):
+    speech = GiftWorkflowSpeech(container_name="an orange bowl", container_label="橙色的碗", **options)
     assert speech.register(
         "r",
         "s",
@@ -141,3 +141,68 @@ def test_gateway_admission_placeholder_is_not_a_physical_warning():
         1, "observe", "RUNNING", "", "", "NOT_NEEDED", 0, "NONE"
     ).to_dict()
     assert speech.accept(payload, 2)[0].token.startswith("F05:")
+
+
+def test_deployment_gift_line_uses_the_registered_fruit_and_container():
+    speech = policy(messages={"F05": "给你拿{fruit}，送到{container}。"})
+    payload = event(phase="observe")
+    payload["detail"].update(current_skill="pick_object", workflow_step_index=0)
+    (notice,) = speech.accept(payload, 1)
+    assert notice.text == "给你拿苹果，送到橙色的碗。"
+
+
+@pytest.mark.parametrize("messages", [[], {"unknown": "提示"}, {"F05": ""}, {"F05": "{missing}"}])
+def test_invalid_gift_overrides_fail_at_startup(messages):
+    with pytest.raises(ValueError, match="gift message"):
+        policy(messages=messages)
+
+
+def test_release_delivery_requires_opt_in_and_completed_typed_facts():
+    payload = event(terminal=True, release_status="RELEASED", verification_status="NOT_RUN", place_succeeded=True)
+    (ordinary,) = policy().accept(payload, 1)
+    assert ordinary.token.startswith("place_ended:")
+    (delivered,) = policy(release_is_delivery=True, messages={"placed": "礼物已送到{container}。"}).accept(payload, 1)
+    assert delivered.text == "礼物已送到橙色的碗。"
+
+
+@pytest.mark.parametrize(
+    "facts",
+    [
+        {"release_status": "UNKNOWN"},
+        {"place_succeeded": False},
+        {"verification_status": "FAILED"},
+        {"recovery_state": "FAILED"},
+    ],
+)
+def test_release_delivery_never_promotes_incomplete_or_failed_facts(facts):
+    detail = {"release_status": "RELEASED", "verification_status": "NOT_RUN", "place_succeeded": True, **facts}
+    (notice,) = policy(release_is_delivery=True).accept(event(terminal=True, **detail), 1)
+    assert not notice.token.startswith("placed:")
+
+
+def test_inflight_release_is_silent_until_a_confirmed_result_or_explicit_fault():
+    speech = policy()
+    assert speech.accept(event(phase="release", release_status="UNKNOWN"), 1) == []
+    (fault,) = speech.accept(
+        event(2, phase="release", release_status="UNKNOWN", reason_code="PLACE_RELEASE_STATE_UNKNOWN"), 2
+    )
+    assert fault.token.startswith("E06:")
+
+
+def test_normal_pick_phase_without_recovery_telemetry_does_not_announce_a_fault():
+    speech = policy()
+    payload = event(phase="observe")
+    payload["detail"].update(current_skill="pick_object", workflow_step_index=0)
+    speech.accept(payload, 1)
+    payload = event(2, phase="preshape", recovery_state="UNKNOWN")
+    payload["detail"].update(current_skill="pick_object", workflow_step_index=0)
+    assert speech.accept(payload, 2) == []
+
+
+def test_successful_return_placeholder_is_not_a_physical_recovery_fault():
+    payload = event(terminal=True)
+    payload["detail"].update(current_skill="return_to_task_pose", workflow_step_index=2)
+    payload["detail"]["execution_detail"] = ExecutionDetail().to_dict()
+    (done,) = policy().accept(payload, 1)
+    assert done.token.startswith("ended:")
+    assert "领取" not in done.text

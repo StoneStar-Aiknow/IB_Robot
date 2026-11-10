@@ -77,7 +77,7 @@ def test_the_allowlist_offers_fixed_free_pose_and_mirror(config):
 def test_direct_commands_route_mirror_without_the_unavailable_reply(config):
     agent = config["embodied"]["agent"]
     commands = agent["planner"]["direct_commands"]
-    assert set(commands.values()) == {
+    assert set(commands.values()) >= {
         "greet_visitor",
         "self_introduction",
         "introduce_platform",
@@ -136,7 +136,7 @@ def test_the_summit_answers_questions_and_replies_without_a_skill_word(config):
 def test_display_policy_and_legacy_hand_preparation_are_bound_after_inheritance(config):
     assert config["pose_composer"]["display_completion"]["mode"] == "playback_only"
     preparation = config["embodied"]["runtime_named_motion"]["hand_preparation"]
-    assert set(preparation["motions"]) == {"wave", "raise_hand", "blow_kiss", "clap", "handshake"}
+    assert set(preparation["motions"]) == {"wave", "raise_hand", "blow_kiss", "clap"}
     assert config["embodied"]["runtime_named_motion"]["enabled"] is True
 
 

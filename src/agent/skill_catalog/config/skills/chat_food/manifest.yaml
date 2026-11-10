@@ -1,0 +1,39 @@
+# Generated from commissioning/audio/summit_clips.yaml (S05); edit the aliases here.
+schema_version: 1
+name: chat_food
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot does not eat; it charges.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks what the robot eats or whether it eats
+  do_not_use:
+  - condition: the visitor asks whether the fruit can be eaten
+    instead_use: explain_fruit_prop
+  aliases_zh:
+  - 机器人吃什么
+  - 你吃饭吗
+  - 你要吃东西吗
+  - 你饿不饿
+  aliases_en:
+  - what do you eat
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.8
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot does not eat; it charges. Use for 机器人吃什么.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

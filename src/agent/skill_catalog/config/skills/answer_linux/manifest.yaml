@@ -1,0 +1,44 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q20); edit the aliases here.
+schema_version: 1
+name: answer_linux
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot is developed on openEuler, a Linux distribution.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks whether the robot is based on Linux
+  do_not_use:
+  - condition: the visitor asks which chip or system the robot uses
+    instead_use: introduce_platform
+  aliases_zh:
+  - 你是基于Linux的吗
+  - 你是Linux吗
+  - 你用的是Linux吗
+  - openEuler是Linux吗
+  aliases_en:
+  - are you based on linux
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot is developed on openEuler, a Linux distribution. Use for 你是基于Linux的吗.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

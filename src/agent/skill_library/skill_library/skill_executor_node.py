@@ -57,6 +57,7 @@ from embodied_common.execution_detail import (
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
 from embodied_common.program_contracts import canonicalize_program
+from embodied_common.recorded_clips import choose_clip_file
 from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
@@ -856,13 +857,15 @@ class SkillExecutorNode(Node):
             raise ValueError("runtime_play_audio_stop_service must be set when runtime_play_audio_enabled is true")
         self._play_audio_lock = threading.Lock()
         self._play_audio_pending_cleanup = None
+        self._play_audio_last = {}
         self._play_audio_clips = load_json_mapping(self.get_parameter("runtime_play_audio_clips_json").value)
         if self._play_audio_enabled:
             for clip_name, clip_path in self._play_audio_clips.items():
                 if not isinstance(clip_name, str) or not clip_name.strip():
                     raise ValueError("runtime_play_audio_clips_json keys must be non-empty clip names")
-                if not isinstance(clip_path, str) or not clip_path.strip():
-                    raise ValueError(f"runtime_play_audio clip {clip_name!r} must map to a file path")
+                paths = clip_path if isinstance(clip_path, list) else [clip_path]
+                if not paths or any(not isinstance(path, str) or not path.strip() for path in paths):
+                    raise ValueError(f"runtime_play_audio clip {clip_name!r} requires paths")
         self._asr_control_topic = self.get_parameter("asr_control_topic").get_parameter_value().string_value.strip()
         self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
         self._runtime_named_motion_action = (
@@ -3146,7 +3149,11 @@ class SkillExecutorNode(Node):
         skill_name = str(goal_handle.request.skill_name)
         binding = template.get("binding") if isinstance(template, Mapping) else None
         clip = str((binding or {}).get("clip", "")).strip() if isinstance(binding, Mapping) else ""
-        path = str(self._play_audio_clips.get(clip, "")).strip() if clip else ""
+        candidates = self._play_audio_clips.get(clip, "") if clip else ""
+        last = getattr(self, "_play_audio_last", {}).get(clip, "")
+        path = choose_clip_file(candidates, last=last, exists=lambda value: Path(value).is_file()) or choose_clip_file(
+            candidates, last=last
+        )
         binds_motion = isinstance(binding, Mapping) and "motion" in binding
         motion = named_motion.bound_motion_name(template) if binds_motion else ""
         if not clip or not path:
@@ -3188,6 +3195,8 @@ class SkillExecutorNode(Node):
             motion_client, error_code, reason = self._prepare_runtime_named_motion(skill_name, motion)
             if motion_client is None:
                 return self._abort_skill(result, goal_handle, [], error_code, reason)
+        if hasattr(self, "_play_audio_last"):
+            self._play_audio_last[clip] = path
         executed = [f"runtime_play_audio:{clip}"]
         deadline = time.monotonic() + timeout_sec
         # Trigger is a global stop: a previous stop must finish before another

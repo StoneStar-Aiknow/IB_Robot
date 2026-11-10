@@ -1,0 +1,34 @@
+# Generated from commissioning/audio/summit_clips.yaml (S08); edit the aliases here.
+schema_version: 1
+name: chat_dont_know
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot does not know.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks a question the deployment facts do not answer and no other recorded reply fits
+  aliases_zh:
+  - 你知道吗
+  - 这个你知道吗
+  aliases_en:
+  - i do not know
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.1
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot does not know. Use for 你知道吗.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

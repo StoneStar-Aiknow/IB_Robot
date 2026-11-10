@@ -17,6 +17,7 @@ from typing import Any
 
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
+from ibrobot_agent.answer_rules import AnswerRules
 from ibrobot_agent.continuation import (
     CONTINUE_REFUSED,
     ContinuationDecision,
@@ -204,6 +205,7 @@ class AgentService:
         pose_skills: frozenset[str] = frozenset({"free_pose"}),
         pose_memory: PoseMemoryPort | None = None,
         workflow_planned: Callable[[tuple], None] | None = None,
+        answer_rules: Mapping[str, Any] | None = None,
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -219,6 +221,8 @@ class AgentService:
         self._robot_scope = robot_scope
         self._fruit_delivery = fruit_delivery_from_config({"fruit_delivery": fruit_delivery})
         self._return_after_place = return_after_place
+        #: Round rules the planner cannot break (one gift per round, ask before a guess).
+        self._rules = AnswerRules(answer_rules, container_name=self._fruit_delivery.get("container_name", ""))
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
@@ -505,21 +509,42 @@ class AgentService:
                         state="PLANNING",
                         detail_json=json.dumps({"step_count": len(replayed.steps)}, sort_keys=True),
                     )
+            session = InMemoryConversationStore._session_key(request)
+            replying = request.reply_to_request_id is not None
+            ruled = (
+                None
+                if replayed is not None or pending_save.get("pose_id")
+                else self._rules.before_planning(session, planned_request.text, replying=replying)
+            )
             query = (
-                None if replayed is not None or pending_save.get("pose_id") else read_only_outcome(planned_request.text)
+                None
+                if replayed is not None or ruled is not None or pending_save.get("pose_id")
+                else read_only_outcome(planned_request.text)
             )
             direct = (
                 None
-                if replayed is not None or query is not None or pending_save.get("pose_id")
+                if replayed is not None or ruled is not None or query is not None or pending_save.get("pose_id")
                 else direct_command_outcome(planned_request.text, self._direct_commands, catalog)
             )
             remembered = (
                 None
-                if replayed is not None or query is not None or direct is not None or pending_save.get("pose_id")
+                if replayed is not None
+                or ruled is not None
+                or query is not None
+                or direct is not None
+                or pending_save.get("pose_id")
                 else self._traced_pose_lookup(request, planned_request.text, catalog, planner_context)
             )
             planned_by = self._planner.identity
-            if remembered is not None:
+            if ruled is not None:
+                _trace.info("answer rule matched", extra={"request_id": request.request_id, "kind": ruled.kind})
+                outcome = ruled
+                planned_by = self._direct_identity
+                if ruled.kind == "workflow" and ruled.user_message in self._rules.lines.values():
+                    # The robot chose the fruit itself ("你帮我随便挑一个"): say so before the
+                    # delivery narration names it. The channel speaks previews as they come.
+                    self._emit_reply_preview(key, ruled.user_message, cancel_token)
+            elif remembered is not None:
                 # A confirmed remembered pose: the model is not asked; the Gateway still
                 # validates the workflow, and the composer still checks the pose.
                 outcome = remembered
@@ -548,7 +573,8 @@ class AgentService:
                             cancel_token,
                             # Storage claims are rendered only after the actual commit.
                             on_preview=None
-                            if pending_save.get("pose_id")
+                            # An answer the rules may still replace is not said ahead of them.
+                            if pending_save.get("pose_id") or self._rules.may_override(planned_request.text)
                             else lambda text: self._emit_reply_preview(key, text, cancel_token),
                         )
                 except Exception:
@@ -565,6 +591,11 @@ class AgentService:
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
+            if ruled is None and replayed is None:
+                outcome = self._rules.after_planning(session, request.text, outcome, replying=replying)
+            if gateway_error is None and replayed is None:
+                # A skill this catalog does not offer is refused aloud, not failed in silence.
+                outcome = self._rules.unsupported(catalog, outcome)
             if (
                 request.admission == CONVERSATION_ADMISSION
                 and outcome.kind == "workflow"
@@ -591,6 +622,8 @@ class AgentService:
             if self._apply_pose_feedback(key, record.planning_generation, request, outcome, pending_save):
                 return
             if outcome.kind != "workflow":
+                if not outcome.missing_fields:
+                    self._rules.answered(session)
                 if outcome.kind == "read_only" and not status:
                     raise RuntimeError("Gateway is unavailable for read-only robot queries") from gateway_error
                 user_message = self._resolve_non_workflow_message(outcome, status, catalog)
@@ -648,13 +681,14 @@ class AgentService:
                 detail_json=json.dumps(proposal.to_dict(), ensure_ascii=False, sort_keys=True),
             )
             self._emit(key, "proposal_ready", "PROPOSAL_READY", outcome.summary)
+            self._rules.proposed(session, outcome)
             if not self._execution_enabled or self._execution is None:
                 self._finish_plan_without_execution(key, record.planning_generation, outcome.user_message)
                 return
             record = self._store.mark_preparing(key, expected_generation=record.planning_generation)
             observe_progress = getattr(self._execution, "set_progress_callback", None)
             if observe_progress is not None:
-                observe_progress(lambda detail: self._execution_progress(key, detail))
+                observe_progress(lambda detail: self._execution_progress(key, detail, session=session))
             with trace_stage(_trace, "agent.execution", request_id=request.request_id):
                 execution_result = self._execution.execute(
                     proposal,
@@ -677,6 +711,10 @@ class AgentService:
                     detail=execution_result.detail,
                 )
             else:
+                if execution_result.status == "succeeded" and any(
+                    step.skill_name == "place_in_container" for step in outcome.steps
+                ):
+                    self._rules.delivered(session)
                 self._store.finish(key, expected_generation=record.planning_generation, result=execution_result)
                 terminal_detail = {**execution_result.detail, "error_code": execution_result.error_code}
                 terminal_message = execution_reply(self._request_state_for_result(execution_result), terminal_detail)
@@ -1199,7 +1237,10 @@ class AgentService:
         )
         self._emit(key, "failed", "FAILED", message)
 
-    def _execution_progress(self, key: RequestKey, detail: Mapping) -> None:
+    def _execution_progress(self, key: RequestKey, detail: Mapping, *, session: tuple[str, ...] = ()) -> None:
+        if session and detail.get("current_skill") == "place_in_container" and detail.get("state") == "SUCCEEDED":
+            # The gift is in the box even if a later step (the return to the task pose) fails.
+            self._rules.delivered(session)
         current = self._store.get_request(key)
         if current.terminal is not None:
             return

@@ -1110,6 +1110,8 @@ def test_planner_config_routes_container_to_actual_model_prompt(monkeypatch, cat
     from ibrobot_agent.node import _planner_from_config
 
     delivery = {"container_name": "configured bowl", "container_label": "配置的碗"}
+    facts = ["本次展示位于北京。"]
+    lines = {"fruit_name": "要哪一种水果？"}
     monkeypatch.setattr(client_module, "VLMAPIClient", lambda **kwargs: object())
     planner = _planner_from_config(
         json.dumps(
@@ -1120,9 +1122,53 @@ def test_planner_config_routes_container_to_actual_model_prompt(monkeypatch, cat
                 "model": "test",
                 "catalog_view": catalog_view,
                 "fruit_delivery": delivery,
+                "deployment_facts": facts,
+                "clarification_lines": lines,
             }
         )
     )
     request = type("Request", (), {"text": "我要苹果", "reply_to_request_id": ""})()
     messages = planner._prompt_builder(request=request, context={}, catalog={"skills": []})
     assert json.loads(messages[1]["content"])["deployment"]["fruit_delivery"] == delivery
+    assert json.loads(messages[1]["content"])["deployment"]["facts"] == facts
+    assert json.loads(messages[1]["content"])["deployment"]["clarification_lines"] == lines
+
+
+def test_node_applies_deployment_gift_rules_before_planning(tmp_path):
+    context = Context()
+    rclpy.init(context=context)
+    line = "每轮只能选择一份水果。"
+    node = IncubationAgentNode(
+        catalog_port=FakeCatalog(),
+        context=context,
+        parameter_overrides=[
+            Parameter("ledger_path", value=str(tmp_path / "requests.sqlite3")),
+            Parameter("conversation_path", value=str(tmp_path / "conversation.sqlite3")),
+            Parameter("deployment_lock_path", value=str(tmp_path / "agent.lock")),
+            Parameter("robot_scope", value="mock_x2"),
+            Parameter(
+                "planner_config_json",
+                value=json.dumps(
+                    {"mode": "rule", "answer_rules": {"once_per_round": True, "lines": {"only_one": line}}}
+                ),
+            ),
+        ],
+    )
+    try:
+        message = String()
+        message.data = json.dumps(
+            {"schema_version": 1, "request_id": "quantity", "session_id": "session", "text": "我要两份水果"}
+        )
+        node._request_callback(message)
+        key = RequestKey("mock_x2", "agent_incubation", "local_operator", "quantity")
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            record = node._service.get_request(key)
+            if record is not None and record.state == "ANSWERED":
+                break
+            time.sleep(0.01)
+        assert record.state == "ANSWERED"
+        assert record.terminal.message == line
+    finally:
+        node.destroy_node()
+        context.shutdown()

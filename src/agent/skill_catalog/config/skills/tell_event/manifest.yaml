@@ -1,0 +1,39 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q15); edit the aliases here.
+schema_version: 1
+name: tell_event
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Name the event, OpenEuler Summit, with a recorded reply.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks which conference or event this is
+  do_not_use:
+  - condition: the visitor asks where the robot is
+    instead_use: tell_venue
+  aliases_zh:
+  - 这是什么大会
+  - 你参加的是什么活动
+  - 这是什么会
+  - 什么展会
+  aliases_en:
+  - what event is this
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 4.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Name the event, OpenEuler Summit, with a recorded reply. Use for 这是什么大会.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

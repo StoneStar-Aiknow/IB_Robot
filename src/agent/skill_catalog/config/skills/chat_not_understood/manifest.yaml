@@ -1,0 +1,34 @@
+# Generated from commissioning/audio/summit_clips.yaml (S07); edit the aliases here.
+schema_version: 1
+name: chat_not_understood
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot did not understand.
+  category: social_interaction
+  when_to_use:
+  - the request is unintelligible or makes no sense even with the conversation so far
+  aliases_zh:
+  - 你听懂了吗
+  - 你明白吗
+  aliases_en:
+  - i did not understand
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.5
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot did not understand. Use for 你听懂了吗.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

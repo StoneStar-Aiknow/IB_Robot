@@ -1,0 +1,44 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q13); edit the aliases here.
+schema_version: 1
+name: explain_open_source
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the software is open source and runs on many robot bodies.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks whether the robot or its code is open source or usable by others
+  do_not_use:
+  - condition: the visitor asks where the code is
+    instead_use: tell_code_repo
+  aliases_zh:
+  - 你开源吗
+  - 别人能用你的代码吗
+  - 代码开源吗
+  - 能装到别的机器人上吗
+  aliases_en:
+  - are you open source
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the software is open source and runs on many robot bodies. Use for 你开源吗.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

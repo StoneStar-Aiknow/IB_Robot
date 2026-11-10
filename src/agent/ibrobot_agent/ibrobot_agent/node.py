@@ -1088,6 +1088,7 @@ class IncubationAgentNode(Node):
             return_after_place=json.loads(str(self.get_parameter("planner_config_json").value)).get(
                 "return_after_place"
             ),
+            answer_rules=json.loads(str(self.get_parameter("planner_config_json").value)).get("answer_rules"),
             pose_preview=self._pose_preview,
             pose_memory=self._pose_preview
             if self._pose_preview is not None and self._pose_preview.has_pose_services
@@ -1351,9 +1352,10 @@ def _planner_from_config(raw: str):
         raise ValueError("planner_config_json must contain a JSON object") from exc
     if not isinstance(config, dict):
         raise ValueError("planner_config_json must contain a JSON object")
-    from ibrobot_agent.planner import fruit_delivery_from_config
+    from ibrobot_agent.planner import deployment_facts_from_config, fruit_delivery_from_config
 
     fruit_delivery = fruit_delivery_from_config(config)
+    deployment_facts, clarification_lines = deployment_facts_from_config(config)
     mode = config.get("mode", "rule")
     if mode == "rule":
         return RulePlanner()
@@ -1401,7 +1403,14 @@ def _planner_from_config(raw: str):
             from robot_skill_cli.catalog import planner_catalog_view
 
             catalog = planner_catalog_view(catalog)
-        return build_planner_messages(request=request, context=context, catalog=catalog, fruit_delivery=fruit_delivery)
+        return build_planner_messages(
+            request=request,
+            context=context,
+            catalog=catalog,
+            fruit_delivery=fruit_delivery,
+            deployment_facts=deployment_facts,
+            clarification_lines=clarification_lines,
+        )
 
     return PlannerAdapter(
         client,

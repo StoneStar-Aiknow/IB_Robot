@@ -421,6 +421,18 @@ class AddresseeGate:
         if self.wake_phrases:
             self.wake_until = max(self.wake_until, heard_at + self.wake_window_sec)
 
+    def note_robot_turn_end(self, now: float) -> None:
+        """Give the current speaker a follow-up window after the robot finishes its turn.
+
+        Keep the existing anchors. A robot turn cannot open an unwoken session;
+        the bridge also rejects completion callbacks from a replaced gate.
+        """
+        if self.trigger == "vendor_session":
+            if self.session_open:
+                self.last_utterance_at = max(self.last_utterance_at, now)
+        elif self.wake_phrases and self.wake_until > 0.0:
+            self.note_handled(now)
+
     def _wakes(self, segment: Segment, heard_at: float) -> bool:
         """Whether the pending wake event opened ``segment``'s utterance.
 

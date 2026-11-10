@@ -1,0 +1,40 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q05); edit the aliases here.
+schema_version: 1
+name: explain_pickup
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the fruit slides from the bowl into the pickup box.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks how the gift reaches them or where to collect it
+  do_not_use:
+  - condition: the visitor asks the robot to throw or hand over the fruit
+    instead_use: explain_delivery_rule
+  aliases_zh:
+  - 你怎么送给我
+  - 我去哪里拿
+  - 在哪里领
+  - 怎么领取
+  - 我去哪拿礼物
+  aliases_en:
+  - where do i get it
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 3.2
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the fruit slides from the bowl into the pickup box. Use for 你怎么送给我.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

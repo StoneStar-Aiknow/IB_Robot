@@ -110,6 +110,10 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
         ):
             return "这次没能完成放置，已完成收尾，可以重新下达指令。"
     if state == "SUCCEEDED":
+        if context.get("current_skill") == "return_to_task_pose":
+            return "准备好啦！"
+        if context.get("current_skill") == "free_pose":
+            return "好啦，动作做完啦！"
         if placing:
             if (
                 detail.schema_version == 2
@@ -142,7 +146,7 @@ def execution_reply(state: str, context: Mapping | None = None, fallback: str = 
             and detail.failed_phase == "verify"
             and detail.reason_code == "TASK_POSE_NOT_REACHED"
         ):
-            return "动作执行结束，未校验通过。"
+            return "这次没做好，请工作人员看看。"
         if detail.schema_version not in {1, 2}:
             return "执行失败，请查看执行记录或联系操作员。"
         if (

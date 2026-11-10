@@ -1,0 +1,36 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q33); edit the aliases here.
+schema_version: 1
+name: explain_photo
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the experience keeps pictures automatically and the visitor chooses them afterwards.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks the robot to take a photo or whether it takes photos
+  aliases_zh:
+  - 你能给我拍照吗
+  - 你会拍照吗
+  - 给我拍张照
+  - 能拍照吗
+  aliases_en:
+  - can you take a photo
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 3.9
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the experience keeps pictures automatically and the visitor chooses them afterwards. Use for 你能给我拍照吗.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

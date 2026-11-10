@@ -909,6 +909,15 @@ def test_the_window_closes_after_wake_window_sec():
     assert _of(actions, PublishRequest) == []
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+def test_only_persistent_dialogue_reopens_followup_after_a_long_robot_turn(persistent):
+    core = _core(**WAKE, persistent_session=persistent)
+    core.on_transcript("灵犀灵犀挥个手", now=1.0)
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=30.0)
+    requests = _of(core.on_transcript("再挥个手", now=31.0), PublishRequest)
+    assert bool(requests) is persistent
+
+
 def test_ignored_speech_does_not_hold_the_window_open():
     """Only an utterance the robot actually handled may extend the window.
 

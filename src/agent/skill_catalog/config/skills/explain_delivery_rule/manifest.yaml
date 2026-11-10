@@ -1,0 +1,41 @@
+# Generated from commissioning/audio/summit_clips.yaml (F04B); edit the aliases here.
+schema_version: 1
+name: explain_delivery_rule
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot cannot throw or hand over the fruit; it goes into the pickup box.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks the robot to throw the fruit to them, hand it over, or put it into their hand
+  do_not_use:
+  - condition: the visitor asks where to collect the gift
+    instead_use: explain_pickup
+  aliases_zh:
+  - 把苹果扔给我
+  - 扔给我
+  - 直接递给我
+  - 放到我手里
+  - 把苹果递给我
+  - 直接给我
+  aliases_en:
+  - throw it to me
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 4.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot cannot throw or hand over the fruit; it goes into the pickup box. Use for 把苹果扔给我.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

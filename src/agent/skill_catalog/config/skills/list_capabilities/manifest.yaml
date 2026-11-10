@@ -1,0 +1,40 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q30); edit the aliases here.
+schema_version: 1
+name: list_capabilities
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: 'List with a recorded reply what the robot can do: greet, move, mirror and give fruit.'
+  category: social_interaction
+  when_to_use:
+  - the visitor asks what the robot can do or what it is good at
+  do_not_use:
+  - condition: the visitor asks the robot to introduce itself
+    instead_use: self_introduction
+  aliases_zh:
+  - 你会做什么
+  - 你能干什么
+  - 你有什么本事
+  - 你除了抓东西还能干什么
+  - 你能执行什么任务
+  aliases_en:
+  - what can you do
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 3.3
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: 'List with a recorded reply what the robot can do: greet, move, mirror and give fruit. Use for 你会做什么.'
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

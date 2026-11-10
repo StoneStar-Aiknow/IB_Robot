@@ -1,0 +1,45 @@
+# Generated from commissioning/audio/summit_clips.yaml (I03); edit the aliases here.
+schema_version: 1
+name: explain_mirror_how
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Explain with a recorded reply how the robot follows the visitor's arm movements.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks how the robot follows or imitates their movements
+  do_not_use:
+  - condition: the visitor asks how to play the mirror game
+    instead_use: explain_mirror_game
+  aliases_zh:
+  - 你怎么跟着我动
+  - 你是怎么模仿的
+  - 你怎么学我的动作
+  - 照镜子的原理
+  - 你怎么知道我在做什么动作
+  aliases_en:
+  - how do you follow me
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Explain with a recorded reply how the robot follows the visitor's arm movements. Use for 你怎么跟着我动.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

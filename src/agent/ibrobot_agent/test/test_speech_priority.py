@@ -232,6 +232,7 @@ def test_gift_e06_maps_to_protection_and_retry_stays_low():
     assert spoken(bridge.on_event(retry, 1))[0].priority == 10
     unknown = event(3, skill="pick_object", round_id=1, recovery="UNKNOWN")
     unknown["detail"].update(workflow_step_index=0, state="RUNNING")
+    unknown["detail"]["execution_detail"].update(phase="recover")
     speech = spoken(bridge.on_event(unknown, 2))[0]
     assert speech.priority == 40 and speech.notice.token.startswith("E06:")
 
