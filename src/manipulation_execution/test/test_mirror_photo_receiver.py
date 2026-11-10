@@ -373,3 +373,30 @@ def test_the_node_s_uploader_empties_its_outbox_into_the_receiver(run, tmp_path)
     assert outbox.names() == []
     assert sorted(entry["round_id"] for entry in one.ledger()) == sorted(names)
     assert uploader.status()["delivered"] == 3
+
+
+# -- the review page (scripts/x2_photo_capture/review.py) ---------------------------------------
+
+
+def test_the_review_page_draws_each_photo_s_box_from_the_received_metadata(run):
+    review = _load("review")
+    one = run()
+    one.post(
+        "r1",
+        round_started_at="2026-11-10T12:18:53.000+0800",
+        round_ended_at="2026-11-10T12:19:05.500+0800",
+        candidates=7,
+        candidate_sources={"uniform": 4, "gesture": 3},
+    )
+    one.post("r2", OTHER, bbox=None, quality="fallback", label="<b>")
+    one.post("r2", OTHER, bbox=None, quality="fallback", label="<b>")  # a resend: counted, no second card
+    page, count = review.render(one.inbox.path)
+    assert count == 2
+    assert "left:25.00%;top:16.67%;width:50.00%;height:66.67%" in page  # [16, 8, 48, 40] on 64x48
+    assert "12.5 s" in page and "gesture 3, uniform 4" in page
+    assert page.count('class="nobox"') == 1  # r2 has no box
+    assert "新照片 2 次、重发 1 次" in page
+    assert "<b>" not in page.split("<body>", 1)[1]  # metadata is escaped
+    assert review.main([str(one.inbox.path)]) == 0
+    assert (one.inbox.path / review.PAGE).is_file()
+    assert (one.inbox.path / "r1.jpg").read_bytes() == JPEG  # the photos are left as they were
