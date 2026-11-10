@@ -41,6 +41,13 @@ class WatchConfig:
     # away read at least 37 % and 25 %, 1 cm away 7-40 % and 6-27 %.
     changed_fraction: float = 0.3
     depth_changed_fraction: float = 0.15
+    # A frame votes moved only when depth AND RGB are both over their fraction
+    # (False: either one). Depth alone misreads next to the closing hand: the
+    # second X2 (2026-11-09, 6 recorded grasp-segment stops, all put back and picked
+    # again) read depth 16-67 % with RGB 3-25 %. Over the 2026-10-12..20 runs
+    # the deliberate moves were caught the same (10 of 11; 104 of their 107
+    # moved votes had RGB over 30 %), a human hand in front no longer read moved.
+    moved_needs_rgb: bool = True
     # Robot spheres are grown by this much before projection (feedback lag,
     # sphere cover error); pixels within it are never compared.
     robot_margin_m: float = 0.02
@@ -231,8 +238,9 @@ def target_change(
         a = a_rgb.astype(np.int16)
         changed = np.any((a < low - config.rgb_change) | (a > high + config.rgb_change), axis=2)
         rgb = float((visible & changed).sum()) / count
-        # Rank by how far over its limit each part is.
-        score = max(depth / config.depth_changed_fraction, rgb / config.changed_fraction)
+        # Rank by how far over its limit each part is (both must be with moved_needs_rgb).
+        parts = (depth / config.depth_changed_fraction, rgb / config.changed_fraction)
+        score = min(parts) if config.moved_needs_rgb else max(parts)
         return dict(
             score=score,
             depth_changed_fraction=depth,
@@ -244,7 +252,8 @@ def target_change(
         )
 
     if r1 <= r0 or c1 <= c0:
-        return dict(vote="unknown", visible_fraction=0.0)  # the shift leaves no room in this image
+        # Not the arm covering it: the watch's undecided reason says so.
+        return dict(vote="unknown", visible_fraction=0.0, unknown="the shift leaves no room in this image")
     best = at(base[1], base[0])
     if best is not None and search:
         grey = [

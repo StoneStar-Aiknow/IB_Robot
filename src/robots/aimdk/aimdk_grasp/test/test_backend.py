@@ -38,6 +38,9 @@ def test_options_default_to_the_x2_deployment_and_refuse_what_they_do_not_know()
     )
     with pytest.raises(ValueError, match="watch_unknown_timeout_s must be a finite number of seconds"):
         _options({"backend_options": {"watch_unknown_timeout_s": 0.0}})
+    assert options["watch_occluded_timeout_s"] == 8.0
+    with pytest.raises(ValueError, match="watch_occluded_timeout_s must be a finite number"):
+        _options({"backend_options": {"watch_occluded_timeout_s": float("nan")}})
     with pytest.raises(ValueError, match="watch_frame_timeout_s must be a finite number"):
         _options({"backend_options": {"watch_frame_timeout_s": float("inf")}})
     with pytest.raises(ValueError, match="status_timeout_s must be a finite number"):
