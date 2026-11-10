@@ -43,10 +43,10 @@ def test_mirror_and_fruit_delivery_share_the_deployment(config):
     assert config["cbf_safety"]["enabled"] is False
 
 
-def test_fruit_grasp_can_select_either_installed_hand(config):
+def test_fruit_grasp_inherits_the_commissioned_left_hand(config):
     grasp = config["grasp_execution"]
-    assert grasp["backend_options"]["arm_side"] == "auto"
-    assert set(grasp["backend_options"]["installed_hands"]) == {"left", "right"}
+    assert grasp["backend_options"]["arm_side"] == "left"
+    assert grasp["backend_options"]["installed_hands"] == ["left"]
     assert {"joint.arm_stream", "joint.hand_stream"} <= set(grasp["command_interfaces"])
 
 
@@ -92,7 +92,7 @@ def test_direct_commands_route_mirror_without_the_unavailable_reply(config):
     assert commands["停止照镜子"] == "mirror_stop"
 
 
-def test_only_summit_opts_in_to_social_wave_cancel_return(config):
+def test_summit_and_commissioned_entry_opt_in_to_social_wave_cancel_return(config):
     assert set(config["runtime"]["cancel_return_motions"].split(",")) == {
         "wave",
         "short_wave",
@@ -101,7 +101,7 @@ def test_only_summit_opts_in_to_social_wave_cancel_return(config):
         "explain",
     }
     base = _load_robot_section(CONFIG.parent / "aimdk_x2_voice_mirror_grasp.yaml")[1]
-    assert not base["runtime"].get("cancel_return_motions")
+    assert base["runtime"]["cancel_return_motions"] == config["runtime"]["cancel_return_motions"]
 
 
 def test_the_summit_follows_only_the_waking_voice_and_vetoes_unaddressed_speech(config):
@@ -113,10 +113,10 @@ def test_the_summit_follows_only_the_waking_voice_and_vetoes_unaddressed_speech(
     assert bridge["semantic_gate_mode"] == "enforce"
     assert bridge["semantic_gate_model_path"] == "$(env WORKSPACE)/models/addressee/addressee_zh_v2.json"
     assert bridge["semantic_gate_fail_open"] is False
-    # The shared mirror/grasp base keeps both checks opt-in.
+    # The commissioned mirror/grasp entry uses the same voice ownership checks.
     base = _load_robot_section(CONFIG.parent / "aimdk_x2_voice_mirror_grasp.yaml")[1]
-    assert base["embodied"]["agent"]["voice_bridge"]["speaker_check_enabled"] is False
-    assert base["voice_asr"]["speaker_embedding"]["enabled"] is False
+    assert base["embodied"]["agent"]["voice_bridge"]["speaker_check_enabled"] is True
+    assert base["voice_asr"]["speaker_embedding"]["enabled"] is True
 
 
 def test_the_summit_answers_questions_and_replies_without_a_skill_word(config):

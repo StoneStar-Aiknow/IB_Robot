@@ -110,7 +110,7 @@ robot:
       - chat_dont_know
       planner:
         fruit_delivery:
-          container_name: an orange bowl
+          container_name: a black bowl
           # The bowl on the summit stand is black (2026-11-09 rig, #158).
           container_label: 黑色的碗
         # The only facts the planner may answer from (2_需要录制的音频.md, confirmed 2026-11-10).

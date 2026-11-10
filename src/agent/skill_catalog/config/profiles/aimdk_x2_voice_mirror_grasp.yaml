@@ -1,33 +1,41 @@
-# Voice, gesture, mirror and pick-to-place skills for aimdk_x2_voice_mirror_grasp.
-#
-# This profile only compiles when grasp_execution and placement_execution are
-# both enabled: pick_object and place_in_container target the grasp_pipeline and
-# placement_pipeline delegated executors, which the robot config registers from
-# those sections. Naming them while a pipeline is off fails with an
-# unknown-executor diagnostic, which is the intended guard against exposing a
-# skill nothing can run.
-#
-# The matching robot config enables both pipelines and requires their model
-# bundles and delegated grasp head to be available at launch.
-# Single-hand and dual-hand deployments share this catalog. The mounting and
-# preparation policy belongs to robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml.
+# Commissioned voice, mirror and gift catalog using Summit motions and recorded answers.
+# Requires both manipulation pipelines and their deployed model bundles.
+# Interactive handshake stays unlisted; fixed poses and return skills remain available.
 schema_version: 1
 name: aimdk_x2_voice_mirror_grasp
 robot_name: aimdk_x2_voice_mirror_grasp
 enabled_skills:
 - name: wave_hand
-  implementation: x2_runtime_v1
-  planner_visible: true
-- name: handshake
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: raise_hand
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: blow_kiss
-  implementation: x2_runtime_v1
+  implementation: aimdk_x2_summit
   planner_visible: true
 - name: clap_hands
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: greet_visitor
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: self_introduction
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: introduce_platform
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: introduce_agent
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: introduce_in_detail
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: explain_pick_scope
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: offer_fruit_menu
   implementation: x2_runtime_v1
   planner_visible: true
 - name: mirror_start
@@ -36,19 +44,135 @@ enabled_skills:
 - name: mirror_stop
   implementation: x2_runtime_v1
   planner_visible: true
-- name: self_introduction
-  implementation: x2_runtime_v1
-  planner_visible: true
 - name: pick_object
-  # Reuse the preparation-aware 150 s implementation, not its robot profile.
-  implementation: aimdk_x2_grasp_task_poses
+  implementation: aimdk_x2_summit_fruit
   planner_visible: true
-- name: free_pose
-  implementation: x2_runtime_v1
+- name: place_in_container
+  implementation: aimdk_x2_grasp
   planner_visible: true
 - name: return_to_task_pose
   implementation: x2_runtime_v1
   planner_visible: true
-- name: place_in_container
-  implementation: aimdk_x2_grasp
+- name: invite_visitor
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: free_pose
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: one_game_at_a_time
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: decline_unsupported
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_mirror_how
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: explain_pick_how
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: fruit_not_available
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: decline_personal_item
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_delivery_rule
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_gift
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_pickup
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: ask_wait_for_delivery
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_fruit_prop
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: tell_name
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_ib_robot
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: tell_origin
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: explain_open_source
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: tell_code_repo
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: tell_event
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: tell_venue
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: answer_price
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: answer_body_price
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: answer_linux
+  implementation: aimdk_x2_summit
+  planner_visible: true
+- name: explain_eyes
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_ears
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_planning
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: list_capabilities
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_arms_only
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_photo
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: answer_language
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: answer_safety
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: answer_unknown_info
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: explain_mirror_game
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_thanks
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_tease
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_slow
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_tired
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_food
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_present
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_not_understood
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: chat_dont_know
+  implementation: x2_runtime_v1
   planner_visible: true
