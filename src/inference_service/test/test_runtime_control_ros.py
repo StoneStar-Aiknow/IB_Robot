@@ -1,7 +1,7 @@
 """Fixed-target ROS transport closure using deterministic CPU executors.
 
-These tests use the real V1 service and polling ACKs. Recovery, dynamic
-membership and pushed terminal receipts are outside the supported interface.
+These tests retain fixed-catalogue coverage through the real V1 service.
+Dynamic membership, recovery and receipts have dedicated protocol suites.
 """
 
 import os
@@ -31,7 +31,7 @@ def wait_for(predicate, timeout=5):
 
 
 @pytest.fixture
-def transport():
+def transport(request):
     assert os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID"), "load the shared ROS domain isolation hooks"
     events = []
     handles, adapters, targets = [], [], []
@@ -72,7 +72,10 @@ def transport():
                 handles.append(handle)
                 adapters.append(SchedulerRuntimeAdapter(nodes[index + 1], t, handle, endpoint="/test/fixed/global"))
             endpoint = GlobalRuntimeEndpoint(
-                nodes[0], targets, endpoint="/test/fixed/global", resources=attested_resources(*targets)
+                nodes[0],
+                targets,
+                endpoint="/test/fixed/global",
+                resources=None if getattr(request, "param", None) == "fixed_only" else attested_resources(*targets),
             )
             spin = threading.Thread(target=executor.spin, daemon=True)
             spin.start()
@@ -96,6 +99,8 @@ def transport():
         # Destroy protocol entities only after successful Global confirmation.
         # ExitStack still attempts every node/context cleanup on assertion failure,
         # preserving the original exception in any subsequent exception chain.
+        for node in nodes:
+            node.executor = None
         for adapter in adapters:
             adapter.destroy_transport()
 
@@ -137,6 +142,27 @@ def test_lost_submit_reply_reuses_the_same_operation(transport, monkeypatch):
     assert result.outputs == {"answer": 6}
     assert events == [("first", "start"), ("first", "end")]
     assert list(endpoint.core._records) == lost
+
+
+def test_terminal_notifications_dispatch_short_deadline_peers_without_polling(transport, monkeypatch):
+    endpoint, adapters, handles, events = transport
+    # Remove periodic Query/ACK reconciliation as a source of progress. Real
+    # ROS guard callbacks must publish completion and dispatch the queued peer.
+    with monkeypatch.context() as scoped:
+        scoped.setattr(endpoint.core, "pending_reports", lambda: [])
+        for _ in range(3):
+            with ThreadPoolExecutor(2) as workers:
+                calls = [
+                    workers.submit(
+                        handle.execute,
+                        ModelRequest({"value": index}),
+                        ExecutionContext(f"short-{index}", Deadline.after(0.2)),
+                    )
+                    for index, handle in enumerate(handles)
+                ]
+                assert [future.result(timeout=2).outputs["answer"] for future in calls] == [0, 2]
+        wait_for(lambda: endpoint.core.resource_settled("cpu"))
+    assert [event for _, event in events] == ["start", "end"] * 6
 
 
 def test_profile_collector_cli_reads_real_ros_measurements(transport, tmp_path):
@@ -185,25 +211,14 @@ def test_profile_collector_cli_reads_real_ros_measurements(transport, tmp_path):
             process.communicate(timeout=5)
 
 
-@pytest.mark.parametrize(
-    "verb",
-    [
-        "recover",
-        "register_group",
-        "unregister",
-        "describe_resource",
-        "begin_initialization",
-        "finish_initialization",
-        "abort_initialization",
-        "terminal_report",
-    ],
-)
-def test_future_control_verbs_are_not_exposed(transport, verb):
+@pytest.mark.parametrize("verb", ["unsupported", "REGISTER"])
+def test_unknown_control_verbs_are_not_exposed(transport, verb):
     _, adapters, _, _ = transport
     with pytest.raises(ControlError, match="INVALID_VERB"):
         adapters[0]._call_control({"verb": verb, "epoch": adapters[0].controller.epoch}, 2)
 
 
+@pytest.mark.parametrize("transport", ["fixed_only"], indirect=True)
 def test_fixed_catalogue_rejects_unknown_target_over_ros(transport):
     endpoint, adapters, _, _ = transport
     status = adapters[0].controller.status()
@@ -304,6 +319,8 @@ def test_factory_role_session_public_ros_path_rejects_bad_role_then_executes(tmp
                 if spin is not None and spin.ident is not None:
                     spin.join(timeout=5)
                     assert not spin.is_alive()
+        for node in nodes:
+            node.executor = None
         adapter.destroy_transport()
 
 
@@ -378,7 +395,7 @@ def test_ros_harness_cleans_infrastructure_after_failure(monkeypatch, tmp_path, 
     monkeypatch.setattr(RuntimeProviders, "close", close_providers)
     with pytest.raises((RuntimeError, AssertionError)) as failed:
         if path == "queue":
-            fixture = transport.__wrapped__()
+            fixture = transport.__wrapped__(SimpleNamespace())
             next(fixture)
             fixture.close()
         else:
@@ -398,8 +415,6 @@ def test_ros_harness_cleans_infrastructure_after_failure(monkeypatch, tmp_path, 
 
 
 def test_invalid_global_service_name_leaves_original_handle_retryable():
-    from rclpy.exceptions import InvalidServiceNameException
-
     from .runtime_scheduler_helpers import Executor
 
     rclpy.init()
@@ -408,7 +423,7 @@ def test_invalid_global_service_name_leaves_original_handle_retryable():
     handle.load()
     adapter = None
     try:
-        with pytest.raises(InvalidServiceNameException):
+        with pytest.raises(ValueError, match="invalid runtime endpoint"):
             SchedulerRuntimeAdapter(node, target(resource="cpu"), handle, endpoint="/invalid endpoint")
         assert not handle.execution_policy_bound
         assert handle.execute(ModelRequest(), ExecutionContext("direct")).outputs["answer"].tolist() == [1]

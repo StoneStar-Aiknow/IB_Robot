@@ -1,5 +1,24 @@
 # robot_config
 
+## Runtime 资源与目标编译
+
+`runtime_target_config.build_runtime_target_directory()` 从 robot SSOT 编译 policy 和
+perception 目标；`build_runtime_resources()` 生成物理设备资源目录。它们校验资源别名、
+容量、endpoint 冲突、workload profile 路径及预测准入覆盖。配置层不导入 inference_service。
+profile 路径展开 `~`，相对路径以 `WORKSPACE` 为基准，并检查文件存在。
+profile 内容和身份由 Global 启动时的 `RuntimeProfileRegistry` 校验。
+`launch_builders.model_runtime.model_runtime_connection_parameters()` 只投影连接参数；
+现有业务 launch 不会因引入该工具自动切换宿主。
+
+`runtime_scheduler.resources` 声明资源 ID、canonical physical_device、资源模式和覆盖证明。
+`managed_perception` 可覆写目标优先级、超时、容量、profile_path 和 runtime_version。
+policy 新增 `runtime_limits`、`runtime_profile_path`、`runtime_version`、
+`profile_observation_inputs`。其中 `runtime_profile_path` 指向 runtime_execution v2 证据；
+旧 `profile_path` 继续服务既有 policy scheduler，不能用 v2 文件替换。
+
+本阶段只编译 policy/perception；尚未迁移的启用中语音或本地模型参与者不能被视为已受管，
+预测准入的覆盖检查会保守拒绝。调度关闭、simulation 或 benchmark 不生成在线目标目录。
+
 ros2_control 和外设的统一机器人配置系统。
 
 ## 概述

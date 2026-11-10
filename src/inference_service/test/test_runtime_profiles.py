@@ -51,6 +51,7 @@ def test_live_collection_crosses_retention_window_and_builds_admissible_profile(
     host, model = controller(t, now_ns=lambda: now[0])
     # Let control records expire throughout this long collection.
     initial = [True]
+    nonempty_pages = []
     samples = tmp_path / "models" / "_work" / "sam" / "profiling" / "samples.jsonl"
 
     def call(payload):
@@ -74,11 +75,15 @@ def test_live_collection_crosses_retention_window_and_builds_admissible_profile(
                     core.collect()
         from types import SimpleNamespace
 
-        return _reply(bus[endpoint.endpoint](_request(payload), SimpleNamespace()))
+        reply = _reply(bus[endpoint.endpoint](_request(payload), SimpleNamespace()))
+        if payload["verb"] == "measurements" and reply["samples"]:
+            nonempty_pages.append(len(reply["samples"]))
+        return reply
 
     try:
         connect(core, host)
         assert collect_runtime_samples(t, call, samples, count=10000) == 10000
+        assert len(nonempty_pages) < 400
         assert len(model.calls) == 10016
         assert len(core.measurements) == 1024
         collected = list(read_runtime_samples(samples))
@@ -336,6 +341,42 @@ def test_measurement_page_fits_wire_budget_with_long_identity_and_bucket():
     assert seen == [1, 2, 3]
 
 
+def test_measurement_pages_fill_byte_budget_without_losing_samples():
+    from inference_service.scheduler.runtime_profiles import RuntimeProfileRegistry
+    from inference_service.scheduler.runtime_protocol import MAX_CONTROL_BYTES, encode_control
+
+    t = target()
+    core = RuntimeScheduler([t])
+    for sequence in range(1, 1025):
+        core.measurements.append(
+            {
+                "sequence": sequence,
+                "operation_id": str(uuid4()),
+                "target_id": t.target_id,
+                "identity": RuntimeProfileRegistry.identity(t),
+                "work": "execute",
+                "input_bucket": 'image:"\\图像"[1,3,224,224]',
+                "occupancy_ns": 1000000,
+                "measured_at": time.time(),
+            }
+        )
+    core._measurement_sequence = 1024
+    cursor, pages, seen = 0, 0, []
+    while cursor < 1024:
+        page = core.read_measurements(cursor)
+        assert len(encode_control(page).encode()) <= MAX_CONTROL_BYTES
+        assert page["dropped"] == 0
+        cursor = page["next_sequence"]
+        pages += 1
+        seen.extend(sample["sequence"] for sample in page["samples"])
+        if cursor < 1024:
+            overflow = {**page, "samples": [*page["samples"], core.measurements[cursor]], "next_sequence": cursor + 1}
+            with pytest.raises(ControlError, match="CONTROL_TOO_LARGE"):
+                encode_control(overflow)
+    assert seen == list(range(1, 1025))
+    assert pages < 32
+
+
 def test_profile_writer_enforces_serialized_size_and_preserves_existing_file(tmp_path, monkeypatch):
     from inference_service.scheduler import runtime_profiles
 
@@ -426,11 +467,11 @@ def test_measurement_cursor_survives_eviction_and_reports_gaps():
     core.measurements = deque(({"sequence": i} for i in range(1, 5)), maxlen=4)
     core._measurement_sequence = 4
     first = core.read_measurements()
-    assert [s["sequence"] for s in first["samples"]] == [1, 2]
+    assert [s["sequence"] for s in first["samples"]] == [1, 2, 3, 4]
     core.measurements.append({"sequence": 5})
     core._measurement_sequence = 5
     second = core.read_measurements(first["next_sequence"])
-    assert [s["sequence"] for s in second["samples"]] == [3, 4]
+    assert [s["sequence"] for s in second["samples"]] == [5]
     assert second["dropped"] == 0
     assert core.read_measurements()["dropped"] == 1
     with pytest.raises(ControlError, match="INVALID_MEASUREMENT_CURSOR"):

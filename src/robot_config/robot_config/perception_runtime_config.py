@@ -291,3 +291,18 @@ __all__ = [
     "PerceptionRuntimeConfigError",
     "parse_perception_runtime_config",
 ]
+
+
+def select_perception_services(services, *, instance_ids=None):
+    """Apply launch selection consistently to model hosts and scheduler targets."""
+    # Services are shared hosts. A consumer's query mode does not own their
+    # lifetime; explicit service enablement and launch selection are authoritative.
+    services = tuple(services)
+    if instance_ids is not None:
+        if not isinstance(instance_ids, list | tuple) or any(
+            not isinstance(item, str) or not item for item in instance_ids
+        ):
+            raise PerceptionRuntimeConfigError("instance_ids must be a list of nonempty service IDs")
+        if missing := set(instance_ids) - {service.instance_id for service in services}:
+            raise PerceptionRuntimeConfigError(f"instance_ids references unavailable services: {sorted(missing)}")
+    return tuple(service for service in services if instance_ids is None or service.instance_id in instance_ids)

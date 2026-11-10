@@ -201,6 +201,10 @@ def test_torch_model_resource_uses_native_request_and_context(tmp_path) -> None:
 
 @pytest.mark.parametrize("failure", ["loader", "validation"])
 def test_torch_constructor_registers_completion_before_model_loader(tmp_path, failure):
+    from contextlib import nullcontext
+
+    import torch as real_torch
+
     from inference_service.backends.errors import BackendLoadError
     from inference_service.unified_runtime import LifecycleState
 
@@ -213,7 +217,10 @@ def test_torch_constructor_registers_completion_before_model_loader(tmp_path, fa
         if not release_allowed[0]:
             raise RuntimeError("device completion pending")
 
-    torch.cuda = SimpleNamespace(is_available=lambda: True, synchronize=synchronize, current_device=lambda: 0)
+    torch.device = real_torch.device
+    torch.cuda = SimpleNamespace(
+        is_available=lambda: True, synchronize=synchronize, current_device=lambda: 0, device=lambda _: nullcontext()
+    )
 
     def loader(_):
         calls.append("load")

@@ -1,5 +1,26 @@
 # robot_config
 
+## Runtime resources and target compilation
+
+`runtime_target_config.build_runtime_target_directory()` compiles policy and perception targets
+from the robot SSOT. `build_runtime_resources()` builds the physical resource catalogue. They
+validate resource aliases, capacity, endpoint conflicts, workload profile paths and predictive
+admission coverage without importing inference_service. Profile paths expand `~`, resolve relative
+to `WORKSPACE`, and must name existing files. Global validates profile contents and identity through
+`RuntimeProfileRegistry` at startup. The
+`launch_builders.model_runtime.model_runtime_connection_parameters()` helper projects connection
+parameters; existing business launches retain their current hosts.
+
+`runtime_scheduler.resources` declares resource IDs, canonical physical devices, resource modes
+and coverage evidence. `managed_perception` supports priority, timeout, capacity, profile_path and
+runtime_version overrides. Policy adds `runtime_limits`, `runtime_profile_path`, `runtime_version`
+and `profile_observation_inputs`. `runtime_profile_path` holds runtime_execution v2 evidence;
+the existing `profile_path` remains dedicated to the legacy policy scheduler.
+
+Only policy and perception are compiled at this stage. Enabled speech or local participants that
+have not migrated cannot count as managed coverage. Disabled scheduling, simulation and benchmark
+purposes do not produce an online target directory.
+
 Unified robot configuration system for ros2_control and peripherals.
 
 ## Overview

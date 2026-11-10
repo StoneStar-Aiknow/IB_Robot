@@ -870,3 +870,61 @@ def test_native_close_checks_budget_between_native_calls(tmp_path, monkeypatch, 
         assert resource.value is None
     finally:
         resource.close()
+
+
+@pytest.mark.parametrize("accelerator", ["cuda", "npu"])
+def test_native_resource_load_and_execution_share_explicit_device(tmp_path, monkeypatch, accelerator):
+    import sys
+    from contextlib import contextmanager
+
+    import torch as real_torch
+
+    bundle = _create_bundle(tmp_path / "indexed_native")
+    path = bundle / "inference_manifest.json"
+    document = json.loads(path.read_text())
+    document["deployments"]["cpu"]["runtime_profile"]["profile"]["device"] = accelerator
+    path.write_text(json.dumps(document))
+    spec = load_inference_manifest(bundle, "cpu")
+    current, operations = [0], []
+
+    @contextmanager
+    def device_scope(device):
+        previous = current[0]
+        current[0] = device.index
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    runtime = SimpleNamespace(
+        current_device=lambda: current[0],
+        device=device_scope,
+        synchronize=lambda device: None,
+        current_stream=lambda device: SimpleNamespace(synchronize=lambda: None),
+    )
+    torch = SimpleNamespace(
+        device=lambda value: real_torch.device(value.replace("npu", "cuda")),
+        no_grad=nullcontext,
+        cuda=runtime,
+        npu=runtime,
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    def factory():
+        operations.append(("load", current[0]))
+        return SimpleNamespace(close=lambda: operations.append(("close", current[0])))
+
+    def execute(model, inputs):
+        operations.append(("execute", current[0]))
+        return 7
+
+    context = RuntimeContext(spec, runtime_options={"torch_device_index": 2}, managed_execution=True)
+    resource = build_native_torch_resource(context, factory=factory, execute=execute)
+    try:
+        resource.load(context)
+        assert resource.runtime_device_index == 2
+        assert resource.execute(ModelRequest(), ExecutionContext("indexed")) == {"value": 7}
+    finally:
+        resource.close()
+    assert operations == [("load", 2), ("execute", 2), ("close", 2)]
+    assert current == [0]

@@ -1,17 +1,25 @@
 """An inherited deadline for synchronous, nested lifecycle cleanup."""
 
+import threading
+import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 from .contracts import Deadline
 
 _deadline = ContextVar("runtime_lifecycle_deadline", default=None)
+# Signals stop the entire host, including executor workers that do not inherit
+# ContextVars. Per-call deadlines and cancellation remain context-local.
+_stop = None
 _context = ContextVar("runtime_lifecycle_context", default=None)
 POLL_INTERVAL_SECONDS = 0.05
 
 
 def check_startup():
-    lifecycle_deadline().check("startup")
+    check_lifecycle(phase="startup")
+    stopping = _stop
+    if stopping is not None and stopping.is_set():
+        raise RuntimeError("model host stopped during initialization")
 
 
 def lifecycle_context():
@@ -21,7 +29,9 @@ def lifecycle_context():
 
 def lifecycle_deadline(deadline=None, *additional_deadlines):
     candidates = [
-        value for value in (deadline, *additional_deadlines, _deadline.get()) if value is not None and value.bounded
+        value
+        for value in (deadline, *additional_deadlines, _deadline.get(), getattr(_stop, "deadline", None))
+        if value is not None and value.bounded
     ]
     return min(candidates, key=lambda value: value.remaining_seconds()) if candidates else Deadline.unbounded()
 
@@ -78,3 +88,43 @@ def lifecycle_budget(timeout):
         yield deadline
     finally:
         _deadline.reset(token)
+
+
+class LifecycleStop(threading.Event):
+    """A process stop request starts the cleanup budget, including startup rollback."""
+
+    def __init__(self, timeout):
+        super().__init__()
+        self.timeout = timeout
+        self.deadline = None
+
+    def set(self):
+        if self.deadline is None:
+            self.deadline = Deadline.after(self.timeout)
+        super().set()
+
+
+@contextmanager
+def lifecycle_stop_scope(stopping):
+    """Install a process stop source from the signal-owning main thread."""
+    global _stop
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("process lifecycle stop must be installed on the main thread")
+    previous, _stop = _stop, stopping
+    try:
+        yield
+    finally:
+        _stop = previous
+
+
+def wait_for_startup(wait, timeout):
+    """Poll interruptible discovery without cancelling any admitted SDK work."""
+    until = time.monotonic() + timeout
+    while True:
+        check_startup()
+        remaining = until - time.monotonic()
+        if remaining <= 0:
+            return False
+        if wait(min(POLL_INTERVAL_SECONDS, remaining)):
+            check_startup()
+            return True

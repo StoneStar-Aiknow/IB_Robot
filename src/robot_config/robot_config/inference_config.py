@@ -39,6 +39,10 @@ _SCHEDULED_PIPELINE_FIELDS = frozenset(
         "compatibility_group",
         "hardware_resource_id",
         "hardware_profile_fingerprint",
+        "runtime_limits",
+        "runtime_version",
+        "runtime_profile_path",
+        "profile_observation_inputs",
         "profile_path",
         "public_capacity",
         "scheduling",
@@ -125,6 +129,10 @@ _SCHEDULER_FIELDS = frozenset(
         "terminal_session_retention",
         "max_session_records",
         "global_policy",
+        "priority_zero_policy",
+        "managed_perception",
+        "resources",
+        "runtime_endpoint",
         "priority_zero_deadline_admission",
     }
 )
@@ -215,6 +223,10 @@ class InferencePipelineConfig:
     hardware_resource_id: str | None = None
     hardware_profile_fingerprint: str | None = None
     profile_path: Path | None = None
+    runtime_profile_path: Path | None = None
+    runtime_version: str = ""
+    profile_observation_inputs: tuple[str, ...] = ()
+    runtime_limits: Mapping[str, int] = dataclass_field(default_factory=lambda: MappingProxyType({}))
     public_capacity: Mapping[str, InferenceWorkCapacityConfig] = dataclass_field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -561,12 +573,26 @@ def _parse_pipeline(
     hardware_resource_id: str | None = None
     hardware_profile_fingerprint: str | None = None
     profile_path: Path | None = None
+    runtime_profile_path: Path | None = None
+    runtime_version = ""
+    profile_observation_inputs = ()
+    runtime_limits = {}
     public_capacity: dict[str, InferenceWorkCapacityConfig] = {}
     runtime_policy_json: str | None = None
     runtime_policy_fingerprint: str | None = None
     profile_compatibility_fingerprint: str | None = None
     scheduling: PipelineSchedulingConfig | None = None
     if scheduler_enabled:
+        from .runtime_target_config import validate_profile_observation_inputs, validate_runtime_limits
+
+        runtime_limits = value.get("runtime_limits", {})
+        validate_runtime_limits(runtime_limits, f"{pipeline_path}.runtime_limits")
+        runtime_version = value.get("runtime_version", "")
+        if not isinstance(runtime_version, str):
+            raise InferenceConfigError(f"{pipeline_path}.runtime_version must be a string")
+        profile_observation_inputs = validate_profile_observation_inputs(value.get("profile_observation_inputs", []))
+        if value.get("runtime_profile_path") is not None:
+            runtime_profile_path = _resolve_profile_path(value["runtime_profile_path"], pipeline_path)
         required_raw = value.get("required", True)
         if not isinstance(required_raw, bool):
             raise InferenceConfigError(f"{pipeline_path}.required must be a boolean")
@@ -623,6 +649,10 @@ def _parse_pipeline(
         hardware_resource_id=hardware_resource_id,
         hardware_profile_fingerprint=hardware_profile_fingerprint,
         profile_path=profile_path,
+        runtime_profile_path=runtime_profile_path,
+        runtime_version=runtime_version,
+        runtime_limits=MappingProxyType(dict(runtime_limits)),
+        profile_observation_inputs=profile_observation_inputs,
         public_capacity=MappingProxyType(public_capacity),
         runtime_policy_json=runtime_policy_json,
         runtime_policy_fingerprint=runtime_policy_fingerprint,
@@ -887,19 +917,7 @@ def _validate_endpoint_conflicts(
         local_interfaces: dict[str, str] = {}
         for field in ("node_name", "cloud_node_name"):
             _record_endpoint_owner(node_owners, pipeline_id, field, getattr(transport, field))
-        active_fields = (
-            (
-                "health_topic",
-                "request_topic",
-                "result_topic",
-                "heartbeat_topic",
-                "video_descriptor_topic",
-                "video_status_topic",
-                *_SCHEDULED_TRANSPORT_FIELDS,
-            )
-            if scheduler_enabled
-            else _NON_SCHEDULED_INTERFACE_FIELDS
-        )
+        active_fields = _active_interface_fields(scheduled=scheduler_enabled)
         for field in active_fields:
             endpoint = getattr(transport, field)
             if endpoint is not None:
@@ -1422,3 +1440,19 @@ __all__ = [
     "SchedulerConfig",
     "parse_inference_config",
 ]
+
+
+def _active_interface_fields(*, scheduled=False):
+    return (
+        (
+            "health_topic",
+            "request_topic",
+            "result_topic",
+            "heartbeat_topic",
+            "video_descriptor_topic",
+            "video_status_topic",
+            *_SCHEDULED_TRANSPORT_FIELDS,
+        )
+        if scheduled
+        else _NON_SCHEDULED_INTERFACE_FIELDS
+    )

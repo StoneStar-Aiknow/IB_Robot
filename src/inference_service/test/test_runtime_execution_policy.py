@@ -696,6 +696,13 @@ def test_lost_policy_close_receipt_cannot_reopen_confirmed_closed_stream():
             owner.close_stream(stream)
         assert stream.closed and owner.ready
         assert owner.open_stream_count == 0 and owner.health.failure_count == 1
+        # Local CLOSED is irreversible, but does not acknowledge the policy's
+        # remote settlement. A lost receipt remains observable until replay
+        # succeeds; the local stream cleanup itself stays idempotent.
+        with pytest.raises(ExecutionFailure):
+            owner.close_stream(stream)
+        assert stream.closed and owner.open_stream_count == 0
+        policy.close_stream = close
         owner.close_stream(stream)
     finally:
         dispose(owner, policy)

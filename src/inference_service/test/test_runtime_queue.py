@@ -440,6 +440,13 @@ def test_ticks_skip_settled_history_but_preserve_replay_expiry_and_conflicting_e
         core.report({"submission": history[-1].to_dict(), "state": "not_started"})
         assert core.query(history[-1])["state"] == "unknown"
         assert core.pending_reports() == [(t, history[-1], "query")]
+        # Reconciliation before expiry must not add duplicate heap entries.
+        indexed = len(core._expirations)
+        core.report({"submission": history[-1].to_dict(), "state": "completed"})
+        for _ in range(3):
+            core.acknowledge_host(history[-1])
+        assert len(core._expirations) == indexed
+        core.report({"submission": history[-1].to_dict(), "state": "not_started"})
         now[0] = max(template.accept_until_ns, template.deadline_ns)
         core.collect()
         assert not core.has_operation(history[0].operation_id)
@@ -449,6 +456,91 @@ def test_ticks_skip_settled_history_but_preserve_replay_expiry_and_conflicting_e
         core.acknowledge_host(history[-1])
         core.collect()
         assert not core.has_operation(history[-1].operation_id)
+    finally:
+        host.shutdown()
+
+
+@pytest.mark.parametrize("work", ["reset", "close"])
+def test_recovery_and_generation_checks_skip_settled_history(work):
+    class NoHistoryScan(dict):
+        def values(self):
+            pytest.fail("recovery scanned acknowledged replay history")
+
+    t = target()
+    core = RuntimeScheduler([t])
+    host, _ = controller(t)
+    try:
+        connect(core, host)
+        template = prepare(host)
+        history = []
+        for _ in range(512):
+            sub = replace(template, operation_id=str(uuid4()), request_ref=str(uuid4()))
+            core.submit(sub)
+            core.dispatchable()
+            core.report({"submission": sub.to_dict(), "state": "completed"})
+            core.acknowledge_host(sub)
+            history.append(sub)
+        active = replace(template, operation_id=str(uuid4()), request_ref=str(uuid4()), work=work)
+        core.submit(active)
+        assert core.dispatchable() == [(t, active)]
+        core._records = NoHistoryScan(core._records)
+        if work == "reset":
+            newer = host.status()
+            newer["generation"] += 1
+            with pytest.raises(ControlError, match="RESET_COMPLETION_EVIDENCE_PENDING"):
+                core.register(newer)
+        core.begin_recovery(t.hardware_resource_id, (t,))
+        assert core._records[active.operation_id].cancel_requested is (work != "close")
+        assert all(not core._records[sub.operation_id].cancel_requested for sub in history)
+        assert len(core._unsettled) == 1
+    finally:
+        host.shutdown()
+
+
+def test_staggered_expirations_do_not_rescan_history_and_duplicate_acks_are_bounded():
+    class NoHistoryScan(dict):
+        def items(self):
+            pytest.fail("expiry scanned retained history")
+
+        def values(self):
+            pytest.fail("expiry scanned retained history")
+
+    now = [time.monotonic_ns()]
+    t = target(max_pending_requests=128)
+    core = RuntimeScheduler([t], now_ns=lambda: now[0])
+    host, _ = controller(t, now_ns=lambda: now[0])
+    try:
+        connect(core, host)
+        history = []
+        for _ in range(64):
+            sub = prepare(host)
+            core.submit(sub)
+            core.report(host.cancel(sub, core.epoch))
+            host.release_result_waiter(sub)
+            history.append(sub)
+            now[0] += 1000
+        # ACK arrival need not follow expiry order; duplicate receipts must not
+        # amplify retained bookkeeping or collect a still-live business waiter.
+        for sub in reversed(history):
+            for _ in range(3):
+                host.acknowledge(sub, core.epoch)
+                core.acknowledge_host(sub)
+        assert len(host._expirations) == len(core._expirations) == len(history)
+        host._records, core._records = NoHistoryScan(host._records), NoHistoryScan(core._records)
+        try:
+            for index, sub in enumerate(history):
+                now[0] = sub.accept_until_ns - 1
+                host.collect()
+                core.collect()
+                assert sub.operation_id in host._records and core.has_operation(sub.operation_id)
+                now[0] += 1
+                host.collect()
+                core.collect()
+                assert sub.operation_id not in host._records and not core.has_operation(sub.operation_id)
+                assert len(host._records) == len(core._records) == len(history) - index - 1
+            assert not host._expirations and not core._expirations and not core._expiration_ids
+        finally:
+            host._records, core._records = dict(host._records), dict(core._records)
     finally:
         host.shutdown()
 

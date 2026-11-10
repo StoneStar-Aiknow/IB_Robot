@@ -38,10 +38,69 @@ manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerp
 
 ## 核心概念
 
+### 动态 runtime 创建与进程所有权
+
+`runtime_creation` 提供显式创建事务。`RuntimeProviders.runtime_environment` 保存进程内
+Handle、初始化回执和控制传输。开启调度时，事务先取得 Global 初始化占用，再加载模型、
+绑定执行策略并发布宿主。Global 不可用时不会退回 direct 执行。未开启调度时使用本地路径；
+simulation、benchmark、isolated_offline 等用途也保留进程清理所有权。
+自定义 `RuntimeProviders.create(acl_provider, admissions)` 默认也创建这个进程所有者；
+调度关闭时不创建 ROS 通信实体。默认与自定义 providers 使用相同的节点调度配置和关闭入口。
+
+普通模型和领域模型都通过 `load_model_runtime` 调用 `ModelRuntimeFactory.load_session`，
+并显式提供 `registry_set` 与 `providers`。领域模型继续使用注册式 Session 和
+`ModelRequest` / `ModelResult`，不引入额外的 native runtime 包装。
+Session builder 只创建未加载的对象并校验参数。原生资源必须在 Session 的 `load()` 中获取，
+此时 Factory/Handle 已持有清理责任。返回 Session 后的组装失败复用该 Session 的关闭流程。
+`load_streaming_model_runtime` 复用同一工厂、资源组装和失败清理，Session 必须实现
+open_stream、step、reset_stream、close_stream，并声明相符的 stream execution contract。
+
+构造事务仅约束显式使用此入口创建的 Handle；现有 direct 调用保持可用。
+`bind_runtime` 目前绑定单个模型，policy stage 和业务宿主迁移另行接入。
+公共单模型完整 Session 使用 `model_runtime` 组合身份；单 role 和 Session stream 分别使用
+`model_runtime/role`、`model_runtime/stream`，不能互用 workload profile。
+`load_model_runtime` 从 `role_execution` / `streaming_execution` 推导身份。
+直接使用 `runtime_creation` 时，通过 `session_execution="full"|"role"|"stream"` 声明选择，默认 full。
+显式 target 也必须匹配实际加载选项与执行方式的组合指纹；Factory 在调用 Session builder 前复核。
+配置编译器生成的业务 adapter/stage target 仍由对应宿主迁移 PR 接入。
+运行时发现的 `configured_target_id` 和 ROS 参数 `configured_target_ids` 使用完整目录 ID，
+例如 `perception/depth_front`，并按原值精确匹配。配置编译侧的 `instance_ids` 仍使用服务 ID，
+例如 `depth_front`；两种选择器不能混用。
+同一 providers 的首个创建事务原子读取并冻结节点配置。
+未传 providers 的显式宿主复用节点上的环境，后续创建同样拒绝变更已冻结配置。
+显式 target 创建也消费节点的端点和初始化超时参数，并在返回前确认注册。
+节点尚未加入 executor 时，发布过程复用临时控制 executor。
+在线调度关闭时，target 描述保持 dormant，不阻止本地加载。
+本地创建不冻结 ROS domain。
+设备身份继续使用 `inference_manifest.runtime_identity`：未解析具体索引的 Torch CUDA/NPU
+profile 会在初始化前被拒绝，不默认假设设备 0。关闭调度不增加这项在线放置检查。
+
+Global 支持动态目标、完整生命周期组注册、初始化 begin/finish/abort 回放和 boot/generation
+隔离。终态回执确认后仍保留重放记录；UNKNOWN 继续隔离设备，不能作为未执行重新提交。
+Global 的账本仅在内存中保存，不支持保留旧 Host 时单独重启 Global。
+Global 崩溃或账本丢失后，必须先停止全部旧 Host，并确认原生设备工作已结束，再统一启动 Global 与 Host。
+进程退出本身不能替代设备完成证据；无法确认时不得开始新一轮加载或执行。
+启动管理器不得单独自动重启 Global。旧 epoch 检查只在旧 Host 上报后生效，
+`COORDINATED_RESTART_REQUIRED` 不是跨重启的占用证明，也不能阻止先到的新初始化。
+Close 必须完成本地释放和 Global 退役确认。丢响应、超时或清理失败时保留所有者及传输，
+后续调用沿用原操作身份。`HostRequests` 与 `host_stop_signals` 停止业务准入，
+在退出预算内保持控制回调可用。调用方仍需关闭 providers，并处理未完成的清理。
+
+跨重试窗口后若接收端明确报告恢复回执缺失，不能据此重放 Reset。
+如果 Global 确认旧回执已缺失，当前调用仍报告未知结果并清除本地旧编号。
+后续显式 Reset 使用新编号。当前调用不会自动重复 Reset。
+Global 仅回收已结算或已被新恢复屏障取代的回执。
+
+首次恢复发送被明确拒绝为 `OPERATION_EXPIRED` 时，允许后续调用申请新编号。
+恢复回执仍存在时，丢响应或未知结果的重试保留原编号及 UNKNOWN 隔离。
+Close 可发起新的排空与清理事务；宿主只重试可重复的 drain、不可逆 Close 和带 generation 校验的 activate。
+已完成的非 Close 恢复回执在同一 boot 的宿主退役后可结算，仍保留原重放窗口；UNKNOWN 不因时间流逝被释放。
+
 ### 后端完成与释放证据
 
 `runtime_context_defaults` 为当前构造上下文提供 `priority_scheduling` 和 `managed_execution`
 默认值。显式参数优先。退出上下文后恢复原值，其他线程不继承这些默认值。
+公共创建入口在本地或隔离用途内将这两个默认值设为 `False`。
 
 Pipeline 和 Manager 工厂省略优先级参数时，继承构造作用域的默认值。
 显式 `False` 仍覆盖作用域默认值。
@@ -55,6 +114,10 @@ typed model services 尚未接入这个开关；执行策略接口不代表后�
 异常保留原有的开始、阶段、恢复和待清理证据。
 设备同步只补充完成证据，确定未开始的失败不改写为已开始。
 成功推理只在 `managed_execution=True` 时增加完成等待。
+
+受管加载也等待设备完成，再发布 READY 并结束初始化占用。
+普通 Torch 与 LeRobot Torch 提供恢复 drain，复用设备同步。
+不支持原生 reset 的 Session 仍需 Close 后重建。
 
 CUDA 和 NPU Session 在加载时固定具体设备索引。
 后续执行和关闭等待同一设备，不依赖调用线程的当前设备。
@@ -82,8 +145,11 @@ Session 的公开调用方式保持可用。
 SpeechDirection 的 FullSubNet Torch 执行异常也使用统一完成检查。
 FullSubNet 关闭和故障后的 reset 先等待设备完成。
 等待失败时，FullSubNet 保留资源并允许重试关闭。
-设备连续 2 次关闭排空失败后，close 放弃等待并释放引用。
+
+本地模式连续 2 次关闭排空失败后，close 放弃等待并释放引用。
+受管 Torch Session 始终保留资源，直到设备同步成功。
 放弃时完成状态未知，日志记录放弃事件。
+
 健康状态的 FullSubNet reset 复用已完成的主机输出证据，不等待其他流。
 reset 重建状态后的完成等待只覆盖提交初始化工作的当前 CUDA 流。
 FullSubNet 也在构造时固定 CUDA 索引，模型、状态和完成等待使用同一设备。
@@ -165,6 +231,7 @@ Factory 异常通过 `cleanup_owner` 移交待清理所有者。
 感知和 ZipVoice 插件构造失败后先关闭 Handle，仅在清理未完成时移交 provider。
 ZipVoice 在 Handle 真正关闭后才标记自身关闭，构造清理失败不会覆盖原加载异常。
 `RuntimeProviders.retain_cleanup()` 保留 Factory 和插件构造失败的所有者。
+创建作用域未指定 node 或 providers 时，Factory 传入的 providers 保留未完成清理的 Handle。
 provider 先关闭这些所有者，再关闭准入 provider 和 ACL provider。
 `process_resources` 统一列出进程资源，关闭顺序和 Handle 所有权过滤共用这份名单。
 
@@ -1213,21 +1280,22 @@ RKNN/HMM 原生释放抛出无完成证据的异常时，保留所有权并报�
 持有原始 `StreamHandle` 对象时，已关闭对象的幂等性不受历史淘汰影响。
 该限制也适用于 SpeechDirection 的字符串流 ID。
 
-## 固定目标公共运行时调度
+## 公共运行时调度
 
 公共基础现提供 native/session factory、宿主执行控制器、共享设备 FIFO/EDF 队列、
-v2 workload profile 和 `global_runtime_scheduler_node`。目标集合在启动时固定。
+v2 workload profile 和 `global_runtime_scheduler_node`。Global 支持动态目标注册。
 现有 policy 调度器、旧 profile 和 direct 调用继续保留。
 
 ### 配置与执行边界
 
-当前入口只覆盖 PR-06 至 PR-10。机器人配置编译尚未接入。
-调用方手工提供相同的 `RuntimeExecutionTarget` 和资源描述。
+公共基础设施覆盖 PR-06 至 PR-16。机器人配置支持 policy/perception 目标编译。
+调用方通过公共创建入口接入，也支持显式提供 `RuntimeExecutionTarget`。
+Host 与 Global 必须使用一致的资源描述。
 现有业务 launch 不会自动创建新 Host 或 Global。
 
 | Global 节点参数 | 默认值与约束 |
 | --- | --- |
-| `runtime_targets_json` | `[]`。固定 Target 对象数组。每个 Host endpoint 必须唯一。 |
+| `runtime_targets_json` | `[]`。初始 Target 对象数组。每个 Host endpoint 必须唯一。 |
 | `runtime_resources_json` | `{}`。按 `hardware_resource_id` 索引的资源对象。 |
 | `runtime_scheduler_endpoint` | `/inference/runtime/v1`。禁止与 Host endpoint 重合。 |
 | `priority_zero_policy` | `fifo`。也支持 `edf`。旧名 `global_policy` 会触发错误。 |
@@ -1246,7 +1314,11 @@ Target 的必填字段：`target_id`、`endpoint`、`hardware_resource_id`、
 每个 Target 默认允许 1 个执行、8 个待处理请求和 4096 条记录。
 输入与结果的保留配额各为 64 MiB。
 默认请求期限为 5000 ms，重试窗口为 30000 ms。
-字段定义与校验见 `scheduler/runtime_protocol.py`。
+
+目标字段及共享校验见 `inference_manifest.runtime_target`。
+生命周期组最多包含 16 个成员，完整控制消息上限为 32 KiB。
+配置编译、初始化和组绑定都会检查整组预算。单成员合法不代表整组合法。
+首次初始化的接受窗口最多为 300 s。模型加载的总预算保持调用方设置。
 
 资源对象必须包含 `physical_device`。默认 `mode` 为 `serial`。
 `ascend_concurrent` 要求 `verified_concurrency=true` 和后端并发证据。
@@ -1260,8 +1332,8 @@ Host 通过 `SchedulerRuntimeAdapter(node, target, handle)` 绑定公共 Handle�
 Session 必须在 `runtime_context_defaults(priority_scheduling=False, managed_execution=True)` 中加载。
 
 绑定后，业务继续调用 Handle 的 `execute`、`reset` 和 `close`。
-当前受管入口只支持请求执行，不支持 managed stream。
-直接调用的单流 Session 仍使用既有 stream 契约。
+公共 `runtime_creation` 和 `bind_runtime` 支持受管流的开流、步进、重置和关闭。
+具体流式业务宿主仍需接入公共入口。直接调用保留既有 stream 契约。
 
 `create_session(role_execution=True)` 拒绝带 `device_links` 的 deployment。
 deployment 必须声明非空执行 role，Session 必须提供 `execute_role()`。
@@ -1296,8 +1368,8 @@ CUDA/NPU 的实际设备索引在加载时确定。
 
 ### 控制、结果与关闭
 
-Global 支持 `describe`、`register`、`measurements`、`submit`、`query`、`cancel`。
-Host 支持 `execute`、`query`、`cancel`、`ack`。
+Global 支持资源发现、组注册、初始化、请求调度、终态回执、恢复和注销。
+Host 支持 `execute`、`query`、`cancel`、`ack` 和 `recover`。
 控制服务只传递身份和执行证据，业务输入与结果留在 Host。
 `<runtime_scheduler_endpoint>/ready` 是 `std_srvs/Trigger` readiness 服务。
 
@@ -1354,17 +1426,41 @@ SDK 关闭成功后的设备 drain 失败，不会重复调用 SDK 关闭。
 Global 仍保留历史供查询和幂等重放。
 回收必须同时满足重试窗口与业务期限到期。
 
-当前 Global 通过 Query 获取终态，首次查询可能等待 250 ms。
-当前版本不保证短 deadline 或高频连续派发。
-每个 Host 必须使用独立 `lifecycle_group`。
+Host 主动上报终态，并重放未确认的证据。Query 仍用于丢响应后的核对。
+每个 Host 单轮最多扫描和发送 32 条终态证据，退避记录也计入扫描预算。
+每个 Host 最多保留 64 个在途终态 RPC。新终态优先入队，旧回执继续轮转重试。
 
-多个 Host 必须逐个关闭，并等待 Global 确认前一个 Host 退出。
+业务等待线程和后台上报复用同一终态回执。
+回执确认后，后台也将已关闭流纳入最多 128 条的历史。
+
+恢复保留原操作身份，续期只延长保留期限。
+Host 等待 Global 确认恢复结果，Global 等待调用方确认。
+未确认的恢复回执不因窗口到期而回收。
+
+Global 确认收到失败证据后，Host 才按重放窗口回收失败回执。
+该确认不解除 Global 的 UNKNOWN 隔离。
+Host 为 drain 和 Close/activate 保留容量，Global 为 Close 保留事务容量。
+初始化必须等待同设备已接受的排队请求，不能越过执行队列占用设备。
+动态加载或重载前，调用方必须暂停同设备的新请求，并等待已接受的请求完成。
+初始化只在设备空闲时取得许可。忙时重试不会取得队列位置，也不保证持续流量下能在期限内加载。
+模型完成创建后，调用方才可恢复提交业务请求。
+
+同一生命周期组通过 `bind_registration_group()` 原子发布全部成员。
+独立模型使用独立的 `lifecycle_group`。多个 Host 支持并发 Close。
+同一节点脱离 serving executor 后，各绑定串行使用临时 executor。
+`max_registered_targets` 包含预配置目标和待回收目录项。
+生命周期组统一使用 `MAX_RUNTIME_GROUP_MEMBERS` 上限。
+
 组合层通过 Global 的 `shutdown_pending()` 核对退出状态。
 本地 Close 返回或本地 ACK 标记都不能单独证明 Global 已确认。
+Close 已释放资源但仍返回清理诊断时，Host 在终态回执中提供 `close_complete=true`。
+Global 保留诊断，并在 ACK 屏障后退役；只有错误终态而没有释放证据时，不允许退役。
 在确认前，必须保留 Host 传输和 executor。
-确认后停止 Host executor，再销毁传输和节点。
+确认后，在所属执行器的安全边界回收传输，或停止执行器再销毁节点。
 
-并发 Close、共享生命周期组、ACK 丢响应恢复和动态退役尚未交付。
+并发 Close、共享生命周期组、ACK 丢响应恢复和动态退役已接入公共基础设施。
+Global 收到最后一个注销后，继续提供 5 s 的响应重放窗口。
+
 清理未知时必须保留所有者，不能重新绑定同一 Handle 来绕过隔离。
 非法 `boot_id` 会在绑定前被拒绝，同一 Handle 仍支持修正参数后重试。
 ROS 实体全部创建成功后才绑定 Handle。
@@ -1428,3 +1524,62 @@ operation ID 沿用控制协议的标识符语法，最长 127 个字符。
 v2 profile 的身份必须匹配 deployment、组合、资源、设备、模式、
 执行类型、硬件指纹、运行时版本和观测输入声明。
 旧 policy profile 不能复用。转换和采样产物只放在 `models/_work/`。
+
+### Managed creation and retirement boundaries
+
+Managed Torch CUDA/NPU callers must set `runtime_options["torch_device_index"]`
+to an integer in 0..127. The same option is consumed by target compilation,
+initialization admission and the Torch Session loader. Loading, execution and
+cleanup use the selected device context; the adapter checks the loaded Session's
+actual index against the admitted target. Missing indices remain rejected for
+managed accelerators; direct callers without this option keep SDK-current-device
+behavior. Device visibility and enumeration constraints still apply.
+
+A process freezes its scheduling policy when it first enters runtime creation,
+including local and explicit-host creation. Failed configuration does not change
+the last accepted settings. Publication shares the startup deadline and stop signal.
+
+Resource drain proves completion of old work, not Reset of every model. Recovery
+can finish while a peer remains reset-required; that peer stays unavailable until
+its own Reset succeeds. Close never resets another lifecycle group's model.
+Only configured required targets impose resource-wide business readiness.
+A clean dynamic peer may still need its own Reset without blocking healthy peers.
+Reset registration refresh requires readiness of its own lifecycle group, not the
+whole device. A completed Reset remains completed if registration or its final ACK
+fails; retry settles the same receipt. A cancelled recovery-lock waiter cannot
+change the active owner's outcome.
+
+Ordinary scheduled model and stream Reset retain their submission across public
+call retries until terminal confirmation and registration refresh succeed. A retry
+only waits for that original operation; it does not renew its execution deadline
+or clear state produced since its completion. Confirmed late Reset completion also
+remains successful lifecycle evidence. A delivered Reset permits the next distinct
+Reset, while successful stream/host Close releases abandoned Reset waiters.
+
+While a resource is fenced, an expired clean heartbeat cannot remove a registered
+participant or replace its boot. Recovery or acknowledged retirement must prove
+that the old owner no longer holds device work.
+
+Local construction failures release the explicit node's record once factory
+validation proves non-start, or all handles are closed with no pending cleanup
+owners. Incomplete cleanup remains retained. `retry_pending_stream_closes()` only
+retries Close intent or undelivered Opens whose original delivery deadline expired;
+an Open still inside that bounded window remains available for normal delivery.
+
+The public Global spin loop collects retired clients between `spin_once` calls.
+Embedders driving `GlobalRuntimeEndpoint` with their own executor must call
+`collect_retired_clients(executor)` on the sole spin thread at that same boundary,
+or retain clients until executor shutdown. Collection waits for worker response
+acquisition; transport capacity remains bounded while collection is pending.
+
+显式 `runtime_creation(node=..., targets=...)` 在 Close 确认后移除构造记录。
+`run_model_node()` 在两次 `spin_once()` 之间回收退役传输。
+公共 runner 默认使用 2 个执行器线程，包括首次 spin 后才加载模型的宿主。
+默认业务回调组串行执行同步请求。`HostRequests.request(context)` 不允许同一 context 同时进入多个作用域；
+重复登记在进入业务代码前报错，原作用域继续参与取消与排空。
+显式宿主从 `runtime_scheduler_enabled` 读取开关，缺省为 false；`targets` 只描述放置，不启用调度。
+
+如果使用自定义执行器，必须保留处理控制响应的空闲线程。
+自定义 spin 循环必须在同一间隙调用 `collect_node_runtime_transport(node, executor)`。
+裸 `executor.spin()` 不提供运行期间的实体回收边界。
+需要独立控制线程的库调用方使用 `RuntimeEnvironment`。

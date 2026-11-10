@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import stat
 import tempfile
 import time
 from pathlib import Path
@@ -35,9 +36,18 @@ class RuntimeProfileRegistry:
     def __init__(self, target, *, min_samples=DEFAULT_MIN_SAMPLES, max_age_days=30, now=time.time):
         validate_profile_options(min_samples, max_age_days)
         path = Path(target.profile_path)
-        if path.stat().st_size > MAX_PROFILE_BYTES:
+        # O_NONBLOCK also protects the open against a path replaced by a FIFO.
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("runtime profile must be a regular file")
+            if info.st_size > MAX_PROFILE_BYTES:
+                raise ValueError("runtime profile exceeds size limit")
+            payload = source.read(MAX_PROFILE_BYTES + 1)
+        if len(payload) > MAX_PROFILE_BYTES:
             raise ValueError("runtime profile exceeds size limit")
-        document = json.loads(path.read_text())
+        document = json.loads(payload)
         if set(document) != {"schema_version", "scope", "identity", "measured_at", "buckets"}:
             raise ValueError("invalid runtime profile fields")
         if document["schema_version"] != 2 or document["scope"] != "runtime_execution":
@@ -99,9 +109,12 @@ class RuntimeProfileRegistry:
             },
         }
 
-    def estimate(self, submission):
+    def check_freshness(self):
         if not 0 <= self._now() - self._measured_at <= self._max_age_seconds:
             raise ControlError("PROFILE_EXPIRED")
+
+    def estimate(self, submission):
+        self.check_freshness()
         value = self.estimates.get((submission.work, submission.input_bucket))
         if value is None:
             raise ControlError("PROFILE_INPUT_OUT_OF_RANGE")

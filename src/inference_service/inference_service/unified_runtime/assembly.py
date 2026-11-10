@@ -256,6 +256,7 @@ class RuntimeProviders:
 
     acl_runtime_provider: object
     resource_admission_provider: object
+    runtime_environment: object | None = None
     _state: _RuntimeProviderState = field(default_factory=_RuntimeProviderState, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -263,9 +264,15 @@ class RuntimeProviders:
             raise TypeError("acl_runtime_provider must be explicitly supplied")
         if self.resource_admission_provider is None:
             raise TypeError("resource_admission_provider must be explicitly supplied")
+        if self.runtime_environment is None:
+            from inference_service.scheduler.runtime_environment import RuntimeEnvironment
+
+            # The two-provider injection path has the same process owner as
+            # the default composition. No ROS entities exist until discovery.
+            object.__setattr__(self, "runtime_environment", RuntimeEnvironment())
         seen = set()
         for provider in self.process_resources:
-            if provider is not None and id(provider) not in seen:
+            if provider is not None and provider is not self.runtime_environment and id(provider) not in seen:
                 seen.add(id(provider))
                 self._state.cleanup.defer(self._close_provider, provider)
 
@@ -277,15 +284,17 @@ class RuntimeProviders:
             self._state.cleanup.defer(owner.close)
 
     @classmethod
-    def create(cls, acl_runtime_provider: object, resource_admission_provider: object) -> RuntimeProviders:
+    def create(
+        cls, acl_runtime_provider: object, resource_admission_provider: object, *, runtime_environment=None
+    ) -> RuntimeProviders:
         """Construct the process-level dependency value at the composition root."""
 
-        return cls(acl_runtime_provider, resource_admission_provider)
+        return cls(acl_runtime_provider, resource_admission_provider, runtime_environment)
 
     @property
     def process_resources(self) -> tuple[object, ...]:
         """The process-owned resources shared by cleanup and handle filtering."""
-        return self.acl_runtime_provider, self.resource_admission_provider
+        return self.acl_runtime_provider, self.resource_admission_provider, self.runtime_environment
 
     @property
     def closed(self) -> bool:
@@ -308,19 +317,23 @@ class RuntimeProviders:
         process-level runtime is finalized.
         """
 
-        with lifecycle_lock(self._state.lock):
-            if self._state.closed:
-                return
-            try:
+        try:
+            # Constructors may retain cleanup while environment shutdown waits
+            # for them. Neither the state nor rollback lock may enclose that wait.
+            if self.runtime_environment is not None:
+                self.runtime_environment.close()
+            with lifecycle_lock(self._state.lock):
+                if self._state.closed:
+                    return
                 self._state.cleanup.close()
-            except Exception as exc:
-                raise ExecutionFailureFactory().from_exception(
-                    exc,
-                    code="provider_shutdown_failed",
-                    message=f"runtime provider shutdown failed: {exc}",
-                    details={"close_pending": True},
-                ) from exc
-            self._state.closed = True
+                self._state.closed = True
+        except Exception as exc:
+            raise ExecutionFailureFactory().from_exception(
+                exc,
+                code="provider_shutdown_failed",
+                message=f"runtime provider shutdown failed: {exc}",
+                details={"close_pending": True},
+            ) from exc
 
     shutdown = close
 

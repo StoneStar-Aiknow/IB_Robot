@@ -1063,34 +1063,52 @@ class SessionBuilderRegistry:
         return self._builders.get(selected_key)
 
     def create(self, key_or_context: SessionBuilderKey | object, *args: object, **kwargs: object) -> object:
-        override = kwargs.pop("override", None)
-        builder_options = kwargs.pop("builder_options", None)
-        if builder_options:
-            kwargs.update(dict(builder_options))
-        if isinstance(key_or_context, SessionBuilderKey):
-            key = key_or_context
-            context = kwargs.pop("context", None)
-        else:
-            context = key_or_context
-            key = SessionBuilderKey.from_context(context)
-        builder = override or self._builders.get(key)
-        if builder is None:
-            raise RuntimeRegistryError(
-                f"session builder {key!r} is unavailable",
-                code="session_builder_unavailable",
-            )
-        if context is None:
-            return builder(*args, **kwargs)
-        try:
-            signature = inspect.signature(builder)
-        except (TypeError, ValueError):
-            return builder(context, *args, **kwargs)
-        accepts_kwargs = any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
-        )
-        if not accepts_kwargs:
-            kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
-        return builder(context, *args, **kwargs)
+        from contextlib import nullcontext
+
+        from .construction import current_runtime_construction
+
+        construction = current_runtime_construction()
+        with construction.validation() if construction is not None else nullcontext():
+            override = kwargs.pop("override", None)
+            builder_options = kwargs.pop("builder_options", None)
+            if builder_options:
+                kwargs.update(dict(builder_options))
+            if isinstance(key_or_context, SessionBuilderKey):
+                key = key_or_context
+                context = kwargs.pop("context", None)
+            else:
+                context = key_or_context
+                key = SessionBuilderKey.from_context(context)
+            builder = override or self._builders.get(key)
+            if builder is None:
+                raise RuntimeRegistryError(
+                    f"session builder {key!r} is unavailable",
+                    code="session_builder_unavailable",
+                )
+            if construction is not None:
+                construction.validate_context(context)
+            # Builders create unloaded Session descriptors. Native acquisition
+            # belongs in Session.load, where an owner already exists for rollback.
+            # Argument binding and constructor validation therefore remain inside
+            # the non-acquisition boundary, including constructors that raise.
+            call_args = args if context is None else (context, *args)
+            try:
+                signature = inspect.signature(builder)
+            except (TypeError, ValueError):
+                pass
+            else:
+                accepts_kwargs = any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()
+                )
+                if context is not None and not accepts_kwargs:
+                    kwargs = {name: value for name, value in kwargs.items() if name in signature.parameters}
+                signature.bind(*call_args, **kwargs)
+            session = builder(*call_args, **kwargs)
+            if session is None:
+                raise RuntimeRegistryError("session builder must return an unloaded Session", code="invalid_session")
+        if construction is not None:
+            construction.begin_acquisition()
+        return session
 
     def freeze(self) -> SessionBuilderRegistry:
         self._frozen = True

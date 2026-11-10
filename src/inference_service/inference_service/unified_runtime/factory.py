@@ -1189,21 +1189,35 @@ class ModelRuntimeFactory:
         still capped by any enclosing lifecycle deadline. Providers retain the
         Handle if cleanup remains pending; native calls are not preempted.
         """
+        from .construction import current_runtime_construction
+
+        construction = current_runtime_construction()
         handle = None
         try:
-            with lifecycle_budget(timeout) if timeout is not None else nullcontext():
-                check_startup()
-                handle = ModelRuntimeFactory.create_session(
+            with construction.validation() if construction is not None else nullcontext():
+                # Binding fails before create_session can enter its own
+                # validation scope. It must still prove no acquisition began.
+                inspect.signature(ModelRuntimeFactory.create_session).bind(
                     validated, registry_set=registry_set, providers=providers, **assembly_options
                 )
-                handle.load()
+                with lifecycle_budget(timeout) if timeout is not None else nullcontext():
+                    check_startup()
+                    handle = ModelRuntimeFactory.create_session(
+                        validated, registry_set=registry_set, providers=providers, **assembly_options
+                    )
+                    handle.load()
         except BaseException:
             if handle is not None:
                 # Finish ordinary rollback, including the instance lease, now.
                 # A pending native owner still belongs to process shutdown.
                 with suppress(BaseException), lifecycle_budget(_FAILED_LOAD_CLEANUP_TIMEOUT_SECONDS):
                     handle.close()
-                if not handle.closed:
+                if not handle.closed and (
+                    construction is None or (construction.retain is None and construction.retire is None)
+                ):
+                    # Provider- and explicit-node-owned constructions already
+                    # retain this Handle. A second callback would keep it alive
+                    # after their successful rollback and retirement.
                     providers.retain_cleanup(handle)
             raise
         return handle
@@ -1217,6 +1231,7 @@ class ModelRuntimeFactory:
         runtime_options=None,
         execution_contract=None,
         role_execution=False,
+        streaming_execution=False,
         role=None,
         runtime_id=None,
         allowed_deployments=None,
@@ -1231,41 +1246,50 @@ class ModelRuntimeFactory:
         """
         from inference_service.backends.types import RuntimeContext
 
-        if registry_set is None or not isinstance(providers, RuntimeProviders):
-            raise RuntimeFactoryError("explicit registries and RuntimeProviders are required")
-        profile = getattr(validated, "runtime_profile", None)
-        if profile is None:
-            raise RuntimeFactoryError(
-                "composite deployments require ModelRuntimeFactory.create and a composite descriptor",
-                code="composite_session_unsupported",
+        from .construction import current_runtime_construction
+
+        construction = current_runtime_construction()
+        acquisition_start = construction.acquisition_count if construction is not None else 0
+        with construction.validation() if construction is not None else nullcontext():
+            if registry_set is None or not isinstance(providers, RuntimeProviders):
+                raise RuntimeFactoryError("explicit registries and RuntimeProviders are required")
+            profile = getattr(validated, "runtime_profile", None)
+            if profile is None:
+                raise RuntimeFactoryError(
+                    "composite deployments require ModelRuntimeFactory.create and a composite descriptor",
+                    code="composite_session_unsupported",
+                )
+            context = RuntimeContext(
+                validated_manifest=validated, runtime_options=runtime_options or {}, runtime_profile=profile, role=role
             )
-        context = RuntimeContext(
-            validated_manifest=validated, runtime_options=runtime_options or {}, runtime_profile=profile, role=role
-        )
-        contract = validated.deployment.execution_contract
-        if execution_contract is not None and _contract_name(execution_contract) != _contract_name(contract):
-            raise RuntimeFactoryError(
-                "session execution contract must match the validated deployment", code="execution_contract_mismatch"
-            )
-        if role_execution and getattr(validated.deployment, "device_links", ()):
-            # One public role call cannot own a producer/consumer transaction.
-            # Shared device buffers otherwise carry data across requests.
-            raise RuntimeFactoryError(
-                "public role execution does not support deployment device links",
-                code="role_device_links_unsupported",
-            )
-        if contract.execution_structure == "iterative" and contract.orchestration_visibility == "executor":
-            raise RuntimeFactoryError(
-                "executor-orchestrated iteration requires ModelRuntimeFactory.create and an iterative assembler",
-                code="executor_orchestration_required",
-            )
-        execution_roles = getattr(validated.deployment, "execution", ())
-        if role_execution and not execution_roles:
-            raise RuntimeFactoryError(
-                "public role execution requires non-empty deployment execution roles", code="role_execution_missing"
-            )
-        backend_registry = backend_registry if backend_registry is not None else registry_set.backend_registry
-        backend_registry.validate(context, allowed_deployments=allowed_deployments)
+            if construction is not None:
+                construction.validate_context(
+                    context, session_execution="role" if role_execution else "stream" if streaming_execution else "full"
+                )
+            contract = validated.deployment.execution_contract
+            if execution_contract is not None and _contract_name(execution_contract) != _contract_name(contract):
+                raise RuntimeFactoryError(
+                    "session execution contract must match the validated deployment", code="execution_contract_mismatch"
+                )
+            if role_execution and getattr(validated.deployment, "device_links", ()):
+                # One public role call cannot own a producer/consumer transaction.
+                # Shared device buffers otherwise carry data across requests.
+                raise RuntimeFactoryError(
+                    "public role execution does not support deployment device links",
+                    code="role_device_links_unsupported",
+                )
+            if contract.execution_structure == "iterative" and contract.orchestration_visibility == "executor":
+                raise RuntimeFactoryError(
+                    "executor-orchestrated iteration requires ModelRuntimeFactory.create and an iterative assembler",
+                    code="executor_orchestration_required",
+                )
+            execution_roles = getattr(validated.deployment, "execution", ())
+            if role_execution and not execution_roles:
+                raise RuntimeFactoryError(
+                    "public role execution requires non-empty deployment execution roles", code="role_execution_missing"
+                )
+            backend_registry = backend_registry if backend_registry is not None else registry_set.backend_registry
+            backend_registry.validate(context, allowed_deployments=allowed_deployments)
         session = registry_set.session_builder_registry.create(
             context,
             allowed_deployments=allowed_deployments,
@@ -1278,8 +1302,19 @@ class ModelRuntimeFactory:
         try:
             if role_execution and not callable(getattr(session, "execute_role", None)):
                 raise RuntimeFactoryError("session does not provide role execution", code="role_execution_unsupported")
-            streaming = role_execution and bool(session.capabilities.stateful)
-            if streaming and contract.state_bank_mode != "runtime_exclusive":
+            if streaming_execution and role_execution:
+                raise RuntimeFactoryError("choose Session streaming or role streaming, not both")
+            if streaming_execution and (
+                contract.state_scope != "stream"
+                or not session.capabilities.stateful
+                or any(
+                    not callable(getattr(session, name, None))
+                    for name in ("open_stream", "step", "reset_stream", "close_stream")
+                )
+            ):
+                raise RuntimeFactoryError("streaming requires a stateful Session and stream deployment contract")
+            streaming = streaming_execution or (role_execution and bool(session.capabilities.stateful))
+            if role_execution and streaming and contract.state_bank_mode != "runtime_exclusive":
                 raise RuntimeFactoryError("role streams require a runtime_exclusive state bank")
             executor_type = SessionRoleStream if streaming else SessionRoleExecutor
             executor = executor_type(session, execution_roles) if role_execution else session
@@ -1316,8 +1351,12 @@ class ModelRuntimeFactory:
             rollback = LoadRollback()
             rollback.defer(session.close)
             if rollback.rollback():
+                if construction is not None:
+                    construction.cleanup_owners.append(rollback)
                 providers.retain_cleanup(rollback)
                 error.cleanup_owner = rollback
+            elif construction is not None:
+                construction.prove_cleanup(error, since=acquisition_start)
             raise
 
     @staticmethod
@@ -1326,34 +1365,41 @@ class ModelRuntimeFactory:
         registry_set: RegistrySet,
         providers: RuntimeProviders,
     ) -> ModelRuntimeHandle:
-        if registry_set is None:
-            raise RuntimeFactoryError("RegistrySet must be explicitly supplied", code="registry_set_required")
-        if providers is None:
-            raise RuntimeFactoryError("RuntimeProviders must be explicitly supplied", code="runtime_providers_required")
-        if not isinstance(registry_set, RegistrySet):
-            raise RuntimeFactoryError(
-                "registry_set must be a RegistrySet value",
-                code="registry_set_invalid",
-            )
-        if not isinstance(providers, RuntimeProviders):
-            raise RuntimeFactoryError(
-                "providers must be a RuntimeProviders value",
-                code="runtime_providers_invalid",
-            )
+        from .construction import current_runtime_construction
 
-        snapshot = _find_snapshot(spec)
-        deployment = _selected_deployment(spec, snapshot)
-        identity = _top_level_identity(spec, snapshot, deployment)
-        contract = _execution_contract(spec, deployment, snapshot)
-        contract_name = _contract_name(contract)
-        visibility = _visibility(contract, contract_name)
-        role_identities = dict(_role_identities(spec, snapshot, deployment))
-        role_specs = dict(_runtime_specs(spec, snapshot, deployment))
-        composite = bool(role_identities or role_specs)
-        bindings, artifact_handles = _artifact_data(snapshot, deployment)
+        construction = current_runtime_construction()
+        acquisition_start = construction.acquisition_count if construction is not None else 0
+        with construction.validation() if construction is not None else nullcontext():
+            if registry_set is None:
+                raise RuntimeFactoryError("RegistrySet must be explicitly supplied", code="registry_set_required")
+            if providers is None:
+                raise RuntimeFactoryError(
+                    "RuntimeProviders must be explicitly supplied", code="runtime_providers_required"
+                )
+            if not isinstance(registry_set, RegistrySet):
+                raise RuntimeFactoryError(
+                    "registry_set must be a RegistrySet value",
+                    code="registry_set_invalid",
+                )
+            if not isinstance(providers, RuntimeProviders):
+                raise RuntimeFactoryError(
+                    "providers must be a RuntimeProviders value",
+                    code="runtime_providers_invalid",
+                )
 
-        session_registry = _registry_value(registry_set, "session_builder_registry")
-        assembler_registry = _registry_value(registry_set, "runtime_assembler_registry")
+            snapshot = _find_snapshot(spec)
+            deployment = _selected_deployment(spec, snapshot)
+            identity = _top_level_identity(spec, snapshot, deployment)
+            contract = _execution_contract(spec, deployment, snapshot)
+            contract_name = _contract_name(contract)
+            visibility = _visibility(contract, contract_name)
+            role_identities = dict(_role_identities(spec, snapshot, deployment))
+            role_specs = dict(_runtime_specs(spec, snapshot, deployment))
+            composite = bool(role_identities or role_specs)
+            bindings, artifact_handles = _artifact_data(snapshot, deployment)
+
+            session_registry = _registry_value(registry_set, "session_builder_registry")
+            assembler_registry = _registry_value(registry_set, "runtime_assembler_registry")
         rollback_entries: list[OwnedComponent] = []
 
         try:
@@ -1655,16 +1701,21 @@ class ModelRuntimeFactory:
                 rollback.defer(_release, entry)
             rollback_errors = rollback.rollback()
             if rollback_errors:
+                if construction is not None:
+                    construction.cleanup_owners.append(rollback)
                 providers.retain_cleanup(rollback)
             details = {"exception_type": type(exc).__name__, **dict(getattr(exc, "details", {}))}
             if rollback_errors:
                 details["rollback_errors"] = tuple(str(error) for error in rollback_errors)
-            raise RuntimeFactoryError(
+            error = RuntimeFactoryError(
                 str(exc) if isinstance(exc, RuntimeRegistryError) else f"runtime construction failed: {exc}",
                 code=exc.code if isinstance(exc, RuntimeRegistryError) else "runtime_factory_failed",
                 details=details,
                 cleanup_owner=rollback if rollback_errors else None,
-            ) from exc
+            )
+            if not rollback_errors and construction is not None:
+                construction.prove_cleanup(error, since=acquisition_start)
+            raise error from exc
 
     build = create
     create_runtime = create

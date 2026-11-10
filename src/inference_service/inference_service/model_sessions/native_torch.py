@@ -83,7 +83,9 @@ class NativeTorchResource:
         current = load_inference_manifest(self.spec.bundle_root, self.spec.deployment_name)
         if current.fingerprint != self.spec.fingerprint:
             raise ValueError("native deployment changed after validation")
-        self._device = resolve_torch_device(torch, self._device_name)
+        self._device = resolve_torch_device(
+            torch, self._device_name, torch_device_index=context.runtime_options.get("torch_device_index")
+        )
         self._torch = torch
         try:
             with torch_device_scope(torch, self._device_name, self._device):

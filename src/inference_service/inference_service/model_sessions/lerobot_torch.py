@@ -26,6 +26,7 @@ from inference_service.model_sessions.torch_completion import (
     drain_torch_device,
     drain_torch_device_before_release,
     resolve_torch_device,
+    torch_device_scope,
     torch_execution_scope,
 )
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
@@ -82,6 +83,7 @@ class LeRobotTorchModelSession(ModelSession):
         self._last_metadata: dict[str, object] = {}
         self._attention_collector = None
         self._release_drain_failures = 0
+        self._managed_execution = False
 
     @property
     def policy(self) -> Any | None:
@@ -172,7 +174,9 @@ class LeRobotTorchModelSession(ModelSession):
             torch_npu_module = self._import_required("torch_npu", "torch_npu")
             self._validate_npu(torch_module)
         try:
-            device = resolve_torch_device(torch_module, profile.device)
+            device = resolve_torch_device(
+                torch_module, profile.device, torch_device_index=context.runtime_options.get("torch_device_index")
+            )
         except Exception as exc:
             raise BackendLoadError(
                 f"cannot construct Torch device {profile.device!r}: {exc}", code="invalid_device"
@@ -180,151 +184,157 @@ class LeRobotTorchModelSession(ModelSession):
         if profile.device == "npu":
             device_name = self._npu_device_name(torch_module, device.index)
 
-        config_type = self._import_attribute(
-            "lerobot.configs.policies", "PreTrainedConfig", "LeRobot policy configuration"
-        )
-        factory = self._import_required("lerobot.policies.factory", "LeRobot policy factory")
-        get_policy_class = self._require_attribute(factory, "get_policy_class", "LeRobot policy factory")
-        make_processors = self._require_attribute(factory, "make_pre_post_processors", "LeRobot processor factory")
-        bundle_path = str(context.validated_manifest.bundle_root)
-        policy_config = config_type.from_pretrained(bundle_path, local_files_only=True)
-        provider_module = self._import_required("torch_models.policy_provider", "torch_models policy provider")
-        resolve_provider = self._require_attribute(
-            provider_module,
-            "resolve_policy_provider",
-            "torch_models policy provider",
-        )
-        try:
-            provider = resolve_provider(context.model_type, context.backend, profile.device)
-        except (AttributeError, ImportError, ValueError) as exc:
-            raise BackendLoadError(
-                f"unable to resolve Torch policy provider for {context.model_type}/{context.backend}/{profile.device}: {exc}",
-                code="unsupported_policy_provider",
-            ) from exc
-        if provider is not None:
-            try:
-                provider_options = self._provider_load_options(
-                    provider, policy_config, context.validated_manifest.deployment.extra_parameters
-                )
-                policy_config = provider.configure_config(policy_config, model_dtype=model_dtype)
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise BackendLoadError(
-                    f"unable to configure repository-owned Torch policy: {exc}",
-                    code="incompatible_policy_config",
-                ) from exc
-        else:
-            provider_options = self._provider_load_options(
-                None, policy_config, context.validated_manifest.deployment.extra_parameters
-            )
-        try:
-            policy_config.device = str(device)
-        except (AttributeError, TypeError) as exc:
-            raise BackendLoadError(
-                "LeRobot policy config does not permit runtime device placement", code="incompatible_policy_config"
-            ) from exc
-        # Avoid network access during policy construction. The strict checkpoint load
-        # restores the bundled backbone parameters from the local model artifacts.
-        try:
-            if getattr(policy_config, "pretrained_backbone_weights", None) is not None:
-                policy_config.pretrained_backbone_weights = None
-        except (AttributeError, TypeError) as exc:
-            raise BackendLoadError(
-                "LeRobot policy config does not permit the backbone weights override",
-                code="incompatible_policy_config",
-            ) from exc
-        try:
-            local_vlm_path = resolve_local_semantic_reference(
-                context.validated_manifest.bundle_root, "config.json", VLM_REFERENCE_KEYS
-            )
-            tokenizer_path = resolve_local_semantic_reference(
-                context.validated_manifest.bundle_root, "policy_preprocessor.json", TOKENIZER_REFERENCE_KEYS
-            )
-        except ValueError as exc:
-            raise BackendLoadError(str(exc), code="invalid_policy_assets") from exc
-        if provider is not None:
-            try:
-                provider.validate(
-                    config=policy_config,
-                    bundle_root=context.validated_manifest.bundle_root,
-                    tokenizer_path=tokenizer_path,
-                    device_name=device_name,
-                )
-            except (AttributeError, TypeError, ValueError) as exc:
-                raise BackendLoadError(
-                    f"repository-owned Torch policy validation failed: {exc}", code="invalid_deployment"
-                ) from exc
-        if local_vlm_path is not None:
-            policy_config.vlm_model_name = local_vlm_path
-        policy_class = provider.policy_class if provider is not None else get_policy_class(context.model_type)
-        policy_load_options = {
-            "config": policy_config,
-            "local_files_only": True,
-            "strict": True,
-        }
-        if provider is not None:
-            policy_load_options.update(provider.load_options)
-            policy_load_options.update(provider_options)
+        self._managed_execution = context.managed_execution
         self._torch = torch_module
         self._device = device
-        self._policy_config = policy_config
-        self._policy_provider = provider
         rollback.defer(self._release)
-        self._policy = policy = policy_class.from_pretrained(
-            bundle_path,
-            **policy_load_options,
-        )
-        if context.runtime_options.get("auto_horizon_enabled", False) and context.model_type != "pi05":
-            raise BackendLoadError(
-                "AutoHorizon currently supports native Torch PI0.5 policies only",
-                code="unsupported_auto_horizon_policy",
+        with torch_device_scope(torch_module, self._configured_device_name, device):
+            config_type = self._import_attribute(
+                "lerobot.configs.policies", "PreTrainedConfig", "LeRobot policy configuration"
             )
-
-        moved = policy.to(device)
-        if moved is not None:
-            self._policy = policy = moved
-        self._cast_model(policy, model_dtype)
-        if provider is not None:
+            factory = self._import_required("lerobot.policies.factory", "LeRobot policy factory")
+            get_policy_class = self._require_attribute(factory, "get_policy_class", "LeRobot policy factory")
+            make_processors = self._require_attribute(factory, "make_pre_post_processors", "LeRobot processor factory")
+            bundle_path = str(context.validated_manifest.bundle_root)
+            policy_config = config_type.from_pretrained(bundle_path, local_files_only=True)
+            provider_module = self._import_required("torch_models.policy_provider", "torch_models policy provider")
+            resolve_provider = self._require_attribute(
+                provider_module,
+                "resolve_policy_provider",
+                "torch_models policy provider",
+            )
             try:
-                provider.prepare(
-                    policy=policy,
-                    deployment_fingerprint=context.deployment_fingerprint,
-                    torch_module=torch_module,
-                    torch_npu_module=torch_npu_module,
-                    device_name=device_name,
-                )
-            except (AttributeError, ImportError, RuntimeError, TypeError, ValueError) as exc:
+                provider = resolve_provider(context.model_type, context.backend, profile.device)
+            except (AttributeError, ImportError, ValueError) as exc:
                 raise BackendLoadError(
-                    f"repository-owned Torch policy setup failed: {exc}",
-                    code="incompatible_policy_runtime",
+                    f"unable to resolve Torch policy provider for {context.model_type}/{context.backend}/{profile.device}: {exc}",
+                    code="unsupported_policy_provider",
                 ) from exc
-        evaluated = policy.eval()
-        if evaluated is not None:
-            self._policy = policy = evaluated
-        try:
-            self._attention_collector = build_action_attention_collector(policy, context.runtime_options)
-        except (TypeError, ValueError) as exc:
-            raise BackendLoadError(f"unable to enable AutoHorizon: {exc}", code="auto_horizon_setup_failed") from exc
-        preprocessor_overrides: dict[str, dict[str, object]] = {"device_processor": {"device": str(device)}}
-        if tokenizer_path is not None:
-            preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_path}
-        self._preprocessor, self._postprocessor = make_processors(
-            policy_cfg=policy_config,
-            pretrained_path=bundle_path,
-            preprocessor_overrides=preprocessor_overrides,
-            postprocessor_overrides={"device_processor": {"device": str(device)}},
-        )
-        configure_processors = getattr(provider, "configure_processors", None)
-        if configure_processors is not None:
-            configure_processors(
-                preprocessor=self._preprocessor, postprocessor=self._postprocessor, config=policy_config
+            if provider is not None:
+                try:
+                    provider_options = self._provider_load_options(
+                        provider, policy_config, context.validated_manifest.deployment.extra_parameters
+                    )
+                    policy_config = provider.configure_config(policy_config, model_dtype=model_dtype)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise BackendLoadError(
+                        f"unable to configure repository-owned Torch policy: {exc}",
+                        code="incompatible_policy_config",
+                    ) from exc
+            else:
+                provider_options = self._provider_load_options(
+                    None, policy_config, context.validated_manifest.deployment.extra_parameters
+                )
+            try:
+                policy_config.device = str(device)
+            except (AttributeError, TypeError) as exc:
+                raise BackendLoadError(
+                    "LeRobot policy config does not permit runtime device placement", code="incompatible_policy_config"
+                ) from exc
+            # Avoid network access during policy construction. The strict checkpoint load
+            # restores the bundled backbone parameters from the local model artifacts.
+            try:
+                if getattr(policy_config, "pretrained_backbone_weights", None) is not None:
+                    policy_config.pretrained_backbone_weights = None
+            except (AttributeError, TypeError) as exc:
+                raise BackendLoadError(
+                    "LeRobot policy config does not permit the backbone weights override",
+                    code="incompatible_policy_config",
+                ) from exc
+            try:
+                local_vlm_path = resolve_local_semantic_reference(
+                    context.validated_manifest.bundle_root, "config.json", VLM_REFERENCE_KEYS
+                )
+                tokenizer_path = resolve_local_semantic_reference(
+                    context.validated_manifest.bundle_root, "policy_preprocessor.json", TOKENIZER_REFERENCE_KEYS
+                )
+            except ValueError as exc:
+                raise BackendLoadError(str(exc), code="invalid_policy_assets") from exc
+            if provider is not None:
+                try:
+                    provider.validate(
+                        config=policy_config,
+                        bundle_root=context.validated_manifest.bundle_root,
+                        tokenizer_path=tokenizer_path,
+                        device_name=device_name,
+                    )
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise BackendLoadError(
+                        f"repository-owned Torch policy validation failed: {exc}", code="invalid_deployment"
+                    ) from exc
+            if local_vlm_path is not None:
+                policy_config.vlm_model_name = local_vlm_path
+            policy_class = provider.policy_class if provider is not None else get_policy_class(context.model_type)
+            policy_load_options = {
+                "config": policy_config,
+                "local_files_only": True,
+                "strict": True,
+            }
+            if provider is not None:
+                policy_load_options.update(provider.load_options)
+                policy_load_options.update(provider_options)
+            self._policy_config = policy_config
+            self._policy_provider = provider
+            self._policy = policy = policy_class.from_pretrained(
+                bundle_path,
+                **policy_load_options,
             )
-        self._model_dtype = model_dtype
-        resettable = callable(getattr(policy, "reset", None))
-        self._update_loaded_capabilities(
-            resettable=resettable,
-            stateful=resettable,
-            supports_attention=self.observes_attention(policy),
-        )
+            if context.runtime_options.get("auto_horizon_enabled", False) and context.model_type != "pi05":
+                raise BackendLoadError(
+                    "AutoHorizon currently supports native Torch PI0.5 policies only",
+                    code="unsupported_auto_horizon_policy",
+                )
+
+            moved = policy.to(device)
+            if moved is not None:
+                self._policy = policy = moved
+            self._cast_model(policy, model_dtype)
+            if provider is not None:
+                try:
+                    provider.prepare(
+                        policy=policy,
+                        deployment_fingerprint=context.deployment_fingerprint,
+                        torch_module=torch_module,
+                        torch_npu_module=torch_npu_module,
+                        device_name=device_name,
+                    )
+                except (AttributeError, ImportError, RuntimeError, TypeError, ValueError) as exc:
+                    raise BackendLoadError(
+                        f"repository-owned Torch policy setup failed: {exc}",
+                        code="incompatible_policy_runtime",
+                    ) from exc
+            evaluated = policy.eval()
+            if evaluated is not None:
+                self._policy = policy = evaluated
+            try:
+                self._attention_collector = build_action_attention_collector(policy, context.runtime_options)
+            except (TypeError, ValueError) as exc:
+                raise BackendLoadError(
+                    f"unable to enable AutoHorizon: {exc}", code="auto_horizon_setup_failed"
+                ) from exc
+            preprocessor_overrides: dict[str, dict[str, object]] = {"device_processor": {"device": str(device)}}
+            if tokenizer_path is not None:
+                preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_path}
+            self._preprocessor, self._postprocessor = make_processors(
+                policy_cfg=policy_config,
+                pretrained_path=bundle_path,
+                preprocessor_overrides=preprocessor_overrides,
+                postprocessor_overrides={"device_processor": {"device": str(device)}},
+            )
+            configure_processors = getattr(provider, "configure_processors", None)
+            if configure_processors is not None:
+                configure_processors(
+                    preprocessor=self._preprocessor, postprocessor=self._postprocessor, config=policy_config
+                )
+            self._model_dtype = model_dtype
+            resettable = callable(getattr(policy, "reset", None))
+            self._update_loaded_capabilities(
+                resettable=resettable,
+                stateful=resettable,
+                supports_attention=self.observes_attention(policy),
+            )
+            if context.managed_execution:
+                self.drain_uncertain_operations()
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
         with torch_execution_scope(
@@ -441,6 +451,10 @@ class LeRobotTorchModelSession(ModelSession):
             if callable(processor_reset):
                 processor_reset()
 
+    def drain_uncertain_operations(self):
+        if self._torch is not None:
+            drain_torch_device(self._torch, self._configured_device_name, self._device)
+
     def _close(self) -> None:
         self._release()
 
@@ -450,7 +464,8 @@ class LeRobotTorchModelSession(ModelSession):
         if torch_module is not None:
             # A failed device drain keeps completion unknown, so the references
             # are retained for a retry. A device stuck in a sticky error state
-            # never completes; after bounded drain failures the release abandons
+            # never completes; only local mode may abandon the drain after bounded
+            # failures. Managed cleanup always retains ownership. Local release abandons
             # the wait, drops the references, and lets close terminate. Drain
             # failures during the load's own rollback path do not count: the
             # load error handling retries the release before any public close,
@@ -462,6 +477,7 @@ class LeRobotTorchModelSession(ModelSession):
                     device_name,
                     self._device,
                     failed_attempts=self._release_drain_failures,
+                    managed=self._managed_execution,
                     owner="LeRobot Torch model session release",
                 )
             except BackendLifecycleError:
@@ -542,7 +558,7 @@ class LeRobotTorchModelSession(ModelSession):
 
     @staticmethod
     def validate_runtime_options(options: Mapping[str, object]) -> str:
-        unknown = sorted(set(options) - ({"model_dtype"} | _AUTO_HORIZON_OPTIONS))
+        unknown = sorted(set(options) - ({"model_dtype", "torch_device_index"} | _AUTO_HORIZON_OPTIONS))
         if unknown:
             raise BackendLoadError(f"unknown Torch runtime options: {unknown}", code="invalid_runtime_options")
         model_dtype = options.get("model_dtype", TORCH_RUNTIME_MODEL_DTYPE_DEFAULT)

@@ -88,6 +88,36 @@ def test_shutdown_heartbeat_revokes_adapter_readiness_and_allows_close(transport
     assert endpoint.core.dispatchable() == [(adapter.target, sub)]
 
 
+def test_transport_release_requires_local_evidence_global_retirement_and_quiescent_node(transport):
+    endpoint, adapter, _ = transport
+    host = adapter.controller
+    adapter._heartbeat()
+    adapter._heartbeat()
+    sub = prepare(host)
+    host.cancel(sub, host.epoch)
+    with pytest.raises(ControlError, match="TERMINAL_EVIDENCE_PENDING"):
+        adapter.destroy_transport()
+    host.acknowledge(sub, host.epoch)
+    with pytest.raises(ControlError, match="RUNTIME_CLOSE_REQUIRED"):
+        adapter.destroy_transport()
+    host.shutdown()
+    host.handle._close_local(ExecutionContext("local-cleanup"), _dispatch_key=host._authority)
+    with pytest.raises(ControlError, match="RUNTIME_RETIREMENT_REQUIRED"):
+        adapter.destroy_transport()
+    assert not getattr(adapter, "_transport_destroyed", False)
+    # Local ACK alone has not settled Global's membership. The normal Close
+    # path owns that barrier; then ROS wait-set quiescence remains mandatory.
+    adapter.node.context = object()
+    adapter.node.executor = object()
+    adapter.close()
+    assert not endpoint.core.shutdown_pending()
+    with pytest.raises(RuntimeError, match="quiescent"):
+        adapter.destroy_transport()
+    adapter.node.executor = None
+    adapter.destroy_transport()
+    assert adapter._transport_destroyed
+
+
 @pytest.mark.parametrize("verb", ["cancel", "ack"])
 def test_control_retries_are_bounded_despite_immediate_replies(transport, monkeypatch, verb):
     import time
@@ -511,6 +541,15 @@ def test_local_completion_wins_over_later_global_control_failure(transport, monk
         raise NotStartedControlError("GLOBAL_UNAVAILABLE")
 
     monkeypatch.setattr(adapter, "_call", call)
+    original_send = adapter._client.call_async
+
+    def send(request):
+        payload = decode_control(request.payload)
+        if payload["verb"] == "terminal_report":
+            return call("terminal_report", None, 0)
+        return original_send(request)
+
+    monkeypatch.setattr(adapter._client, "call_async", send)
     with pytest.raises(ExecutionFailure) as failed:
         host.handle.execute(ModelRequest(), ExecutionContext("completed-before-control-error", Deadline.after(2)))
     assert failed.value.evidence.outcome_known and failed.value.evidence.state.value != "not_started"
@@ -543,7 +582,8 @@ def test_unsent_integer_encoding_failure_does_not_consume_record_capacity(transp
     prepare(host, priority=10**100)  # Software priority is not restricted to an int32/native range.
 
 
-def test_submission_budget_reserves_terminal_receipt_before_admission(transport, monkeypatch):
+@pytest.mark.parametrize("boundary", ["report", "transport_envelope"])
+def test_submission_budget_reserves_terminal_receipt_before_admission(transport, monkeypatch, boundary):
     import json
 
     from inference_service.scheduler.runtime_protocol import MAX_CONTROL_BYTES, ControlError
@@ -567,6 +607,16 @@ def test_submission_budget_reserves_terminal_receipt_before_admission(transport,
         sys.set_int_max_str_digits(0)
         base = {"verb": "submit", "epoch": host.epoch, "submission": seed.to_dict()}
         priority = 10 ** (MAX_CONTROL_BYTES - 18 - len(encode_control(base).encode()))
+        worst = {
+            "submission": seed.to_dict(),
+            "state": "not_started",
+            "error": "\U0010ffff" * 256,
+            "started_ns": 2**63 - 1,
+            "finished_ns": 2**63 - 1,
+        }
+        if boundary == "transport_envelope":
+            # The bare report fits with eight bytes left; its transport does not.
+            priority = 10 ** (MAX_CONTROL_BYTES - 8 - len(encode_control(worst).encode()))
         candidate = replace(seed, priority=priority)
         submit = {**base, "submission": candidate.to_dict()}
         completed = {
@@ -577,7 +627,13 @@ def test_submission_budget_reserves_terminal_receipt_before_admission(transport,
             "finished_ns": now + 1,
         }
         assert len(encode_control(submit).encode()) <= MAX_CONTROL_BYTES
-        assert len(json.dumps(completed, sort_keys=True, separators=(",", ":")).encode()) > MAX_CONTROL_BYTES
+        if boundary == "report":
+            oversized = completed
+        else:
+            worst["submission"] = candidate.to_dict()
+            assert len(encode_control(worst).encode()) <= MAX_CONTROL_BYTES
+            oversized = {"verb": "terminal_report", "epoch": host.epoch, "report": worst}
+        assert len(json.dumps(oversized, sort_keys=True, separators=(",", ":")).encode()) > MAX_CONTROL_BYTES
         with pytest.raises(ControlError, match="CONTROL_TOO_LARGE"):
             host.prepare(ModelRequest(), ExecutionContext("boundary", Deadline.after(1)), priority=priority)
         assert not host._records and host._input_bytes == host._result_bytes == 0
@@ -590,12 +646,9 @@ def test_submission_budget_reserves_terminal_receipt_before_admission(transport,
             encode_control({"verb": verb, "epoch": host.epoch, "submission": sub.to_dict()})
         encode_control(
             {
-                **completed,
-                "submission": sub.to_dict(),
-                "state": "not_started",
-                "error": "\U0010ffff" * 256,
-                "started_ns": 2**63 - 1,
-                "finished_ns": 2**63 - 1,
+                "verb": "terminal_report",
+                "epoch": host.epoch,
+                "report": {**worst, "submission": sub.to_dict()},
             }
         )
     finally:
@@ -763,7 +816,7 @@ def test_healthy_heartbeat_stays_ready_between_reply_consumption_ticks(monkeypat
     finally:
         adapter.controller.shutdown()
         handle._close_local(ExecutionContext("cleanup"), _dispatch_key=adapter.controller._authority)
-        adapter.destroy_transport()
+        adapter.close()
 
 
 @pytest.mark.parametrize("registration", ["heartbeat", "reset"])

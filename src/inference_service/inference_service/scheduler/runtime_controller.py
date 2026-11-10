@@ -7,11 +7,13 @@ import json
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
+from heapq import heappop, heappush
 from types import MappingProxyType
 from uuid import uuid4
 
@@ -24,11 +26,13 @@ from inference_service.unified_runtime.errors import (
     RecoveryRequirement,
     RecoveryScope,
 )
+from inference_service.unified_runtime.handle import _completed_control_failure
 
 from .runtime_protocol import (
     CLOSE_INPUT_RESERVE_BYTES,
     EMPTY_MAPPING_BYTES,
     MAX_INPUT_BUCKET_BYTES,
+    RUNTIME_HANDLE_OPERATION,
     TERMINAL,
     CompletedControlError,
     ControlError,
@@ -37,6 +41,7 @@ from .runtime_protocol import (
     Submission,
     encode_control,
     machine_clock_id,
+    uuid_value,
 )
 
 trace = get_trace_emitter("ib_trace.runtime", component_id="runtime_controller")
@@ -48,6 +53,9 @@ _EMPTY_SEQUENCE_BYTES = 64
 _SEQUENCE_SLOT_BYTES = 8
 _STRING_HEADER_BYTES = 64
 _STRING_CHARACTER_BYTES = 4
+# Per Host command receipts, including completed commands until coordinator ACK
+# and the last accepted retry window have both been observed.
+MAX_HOST_RECOVERY_RECEIPTS = 16
 
 
 def _copy_failure(failure):
@@ -230,7 +238,7 @@ def profile_inputs_for_request(request, configured, work="execute"):
     required tensors are validated by the role contract, while this list only
     selects which present tensors use shape-based empirical profiles.
     """
-    if work != "execute" or request.metadata.get("runtime_handle_operation") in {
+    if work != "execute" or request.metadata.get(RUNTIME_HANDLE_OPERATION) in {
         "open_stream",
         "reset_stream",
         "close_stream",
@@ -285,11 +293,15 @@ class LocalOperation:
     result: object = None
     failure: BaseException | None = None
     acknowledged: bool = False
+    collection_scheduled: bool = False
     result_waiter: bool = False
     started_ns: int = 0
     finished_ns: int = 0
+    close_complete: bool = False
     result_bytes: int = 0
+    terminal_retry_after_ns: int = 0
     done: Future = field(default_factory=Future)
+    receipt: Future = field(default_factory=Future)
     release_cancellation: Callable[[], None] | None = None
 
     def report(self):
@@ -299,7 +311,19 @@ class LocalOperation:
             "error": self.error,
             "started_ns": self.started_ns,
             "finished_ns": self.finished_ns,
+            **({"close_complete": self.close_complete} if self.submission.work == "close" else {}),
         }
+
+
+@dataclass
+class RecoveryReceipt:
+    command: str
+    accept_until_ns: int
+    future: Future
+    expected_generation: int | None
+    stream_id: str | None
+    retain_until_ns: int
+    acknowledged: bool = False
 
 
 class RuntimeExecutionController:
@@ -316,8 +340,9 @@ class RuntimeExecutionController:
         self._lock = threading.RLock()
         self._preparation_done = threading.Condition(self._lock)
         self._records = {}
+        self._terminal_pending = OrderedDict()
         self._pending = 0
-        self._next_collect_ns = None
+        self._expirations = []
         self._preparing = {}
         self.on_terminal = None
         self._input_bytes = 0
@@ -328,11 +353,18 @@ class RuntimeExecutionController:
         self.startup_clean = True
         self.lifecycle_peers = [self]
         self._workers = ThreadPoolExecutor(max_workers=target.max_in_flight, thread_name_prefix="runtime-execute")
+        self._recovery = ThreadPoolExecutor(max_workers=1, thread_name_prefix="runtime-recovery")
+        self._recovery_records = {}
+        # Receipt ACK/expiry is not device completion. Only a proven backend
+        # drain clears uncertainty left by a recovery command.
+        self._recovery_uncertain = False
+        self._control_future = None
         self.policy = _ControllerPolicy(self)
         try:
             self._authority = handle.bind_execution_policy(self.policy)
         except BaseException:
             self._workers.shutdown(wait=True)
+            self._recovery.shutdown(wait=True)
             raise
 
     @contextmanager
@@ -376,6 +408,14 @@ class RuntimeExecutionController:
         with self._lock:
             return [record.report() for record in self._records.values() if record.state in TERMINAL]
 
+    def require_transport_release(self):
+        """Validate local cleanup evidence; Global retirement belongs to the adapter."""
+        with self._lock:
+            if any(record.state not in TERMINAL or not record.acknowledged for record in self._records.values()):
+                raise ControlError("TERMINAL_EVIDENCE_PENDING")
+            if not self.handle.closed or self._preparing or self._running:
+                raise ControlError("RUNTIME_CLOSE_REQUIRED")
+
     def status(self):
         with self._lock:
             self._sequence += 1
@@ -389,7 +429,14 @@ class RuntimeExecutionController:
                 "sequence": self._sequence,
                 "status_ns": self.now_ns(),
                 "ready": self._gate == "ready" and self.handle.local_ready,
-                "clean": self.startup_clean and not self._pending and not self._running and not self._preparing,
+                "clean": (
+                    self.startup_clean
+                    and not self._pending
+                    and not self._running
+                    and not self._preparing
+                    and not self._recovery_uncertain
+                    and (self._control_future is None or self._control_future.done())
+                ),
             }
 
     def accept_epoch(self, epoch):
@@ -548,11 +595,15 @@ class RuntimeExecutionController:
         encode_control({"verb": "execute", "epoch": self.epoch, "submission": submission.to_dict()})
         encode_control(
             {
-                **record.report(),
-                "state": "not_started",
-                "error": "\U0010ffff" * 256,
-                "started_ns": 2**63 - 1,
-                "finished_ns": 2**63 - 1,
+                "verb": "terminal_report",
+                "epoch": self.epoch,
+                "report": {
+                    **record.report(),
+                    "state": "not_started",
+                    "error": "\U0010ffff" * 256,
+                    "started_ns": 2**63 - 1,
+                    "finished_ns": 2**63 - 1,
+                },
             }
         )
         self._records[submission.operation_id] = record
@@ -683,15 +734,25 @@ class RuntimeExecutionController:
             elif record.submission.work == "drain":
                 self._drain(context)
         except ExecutionFailure as exc:
-            failure, error = exc, exc.code
-            if exc.evidence.state is OutcomeState.NOT_STARTED:
-                state = "not_started"
-            elif exc.evidence.outcome_known:
-                # STARTED describes how far execution got, not uncertainty.
-                # A synchronized backend can fail with a known final outcome.
-                state = "completed"
+            reset = record.submission.work == "reset" or (
+                record.submission.work == "execute"
+                and record.request.metadata.get(RUNTIME_HANDLE_OPERATION) == "reset_stream"
+            )
+            if reset and _completed_control_failure(exc):
+                # The Handle finalized Reset before checking delivery. Keep
+                # successful lifecycle evidence despite the departed waiter.
+                if record.submission.work == "execute":
+                    result = ModelResult({}, 0.0, exc.evidence)
             else:
-                state = "unknown"
+                failure, error = exc, exc.code
+                if exc.evidence.state is OutcomeState.NOT_STARTED:
+                    state = "not_started"
+                elif exc.evidence.outcome_known:
+                    # STARTED describes how far execution got, not uncertainty.
+                    # A synchronized backend can fail with a known final outcome.
+                    state = "completed"
+                else:
+                    state = "unknown"
         except BaseException as exc:
             failure, error, state = exc, type(exc).__name__, "unknown"
         # Tracebacks retain executor frames and image/device buffers outside
@@ -795,6 +856,10 @@ class RuntimeExecutionController:
         self._result_bytes += result_bytes - record.result_bytes
         record.result_bytes = result_bytes
         record.state, record.error, record.result, record.failure = state, error[:256], result, failure
+        # A recovery drain can settle a Close outcome without releasing its
+        # resources. Snapshot actual release separately from terminal certainty.
+        if record.submission.work == "close":
+            record.close_complete = state == "completed" and self.handle.closed
         record.finished_ns = self.now_ns()
         if state in TERMINAL and record.request is not None:
             release = getattr(self.handle, "release_request", None)
@@ -807,6 +872,13 @@ class RuntimeExecutionController:
         if not record.done.done():
             record.done.set_result(None)
         self._preparation_done.notify_all()
+        if state in TERMINAL and not record.acknowledged:
+            key = record.submission.operation_id
+            if key not in self._terminal_pending:
+                self._terminal_pending[key] = record
+                # Fresh evidence must not wait behind a full replay backlog.
+                # Retries continue rotating in the same bounded queue.
+                self._terminal_pending.move_to_end(key, last=False)
         if state in TERMINAL and self.on_terminal is not None:
             self.on_terminal()
 
@@ -866,7 +938,11 @@ class RuntimeExecutionController:
         # so caller traceback frames never attach to the stored evidence.
         raise _copy_failure(failure) from None
 
-    def acknowledge(self, submission, epoch):
+    def terminal_receipt(self, submission):
+        with self._lock:
+            return self._validate(submission, self.epoch, window=False).receipt
+
+    def acknowledge(self, submission, epoch, *, outcome=None):
         with self._lock:
             # ACK is an idempotent cleanup operation, including after reset
             # advances the generation and the terminal record is collected.
@@ -874,15 +950,26 @@ class RuntimeExecutionController:
             record = self._validate(submission, epoch, window=False, allow_past_generation=True)
             if record is not None and record.state in TERMINAL:
                 record.acknowledged = True
+                if not record.receipt.done():
+                    record.receipt.set_result(outcome or record.report())
+                self._terminal_pending.pop(submission.operation_id, None)
                 self._schedule_collection(record)
 
-    def pending_terminal_reports(self):
+    def pending_terminal_reports(self, *, limit=None, retry_interval_ns=0):
+        """Rotate pending evidence, examining at most limit records, including backoff."""
         with self._lock:
-            return [
-                record.report()
-                for record in self._records.values()
-                if record.state in TERMINAL and not record.acknowledged
-            ]
+            count = len(self._terminal_pending) if limit is None else min(limit, len(self._terminal_pending))
+            reports = []
+            now = self.now_ns()
+            for _ in range(count):
+                key = next(iter(self._terminal_pending))
+                record = self._terminal_pending[key]
+                self._terminal_pending.move_to_end(key)
+                if retry_interval_ns and now < record.terminal_retry_after_ns:
+                    continue
+                record.terminal_retry_after_ns = now + retry_interval_ns
+                reports.append(record.report())
+            return reports
 
     def release_result_waiter(self, submission):
         """Release business ownership after consumption or waiter abandonment."""
@@ -901,9 +988,14 @@ class RuntimeExecutionController:
         self._schedule_collection(record)
 
     def _schedule_collection(self, record):
-        if record.state in TERMINAL and record.acknowledged and not record.result_waiter:
-            expiry = record.submission.accept_until_ns
-            self._next_collect_ns = expiry if self._next_collect_ns is None else min(expiry, self._next_collect_ns)
+        if (
+            record.state in TERMINAL
+            and record.acknowledged
+            and not record.result_waiter
+            and not record.collection_scheduled
+        ):
+            heappush(self._expirations, (record.submission.accept_until_ns, record.submission.operation_id))
+            record.collection_scheduled = True
 
     def retains_request(self, metadata_key, value):
         """Whether execution ownership still pins this request's side payload."""
@@ -916,17 +1008,15 @@ class RuntimeExecutionController:
     def collect(self):
         with self._lock:
             now = self.now_ns()
-            if self._next_collect_ns is None or now < self._next_collect_ns:
-                return
-            self._next_collect_ns = None
-            expired = []
-            for key, record in self._records.items():
-                if record.state in TERMINAL and record.acknowledged and not record.result_waiter:
-                    if now >= record.submission.accept_until_ns:
-                        expired.append(key)
-                    else:
-                        self._schedule_collection(record)
-            for key in expired:
+            self._recovery_records = {
+                key: value
+                for key, value in self._recovery_records.items()
+                if not value.acknowledged or not value.future.done() or value.retain_until_ns > now
+            }
+            if self._control_future is not None and self._control_future.done():
+                self._control_future = None
+            while self._expirations and self._expirations[0][0] <= now:
+                _, key = heappop(self._expirations)
                 self._result_bytes -= self._records[key].result_bytes
                 del self._records[key]
 
@@ -948,7 +1038,11 @@ class RuntimeExecutionController:
                 if record.state not in TERMINAL:
                     record.context.cancellation_token.cancel("host shutdown")
                     self.cancel(record.submission, self.epoch)
-            while self._preparing or self._running:
+            while (
+                self._preparing
+                or self._running
+                or (self._control_future is not None and not self._control_future.done())
+            ):
                 # A timeout leaves the closing gate, workers and ownership
                 # intact. Cancellation alone is not proof of native cleanup.
                 context.check("host_shutdown")
@@ -957,6 +1051,294 @@ class RuntimeExecutionController:
         # No native invocation remains. Do not add an unbounded thread join
         # after the caller's bounded wait for preparation and execution.
         self._workers.shutdown(wait=False)
+        self._recovery.shutdown(wait=False)
+
+    def join_lifecycle(self, leader, peers):
+        """Bind stage peers before any transport or execution is exposed."""
+        self._lock = leader._lock
+        self._preparation_done = threading.Condition(self._lock)
+        self.boot_id = leader.boot_id
+        self.lifecycle_peers = list(peers)
+
+    def close_snapshot(self, previous_submission):
+        """Return close decisions and operation identities, never mutable records."""
+        with self._lock:
+            records = tuple(record for peer in self.lifecycle_peers for record in peer._records.values())
+            previous = previous_submission is not None and previous_submission.operation_id in self._records
+            return (
+                any(record.state not in TERMINAL for record in records)
+                or any(peer._preparing for peer in self.lifecycle_peers),
+                previous
+                or any(record.state == "unknown" for record in records)
+                or any(peer._gate == "recovery" for peer in self.lifecycle_peers),
+                frozenset(self._records),
+            )
+
+    def find_close_submission(self, previous_ids, fallback):
+        with self._lock:
+            return next(
+                (
+                    record.submission
+                    for key, record in self._records.items()
+                    if key not in previous_ids and record.submission.work == "close"
+                ),
+                fallback,
+            )
+
+    def recover(
+        self,
+        epoch,
+        operation_id,
+        command,
+        accept_until_ns,
+        *,
+        expected_generation=None,
+        resume_until_ns=None,
+        stream_id=None,
+        acknowledged=False,
+    ):
+        uuid_value(operation_id)
+        if type(acknowledged) is not bool:
+            raise ValueError("recovery acknowledgement must be boolean")
+        with self._lock:
+            if epoch != self.epoch:
+                raise ControlError("EPOCH_MISMATCH")
+            old = self._recovery_records.get(operation_id)
+            if old is not None and (command, accept_until_ns, expected_generation, stream_id) != (
+                old.command,
+                old.accept_until_ns,
+                old.expected_generation,
+                old.stream_id,
+            ):
+                raise ControlError("OPERATION_CONFLICT")
+            if acknowledged:
+                if old is not None:
+                    if not old.future.done():
+                        raise ControlError("RECOVERY_EVIDENCE_PENDING")
+                    old.acknowledged = True
+                    succeeded = old.future.result() is None or (command == "close" and self.handle.closed)
+                    if succeeded and command in {"activate", "close"}:
+                        # Global has stored this cleanup/activation result. Earlier
+                        # finished commands are now superseded by this barrier;
+                        # their old waiters cannot authorize another mutation.
+                        for receipt in self._recovery_records.values():
+                            if receipt is old:
+                                break
+                            if receipt.future.done():
+                                receipt.acknowledged = True
+                    settle = getattr(self.handle, "settle_recovery", None)
+                    if succeeded and callable(settle):
+                        settle(command, stream_id)
+                return {"state": "acknowledged"}
+            expiry = accept_until_ns if resume_until_ns is None else resume_until_ns
+            if (
+                type(expiry) is not int
+                or not self.now_ns() < expiry <= self.now_ns() + self.target.retry_window_ms * 1000000
+            ):
+                raise ControlError("OPERATION_EXPIRED")
+            if command not in {"drain", "close", "reset", "activate", "reset_stream", "close_stream"}:
+                raise ControlError("INVALID_RECOVERY_COMMAND")
+            if (command in {"reset_stream", "close_stream"}) != (isinstance(stream_id, str) and bool(stream_id)):
+                raise ControlError("INVALID_RECOVERY_STREAM")
+            if command not in {"reset_stream", "close_stream"} and stream_id is not None:
+                raise ControlError("INVALID_RECOVERY_STREAM")
+            if command == "activate" and (type(expected_generation) is not int or expected_generation < 1):
+                raise ControlError("INVALID_RECOVERY_GENERATION")
+            if self._gate == "closing" and command not in {"drain", "close"}:
+                raise ControlError("CLOSE_IS_IRREVERSIBLE")
+            old = self._recovery_records.get(operation_id)
+            if resume_until_ns is not None and old is None:
+                # Never replay a lifecycle mutation after losing its receipt.
+                raise ControlError("RECOVERY_RECEIPT_UNAVAILABLE")
+            if old is not None:
+                old.retain_until_ns = max(old.retain_until_ns, expiry)
+                future = old.future
+                if future.done():
+                    try:
+                        failure = future.result()
+                        if isinstance(failure, ExecutionFailure):
+                            raise _copy_failure(failure)
+                        if failure is not None:
+                            raise type(failure)(failure.code)
+                    except Exception as exc:
+                        if (
+                            command == "close"
+                            and self.handle.closed
+                            and isinstance(exc, ExecutionFailure)
+                            and exc.evidence.outcome_known
+                        ):
+                            # Cleanup diagnostics do not erase positive release
+                            # evidence. Keep the failure on the Handle/receipt.
+                            return {"state": "completed", "generation": self.generation, "error": exc.code}
+                        if not (
+                            (command == "activate" and getattr(exc, "code", None) == "RECOVERY_EVIDENCE_PENDING")
+                            or (command == "drain" and resume_until_ns is not None)
+                            or (
+                                command in {"reset", "reset_stream"}
+                                and isinstance(exc, ExecutionFailure)
+                                and exc.evidence.state is OutcomeState.NOT_STARTED
+                                and exc.evidence.outcome_known
+                            )
+                            or (
+                                command in {"close", "close_stream"}
+                                and resume_until_ns is not None
+                                and getattr(exc, "details", {}).get("close_pending") is True
+                            )
+                        ):
+                            raise
+                        # Drain is a repeatable evidence barrier, including
+                        # after its local execution deadline. Activation may
+                        # retry only its unmet evidence precondition. Close
+                        # may continue explicitly unfinished cleanup: the owner
+                        # retains release progress and never reopens admission.
+                        # Stream Close follows the same unfinished-cleanup
+                        # contract. Reset can retry proven NOT_STARTED only.
+                        # A completed mutation or an unknown reply
+                        # without that evidence is not rerun.
+                        del self._recovery_records[operation_id]
+                    else:
+                        return {
+                            "state": "completed",
+                            "generation": self.generation,
+                            "ready": self._gate == "ready" and self.handle.local_ready,
+                        }
+                else:
+                    return {"state": "running"}
+            if self._control_future is not None and not self._control_future.done():
+                raise ControlError("RECOVERY_BUSY")
+            self.collect()
+            # Retained mutations cannot consume the final drain and Close/
+            # activation slots. Repeating an existing receipt reuses its slot.
+            reserve = 0 if command in {"close", "activate"} else 1 if command == "drain" else 2
+            if old is None and len(self._recovery_records) >= MAX_HOST_RECOVERY_RECEIPTS - reserve:
+                raise NotStartedControlError("RECOVERY_CAPACITY")
+            # Register before submission. ThreadPoolExecutor may enqueue work
+            # and then fail to create its first worker; the callback must claim
+            # this same receipt under the controller lock before doing anything.
+            future = Future()
+            self._control_future = future
+            self._recovery_records[operation_id] = RecoveryReceipt(
+                command, accept_until_ns, future, expected_generation, stream_id, expiry
+            )
+            try:
+                self._recovery.submit(self._run_recovery, future, command, expected_generation, stream_id)
+            except Exception as exc:
+                future.cancel()
+                # The controller lock prevents the worker claiming the Future
+                # before cancellation. Its queued callback is now harmless;
+                # Global may replace this proven-unstarted command's ID.
+                del self._recovery_records[operation_id]
+                self._control_future = None
+                raise NotStartedControlError("RECOVERY_WORKER_SUBMIT_FAILED") from exc
+            if command != "activate" and self._gate != "closing":
+                self._gate = "closing" if command == "close" else "recovery"
+            return {"state": "running"}
+
+    def _run_recovery(self, receipt, command, expected_generation, stream_id):
+        with self._lock:
+            if not receipt.set_running_or_notify_cancel():
+                return
+        failure = None
+        try:
+            self._recover(command, expected_generation, stream_id)
+        except ControlError as exc:
+            kind = (
+                NotStartedControlError
+                if exc.operation_started is False
+                else CompletedControlError
+                if exc.outcome_known
+                else ControlError
+            )
+            failure = kind(exc.code[:256])
+        except BaseException as exc:
+            # Use the ordinary bounded diagnostic projection; never retain
+            # backend exception frames, causes, payloads or arbitrary details.
+            if isinstance(exc, ExecutionFailure):
+                failure = self.policy.failure_diagnostic(exc)
+            else:
+                failure = ExecutionFailure(
+                    code=str(getattr(exc, "code", type(exc).__name__))[:128],
+                    message=str(exc)[:256] or type(exc).__name__,
+                    evidence=OutcomeEvidence.started("recovery", outcome_known=False),
+                )
+        with self._lock:
+            # Activation checks local evidence only; it submits no device work.
+            if failure is not None and command != "activate":
+                evidence = failure.evidence if isinstance(failure, ExecutionFailure) else failure
+                if not evidence.outcome_known:
+                    self._recovery_uncertain = True
+            # Store a value, not Future.set_exception: every public replay
+            # creates a fresh exception and cannot grow a retained traceback.
+            receipt.set_result(failure)
+            self._preparation_done.notify_all()
+
+    def _clean_optional_unavailable(self):
+        """A rolled-back optional load owns no backend resources to recover."""
+        return (
+            not self.target.required
+            and isinstance(self.handle, UnavailableRuntime)
+            and self.startup_clean
+            and not self._running
+            and not self._preparing
+            and all(r.state in TERMINAL for r in self._records.values())
+        )
+
+    def _recover(self, command, expected_generation=None, stream_id=None):
+        context = ExecutionContext(str(uuid4()), Deadline.after(self.target.request_timeout_ms / 1000))
+        if command == "activate":
+            with self._lock:
+                if (
+                    self._gate == "closing"
+                    or self._recovery_uncertain
+                    or self._preparing
+                    or (isinstance(self.handle, UnavailableRuntime) and not self._clean_optional_unavailable())
+                    or any(r.state not in TERMINAL or not r.acknowledged for r in self._records.values())
+                ):
+                    raise ControlError("RECOVERY_EVIDENCE_PENDING")
+                # A new recovery operation may retry an activation whose reply
+                # was lost. Only the coordinated next generation (or its replay)
+                # is valid; never absorb an unrelated generation jump.
+                if type(expected_generation) is not int or expected_generation not in {
+                    self.generation,
+                    self.generation + 1,
+                }:
+                    raise ControlError("UNCOORDINATED_GENERATION")
+                self.generation = expected_generation
+                # Drain proves device completion, not model reset. Release the
+                # resource barrier while preserving this owner's reset gate.
+                self._gate = "ready" if self.handle.local_ready or self._clean_optional_unavailable() else "recovery"
+            return
+        with self._lock:
+            for record in self._records.values():
+                if record.state not in TERMINAL and record.submission.work != "close":
+                    # An already-running Close is an irreversible cleanup
+                    # barrier. Drain waits for its evidence without canceling
+                    # the owner's public waiter or the cleanup it is doing.
+                    record.context.cancellation_token.cancel("runtime recovery")
+        while True:
+            with self._lock:
+                if not self._running and not self._preparing:
+                    # A running call can lose completion evidence while drain
+                    # waits. Decide only after all Python invocations return.
+                    unknown = self._recovery_uncertain or any(r.state == "unknown" for r in self._records.values())
+                    break
+            context.check("drain")
+            time.sleep(0.005)
+        if unknown:
+            self._drain(context)
+        with self._lock:
+            self._recovery_uncertain = False
+            for record in self._records.values():
+                if record.state not in TERMINAL:
+                    self._finish(record, "completed" if record.state == "unknown" else "not_started", error="RECOVERED")
+            if self._clean_optional_unavailable():
+                return
+        if command == "reset":
+            self.handle._reset_local(context, _dispatch_key=self._authority)
+        elif command == "close":
+            self.handle._close_local(context, _dispatch_key=self._authority)
+        elif command in {"reset_stream", "close_stream"}:
+            self.handle.recover_stream(command, stream_id, context, _dispatch_key=self._authority)
 
 
 def retain_result(value, *, byte_limit=None):

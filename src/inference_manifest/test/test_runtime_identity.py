@@ -37,11 +37,12 @@ def test_composite_placement_uses_one_accelerator_and_rejects_multiple_devices()
 @pytest.mark.parametrize("device", ["cuda", "npu"])
 def test_torch_identity_requires_the_callers_resolved_device_index(device):
     validated = SimpleNamespace(runtime_profile=_profile(device), role_runtime_profiles={})
-    for index in (None, -1, True, "1"):
+    for index in (None, -1, True, "1", 128, 255, 256):
         with pytest.raises(ValueError, match="explicit resolved torch_device_index"):
             physical_device(validated, torch_device_index=index)
     assert physical_device(validated, torch_device_index=0) == f"local/{device}:0"
     assert physical_device(validated, torch_device_index=1) == f"local/{device}:1"
+    assert physical_device(validated, torch_device_index=127) == f"local/{device}:127"
 
 
 @pytest.mark.parametrize(

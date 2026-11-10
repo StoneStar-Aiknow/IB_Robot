@@ -70,6 +70,9 @@ class GlobalRuntimeSchedulerNode(Node):
         response.message = json.dumps(list(unavailable)) if unavailable else ""
         return response
 
+    def collect_retired_transport(self, executor):
+        self._runtime_endpoint.collect_retired_clients(executor)
+
     def begin_shutdown(self):
         self._runtime_endpoint.core.begin_shutdown()
 

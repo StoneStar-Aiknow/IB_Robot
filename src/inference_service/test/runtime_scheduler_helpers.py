@@ -9,6 +9,8 @@ import numpy as np
 from inference_service.scheduler.runtime_controller import RuntimeExecutionController
 from inference_service.scheduler.runtime_protocol import (
     RuntimeExecutionTarget,
+    decode_control,
+    encode_control,
 )
 from inference_service.unified_runtime import Deadline, ExecutionContext, ModelRequest, ModelRuntimeHandle
 
@@ -131,3 +133,112 @@ class FakeNode:
 
     def destroy_guard_condition(self, guard):
         pass
+
+
+class StreamFixture:
+    def reset(self):
+        pass
+
+    def step(self, stream, request, context):
+        return {}
+
+    def reset_stream(self, stream, context):
+        pass
+
+    def close_stream(self, stream, context):
+        pass
+
+
+class LocalClient:
+    def __init__(self, endpoint, services):
+        self.endpoint = endpoint
+        self.services = services
+        self.removed = []
+
+    def service_is_ready(self):
+        return self.endpoint in self.services
+
+    def call_async(self, request):
+        future = Future()
+        try:
+            reply = self.services[self.endpoint](decode_control(request.payload))
+            future.set_result(SimpleNamespace(payload=encode_control(reply)))
+        except Exception as exc:
+            future.set_exception(exc)
+        return future
+
+    def remove_pending_request(self, future):
+        self.removed.append(future)
+
+
+class LocalNode:
+    def __init__(self, services):
+        self.services = services
+        self.created = []
+        self.destroyed = []
+        self.warnings = []
+
+    def get_logger(self):
+        return SimpleNamespace(warning=self.warnings.append)
+
+    def create_client(self, _type, endpoint, **_kwargs):
+        client = LocalClient(endpoint, self.services)
+        self.created.append(client)
+        return client
+
+    def create_service(self, _type, endpoint, callback, **_kwargs):
+        self.services[endpoint] = lambda message: decode_control(
+            callback(SimpleNamespace(payload=encode_control(message)), SimpleNamespace()).payload
+        )
+        return endpoint
+
+    def create_timer(self, _period, _callback, **_kwargs):
+        return SimpleNamespace(cancel=lambda: None)
+
+    def create_guard_condition(self, callback, **_kwargs):
+        return SimpleNamespace(trigger=lambda: None)
+
+    def destroy_guard_condition(self, _guard):
+        pass
+
+    def destroy_timer(self, _timer):
+        pass
+
+    def destroy_client(self, client):
+        self.destroyed.append(client)
+
+    def destroy_service(self, endpoint):
+        self.services.pop(endpoint, None)
+
+
+def transport_target(name="late"):
+    return RuntimeExecutionTarget(
+        target_id=f"perception/{name}",
+        endpoint=f"/runtime/{name}",
+        hardware_resource_id="cpu",
+        physical_device="local/cpu",
+        deployment_fingerprint="deployment",
+        composition_fingerprint="composition",
+        lifecycle_group=name,
+        configuration_generation="configuration",
+        interface="tensor_model",
+        model_type=name,
+        operation="infer",
+        retry_window_ms=100,
+    )
+
+
+def initialization_target(name="model"):
+    return RuntimeExecutionTarget(
+        target_id=f"perception/{name}",
+        endpoint=f"/runtime/{name}",
+        hardware_resource_id="cpu",
+        physical_device="local/cpu",
+        deployment_fingerprint="test",
+        composition_fingerprint="test",
+        configuration_generation="test",
+        lifecycle_group=name,
+        interface="tensor_model",
+        model_type="test",
+        operation="infer",
+    )
