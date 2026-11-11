@@ -90,7 +90,7 @@ class TestTheBlock:
 
         Except asr: feat/x2-retarget-tune deploys "session", the mode that stopped the
         STANDBY/MIRRORING stalls on the robot. And zll (11-10) turned the key actions on,
-        with the v2 table that has their lines. max_per_round is auto: the lines fill the
+        with the v2 table that has their lines; v3 (11-11) adds lines for the 100 s session. max_per_round is auto: the lines fill the
         operator's session limit (11-11, 100 s); 8 is only its fallback.
         """
         settings = contract.normalize(config["internvl_voice"])[0]
@@ -104,23 +104,23 @@ class TestTheBlock:
         assert settings == replace(
             defaults,
             asr="session",
-            clips_table="$(find robot_config)/config/mirror_voice/x2_clips_v2.yaml",
-            clip_dir="assets/audio/x2_mirror_clips_v2",
+            clips_table="$(find robot_config)/config/mirror_voice/x2_clips_v3.yaml",
+            clip_dir="assets/audio/x2_mirror_clips_v3",
             look=look,
         )
 
     def test_its_table_is_the_installed_one(self, config):
         """``$(find robot_config)`` against the source tree, laid out as the share dir is."""
-        shipped = str(PACKAGE / "config" / "mirror_voice" / "x2_clips_v2.yaml")
+        shipped = str(PACKAGE / "config" / "mirror_voice" / "x2_clips_v3.yaml")
         default = str(PACKAGE / "config" / "mirror_voice" / "x2_clips_v1.yaml")
 
         bundle = contract.build_bundle(config["internvl_voice"], "/root/tree", default, lambda package: str(PACKAGE))
 
         assert bundle.warnings == ()
         assert bundle.settings.clips_table == shipped
-        assert len(bundle.table.clips) == 64
+        assert len(bundle.table.clips) == 85
         assert bundle.clip_dirs == (
-            "/root/tree/assets/audio/x2_mirror_clips_v2",
+            "/root/tree/assets/audio/x2_mirror_clips_v3",
             "/root/tree/assets/audio/x2_mirror_clips_v1",
         )
 
@@ -154,5 +154,5 @@ class TestGraspProfile:
         assert config["internvl_voice"]["enabled"] is True
         settings, warnings = contract.normalize(config["internvl_voice"])
         assert settings is not None and warnings == []
-        assert settings.clips_table == "$(find robot_config)/config/mirror_voice/x2_clips_v2.yaml"
+        assert settings.clips_table == "$(find robot_config)/config/mirror_voice/x2_clips_v3.yaml"
         assert config["mirror_session"]["voice"]["enabled"] is True

@@ -9,7 +9,8 @@ InternVL 看图后匹配到的一句。配置在 `config/robots/aimdk_x2_voice_m
 
 | 文件 | 说明 |
 |---|---|
-| `x2_clips_v2.yaml` | 入口在用的句表，64 句，`version: 2`：v1 的 61 句原样保留，加 3 句张开双臂（`big_open_02..04`）。随 `robot_config` 安装，由发布目录的 `clips.tsv` 生成，不要手改 |
+| `x2_clips_v3.yaml` | 入口在用的句表，85 句，`version: 3`：v2 的 64 句原样保留，加 21 句（19 句看图说话，体验时长 100 s 时不至于说重；2 句待机短词 `standby_any_06/07`「站脚印上！」「看脚印！」）。随 `robot_config` 安装，由发布目录的 `clips.tsv` 生成，不要手改 |
+| `x2_clips_v2.yaml` | 上一版句表，64 句，`version: 2`：v1 的 61 句原样保留，加 3 句张开双臂（`big_open_02..04`）。保留不动 |
 | `x2_clips_v1.yaml` | 上一版句表，61 句，`version: 1`。保留不动，是 `clips_table` 读不到时的兜底 |
 | `README.md` | 本文件 |
 
@@ -19,34 +20,36 @@ wav 和模型都不进 git，按下面放到板上。
 
 | 东西 | 位置 | 配置键 |
 |---|---|---|
-| 64 个 wav | `$WORKSPACE/assets/audio/x2_mirror_clips_v2/`，wav 直接放在这一层。在 .5 上是 `/root/x2-feat-internvl-voice-wt/assets/audio/x2_mirror_clips_v2/` | `internvl_voice.clip_dir`（相对 `$WORKSPACE`，也可写绝对路径） |
+| 85 个 wav | `$WORKSPACE/assets/audio/x2_mirror_clips_v3/`，wav 直接放在这一层 | `internvl_voice.clip_dir`（相对 `$WORKSPACE`，也可写绝对路径） |
 | InternVL3-1B 310P | `/root/vlx_internvl_310p/`：用到 `om/` 里 3 个 OM、`tokenizer/`、`scripts/`、`live/`、`onnx/embed_tokens_fp32.npy`。部署包 `visual_talk_wrist` 的 `3_vlx.tar` 就解到这里；不挪、不复制 | `internvl_voice.look.demo_root`（绝对路径，或相对 `$WORKSPACE`） |
-| 句表 | 本目录的 `x2_clips_v2.yaml`，随 `robot_config` 装到 share 目录 | `internvl_voice.clips_table`。入口写的是 `$(find robot_config)/config/mirror_voice/x2_clips_v2.yaml`；不写时默认 v1 |
+| 句表 | 本目录的 `x2_clips_v3.yaml`，随 `robot_config` 装到 share 目录 | `internvl_voice.clips_table`。入口写的是 `$(find robot_config)/config/mirror_voice/x2_clips_v3.yaml`；不写时默认 v1 |
 
-- wav 是 24000 Hz、单声道、16 bit，文件名 `<id>_v2.wav`（句表的 `wav_suffix`），`id` 和句表里的键一一对应。
+- wav 是 24000 Hz、单声道、16 bit，文件名 `<id>_v3.wav`（句表的 `wav_suffix`），`id` 和句表里的键一一对应。
 - `clip_dir` 下找不到 wav 时，还会去默认的 `$WORKSPACE/assets/audio/x2_mirror_clips_v1` 找一次。
-  那里的文件叫 `_v1.wav`，用 v2 句表时找不到，所以**v2 目录必须拷**，否则没有声音。
+  那里的文件叫 `_v1.wav`，用 v3 句表时找不到，所以**v3 目录必须拷**，否则整场没有声音（ERROR「找到 0 / 85」）。
+  也不会去 v2 目录补：只用第一个有文件的目录。
 - `assets/` 是树里的未跟踪文件，deploy.sh 不会清理；但整棵树删了重建后要重新拷。
 
 ## 2. 从哪里拿 wav
 
-发布目录（本机）：`<本机发布目录>/x2_mirror_clips_v2/`，里面有 64 个 wav、
-`clips.tsv`（id、句池、时长、文本）、`SHA256SUMS` 和它自己的 `README.md`。给别人时打成一个包：
+发布目录（本机）：`<本机发布目录>/x2_mirror_clips_v3/`，里面有 85 个 wav、
+`clips.tsv`（id、句池、时长、文本）、`SHA256SUMS` 和它自己的 `README.md`。单独就能用，不需要 v1 / v2 目录。
+给别人时打成一个包：
 
-    tar czf x2_mirror_clips_v2.tar.gz x2_mirror_clips_v2
+    tar czf x2_mirror_clips_v3.tar.gz x2_mirror_clips_v3
 
-拷到板上（约 7 MB）：
+拷到板上（约 10 MB）：
 
-    scp -r x2_mirror_clips_v2 root@<板子>:<WORKSPACE>/assets/audio/
+    scp -r x2_mirror_clips_v3 root@<板子>:<WORKSPACE>/assets/audio/
 
-v2 的 61 句和 v1 是同一批录音（字节相同，只改了文件名）；3 句新的同一音色、同一方法合成。
-v1 目录 `x2_mirror_clips_v1/` 不动，留着给 v1 句表。
+v3 的 64 句和 v2 是同一批录音（字节相同，只改了文件名）；21 句新的同一音色、同一方法合成。
+v1、v2 目录不动，留着给各自的句表。
 
 ## 3. 核对
 
-    cd <WORKSPACE>/assets/audio/x2_mirror_clips_v2 && sha256sum -c SHA256SUMS
+    cd <WORKSPACE>/assets/audio/x2_mirror_clips_v3 && LC_ALL=C sha256sum -c SHA256SUMS
 
-应该 64 个都是 OK。启动后看 mirror_voice 的日志，应该打出「用 <目录>，找到 64 / 64」。
+应该 87 个都是 OK（85 个 wav，加 `clips.tsv` 和 `README.md`）。启动后看 mirror_voice 的日志，应该打出「用 <目录>，找到 85 / 85」。
 
 - 缺了某个 wav 或格式不对：只有那一句不说，同一事件有别的句子就换一句；**不会改成合成**。
 - 一个 wav 都没有：ERROR，镜像照常但没声音。

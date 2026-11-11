@@ -1,4 +1,4 @@
-"""The X2 mirror clip tables: v1 (61 lines) and v2 (v1 plus 3 for open arms), text only.
+"""The X2 mirror clip tables: v1 (61 lines), v2 (v1 plus 3 for open arms) and v3 (v2 plus 21), text only.
 
 The WAVs are recordings of these exact texts, so the table is generated from
 the release's clips.tsv and never edited by hand. What the mirror relies on is
@@ -20,8 +20,8 @@ from embodied_common import internvl_voice_contract as contract
 from robot_config.loader import _load_robot_section
 
 CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
-# version -> (wav suffix, lines); v2 is the one the entry ships.
-TABLES = {1: ("_v1.wav", 61), 2: ("_v2.wav", 64)}
+# version -> (wav suffix, lines); v3 is the one the entry ships.
+TABLES = {1: ("_v1.wav", 61), 2: ("_v2.wav", 64), 3: ("_v3.wav", 85)}
 HOTWORDS = CONFIG_DIR / "hotwords" / "x2_commands.txt"
 ENTRY = CONFIG_DIR / "robots" / "aimdk_x2_voice_mirror_all.yaml"
 # src/robot_config/test/ -> src/
@@ -98,7 +98,8 @@ def _read(version: int):
     return contract.parse_clip_table(yaml.safe_load(_path(version).read_text(encoding="utf-8")))[0]
 
 
-# v2 holds every v1 line with the same text (checked below), so checking v2's lines checks both.
+# Each version holds every line of the one before with the same text (checked below),
+# so checking the newest table's lines checks them all.
 SHIPPED = _read(max(TABLES))
 
 
@@ -121,6 +122,33 @@ def test_v2_is_v1_plus_the_open_arms_lines():
 
     assert {k: v for k, v in v2.clips.items() if k in v1.clips} == dict(v1.clips)
     assert sorted(set(v2.clips) - set(v1.clips)) == ["big_open_02", "big_open_03", "big_open_04"]
+
+
+# 11-11, zll: 19 look lines so a 100 s session does not repeat itself, and 2 standby words.
+V3_NEW = {
+    "big.open": 2,
+    "big.wave": 2,
+    "hand.thumb": 3,
+    "other.any": 4,
+    "seq.invite": 3,
+    "seq.repeat": 2,
+    "seq.still": 2,
+    "seq.switch": 1,
+    "standby.any": 2,
+}
+
+
+def test_v3_is_v2_plus_the_100_s_lines():
+    """The 64 v2 lines are the same recordings under v3's names, so their text must not move."""
+    v2, v3 = _read(2), _read(3)
+    new = set(v3.clips) - set(v2.clips)
+
+    assert {k: v for k, v in v3.clips.items() if k in v2.clips} == dict(v2.clips)
+    counts = {pool: sum(1 for clip_id in new if v3.pool_of(clip_id) == pool) for pool in V3_NEW}
+    assert counts == V3_NEW
+    assert len(new) == sum(V3_NEW.values()) == 21
+    assert v3.clips["standby_any_06"] == "站脚印上！"
+    assert v3.clips["standby_any_07"] == "看脚印！"
 
 
 @pytest.mark.parametrize("pool", contract.REQUIRED_POOLS)

@@ -843,7 +843,7 @@ def test_every_pool_a_look_can_choose_is_in_the_shipped_table():
 
     from embodied_common.internvl_voice_contract import Settings, load_clip_table, look_json, parse_look_json
 
-    path = Path(__file__).resolve().parents[2] / "robot_config" / "config" / "mirror_voice" / "x2_clips_v2.yaml"
+    path = Path(__file__).resolve().parents[2] / "robot_config" / "config" / "mirror_voice" / "x2_clips_v3.yaml"
     if not path.exists():
         pytest.skip("robot_config's clip table is not beside this package")
     table, _ = load_clip_table(str(path))
