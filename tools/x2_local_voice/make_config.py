@@ -15,6 +15,7 @@ whatever is not changed here runs exactly as on the summit deployment.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -29,9 +30,8 @@ SUMMIT_CATALOG = WORKSPACE / "src/agent/skill_catalog/config/profiles/aimdk_x2_s
 CATALOG_NAME = "aimdk_x2_summit_local_voice"
 ASR_BUNDLE = "voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05"
 
-#: Skills the PC cannot run: the mirror needs the head camera and Ascend YOLOX/PEAR, and
-#: free_pose and return_to_task_pose need the fixed pose library of a commissioned robot.
-UNSUPPORTED_SKILLS = frozenset({"mirror_start", "mirror_stop", "free_pose", "return_to_task_pose"})
+#: Mirror needs the head camera and Ascend YOLOX/PEAR. Contact interaction stays disabled.
+UNSUPPORTED_SKILLS = frozenset({"mirror_start", "mirror_stop", "handshake"})
 
 
 def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> dict:
@@ -40,6 +40,7 @@ def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> d
     config["mirror_session"]["enabled"] = False
     config["motion_imitation_stream"]["enabled"] = False
     config["motion_imitation_stream"]["pause_during_manipulation"] = False
+    config["motion_imitation_stream"]["pause_during_robot_motion"] = False
     config["visual_interaction"]["enabled"] = False
     # model_inference is the mirror's mode; the rest of the summit uses these two.
     config["default_control_mode"] = "moveit_planning"
@@ -48,19 +49,20 @@ def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> d
     # Grounding DINO, SAM2, GraspGen, YOLOX and PEAR are Ascend deployments; the fake
     # pick/place backends need none of them.
     config["perception_services"]["services"] = []
-    # No fixed pose library: the loader validates it even when the composer is disabled.
-    config["task_poses"] = None
-    config["pose_composer"] = {"enabled": False}
+    # Execute the existing fixed poses through the simulated runtime. Keep hardware's
+    # commissioning block in the summit config; it does not apply to this localhost mock.
+    config["pose_composer"]["enabled"] = True
+    config["pose_composer"]["blocked_task_poses"] = []
+    config["pose_composer"]["fixed_library"] = str(state.parent / "fixed_poses.json")
     # Pick and place keep their pipelines, custody and Gateway contracts; only perception
-    # and motion are fakes (mock_manipulation.py). The bundle carries the model identity only.
+    # and motion are fakes (mock_manipulation.py). The bundle carries identity and mock hand presets, no weights.
     config["grasp_execution"].update(
         backend="mock_manipulation:grasp_backends",
         model_bundle_path=str(HERE / "mock_model_bundle"),
         model_deployment="physical_mock",
     )
     config["placement_execution"]["backend"] = "mock_manipulation:place_backends"
-    # Opening the hands before a gesture plans from the GraspGen-X gripper description in the
-    # real model bundle; the identity-only bundle has none, and the vendor mock has no hands to open.
+    # Named gestures use the vendor mock directly. Fixed poses keep their articulated-hand checks.
     config["embodied"].get("runtime_named_motion", {}).pop("hand_preparation", None)
     # Same models as the robot, from this PC's model root; ZipVoice in its x86 deployment.
     config["voice_asr"]["bundle_path"] = str(models / ASR_BUNDLE)
@@ -74,6 +76,8 @@ def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> d
     # Ledgers of this rig only; start.sh empties them, so a quarantine lasts one run.
     embodied["execution_store_path"] = str(state / "executions.sqlite3")
     agent = embodied["agent"]
+    if (agent.get("gift_state") or {}).get("enabled") is True:
+        agent["gift_state"]["path"] = str(state.parent / "gift_state.sqlite3")
     agent["ledger_path"] = str(state / "requests.sqlite3")
     agent["conversation_path"] = str(state / "conversation.sqlite3")
     agent["deployment_lock_path"] = str(state / "agent.lock")
@@ -88,6 +92,35 @@ def deviate(config: dict, *, models: Path, state: Path, keep_english: bool) -> d
     # English words reach ZipVoice only when its English frontend (piper_phonemize) is installed.
     bridge["tts_keep_english"] = keep_english
     return config
+
+
+def prepare_fixed_library(state: Path) -> None:
+    """Recompile stale derived pose assets against this checkout's current motion profile."""
+    from aimdk_grasp.fixed_pose_backend import FixedBackend
+
+    from pose_composer.compile_library import compile_library, configuration_inputs
+
+    inputs = configuration_inputs(SUMMIT)
+    output = state.parent / "fixed_poses.json"
+    if output.is_file():
+        try:
+            FixedBackend(inputs["profile"], inputs["limits"], output, task_poses=inputs["task_poses"])
+            return
+        except ValueError:
+            pass  # This artifact is derived; rebuild it when its inputs change.
+    selected = list(json.loads(Path(inputs["output"]).read_text())["poses"])
+    print("compiling local fixed pose library", flush=True)
+    library = compile_library(
+        inputs["mjcf"],
+        inputs["profile"],
+        inputs["limits"],
+        inputs["seeds"],
+        selected,
+        task_poses=inputs["task_poses"],
+        hand_path_check=inputs["hand_path_check"],
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(library, ensure_ascii=False), encoding="utf-8")
 
 
 def catalog(text: str) -> str:
@@ -106,6 +139,7 @@ def main() -> None:
     parser.add_argument("--catalog-out", type=Path, required=True)
     parser.add_argument("--keep-english", action="store_true")
     args = parser.parse_args()
+    prepare_fixed_library(args.state.resolve())
     _path, config = _load_robot_section(SUMMIT)
     deviate(
         config,

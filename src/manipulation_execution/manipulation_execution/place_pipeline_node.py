@@ -131,6 +131,7 @@ class PlacePipelineNode(Node):
                 deadline=deadline,
                 cancelled=lambda: handle.is_cancel_requested,
                 on_phase=phase,
+                prefetched=getattr(self.custody, "container", None),
             )
         except GraspFailure as failure:
             outcome = PlaceOutcome(

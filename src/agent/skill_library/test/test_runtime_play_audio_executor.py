@@ -595,3 +595,17 @@ def test_a_clip_with_a_motion_counts_as_a_named_motion_catalog_entry():
 
     with pytest.raises(ValueError, match="runtime_named_motion configuration mismatch"):
         node._validate_hri_runtime_catalog_consistency(snapshot)
+
+
+def test_restored_recording_list_avoids_last_and_skips_missing_file(tmp_path):
+    events, audio, _motion, node = _setup(tmp_path, _Playback(_played(), done_after_polls=0))
+    first = tmp_path / "first.wav"
+    second = tmp_path / "second.wav"
+    first.write_bytes(b"RIFF")
+    second.write_bytes(b"RIFF")
+    node._play_audio_clips = {"self_intro": [str(tmp_path / "missing.wav"), str(first), str(second)]}
+    node._play_audio_last = {"self_intro": str(first)}
+    result = _run(node, _CountingGoalHandle(), CLIP_TEMPLATE)
+    assert result.success
+    assert audio.requests == [str(second)]
+    assert node._play_audio_last["self_intro"] == str(second)

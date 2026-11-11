@@ -66,7 +66,6 @@ def test_voice_mirror_grasp_preserves_skills_and_compiles_preparation_budget():
     )
     expected = {
         "wave_hand",
-        "handshake",
         "raise_hand",
         "blow_kiss",
         "clap_hands",
@@ -78,19 +77,23 @@ def test_voice_mirror_grasp_preserves_skills_and_compiles_preparation_budget():
         "return_to_task_pose",
         "place_in_container",
     }
-    assert set(snapshot.enabled_skill_names) == expected
-    assert set(snapshot.planner_visible_skill_names) == expected
+    assert expected <= set(snapshot.enabled_skill_names)
+    assert "handshake" not in snapshot.enabled_skill_names
+    assert len(snapshot.enabled_skill_names) == 57
+    assert set(snapshot.planner_visible_skill_names) == set(snapshot.enabled_skill_names)
     assert snapshot.robot_name == "aimdk_x2_voice_mirror_grasp"
     assert snapshot.templates["return_to_task_pose"]["executor"] == "pose_composer"
     pick = snapshot.templates["pick_object"]
-    assert pick["implementation_identity"].endswith("#aimdk_x2_grasp_task_poses")
+    assert pick["implementation_identity"].endswith("#aimdk_x2_summit_fruit")
     assert pick["executor"] == "grasp_pipeline"
     assert pick["timeout_sec"] == 150.0
-    assert "preparation posture" in str(snapshot.capability_view["pick_object"])
+    assert "explicitly named container" in str(snapshot.capability_view["pick_object"])
+    assert "only when no destination was specified" in str(snapshot.capability_view["pick_object"])
+    assert "explicitly requested container takes priority" in str(snapshot.capability_view["place_in_container"])
     assert snapshot.templates["place_in_container"]["executor"] == "placement_pipeline"
     assert snapshot.templates["mirror_start"]["executor"] == "mirror_session"
     assert snapshot.templates["self_introduction"]["executor"] == "runtime_play_audio"
-    assert snapshot.templates["self_introduction"]["binding"] == {"clip": "self_intro", "motion": "wave"}
+    assert snapshot.templates["self_introduction"]["binding"] == {"clip": "self_intro", "motion": "self_intro"}
     assert snapshot.capability_view["self_introduction"]["moves_robot"] is True
 
 

@@ -87,6 +87,11 @@ def pipeline_config(grasp_execution: Mapping) -> PipelineConfig:
     return PipelineConfig(**dict(options))
 
 
+def prefetch_service_name(action_name: str) -> str:
+    """The pick node's PrefetchGrasp service, beside its action (the Gateway derives the same name)."""
+    return f"{action_name.rstrip('/')}/prefetch"
+
+
 def verification_status(outcome: PickOutcome) -> int:
     """The close's answer; NOT_RUN when no close finished."""
     if (
@@ -179,6 +184,8 @@ def terminal_record(outcome: PickOutcome, pre_motion: PreMotionTimer | None = No
         "first_execution_failure": report.get("first_execution_failure"),
         "execution_failures": report.get("execution_failures", []),
         "handover_s": report.get("handover_s"),
+        # Whether the first attempt took the capture started before the goal, and why not.
+        "perception_prefetch": report.get("perception_prefetch"),
         "pre_motion": None if pre_motion is None else {**pre_motion.record(), **thinking_report(report)},
         "watch": [
             {key: watch[key] for key in WATCH_LOG_KEYS if key in watch}
@@ -261,7 +268,47 @@ class GraspPipelineNode(Node):
             callback_group=ReentrantCallbackGroup(),
             feedback_pub_qos_profile=QoSProfile(depth=256),
         )
-        self.get_logger().info(f"grasp pipeline ready: action={self._action_name} backend={spec}")
+        self._prefetch_service = None
+        if self._pipeline.prefetch is not None:
+            from ibrobot_msgs.srv import PrefetchGrasp
+
+            self._prefetch_service = self.create_service(
+                PrefetchGrasp,
+                prefetch_service_name(self._action_name),
+                self._on_prefetch,
+                callback_group=ReentrantCallbackGroup(),
+            )
+        self.get_logger().info(
+            f"grasp pipeline ready: action={self._action_name} backend={spec} "
+            f"prefetch={'on' if self._prefetch_service is not None else 'off'}"
+        )
+
+    def _on_prefetch(self, request, response):
+        """Start perceiving a pick's target (and its place's container) before its goal; never moves anything."""
+        reason = ""
+        if not self._ready.is_set():
+            reason = "the grasp backends are still warming up"
+        elif self._goal_active or (self._custody is not None and self._custody.custody.occupied):
+            reason = "a goal or a held object owns the robot"
+        else:
+            reason = self._pipeline.prefetch.start(
+                request.target_query,
+                request.container_query if self._custody is not None else "",
+                request.dispatch_binding.root_task_id,
+            )
+        response.accepted, response.reason = not reason, reason
+        self.get_logger().info(
+            json.dumps(
+                {
+                    "event": "perception_prefetch_request",
+                    "target": request.target_query,
+                    "container": request.container_query,
+                    "accepted": not reason,
+                    "reason": reason,
+                }
+            )
+        )
+        return response
 
     def _prepare(self) -> None:
         """Warm the backends up off the executor; goals are refused until it succeeds."""
@@ -403,8 +450,14 @@ class GraspPipelineNode(Node):
 
             return GraspSequence(backends).home_after_drop(go_home, cancelled=self._closing.is_set)
 
+        container, self._retain_timings["container_prefetch"] = (
+            self._pipeline.prefetch.container(goal.dispatch_binding.root_task_id)
+            if self._pipeline.prefetch is not None
+            else (None, {"reason": "off"})
+        )
         self._custody.custody.accept(
             held,
+            container=container,
             recover=recover,
             release=release,
             holding=backends.effector.holding,

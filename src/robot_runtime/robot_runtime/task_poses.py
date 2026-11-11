@@ -47,6 +47,75 @@ def pose_hand_sides(pose: Mapping) -> tuple[str, ...]:
     return tuple(pose.get("hands") or {})
 
 
+def _transition_route(name, route, joints):
+    """Freeze route provenance separately from endpoint hardware approval."""
+    if (
+        not isinstance(route, Mapping)
+        or set(route) - {"waypoints", "supported_starts", "hardware_approved", "source", "table_bounds"}
+        or not {"waypoints", "supported_starts", "hardware_approved", "source"} <= set(route)
+    ):
+        raise ValueError(f"{name}: invalid transition_route keys")
+    if not isinstance(route["hardware_approved"], bool):
+        raise ValueError(f"{name}: route hardware_approved must be a boolean")
+
+    def positions(q):
+        if not isinstance(q, Mapping) or set(q) != set(joints):
+            raise ValueError(f"{name}: route positions must cover exactly joint_names")
+        return {j: _number(q[j], j, -10, 10) for j in joints}
+
+    waypoints, starts = route["waypoints"], route["supported_starts"]
+    if not isinstance(waypoints, list) or not 1 <= len(waypoints) <= 32:
+        raise ValueError(f"{name}: route requires 1..32 waypoints")
+    if not isinstance(starts, list) or not 1 <= len(starts) <= 32:
+        raise ValueError(f"{name}: route requires explicit supported starts")
+    normalized_starts = []
+    for start in starts:
+        if not isinstance(start, Mapping) or set(start) != {"joint_positions", "tolerance_rad"}:
+            raise ValueError(f"{name}: invalid supported start")
+        normalized_starts.append(
+            {
+                "joint_positions": positions(start["joint_positions"]),
+                "tolerance_rad": _number(start["tolerance_rad"], "route start tolerance_rad", 0.001, 0.2),
+            }
+        )
+    source = route["source"]
+    if (
+        not isinstance(source, Mapping)
+        or set(source) != {"path", "sha256", "sample_indices"}
+        or not isinstance(source["path"], str)
+        or not source["path"].strip()
+        or not isinstance(source["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", source["sha256"])
+        or not isinstance(source["sample_indices"], list)
+        or len(source["sample_indices"]) != len(waypoints)
+        or any(type(i) is not int or i < 0 for i in source["sample_indices"])
+    ):
+        raise ValueError(f"{name}: route requires source SHA256 and one sample index per waypoint")
+    result = {
+        "waypoints": [positions(q) for q in waypoints],
+        "supported_starts": normalized_starts,
+        "hardware_approved": route["hardware_approved"],
+        "source": copy.deepcopy(dict(source)),
+    }
+    if "table_bounds" in route:
+        bounds = route["table_bounds"]
+        if not isinstance(bounds, Mapping) or set(bounds) != {"frame", "min_xyz_m", "max_xyz_m", "clearance_m"}:
+            raise ValueError(f"{name}: invalid table_bounds")
+        # Robot root frame: +X forward, +Y left, +Z up. No implicit world transform.
+        if bounds["frame"] != "base_link":
+            raise ValueError(f"{name}: table_bounds frame must be base_link")
+        normalized = {"frame": "base_link"}
+        for key in ("min_xyz_m", "max_xyz_m"):
+            if not isinstance(bounds[key], list) or len(bounds[key]) != 3:
+                raise ValueError(f"{name}: table bounds require three coordinates")
+            normalized[key] = [_number(v, key, -10, 10) for v in bounds[key]]
+        if any(a >= b for a, b in zip(normalized["min_xyz_m"], normalized["max_xyz_m"], strict=True)):
+            raise ValueError(f"{name}: table bounds must have positive extent")
+        normalized["clearance_m"] = _number(bounds["clearance_m"], "clearance_m", 0, 1)
+        result["table_bounds"] = normalized
+    return result
+
+
 def normalize_task_poses(data: Mapping) -> dict:
     if not isinstance(data, Mapping) or type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
         raise ValueError("task poses require schema_version: 1")
@@ -80,6 +149,8 @@ def normalize_task_poses(data: Mapping) -> dict:
             "timeout_sec",
             "max_state_age_sec",
             "hardware_approved",
+            "transition_route",
+            "arrival_wait_sec",
             "hands",
             "unloaded_operation_approved",
             "description",
@@ -107,6 +178,11 @@ def normalize_task_poses(data: Mapping) -> dict:
             "max_state_age_sec": _number(pose.get("max_state_age_sec", 0.5), "max_state_age_sec", 0.02, 2),
             "hardware_approved": approved,
         }
+        # Optional fields preserve the identity of legacy endpoint-only snapshots.
+        if "transition_route" in pose:
+            out["poses"][name]["transition_route"] = _transition_route(name, pose["transition_route"], joints)
+        if "arrival_wait_sec" in pose:
+            out["poses"][name]["arrival_wait_sec"] = _number(pose["arrival_wait_sec"], "arrival_wait_sec", 0.0, 10.0)
         for key in ("description", "aliases"):
             if key not in pose:
                 continue

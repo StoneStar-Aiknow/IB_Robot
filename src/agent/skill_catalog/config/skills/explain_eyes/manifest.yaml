@@ -1,0 +1,36 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q21); edit the aliases here.
+schema_version: 1
+name: explain_eyes
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot sees through the camera on its head.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks whether the robot has eyes or which camera it sees with
+  aliases_zh:
+  - 你有眼睛吗
+  - 你通过哪个摄像头看我
+  - 你能看见我吗
+  - 你的眼睛在哪
+  aliases_en:
+  - can you see me
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 3.1
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot sees through the camera on its head. Use for 你有眼睛吗.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

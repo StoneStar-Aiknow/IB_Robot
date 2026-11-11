@@ -17,6 +17,11 @@ def motion_stop_is_unknown(result):
     return getattr(detail, "schema_version", 0) in {1, 2} and detail.recovery_state == "UNKNOWN"
 
 
+def place_container_after(steps, index):
+    """The container of the place that follows the pick at ``index`` (retains_for_place), else ''."""
+    return steps[index + 1].container_name.strip() if retains_for_place(steps, index) else ""
+
+
 def retains_for_place(steps, index):
     if not 0 <= index < len(steps) - 1:
         return False

@@ -41,7 +41,7 @@ from manipulation_execution.grasp_pipeline.perception import PerceptionServices
 from manipulation_execution.grasp_pipeline.streaming import received_at_or_stale
 
 from . import head_wire as wire
-from .backend import WARMUP_BUDGET_S, arm_and_hand, automatic_execution, watch_timeouts, x2_robot
+from .backend import WARMUP_BUDGET_S, arm_and_hand, automatic_execution, installed_hands, watch_timeouts, x2_robot
 from .execution_watch import WATCH_FAILED, WatchState, WatchStatus, WatchTimeouts, watch_failure
 from .head_interface import NO_SUPPORT, STATUS_DEPTH, head_endpoints, session_id
 from .proposer import X2Proposer
@@ -712,7 +712,55 @@ def x2_remote_grasp_backends(
         prepare=prepare,
         held_object=held_builder(node, executor, effector),
         plan_home=RemotePlacePlanner(head).plan_home,
+        posture=x2_posture(executor, effector, installed_hands(options)),
+        container_detector=container_detector(services, grasp_execution, robot.perception),
     )
+
+
+def x2_posture(executor, effector, sides):
+    """Both arms, the head and the installed hands as measured on this host (GraspBackends.posture)."""
+    from .joints import HAND_PARTS, HEAD, arm_joints
+    from .omnihand import HAND_OFFSETS
+
+    arm = getattr(executor, "parts", {}).get("left", executor)
+    hand = getattr(effector, "parts", {}).get(sides[0], effector) if sides else None
+    names = (*arm_joints("left"), *arm_joints("right"), *HEAD)
+
+    def posture() -> np.ndarray:
+        values = [np.asarray(arm.measured(names), dtype=float)]
+        if hand is not None:
+            sample = hand.io.feedback()
+            if not sample.healthy:
+                raise RuntimeError("hand feedback unhealthy")
+            channel = hand.io.channel_joints
+            for side in sides:
+                joints = channel[HAND_OFFSETS[side] : HAND_OFFSETS[side] + len(HAND_PARTS)]
+                values.append(np.asarray([sample.positions[name] for name in joints], dtype=float))
+        return np.concatenate(values)
+
+    return posture
+
+
+def container_detector(services, grasp_execution, perception):
+    """The place's container mask on a pick capture (GraspBackends.container_detector).
+
+    Detected as the place detects it (container_proposer.detect_masks) with the
+    placement perception settings (``container_perception``, from
+    placement_execution.perception by the launch).
+    """
+    from dataclasses import replace
+
+    from .container_proposer import detect_masks
+
+    settings = replace(perception, **dict(grasp_execution.get("container_perception") or {}))
+
+    def detect(observation, query, *, deadline, cancelled):
+        stop = lambda: cancelled() or time.monotonic() >= deadline  # noqa: E731
+        for mask in detect_masks(services, observation, query, cancelled=stop, settings=settings):
+            return mask
+        return None
+
+    return detect
 
 
 def x2_remote_place_backends(*, node, placement_execution, grasp_execution, description):

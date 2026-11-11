@@ -142,9 +142,12 @@ class TestNothingElseChanges:
 
 
 class TestGraspProfile:
-    def test_grasp_does_not_inherit_the_clips_or_the_look(self):
-        """voice_mirror_grasp's base_config is the entry: without its own block it would start the look."""
+    def test_commissioned_grasp_entry_enables_mirror_voice(self):
+        """The commissioned entry retains the mirror feedback enabled on the robot."""
         config = _load_robot_section(GRASP)[1]
 
-        assert config["internvl_voice"]["enabled"] is False
-        assert contract.normalize(config["internvl_voice"]) == (None, [])
+        assert config["internvl_voice"]["enabled"] is True
+        settings, warnings = contract.normalize(config["internvl_voice"])
+        assert settings is not None and warnings == []
+        assert settings.clips_table == "$(find robot_config)/config/mirror_voice/x2_clips_v2.yaml"
+        assert config["mirror_session"]["voice"]["enabled"] is True

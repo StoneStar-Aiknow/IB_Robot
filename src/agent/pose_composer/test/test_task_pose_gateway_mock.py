@@ -191,3 +191,16 @@ def test_each_hand_phase_failure_blocks_capture_and_grasp(monkeypatch, fault):
     if fault in {"opening_right", "cancel"}:
         assert "opened_hands=left" in result.message
         assert "opened_hands=left,right" not in result.message
+
+
+def test_restored_block_refuses_uncommissioned_route_before_motion():
+    from ibrobot_msgs.action import ExecuteArmPose
+
+    server = object.__new__(PoseComposerNode)
+    server._blocked_task_poses = frozenset({"grasp_ready"})
+    arm = MockArm()
+    goal = Goal(SimpleNamespace(), arm)
+    result = server._execute_task_pose(goal, ExecuteArmPose.Result(), "grasp_ready", "", "policy_stream")
+    assert not result.success
+    assert result.error_code == "TASK_POSE_ROUTE_NOT_APPROVED"
+    assert not arm.moves

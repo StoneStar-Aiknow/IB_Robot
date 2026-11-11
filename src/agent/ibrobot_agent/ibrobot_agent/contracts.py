@@ -237,6 +237,8 @@ class AgentRequest:
     reply_to_request_id: str | None = None
     #: None: an ordinary request. ``conversation``: answer only (``REQUEST_ADMISSIONS``).
     admission: str | None = None
+    #: Idempotent wake event for the gift round; does not change conversation identity.
+    gift_wake_id: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.schema_version, bool) or self.schema_version != 1:
@@ -253,6 +255,8 @@ class AgentRequest:
             object.__setattr__(
                 self, "reply_to_request_id", _non_empty_text(self.reply_to_request_id, "reply_to_request_id")
             )
+        if self.gift_wake_id is not None:
+            object.__setattr__(self, "gift_wake_id", _non_empty_text(self.gift_wake_id, "gift_wake_id", max_length=128))
         if not isinstance(self.received_at, datetime):
             raise TypeError("received_at must be a datetime")
 
@@ -276,6 +280,7 @@ class AgentRequest:
             "received_at": self.received_at.isoformat(),
             "reply_to_request_id": self.reply_to_request_id,
             "admission": self.admission,
+            **({"gift_wake_id": self.gift_wake_id} if self.gift_wake_id is not None else {}),
         }
 
 
@@ -861,6 +866,8 @@ def request_hash_preimage(request: AgentRequest) -> dict[str, Any]:
     # Only when set, so every request hash recorded before the field existed still matches.
     if request.admission is not None:
         preimage["admission"] = request.admission
+    if request.gift_wake_id is not None:
+        preimage["gift_wake_id"] = request.gift_wake_id
     return preimage
 
 

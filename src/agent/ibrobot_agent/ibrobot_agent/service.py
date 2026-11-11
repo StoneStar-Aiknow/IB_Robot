@@ -10,13 +10,14 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
+from ibrobot_agent.answer_rules import AnswerRules
 from ibrobot_agent.continuation import (
     CONTINUE_REFUSED,
     ContinuationDecision,
@@ -30,6 +31,7 @@ from ibrobot_agent.contracts import (
     ASYNC_PRESENTATION_MODE,
     CATALOG_SKILL_NAMES_ZH,
     CONVERSATION_ADMISSION,
+    TERMINAL_REQUEST_STATES,
     AgentEvent,
     AgentRequest,
     CatalogPort,
@@ -52,6 +54,7 @@ from ibrobot_agent.contracts import (
     request_hash_text,
 )
 from ibrobot_agent.execution_feedback import execution_reply
+from ibrobot_agent.gift_state import GiftStateError, SQLiteGiftStateStore
 from ibrobot_agent.gift_workflow import fruit_label_zh
 from ibrobot_agent.planner import (
     _HYPOTHETICAL_MARKERS,
@@ -203,6 +206,9 @@ class AgentService:
         pose_preview: PosePreviewPort | None = None,
         pose_skills: frozenset[str] = frozenset({"free_pose"}),
         pose_memory: PoseMemoryPort | None = None,
+        workflow_planned: Callable[[tuple], None] | None = None,
+        answer_rules: Mapping[str, Any] | None = None,
+        gift_state: SQLiteGiftStateStore | None = None,
     ) -> None:
         if max_planning_workers != 1:
             raise ValueError("incubation node requires exactly one planning worker")
@@ -218,6 +224,11 @@ class AgentService:
         self._robot_scope = robot_scope
         self._fruit_delivery = fruit_delivery_from_config({"fruit_delivery": fruit_delivery})
         self._return_after_place = return_after_place
+        self._gift_state = gift_state
+        if gift_state is not None:
+            gift_state.recover_interrupted(robot_scope)
+        #: Wording and clarification policy; gift eligibility belongs to Agent state.
+        self._rules = AnswerRules(answer_rules, container_name=self._fruit_delivery.get("container_name", ""))
         # Utterance -> skill name. Empty by default: no phrase reaches the robot
         # without the planner unless a deployment opted it in.
         self._direct_commands = dict(direct_commands or {})
@@ -233,6 +244,9 @@ class AgentService:
         # Remembered poses: a confirmed one is recalled without planning, and the
         # user's save intent is interpreted by the existing planner.
         self._pose_memory = pose_memory
+        # Told the steps of a workflow as soon as they are validated, before the
+        # Gateway is asked; only for work that never moves the robot (pick_prefetch).
+        self._workflow_planned = workflow_planned
         self._pose_memory_identity = PlannerIdentity(
             route="pose_memory",
             returned_model="none",
@@ -299,6 +313,34 @@ class AgentService:
             raise RuntimeError("Agent planning worker did not stop")
         self._conversation.close()
         self._store.close()
+        if self._gift_state is not None:
+            self._gift_state.close()
+
+    @staticmethod
+    def _gift_scope(request) -> tuple[str, str, str]:
+        return request.robot_scope, request.channel_id, request.principal_id
+
+    def get_gift_state(self, scope: tuple[str, str, str]) -> dict:
+        if self._gift_state is None:
+            raise GiftStateError("GIFT_STATE_DISABLED", "gift state is not enabled")
+        if scope[0] != self._robot_scope:
+            raise GiftStateError("UNSUPPORTED_ROBOT", "robot scope is not bound")
+        return self._gift_state.get(scope)
+
+    def _gift_already_given_message(self) -> str:
+        return self._rules.lines.get("already_given", "这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。")
+
+    def reset_gift_round(self, scope: tuple[str, str, str], wake_id: str) -> dict:
+        with self._queue_condition:
+            current = self.get_gift_state(scope)
+            if current["round_id"] == wake_id:
+                return current
+            busy = any(
+                self._store.get_request(key).state not in TERMINAL_REQUEST_STATES for key in self._queued_or_active
+            )
+            if self._quarantined or busy:
+                raise GiftStateError("BUSY", "an active or unresolved request prevents a new gift round")
+            return self._gift_state.reset(scope, wake_id)
 
     def get_request(self, key: RequestKey):
         return self._store.get_request(key)
@@ -333,9 +375,19 @@ class AgentService:
             elif self._queued_or_active:
                 rejection = ("BUSY", "BUSY", "robot scope has an active request")
             else:
-                self._queued_or_active.add(key)
-                self._queue.append(request)
-                self._queue_condition.notify()
+                try:
+                    if self._gift_state is not None and request.gift_wake_id:
+                        self._gift_state.reset(self._gift_scope(request), request.gift_wake_id)
+                except GiftStateError as error:
+                    if error.code != "GIFT_STATE_UNRESOLVED":
+                        rejection = (error.code, "FAILED", str(error))
+                except Exception:
+                    self._quarantined = True
+                    rejection = ("GIFT_STATE_UNAVAILABLE", "UNKNOWN", "gift state storage is unavailable")
+                if rejection is None:
+                    self._queued_or_active.add(key)
+                    self._queue.append(request)
+                    self._queue_condition.notify()
         if rejection is not None:
             reason_code, state, message = rejection
             try:
@@ -416,6 +468,7 @@ class AgentService:
 
     def _plan_one_traced(self, request: AgentRequest) -> None:
         key = request.to_key()
+        gift_round = None
         try:
             record = self._store.begin_planning(key, expected_generation=0)
             cancel_token = threading.Event()
@@ -462,6 +515,11 @@ class AgentService:
                 "clarification": clarification,
                 "pending_pose_save": pending_save if pending_save.get("pose_id") else None,
             }
+            if self._gift_state is not None:
+                planner_context["gift_state"] = {
+                    **self.get_gift_state(self._gift_scope(request)),
+                    "already_given_message": self._gift_already_given_message(),
+                }
             if request.admission == CONVERSATION_ADMISSION:
                 # The planner is told, so it answers instead of proposing motion; the check
                 # after planning holds even when it does not listen.
@@ -501,21 +559,42 @@ class AgentService:
                         state="PLANNING",
                         detail_json=json.dumps({"step_count": len(replayed.steps)}, sort_keys=True),
                     )
+            session = InMemoryConversationStore._session_key(request)
+            replying = request.reply_to_request_id is not None
+            ruled = (
+                None
+                if replayed is not None or pending_save.get("pose_id")
+                else self._rules.before_planning(session, planned_request.text, replying=replying)
+            )
             query = (
-                None if replayed is not None or pending_save.get("pose_id") else read_only_outcome(planned_request.text)
+                None
+                if replayed is not None or ruled is not None or pending_save.get("pose_id")
+                else read_only_outcome(planned_request.text)
             )
             direct = (
                 None
-                if replayed is not None or query is not None or pending_save.get("pose_id")
+                if replayed is not None or ruled is not None or query is not None or pending_save.get("pose_id")
                 else direct_command_outcome(planned_request.text, self._direct_commands, catalog)
             )
             remembered = (
                 None
-                if replayed is not None or query is not None or direct is not None or pending_save.get("pose_id")
+                if replayed is not None
+                or ruled is not None
+                or query is not None
+                or direct is not None
+                or pending_save.get("pose_id")
                 else self._traced_pose_lookup(request, planned_request.text, catalog, planner_context)
             )
             planned_by = self._planner.identity
-            if remembered is not None:
+            if ruled is not None:
+                _trace.info("answer rule matched", extra={"request_id": request.request_id, "kind": ruled.kind})
+                outcome = ruled
+                planned_by = self._direct_identity
+                if ruled.kind == "workflow" and ruled.user_message in self._rules.lines.values():
+                    # The robot chose the fruit itself ("你帮我随便挑一个"): say so before the
+                    # delivery narration names it. The channel speaks previews as they come.
+                    self._emit_reply_preview(key, ruled.user_message, cancel_token)
+            elif remembered is not None:
                 # A confirmed remembered pose: the model is not asked; the Gateway still
                 # validates the workflow, and the composer still checks the pose.
                 outcome = remembered
@@ -544,7 +623,8 @@ class AgentService:
                             cancel_token,
                             # Storage claims are rendered only after the actual commit.
                             on_preview=None
-                            if pending_save.get("pose_id")
+                            # An answer the rules may still replace is not said ahead of them.
+                            if pending_save.get("pose_id") or self._rules.may_override(planned_request.text)
                             else lambda text: self._emit_reply_preview(key, text, cancel_token),
                         )
                 except Exception:
@@ -561,6 +641,26 @@ class AgentService:
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
+            if ruled is None and replayed is None:
+                outcome = self._rules.after_planning(session, request.text, outcome, replying=replying)
+            if gateway_error is None and replayed is None:
+                # A skill this catalog does not offer is refused aloud, not failed in silence.
+                outcome = self._rules.unsupported(catalog, outcome)
+            if self._gift_state is not None and outcome.kind == "workflow":
+                picks = sum(step.skill_name == "pick_object" for step in outcome.steps)
+                state = self.get_gift_state(self._gift_scope(request))
+                if picks > 1:
+                    outcome = PlannerOutcome(
+                        kind="conversation",
+                        user_message=self._rules.lines.get("only_one", "每轮只能选一份，请选一个水果。"),
+                    )
+                elif picks and state["status"] != "available":
+                    text = (
+                        self._gift_already_given_message()
+                        if state["status"] == "delivered"
+                        else "上一份礼物的状态还没有确认，请先完成当前任务。"
+                    )
+                    outcome = PlannerOutcome(kind="conversation", user_message=text)
             if (
                 request.admission == CONVERSATION_ADMISSION
                 and outcome.kind == "workflow"
@@ -587,6 +687,8 @@ class AgentService:
             if self._apply_pose_feedback(key, record.planning_generation, request, outcome, pending_save):
                 return
             if outcome.kind != "workflow":
+                if not outcome.missing_fields:
+                    self._rules.answered(session)
                 if outcome.kind == "read_only" and not status:
                     raise RuntimeError("Gateway is unavailable for read-only robot queries") from gateway_error
                 user_message = self._resolve_non_workflow_message(outcome, status, catalog)
@@ -618,6 +720,7 @@ class AgentService:
             self._validate_workflow(outcome, catalog)
             outcome = self._bind_step_schema_versions(outcome, catalog)
             outcome = self._bind_summary_to_catalog_names(outcome, catalog, pose_skills=self._pose_skills)
+            self._notify_workflow_planned(request.request_id, outcome.steps)
             if not self._preview_pose(key, record.planning_generation, request, outcome):
                 return
             if cancel_token.is_set():
@@ -643,13 +746,18 @@ class AgentService:
                 detail_json=json.dumps(proposal.to_dict(), ensure_ascii=False, sort_keys=True),
             )
             self._emit(key, "proposal_ready", "PROPOSAL_READY", outcome.summary)
+            self._rules.proposed(session, outcome)
             if not self._execution_enabled or self._execution is None:
                 self._finish_plan_without_execution(key, record.planning_generation, outcome.user_message)
                 return
+            if self._gift_state is not None and any(step.skill_name == "pick_object" for step in outcome.steps):
+                scope = self._gift_scope(request)
+                state = self.get_gift_state(scope)
+                gift_round = self._gift_state.reserve(scope, state["round_id"], request.request_id)
             record = self._store.mark_preparing(key, expected_generation=record.planning_generation)
             observe_progress = getattr(self._execution, "set_progress_callback", None)
             if observe_progress is not None:
-                observe_progress(lambda detail: self._execution_progress(key, detail))
+                observe_progress(lambda detail: self._execution_progress(key, detail, gift_round=gift_round))
             with trace_stage(_trace, "agent.execution", request_id=request.request_id):
                 execution_result = self._execution.execute(
                     proposal,
@@ -662,6 +770,22 @@ class AgentService:
                     ),
                     stop_event=cancel_token,
                     continues_from_execution_id=resume_execution_id(planner_context.get("continuation"), outcome.steps),
+                )
+            if gift_round is not None:
+                facts = execution_result.detail.get("execution_detail") or {}
+                delivered = execution_result.status == "succeeded" and any(
+                    step.skill_name == "place_in_container" for step in outcome.steps
+                )
+                safe_failure = (
+                    execution_result.status in {"failed", "cancelled"}
+                    and facts.get("recovery_state") in {"NOT_NEEDED", "COMPLETED"}
+                    and execution_result.detail.get("current_skill") != "return_to_task_pose"
+                )
+                self._gift_state.finish(
+                    self._gift_scope(request),
+                    gift_round["round_id"],
+                    request.request_id,
+                    "delivered" if delivered else "available" if safe_failure else "uncertain",
                 )
             if execution_result.status == "unknown":
                 current = self._store.get_request(key)
@@ -712,6 +836,14 @@ class AgentService:
                 self._quarantined = True
                 _LOGGER.exception("Could not persist Agent request failure for %s", request.request_id)
         finally:
+            if gift_round is not None:
+                try:
+                    self._gift_state.finish(
+                        self._gift_scope(request), gift_round["round_id"], request.request_id, "uncertain"
+                    )
+                except Exception:
+                    self._quarantined = True
+                    _LOGGER.exception("Could not persist gift execution state")
             with self._active_lock:
                 self._active.pop(key, None)
             with self._queue_condition:
@@ -999,6 +1131,14 @@ class AgentService:
         suffix = f"，另有 {remaining} 项。" if remaining else "。"
         return f"{prefix}：{'、'.join(visible)}{suffix}"
 
+    def _notify_workflow_planned(self, request_id: str, steps) -> None:
+        if self._workflow_planned is None:
+            return
+        try:
+            self._workflow_planned(tuple(steps))
+        except Exception:  # noqa: BLE001 - an optimisation only; the plan goes on
+            _LOGGER.exception("workflow_planned hook failed for %s", request_id)
+
     @staticmethod
     def _bind_catalog_targets(outcome: PlannerOutcome, catalog: Mapping[str, Any]) -> PlannerOutcome:
         """Resolve only unique explicit aliases; never guess a motion target."""
@@ -1186,7 +1326,10 @@ class AgentService:
         )
         self._emit(key, "failed", "FAILED", message)
 
-    def _execution_progress(self, key: RequestKey, detail: Mapping) -> None:
+    def _execution_progress(self, key: RequestKey, detail: Mapping, *, gift_round: dict | None = None) -> None:
+        if gift_round and detail.get("current_skill") == "place_in_container" and detail.get("state") == "SUCCEEDED":
+            # The gift is in the box even if a later step (the return to the task pose) fails.
+            self._gift_state.finish(self._gift_scope(key), gift_round["round_id"], key.request_id, "delivered")
         current = self._store.get_request(key)
         if current.terminal is not None:
             return

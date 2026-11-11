@@ -11,6 +11,7 @@ from launch_ros.actions import Node
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common import pose_composer_contract as POSE_COMPOSER
+from embodied_common import recorded_clips
 from embodied_common.motion_imitation_contract import perception_pause_settings
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
@@ -57,6 +58,12 @@ def delegated_grasp_execution(robot_config: dict[str, Any]) -> dict[str, Any]:
                 "duration_sec": motion.get("place_duration_sec", 5.0),
                 "velocity_scaling": motion.get("place_velocity_scaling", 0.08),
             }
+        perception = placement_execution.get("perception")
+        pipeline = grasp_execution.get("pipeline")
+        if isinstance(perception, dict) and isinstance(pipeline, dict) and pipeline.get("prefetch_perception") is True:
+            # A prefetching pick detects the place's container as the place would.
+            grasp_execution = dict(grasp_execution)
+            grasp_execution["container_perception"] = dict(perception)
     return grasp_execution
 
 
@@ -130,6 +137,18 @@ def apply_planner_base_url(robot_config: dict[str, Any], planner_base_url: str) 
     planner["base_url"] = url
 
 
+def _pick_prefetch_service(robot_config: dict) -> str:
+    """The pick executor's PrefetchGrasp service when its pipeline prefetches perception, else ''."""
+    if not runs_grasp_pipeline(robot_config):
+        return ""
+    grasp_execution = robot_config["grasp_execution"]
+    pipeline = grasp_execution.get("pipeline")
+    if not isinstance(pipeline, dict) or pipeline.get("prefetch_perception") is not True:
+        return ""
+    # manipulation_execution.grasp_pipeline_node.prefetch_service_name, beside the pick action.
+    return f"{str(grasp_execution.get('action_name', '/manipulation/execute_pick')).rstrip('/')}/prefetch"
+
+
 def _pose_memory_agent_params(robot_config: dict, common_params: dict) -> dict:
     composer = robot_config.get("pose_composer") or {}
     if not common_params.get("pose_composer_enabled"):
@@ -141,6 +160,37 @@ def _pose_memory_agent_params(robot_config: dict, common_params: dict) -> dict:
         if isinstance(memory, dict) and memory.get("enabled") is True
         else "",
     }
+
+
+def runtime_play_audio_clips(play_audio):
+    """Resolve legacy paths and manifest-backed candidate lists; manifest wins."""
+    resolved = {}
+    for name, value in (play_audio.get("clips") or {}).items():
+        paths = value if isinstance(value, list) else [value]
+        if not paths or any(not isinstance(path, str) or not path.strip() for path in paths):
+            raise ValueError(f"invalid clip paths: {name}")
+        resolved[name] = [str(Path(resolve_ros_path(path)).expanduser()) for path in paths]
+    if play_audio.get("clip_manifest"):
+        if not play_audio.get("clip_dir"):
+            raise ValueError("clip_manifest requires clip_dir")
+        resolved.update(
+            recorded_clips.clip_files(
+                recorded_clips.load_manifest(resolve_ros_path(play_audio["clip_manifest"])),
+                resolve_ros_path(play_audio["clip_dir"]),
+            )
+        )
+    if not resolved:
+        raise ValueError("runtime_play_audio needs clips or clip_manifest")
+    return resolved
+
+
+def runtime_spoken_clips(robot_config):
+    config = (robot_config.get("embodied") or {}).get("runtime_play_audio") or {}
+    if config.get("enabled") is not True or not config.get("clip_manifest"):
+        return {}
+    return recorded_clips.spoken_clips(
+        recorded_clips.load_manifest(resolve_ros_path(config["clip_manifest"])), resolve_ros_path(config["clip_dir"])
+    )
 
 
 def generate_embodied_nodes(
@@ -435,16 +485,7 @@ def generate_embodied_nodes(
     if isinstance(play_audio, dict) and play_audio.get("enabled") is True:
         # Recorded clips (the self-introduction): the catalog binds a clip name and
         # this deployment profile resolves it, so the skill carries no file path.
-        clips = play_audio.get("clips", {})
-        if not isinstance(clips, dict) or not clips:
-            raise ValueError("embodied.runtime_play_audio.clips must map clip names to file paths")
-        resolved_clips = {}
-        for clip_name, clip_path in clips.items():
-            if not isinstance(clip_name, str) or not str(clip_name).strip():
-                raise ValueError("embodied.runtime_play_audio.clips keys must be clip names")
-            if not isinstance(clip_path, str) or not clip_path.strip():
-                raise ValueError(f"embodied.runtime_play_audio clip {clip_name!r} must be a file path")
-            resolved_clips[clip_name] = str(Path(resolve_ros_path(clip_path)).expanduser())
+        resolved_clips = runtime_play_audio_clips(play_audio)
         common_params.update(
             runtime_play_audio_enabled=True,
             runtime_play_audio_service=str(play_audio.get("service", "/voice_tts/play")),
@@ -687,6 +728,10 @@ def generate_embodied_nodes(
                         "principal_id": agent_config.get("principal_id", "local_operator"),
                         "ledger_path": agent_config.get("ledger_path", ""),
                         "conversation_path": agent_config.get("conversation_path", ""),
+                        "gift_state_enabled": (agent_config.get("gift_state") or {}).get("enabled") is True,
+                        "gift_state_path": str(resolve_ros_path(agent_config["gift_state"]["path"]))
+                        if (agent_config.get("gift_state") or {}).get("path")
+                        else "",
                         "deployment_lock_path": agent_config.get("deployment_lock_path", ""),
                         "execution_enabled": agent_config.get("execution_enabled", False),
                         "max_session_turns": agent_config.get("max_session_turns", 12),
@@ -731,6 +776,8 @@ def generate_embodied_nodes(
                             "caller_token_env", "IBROBOT_EXECUTION_TOKEN_AGENT_INCUBATION_LOCAL_OPERATOR"
                         ),
                         "gateway_caller_token": agent_config.get("caller_token", ""),
+                        # Perceive the pick's target as soon as the plan names it (PrefetchGrasp).
+                        "pick_prefetch_service": _pick_prefetch_service(robot_config),
                         # Compose arm poses while the plan is prepared, so the presented pose is the one run.
                         "pose_compose_service": POSE_COMPOSER.COMPOSE_SERVICE
                         if common_params.get("pose_composer_enabled")
@@ -986,6 +1033,7 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         "response_topic": agent_config.get("response_topic", "/agent/response"),
         "event_topic": agent_config.get("event_topic", "/agent/event"),
         "control_topic": agent_config.get("control_topic", "/agent/control"),
+        "gift_reset_on_wake": (agent_config.get("gift_state") or {}).get("enabled") is True,
         "channel_id": agent_config.get("channel_id", "agent_incubation"),
         "principal_id": agent_config.get("principal_id", "local_operator"),
         "robot_scope": str(robot_config.get("name", "unknown")),
@@ -1111,6 +1159,24 @@ def _agent_voice_bridge_node(robot_config: dict, agent_config: dict, voice_bridg
         aliases = [alias for pose in pose_catalog(None, composer)["free_pose"] for alias in pose["aliases"]]
         lexicon = list(voice_bridge.get("semantic_gate_lexicon", []))
         params["semantic_gate_lexicon_json"] = json.dumps(list(dict.fromkeys([*lexicon, *aliases])), ensure_ascii=False)
+    spoken = runtime_spoken_clips(robot_config)
+    if spoken:
+        params["speech_clips_json"] = json.dumps(spoken, ensure_ascii=False)
+    for field in ("spoken_lines", "gift_messages", "tts_pronunciations"):
+        if field in voice_bridge:
+            params[field + "_json"] = json.dumps(voice_bridge[field], ensure_ascii=False)
+    if "pending_sentence_sec" in voice_bridge:
+        params["pending_sentence_sec"] = float(voice_bridge["pending_sentence_sec"])
+    placement = (robot_config.get("placement_execution") or {}).get("pipeline") or {}
+    if placement.get("verify_placement") is False:
+        params["gift_release_is_delivery"] = True
+    if "pick_object" in agent_config.get("test_allowlist", []):
+        lexicon = json.loads(params.get("semantic_gate_lexicon_json", "[]"))
+        delivery = (agent_config.get("planner") or {}).get("fruit_delivery") or {}
+        targets = ["柠檬", "苹果", "橙子", "橘子", "水果", "抓进", "放进", "放到", "拿到", "碗里"]
+        if delivery.get("container_label"):
+            targets.append(delivery["container_label"])
+        params["semantic_gate_lexicon_json"] = json.dumps(list(dict.fromkeys([*lexicon, *targets])), ensure_ascii=False)
     return Node(
         package="ibrobot_agent",
         executable="ibrobot_agent_voice_bridge",

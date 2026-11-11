@@ -1,44 +1,22 @@
-# AgiBot X2: voice, gestures, mirror and the pick-to-place workflow.
-#
-# Layered on aimdk_x2_voice_mirror_all for the voice agent, gestures, and mirror.
-# This profile maps gestures, grasp, placement, and mirror to the shared
-# policy_stream, and enables the perception services and the pick/place
-# delegated executors connected to the Orin's grasp head.
-#
-# This profile requires the three grasp model bundles on the 310P and the grasp
-# head on the Orin. Keep the models, Orin head, and robot preparation available
-# whenever this configuration is launched. This is the shared entry point on
-# both hosts; change the mounting settings below instead of copying this file.
+# Canonical voice, mirror and grasp entry recovered from the left-hand 310P deployment.
 robot:
   base_config: aimdk_x2_voice_mirror_all.yaml
   name: aimdk_x2_voice_mirror_grasp
-
-  # Release the mirror camera reader and stop new HRI model requests during pick/place.
-  # The grasp head's RGB-D capture and safety checks remain active.
   motion_imitation_stream:
     pause_during_manipulation: true
-
-  # pick_object declares moveit_planning. The catalog compiler only compiles the
-  # modes a deployment lists here, so without it the skill is silently dropped
-  # rather than mis-bound.
+    enabled: true
+    pause_during_robot_motion: true
   skill_supported_control_modes:
-    - named_motion
-    - model_inference
-    - moveit_planning
-
-  # Table-side grasp_ready and arms_rest, approved on this robot. The committed
-  # commissioning/fixed_poses.json is compiled against exactly these poses.
+  - model_inference
+  - moveit_planning
+  - named_motion
   task_poses:
     file: ../task_poses/x2_voice_mirror_grasp_approved.yaml
-    # Resolve open-hand requests from the explicit mounting declaration below.
-    # The same source poses support one or both hands without editing their angles.
     hands: installed
   pose_composer:
     enabled: true
-    # The 310P executes compiled targets without a MuJoCo installation. Compile
-    # this deployment asset with pose_compile_library --robot-config <this file>.
     mode: fixed
-    fixed_library: "$(env WORKSPACE)/commissioning/fixed_poses.json"
+    fixed_library: $(env WORKSPACE)/commissioning/fixed_poses_voice_mirror_grasp.json
     interfaces:
       trajectory:
         interface: joint.trajectory_arm
@@ -51,278 +29,627 @@ robot:
     memory:
       enabled: false
     path_validation:
-      # Commissioning policy: retain entry/endpoint checks, skip full-path checks.
-      hand: "off"
-      body: "off"
-
-  # MC-enforced travel, shared by the fixed compiler and the grasp backend.
-  # Matches aimdk_x2_grasp and the inherited mirror playback limits.
+      hand: 'off'
+      body: 'off'
+    blocked_task_poses: []
+    display_completion:
+      pose_ids:
+      - arms_forward
+      - arms_up
+      - arms_out
+      - arms_v
+      - flex
+      - surrender
+      - right_forward
+      - left_forward
+      mode: playback_only
   arm_limits:
-    left_shoulder_pitch_joint: [-3.0800, 2.0400]
-    left_shoulder_roll_joint: [-0.0610, 2.9930]
-    left_shoulder_yaw_joint: [-2.5560, 2.5560]
-    left_elbow_joint: [-2.3556, 0.0000]
-    left_wrist_yaw_joint: [-2.5560, 2.5560]
-    left_wrist_pitch_joint: [-0.5580, 0.5580]
-    left_wrist_roll_joint: [-1.5710, 0.7240]
-    right_shoulder_pitch_joint: [-3.0800, 2.0400]
-    right_shoulder_roll_joint: [-2.9930, 0.0610]
-    right_shoulder_yaw_joint: [-2.5560, 2.5560]
-    right_elbow_joint: [-2.3556, 0.0000]
-    right_wrist_yaw_joint: [-2.5560, 2.5560]
-    right_wrist_pitch_joint: [-0.5580, 0.5580]
-    right_wrist_roll_joint: [-0.7240, 1.5710]
-
+    left_shoulder_pitch_joint:
+    - -3.08
+    - 2.04
+    left_shoulder_roll_joint:
+    - -0.061
+    - 2.993
+    left_shoulder_yaw_joint:
+    - -2.556
+    - 2.556
+    left_elbow_joint:
+    - -2.3556
+    - 0.0
+    left_wrist_yaw_joint:
+    - -2.556
+    - 2.556
+    left_wrist_pitch_joint:
+    - -0.558
+    - 0.558
+    left_wrist_roll_joint:
+    - -1.571
+    - 0.724
+    right_shoulder_pitch_joint:
+    - -3.08
+    - 2.04
+    right_shoulder_roll_joint:
+    - -2.993
+    - 0.061
+    right_shoulder_yaw_joint:
+    - -2.556
+    - 2.556
+    right_elbow_joint:
+    - -2.3556
+    - 0.0
+    right_wrist_yaw_joint:
+    - -2.556
+    - 2.556
+    right_wrist_pitch_joint:
+    - -0.558
+    - 0.558
+    right_wrist_roll_joint:
+    - -0.724
+    - 1.571
   control_modes:
-    # Gestures, grasp, placement, and mirror share the vendor's upper-body stream
-    # so sequential skills do not switch between incompatible vendor modes.
     named_motion:
       runtime_mode: policy_stream
       inference:
         enabled: false
       executor:
         enabled: false
-    # The pick and place pipelines stream the configured arm and hand through
-    # their delegated executors, so the control-mode executor stays off. They and
-    # the mirror all use policy_stream and must not run concurrently.
     moveit_planning:
-      description: "Pick and place pipelines stream the configured arm and hand"
-      description_cn: "抓取和放置流水线流式控制配置的机械臂和灵巧手"
+      description: Pick and place pipelines stream the configured arm and hand
+      description_cn: 抓取和放置流水线流式控制配置的机械臂和灵巧手
       runtime_mode: policy_stream
       inference:
         enabled: false
       executor:
         enabled: false
-
-  # __append__ keeps the mirror's own services (yolox, pear): robot overlays
-  # append to a list instead of replacing it.
   perception_services:
     services:
       __append__:
-        # GroundingDINO returns boxes for a text prompt; SAM2 turns each box into
-        # a mask; GraspGen-X proposes grasps on the masked cloud. All three are
-        # required by the always-enabled grasp pipeline.
-        - id: grasp_grounding
-          enabled: true
-          required: true
-          bundle_path: models/grounding_dino_swint_seq8_1280x720
-          deployment: ascend_310p
-          adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
-          service_type: ibrobot_msgs/srv/GroundingDetect
-          endpoint: /perception/grasp/grounding_detect
-          node_name: grasp_grounding_detect
-          runtime_options:
-            device_id: 0
-        - id: grasp_segmentation
-          enabled: true
-          required: true
-          bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
-          deployment: ascend_310p
-          adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
-          service_type: ibrobot_msgs/srv/SegmentDetections
-          endpoint: /perception/grasp/segment_detections
-          node_name: grasp_segment_detections
-          runtime_options:
-            device_id: 0
-        - id: grasp_generation
-          enabled: true
-          required: true
-          bundle_path: models/graspgenx_omnihand_left_x2
-          # torch_npu, unlike the two above: the compiled 400-grasp diffusion
-          # loop runs on the NPU and its gripper description is what the planner
-          # mounts on the left palm.
-          deployment: torch_npu
-          adapter_class: perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin
-          service_type: ibrobot_msgs/srv/GenerateGrasps
-          endpoint: /perception/grasp/generate_grasps
-          node_name: grasp_generate_grasps
-
+      - id: grasp_grounding
+        enabled: true
+        required: true
+        bundle_path: models/grounding_dino_swint_seq8_1280x720
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
+        service_type: ibrobot_msgs/srv/GroundingDetect
+        endpoint: /perception/grasp/grounding_detect
+        node_name: grasp_grounding_detect
+        runtime_options:
+          device_id: 0
+      - id: grasp_segmentation
+        enabled: true
+        required: true
+        bundle_path: models/sam2.1_hiera_tiny_prompt_ascend
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
+        service_type: ibrobot_msgs/srv/SegmentDetections
+        endpoint: /perception/grasp/segment_detections
+        node_name: grasp_segment_detections
+        runtime_options:
+          device_id: 0
+      - id: grasp_generation
+        enabled: true
+        required: true
+        bundle_path: models/graspgenx_omnihand_left_x2
+        deployment: torch_npu
+        adapter_class: perception_service.model_service_plugins:GraspGenXGenerateGraspsPlugin
+        service_type: ibrobot_msgs/srv/GenerateGrasps
+        endpoint: /perception/grasp/generate_grasps
+        node_name: grasp_generate_grasps
   grasp_execution:
     enabled: true
     action_name: /manipulation/execute_pick
-    # Only compressed captures, masks, candidates, plans and the watch's status
-    # cross to the Orin; the vendor forbids subscribing raw camera streams
-    # across compute units.
-    backend: "aimdk_grasp.remote_head:x2_remote_grasp_backends"
+    backend: aimdk_grasp.remote_head:x2_remote_grasp_backends
     held_lease_s: 30.0
     model_deployment: torch_npu
-    model_bundle_path: "$(env WORKSPACE)/models/graspgenx_omnihand_left_x2"
+    model_bundle_path: $(env WORKSPACE)/models/graspgenx_omnihand_left_x2
     command_interfaces:
-      - joint.arm_stream
-      - joint.hand_stream
+    - joint.arm_stream
+    - joint.hand_stream
     backend_options:
-      # Both hands are mounted; select the arm from the target's position.
-      # Left hand only: installed_hands: [left], arm_side: left.
-      # Keep this block identical on the 310P and Orin. Recompile the fixed
-      # artifact after changing mounting or task poses; their digest is frozen.
-      installed_hands: [left, right]
-      arm_side: auto
-      # The workflow returns the arms (embodied.agent.planner.return_after_place).
+      installed_hands:
+      - left
+      arm_side: left
       place:
         plan_return_home: false
       planning:
         approach_over_height_m: 0.18
-        approach_order_m: [0.10, 0.15, 0.07, 0.05]
+        approach_order_m:
+        - 0.1
+        - 0.15
+        - 0.07
+        - 0.05
         carry_lift_m: 0.15
       detect_service: /perception/grasp/grounding_detect
       generate_grasps_service: /perception/grasp/generate_grasps
       segment_service: /perception/grasp/segment_detections
-      # Halt the approach when the target moves, and replan once it is back.
       watch: stop
-      # Measured on the robot (123 armed executions): frames every 0.21 s,
-      # p99 0.47 s; the hand hid the target for up to 2.62 s at the end of the
-      # grasp segment, so the timeout is well above the median gap.
       watch_frame_timeout_s: 1.0
       watch_unknown_timeout_s: 4.0
+      watch_occluded_timeout_s: 8.0
       watch_image_age_s: 0.5
       head:
         namespace: /x2_grasp_head
         status_timeout_s: 1.0
         cpu_isolation:
-          node: "4-7"
-          others: "1-3"
+          node: 4-7
+          others: 1-3
     pipeline:
       release_after_success: true
       max_attempts: 3
       max_regrasps: 1
       execute_reserve_s: 50.0
-      # Open the hand while the Orin plans (~0.6 s off every pick).
       prefetch_preshape: true
-
+      prefetch_perception: true
   placement_execution:
     enabled: true
     executor: placement_pipeline
-    required_args: [target_name, container_name]
+    required_args:
+    - target_name
+    - container_name
     action_name: /manipulation/execute_place
-    backend: "aimdk_grasp.remote_head:x2_remote_place_backends"
+    backend: aimdk_grasp.remote_head:x2_remote_place_backends
     perception:
-      # Candidate supported by the saved basket/table detection comparison.
-      box_threshold: 0.50
+      box_threshold: 0.5
     pipeline:
       max_attempts: 2
-      # The summit bowl has a slide: a correctly placed fruit leaves the bowl, so
-      # "is it in the bowl" fails every good place. The confirmed release decides.
       verify_placement: false
-
-  # Local Oula text wake is enabled; speaker checking stays off by default.
   voice_asr:
-    # X-ASR is the model used by this combined deployment. It does not support
-    # the domain hotwords inherited from the older voice-only entry.
     bundle_path: models/voice_asr/sherpa-onnx-x-asr-480ms-streaming-zipformer-transducer-zh-en-int8-2026-06-05
     deployment: torch_cpu
-    hotwords_file: ""
+    hotwords_file: ''
     external_finalize_on_idle: true
     speaker_embedding:
-      enabled: false
+      enabled: true
       bundle_path: models/campplus-speaker
       deployment: torch_cpu
       min_speech_seconds: 1.0
       max_speech_seconds: 6.0
       idle_timeout_sec: 1.2
-
+      window_hop_seconds: 1.0
+    input_mode: shared_audio
+    active_mode: continuous
+    audio_input:
+      interface: audio.capture
+      type: audio_common_msgs/msg/AudioDataStamped
+    vad_bundle_path: models/silero-vad
+    vad_deployment: torch_cpu
+    audio_input_channel: 0
   embodied:
-    # The profile exposes pick_object and place_in_container together with the
-    # delegated executors registered by grasp_execution and placement_execution.
     skill_catalog_profile: aimdk_x2_voice_mirror_grasp
     agent:
-      # Override the address with planner_base_url at launch on another bench.
       planner:
         base_url: http://10.42.0.233:8080/v1
         model: qwen3.8-flash-next-iq3_s
         api_key_env: X2_PLANNER_API_KEY
         enable_thinking: false
-        # Every delivery ends back at the task pose: the place stops at its retreat.
         return_after_place: grasp_ready
         extra_body:
           chat_template_kwargs:
             enable_thinking: false
+        fruit_delivery:
+          container_name: a black bowl
+          container_label: 黑色的碗
+        deployment_facts:
+        - 机器人的名字是欧拉，和操作系统 openEuler 同音。
+        - 这里是 OpenEuler Summit 操作系统大会，地点是北京中关村国际创新中心。
+        - IB-Robot 的全称是 Intelligence BooM Robot。
+        - 本次展示的是 openEuler 开源社区开发的软件；软件开源，可以下载，运行在很多机器人本体上。机器人本体由社区伙伴提供，不要说成是本体的制造商，也不要说是华为团队开发的。
+        - 第一次问价格：展示的是开源软件，可以扫旁边的代码仓库二维码了解；追问本体价格：本体是社区伙伴提供的，具体多少钱我们也不清楚。
+        - 代码仓库：扫旁边的二维码。
+        - 机器人基于 openEuler 开发（openEuler Embedded），openEuler 是基于 Linux 的发行版；芯片是昇腾 310P。
+        - 照镜子：通过头部摄像头识别人体姿态，实时跟随手臂动作，只学手臂，学不了腿；体验中会自动留图，结束后自己选。
+        - 礼物：柠檬、苹果、橙子三选一，礼物藏在水果里；每次有效唤醒欧拉欧拉开始新领取轮次，每轮送一份，重新唤醒可以再领；水果放进碗里，顺着滑道滑到领取盒，由参观者自己拿；不能扔，不能递到手里；没确认送到之前先别取。
+        - 现场的水果是道具，不能吃。
+        - 机器人主要说中文。
+        - 安全：不做不会伤害人这类保证，请按现场提示互动。
+        - 机器人没有接入日期、时间和天气查询：回答暂时查不到，不说没联网。
+        - 机器人没有生日，也没有星座；不要用自我介绍代替这个回答。
+        - 防水能力和防护等级没有厂商确认资料，明确说不清楚，请勿让机器人碰水。
+        - 身体接触（拥抱、触摸、亲吻、握手、搀扶）出于安全暂不支持：直接说明，不得用飞吻、挥手或其他动作代替；访客明确要飞吻、挥手时照常做。
+        clarification_lines:
+          not_heard: 啊？没听清，玩模仿还是选水果呀？
+          fruit_name: 要柠檬、苹果还是橙子呀？
+          confirm_pick: 可以呀，现在就给你拿吗？
+          recommend: 每个都有礼物哦，要我帮你挑吗？
+        answer_rules:
+          contact_replies:
+          - 出于安全考虑，我暂时不支持这类肢体接触哦。
+          - 为了安全，这类身体接触的互动暂时还不支持哦。
+          - 这类接触互动暂时不支持，我们可以聊聊天。
+          unavailable_fruit_skill: fruit_not_available
+          unsupported_skill: decline_unsupported
+          lines:
+            only_one: 嘿嘿，这轮只能选一份哦～
+            already_given: 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。
+            confirm_pick: 可以呀，现在就给你拿吗？
+            recommend: 每个都有礼物哦，要我帮你挑吗？
+            random_pick: 每个都有礼物，我帮你挑一个！
+            confirm_delivery: 不能直接递给你哦，我放进碗里，滑到领取盒你自己拿，可以吗？
+          non_fruit_skill: decline_personal_item
+          repeat_skills:
+            answer_price: answer_body_price
+        direct_commands:
+          你好: greet_visitor
+          你好呀: greet_visitor
+          自我介绍: self_introduction
+          介绍一下你自己: self_introduction
+          你是谁: self_introduction
+          欢迎: greet_visitor
+          介绍一下芯片和系统: introduce_platform
+          你的Agent有什么用: introduce_agent
+          随便玩一下: invite_visitor
+          开始照镜子: mirror_start
+          停止照镜子: mirror_stop
+          动作模仿: mirror_start
+          跟着我做: mirror_start
+          学我的动作: mirror_start
+          有什么水果: offer_fruit_menu
+          有什么礼物可以选: offer_fruit_menu
+          我想选水果礼物: offer_fruit_menu
+          我要水果: offer_fruit_menu
+          选水果: offer_fruit_menu
+          你的大脑是怎么工作的: introduce_agent
+          礼物是什么: explain_gift
+          我去哪里拿: explain_pickup
+          可以拿了吗: ask_wait_for_delivery
+          这个水果能吃吗: explain_fruit_prop
+          你叫什么名字: tell_name
+          IB Robot是什么意思: explain_ib_robot
+          IBROBOT是什么意思: explain_ib_robot
+          是谁把你做出来的: tell_origin
+          你开源吗: explain_open_source
+          你多少钱一台: answer_price
+          本体多少钱: answer_body_price
+          你的代码在哪里: tell_code_repo
+          这是什么大会: tell_event
+          你在哪儿: tell_venue
+          你在哪个城市: tell_venue
+          你会做什么: list_capabilities
+          你能干什么: list_capabilities
+          你能给我拍照吗: explain_photo
+          你能说英语吗: answer_language
+          今天是几号: answer_unknown_info
+          照镜子怎么玩: explain_mirror_game
+          你还在吗: chat_present
+          你累不累: chat_tired
       voice_bridge:
         addressee_trigger: wake_phrase
-        # Remove wake_phrases to accept speech without a wake prefix.
-        # Speaker checks require both speaker flags, CAMPPlus, and a verified
-        # continuous vendor speech stream.
-        # Exact ASR prefixes: pairs of 欧拉 / 欧啦 / 鸥拉 / 偶拉.
         wake_phrases:
-          - 欧拉欧拉
-          - 欧拉欧啦
-          - 欧拉鸥拉
-          - 欧拉偶拉
-          - 欧啦欧拉
-          - 欧啦欧啦
-          - 欧啦鸥拉
-          - 欧啦偶拉
-          - 鸥拉欧拉
-          - 鸥拉欧啦
-          - 鸥拉鸥拉
-          - 鸥拉偶拉
-          - 偶拉欧拉
-          - 偶拉欧啦
-          - 偶拉鸥拉
-          - 偶拉偶拉
+        - 欧拉欧拉
+        - 欧拉欧啦
+        - 欧拉鸥拉
+        - 欧拉偶拉
+        - 欧啦欧拉
+        - 欧啦欧啦
+        - 欧啦鸥拉
+        - 欧啦偶拉
+        - 鸥拉欧拉
+        - 鸥拉欧啦
+        - 鸥拉鸥拉
+        - 鸥拉偶拉
+        - 偶拉欧拉
+        - 偶拉欧啦
+        - 偶拉鸥拉
+        - 偶拉偶拉
         wake_window_sec: 60.0
-        speaker_check_enabled: false
-        speaker_min_similarity: 0.60
-        speaker_merge_margin: 0.10
+        speaker_check_enabled: true
+        speaker_min_similarity: 0.45
+        speaker_merge_margin: 0.1
         speaker_max_age_sec: 6.0
         speaker_reject_short: true
         measurement_grace_sec: 1.5
-      test_allowlist:
-        - wave_hand
-        - handshake
-        - raise_hand
-        - blow_kiss
-        - clap_hands
-        - mirror_start
-        - mirror_stop
+        persistent_session: true
+        spoken_lines:
+          gesture_start: 好呀，看我的！
+          gesture_done: 搞定啦！
+          busy: 等一下下，我还在忙呢～
+          busy_pick: 已经在拿啦，这次改不了哦～
+          speech_stopped: 好嘞～
+          wake_ack: 我在呢！
+          wake_hint: 要找我，先叫欧拉欧拉哦～
+        gift_messages:
+          F05: 好嘞，给你拿{fruit}！
+          F08: 拿到了，我把它送到领取盒。
+          F12: 哎呀，这次没成功，我再试一下。
+          verifying: 我再确认一下，稍等。
+          placed: 耶，礼物到啦！去领取盒拿吧～
+          place_ended: 礼物还没到，先别取，工作人员来帮忙。
+          pick_failed: 还是没成功，请工作人员帮我一下。
+          place_failed: 还是没成功，请工作人员帮我一下。
+          E06: 请先别靠近，工作人员正在处理。
+          cancelled: 已经停下了。请先走出体验区。
+          completed: 好啦，这次任务完成啦！
+          ended: 任务已结束，请工作人员确认现场状态。
+        pending_sentence_sec: 10.0
+        tts_pronunciations:
+          openEuler Embedded: 欧喷欧拉嗯贝迪德
+          OpenEuler Summit: 欧喷欧拉萨米特
+          Intelligence BooM Robot: 因特利真斯布姆肉波特
+          IB-Robot: 爱比肉波特
+          IB Robot: 爱比肉波特
+          openEuler: 欧喷欧拉
+          Linux: 林纳克斯
+          Agent: 艾振特
+          310P: 三一零皮
+          Summit: 萨米特
+        speaker_split_enabled: true
+        speaker_split_owner_similarity: 0.45
+        speaker_split_other_similarity: 0.25
+        semantic_gate_model_path: $(env WORKSPACE)/models/addressee/addressee_zh_v2.json
+        semantic_gate_fail_open: false
+        semantic_gate_conversation: true
+        semantic_gate_followup_sec: 20.0
+        text_corrections:
+          Agent:
+          - A准
+          openEuler:
+          - OPEN USER
+          - OPENUSER
+          - Open User
+          - open user
+        text_rewrites:
+        - - ^作为一个(.{1,6})的动作$
+          - 做一个\1的动作
+        semantic_gate_wake_prefixes:
+          __append__:
+          - 欧拉欧拉
+          - 欧拉
+          - 乌拉乌拉
+          - 呼啦呼啦
+        semantic_gate_dialogue_requests:
+          __append__:
+          - 作首诗
+          - 写首诗
+          - 做首诗
+          - 再讲一个
+          - 自我介绍
+          - 介绍一下你自己
+          - 你是谁
+          - 介绍一下芯片和系统
+          - 你的Agent有什么用
+          - 随便玩一下
+        semantic_gate_lexicon:
+          __append__:
+          - 能抓任何东西吗
+          - 什么都能抓吗
+          - 你能拿什么
+          - 摆个姿势
+          - 手伸直
+          - 双手举起来
+          - 双臂放下
+          - 手放下
+          - 弯曲手臂
+          - 叉腰
+          - 你好
+          - 你好呀
+          - 打个招呼
+          - 跟大家打招呼
+          - 欢迎一下
+          - Agent有什么用
+          - 你聪明在哪
+          - 你的智能体是干什么的
+          - 详细介绍一下
+          - 详细介绍一下你自己
+          - 详细讲一下原理
+          - 用什么芯片
+          - 什么芯片
+          - 什么系统
+          - 你的系统是什么
+          - 你用的是什么系统
+          - 邀请选择玩法
+          - 随便玩一下
+          - 我想体验一下
+          - 动作模仿
+          - 照镜子
+          - 跟着我做
+          - 学我的动作
+          - 选水果
+          - 水果礼物
+          - 我要水果
+          - 有什么水果
+          - 柠檬
+          - 苹果
+          - 橙子
+          - 橘子
+          - 水果
+          - 全都要
+          - 要两个
+          - 帮我选一个
+          - 你帮我选
+          - 帮我挑一个
+          - 随便挑一个
+          - 随便拿一个
+          - 推荐一个
+        silent_skills:
+        - greet_visitor
         - self_introduction
-        - pick_object
-        - free_pose
-        - return_to_task_pose
-        - place_in_container
+        - introduce_platform
+        - introduce_agent
+        - introduce_in_detail
+        - explain_pick_scope
+        - offer_fruit_menu
+        - invite_visitor
+        - explain_mirror_how
+        - explain_pick_how
+        - decline_unsupported
+        - one_game_at_a_time
+        - fruit_not_available
+        - decline_personal_item
+        - explain_delivery_rule
+        - explain_gift
+        - explain_pickup
+        - ask_wait_for_delivery
+        - explain_fruit_prop
+        - tell_name
+        - explain_ib_robot
+        - tell_origin
+        - explain_open_source
+        - answer_price
+        - answer_body_price
+        - tell_code_repo
+        - tell_event
+        - tell_venue
+        - answer_linux
+        - explain_eyes
+        - explain_ears
+        - explain_planning
+        - list_capabilities
+        - explain_arms_only
+        - explain_photo
+        - answer_language
+        - answer_safety
+        - answer_unknown_info
+        - explain_mirror_game
+        - chat_thanks
+        - chat_tease
+        - chat_slow
+        - chat_tired
+        - chat_food
+        - chat_present
+        - chat_not_understood
+        - chat_dont_know
+        stop_phrases:
+        - 别动了
+        - 别动
+        - 停止
+        - 停下
+        - 停
+        - stop
+        - halt
+        - 不玩了
+        - 不拿了
+        - 别拿了
+        - 不要了
+        - 算了不要了
+        speech_mode: concise
+        speech_messages:
+          start: 好，我这就去拿，请稍等。
+          waiting: 我正在确认水果的位置，请先别移动桌上的物品。
+          recover: ''
+          recovered: ''
+          retry: 哎呀，这次没成功，我再试一下。
+          retry_recovered: 哎呀，这次没成功，我再试一下。
+          retry_EMPTY_GRASP: 哎呀，这次没成功，我再试一下。
+          retry_TARGET_NOT_VISIBLE: 哎呀，这次没成功，我再试一下。
+          retry_TARGET_MOVED: 水果的位置变了，我重新确认一下。
+          success: 成功拿到啦！小礼物请找旁边的工作人员领取。
+          completed: 成功拿到啦！小礼物请找旁边的工作人员领取。
+          canceled: 已经停下了。请先走出体验区。
+          not_started: 好的，这次先不拿。
+          unknown: 请先别靠近，工作人员正在处理。
+          recovery_failed: 请先别靠近，工作人员正在处理。
+          manual_check: 这次没有完成，请工作人员帮我看看。
+          failed: 还是没成功，请工作人员帮我一下。
+          reason_INVALID_TARGET: 要柠檬、苹果还是橙子呀？
+          reason_TARGET_NOT_VISIBLE: 我没看到这个水果，请工作人员帮我看看。
+          reason_OUT_OF_REACH: 还是没成功，请工作人员帮我一下。
+          reason_NO_COMPLETE_PATH: 还是没成功，请工作人员帮我一下。
+          reason_NO_EXECUTABLE_CANDIDATE: 还是没成功，请工作人员帮我一下。
+          reason_PLAN_TIMEOUT: 还是没成功，请工作人员帮我一下。
+          reason_OBSERVATION_UNAVAILABLE: 还是没成功，请工作人员帮我一下。
+          reason_REOBSERVE_REQUIRED: 还是没成功，请工作人员帮我一下。
+          reason_TARGET_MOVED: 还是没成功，请工作人员帮我一下。
+          reason_EMPTY_GRASP: 还是没成功，请工作人员帮我一下。
+          reason_GRIP_LOST: 还是没成功，请工作人员帮我一下。
+          reason_GRASP_VERIFICATION_FAILED: 还是没成功，请工作人员帮我一下。
+          reason_EXECUTION_BUDGET_INSUFFICIENT: 还是没成功，请工作人员帮我一下。
+        semantic_gate_log_path: log/agent_interaction/semantic_gate.jsonl
+        require_verified_speech: true
+        semantic_gate_mode: enforce
+      test_allowlist:
+      - wave_hand
+      - raise_hand
+      - blow_kiss
+      - clap_hands
+      - greet_visitor
+      - self_introduction
+      - introduce_platform
+      - introduce_agent
+      - introduce_in_detail
+      - explain_pick_scope
+      - offer_fruit_menu
+      - mirror_start
+      - mirror_stop
+      - pick_object
+      - place_in_container
+      - return_to_task_pose
+      - invite_visitor
+      - free_pose
+      - explain_mirror_how
+      - explain_pick_how
+      - decline_unsupported
+      - one_game_at_a_time
+      - fruit_not_available
+      - decline_personal_item
+      - explain_delivery_rule
+      - explain_gift
+      - explain_pickup
+      - ask_wait_for_delivery
+      - explain_fruit_prop
+      - tell_name
+      - explain_ib_robot
+      - tell_origin
+      - explain_open_source
+      - answer_price
+      - answer_body_price
+      - tell_code_repo
+      - tell_event
+      - tell_venue
+      - answer_linux
+      - explain_eyes
+      - explain_ears
+      - explain_planning
+      - list_capabilities
+      - explain_arms_only
+      - explain_photo
+      - answer_language
+      - answer_safety
+      - answer_unknown_info
+      - explain_mirror_game
+      - chat_thanks
+      - chat_tease
+      - chat_slow
+      - chat_tired
+      - chat_food
+      - chat_present
+      - chat_not_understood
+      - chat_dont_know
+      gift_state:
+        enabled: true
+      # Lifecycle helpers launch from the workspace root; state paths are relative to it.
+      ledger_path: log/agent_interaction/state/requests.sqlite3
+      conversation_path: log/agent_interaction/state/conversation.sqlite3
+      deployment_lock_path: log/agent_interaction/state/agent.lock
     runtime_play_audio:
       clips:
-        self_intro: "$(env WORKSPACE)/commissioning/audio/self_introduction.wav"
-
-  # The Agent owns spoken interaction, so the mirror's own phrases stay off. The
-  # physical triggers (double cover, long cover, head touch, the session timeout)
-  # are the operator's, inherited from aimdk_x2_voice_mirror_all.yaml.
+        self_intro: $(env WORKSPACE)/commissioning/audio/self_introduction.wav
+      clip_manifest: $(env WORKSPACE)/commissioning/audio/summit_clips.yaml
+      clip_dir: $(env WORKSPACE)/commissioning/audio/summit
+    runtime_named_motion:
+      hand_preparation:
+        factory: aimdk_grasp.hand_restore_ros:create_named_motion_hand_preparer
+        motions:
+        - wave
+        - raise_hand
+        - blow_kiss
+        - clap
+    execution_store_path: log/agent_interaction/state/executions.sqlite3
   mirror_session:
     voice:
-      enabled: false
-
-# Runtime prerequisites for pick_object: the model bundles configured above
-# must be installed on the 310P, and the matching grasp head must run on the
-# Orin. Before each request, put the platform in URS. The task preparation
-# stage moves both arms to grasp_ready and opens the installed hands before perception.
-# The packaged table-side pose remains unapproved for hardware; provide a locally
-# calibrated and approved task pose file before hardware deployment.
-# Grasp executor HOME and mirror reset are independent of grasp_ready.
-# A changed hand shape can rebuild the cuRobo planner on the Orin (~50 s)
-# and consume the request budget.
-#
-# Stop the mirror session before a pick. Pick/place and mirror share
-# policy_stream, so mode switching alone does not arbitrate concurrent arm
-# commands. Adjacent pick/place steps retain custody until placement releases
-# the object; a standalone pick keeps its normal put-back behavior.
-
-  # feat/x2-cbf-safety
-  # Grasp and mirror share policy_stream + joint.arm_stream without arm_owner.
-  # The data plane cannot distinguish them, so this profile must not inherit CBF.
+      enabled: true
+    enabled: true
   cbf_safety:
     enabled: false
-  # /feat/x2-cbf-safety
-
-  # feat/x2-internvl-voice
-  # Off here: this profile turns the mirror's voice off (mirror_session.voice
-  # above), so nothing would speak the clips, and the InternVL look would load
-  # its models on the 310P next to the grasp models. Without this block the
-  # look node is inherited from aimdk_x2_voice_mirror_all.yaml and starts.
+    hands_installed:
+    - true
+    - true
   internvl_voice:
-    enabled: false
-  # /feat/x2-internvl-voice
-
-  # feat/x2-preset-motions
+    enabled: true
   preset_motions:
     enabled: false
     motion_enabled: false
-  # /feat/x2-preset-motions
+  runtime:
+    cancel_return_motions: wave,short_wave,invite,self_intro,explain
+    profile: commissioning/profiles/x2_ultra_omnihand_external.yaml
+  default_control_mode: model_inference
+  skill_required_control_mode: model_inference

@@ -1,0 +1,46 @@
+# Generated from commissioning/audio/summit_clips.yaml (W09); edit the aliases here.
+schema_version: 1
+name: decline_unsupported
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot cannot do this request yet.
+  category: social_interaction
+  when_to_use:
+  - 'the visitor asks for something the robot cannot do: sing, write a poem, tell a story, hug, imitate an animal, browse the web'
+  do_not_use:
+  - condition: the visitor asks to imitate leg or whole-body moves
+    instead_use: explain_arms_only
+  - condition: the visitor asks what the robot can do
+    instead_use: list_capabilities
+  aliases_zh:
+  - 唱首歌
+  - 讲个故事
+  - 作首诗
+  - 写首诗
+  - 拥抱一下
+  - 抱抱我
+  - 模仿青蛙
+  - 模仿小动物
+  - 看小红书
+  aliases_en:
+  - sing a song
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.6
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot cannot do this request yet. Use for 唱首歌.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

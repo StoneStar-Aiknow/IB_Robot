@@ -1,0 +1,36 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q22); edit the aliases here.
+schema_version: 1
+name: explain_ears
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the robot hears through its microphone.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks how the robot hears them
+  aliases_zh:
+  - 你为什么能听见我说话
+  - 你怎么听见的
+  - 你有耳朵吗
+  - 你用什么听
+  aliases_en:
+  - how do you hear me
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.9
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the robot hears through its microphone. Use for 你为什么能听见我说话.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

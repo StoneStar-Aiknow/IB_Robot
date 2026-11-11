@@ -65,8 +65,10 @@ description_variants:
       pick_object(target_name "an apple") then place_in_container(target_name "an apple",
       container_name "a basket"). An object picked by an earlier request has already been put back.
       Use short English phrases for target_name and container_name.
-      When deployment fruit_delivery is configured, use its container_name verbatim for the fruit gift,
-      not the example basket. Never infer that an orange-colored container is the fruit target.
+      The user's explicitly requested container takes priority: preserve its color, material and position.
+      Use deployment fruit_delivery.container_name only when the user specifies no destination, not the
+      example basket. Ask about an ambiguous container. If the requested container is not found, report
+      failure or ask the user; never substitute the default. Never confuse a container color with the fruit target.
     category: placement
     when_to_use:
     - place the object just picked into a visible container

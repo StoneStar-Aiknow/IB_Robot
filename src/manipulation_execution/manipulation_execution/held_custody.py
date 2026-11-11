@@ -83,6 +83,7 @@ class HeldCustody:
         self._unknown_since = None
         self._settled_since = None
         self.root_task_id = ""
+        self.container = None
         self.manual_reset = None
 
     @property
@@ -90,8 +91,11 @@ class HeldCustody:
         with self.lock:
             return self.state in {"picked", "claimed", "recovering", "uncertain"}
 
-    def accept(self, held, *, recover, release, holding, root_task_id="", drop=None, settled=None):
+    def accept(self, held, *, recover, release, holding, root_task_id="", drop=None, settled=None, container=None):
         """``drop`` opens the hand and takes it home after an unclaimed object falls; True when it did.
+
+        ``container`` (grasp_pipeline.prefetch.PrefetchedContainer or None) is the
+        following place's container detected on the pick's capture; a claim hands it over.
 
         ``settled`` tells whether the hand is open and empty and the arm is back
         at ``held.home_positions``. After a drop whose hand opened but whose way
@@ -104,6 +108,7 @@ class HeldCustody:
             self.held, self.recover, self.release, self.holding = held, recover, release, holding
             self.drop, self.settled = drop, settled
             self.root_task_id = root_task_id
+            self.container = container
             self.state, self.owner, self.reason, self.token = "picked", "pick", "", ""
             self.deadline, self._unknown_since, self._settled_since = self.clock() + self.lease_s, None, None
             self.recovery_report = None
@@ -297,6 +302,20 @@ def _released(result) -> bool:
     return isinstance(result, dict) and "release" in (result.get("completed") or ())
 
 
+def container_msg(container):
+    """``ibrobot_msgs/PrefetchedContainer`` for a claim (empty query when nothing was prefetched)."""
+    from sensor_msgs.msg import Image
+
+    from ibrobot_msgs.msg import PrefetchedContainer
+
+    from .grasp_pipeline.prefetch import container_to_msg, encode_mask
+
+    try:
+        return container_to_msg(container, PrefetchedContainer, encode_mask=encode_mask, image_class=Image)
+    except Exception:  # noqa: BLE001 - the place detects the container itself
+        return PrefetchedContainer()
+
+
 class HeldCustodyServer:
     def __init__(self, node, *, lease_s=30.0):
         from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
@@ -383,6 +402,7 @@ class HeldCustodyServer:
             )
             response.success, response.claim_token = True, token
             response.held_object = held_to_msg(held, state="claimed", owner=request.claimant)
+            response.container = container_msg(getattr(self.custody, "container", None))
         except GraspFailure as failure:
             response.reason_code = failure.code
         return response

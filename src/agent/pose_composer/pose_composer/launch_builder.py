@@ -56,6 +56,7 @@ _KEYS = frozenset(
         "interfaces",
         "path_validation",
         "display_completion",
+        "blocked_task_poses",
     }
 )
 _MEMORY_KEYS = frozenset({"enabled", "path", "max_poses", "candidate_ttl_days", "seeds"})
@@ -243,6 +244,7 @@ def generate_pose_composer_nodes(robot_config: dict, *, use_sim: bool | None = N
                         "runtime_profile": str(profile),
                         "arm_limits_json": json.dumps(robot_config.get("arm_limits")),
                         "task_poses_json": json.dumps(robot_config.get("task_poses") or {}, sort_keys=True),
+                        "blocked_task_poses": list(config.get("blocked_task_poses") or [""]),
                         "task_pose_simulation": bool(robot_config.get("use_sim", False))
                         if use_sim is None
                         else use_sim,

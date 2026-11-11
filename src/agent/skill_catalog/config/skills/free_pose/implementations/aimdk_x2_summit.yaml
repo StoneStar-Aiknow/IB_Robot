@@ -1,0 +1,8 @@
+schema_version: 1
+kind: delegated_executor
+robot: aimdk_x2_summit
+executor: pose_composer
+required_args:
+- target_name
+# Composition (when not prepared with the plan) plus the longest planned path.
+timeout_sec: 90.0

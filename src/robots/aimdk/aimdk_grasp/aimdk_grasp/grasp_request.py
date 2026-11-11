@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 
 import numpy as np
 
@@ -39,6 +40,7 @@ from manipulation_execution.grasp_pipeline.contracts import (
 from .arm_gravity import ArmGravity, require_executable
 from .grasp_session import check_approach_order
 from .hand import OPEN_HAND_TOLERANCE_RAD, THUMB_ABAD_OPEN_TOLERANCE_RAD, HandMapping
+from .inputs_record import inputs_directory, save_record
 from .joints import arm_joints
 from .observation import AdmittedState, LiveState
 from .planner import PlannerFault, palm_goals_from_camera_grasps
@@ -127,24 +129,93 @@ def palm_reach(side: str = "left"):
     return center, radius
 
 
-def prefilter_candidates(grasps, confidence, base_from_camera, grasp_to_palm, max_candidates, side: str = "left"):
-    """Indices of the most confident candidates whose palm goal is kinematically reachable.
+#: A candidate whose open hand at contact reaches this far (m) below the support
+#: plane goes after the others before the max_planning_candidates cut (kept,
+#: never removed). Live 2026-11-09 (12 plan inputs, new X2): the open hand of
+#: 85-95 % of the kept candidates entered the table by a median 20-45 mm, and
+#: the fine contact screen passed only 2-12 of them; the table-free ones sat at
+#: confidence ranks 50-200, so a confidence-only cut gave their slots away.
+#: None disables it.
+TABLE_PREFILTER_PENETRATION_M = 0.005
+
+
+@lru_cache(maxsize=4)
+def _open_hand_palm_spheres(side: str, open_pose: tuple) -> np.ndarray:
+    """(N, 4) palm-frame centres and radii of the open hand's collision spheres.
+
+    The hand's spheres relative to its palm do not depend on the arm, so any arm
+    state gives them; the planning model's hand links select them.
+    """
+    from .hand import hand_links
+    from .joints import HEAD
+    from .robot_model import config_directory, planning_model
+    from .robot_spheres import RobotSphereModel
+
+    directory = config_directory(side)
+    model = RobotSphereModel(directory=directory)
+    spheres, _ = model.spheres(
+        None, np.zeros((1, 7)), other=np.zeros(7), head=np.zeros(len(HEAD)), hand=np.asarray(open_pose, dtype=float)
+    )
+    links = set(hand_links(planning_model(directory)))
+    mask = np.array([link in links for link in model.sphere_links]) & (spheres[0, :, 3] > 0)
+    palm = model.last_link_frames[0, model.link_indices["R_palm"]]
+    local = (spheres[0, mask, :3] - palm[:3, 3]) @ palm[:3, :3]
+    return np.column_stack([local, spheres[0, mask, 3]])
+
+
+def open_hand_palm_spheres(mapping: HandMapping) -> np.ndarray:
+    """:func:`_open_hand_palm_spheres` for a hand mapping with its gripper presets."""
+    return _open_hand_palm_spheres(mapping.side, tuple(float(v) for v in mapping.preset("open")))
+
+
+def table_penetration_m(goals, support, hand_spheres) -> np.ndarray:
+    """Per palm goal (Kx4x4, torso frame): how far (m) the open hand reaches below the support plane."""
+    centers = np.einsum("kij,nj->kni", goals[:, :3, :3], hand_spheres[:, :3]) + goals[:, None, :3, 3]
+    normal = np.asarray(support.normal, dtype=float)
+    height = (centers - np.asarray(support.point, dtype=float)) @ (normal / np.linalg.norm(normal))
+    return (hand_spheres[None, :, 3] - height).max(axis=1)
+
+
+def prefilter_candidates(
+    grasps,
+    confidence,
+    base_from_camera,
+    grasp_to_palm,
+    max_candidates,
+    side: str = "left",
+    *,
+    support=None,
+    hand_spheres=None,
+):
+    """Indices of the candidates to plan: kinematically reachable, table-free first, most confident first.
 
     No reachable palm origin lies outside the bound, and IK accepts goals
-    within its position tolerance, so this only drops candidates IK cannot
-    solve. On recorded live inputs about half of GraspGen-X's candidates lie
-    beyond it.
+    within its position tolerance, so the reach test only drops candidates IK
+    cannot solve. On recorded live inputs about half of GraspGen-X's candidates
+    lie beyond it. With a support plane and the open hand's palm-frame spheres,
+    candidates whose hand enters the table (TABLE_PREFILTER_PENETRATION_M) go
+    after the others before the cut; they are never dropped for it.
     """
     center, radius = palm_reach(side)
     goals = palm_goals_from_camera_grasps(grasps, base_from_camera, grasp_to_palm)
     reach = np.linalg.norm(goals[:, :3, 3] - center, axis=1) <= radius + IK_POSITION_TOLERANCE_M
-    order = np.flatnonzero(reach)[np.argsort(-np.asarray(confidence)[reach], kind="stable")]
-    return order[:max_candidates], dict(
-        generated=len(grasps),
-        in_reach=int(reach.sum()),
-        kept=int(min(len(order), max_candidates)),
-        palm_reach_m=float(radius),
-    )
+    indices = np.flatnonzero(reach)
+    scores = -np.asarray(confidence)[indices]
+    report = dict(generated=len(grasps), in_reach=int(reach.sum()), palm_reach_m=float(radius))
+    if TABLE_PREFILTER_PENETRATION_M is not None and support is not None and hand_spheres is not None:
+        penetration = table_penetration_m(goals[indices], support, hand_spheres)
+        into_table = penetration > TABLE_PREFILTER_PENETRATION_M
+        order = indices[np.lexsort((scores, into_table))]
+        report["table"] = dict(
+            max_penetration_m=TABLE_PREFILTER_PENETRATION_M,
+            free=int((~into_table).sum()),
+            into_table=int(into_table.sum()),
+            free_kept=int(min((~into_table).sum(), max_candidates)),
+        )
+    else:
+        order = indices[np.argsort(scores, kind="stable")]
+    report["kept"] = int(min(len(order), max_candidates))
+    return order[:max_candidates], report
 
 
 def check_initial_hand(mapping: HandMapping, admitted: AdmittedState) -> dict:
@@ -297,9 +368,33 @@ class X2GraspPlanner:
                     self.grasp_to_palm,
                     self.config.max_planning_candidates,
                     self.hand.side,
+                    support=getattr(estimate, "support", None),
+                    hand_spheres=open_hand_palm_spheres(self.hand),
                 ),
             )
             report["candidate_prefilter"]["kept_indices"] = kept.tolist()
+            directory = inputs_directory()
+            if directory is not None:
+                # Every generated candidate, before the cut, for offline replay of the prefilter.
+                support = getattr(estimate, "support", None)
+                save_record(
+                    directory,
+                    "prefilter",
+                    dict(
+                        stamp_ns=transform.stamp_ns,
+                        side=self.hand.side,
+                        grasps=np.array(grasps, copy=True),
+                        confidence=np.array(confidence, copy=True),
+                        base_from_camera=np.array(transform.base_from_camera, copy=True),
+                        grasp_to_palm=np.array(self.grasp_to_palm, copy=True),
+                        support=None
+                        if support is None
+                        else dict(point=np.array(support.point), normal=np.array(support.normal)),
+                        max_candidates=self.config.max_planning_candidates,
+                        kept=kept.copy(),
+                        report=dict(report["candidate_prefilter"]),
+                    ),
+                )
             if not len(kept):
                 raise GraspFailure(
                     NO_EXECUTABLE_CANDIDATE,

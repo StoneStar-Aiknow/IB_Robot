@@ -70,6 +70,23 @@ def test_a_still_target_votes_still_and_a_moved_one_votes_moved():
     assert target_change(rgb, depth, moved_rgb, moved_depth, mask, NONE, NONE)["vote"] == "moved"
 
 
+def test_a_depth_change_without_an_rgb_change_is_not_a_move():
+    # The second X2's grasp-segment stops: depth over its fraction next to the hand, the colours unchanged.
+    rgb, depth, mask = scene()
+    near = depth.copy()
+    near[30:42, 40:52] -= 0.05
+    result = target_change(rgb, depth, rgb, near, mask, NONE, NONE)
+    assert result["vote"] == "still" and result["depth_changed_fraction"] > 0.15 > result["rgb_changed_fraction"]
+    either = WatchConfig(moved_needs_rgb=False)
+    assert target_change(rgb, depth, rgb, near, mask, NONE, NONE, either)["vote"] == "moved"
+
+
+def test_a_shift_that_leaves_no_room_is_not_reported_as_the_arm_covering_the_target():
+    rgb, depth, mask = scene(target_at=(2, 40))
+    result = target_change(rgb, depth, rgb, depth, mask, NONE, NONE, predicted_shift=(0.0, 30.0))
+    assert result == dict(vote="unknown", visible_fraction=0.0, unknown="the shift leaves no room in this image")
+
+
 def test_camera_sway_within_the_shift_range_is_not_a_move():
     rgb, depth, mask = scene()
     swayed_rgb, swayed_depth = np.roll(rgb, (2, -3), axis=(0, 1)), np.roll(depth, (2, -3), axis=(0, 1))

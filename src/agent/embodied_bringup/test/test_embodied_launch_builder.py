@@ -193,7 +193,7 @@ def test_runtime_audio_clips_resolve_workspace_before_reaching_the_executor(tmp_
     }
     nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
     params = _skill_executor_params(nodes)
-    assert _decode_launch_json_string(params["runtime_play_audio_clips_json"]) == {"self_intro": str(clip)}
+    assert _decode_launch_json_string(params["runtime_play_audio_clips_json"]) == {"self_intro": [str(clip)]}
     assert config["embodied"]["runtime_play_audio"]["clips"]["self_intro"] == configured_path
 
 

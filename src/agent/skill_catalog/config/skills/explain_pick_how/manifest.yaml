@@ -1,0 +1,44 @@
+# Generated from commissioning/audio/summit_clips.yaml (I04); edit the aliases here.
+schema_version: 1
+name: explain_pick_how
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Explain with a recorded reply how the robot picks a fruit and delivers it.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks how the robot grasps or picks fruit
+  do_not_use:
+  - condition: the visitor asks how the gift reaches them
+    instead_use: explain_pickup
+  aliases_zh:
+  - 你怎么抓水果
+  - 你是怎么抓东西的
+  - 抓取的原理
+  - 你怎么拿起来的
+  aliases_en:
+  - how do you pick fruit
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 15.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Explain with a recorded reply how the robot picks a fruit and delivers it. Use for 你怎么抓水果.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
+  aimdk_x2_summit: implementations/aimdk_x2_summit.yaml

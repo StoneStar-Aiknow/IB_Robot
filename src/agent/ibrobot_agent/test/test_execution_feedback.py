@@ -124,7 +124,7 @@ def test_pose_arrival_failure_reports_motion_end_without_claiming_verified_succe
             1, "verify", "FAILED", "verify", "TASK_POSE_NOT_REACHED", "NOT_NEEDED", 0, "MANUAL_CHECK"
         ).to_dict(),
     }
-    assert execution_reply("FAILED", context) == "动作执行结束，未校验通过。"
+    assert execution_reply("FAILED", context) == "这次没做好，请工作人员看看。"
     assert "结果未知" in execution_reply("UNKNOWN", context)
     assert execution_reply("CANCELLED", context) == "已停止。"
     context["current_skill"] = "pick_object"
@@ -255,3 +255,8 @@ def test_version_two_known_release_is_not_hidden_by_a_mirror_reason():
     context["current_skill"] = "place_in_container"
     text = execution_reply("FAILED", context)
     assert "已经松开" in text and "照镜子" not in text
+
+
+@pytest.mark.parametrize("skill,text", [("return_to_task_pose", "准备好啦！"), ("free_pose", "好啦，动作做完啦！")])
+def test_restored_pose_feedback(skill, text):
+    assert execution_reply("SUCCEEDED", {"current_skill": skill}) == text

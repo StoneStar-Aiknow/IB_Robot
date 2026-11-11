@@ -57,6 +57,7 @@ from embodied_common.execution_detail import (
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
 from embodied_common.program_contracts import canonicalize_program
+from embodied_common.recorded_clips import choose_clip_file
 from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
 from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
@@ -100,6 +101,7 @@ from ibrobot_msgs.srv import (
     GetSkillSnapshot,
     MoveToConfiguration,
     PlayAudioFile,
+    PrefetchGrasp,
     ReloadSkillCatalog,
     SetPerceptionPaused,
     SetRuntimeMode,
@@ -114,7 +116,12 @@ from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library import runtime_named_motion as named_motion
-from skill_library.carry_handover import HELD_CUSTODY_STATES, motion_stop_is_unknown, retains_for_place
+from skill_library.carry_handover import (
+    HELD_CUSTODY_STATES,
+    motion_stop_is_unknown,
+    place_container_after,
+    retains_for_place,
+)
 from skill_library.execution_store import (
     ExecutionBusyError,
     ExecutionConflictError,
@@ -850,13 +857,15 @@ class SkillExecutorNode(Node):
             raise ValueError("runtime_play_audio_stop_service must be set when runtime_play_audio_enabled is true")
         self._play_audio_lock = threading.Lock()
         self._play_audio_pending_cleanup = None
+        self._play_audio_last = {}
         self._play_audio_clips = load_json_mapping(self.get_parameter("runtime_play_audio_clips_json").value)
         if self._play_audio_enabled:
             for clip_name, clip_path in self._play_audio_clips.items():
                 if not isinstance(clip_name, str) or not clip_name.strip():
                     raise ValueError("runtime_play_audio_clips_json keys must be non-empty clip names")
-                if not isinstance(clip_path, str) or not clip_path.strip():
-                    raise ValueError(f"runtime_play_audio clip {clip_name!r} must map to a file path")
+                paths = clip_path if isinstance(clip_path, list) else [clip_path]
+                if not paths or any(not isinstance(path, str) or not path.strip() for path in paths):
+                    raise ValueError(f"runtime_play_audio clip {clip_name!r} requires paths")
         self._asr_control_topic = self.get_parameter("asr_control_topic").get_parameter_value().string_value.strip()
         self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
         self._runtime_named_motion_action = (
@@ -1163,6 +1172,15 @@ class SkillExecutorNode(Node):
             self._pick_action_name,
             callback_group=MutuallyExclusiveCallbackGroup(),
             feedback_sub_qos_profile=QoSProfile(depth=256),
+        )
+        # Only a pipeline configured to take a prefetched capture is asked for one.
+        pipeline_options = self._grasp_execution.get("pipeline") or {}
+        self._pick_prefetch_client = (
+            self.create_client(
+                PrefetchGrasp, f"{self._pick_action_name.rstrip('/')}/prefetch", callback_group=callback_group
+            )
+            if isinstance(pipeline_options, dict) and pipeline_options.get("prefetch_perception") is True
+            else None
         )
         self._place_client = ActionClient(self, PlaceObject, self._place_action_name, callback_group=callback_group)
         self._imitate_human_motion_client = ActionClient(
@@ -2722,6 +2740,34 @@ class SkillExecutorNode(Node):
         goal_handle.succeed()
         return result
 
+    def _request_pick_prefetch(self, goal) -> None:
+        """Ask the pick executor to start perceiving during the preparation; the goal never waits for this.
+
+        The target (and, for a pick the plan follows with a place, its container)
+        comes from the admitted workflow. A prefetch that is not started, refused
+        or cannot be used only means the goal observes as it always did.
+        """
+        client = getattr(self, "_pick_prefetch_client", None)
+        if client is None or not client.service_is_ready():
+            return
+        try:
+            workflow = getattr(self, "_active_workflow", None)
+            placement = getattr(self, "_placement_execution", {})
+            container = (
+                place_container_after(workflow.workflow_steps, int(goal.dispatch_binding.workflow_step_index))
+                if placement.get("backend") and workflow is not None
+                else ""
+            )
+            client.call_async(
+                PrefetchGrasp.Request(
+                    dispatch_binding=copy_binding(goal.dispatch_binding),
+                    target_query=goal.target_name,
+                    container_query=container,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - only an optimisation
+            self.get_logger().warning(f"pick prefetch not requested: {type(exc).__name__}: {exc}")
+
     def _execute_prepared_pick_skill(self, goal_handle, template, *, effective_timeout_sec=None):
         """A declared preparation phase within the admitted pick, never nested admission.
 
@@ -2744,6 +2790,7 @@ class SkillExecutorNode(Node):
         ready, reason = self._ensure_skill_capabilities(RETURN_TASK_POSE)
         if not ready:
             return self._abort_skill(SkillCommand.Result(), goal_handle, [], "CAPABILITY_MISSING", reason)
+        self._request_pick_prefetch(goal_handle.request)
         child = _DeferredTerminalGoalHandle(goal_handle)
         feedback = SkillCommand.Feedback()
         feedback.state, feedback.detail = "preparing", f"task_pose:{name}"
@@ -3102,7 +3149,11 @@ class SkillExecutorNode(Node):
         skill_name = str(goal_handle.request.skill_name)
         binding = template.get("binding") if isinstance(template, Mapping) else None
         clip = str((binding or {}).get("clip", "")).strip() if isinstance(binding, Mapping) else ""
-        path = str(self._play_audio_clips.get(clip, "")).strip() if clip else ""
+        candidates = self._play_audio_clips.get(clip, "") if clip else ""
+        last = getattr(self, "_play_audio_last", {}).get(clip, "")
+        path = choose_clip_file(candidates, last=last, exists=lambda value: Path(value).is_file()) or choose_clip_file(
+            candidates, last=last
+        )
         binds_motion = isinstance(binding, Mapping) and "motion" in binding
         motion = named_motion.bound_motion_name(template) if binds_motion else ""
         if not clip or not path:
@@ -3144,6 +3195,8 @@ class SkillExecutorNode(Node):
             motion_client, error_code, reason = self._prepare_runtime_named_motion(skill_name, motion)
             if motion_client is None:
                 return self._abort_skill(result, goal_handle, [], error_code, reason)
+        if hasattr(self, "_play_audio_last"):
+            self._play_audio_last[clip] = path
         executed = [f"runtime_play_audio:{clip}"]
         deadline = time.monotonic() + timeout_sec
         # Trigger is a global stop: a previous stop must finish before another

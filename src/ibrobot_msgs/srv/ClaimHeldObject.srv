@@ -9,3 +9,5 @@ bool success
 string reason_code
 string claim_token
 HeldObject held_object
+# The container the pick detected for this place; empty query when none.
+PrefetchedContainer container

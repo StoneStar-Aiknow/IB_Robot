@@ -1,0 +1,37 @@
+# Generated from commissioning/audio/summit_clips.yaml (Q04); edit the aliases here.
+schema_version: 1
+name: explain_gift
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Say with a recorded reply that the gift is hidden inside the fruit.
+  category: social_interaction
+  when_to_use:
+  - the visitor asks what the gift is or what is inside the fruit
+  aliases_zh:
+  - 礼物是什么
+  - 你送的是什么
+  - 里面有什么
+  - 你到底送了什么东西
+  - 礼物就是水果吗
+  aliases_en:
+  - what is the gift
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 3.5
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Say with a recorded reply that the gift is hidden inside the fruit. Use for 礼物是什么.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

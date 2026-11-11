@@ -12,15 +12,11 @@ from skill_catalog.source import DevelopmentStagingSkillSource
 
 ROOT = Path(__file__).resolve().parents[1]
 ROBOT = ROOT.parents[1] / "robot_config" / "config" / "robots" / "aimdk_x2_summit.yaml"
+MANIFEST = ROOT.parents[2] / "commissioning/audio/summit_clips.yaml"
 CLIP_SKILLS = {
-    "greet_visitor",
-    "self_introduction",
-    "introduce_platform",
-    "introduce_agent",
-    "introduce_in_detail",
-    "explain_pick_scope",
-    "offer_fruit_menu",
-    "invite_visitor",
+    entry["consumer"].removeprefix("skill:"): entry["clip"]
+    for entry in yaml.safe_load(MANIFEST.read_text())["codes"].values()
+    if entry["consumer"].startswith("skill:")
 }
 
 
@@ -57,7 +53,7 @@ def deployment():
 def test_the_catalog_matches_the_deployment_allowlist(snapshot, deployment):
     enabled = set(snapshot.enabled_skill_names)
     assert enabled == set(deployment["agent"]["test_allowlist"])
-    assert enabled >= CLIP_SKILLS
+    assert enabled >= set(CLIP_SKILLS)
     assert {"mirror_start", "mirror_stop"} <= enabled
     assert "mimic_not_ready" not in enabled
     assert snapshot.templates["free_pose"]["executor"] == "pose_composer"
@@ -69,10 +65,9 @@ def test_the_catalog_matches_the_deployment_allowlist(snapshot, deployment):
 
 def test_every_clip_skill_is_silent_and_resolves_its_clip(snapshot, deployment):
     played = {name for name, template in snapshot.templates.items() if template["executor"] == "runtime_play_audio"}
-    assert played == CLIP_SKILLS == set(deployment["agent"]["voice_bridge"]["silent_skills"])
-    assert {snapshot.templates[name]["binding"]["clip"] for name in played} == set(
-        deployment["runtime_play_audio"]["clips"]
-    )
+    assert played == set(CLIP_SKILLS) == set(deployment["agent"]["voice_bridge"]["silent_skills"])
+    assert {name: snapshot.templates[name]["binding"]["clip"] for name in played} == CLIP_SKILLS
+    assert deployment["runtime_play_audio"]["clip_manifest"].endswith("summit_clips.yaml")
 
 
 def test_each_social_clip_selects_its_recorded_gesture(snapshot):
@@ -83,6 +78,11 @@ def test_each_social_clip_selects_its_recorded_gesture(snapshot):
         "introduce_agent": ("intro_agent", "explain"),
         "introduce_in_detail": ("intro_detail", "self_intro"),
         "invite_visitor": ("invitation", "invite"),
+        "explain_mirror_how": ("intro_mirror_how", "explain"),
+        "explain_pick_how": ("intro_pick_how", "explain"),
+        "tell_origin": ("who_made", "explain"),
+        "explain_open_source": ("open_source", "explain"),
+        "answer_linux": ("linux_based", "explain"),
     }
     assert {name for name in CLIP_SKILLS if snapshot.capability_view[name]["moves_robot"]} == set(bindings)
     for name, (clip, motion) in bindings.items():
@@ -106,9 +106,15 @@ def test_the_planner_is_told_the_three_fruits(snapshot):
 
 def test_legacy_gestures_bind_summit_hand_preparation_budget(snapshot, deployment):
     motions = deployment["runtime_named_motion"]["hand_preparation"]["motions"]
-    assert set(motions) == {"wave", "raise_hand", "blow_kiss", "clap", "handshake"}
-    for skill in ("wave_hand", "raise_hand", "blow_kiss", "clap_hands", "handshake"):
+    assert set(motions) == {"wave", "raise_hand", "blow_kiss", "clap"}
+    for skill in ("wave_hand", "raise_hand", "blow_kiss", "clap_hands"):
         template = snapshot.templates[skill]
         assert template["timeout_sec"] == 90.0
         assert template["implementation_identity"].endswith("#aimdk_x2_summit")
         assert "Open installed hands" in snapshot.capability_view[skill]["summary"]
+
+
+def test_handshake_is_not_executable(snapshot, deployment):
+    assert "handshake" not in snapshot.enabled_skill_names
+    assert "handshake" not in snapshot.templates
+    assert "handshake" not in deployment["agent"]["test_allowlist"]

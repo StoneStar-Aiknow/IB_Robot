@@ -30,6 +30,7 @@ from typing import Any
 
 from embodied_common import mirror_session_contract as MIRROR_SESSION
 from embodied_common.control_phrases import STOP_PHRASES
+from embodied_common.recorded_clips import choose_clip_file, spoken_key
 from embodied_common.text_normalization import normalize_trigger_text
 from ibrobot_agent.addressee import (
     ADDRESSEE_TRIGGERS,
@@ -55,6 +56,15 @@ from ibrobot_agent.speech_pipeline import SpeechPipeline
 from ibrobot_agent.speech_policy import GraspSpeechPolicy, MirrorSpeechPolicy
 
 CONFIRM_MODES = ("auto", "voice_confirm")
+SPOKEN_LINE_EVENTS = (
+    "gesture_start",
+    "gesture_done",
+    "busy",
+    "busy_pick",
+    "speech_stopped",
+    "wake_ack",
+    "wake_hint",
+)
 _ACTIVE_ASR_STATES = {"listening", "recognizing"}
 #: A refusal can contain a confirm word ("不执行" has 执行, "我不确定" has 确定); it must never
 #: acknowledge a plan. "没" is left out on purpose: "没问题" is consent.
@@ -156,6 +166,7 @@ class VoiceBridgeConfig:
     confirm_timeout_sec: float = 20.0
     session_idle_sec: float = 120.0
     persistent_session: bool = False
+    gift_reset_on_wake: bool = False
     mirror_session_enabled: bool = False
     min_text_chars: int = 2
     request_timeout_sec: float = 180.0
@@ -216,10 +227,33 @@ class VoiceBridgeConfig:
     #: How long after the robot last spoke (its own speech ended, or a request of this
     #: channel finished) a reply-shaped sentence counts as an answer to it.
     semantic_gate_followup_sec: float = 20.0
+    #: Lines the bridge says itself, by event, overriding its built-in wording (a deployment
+    #: sets them to lines it has recorded, see ``speech_clips``): ``gesture_start`` and
+    #: ``gesture_done`` (a gesture starts / succeeds), ``busy`` and ``busy_pick`` (a request
+    #: arrives while another one, or a fruit delivery, runs), ``speech_stopped`` (after "别说了"),
+    #: ``wake_ack`` (only the wake phrase was said) and ``wake_hint`` (the woken speaker talks
+    #: after the window closed). An event without a line keeps the built-in behaviour; the two
+    #: without one (``wake_ack``, ``wake_hint``, ``speech_stopped``) stay silent.
+    spoken_lines_json: str = "{}"
+    #: Fruit-delivery narration overrides by notice key (``gift_workflow.GiftWorkflowSpeech``).
+    gift_messages_json: str = "{}"
+    #: The deployment does not check the container after a release (``verify_placement: false``):
+    #: a confirmed release is announced as the delivery. The launch derives it.
+    gift_release_is_delivery: bool = False
+    #: How long a sentence said while the robot answers (a clip or spoken reply, not a motion)
+    #: is kept to be judged once that answer ends. 0 drops it, as before.
+    pending_sentence_sec: float = 0.0
+    #: Recorded lines (``embodied_common.recorded_clips.spoken_clips``): spoken text -> files.
+    #: Speech whose text is one of them plays a recording instead of being synthesized; any
+    #: other text is synthesized as before. The launch builds it from the clip manifest.
+    speech_clips_json: str = "{}"
+    #: English words and their reading for a TTS without an English front end
+    #: ("openEuler" -> "欧喷欧拉"); applied before the remaining Latin words are dropped.
+    tts_pronunciations_json: str = "{}"
 
     def __post_init__(self) -> None:
         GraspSpeechPolicy(self.speech_mode, json.loads(self.speech_messages_json))
-        for name in ("persistent_session", "mirror_session_enabled"):
+        for name in ("persistent_session", "mirror_session_enabled", "gift_reset_on_wake"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a boolean")
         if not str(self.robot_scope).strip():
@@ -285,6 +319,27 @@ class VoiceBridgeConfig:
                 raise ValueError(f"text_rewrites pattern {pattern!r} is invalid: {error}") from error
             rewrites.append((pattern, replacement))
         object.__setattr__(self, "text_rewrites", tuple(rewrites))
+        lines = json.loads(self.spoken_lines_json)
+        if not isinstance(lines, dict) or any(
+            key not in SPOKEN_LINE_EVENTS or not isinstance(value, str) for key, value in lines.items()
+        ):
+            raise ValueError(f"spoken_lines must map events of {SPOKEN_LINE_EVENTS} to text")
+        if any(phrase in _normalize(value) for value in lines.values() for phrase in self.stop_phrases):
+            raise ValueError("spoken_lines must not contain a stop phrase: the bridge would stop its own request")
+        GiftWorkflowSpeech(messages=json.loads(self.gift_messages_json))
+        clips = json.loads(self.speech_clips_json)
+        if not isinstance(clips, dict) or any(
+            not isinstance(files, list) or not files or any(not isinstance(item, str) for item in files)
+            for files in clips.values()
+        ):
+            raise ValueError("speech_clips must map spoken text to a non-empty list of files")
+        pronunciations = json.loads(self.tts_pronunciations_json)
+        if not isinstance(pronunciations, dict) or any(
+            not isinstance(key, str) or not key or not isinstance(value, str) for key, value in pronunciations.items()
+        ):
+            raise ValueError("tts_pronunciations must map words to their reading")
+        if not float(self.pending_sentence_sec) >= 0:
+            raise ValueError("pending_sentence_sec must not be negative")
         if not float(self.semantic_gate_followup_sec) >= 0:
             raise ValueError("semantic_gate_followup_sec must not be negative")
         if self.semantic_gate_mode not in SEMANTIC_GATE_MODES:
@@ -378,6 +433,9 @@ class Speak:
     priority: int | None = None
     phase: str = ""
     event_key: str = ""
+    #: The addressee gate this speech belongs to (``VoiceBridgeCore._gate_epoch``): its end
+    #: restarts that gate's window, never a newer one.
+    gate_epoch: int = 0
 
 
 @dataclass(frozen=True)
@@ -482,12 +540,30 @@ class VoiceBridgeCore:
     ) -> None:
         self.config = config
         self._state = _BridgeState()
+        self._gift_wake_id = ""
+        self._gift_local_wakes: OrderedDict[str, None] = OrderedDict()
+        self._gift_revision = -1
+        self._gift_wake_segments: OrderedDict[Segment, str] = OrderedDict()
         self._feedback = FeedbackTracker()
         self._mirror_speech_policy = MirrorSpeechPolicy()
         self._speech_policy = GraspSpeechPolicy(config.speech_mode, json.loads(config.speech_messages_json))
         self._gift = GiftWorkflowSpeech(
-            container_name=config.gift_container_name, container_label=config.gift_container_label
+            container_name=config.gift_container_name,
+            container_label=config.gift_container_label,
+            messages=json.loads(config.gift_messages_json),
+            release_is_delivery=config.gift_release_is_delivery,
         )
+        self._lines: dict[str, str] = json.loads(config.spoken_lines_json)
+        #: Bumped whenever ``end_session`` replaces the addressee gate; a request or speech of an
+        #: older epoch must not restart the new gate's window.
+        self._gate_epoch = 0
+        self._request_epoch: OrderedDict[str, int] = OrderedDict()
+        #: The window (its ``wake_until``) the woken speaker was already told had closed.
+        self._wake_hint_window = -1.0
+        #: Requests that only answer (conversation admission, or a recorded clip): a sentence
+        #: said meanwhile is kept for ``pending_sentence_sec`` instead of dropped.
+        self._answer_only = _BoundedIdSet()
+        self._pending_sentence: tuple[str, float, Segment | None, float] | None = None
         self._generation = 0
         self._latest_request_id = ""
         self._introduction_request_id = ""
@@ -534,6 +610,38 @@ class VoiceBridgeCore:
         #: The per-window verdict of each recent segment (``_split_speakers``), for judging a
         #: question rescued from the end of that segment after the speaker check consumed it.
         self._splits: OrderedDict[Segment, SpeakerSplit] = OrderedDict()
+
+    def _end_robot_turn(self, now: float, epoch: int | None) -> None:
+        """A turn of the robot (speech, a clip, a motion) ended: restart the window it was taken in.
+
+        Only for a turn of the current gate (``epoch``): one that outlived ``end_session`` belongs
+        to a window nobody holds any more, and must not reopen it for whoever speaks next.
+        """
+        if epoch is None or epoch != self._gate_epoch:
+            return
+        self._last_robot_turn = max(self._last_robot_turn, now)
+        if self.config.persistent_session:
+            self._gate.note_robot_turn_end(now)
+
+    def _not_addressed(self, verdict: Any, raw: str, heard_at: float, segment: Segment | None) -> list[Action]:
+        """Ignore an utterance not meant for the robot; tell the woken speaker once that the window closed."""
+        actions: list[Action] = [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
+        hint = self._lines.get("wake_hint")
+        window = float(getattr(self._gate, "wake_until", 0.0))
+        if (
+            hint
+            and verdict.reason == "no wake phrase"
+            and window > 0.0
+            and window != self._wake_hint_window
+            and not self._state.active_request_id
+            and self._gate.anchor_speaks(segment)
+        ):
+            self._wake_hint_window = window
+            actions.append(Log("the woken speaker spoke after the window closed; telling them once"))
+            if self.config.speak_replies:
+                # Not a turn of the window: its end must not reopen what the hint says is closed.
+                actions.append(self._speech(hint, kind="reply", gate_epoch=-1))
+        return actions
 
     def on_mirror_state(self, payload: dict[str, Any], now: float, *, source_now: float) -> list[Action]:
         """Convert ROS source age to monotonic expiry without comparing clock domains."""
@@ -642,10 +750,10 @@ class VoiceBridgeCore:
         elif request_id == self._mirror_start_request_id and payload.get("accepted") is False:
             self._mirror_start_request_id = ""
 
-    def note_speech(self, text: str, now: float, *, finished: bool = False) -> None:
+    def note_speech(self, text: str, now: float, *, finished: bool = False, gate_epoch: int | None = None) -> None:
         self._recent_speech.append((_normalize(text), now))
         if finished:
-            self._last_robot_turn = max(self._last_robot_turn, now)
+            self._end_robot_turn(now, self._gate_epoch if gate_epoch is None else gate_epoch)
             if self._speech_windows:
                 self._speech_windows[-1][1] = now + 1.0
         else:
@@ -660,7 +768,7 @@ class VoiceBridgeCore:
     def is_recent_echo(self, text: str, now: float) -> bool:
         if (
             self.is_stop_text(text)
-            or self._speech_interrupt(text) is not None
+            or self._speech_interrupt(text, now) is not None
             or _normalize(text) in {"不玩了", "再见"}
         ):
             return False
@@ -742,7 +850,7 @@ class VoiceBridgeCore:
             return []
         if not self.config.require_verified_speech and (
             self.is_stop_text(text)
-            or self._speech_interrupt(text) is not None
+            or self._speech_interrupt(text, now) is not None
             or _normalize(text) in {"不玩了", "再见"}
         ):
             cancelled = self._cancel_held(f"stop keyword in {str(text).strip()!r}")
@@ -800,13 +908,16 @@ class VoiceBridgeCore:
         if not normalized:
             return split_log
         corrected = split_log + ([Log(f"corrected transcript {heard!r} -> {raw!r}")] if raw != heard else [])
-        if stopped_by_partial and self._contains_stop(normalized) and not self._speech_interrupt(raw):
+        if stopped_by_partial and self._contains_stop(normalized) and not self._speech_interrupt(raw, now):
             # Once the stop has finished the request, this sentence would otherwise reach the
             # Agent as a new command and occupy the channel ("帮我停一下" -> busy for "继续").
             return [*corrected, Log(f"final transcript {raw!r} of a stop already sent from its partial")]
+        previous_wake = self._gift_wake_id
         actions = self._route_transcript(
             raw, normalized, now, heard_at, segment, session_opened=session_opened, cancels_held=cancels_held
         )
+        if self._gift_wake_id != previous_wake:
+            actions = [PublishControl({"operation": "reset_gift_round", "wake_id": self._gift_wake_id}), *actions]
         return corrected + actions if actions else corrected
 
     def _split_speakers(
@@ -1055,7 +1166,7 @@ class VoiceBridgeCore:
                 raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
             )
             if not verdict.addressed:
-                return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
+                return self._not_addressed(verdict, raw, heard_at, segment)
             raw, normalized = verdict.raw, verdict.normalized
             # An exact stop is an explicit control intent. A longer sentence
             # merely mentioning STOP must also pass the enabled intent gate.
@@ -1067,8 +1178,10 @@ class VoiceBridgeCore:
                     return semantic_block
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
-        remainder = self._speech_interrupt(raw)
+        remainder = self._speech_interrupt(raw, now)
         if remainder is not None:
+            # The robot's turn ends here: the window restarts, as when the turn ends by itself.
+            self._end_robot_turn(now, self._request_epoch.get(self._stop_target(), self._gate_epoch))
             if self._introduction_request_id and self._stop_target() == self._introduction_request_id:
                 # "别说了" silences the introduction; it does not stop the robot. The clip
                 # executor ends the skill normally once its gesture finishes, so there is no
@@ -1078,8 +1191,15 @@ class VoiceBridgeCore:
                 return [
                     Log(f"introduction speech stopped; {self._introduction_request_id} finishes its gesture"),
                     *self.cancel_speech(recorded=True),
+                    *(
+                        self._say(self._lines["speech_stopped"])
+                        if not remainder and self._lines.get("speech_stopped")
+                        else []
+                    ),
                 ]
             actions = self.cancel_speech()
+            if not remainder and self._lines.get("speech_stopped"):
+                actions += self._say(self._lines["speech_stopped"])
             if remainder:
                 return [
                     *actions,
@@ -1115,15 +1235,47 @@ class VoiceBridgeCore:
                 raw, normalized, now, session_opened=session_opened, heard_at=heard_at, segment=segment
             )
         if verdict is not None and not verdict.addressed:
-            return [Log(f"not addressed to me ({verdict.reason}); ignored {raw!r}")]
+            return self._not_addressed(verdict, raw, heard_at, segment)
         # The intent gate judges the sentence as heard: the addressee gate strips the wake
         # phrase, and a woken sentence must keep the gate's wake-prefix exemption.
         if verdict is not None:
             raw, normalized = verdict.raw, verdict.normalized
+        if (
+            self.config.gift_reset_on_wake
+            and verdict is not None
+            and (verdict.explicit_wake or session_opened)
+            and not state.active_request_id
+            and state.pending is None
+            and self._mirror_idle(now)
+        ):
+            wake_id = self._gift_wake_segments.get(segment) if segment is not None else None
+            if wake_id is None:
+                wake_id = "wake-" + uuid.uuid4().hex
+                if segment is not None:
+                    self._gift_wake_segments[segment] = wake_id
+                    while len(self._gift_wake_segments) > _REMEMBERED_REQUEST_IDS:
+                        self._gift_wake_segments.popitem(last=False)
+            self._gift_wake_id = wake_id
+            self._gift_local_wakes[wake_id] = None
+            while len(self._gift_local_wakes) > _REMEMBERED_REQUEST_IDS:
+                self._gift_local_wakes.popitem(last=False)
+            if not normalized:
+                return [
+                    *(self._say(self._lines["wake_ack"]) if self._lines.get("wake_ack") else []),
+                ]
         if normalized == "再见":
             return [Log("farewell retained dialogue and business state")]
         if any(phrase in normalized for phrase in self.config.bypass_phrases):
             return [Log(f"ignored bypass utterance {raw!r}")]
+        if (
+            verdict is not None
+            and not normalized
+            and self._lines.get("wake_ack")
+            and not state.active_request_id
+            and self._mirror_idle(now)
+        ):
+            # Only the robot's name: answer that it listens, so the speaker knows to go on.
+            return [Log(f"wake phrase only: {heard_raw!r}"), *self._say(self._lines["wake_ack"])]
         if not state.active_request_id and not self._mirror_idle(now):
             mirror = self._mirror_state or {}
             actions = [
@@ -1145,12 +1297,24 @@ class VoiceBridgeCore:
                 )
             return actions
         if state.active_request_id:
+            if (
+                self.config.pending_sentence_sec > 0
+                and state.active_request_id in self._answer_only
+                and len(normalized) >= self.config.min_text_chars
+            ):
+                # The robot is only answering: the next question waits for the answer to end
+                # (``tick``) instead of being lost. One sentence, the latest one.
+                self._pending_sentence = (raw, heard_at, segment, now + self.config.pending_sentence_sec)
+                return [Log(f"answering {state.active_request_id}; kept {raw!r} for after the answer")]
             actions = [Log(f"busy with {state.active_request_id}; dropped {raw!r}")]
             if state.last_busy_at == float("-inf") and state.stopped_request_id != state.active_request_id:
                 state.last_busy_at = now
+                busy_line = self._lines.get("busy")
+                if self._gift.owns(state.active_request_id) and self._lines.get("busy_pick"):
+                    busy_line = self._lines["busy_pick"]
                 actions.append(
                     self._speech(
-                        f"正在做{state.task_label}，请稍等。",
+                        busy_line or f"正在做{state.task_label}，请稍等。",
                         request_id=state.active_request_id,
                         kind="busy",
                         priority=0,
@@ -1158,13 +1322,25 @@ class VoiceBridgeCore:
                     )
                 )
             return actions
-        semantic_block, semantic = self._judge_semantics(
-            heard_raw,
-            normalized,
-            now,
-            session_opened=session_opened,
-            segment=segment,
-            addressed=verdict is not None and verdict.addressed,
+        # The robot just asked a question of its own ("可以呀，现在就给你拿吗？"): a short reply
+        # inside the follow-up window answers it, and "好"/"要" carry nothing an intent model
+        # could judge. It still had to pass the wake window and the voiceprint above.
+        answering = (
+            bool(state.clarification_request_id)
+            and now - self._last_robot_turn <= max(float(self.config.semantic_gate_followup_sec), 20.0)
+            and len(normalized) <= _CLARIFICATION_REPLY_MAX_CHARS
+        )
+        semantic_block, semantic = (
+            (None, None)
+            if answering
+            else self._judge_semantics(
+                heard_raw,
+                normalized,
+                now,
+                session_opened=session_opened,
+                segment=segment,
+                addressed=verdict is not None and verdict.addressed,
+            )
         )
         if semantic_block is not None:
             # Vetoed as not meant for the robot, yet it passed the wake and voiceprint checks:
@@ -1175,7 +1351,7 @@ class VoiceBridgeCore:
         if semantic is not None and semantic.admitted_text:
             admission_log.append(Log(f"admitted the trailing question {semantic.admitted_text!r} of {raw!r}"))
             raw, normalized = semantic.admitted_text, _normalize(semantic.admitted_text)
-        if len(normalized) < self.config.min_text_chars:
+        if len(normalized) < self.config.min_text_chars and not answering:
             return [Log(f"ignored short utterance {raw!r}")]
         self._gate.note_handled(heard_at)
 
@@ -1196,12 +1372,19 @@ class VoiceBridgeCore:
             "session_id": state.session_id,
             "text": raw,
         }
+        if self.config.gift_reset_on_wake and self._gift_wake_id:
+            payload["gift_wake_id"] = self._gift_wake_id
         if state.clarification_request_id:
             payload["reply_to_request_id"] = state.clarification_request_id
             state.clarification_request_id = ""
         if semantic is not None and semantic.grade == GRADE_CONVERSATION:
             # Admitted as a question or a reply only: the Agent may answer it, never execute it.
             payload["admission"] = GRADE_CONVERSATION
+            self._answer_only.add(request_id)
+        self._request_epoch[request_id] = self._gate_epoch
+        while len(self._request_epoch) > _REMEMBERED_REQUEST_IDS:
+            self._request_epoch.popitem(last=False)
+        self._pending_sentence = None
         state.active_request_id = request_id
         state.task_label = _spoken_label(raw)
         state.last_busy_at = float("-inf")
@@ -1218,6 +1401,41 @@ class VoiceBridgeCore:
 
     def on_response(self, payload: dict[str, Any], now: float) -> list[Action]:
         if self.config.feedback_only:
+            return []
+        if payload.get("operation") == "reset_gift_round":
+            wake_id = payload.get("wake_id")
+            if payload.get("accepted") is not True and wake_id == self._gift_wake_id:
+                state = payload.get("gift_state")
+                if (
+                    isinstance(state, dict)
+                    and isinstance(state.get("round_id"), str)
+                    and all(
+                        state.get(name) == getattr(self.config, name)
+                        for name in ("robot_scope", "channel_id", "principal_id")
+                    )
+                ):
+                    self._gift_wake_id = state["round_id"]
+                return [
+                    Log("gift round reset rejected: " + str(payload.get("reason_code", "unknown"))),
+                    *self._say("当前任务状态还没确认，暂时不能开始新一轮。"),
+                ]
+            state = payload.get("gift_state")
+            if (
+                payload.get("accepted") is True
+                and isinstance(state, dict)
+                and all(
+                    state.get(name) == getattr(self.config, name)
+                    for name in ("robot_scope", "channel_id", "principal_id")
+                )
+                and isinstance(wake_id, str)
+                and state.get("round_id") == wake_id
+                and type(state.get("revision")) is int
+                and state["revision"] >= self._gift_revision
+                and (wake_id == self._gift_wake_id or wake_id not in self._gift_local_wakes)
+            ):
+                self._gift_wake_id = wake_id
+                self._gift_revision = state["revision"]
+                return [Log("gift round reset: " + wake_id)]
             return []
         request_id = str(payload.get("request_id", ""))
         if request_id not in self._state.known_request_ids:
@@ -1295,8 +1513,10 @@ class VoiceBridgeCore:
         if not self._finish(request_id):
             return []
         # A recorded clip (the fruit menu) never passes through this bridge's speech, so its
-        # request's end is the robot's end of turn; spoken replies move it on again.
-        self._last_robot_turn = max(self._last_robot_turn, now)
+        # request's end is the robot's end of turn; spoken replies move it on again. A turn
+        # whose outcome is unknown does not: nothing new may start until staff resolve it.
+        if state != "UNKNOWN" and event_type != "quarantined":
+            self._end_robot_turn(now, self._request_epoch.get(request_id))
         if request_id in self._speech_suppressed:
             return [Log(f"suppressed terminal speech for {request_id}")]
         if event_type == "needs_clarification":
@@ -1305,6 +1525,8 @@ class VoiceBridgeCore:
         if isinstance(payload.get("detail"), dict) and payload["detail"].get("execution_id"):
             return self._execution_speech(payload, now, silent=silent)
         spoken = "" if silent else _spoken_reply(state, message)
+        if state == "SUCCEEDED" and spoken == "执行完成。" and self._lines.get("gesture_done"):
+            spoken = self._lines["gesture_done"]
         detail = payload.get("detail") or {}
         if state == "SUCCEEDED" and isinstance(detail, dict) and detail.get("save_prompt"):
             spoken = "执行完成。" + str(detail["save_prompt"])
@@ -1356,6 +1578,8 @@ class VoiceBridgeCore:
         if accepted is None or not self.config.speak_replies:
             return []
         execution_id, text, terminal = accepted
+        if payload.get("state") == "SUCCEEDED" and text == "执行完成。" and self._lines.get("gesture_done"):
+            text = self._lines["gesture_done"]
         key = payload.get("request_key")
         request_id = str(key.get("request_id", "")) if isinstance(key, dict) else ""
         # Finishing a request clears its silent mark, so a terminal event passes it in. A clip
@@ -1456,6 +1680,16 @@ class VoiceBridgeCore:
             for action in submitted:
                 if isinstance(action, PublishRequest):
                     self._deferred_submission = (action.payload["request_id"], text)
+        if self._pending_sentence is not None and not state.active_request_id:
+            text, heard_at, segment, deadline = self._pending_sentence
+            self._pending_sentence = None
+            if now <= deadline and not self._unsafe_request_id and self._mirror_idle(now):
+                actions.append(Log(f"answer ended; judging the kept sentence {text!r}"))
+                actions += self._route_transcript(
+                    text, _normalize(text), now, heard_at, segment, session_opened=False, admitted=True
+                )
+            else:
+                actions.append(Log(f"kept sentence {text!r} expired before the answer ended"))
         if (
             self._ending_session
             and not self._unsafe_request_id
@@ -1549,6 +1783,7 @@ class VoiceBridgeCore:
                 "introduce_agent",
                 "introduce_platform",
                 "runtime_play_audio",
+                *self.config.silent_skills,
             }
             for step in steps
         ):
@@ -1560,6 +1795,7 @@ class VoiceBridgeCore:
         if self._is_silent_presentation(presentation):
             # The clip is the reply: announcing the plan and then saying "执行完成。" would talk over it.
             self._state.silent_request_id = request_id
+            self._answer_only.add(request_id)
             return [plan_log]
         pick_steps = [
             step
@@ -1596,7 +1832,16 @@ class VoiceBridgeCore:
                 # The preview already told the user what is about to happen, and nothing waits on
                 # this line; saying it again only delays the answer behind it.
                 return [plan_log, *gate, Log(f"request {request_id} plan was already announced by its preview")]
-            return [plan_log, *gate, *self._say(f"正在执行：{summary}。")]
+            standalone_return = (
+                len(presentation.get("steps", [])) == 1
+                and presentation["steps"][0].get("skill_name") == "return_to_task_pose"
+            )
+            line = (
+                "好呀，我先准备一下。"
+                if standalone_return
+                else self._lines.get("gesture_start") or f"正在执行：{summary}。"
+            )
+            return [plan_log, *gate, *self._say(line)]
         acknowledgement = PublishControl(
             {
                 "operation": "presentation_rendered",
@@ -1650,6 +1895,9 @@ class VoiceBridgeCore:
         if not target:
             return [Log(f"{reason}: no active request")]
         state.stopped_request_id = target
+        # Stopping ends the robot's turn; the woken speaker usually goes on talking. A stop
+        # whose terminal never comes keeps the channel held anyway (``_unsafe_request_id``).
+        self._end_robot_turn(now, self._request_epoch.get(target))
         self._unsafe_request_id = target
         if self._stop_deadline == float("inf"):
             self._stop_deadline = now + 5.0
@@ -1678,13 +1926,37 @@ class VoiceBridgeCore:
             self._state.pending = None
         return True
 
-    @staticmethod
-    def _speech_interrupt(text: str) -> str | None:
+    def _speech_interrupt(self, text: str, now: float | None = None) -> str | None:
+        """The rest of a request to stop talking ("好了别说了，挥个手" -> "挥个手"); None when it is none.
+
+        A short sentence (at most ``_SPEECH_INTERRUPT_MAX_CHARS``) that contains an interrupt
+        phrase anywhere is one ("行了别说了", "知道了别说了"); a longer one only with the phrase
+        up front. While the robot is talking (``now`` given), a sentence made only of closing
+        words ("好了", "知道啦", "好啦知道啦") stops the talk too; at any other time those words
+        are ordinary answers and go to the intent gate.
+        """
+        text = str(text).strip()
         match = re.match(
             _SPEECH_INTERRUPT_LEAD + r"(?:" + "|".join(_SPEECH_INTERRUPT_PHRASES) + r")[，,。！!\s]*(.*)$",
             text,
         )
-        return match.group(1).strip() if match else None
+        if match:
+            return match.group(1).strip()
+        compact = re.sub(r"[，,。！!？?、\s~～]", "", text)
+        if len(compact) <= _SPEECH_INTERRUPT_MAX_CHARS:
+            for phrase in sorted(_SPEECH_INTERRUPT_PHRASES, key=len, reverse=True):
+                at = compact.find(phrase)
+                if at >= 0:
+                    return compact[at + len(phrase) :]
+        if now is not None and _closing_words(compact) and self._robot_speaking(now):
+            return ""
+        return None
+
+    def _robot_speaking(self, now: float) -> bool:
+        """A recorded answer is playing, or the bridge's own speech has not finished."""
+        if self._introduction_request_id and self._stop_target() == self._introduction_request_id:
+            return True
+        return any(start <= now <= end for start, end in self._speech_windows)
 
     def _may_become_speech_interrupt(self, partial: str) -> bool:
         """During an introduction, a partial that is or may still grow into "别说了" is not a stop.
@@ -1695,7 +1967,10 @@ class VoiceBridgeCore:
         """
         if not (self._introduction_request_id and self._stop_target() == self._introduction_request_id):
             return False
-        text = re.sub(_SPEECH_INTERRUPT_LEAD, "", _normalize(self.config.correct(str(partial).strip())))
+        text = re.sub(r"[，,。！!？?、\s]", "", _normalize(self.config.correct(str(partial).strip())))
+        # "好了别", "知道了别说": a closing word may come first ("好了别说了").
+        text = re.sub(r"^(?:" + "|".join(_CLOSING_WORDS) + r")+", "", text) or text
+        text = re.sub(_SPEECH_INTERRUPT_LEAD, "", text)
         return bool(text) and any(
             phrase.startswith(text) or text.startswith(phrase) for phrase in _SPEECH_INTERRUPT_PHRASES
         )
@@ -1710,6 +1985,8 @@ class VoiceBridgeCore:
     def end_session(self, now: float) -> list[Action]:
         """End dialogue without clearing unresolved robot safety state."""
         self._gift.end_session(self._state.session_id)
+        self._gate_epoch += 1
+        self._pending_sentence = None
         # Retain configured checks, but end their wake window and speaker anchors.
         self._gate = AddresseeGate(
             trigger=self.config.addressee_trigger,
@@ -1770,6 +2047,7 @@ class VoiceBridgeCore:
     def _speech(self, text: str, **kwargs) -> Speak:
         kwargs.setdefault("request_id", self._latest_request_id)
         kwargs.setdefault("priority", 20 if kwargs.get("kind") == "terminal" else 10)
+        kwargs.setdefault("gate_epoch", self._request_epoch.get(kwargs["request_id"], self._gate_epoch))
         return Speak(text, generation=self._generation, session_id=self._state.session_id, **kwargs)
 
     def _say(self, text: str, *, kind: str = "reply") -> list[Action]:
@@ -1789,8 +2067,45 @@ _SPEECH_INTERRUPT_PHRASES = (
     "不用讲了",
     "别介绍了",
     "不用介绍了",
+    "好了好了",
+    "别说",
 )
 _SPEECH_INTERRUPT_LEAD = r"^\s*(?:(?:好(?:的)?|嗯|那个|行)[，,。！!\s]*)*"
+#: Longest reply to the robot's own clarification question that skips the intent gate.
+_CLARIFICATION_REPLY_MAX_CHARS = 12
+#: Longest sentence in which an interrupt phrase counts anywhere ("后来知道了别说了" is 8).
+_SPEECH_INTERRUPT_MAX_CHARS = 12
+#: Words that end a talk only while the robot is talking ("好了", "知道啦"): elsewhere they are
+#: answers. "好"/"好的"/"嗯" alone are not among them: a listener says them while listening.
+_CLOSING_WORDS = (
+    "好了",
+    "好啦",
+    "知道了",
+    "知道啦",
+    "行了",
+    "行啦",
+    "可以了",
+    "可以啦",
+    "好的好的",
+    "好好",
+    "好的",
+    "好",
+    "行",
+    "嗯",
+)
+_STRONG_CLOSING = ("好了", "好啦", "知道了", "知道啦", "行了", "行啦", "可以了", "可以啦", "好的好的")
+
+
+def _closing_words(compact: str) -> bool:
+    """Whether ``compact`` is made only of closing words, at least one of them a strong one."""
+    rest, strong = compact, False
+    while rest:
+        word = next((item for item in _CLOSING_WORDS if rest.startswith(item)), "")
+        if not word:
+            return False
+        strong = strong or word in _STRONG_CLOSING
+        rest = rest[len(word) :]
+    return strong
 
 
 def _spoken_reply(state: Any, message: str) -> str:
@@ -1804,14 +2119,18 @@ def _spoken_label(text: str) -> str:
     return value[:18] if re.search(r"[\u4e00-\u9fff]", value) else "当前动作"
 
 
-def _tts_text(text: str, *, keep_english: bool = False) -> str:
+def _tts_text(text: str, *, keep_english: bool = False, pronunciations: dict[str, str] | None = None) -> str:
     """Text the TTS can say: internal IDs never reach it, English words only when it reads English.
 
     ``keep_english`` is for a TTS whose English frontend is installed (ZipVoice with
     piper_phonemize); without it a sentence containing English fails to synthesize at all,
-    so the default keeps dropping every Latin word.
+    so the default keeps dropping every Latin word -- after ``pronunciations`` replaced the
+    ones a deployment knows how to say ("openEuler" -> "欧喷欧拉"), longest first.
     """
     text = str(text).replace("free_pose", "自由姿态").replace("(remembered)", "").replace("V字", "胜利手势")
+    if pronunciations and not keep_english:
+        for word in sorted(pronunciations, key=len, reverse=True):
+            text = re.sub(re.escape(word), pronunciations[word], text, flags=re.IGNORECASE)
     if keep_english:
         # snake_case skill names and robot IDs are not words anyone should hear.
         text = re.sub(r"[A-Za-z0-9-]*_[A-Za-z0-9_-]*", "", text).strip()
@@ -1928,6 +2247,7 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         confirm_timeout_sec=float(values["confirm_timeout_sec"]),
         session_idle_sec=float(values["session_idle_sec"]),
         persistent_session=bool(values["persistent_session"]),
+        gift_reset_on_wake=bool(values["gift_reset_on_wake"]),
         mirror_session_enabled=bool(values["mirror_session_enabled"]),
         min_text_chars=int(values["min_text_chars"]),
         request_timeout_sec=float(values["request_timeout_sec"]),
@@ -1956,6 +2276,12 @@ def config_from_parameters(values: dict[str, Any]) -> VoiceBridgeConfig:
         semantic_gate_fail_open=bool(values["semantic_gate_fail_open"]),
         semantic_gate_conversation=bool(values["semantic_gate_conversation"]),
         semantic_gate_followup_sec=float(values["semantic_gate_followup_sec"]),
+        spoken_lines_json=str(values["spoken_lines_json"]),
+        gift_messages_json=str(values["gift_messages_json"]),
+        gift_release_is_delivery=bool(values["gift_release_is_delivery"]),
+        pending_sentence_sec=float(values["pending_sentence_sec"]),
+        speech_clips_json=str(values["speech_clips_json"]),
+        tts_pronunciations_json=str(values["tts_pronunciations_json"]),
     )
 
 
@@ -1973,6 +2299,27 @@ def _corrections(value: Any) -> tuple[tuple[str, tuple[str, ...]], ...]:
     if not isinstance(value, dict):
         raise ValueError("text_corrections must be a mapping of term -> list of misrecognized variants")
     return tuple((str(term), _string_tuple(variants, f"text_corrections[{term}]")) for term, variants in value.items())
+
+
+@dataclass(frozen=True)
+class _RecordedAudio:
+    """A recorded line chosen in place of synthesis (``speech_clips``)."""
+
+    path: str
+
+
+def choose_recorded_line(
+    text: str, clips: dict[str, list[str]], last: dict[str, str], *, exists: Callable[[str], bool] = os.path.isfile
+) -> str:
+    """The file to play for ``text``, or empty to synthesize it: not a recorded line, or no file left."""
+    key = spoken_key(text)
+    files = clips.get(key)
+    if not files:
+        return ""
+    path = choose_clip_file(files, last=last.get(key, ""), exists=exists)
+    if path:
+        last[key] = path
+    return path
 
 
 class _Speaker:
@@ -2037,6 +2384,29 @@ class _Speaker:
             return None
         return result.audio_segments
 
+    def play_file(self, path: str) -> bool:
+        """Play a recorded file through the same service, cancellable the same way."""
+        with self._play_lock:
+            generation = self._play_generation
+        if self._closing.is_set() or not self._playback.wait_for_service(timeout_sec=2.0):
+            return False
+        play = self._playback_type.Request()
+        play.file_path = path
+        with self._play_lock:
+            if generation != self._play_generation or self._closing.is_set():
+                return False
+            if self._pending_stop is not None or self._pending_play is not None:
+                return False
+            future = self._playback.call_async(play)
+            self._pending_play = future
+        played = self._wait(future)
+        if future.done():
+            self._pending_play = None
+        if played is None or not played.success:
+            self._node.get_logger().error(f"recorded line playback failed: {getattr(played, 'message', 'timeout')}")
+            return False
+        return True
+
     def play(self, segments: Any) -> bool:
         with self._play_lock:
             generation = self._play_generation
@@ -2091,6 +2461,10 @@ def _build_node_class():
         """ROS transport for :class:`VoiceBridgeCore`."""
 
         _tts_keep_english = False  # set from the tts_keep_english parameter
+        # Set from speech_clips_json / tts_pronunciations_json; empty: everything is synthesized.
+        _spoken_clips: dict[str, list[str]] = {}  # noqa: RUF012
+        _spoken_last: dict[str, str] = {}  # noqa: RUF012
+        _pronunciations: dict[str, str] = {}  # noqa: RUF012
 
         def __init__(self, **node_options) -> None:
             super().__init__("agent_voice_bridge", **node_options)
@@ -2103,6 +2477,17 @@ def _build_node_class():
             self._asr_state = ""
             self._mute_asr = bool(values["mute_asr_during_tts"])
             self._tts_keep_english = bool(values["tts_keep_english"])
+            self._spoken_clips: dict[str, list[str]] = json.loads(str(values["speech_clips_json"]))
+            self._spoken_last: dict[str, str] = {}
+            self._pronunciations: dict[str, str] = json.loads(str(values["tts_pronunciations_json"]))
+            missing = sorted(
+                {path for files in self._spoken_clips.values() for path in files if not os.path.isfile(path)}
+            )
+            if missing:
+                # Not fatal: such a line is synthesized instead. The clips are installed per checkout.
+                self.get_logger().warning(
+                    f"{len(missing)} recorded line file(s) missing, those lines are synthesized: {missing[:5]}"
+                )
             self._speaker = (
                 _Speaker(
                     self,
@@ -2216,9 +2601,7 @@ def _build_node_class():
             self.create_timer(0.2, self._on_tick, callback_group=inbound)
             if self._speaker is not None:
                 self._speech_pipeline = SpeechPipeline(
-                    synthesize=lambda action: self._speaker.synthesize(
-                        _tts_text(action.text, keep_english=self._tts_keep_english)
-                    ),
+                    synthesize=self._prepare_speech,
                     play=self._render_speech,
                     stop=self._speaker.stop,
                     is_current=self._speech_is_current,
@@ -2410,21 +2793,36 @@ def _build_node_class():
                 self._speech_pipeline = None
             return super().destroy_node()
 
+        def _prepare_speech(self, action: Speak) -> Any:
+            """A recorded line when ``action.text`` is one (and its file exists), else the synthesis."""
+            path = choose_recorded_line(action.text, self._spoken_clips, self._spoken_last)
+            if path:
+                return _RecordedAudio(path)
+            if spoken_key(action.text) in self._spoken_clips:
+                self.get_logger().warning(f"no recorded file left for {action.text!r}; synthesizing it")
+            return self._speaker.synthesize(
+                _tts_text(action.text, keep_english=self._tts_keep_english, pronunciations=self._pronunciations)
+            )
+
         def _render_speech(self, action: Speak, audio: Any) -> bool:
-            text = _tts_text(action.text, keep_english=self._tts_keep_english)
+            text = _tts_text(action.text, keep_english=self._tts_keep_english, pronunciations=self._pronunciations)
             with self._core_lock:
                 if not self._core.speech_is_current(action, time.monotonic()):
                     return False
                 self._core.note_playback(action, time.monotonic())
-                self._core.note_speech(text, time.monotonic())
+                self._core.note_speech(action.text, time.monotonic())
             # Keep recognition live; the core filters actual text echoes, not all audio
             # captured during playback. Cancellation runs on the transport worker.
             try:
-                self.get_logger().info(f"[say] {text}")
-                spoken = self._speaker.play(audio)
+                if isinstance(audio, _RecordedAudio):
+                    self.get_logger().info(f"[say] {action.text} (recorded {os.path.basename(audio.path)})")
+                    spoken = self._speaker.play_file(audio.path)
+                else:
+                    self.get_logger().info(f"[say] {text}")
+                    spoken = self._speaker.play(audio)
             finally:
                 with self._core_lock:
-                    self._core.note_speech(text, time.monotonic(), finished=True)
+                    self._core.note_speech(action.text, time.monotonic(), finished=True, gate_epoch=action.gate_epoch)
             return spoken
 
     return VoiceBridgeNode

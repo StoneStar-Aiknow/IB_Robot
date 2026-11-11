@@ -210,6 +210,7 @@ class GateVerdict:
     normalized: str
     #: Why it was rejected, for the log; empty when addressed.
     reason: str = ""
+    explicit_wake: bool = False
 
 
 class AddresseeGate:
@@ -277,6 +278,24 @@ class AddresseeGate:
     def required_measurements(self) -> tuple[str, ...]:
         """Measurement names the enabled checks need the node to feed."""
         return tuple(check.name for check in self.checks)
+
+    def anchor_speaks(self, segment: Segment | None) -> bool:
+        """Positive speaker evidence for an expiry hint, without renewing the window.
+
+        Missing evidence stays silent. Unlike admission, this lookup neither
+        consumes measurements nor merges them into the owner's anchor.
+        """
+        if segment is None:
+            return False
+        check = next((check for check in self.checks if isinstance(check, SpeakerCheck)), None)
+        if check is None:
+            return False
+        anchor = self.anchors.get(check.name)
+        measurement = self.measurements.get(check.name, {}).get(segment)
+        if measurement is None or not _usable_voiceprint(anchor) or not _usable_voiceprint(measurement.value):
+            return False
+        similarity = _similarity(anchor, measurement.value)
+        return similarity is not None and math.isfinite(similarity) and check.verdict(anchor, measurement.value)[0]
 
     def on_wake(self, now: float, segment: Segment | None) -> bool:
         """The audio source reports that its wake word opened ``segment``; False when it came too late.
@@ -420,6 +439,18 @@ class AddresseeGate:
         """
         if self.wake_phrases:
             self.wake_until = max(self.wake_until, heard_at + self.wake_window_sec)
+
+    def note_robot_turn_end(self, now: float) -> None:
+        """Give the current speaker a follow-up window after the robot finishes its turn.
+
+        Keep the existing anchors. A robot turn cannot open an unwoken session;
+        the bridge also rejects completion callbacks from a replaced gate.
+        """
+        if self.trigger == "vendor_session":
+            if self.session_open:
+                self.last_utterance_at = max(self.last_utterance_at, now)
+        elif self.wake_phrases and self.wake_until > 0.0:
+            self.note_handled(now)
 
     def _wakes(self, segment: Segment, heard_at: float) -> bool:
         """Whether the pending wake event opened ``segment``'s utterance.
@@ -622,7 +653,9 @@ class AddresseeGate:
             # Naming the robot is itself a request for attention, so the window
             # opens even when nothing follows the phrase ("灵犀灵犀" then "挥个手").
             self.wake_until = heard_at + self.wake_window_sec
-            return GateVerdict(True, raw[cut:].lstrip(spare), normalized[len(phrase) :].lstrip(spare))
+            return GateVerdict(
+                True, raw[cut:].lstrip(spare), normalized[len(phrase) :].lstrip(spare), explicit_wake=True
+            )
         if heard_at < self.wake_until:
             rejected = self._rejecting_check(segment, heard_at=heard_at)
             return GateVerdict(not rejected, raw, normalized, reason=rejected)

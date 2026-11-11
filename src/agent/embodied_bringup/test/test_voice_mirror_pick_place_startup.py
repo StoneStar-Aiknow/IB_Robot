@@ -6,7 +6,9 @@ no model inference, vendor runtime, camera or motion executor is started.
 """
 
 import json
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import rclpy
 import yaml
@@ -30,14 +32,13 @@ ROOT = Path(__file__).resolve().parents[4]
 CONFIG = ROOT / "src/robot_config/config/robots/aimdk_x2_voice_mirror_grasp.yaml"
 
 
-def test_voice_mirror_entry_launches_pick_place_and_compiles_all_skill_families(tmp_path):
+def test_voice_mirror_entry_launches_pick_place_and_compiles_all_skill_families(tmp_path, monkeypatch):
     # Model availability is a separate deployment check. Merge the actual YAML
     # rather than calling the full artifact validator on this model-free host.
     path, config = _load_robot_section(CONFIG)
     resolve_task_pose_file(config, path)
-    # The fixed pose library is a per-deployment artifact compiled on site
-    # (test_fixed_pose_path covers its resolution). This wiring test binds a
-    # minimal stand-in the same way the loader binds the real one.
+    # The recovered fixed pose library is checked by test_voice_mirror_deployment.
+    # This wiring test binds a minimal stand-in the same way the loader binds the real one.
     library = tmp_path / "commissioning/fixed_poses.json"
     library.parent.mkdir(parents=True)
     library.write_text(json.dumps({"poses": {"arms_up": {"user_message": "举起双臂", "phrases": ["举手"]}}}))
@@ -55,21 +56,46 @@ def test_voice_mirror_entry_launches_pick_place_and_compiles_all_skill_families(
 
     _write_graspgen_bundle(tmp_path / "models")
     config["grasp_execution"].update(model_bundle_path=str(tmp_path / "models/graspgen"), model_deployment="torch_cpu")
-    profile = ROOT / "src/robots/aimdk/aimdk_robot/profiles" / f"{config['runtime']['profile']}.yaml"
+    profile = ROOT / config["runtime"]["profile"]
     config = bind_robot_interfaces(config, build_description(load_profile(str(profile)), use_sim=True))
     nodes = generate_embodied_nodes(config, "model_inference", motion_authorized=False, include_perception=False)
     params = {
         vars(node).get("_Node__node_executable"): _normalize_launch_param_mapping(node._Node__parameters[0])
         for node in nodes
         if vars(node).get("_Node__node_executable")
-        in {"skill_executor_node", "grasp_pipeline_node", "place_pipeline_node"}
+        in {
+            "skill_executor_node",
+            "grasp_pipeline_node",
+            "place_pipeline_node",
+            "ibrobot_agent_node",
+            "ibrobot_agent_voice_bridge",
+        }
     }
-    assert set(params) == {"skill_executor_node", "grasp_pipeline_node", "place_pipeline_node"}
+    assert set(params) == {
+        "skill_executor_node",
+        "grasp_pipeline_node",
+        "place_pipeline_node",
+        "ibrobot_agent_node",
+        "ibrobot_agent_voice_bridge",
+    }
+    agent_params = params["ibrobot_agent_node"]
+    for field, name in (
+        ("ledger_path", "requests.sqlite3"),
+        ("conversation_path", "conversation.sqlite3"),
+        ("deployment_lock_path", "agent.lock"),
+    ):
+        assert _decode_launch_string(agent_params[field]) == f"log/agent_interaction/state/{name}"
+    bridge_params = params["ibrobot_agent_voice_bridge"]
+    assert _decode_launch_string(bridge_params["semantic_gate_log_path"]) == "log/agent_interaction/semantic_gate.jsonl"
+    assert _decode_launch_string(bridge_params["semantic_gate_model_path"]) == str(
+        ROOT / "models/addressee/addressee_zh_v2.json"
+    )
     gateway_params = {
         key: yaml.safe_load(value) if isinstance(value, str) else value
         for key, value in params["skill_executor_node"].items()
     }
     assert gateway_params["skill_catalog_profile"] == "aimdk_x2_voice_mirror_grasp"
+    assert gateway_params["execution_store_path"] == "log/agent_interaction/state/executions.sqlite3"
     for field, executable in (
         ("grasp_execution_json", "grasp_pipeline_node"),
         ("placement_execution_json", "place_pipeline_node"),
@@ -79,12 +105,28 @@ def test_voice_mirror_entry_launches_pick_place_and_compiles_all_skill_families(
     gateway_params["execution_store_path"] = str(tmp_path / "executions.sqlite3")
     gateway_params["skill_catalog_source_mode"] = "development"
     gateway_params["skill_catalog_source_root"] = str(ROOT / "src/agent/skill_catalog")
+    # Hand preparation binds a deployed gripper model and hardware ports. Keep
+    # its real launch mapping, replacing only that hardware boundary in this rig.
+    preparations = []
+
+    def prepare_hands(_node, preparation, **_kwargs):
+        preparations.append(preparation)
+        return SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "aimdk_grasp.hand_restore_ros",
+        SimpleNamespace(create_named_motion_hand_preparer=prepare_hands),
+    )
     rclpy.init()
     gateway = None
     try:
         gateway = SkillExecutorNode(
             parameter_overrides=[Parameter(key, value=value) for key, value in gateway_params.items()]
         )
+        assert len(preparations) == 1
+        assert preparations[0]["motions"] == ["wave", "raise_hand", "blow_kiss", "clap"]
+        assert preparations[0]["grasp_execution"]["backend_options"]["installed_hands"] == ["left"]
         snapshot = gateway._compile_runtime_snapshot()
         visible = set(snapshot.planner_visible_skill_names)
         assert set(config["embodied"]["agent"]["test_allowlist"]) == visible
@@ -101,6 +143,7 @@ def test_voice_mirror_entry_launches_pick_place_and_compiles_all_skill_families(
         assert snapshot.capability_view["pick_object"]["required_control_mode"] == "moveit_planning"
         assert snapshot.capability_view["mirror_start"]["required_control_mode"] == "model_inference"
         assert snapshot.capability_view["wave_hand"]["required_control_mode"] == "named_motion"
+        assert "handshake" not in visible
     finally:
         if gateway is not None:
             gateway.destroy_node()

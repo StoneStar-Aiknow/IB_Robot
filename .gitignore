@@ -13,6 +13,7 @@ tmp/
 # Except the approved library of aimdk_x2_voice_mirror_grasp, shared so a
 # pulled tree reuses it while its motion fingerprint matches (no MuJoCo).
 !/commissioning/fixed_poses.json
+!/commissioning/fixed_poses_voice_mirror_grasp.json
 
 # Vendor SDK reference trees (never vendored: see
 # src/robots/aimdk/aimdk_robot/README.md). AimDK is ~490 MB and its message

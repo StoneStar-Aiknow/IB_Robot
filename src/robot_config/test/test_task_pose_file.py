@@ -44,18 +44,19 @@ def test_grasp_ready_uses_table_side_pose(robot_file):
     assert set(task_poses["joint_names"]) == set(expected)
     assert pose["joint_positions"] == pytest.approx(expected, abs=1e-9)
     assert task_poses["skill_entry_poses"] == {"pick_object": "grasp_ready"}
-    expected_hands = {"right": "open"} if "voice_mirror" in robot_file else {"left": "open", "right": "open"}
+    commissioned = "voice_mirror" in robot_file
+    expected_hands = {"left": "open"} if commissioned else {"left": "open", "right": "open"}
     assert pose["hands"] == expected_hands
-    assert pose["hardware_approved"] is False
-    assert pose["unloaded_operation_approved"] is False
+    assert pose["hardware_approved"] is commissioned
+    assert pose["unloaded_operation_approved"] is commissioned
     assert "HOME" not in pose["aliases"]
     assert "双臂放下" not in pose["aliases"]
     rest = task_poses["poses"]["arms_rest"]
     assert rest["joint_positions"] != pose["joint_positions"]
     assert "双手放下" in rest["aliases"]
     assert rest["hands"] == expected_hands
-    assert rest["hardware_approved"] is False
-    assert rest["unloaded_operation_approved"] is False
+    assert rest["hardware_approved"] is commissioned
+    assert rest["unloaded_operation_approved"] is commissioned
 
     # Both entry points must stay within the grasp runtime's declared MC limits.
     _, grasp_config = _load_robot_section(ROOT / "config/robots/aimdk_x2_grasp.yaml")
@@ -182,23 +183,22 @@ def test_voice_mirror_grasp_resolves_task_poses_without_losing_deployment_featur
     from robot_config.task_poses import resolve_task_pose_file
 
     path, config = _load_robot_section(ROOT / "config/robots/aimdk_x2_voice_mirror_grasp.yaml")
-    assert config["task_poses"]["file"] == "../task_poses/x2_example.yaml"
+    assert config["task_poses"]["file"] == "../task_poses/x2_voice_mirror_grasp_approved.yaml"
     resolve_task_pose_file(config, path)
     assert config["name"] == "aimdk_x2_voice_mirror_grasp"
     assert config["task_poses"]["skill_entry_poses"] == {"pick_object": "grasp_ready"}
     pose = config["task_poses"]["poses"]["grasp_ready"]
-    assert pose["hardware_approved"] is False
-    assert pose["unloaded_operation_approved"] is False
-    assert pose["hands"] == {"right": "open"}
-    assert config["grasp_execution"]["backend_options"]["installed_hands"] == ["right"]
-    assert config["grasp_execution"]["backend_options"]["arm_side"] == "right"
+    assert pose["hardware_approved"] is True
+    assert pose["unloaded_operation_approved"] is True
+    assert pose["hands"] == {"left": "open"}
+    assert config["grasp_execution"]["backend_options"]["installed_hands"] == ["left"]
+    assert config["grasp_execution"]["backend_options"]["arm_side"] == "left"
     assert config["pose_composer"]["mode"] == "fixed"
     assert config["pose_composer"]["enabled"] is True
     assert config["pose_composer"]["memory"]["enabled"] is False
     assert config["embodied"]["skill_catalog_profile"] == "aimdk_x2_voice_mirror_grasp"
-    assert set(config["embodied"]["agent"]["test_allowlist"]) == {
+    assert {
         "wave_hand",
-        "handshake",
         "raise_hand",
         "blow_kiss",
         "clap_hands",
@@ -209,10 +209,11 @@ def test_voice_mirror_grasp_resolves_task_poses_without_losing_deployment_featur
         "free_pose",
         "return_to_task_pose",
         "place_in_container",
-    }
+    } <= set(config["embodied"]["agent"]["test_allowlist"])
+    assert "handshake" not in config["embodied"]["agent"]["test_allowlist"]
     assert config["voice_asr"]["enabled"] is True
     assert config["mirror_session"]["enabled"] is True
-    assert config["mirror_session"]["voice"]["enabled"] is False
+    assert config["mirror_session"]["voice"]["enabled"] is True
     assert config["mirror_session"]["operator"]["enabled"] is True
     assert config["grasp_execution"]["enabled"] is True
     _, grasp = _load_robot_section(ROOT / "config/robots/aimdk_x2_grasp.yaml")
@@ -284,14 +285,15 @@ def test_one_voice_mirror_grasp_config_selects_mounted_hands_without_changing_ta
 
     path, config = _load_robot_section(ROOT / "config/robots/aimdk_x2_voice_mirror_grasp.yaml")
     config["grasp_execution"]["backend_options"].update(installed_hands=sides, arm_side=arm_side)
-    source = normalize_task_poses(yaml.safe_load(EXAMPLE.read_text()))
+    source_path = ROOT / "config/task_poses/x2_voice_mirror_grasp_approved.yaml"
+    source = normalize_task_poses(yaml.safe_load(source_path.read_text()))
     resolve_task_pose_file(config, path)
     selected = config["task_poses"]
     for name, pose in selected["poses"].items():
         assert pose["hands"] == dict.fromkeys(sides, "open")
         assert pose["joint_positions"] == source["poses"][name]["joint_positions"]
-        assert pose["hardware_approved"] is False
-        assert pose["unloaded_operation_approved"] is False
+        assert pose["hardware_approved"] is True
+        assert pose["unloaded_operation_approved"] is True
     if len(sides) == 2:
         assert selected == source
     else:
@@ -299,7 +301,7 @@ def test_one_voice_mirror_grasp_config_selects_mounted_hands_without_changing_ta
     frozen = copy.deepcopy(config)
     resolve_task_pose_file(config, path)
     assert config == frozen
-    assert normalize_task_poses(yaml.safe_load(EXAMPLE.read_text())) == source
+    assert normalize_task_poses(yaml.safe_load(source_path.read_text())) == source
 
 
 @pytest.mark.parametrize("mounts", [None, [], "right", ["left", "left"], ["unknown"], [False]])

@@ -1278,6 +1278,62 @@ class ContextRecordingPlanner(FakePlanner):
         return super().plan(request, context, catalog, cancel_token, on_preview=on_preview)
 
 
+def test_requested_container_reaches_prefetch_and_execution_instead_of_the_default(tmp_path):
+    from ibrobot_agent.pick_prefetch import first_pick
+
+    class FruitCatalog(FakeCatalog):
+        def get_catalog(self, status):
+            return {
+                "skills": [
+                    {"name": name, "planner_visible": True, "semantic_level": "skill"}
+                    for name in ("pick_object", "place_in_container")
+                ]
+            }
+
+    class CaptureExecution(FakeExecution):
+        def execute(self, proposal, **kwargs):
+            self.steps = proposal.outcome.steps
+            return super().execute(proposal, **kwargs)
+
+    outcome = PlannerOutcome(
+        kind="workflow",
+        user_message="放进绿色的碗。",
+        summary="放置苹果",
+        steps=(
+            CanonicalWorkflowStep(1, "pick_object", target_name="an apple"),
+            CanonicalWorkflowStep(1, "place_in_container", target_name="an apple", container_name="a green bowl"),
+        ),
+    )
+    events, execution, prefetched = RenderedEvents(), CaptureExecution(), []
+    planner = FakePlanner(outcome)
+    service = AgentService(
+        planner=planner,
+        catalog=FruitCatalog(),
+        store=SQLiteRequestStore(tmp_path / "container.db"),
+        execution=execution,
+        event_sink=events,
+        presentation=events.gate,
+        execution_enabled=True,
+        allowed_skills={"pick_object", "place_in_container"},
+        robot_scope="aimdk_x2_summit",
+        fruit_delivery={"container_name": "a black bowl", "container_label": "黑色的碗"},
+        answer_rules={"lines": {"random_pick": "我帮你挑一个！"}},
+        workflow_planned=lambda steps: prefetched.append(first_pick(steps)),
+    )
+    try:
+        request = replace(_request(text="帮我随便挑一个水果，放进绿色的碗"), robot_scope="aimdk_x2_summit")
+        assert service.send_message(request).accepted
+        record = _wait_state(service, request.to_key(), {"SUCCEEDED", "FAILED", "UNKNOWN"})
+        assert record.state == "SUCCEEDED", record.terminal
+        assert planner.calls == 1
+        assert prefetched == [("an apple", "a green bowl")]
+        assert execution.steps[1].container_name == "a green bowl"
+        snapshot = service._store.latest_event_detail(request.to_key(), "proposal_snapshot")
+        assert snapshot["outcome"]["steps"][1]["container_name"] == "a green bowl"
+    finally:
+        service.close()
+
+
 def _conversation_request(text: str) -> AgentRequest:
     return replace(_request(text=text), admission="conversation")
 
@@ -1379,3 +1435,137 @@ def test_a_conversation_only_request_may_run_an_answer_skill(tmp_path):
     assert identity["route"] == "fake"
     assert capped is None
     assert planner.context["answer_skills"] == ["wave_hello"]
+
+
+def test_an_ability_question_about_a_pick_is_asked_back_and_never_planned_twice(tmp_path):
+    """1_需要修改的代码.md 1.4/1.5: the pick waits for a yes; the yes runs the held plan without the model."""
+    from embodied_common.workflow_contracts import CanonicalWorkflowStep
+
+    pick = PlannerOutcome(
+        kind="workflow",
+        user_message="好的",
+        summary="pick",
+        steps=(
+            CanonicalWorkflowStep(schema_version=1, skill_name="pick_object", target_name="an apple"),
+            CanonicalWorkflowStep(
+                schema_version=1, skill_name="place_in_container", target_name="an apple", container_name="bowl"
+            ),
+        ),
+    )
+    events = Events()
+    planner = FakePlanner(pick)
+    service = AgentService(
+        planner=planner,
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=events,
+        answer_rules={
+            "lines": {"confirm_pick": "可以呀，现在就给你拿吗？", "only_one": "这轮只能选一份哦"},
+        },
+    )
+    try:
+        service.send_message(_request("r1", text="你可以抓苹果吗"))
+        _wait_for_event(events, "needs_clarification")
+        asked = next(event for event in events.items if event.event_type == "needs_clarification")
+        assert asked.user_message == "可以呀，现在就给你拿吗？" and planner.calls == 1
+        service.send_message(_request("r2", text="我全都要"))
+        for _ in range(200):
+            if service._store.get_request(_request("r2").to_key()).state == "ANSWERED":
+                break
+            time.sleep(0.01)
+        assert service._store.get_request(_request("r2").to_key()).state == "ANSWERED"
+        assert planner.calls == 1  # answered by the round rule, not planned
+    finally:
+        service.close()
+
+
+def test_a_fruit_the_robot_picks_itself_is_announced_before_the_delivery(tmp_path):
+    events = Events()
+    service = AgentService(
+        planner=FakePlanner(PlannerOutcome(kind="conversation", user_message="x")),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        event_sink=events,
+        fruit_delivery={"container_name": "an orange bowl", "container_label": "黑色的碗"},
+        answer_rules={"lines": {"random_pick": "每个都有礼物，我帮你挑一个！"}},
+    )
+    try:
+        service.send_message(_request("r1", text="你帮我随便挑一个"))
+        _wait_for_event(events, "reply_preview")
+        preview = next(event for event in events.items if event.event_type == "reply_preview")
+        assert preview.user_message == "每个都有礼物，我帮你挑一个！"
+    finally:
+        service.close()
+
+
+class _GestureCatalog(FakeCatalog):
+    def get_catalog(self, status):
+        return {
+            "robot_name": "so101_single_arm",
+            "skills": [
+                {"name": name, "planner_visible": True, "semantic_level": "skill"}
+                for name in ("blow_kiss", "decline_unsupported")
+            ],
+        }
+
+
+def _wait_terminal(service, request_id):
+    for _ in range(300):
+        record = service.get_request(_request(request_id).to_key())
+        if record.state in {"SUCCEEDED", "FAILED", "ANSWERED", "UNKNOWN", "CANCELLED"}:
+            return record
+        time.sleep(0.01)
+    raise AssertionError(f"{request_id} did not finish")
+
+
+def _gesture_service(tmp_path, outcome, execution):
+    events = RenderedEvents()
+    service = AgentService(
+        planner=FakePlanner(outcome),
+        catalog=_GestureCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        execution=execution,
+        event_sink=events,
+        presentation=events.gate,
+        execution_enabled=True,
+        allowed_skills={"blow_kiss", "decline_unsupported"},
+        answer_rules={
+            "contact_replies": ["出于安全考虑，我暂时不支持这类肢体接触哦。"],
+            "unsupported_skill": "decline_unsupported",
+        },
+    )
+    return service, events
+
+
+def test_a_contact_request_is_answered_without_the_planner_or_any_motion(tmp_path):
+    kiss = PlannerOutcome(
+        kind="workflow", user_message="好的", summary="飞吻", steps=(CanonicalWorkflowStep(1, "blow_kiss"),)
+    )
+    execution = FakeExecution()
+    service, events = _gesture_service(tmp_path, kiss, execution)
+    try:
+        service.send_message(_request("r1", text="你能抱抱我吗"))
+        record = _wait_terminal(service, "r1")
+        assert record.state == "ANSWERED" and service._planner.calls == 0 and execution.calls == 0
+        # The model planned a kiss for "别抱我": the rule still answers, nothing moves.
+        service.send_message(_request("r2", text="别抱我"))
+        record = _wait_terminal(service, "r2")
+        assert record.state == "ANSWERED" and service._planner.calls == 1 and execution.calls == 0
+        assert not any(event.event_type == "reply_preview" for event in events.items)
+    finally:
+        service.close()
+
+
+def test_a_planned_skill_outside_the_catalog_is_refused_aloud(tmp_path):
+    nod = PlannerOutcome(
+        kind="workflow", user_message="好的，点个头。", summary="nod_yes", steps=(CanonicalWorkflowStep(1, "nod_yes"),)
+    )
+    execution = FakeExecution()
+    service, _events = _gesture_service(tmp_path, nod, execution)
+    try:
+        service.send_message(_request("r1", text="帮我看看小红书"))
+        record = _wait_terminal(service, "r1")
+        assert record.state == "SUCCEEDED" and execution.calls == 1
+        assert record.task_ref is not None
+    finally:
+        service.close()

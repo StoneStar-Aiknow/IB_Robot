@@ -56,6 +56,11 @@ def read_only_outcome(text: str) -> PlannerOutcome | None:
     return None
 
 
+def _command_key(text: str) -> str:
+    """The words of a direct command: case, spaces and punctuation never decide a match ("IB ROBOT")."""
+    return re.sub(r"[\s，,。.！!？?、~～:：;；]", "", str(text)).casefold()
+
+
 def direct_command_outcome(text: str, commands: Mapping[str, str], catalog: Mapping[str, Any]) -> PlannerOutcome | None:
     """Turn an exactly-matching known phrase straight into a one-step workflow.
 
@@ -78,13 +83,13 @@ def direct_command_outcome(text: str, commands: Mapping[str, str], catalog: Mapp
     """
     if not commands:
         return None
-    folded = text.strip().casefold()
+    folded = _command_key(text)
     if not folded:
         return None
     if any(token in folded for token in (*_NEGATION_MARKERS, *_HYPOTHETICAL_MARKERS)):
         return None
     phrase, skill_name = next(
-        ((phrase, name) for phrase, name in commands.items() if phrase.strip().casefold() == folded),
+        ((phrase, name) for phrase, name in commands.items() if _command_key(phrase) == folded),
         ("", None),
     )
     if skill_name is None:
@@ -237,8 +242,36 @@ def fruit_delivery_from_config(config: Mapping[str, Any]) -> dict[str, str]:
     return {key: item.strip() for key, item in value.items()}
 
 
+#: Clarifications a deployment has recorded lines for (``clarification_lines``).
+CLARIFICATION_LINE_KEYS = ("not_heard", "fruit_name", "confirm_pick", "recommend")
+
+
+def deployment_facts_from_config(config: Mapping[str, Any]) -> tuple[list[str], dict[str, str]]:
+    """The deployment's facts and recorded clarification lines (``planner.deployment_facts``).
+
+    Facts are short statements the planner may answer from, and the only ones: on 2026-11-09
+    a model without them placed the robot in 深圳 and credited a team that did not build it.
+    """
+    facts = config.get("deployment_facts", [])
+    if not isinstance(facts, list) or any(not isinstance(item, str) or not item.strip() for item in facts):
+        raise ValueError("planner deployment_facts must be a list of non-empty strings")
+    lines = config.get("clarification_lines", {})
+    if (
+        not isinstance(lines, Mapping)
+        or set(lines) - set(CLARIFICATION_LINE_KEYS)
+        or any(not isinstance(value, str) or not value.strip() for value in lines.values())
+    ):
+        raise ValueError(f"planner clarification_lines must map {CLARIFICATION_LINE_KEYS} to texts")
+    return [item.strip() for item in facts], {key: str(value).strip() for key, value in lines.items()}
+
+
 def validate_fruit_delivery(outcome: PlannerOutcome, config: Mapping[str, str], *, required: bool) -> None:
-    """Reject incomplete gift plans before proposal; never silently append a place step."""
+    """Validate the paired gift workflow; the configured container is only a default.
+
+    Container interpretation belongs to the planner, including color and location
+    qualifiers. An explicit user destination must not be rejected for differing
+    from the deployment default, or silently replaced with that default.
+    """
     if not required and not config:
         return
     for index, step in enumerate(outcome.steps):
@@ -256,9 +289,9 @@ def validate_fruit_delivery(outcome: PlannerOutcome, config: Mapping[str, str], 
             or pick.target_name not in {"a lemon", "an apple", "an orange"}
             or pick.target_name != place.target_name
             or pick.arm_side != place.arm_side
-            or place.container_name != config["container_name"]
+            or not place.container_name.strip()
         ):
-            raise ValueError("fruit delivery requires the same fruit and configured container in an adjacent pair")
+            raise ValueError("fruit delivery requires the same fruit and a named container in an adjacent pair")
 
 
 def append_return_after_place(outcome: PlannerOutcome, task_pose: str | None) -> PlannerOutcome:
@@ -424,6 +457,8 @@ def build_planner_messages(
     context: Mapping[str, Any],
     catalog: Mapping[str, Any],
     fruit_delivery: Mapping[str, str] | None = None,
+    deployment_facts: list[str] | None = None,
+    clarification_lines: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Build a channel-neutral prompt whose output is still locally validated.
 
@@ -488,21 +523,73 @@ def build_planner_messages(
         "container_name, place_name, arm_side, motion_direction, motion_distance, imitation_duration_sec "
         "and timeout_sec; never nest a parameters object. Example conversation: "
         '{"kind":"conversation","user_message":"简短回答"}. Example workflow: '
-        '{"kind":"workflow","user_message":"好的，点个头。","summary":"nod_yes",'
-        '"steps":[{"schema_version":1,"skill_name":"nod_yes"}]}. '
+        '{"kind":"workflow","user_message":"好的，马上来。","summary":"简短摘要",'
+        '"steps":[{"schema_version":1,"skill_name":"<CATALOG skill name>"}]}. '
+        "Its skill_name is a placeholder for a skill of the current CATALOG; never name a skill it does not list. "
         "If conversation.continuation is present, request.text is an interrupted task the user asked to continue: "
         "plan only its unfinished part, never repeating conversation.continuation.completed_steps and planning "
         "conversation.continuation.interrupted_step again, because it may have stopped half way."
     )
     if fruit_delivery:
         system += (
-            " Deployment fruit_delivery is authoritative: every supported fruit choice requires a single "
+            " Every supported fruit choice requires a single "
             "workflow with adjacent pick_object then place_in_container, identical canonical target_name "
-            "and arm_side, and container_name copied verbatim from deployment.fruit_delivery. "
-            "Never confuse a container color with a fruit target. If it is missing, do not pick a gift. "
+            "and arm_side. For container_name, the user's explicitly requested destination takes priority "
+            "over deployment.fruit_delivery: translate it into a short English visual query preserving its "
+            "color, material and position qualifiers (for example 绿色的碗 -> a green bowl). "
+            "deployment.fruit_delivery.container_name is ONLY the default when the user does not specify "
+            "a destination. Never replace an explicit or unresolved destination with the default, even if "
+            "it was not found or an earlier attempt failed. For ambiguous references such as '那个碗', "
+            "ask which container using kind=needs_clarification and missing_fields=['container_name']; "
+            "do not invent a color or choose the default. If resuming or confirming an existing workflow, "
+            "preserve its chosen container unless the user explicitly changes it. "
+            "Never confuse a container color with a fruit target. If the default configuration is missing, "
+            "do not pick a gift. "
+        )
+    if isinstance(context.get("gift_state"), Mapping):
+        system += (
+            " conversation.gift_state is the Agent's authoritative CURRENT gift round, independent of chat history. "
+            "Its status overrides earlier messages about gift eligibility: available means a gift can be requested "
+            "in this round, even if an earlier round delivered one or an earlier answer refused another. "
+            "For an explicit request for one supported fruit, including '再给我一个苹果', plan the normal delivery "
+            "when status is available; do not repeat an earlier already-given answer. When status is delivered, "
+            "copy conversation.gift_state.already_given_message verbatim as user_message for a repeat gift request. "
+            "That recorded reply is exempt from the short-answer length limit; never shorten or paraphrase it. "
+            "For in_progress or uncertain, do not "
+            "propose another pick. Never claim to reset state yourself or invent delivery results. "
+        )
+    deployment: dict[str, Any] = {"fruit_delivery": dict(fruit_delivery or {})}
+    if deployment_facts:
+        deployment["facts"] = list(deployment_facts)
+        system += (
+            " deployment.facts are the only facts about this robot, its name, software, team, price, event, "
+            "venue and gifts: answer from them and never invent others; if they do not cover a factual question, "
+            "say briefly that you do not know. Small talk, a joke, or a question about the robot's feelings, likes "
+            "or looks is answered in words, playfully. This is a spoken exhibit: keep user_message to at most 15 Chinese "
+            "characters, conversational, with at most one interjection (呀, 哦, 啦, 嘿嘿, 哎呀), and write no "
+            "English or Latin letters in it (the robot's speech cannot read them). Never end an answer by "
+            "offering motions or gifts; mention them only when asked what the robot can do or what it gives. "
+            "When a CATALOG skill whose summary says 'recorded reply' answers exactly this question, return a "
+            "workflow of exactly that skill instead of answering in words: the recording is faster and correct; "
+            "never use one whose recording would not answer what was asked. Answer the actual question; "
+            "a self-introduction is not a fallback for an unknown fact. Do not shorten a factual answer "
+            "so far that it no longer answers the question; factual accuracy takes priority over brevity. "
+        )
+    if clarification_lines:
+        deployment["clarification_lines"] = dict(clarification_lines)
+        system += (
+            " deployment.clarification_lines are recorded sentences: when you need to clarify one of these "
+            "situations (not_heard: request.text is unintelligible gibberish, never a clear question or request; "
+            "fruit_name: the user wants a fruit but did not say which one -- a named fruit that is not offered "
+            "is not unclear and has its own recorded reply; "
+            "fruit_name is only for an ambiguous reference such as '我要那个'. For a generic request for fruit "
+            "or a question listing the available fruit ('我要水果', '有什么水果', '我想选水果礼物'), select "
+            "offer_fruit_menu instead: its recording lists the choices and asks the question. "
+            "confirm_pick: the user only asked whether you can pick a fruit; recommend: the user asked you to "
+            "recommend a fruit), return kind=needs_clarification with that sentence verbatim as user_message. "
         )
     payload = {
-        "deployment": {"fruit_delivery": dict(fruit_delivery or {})},
+        "deployment": deployment,
         "request": {"text": request.text, "reply_to_request_id": request.reply_to_request_id},
         "conversation": context,
         "catalog": catalog,

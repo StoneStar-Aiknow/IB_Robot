@@ -125,6 +125,7 @@ _COMMAND_MARKERS = (
     "你会",
     "可以",
     "想",
+    "我要",
     "吗",
     "吧",
 )
@@ -163,10 +164,16 @@ _ASK_MARKERS = (
     "有没有",
     "可不可以",
     "要不要",
+    "多高",
+    "多重",
+    "多大",
+    "几岁",
+    "几号",
+    "等于几",
 )
 #: Third-person pronouns: a sentence about "him"/"it" is said *about* the robot or a person,
 #: to somebody else ("他实际的表现是什", "你看见它手指刚才抖了吗").
-_THIRD_PERSON = ("他", "她", "它")
+_THIRD_PERSON = re.compile(r"(?<!其)[他她它]")
 #: Answers to the robot's own question ("有什么水果" -> "我想选香蕉"): a choice verb and a
 #: short object, nothing else. Admitted only inside the follow-up window.
 _CHOICE = re.compile(r"^(?:我想选|我想要|我要|我选|给我个|给我一个|给我来个|来个|来一个|要个|要一个)\S{1,4}$")
@@ -217,19 +224,28 @@ def _asks(body: str) -> bool:
 def _second_person_question(body: str) -> bool:
     """A short question put to "you" that is not about a third person and not rhetorical."""
     return (
-        body.startswith(_QUESTION_STARTS)
+        (body.startswith(_QUESTION_STARTS) or re.match(r"^(?:除了.{1,10}|是谁.{0,3})[你您]", body))
         and len(body) <= _QUESTION_MAX_CHARS
         and _asks(body)
-        and not any(p in body for p in _THIRD_PERSON)
+        and not _THIRD_PERSON.search(body)
         and not _RHETORICAL.search(body)
     )
 
 
 def _reply_shaped(body: str) -> bool:
     """A sentence that reads as an answer or a reaction to what the robot just said."""
-    if len(body) > _FOLLOWUP_MAX_CHARS or any(p in body for p in _THIRD_PERSON):
+    if _THIRD_PERSON.search(body):
         return False
-    return _asks(body) or body.endswith(("吗", "呢")) or body.startswith(_QUESTION_STARTS) or bool(_CHOICE.match(body))
+    if len(body) > _FOLLOWUP_MAX_CHARS:
+        # A listener may repeat a correction as two short questions in one VAD segment.
+        return len(body) <= 32 and bool(re.fullmatch(r"你不应该.{1,16}吗你不.{1,16}[啊吗呢]", body))
+    return (
+        _asks(body)
+        or body.endswith(("吗", "呢"))
+        or body.startswith(_QUESTION_STARTS)
+        or bool(_CHOICE.match(body))
+        or bool(re.fullmatch(r"再来(?:一个|一次|一遍)", body))
+    )
 
 
 def _fnv1a32(text: str) -> int:
@@ -610,6 +626,7 @@ class SemanticGate:
         lexicon_hit = bool(self._phrase_hit(self.lexicon, raw_normalized, body))
         wake_prefix = any(raw_normalized.startswith(prefix) for prefix in self.wake_prefixes)
         address_term = next((term for term in _ADDRESS_TERMS if term in raw_normalized), "")
+        dialogue_request = self._phrase_hit(self.dialogue_requests, raw_normalized, body)
 
         def decide(rejected: bool, reason: str, grade: str = GRADE_COMMAND, admitted: str = "") -> SemanticDecision:
             return SemanticDecision(
@@ -618,7 +635,11 @@ class SemanticGate:
 
         if not body:
             return decide(False, "empty after wake-word stripping")
-        if address_term and not wake_prefix:
+        if (
+            address_term
+            and not wake_prefix
+            and not (address_term == "大家" and body.startswith("给大家") and dialogue_request)
+        ):
             return decide(True, f"names someone else ({address_term})")
         if _manipulation_noncommand(body, text):
             if conversation and session_open and _second_person_question(body):
@@ -628,8 +649,18 @@ class SemanticGate:
             return decide(True, "manipulation reference or negation, not an instruction")
         # A request to talk is addressed to whatever can talk back, and it can only ever
         # start a conversation, so it outranks the model instead of arguing with it.
-        if self._phrase_hit(self.dialogue_requests, raw_normalized, body):
+        if dialogue_request:
             return decide(False, "dialogue request")
+        if (
+            conversation
+            and session_open
+            and any(
+                body == greeting + prefix
+                for greeting in ("你好", "嗨", "哈喽", "hello")
+                for prefix in self.wake_prefixes
+            )
+        ):
+            return decide(False, "greeting to the robot", GRADE_CONVERSATION)
         if (
             lexicon_hit
             and self._leading_skill_word(body)
@@ -691,7 +722,7 @@ class SemanticGate:
             if any(tail.endswith(tag) for tag in _TAG_QUESTIONS):
                 continue
             if _second_person_question(tail) or (
-                self._phrase_hit(self.dialogue_requests, tail) and not any(p in tail for p in _THIRD_PERSON)
+                self._phrase_hit(self.dialogue_requests, tail) and not _THIRD_PERSON.search(tail)
             ):
                 return tail
         return ""

@@ -26,7 +26,8 @@ description is the deployed GraspGen-X bundle's
   own masks), ``generate_grasps_service``, ``service_timeout_s``
 - ``registration_device``, ``depth_scale``, ``calibration_verified``
 - ``watch``: ``stop``, ``log`` or ``off``; ``watch_period_s``; ``watch_frame_timeout_s``,
-  ``watch_unknown_timeout_s`` and ``watch_image_age_s`` (``execution_watch.WatchTimeouts``)
+  ``watch_unknown_timeout_s``, ``watch_occluded_timeout_s`` and ``watch_image_age_s``
+  (``execution_watch.WatchTimeouts``)
 - ``warmup_prompt``: optional local-backend inference warmup query; empty by default
 - ``head``: the grasp head on another host (``aimdk_grasp.split``); remote_head only
 - ``perception``: PerceptionSettings fields; ``planning``: GraspRequestConfig fields
@@ -77,6 +78,7 @@ DEFAULTS = {
     "watch_frame_timeout_s": WatchTimeouts.frame_s,
     "watch_unknown_timeout_s": WatchTimeouts.unknown_s,
     "watch_image_age_s": WatchTimeouts.image_age_s,
+    "watch_occluded_timeout_s": WatchTimeouts.occluded_s,
     "warmup_prompt": "",
     # The grasp head on another host (aimdk_grasp.split), for remote_head only.
     "head": {},
@@ -134,7 +136,7 @@ def _options(grasp_execution: Mapping[str, Any]) -> dict[str, Any]:
         )
     if options["watch"] not in ("stop", "log", "off"):
         raise ValueError("backend_options.watch must be stop, log or off")
-    for name in ("watch_frame_timeout_s", "watch_unknown_timeout_s", "watch_image_age_s"):
+    for name in ("watch_frame_timeout_s", "watch_unknown_timeout_s", "watch_image_age_s", "watch_occluded_timeout_s"):
         if not finite_seconds(options[name], 0.0, MAX_TIMEOUT_S):
             raise ValueError(f"backend_options.{name} must be a finite number of seconds in (0, {MAX_TIMEOUT_S:g}]")
     head_options(options)
@@ -156,6 +158,7 @@ def watch_timeouts(options: Mapping[str, Any]) -> WatchTimeouts:
         frame_s=float(options["watch_frame_timeout_s"]),
         unknown_s=float(options["watch_unknown_timeout_s"]),
         image_age_s=float(options["watch_image_age_s"]),
+        occluded_s=float(options["watch_occluded_timeout_s"]),
     )
 
 

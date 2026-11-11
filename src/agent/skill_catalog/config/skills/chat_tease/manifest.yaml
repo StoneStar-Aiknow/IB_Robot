@@ -1,0 +1,37 @@
+# Generated from commissioning/audio/summit_clips.yaml (S02); edit the aliases here.
+schema_version: 1
+name: chat_tease
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Answer good-naturedly with a recorded reply when the visitor says the robot is not smart.
+  category: social_interaction
+  when_to_use:
+  - the visitor teases the robot or says it is stupid
+  aliases_zh:
+  - 你懂个屁
+  - 你不太聪明
+  - 你好笨
+  - 你好像不太聪明的样子
+  - 你真傻
+  aliases_en:
+  - you are dumb
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.5
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Answer good-naturedly with a recorded reply when the visitor says the robot is not smart. Use for 你懂个屁.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

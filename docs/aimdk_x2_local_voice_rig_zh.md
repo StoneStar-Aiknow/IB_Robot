@@ -18,7 +18,8 @@
 | X2 平台（HAL、运动控制） | 替换 | 仓库自带的 `aimdk_vendor_mock` |
 | X2 麦克风与扬声器 | 替换 | `local_audio_hal.py`，使用本机声卡 |
 | 抓取、放置的感知与运动 | 替换 | `mock_manipulation.py`；流水线、托管和 Gateway 契约仍为真实 |
-| 照镜子、`free_pose`、`return_to_task_pose` | 关闭 | 需要相机、Ascend 模型或固定姿态库 |
+| 固定姿态库、`free_pose`、`return_to_task_pose` | 启用 | 执行器使用本机编译的姿态库和模拟运动接口 |
+| 照镜子、视觉互动、握手 | 关闭 | 本机缺少视觉输入，握手默认禁用 |
 
 ROS 只在本机回环上通信（`ROS_LOCALHOST_ONLY=1`），默认域号为 91。局域网中的机器人使用域 0，
 本机环境不会向机器人发送话题。
@@ -55,7 +56,8 @@ Silero 会话只使用 1 个线程，并关闭空转等待。项目的 manifest 
 - 两个假执行器运行在不同进程中，真机上只有一条手臂。交接姿态设为放置执行器的起点，
   使放置开始时的持握姿态检查通过。
 - 托管交给放置之后，抓取执行器报告手臂已回到起点。真机上，放置结束时手臂回到起点。
-- `mock_model_bundle/` 只提供模型身份，不含权重。Gateway 与抓取执行器用它核对执行器身份。
+- `mock_model_bundle/` 提供模型身份和模拟手部预设，不含权重。
+  Gateway 与抓取执行器使用模型身份。姿态执行器使用手部预设检查模拟双手。
 
 ## 3. 配置如何生成
 
@@ -77,13 +79,14 @@ Silero 会话只使用 1 个线程，并关闭空转等待。项目的 manifest 
 | 关闭照镜子、动作模仿流和视觉互动 | 没有头部相机和 Ascend YOLOX/PEAR |
 | 控制模式改为 `moveit_planning` | `model_inference` 只用于照镜子 |
 | 清空 `perception_services` | Grounding DINO、SAM2、GraspGen 都是 Ascend 部署 |
-| 关闭 `task_poses` 和 `pose_composer` | 没有固定姿态库 |
+| 保留 `task_poses` 并启用固定姿态执行器 | 本机验证自由摆姿和归位流程 |
+| 清空本机的 `blocked_task_poses` | 模拟验证不使用真机的待标定禁用列表 |
 | 抓取、放置改用假后端和身份包 | 没有相机和手臂 |
-| 删除 `runtime_named_motion.hand_preparation` | 手部准备读取 GraspGen-X 模型包中的夹爪描述 |
+| 删除 `runtime_named_motion.hand_preparation` | 预设手势直接使用厂商 Mock，固定姿态保留手部检查 |
 | ASR、声纹、TTS、意图模型指向本机模型目录 | 模型不在检出目录中 |
 | TTS 改用 `ubuntu_onnx` | 本机没有 NPU |
 | 账本、Gateway 记录、意图日志写入本机状态目录 | 与其他本机测试隔离 |
-| 删除技能 `mirror_start`、`mirror_stop`、`free_pose`、`return_to_task_pose`，并删除指向它们的直达命令 | 上面这些条件不满足 |
+| 删除技能 `mirror_start`、`mirror_stop`、`handshake`，并删除指向这些技能的直达命令 | 视觉输入缺失，握手默认禁用 |
 | `tts_keep_english` 取决于 `piper_phonemize` 能否导入 | 缺少英文前端时，含英文的句子会整句合成失败 |
 
 生成文件必须放在源码树中，原因是 2 个：
@@ -93,13 +96,21 @@ Silero 会话只使用 1 个线程，并关闭空转等待。项目的 manifest 
 
 两个生成文件都不提交。如果脚本异常退出，执行 `stop.sh` 删除这两个文件。
 
+启动脚本还会检查固定姿态库与当前动作轨迹是否匹配。
+如果编译产物缺失或失效，系统使用已有种子重新编译。
+编译产物位于 `<状态目录>/fixed_poses.json`。
+这一步需要已下载的 X2 MuJoCo 模型。
+
+语音桥读取展会配置中的自定义文案、录音匹配和读音替换。
+语音桥还会暂存播报期间的追问，暂存时长为 10 秒。
+
 ## 4. 前置条件
 
 1. 在检出目录中完成构建，`voice_asr_service` 和 `aimdk_robot` 都要构建：
 
    ```bash
    source .shrc_local && source ~/aimdk/overlay_x86/install/local_setup.bash && \
-     ./scripts/build.sh -- --packages-up-to embodied_bringup voice_asr_service voice_tts_service aimdk_robot \
+     ./scripts/build.sh -- --packages-up-to embodied_bringup voice_asr_service voice_tts_service aimdk_robot pose_composer \
      --packages-ignore livox_ros_driver2 fast_lio usb_cam fast_calib pymoveit2
    ```
 
@@ -184,9 +195,16 @@ PulseAudio。
 - `<状态目录>/logs/audio_hal_latest.log`：音频桥日志。
 - `<状态目录>/agent/`：本次运行的 Agent 账本、Gateway 记录和意图日志。
 - 每次启动时，系统把上一次的 `agent/` 移到 `logs/agent_state_before_<时间>/`。
+- `<状态目录>/gift_state.sqlite3`：Agent 管理的领取状态。该文件保留，不随 `agent/` 归档。
+
+有效唤醒“欧拉欧拉”开始新的领取轮次。聊天会话和聊天上下文保留。
+只说唤醒词，或连说“欧拉欧拉，给我一个苹果”，都可以开始新轮次。
+同一轮内送出礼物后，再次索要会收到重新唤醒的提示。
+执行中、持物或执行结果待确认时，唤醒不会清除现有任务和保护状态。
+状态库中仍在执行的记录，在重启后转为待确认，不会自动恢复领取资格。
 
 同一次运行中，如果请求结果为 UNKNOWN，机器人进入隔离（`ROBOT_QUARANTINED`），与真机相同。
-重启环境后，隔离解除。
+重启本机环境后，新的请求账本解除该隔离。领取状态库中的待确认记录继续保留。
 
 ## 9. 已知限制
 

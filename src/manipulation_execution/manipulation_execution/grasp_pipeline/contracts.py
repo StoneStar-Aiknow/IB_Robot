@@ -465,6 +465,12 @@ class GraspBackends:
     held_object: Callable | None = None
     #: The empty hand's way home after a retained object drops: (held, deadline, cancelled) -> Move.
     plan_home: Callable | None = None
+    #: The robot's measured joints as one vector (both arms, head, hands): a capture made before
+    #: the goal is used only when this has not changed since (prefetch.PerceptionPrefetch).
+    posture: Callable[[], np.ndarray] | None = None
+    #: (observation, container_query, *, deadline, cancelled) -> HxW mask or None: the container of
+    #: a following place, detected on a prefetched capture and handed over with the held object.
+    container_detector: Callable | None = None
 
 
 @dataclass(frozen=True)

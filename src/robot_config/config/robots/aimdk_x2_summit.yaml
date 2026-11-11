@@ -13,6 +13,9 @@ robot:
   - moveit_planning
   - named_motion
   pose_composer:
+    # Old direct grasp_ready path is disabled until the side-entry route is commissioned.
+    # Preserve the existing compiled snapshot so other display skills can still start.
+    blocked_task_poses: [grasp_ready]
     display_completion:
       pose_ids: [arms_forward, arms_up, arms_out, arms_v, flex, surrender, right_forward, left_forward]
       mode: playback_only
@@ -41,12 +44,13 @@ robot:
     runtime_named_motion:
       hand_preparation:
         factory: aimdk_grasp.hand_restore_ros:create_named_motion_hand_preparer
-        motions: [wave, raise_hand, blow_kiss, clap, handshake]
+        motions: [wave, raise_hand, blow_kiss, clap]
     skill_catalog_profile: aimdk_x2_summit
     agent:
+      gift_state:
+        enabled: true
       test_allowlist:
       - wave_hand
-      - handshake
       - raise_hand
       - blow_kiss
       - clap_hands
@@ -64,10 +68,99 @@ robot:
       - return_to_task_pose
       - invite_visitor
       - free_pose
+      # Recorded answers (commissioning/audio/summit_clips.yaml).
+      - explain_mirror_how
+      - explain_pick_how
+      - decline_unsupported
+      - one_game_at_a_time
+      - fruit_not_available
+      - decline_personal_item
+      - explain_delivery_rule
+      - explain_gift
+      - explain_pickup
+      - ask_wait_for_delivery
+      - explain_fruit_prop
+      - tell_name
+      - explain_ib_robot
+      - tell_origin
+      - explain_open_source
+      - answer_price
+      - answer_body_price
+      - tell_code_repo
+      - tell_event
+      - tell_venue
+      - answer_linux
+      - explain_eyes
+      - explain_ears
+      - explain_planning
+      - list_capabilities
+      - explain_arms_only
+      - explain_photo
+      - answer_language
+      - answer_safety
+      - answer_unknown_info
+      - explain_mirror_game
+      - chat_thanks
+      - chat_tease
+      - chat_slow
+      - chat_tired
+      - chat_food
+      - chat_present
+      - chat_not_understood
+      - chat_dont_know
       planner:
         fruit_delivery:
-          container_name: an orange bowl
-          container_label: 橙色的碗
+          container_name: a black bowl
+          # The bowl on the summit stand is black (2026-11-09 rig, #158).
+          container_label: 黑色的碗
+        # The only facts the planner may answer from (2_需要录制的音频.md, confirmed 2026-11-10).
+        deployment_facts:
+        - 机器人的名字是欧拉，和操作系统 openEuler 同音。
+        - 这里是 OpenEuler Summit 操作系统大会，地点是北京中关村国际创新中心。
+        - IB-Robot 的全称是 Intelligence BooM Robot。
+        - 本次展示的是 openEuler 开源社区开发的软件；软件开源，可以下载，运行在很多机器人本体上。机器人本体由社区伙伴提供，不要说成是本体的制造商，也不要说是华为团队开发的。
+        - 第一次问价格：展示的是开源软件，可以扫旁边的代码仓库二维码了解；追问本体价格：本体是社区伙伴提供的，具体多少钱我们也不清楚。
+        - 代码仓库：扫旁边的二维码。
+        - 机器人基于 openEuler 开发（openEuler Embedded），openEuler 是基于 Linux 的发行版；芯片是昇腾 310P。
+        - 照镜子：通过头部摄像头识别人体姿态，实时跟随手臂动作，只学手臂，学不了腿；体验中会自动留图，结束后自己选。
+        - 礼物：柠檬、苹果、橙子三选一，礼物藏在水果里；每次有效唤醒欧拉欧拉开始新领取轮次，每轮送一份，重新唤醒可以再领；水果放进碗里，顺着滑道滑到领取盒，由参观者自己拿；不能扔，不能递到手里；没确认送到之前先别取。
+        - 现场的水果是道具，不能吃。
+        - 机器人主要说中文。
+        - 安全：不做不会伤害人这类保证，请按现场提示互动。
+        - 机器人没有接入日期、时间和天气查询：回答暂时查不到，不说没联网。
+        - 机器人没有生日，也没有星座；不要用自我介绍代替这个回答。
+        - 防水能力和防护等级没有厂商确认资料，明确说不清楚，请勿让机器人碰水。
+        - 身体接触（拥抱、触摸、亲吻、握手、搀扶）出于安全暂不支持：直接说明，不得用飞吻、挥手或其他动作代替；访客明确要飞吻、挥手时照常做。
+        # Recorded sentences for clarifications (commissioning/audio/summit_clips.yaml).
+        clarification_lines:
+          not_heard: 啊？没听清，玩模仿还是选水果呀？
+          fruit_name: 要柠檬、苹果还是橙子呀？
+          confirm_pick: 可以呀，现在就给你拿吗？
+          recommend: 每个都有礼物哦，要我帮你挑吗？
+        # Wording rules only; Agent gift_state owns eligibility and wake resets.
+        answer_rules:
+          # Explicit safety replies; synthesize until matching recordings are installed.
+          contact_replies:
+          - 出于安全考虑，我暂时不支持这类肢体接触哦。
+          - 为了安全，这类身体接触的互动暂时还不支持哦。
+          - 这类接触互动暂时不支持，我们可以聊聊天。
+          # A fruit the stand does not have is not a personal item ("给我一个梨").
+          unavailable_fruit_skill: fruit_not_available
+          # A plan naming a skill outside this catalog is refused with the recording.
+          unsupported_skill: decline_unsupported
+          lines:
+            only_one: 嘿嘿，这轮只能选一份哦～
+            already_given: 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。
+            confirm_pick: 可以呀，现在就给你拿吗？
+            recommend: 每个都有礼物哦，要我帮你挑吗？
+            random_pick: 每个都有礼物，我帮你挑一个！
+            # Asked before a pick the visitor wants thrown or handed over; a yes runs it.
+            confirm_delivery: 不能直接递给你哦，我放进碗里，滑到领取盒你自己拿，可以吗？
+          # A pick nobody named a fruit for ("帮我拿一下我的手机") is refused with the recording.
+          non_fruit_skill: decline_personal_item
+          # A second price question in a round is about the robot body.
+          repeat_skills:
+            answer_price: answer_body_price
         direct_commands:
           你好: greet_visitor
           你好呀: greet_visitor
@@ -83,8 +176,75 @@ robot:
           动作模仿: mirror_start
           跟着我做: mirror_start
           学我的动作: mirror_start
+          有什么水果: offer_fruit_menu
+          有什么礼物可以选: offer_fruit_menu
+          我想选水果礼物: offer_fruit_menu
+          我要水果: offer_fruit_menu
+          选水果: offer_fruit_menu
+          你的大脑是怎么工作的: introduce_agent
+          # Recorded answers: the most frequent exact wordings skip the planner (about 0.2 s to audio).
+          礼物是什么: explain_gift
+          我去哪里拿: explain_pickup
+          可以拿了吗: ask_wait_for_delivery
+          这个水果能吃吗: explain_fruit_prop
+          你叫什么名字: tell_name
+          IB Robot是什么意思: explain_ib_robot
+          IBROBOT是什么意思: explain_ib_robot
+          是谁把你做出来的: tell_origin
+          你开源吗: explain_open_source
+          你多少钱一台: answer_price
+          本体多少钱: answer_body_price
+          你的代码在哪里: tell_code_repo
+          这是什么大会: tell_event
+          你在哪儿: tell_venue
+          你在哪个城市: tell_venue
+          你会做什么: list_capabilities
+          你能干什么: list_capabilities
+          你能给我拍照吗: explain_photo
+          你能说英语吗: answer_language
+          今天是几号: answer_unknown_info
+          照镜子怎么玩: explain_mirror_game
+          你还在吗: chat_present
+          你累不累: chat_tired
       voice_bridge:
         persistent_session: true
+        # Lines the bridge says itself, set to recorded ones (summit_clips.yaml X01-X06, F14).
+        spoken_lines:
+          gesture_start: 好呀，看我的！
+          gesture_done: 搞定啦！
+          busy: 等一下下，我还在忙呢～
+          busy_pick: 已经在拿啦，这次改不了哦～
+          speech_stopped: 好嘞～
+          wake_ack: 我在呢！
+          wake_hint: 要找我，先叫欧拉欧拉哦～
+        # Recorded fruit-delivery narration, including F18 success and F19 unconfirmed task endings.
+        gift_messages:
+          F05: 好嘞，给你拿{fruit}！
+          F08: 拿到了，我把它送到领取盒。
+          F12: 哎呀，这次没成功，我再试一下。
+          verifying: 我再确认一下，稍等。
+          placed: 耶，礼物到啦！去领取盒拿吧～
+          place_ended: 礼物还没到，先别取，工作人员来帮忙。
+          pick_failed: 还是没成功，请工作人员帮我一下。
+          place_failed: 还是没成功，请工作人员帮我一下。
+          E06: 请先别靠近，工作人员正在处理。
+          cancelled: 已经停下了。请先走出体验区。
+          completed: 好啦，这次任务完成啦！
+          ended: 任务已结束，请工作人员确认现场状态。
+        # A question asked while the robot answers is judged when the answer ends.
+        pending_sentence_sec: 10.0
+        # The 310P ZipVoice has no English front end: these words are read in Chinese.
+        tts_pronunciations:
+          openEuler Embedded: 欧喷欧拉嗯贝迪德
+          OpenEuler Summit: 欧喷欧拉萨米特
+          Intelligence BooM Robot: 因特利真斯布姆肉波特
+          IB-Robot: 爱比肉波特
+          IB Robot: 爱比肉波特
+          openEuler: 欧喷欧拉
+          Linux: 林纳克斯
+          Agent: 艾振特
+          310P: 三一零皮
+          Summit: 萨米特
         # After "欧拉欧拉" only the voice that woke the robot is followed; stop words still
         # work from any voice.
         speaker_check_enabled: true
@@ -118,8 +278,20 @@ robot:
         # "介绍一下芯片和系统" would rest on a model that never saw them.
         # The planner's direct commands (above) are questions to the robot; the gate must
         # never veto them, whatever their length ("你的Agent有什么用" is 11 characters).
+        # "欧拉" opens a sentence said to the robot ("哈喽欧拉", "欧拉你好"), at its start only:
+        # "你跟open欧拉是什么关系" names the operating system.
+        semantic_gate_wake_prefixes:
+          __append__:
+          - 欧拉欧拉
+          - 欧拉
+          - 乌拉乌拉
+          - 呼啦呼啦
         semantic_gate_dialogue_requests:
           __append__:
+          - 作首诗
+          - 写首诗
+          - 做首诗
+          - 再讲一个
           - 自我介绍
           - 介绍一下你自己
           - 你是谁
@@ -170,6 +342,15 @@ robot:
           - 橙子
           - 橘子
           - 水果
+          # One gift per round, and the robot's own pick (answer_rules).
+          - 全都要
+          - 要两个
+          - 帮我选一个
+          - 你帮我选
+          - 帮我挑一个
+          - 随便挑一个
+          - 随便拿一个
+          - 推荐一个
         silent_skills:
         - greet_visitor
         - self_introduction
@@ -179,6 +360,45 @@ robot:
         - explain_pick_scope
         - offer_fruit_menu
         - invite_visitor
+        - explain_mirror_how
+        - explain_pick_how
+        - decline_unsupported
+        - one_game_at_a_time
+        - fruit_not_available
+        - decline_personal_item
+        - explain_delivery_rule
+        - explain_gift
+        - explain_pickup
+        - ask_wait_for_delivery
+        - explain_fruit_prop
+        - tell_name
+        - explain_ib_robot
+        - tell_origin
+        - explain_open_source
+        - answer_price
+        - answer_body_price
+        - tell_code_repo
+        - tell_event
+        - tell_venue
+        - answer_linux
+        - explain_eyes
+        - explain_ears
+        - explain_planning
+        - list_capabilities
+        - explain_arms_only
+        - explain_photo
+        - answer_language
+        - answer_safety
+        - answer_unknown_info
+        - explain_mirror_game
+        - chat_thanks
+        - chat_tease
+        - chat_slow
+        - chat_tired
+        - chat_food
+        - chat_present
+        - chat_not_understood
+        - chat_dont_know
         stop_phrases:
         - 别动了
         - 别动
@@ -189,9 +409,15 @@ robot:
         - halt
         - 不玩了
         - 不拿了
+        # Called out at the 2026-11-10 rig (#181-#183). Not the bare 不要/算了: stop words match as
+        # substrings, and "你不要跟我再说……" must not stop the robot.
+        - 别拿了
+        - 不要了
+        - 算了不要了
         speech_mode: concise
         speech_messages:
           start: 好，我这就去拿，请稍等。
+          # Not the recorded F06 ("我在找它呢，别动桌子哦～"): 别动 is a stop word and the robot would stop itself.
           waiting: 我正在确认水果的位置，请先别移动桌上的物品。
           recover: ''
           recovered: ''
@@ -202,13 +428,13 @@ robot:
           retry_TARGET_MOVED: 水果的位置变了，我重新确认一下。
           success: 成功拿到啦！小礼物请找旁边的工作人员领取。
           completed: 成功拿到啦！小礼物请找旁边的工作人员领取。
-          canceled: 已经停下了。
+          canceled: 已经停下了。请先走出体验区。
           not_started: 好的，这次先不拿。
-          unknown: 动作状态还需要确认，请先别靠近，工作人员正在处理。
-          recovery_failed: 动作状态还需要确认，请先别靠近，工作人员正在处理。
+          unknown: 请先别靠近，工作人员正在处理。
+          recovery_failed: 请先别靠近，工作人员正在处理。
           manual_check: 这次没有完成，请工作人员帮我看看。
           failed: 还是没成功，请工作人员帮我一下。
-          reason_INVALID_TARGET: 请说一下水果名称：柠檬、苹果，还是橙子？
+          reason_INVALID_TARGET: 要柠檬、苹果还是橙子呀？
           reason_TARGET_NOT_VISIBLE: 我没看到这个水果，请工作人员帮我看看。
           reason_OUT_OF_REACH: 还是没成功，请工作人员帮我一下。
           reason_NO_COMPLETE_PATH: 还是没成功，请工作人员帮我一下。
@@ -222,12 +448,8 @@ robot:
           reason_GRASP_VERIFICATION_FAILED: 还是没成功，请工作人员帮我一下。
           reason_EXECUTION_BUDGET_INSUFFICIENT: 还是没成功，请工作人员帮我一下。
     runtime_play_audio:
-      clips:
-        greeting: $(env WORKSPACE)/commissioning/audio/summit/greeting.wav
-        self_intro: $(env WORKSPACE)/commissioning/audio/summit/self_intro.wav
-        intro_platform: $(env WORKSPACE)/commissioning/audio/summit/intro_platform.wav
-        intro_agent: $(env WORKSPACE)/commissioning/audio/summit/intro_agent.wav
-        intro_detail: $(env WORKSPACE)/commissioning/audio/summit/intro_detail.wav
-        pick_scope: $(env WORKSPACE)/commissioning/audio/summit/pick_scope.wav
-        fruit_menu: $(env WORKSPACE)/commissioning/audio/summit/fruit_menu.wav
-        invitation: $(env WORKSPACE)/commissioning/audio/summit/invitation.wav
+      # Every recorded reply: clip names and files come from the manifest; install the files
+      # with commissioning/make_summit_clips.py (they are not tracked). The manifest's names win
+      # over the inherited single-file self_intro.
+      clip_manifest: $(env WORKSPACE)/commissioning/audio/summit_clips.yaml
+      clip_dir: $(env WORKSPACE)/commissioning/audio/summit

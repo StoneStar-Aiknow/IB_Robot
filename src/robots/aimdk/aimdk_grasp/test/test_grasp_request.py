@@ -17,13 +17,16 @@ from aimdk_grasp.grasp_request import (
     GraspRequestConfig,
     X2GraspPlanner,
     left_palm_reach,
+    open_hand_palm_spheres,
+    prefilter_candidates,
+    table_penetration_m,
 )
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.joints import BODY_JOINTS, LEFT_ARM
 from aimdk_grasp.observation import AdmittedState, LiveState, RegisteredObservation
 from aimdk_grasp.planner import PlannerFault
 from aimdk_grasp.robot_model import arm_limits, config_directory, planning_model
-from aimdk_grasp.scene_estimation import SceneEstimate
+from aimdk_grasp.scene_estimation import SceneEstimate, SupportPlane
 from aimdk_grasp.trajectory import TimedTrajectory
 from aimdk_grasp.types import CameraIntrinsics, RGBDFrame
 from test_arm_stream import APPROACH, GRASP, START
@@ -149,6 +152,61 @@ def plan(planner, admitted, *, grasps=None, mask=None, estimate=None):
         region if mask is None else mask, np.zeros((16, 3)), poses, confidence, {}, scene=estimate or scene()
     )
     return planner.plan(observation, proposals, deadline=time.monotonic() + 30.0, cancelled=lambda: False)
+
+
+def table_candidates(hand):
+    """Two reachable candidates 0.2 m apart in height; a support plane the lower one's open hand enters."""
+    center, _ = left_palm_reach()
+    camera_from_base = np.linalg.inv(BASE_FROM_CAMERA)
+    goals = []
+    for dz in (-0.1, 0.1):
+        goal = np.eye(4)
+        goal[:3, 3] = center + [0.0, 0.0, dz]
+        goals.append(goal)
+    spheres = open_hand_palm_spheres(hand)
+    upper = table_penetration_m(np.stack(goals[1:]), SupportPlane(center, np.array([0.0, 0.0, 1.0]), None), spheres)
+    # Put the plane 5 cm below the upper hand's lowest sphere: the lower hand then enters it by 15 cm.
+    plane = SupportPlane(center + [0.0, 0.0, -0.05 - upper[0]], np.array([0.0, 0.0, 1.0]), np.zeros((0, 3)))
+    poses = np.stack([camera_from_base @ goal for goal in goals])
+    return poses, np.array([0.9, 0.5]), plane, spheres
+
+
+def test_table_free_candidates_take_the_planning_slots_before_more_confident_ones_in_the_table(hand):
+    poses, confidence, plane, spheres = table_candidates(hand)
+    grasp_to_palm = np.eye(4)
+    goals = BASE_FROM_CAMERA @ poses
+    np.testing.assert_allclose(table_penetration_m(goals, plane, spheres), [0.15, -0.05], atol=1e-9)
+    kept, report = prefilter_candidates(
+        poses, confidence, BASE_FROM_CAMERA, grasp_to_palm, 1, support=plane, hand_spheres=spheres
+    )
+    assert kept.tolist() == [1] and report["table"] == dict(max_penetration_m=0.005, free=1, into_table=1, free_kept=1)
+    # Never dropped for it: with room for both, the one in the table follows.
+    kept, _ = prefilter_candidates(
+        poses, confidence, BASE_FROM_CAMERA, grasp_to_palm, 2, support=plane, hand_spheres=spheres
+    )
+    assert kept.tolist() == [1, 0]
+    # Without a support plane: confidence order only.
+    kept, report = prefilter_candidates(poses, confidence, BASE_FROM_CAMERA, grasp_to_palm, 1)
+    assert kept.tolist() == [0] and "table" not in report
+
+
+def test_every_generated_candidate_is_recorded_before_the_cut(setup, hand, tmp_path, monkeypatch):
+    import pickle
+
+    monkeypatch.setenv("IBROBOT_X2_PLAN_INPUTS_DIR", str(tmp_path))
+    make, admitted, _ = setup
+    poses, confidence, plane, _ = table_candidates(hand)
+    estimate = SceneEstimate({}, STAMP * 1e-9, STAMP, FRAME, True, plane, {}, {})
+    plan(make(FakeService()), admitted, grasps=(poses, confidence), estimate=estimate)
+    deadline = time.monotonic() + 5.0
+    while not list(tmp_path.glob("prefilter_*.pkl")) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    (path,) = tmp_path.glob("prefilter_*.pkl")
+    record = pickle.loads(path.read_bytes())
+    np.testing.assert_array_equal(record["grasps"], poses)
+    np.testing.assert_array_equal(record["confidence"], confidence)
+    np.testing.assert_allclose(record["support"]["point"], plane.point)
+    assert record["kept"].tolist() == [1, 0] and record["report"]["table"]["into_table"] == 1
 
 
 def test_a_reachable_candidate_becomes_the_x2_grasp_sequence(setup):

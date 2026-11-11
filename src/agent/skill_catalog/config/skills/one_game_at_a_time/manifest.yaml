@@ -1,0 +1,36 @@
+# Generated from commissioning/audio/summit_clips.yaml (W06); edit the aliases here.
+schema_version: 1
+name: one_game_at_a_time
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Tell with a recorded reply that the visitor picks one game this round.
+  category: social_interaction
+  when_to_use:
+  - the visitor wants both the mirror game and the fruit gift at once
+  aliases_zh:
+  - 两个都想玩
+  - 模仿和水果都要
+  - 两个游戏都要
+  - 我都想玩
+  aliases_en:
+  - i want to play both
+  motion_scope: []
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 2.9
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Tell with a recorded reply that the visitor picks one game this round. Use for 两个都想玩.
+  domain: social
+  moves_robot: false
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

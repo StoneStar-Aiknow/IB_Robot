@@ -1,0 +1,24 @@
+{
+  "input": "final_in_explain_v5.json",
+  "wave_side": "right",
+  "hand_source": "trigger",
+  "recorded_frames": 185,
+  "synthetic_return_frames": 0,
+  "clipped_to_urdf_limit_rad": {},
+  "duration_s": 3.68,
+  "frames": 185,
+  "arm_peak_speed_radps": 3.84,
+  "hand_peak_speed_radps": 3.15,
+  "arm_excursion_rad": {
+    "left": 2.075,
+    "right": 2.416
+  },
+  "hand_open_window_s": [
+    1.02,
+    2.66
+  ],
+  "palm_rise_max_m": null,
+  "end_minus_start_rad": 0.0,
+  "body_range_during_recording_rad": {},
+  "hand_range_during_recording_rad": {}
+}

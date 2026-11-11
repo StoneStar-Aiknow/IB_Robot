@@ -23,10 +23,27 @@ import math
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from string import Formatter
 
 _TERMINAL = {"SUCCEEDED", "FAILED", "UNKNOWN", "CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}
 _RUNNING = {"ACTIVE", "RUNNING", "EXECUTING"}
 _TARGETS = {"a lemon": "柠檬", "an apple": "苹果", "an orange": "橙子"}
+_MESSAGE_KEYS = {
+    "F05",
+    "F08",
+    "F12",
+    "E06",
+    "verifying",
+    "placed",
+    "place_ended",
+    "pick_failed",
+    "place_failed",
+    "held_recovery_required",
+    "recovery_failed",
+    "cancelled",
+    "completed",
+    "ended",
+}
 
 
 def fruit_label_zh(target_name: str) -> str | None:
@@ -87,7 +104,32 @@ class GiftWorkflowSpeech:
     registration of the same current request is idempotent.
     """
 
-    def __init__(self, *, container_name: str = "", container_label: str = "指定容器") -> None:
+    def __init__(
+        self,
+        *,
+        container_name: str = "",
+        container_label: str = "指定容器",
+        messages: Mapping | None = None,
+        release_is_delivery: bool = False,
+    ) -> None:
+        if messages is not None and not isinstance(messages, Mapping):
+            raise ValueError("gift messages must be a mapping")
+        if type(release_is_delivery) is not bool:
+            raise ValueError("release_is_delivery must be a boolean")
+        self._messages = dict(messages or {})
+        for key, text in self._messages.items():
+            if key not in _MESSAGE_KEYS or not isinstance(text, str) or not text.strip() or len(text) > 180:
+                raise ValueError(f"invalid gift message: {key}")
+            try:
+                fields = list(Formatter().parse(text))
+            except ValueError as exc:
+                raise ValueError(f"invalid gift message template: {key}") from exc
+            if any(
+                name is not None and (name not in {"fruit", "container"} or spec or conversion)
+                for _, name, spec, conversion in fields
+            ):
+                raise ValueError(f"invalid gift message template field: {key}")
+        self._release_is_delivery = release_is_delivery
         self._container_name = container_name
         self._container_label = container_label
         self._current: _Request | None = None
@@ -146,6 +188,12 @@ class GiftWorkflowSpeech:
             self._notices.clear()
 
     def _notice(self, item: _Request, key: str, text: str, now: float, *, terminal=False) -> list[Notice]:
+        if key in self._messages:
+            index = item.index if item.index in item.pairs else item.index - 1
+            text = self._messages[key].format(
+                fruit=item.pairs.get(index, "这个物体"),
+                container=item.containers.get(index, "指定容器"),
+            )
         marker = (key, item.index, item.retries.get(item.index, 0) if key == "F12" else 0)
         if marker in item.emitted:
             return []
@@ -246,8 +294,16 @@ class GiftWorkflowSpeech:
         # Wait for executor facts rather than alarming on normal dispatch.
         if facts.get("schema_version") not in {1, 2}:
             return []
-        if facts.get("recovery_state") in ("UNKNOWN", "FAILED") or (
-            skill == "place_in_container" and self._release(facts) == "UNKNOWN"
+        # A release is unconfirmed while it runs; ordinary executor phases can
+        # also omit recovery telemetry. Neither is evidence of a recovery fault.
+        if (
+            facts.get("recovery_state") == "FAILED"
+            or (facts.get("recovery_state") == "UNKNOWN" and (phase == "recover" or phase_state == "FAILED"))
+            or (
+                skill == "place_in_container"
+                and self._release(facts) == "UNKNOWN"
+                and (facts.get("reason_code") == "PLACE_RELEASE_STATE_UNKNOWN" or phase_state == "FAILED")
+            )
         ):
             return self._notice(item, "E06", "执行状态尚未确认，请工作人员检查机器人和物体。", now)
         if skill == "pick_object":
@@ -342,7 +398,7 @@ class GiftWorkflowSpeech:
     def _terminal(self, item, state, skill, in_pair, pick_index, facts, now):
         if (
             state == "UNKNOWN"
-            or facts.get("recovery_state") == "UNKNOWN"
+            or (facts.get("schema_version") in {1, 2} and facts.get("recovery_state") == "UNKNOWN")
             or (skill == "place_in_container" and self._release(facts) == "UNKNOWN")
         ):
             key, text = "E06", "执行状态尚未确认，请工作人员检查机器人和物体。"
@@ -366,8 +422,21 @@ class GiftWorkflowSpeech:
                 key, text = "place_failed", "这次没能完成放置，请工作人员协助。"
             elif self._verified(facts):
                 key, text = "placed", f"已确认物体放进{item.containers[pick_index]}，请工作人员确认后领取。"
+            elif (
+                self._release_is_delivery
+                and facts.get("schema_version") == 2
+                and self._release(facts) == "RELEASED"
+                and facts.get("verification_status") == "NOT_RUN"
+                and facts.get("place_succeeded") is True
+                and facts.get("phase_state") == "SUCCEEDED"
+            ):
+                key, text = "placed", f"物体已放到{item.containers[pick_index]}，请工作人员确认后领取。"
             else:
                 key, text = "place_ended", "放置步骤已结束，请工作人员确认现场状态。"
+        elif state == "SUCCEEDED" and not in_pair:
+            # The Gateway confirms the whole workflow, including a trailing return.
+            # This says the task is complete, without inventing placement evidence.
+            key, text = "completed", "好啦，这次任务完成啦！"
         else:
             key, text = "ended", "任务已结束，请工作人员确认现场状态。"
         # Step-failure narration must not suppress the request's authoritative terminal.

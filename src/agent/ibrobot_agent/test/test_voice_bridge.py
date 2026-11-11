@@ -909,6 +909,15 @@ def test_the_window_closes_after_wake_window_sec():
     assert _of(actions, PublishRequest) == []
 
 
+@pytest.mark.parametrize("persistent", [False, True])
+def test_only_persistent_dialogue_reopens_followup_after_a_long_robot_turn(persistent):
+    core = _core(**WAKE, persistent_session=persistent)
+    core.on_transcript("灵犀灵犀挥个手", now=1.0)
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=30.0)
+    requests = _of(core.on_transcript("再挥个手", now=31.0), PublishRequest)
+    assert bool(requests) is persistent
+
+
 def test_ignored_speech_does_not_hold_the_window_open():
     """Only an utterance the robot actually handled may extend the window.
 
@@ -1080,6 +1089,60 @@ MODEL = "campplus@test"
 ALICE = Voiceprint((1.0, 0.0, 0.0), MODEL)
 BOB = Voiceprint((0.0, 1.0, 0.0), MODEL)
 SPEAKER = {**WAKE, "speaker_check_enabled": True, "speaker_min_similarity": 0.5, "speaker_max_age_sec": 2.5}
+
+
+@pytest.mark.parametrize(
+    "voice,expected_hint",
+    [
+        (ALICE, True),
+        (BOB, False),
+        (None, False),
+        (Voiceprint(ALICE.vector, "other-model"), False),
+        (Voiceprint((0.0, 0.0, 0.0), MODEL), False),
+        (Voiceprint((float("nan"), 0.0, 0.0), MODEL), False),
+    ],
+)
+def test_expired_window_hint_needs_owner_evidence_and_keeps_wake_closed(voice, expected_hint):
+    hint = "要找我，先叫欧拉欧拉哦～"
+    core = _core(
+        **{
+            **SPEAKER,
+            "wake_window_sec": 60.0,
+            "persistent_session": True,
+            "spoken_lines_json": json.dumps({"wake_hint": hint}),
+        }
+    )
+    core.on_measurement("speaker", ALICE, now=1.0, segment=_seg(1))
+    core.on_heard("灵犀灵犀挥手", now=1.0, segment=_seg(1))
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), now=2.0)
+    window = core._gate.wake_until
+    anchors = dict(core._gate.anchors)
+    core.on_measurement("speaker", voice, now=63.0, segment=_seg(2))
+    actions = core.on_heard("挥一挥手", now=63.0, segment=_seg(2))
+    hints = [action for action in _of(actions, Speak) if action.text == hint]
+    assert bool(hints) is expected_hint
+    assert not _of(actions, PublishRequest) and not _of(actions, PublishControl)
+    assert core._gate.wake_until == window and core._gate.anchors == anchors
+    assert _seg(2) in core._gate.measurements["speaker"]
+    if hints:
+        core._end_robot_turn(64.0, hints[0].gate_epoch)
+        assert core._gate.wake_until == window
+    core.on_measurement("speaker", ALICE, now=64.0, segment=_seg(3))
+    followup = core.on_heard("挥一挥手", now=64.0, segment=_seg(3))
+    assert not _of(followup, PublishRequest)
+    if expected_hint:
+        assert not _of(followup, Speak)
+    core.on_measurement("speaker", ALICE, now=65.0, segment=_seg(4))
+    awakened = core.on_heard("灵犀灵犀做一个飞吻", now=65.0, segment=_seg(4))
+    assert _of(awakened, PublishRequest)[0].payload["text"] == "做一个飞吻"
+
+
+def test_expired_window_without_owner_measurements_stays_silent_and_does_not_crash():
+    core = _core(**{**WAKE, "spoken_lines_json": json.dumps({"wake_hint": "请先叫我。"})})
+    core.on_heard("灵犀灵犀挥手", 1.0)
+    core.on_event(_event("voice-0", "terminal", "SUCCEEDED"), 2.0)
+    actions = core.on_heard("挥一挥手", core._gate.wake_until + 1.0)
+    assert not _of(actions, Speak) and not _of(actions, PublishRequest)
 
 
 def _strict_voice_core(**overrides):
