@@ -137,7 +137,7 @@ def test_missing_joints_and_desynchronized_views_are_refused():
     history = FeedbackHistory()
     history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
     history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
-    history.record("joint.hand_state", 200 * MS, LEFT_HAND, [0.0] * 10)
+    history.record("joint.hand_state", 1200 * MS, LEFT_HAND, [0.0] * 10)
     with pytest.raises(ValueError, match="not synchronized"):
         history.latest()
 

@@ -74,6 +74,22 @@ def test_buffer_owns_data_and_never_refreshes_source_age(observation):
     assert not buffer.update_feedback(replace(original.image_feedback, received_at=-1.0))
 
 
+def test_a_capture_accepts_an_older_scene_than_a_recheck(observation):
+    """Live 2026-11-11: head RGB up to 1.1 s late; the capture plans from its image-time feedback."""
+    buffer = ObservationBuffer()
+    buffer.update_observation(observation())  # the scene, received at 0 s
+    newer = replace(observation().image_feedback, received_at=2.0)
+    buffer.update_feedback(newer)  # feedback is current at 2.05 s
+    config = RevalidationConfig()
+    with pytest.raises(ReobserveRequired, match="scene_age=2.05"):
+        require_fresh(buffer(), 2.05, config)  # a recheck needs a scene within 0.5 s
+    require_fresh(buffer(), 2.05, config, capture=True)
+    with pytest.raises(ReobserveRequired, match="stale"):
+        require_fresh(buffer(), 4.1, config, capture=True)  # older than capture_scene_max_age_s
+    with pytest.raises(ValueError, match="fresher scene than a recheck"):
+        RevalidationConfig(capture_scene_max_age_s=0.4)
+
+
 @pytest.mark.parametrize("side", ["left", "right", None])
 def test_snapshot_can_own_one_hand_or_no_hands_without_fabricating_the_other(observation, side):
     from aimdk_grasp.observation import copy_feedback, observation_hand_mapping

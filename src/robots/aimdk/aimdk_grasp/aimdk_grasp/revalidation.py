@@ -22,7 +22,16 @@ class ReobserveRequired(RuntimeError):
 @dataclass(frozen=True)
 class RevalidationConfig:
     feedback_max_age_s: float = 0.1
+    #: Newest registered scene age a recheck accepts: the frame that judges the
+    #: target still where it was planned, right before the arm moves.
     scene_max_age_s: float = 0.5
+    #: Newest registered scene age a capture accepts. A capture plans from the
+    #: frame with the joint feedback at its own image time, and nothing moves
+    #: before a recheck compares a newer frame (scene_max_age_s) with it, so the
+    #: capture may be as old as a prefetched one (PipelineConfig.prefetch_max_age_s).
+    #: Live 2026-11-11: head RGB arrived up to 1.1 s late and 2 of 16 picks lost their
+    #: prefetched capture to the 0.5 s limit (scene ages 1.66 and 2.32 s).
+    capture_scene_max_age_s: float = 4.0
     start_tolerance_rad: float = 0.025
     depth_change_m: float = 0.01
     rgb_change: float = 30.0
@@ -41,16 +50,23 @@ class RevalidationConfig:
             or max(self.changed_fraction, self.depth_changed_fraction) >= 1
         ):
             raise ValueError("Finite positive revalidation limits required")
+        if self.capture_scene_max_age_s < self.scene_max_age_s:
+            raise ValueError("A capture may not need a fresher scene than a recheck")
 
 
-def require_fresh(state, now: float, config: RevalidationConfig) -> None:
-    """Reject stale, future-dated or unhealthy feedback and scenes of a :class:`LiveState`."""
+def require_fresh(state, now: float, config: RevalidationConfig, *, capture: bool = False) -> None:
+    """Reject stale, future-dated or unhealthy feedback and scenes of a :class:`LiveState`.
+
+    ``capture``: the scene is judged by ``capture_scene_max_age_s`` (a planning
+    capture) instead of ``scene_max_age_s`` (a recheck).
+    """
+    scene_max_age_s = config.capture_scene_max_age_s if capture else config.scene_max_age_s
     if (
         not state.feedback.healthy
         or not state.observation.image_feedback.healthy
         or not np.isfinite(now)
         or not 0 <= now - state.feedback.received_at <= config.feedback_max_age_s
-        or not 0 <= now - state.observation.received_at <= config.scene_max_age_s
+        or not 0 <= now - state.observation.received_at <= scene_max_age_s
     ):
         raise ReobserveRequired(
             "Latest feedback or registered scene stale, future-dated or unhealthy: "
