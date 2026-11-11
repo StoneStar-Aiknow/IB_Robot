@@ -17,4 +17,4 @@
 session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0}
 timing:      {start_confirm_s: 1.5, cancel_confirm_s: 2.0}
 cover_judge: {percentile: 95, max_value: 45}
-operator:    {max_session_s: 60.0, leave_stop_min_round_s: 10.0}
+operator:    {max_session_s: 100.0, leave_stop_min_round_s: 10.0}
