@@ -158,6 +158,12 @@ def test_stale_or_future_source_stamp_rejected_despite_fresh_receipt(stamp_sec):
     assert "stale" in reason
 
 
+def test_a_stamp_one_tick_ahead_of_a_simulated_clock_is_not_from_the_future():
+    # The runtime stamped the status with a tick whose /clock this node has not received yet.
+    node = _node(status=_status(stamp=SimpleNamespace(sec=100, nanosec=40_000_000)))
+    assert node._ensure_skill_capabilities("pick_object") == (True, "")
+
+
 def test_receipt_timeout_rejects_status_even_when_ros_clock_is_paused():
     node = _node(status=_status())
     status, receipt = node._runtime_status_snapshot

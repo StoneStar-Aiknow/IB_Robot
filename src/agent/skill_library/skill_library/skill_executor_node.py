@@ -125,6 +125,9 @@ from skill_library.resolver import PrimitiveSpec, load_json_mapping, resolve_ski
 from skill_library.runtime_coordinator import SkillRegistryOwner
 
 EE_POSITION_TOLERANCE_M = 0.02
+# How far ahead of this node's clock a runtime status stamp may be (one simulated tick is
+# 0.04 s on RoboDojo; on wall clocks of one host the skew is ~0). Further ahead stays refused.
+RUNTIME_STATUS_CLOCK_SKEW_SEC = 0.1
 SKILL_CANCEL_TIMEOUT = "SKILL_CANCEL_TIMEOUT"
 PRIMITIVE_CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
 # A motion primitive whose MoveIt planning failed before any arm motion: the
@@ -3553,7 +3556,11 @@ class SkillExecutorNode(Node):
         receipt_age = time.monotonic() - received
         stamp_ns = status.stamp.sec * 1_000_000_000 + status.stamp.nanosec
         source_age = (self.get_clock().now().nanoseconds - stamp_ns) / 1_000_000_000
-        if not 0 <= receipt_age <= max_age or not 0 <= source_age <= max_age:
+        # The source age is measured on this node's clock. Under a simulated clock the status
+        # can be stamped with a tick whose /clock has not reached this node yet: a stamp up to
+        # RUNTIME_STATUS_CLOCK_SKEW_SEC ahead is not "from the future". Liveness is the
+        # monotonic receipt age, which a standing simulated clock does not affect.
+        if not 0 <= receipt_age <= max_age or not -RUNTIME_STATUS_CLOCK_SKEW_SEC <= source_age <= max_age:
             # review r2 finding 9's instrumentation: name the measured ages at
             # the refusal — the receipt age (this node's last processed
             # heartbeat) and the source age (the facade's stamp on this

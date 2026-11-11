@@ -105,6 +105,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetHotwords.srv"
   "srv/MoveToConfiguration.srv"
   "srv/MoveToPose.srv"
+  "srv/CancelSimulationCommand.srv"
   "srv/SetRuntimeMode.srv"
   "srv/GetRuntimeStatus.srv"
   "srv/ExecuteInteractionDemo.srv"

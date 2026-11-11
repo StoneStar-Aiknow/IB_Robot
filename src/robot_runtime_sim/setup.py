@@ -8,6 +8,8 @@ setup(
     name=package_name,
     version="0.1.0",
     packages=find_packages(exclude=["test"]),
+    # The toy profile the direct-control test doubles load (robot_runtime_sim.testing).
+    package_data={"robot_runtime_sim.testing": ["*.yaml"]},
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
@@ -20,7 +22,7 @@ setup(
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",
-    description="Simulation platform providers for the robot runtime: Gazebo and MuJoCo embodiments, platform specs and sim-only nodes",
+    description="Simulation platform providers for the robot runtime: Gazebo and MuJoCo embodiments, platform specs, sim-only nodes and the direct-control runtime for platforms without a controller",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
@@ -29,6 +31,9 @@ setup(
             "finite_cloud_filter = robot_runtime_sim.finite_cloud_filter:main",
             "imu_settle_filter = robot_runtime_sim.imu_settle_filter:main",
             "odometry_twist_relay = robot_runtime_sim.odometry_twist_relay:main",
+            # The runtime of a platform without a controller (direct_control); a platform's
+            # embodiment starts it with the platform's adapter.
+            "direct_control_runtime = robot_runtime_sim.direct_control.node:main",
         ],
         # The physics platforms this package provides (openspec
         # sim-platform-registry D1/D6); a platform is discovered through its

@@ -234,3 +234,30 @@ def test_safety_guard_asynchronously_switches_and_retains_verified_snapshots():
         spin_thread.join(timeout=1.0)
         for node in (safety, client_node, gateway):
             node.destroy_node()
+
+
+def test_the_snapshot_sync_poll_runs_on_the_steady_clock_under_a_standing_sim_clock():
+    """With use_sim_time and no /clock advancing, the poll still fires (it is the only retry)."""
+    from rclpy.clock import ClockType
+
+    safety = SafetyGuardNode(
+        parameter_overrides=[
+            Parameter("use_sim_time", value=True),
+            Parameter("skill_gateway_status_service", value=f"/sg_steady_{uuid.uuid4().hex}/status"),
+            Parameter("snapshot_sync_period_sec", value=0.05),
+        ]
+    )
+    calls = []
+    safety._sync_gateway_status = lambda: calls.append(time.monotonic())  # bound by the timer below
+    safety._snapshot_sync_timer.callback = safety._sync_gateway_status
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(safety)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    try:
+        assert safety._snapshot_sync_timer.clock.clock_type == ClockType.STEADY_TIME
+        _wait_for(lambda: len(calls) >= 3)
+    finally:
+        executor.shutdown(timeout_sec=1.0)
+        spin_thread.join(timeout=1.0)
+        safety.destroy_node()

@@ -7,7 +7,9 @@
     Simulation platform providers for the robot runtime: the Gazebo and
     MuJoCo platform specs (ibrobot.sim_platforms entry points), their
     default embodiments (description rendering + launch composition), the
-    simulation-only helper nodes, and the simulator-environment test
+    simulation-only helper nodes, the direct-control runtime for platforms
+    without a controller (the runtime writes every step's targets itself;
+    robot_runtime_sim.direct_control), and the simulator-environment test
     support. The runtime contract layer (robot_runtime) stays
     simulator-free and discovers these platforms through the registry.
   </description>
@@ -40,6 +42,10 @@
   <exec_depend version_gte="0.1.2">mujoco_3d_lidar</exec_depend>
   <exec_depend>imu_sensor_broadcaster</exec_depend>
 
+  <!-- direct_control: the runtime of a platform without a controller (its gripper action
+       server, the Trigger session services). -->
+  <depend>control_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
@@ -75,6 +81,8 @@
   <test_depend>sim_models</test_depend>
   <test_depend>robot_runtime</test_depend>
   <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>trajectory_msgs</test_depend>
+  <test_depend>action_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

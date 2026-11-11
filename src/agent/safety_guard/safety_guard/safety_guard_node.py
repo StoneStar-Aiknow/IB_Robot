@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from threading import RLock
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -96,7 +97,16 @@ class SafetyGuardNode(Node):
             self._handle_registry_event,
             registry_qos,
         )
-        self.create_timer(self._snapshot_sync_period_sec, self._sync_gateway_status)
+        # A discovery and reconciliation poll, not a timed behaviour: it runs on the steady
+        # clock so it keeps firing when this node runs on a simulated clock that stands
+        # still (a lockstep platform does not advance /clock while the robot is idle). It is
+        # also the only retry when the latched registry event arrives before the snapshot
+        # service is discovered.
+        self._snapshot_sync_timer = self.create_timer(
+            self._snapshot_sync_period_sec,
+            self._sync_gateway_status,
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
+        )
 
         self.create_service(ValidateSkill, self._validate_skill_service, self._handle_validate_skill)
         self.create_service(ValidatePrimitive, self._validate_primitive_service, self._handle_validate_primitive)

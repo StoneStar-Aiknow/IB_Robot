@@ -36,10 +36,10 @@
    from robot_runtime.sim_platforms import SimPlatform, SimSensorTraits
 
    MY_PLATFORM = SimPlatform(
-       name="my_platform",          # 匹配 ^[a-z][a-z0-9_]*$，不能叫 sdk
-       package="my_pkg",            # 未安装报错时提示安装的包
+       name="my_platform",  # 匹配 ^[a-z][a-z0-9_]*$，不能叫 sdk
+       package="my_pkg",  # 未安装报错时提示安装的包
        embodiment="my_pkg.embodiment:MY_EMBODIMENT",  # module:attr
-       world=None,                  # 通用 launch 的 world 钩子（D5，可后补）
+       world=None,  # 通用 launch 的 world 钩子（D5，可后补）
        scene_task=None,
        sensor_traits=SimSensorTraits(),  # 默认 traits：不做平台特化改写
    )
@@ -48,7 +48,7 @@
 2. 在你包的 `setup.py` 注册 entry point：
 
    ```python
-   entry_points={
+   entry_points = {
        "ibrobot.sim_platforms": ["my_platform = my_pkg.platforms:MY_PLATFORM"],
    }
    ```
@@ -82,6 +82,62 @@ simulation:
   非空：`:attr`、`module:`、空串与不含冒号的形式都按 `ProfileError` 拒绝并点名
   profile，注册性与可导入性仍留到有效选择时才查）；不设置时使用平台的默认
   embodiment。
+
+## 选哪种接法：平台由谁控制、时间由谁推进
+
+| 平台情况 | 例子 | 接法 |
+|---|---|---|
+| 仿真自己按时钟推进，机器人用 ros2_control | Gazebo、MuJoCo | 本包已有的平台：`SimPlatform` + 默认 embodiment（ros2_control、桥接、facade），`/clock` 由仿真发布 |
+| 仿真自己推进，没有 ros2_control，但有自己的控制接口 | 厂商仿真 SDK、远程仿真服务 | 优先写 ros2_control 硬件接口，归入上一类；或者自定义 embodiment，起一个直接提供运行时公共契约的桥接节点（同 X2 厂商运动控制层的做法） |
+| **没有控制器，仿真每一步都要等运行时给目标**（平台每拍来要动作，或只提供 `reset/step`） | RoboDojo（平台来要）、gym 式环境（只有 `reset/step`） | **`direct_control`**：运行时自己当控制器，见下节 |
+| 本来能单步，但评测要求可复现 | MuJoCo、Isaac Sim 都能暂停 | 可以有意走 `direct_control` 的 host_step |
+
+## direct_control：没有控制器的平台
+
+`robot_runtime_sim.direct_control` 是这一类平台共用的运行时。运行时自己把
+`MoveToPose` / `ComputeIk` / 关节和夹爪命令变成每一步的关节目标，平台只负责物理。
+按需导入：选 Gazebo / MuJoCo 时不会加载它。
+
+| 模块 | 职责 |
+|---|---|
+| `engine.py` | 纯逻辑（不导入 rclpy）：会话与 reset 代次（旧代次的请求一律拒绝）、指令生命周期（去重、取消、停止、墙钟期限、平台断联记为 UNKNOWN）、逐步生成目标、空闲不推进 |
+| `ports.py` | 平台适配器端口：`AdapterDescriptor`、`ObservationFrame`、`PlatformCodec`、`PlatformResult`；读取 profile 的 `simulation.<platform>` 段 |
+| `host_step.py` | 第二种推进方式：平台只提供 `reset/step` 时，由运行时扮演主循环 |
+| `kinematics.py` | 位姿与关节路径的纯计算 |
+| `node.py` | ROS 外壳（可执行文件 `direct_control_runtime`）：公共运行时契约、`/simulation/*` 会话接口、`/clock` |
+
+三种时间各管一件事：
+
+| 时间 | 用途 |
+|---|---|
+| 步号（会话内） | 会话记账；平台的步数预算 |
+| ROS 时间 `/clock` | = 本进程所有会话累计的仿真时间，reset 不回退。只在平台推进时前进，空闲时停住；所有消费者用 `use_sim_time`，动作超时按仿真时间算，平台跑得慢不会误判 |
+| 墙钟期限 | 只判断“还活着没有”：单条命令的墙钟上限、平台长时间无调用。平台卡死时调用方照样能退出 |
+
+运行时节点本身用墙钟（它就是时钟源），状态和关节消息按墙钟定时发布、暂停时照常发布，
+消息时间戳是对应观测的仿真时间。
+
+引擎没有评测概念。评测（准入、判分通道、任务说明等）是可选的外挂层：通过节点参数
+`extensions`（`module:attr`，节点建好后调用一次）挂上，可以装运动闸门
+（`SimulationCore.set_motion_gate`）、监听平台结果（`add_platform_result_listener`）并提供
+自己的接口。不挂时，平台自己的判分结果只写日志，不发布到任何话题。
+
+### 接入一个没有控制器的平台
+
+1. 在 profile 里声明平台：`use_sim: true`、`sim_platforms: [my_platform]`、
+   `sim_platform: my_platform`；`simulation.my_platform` 段写 `clock_mode`（`platform_pull` 或
+   `host_step`）、`dt_s`、`supported_commands`、`ik`、`motion`、`adapter_config`。
+2. 写适配器：工厂 `create_adapter(profile, overrides)`，返回带 `descriptor`、`codec`、
+   `start(core, logger)`、`stop()` 的对象（参考 `robot_runtime_sim.testing.direct_control_fakes`）。
+3. 写 embodiment：`actions()` 起 `robot_runtime_sim` 的 `direct_control_runtime`，参数
+   `platform`、`adapter`（适配器工厂的 `module:attr`）、`use_sim_time: false`。适配器只由这里
+   指定，没有单独的适配器注册表。
+4. 注册平台：`ibrobot.sim_platforms` 入口点指向轻量的 `SimPlatform` spec（`world=None` 表示
+   世界由平台自己管）。完整示例见 `robodojo_robot`。
+
+现在只有 RoboDojo 一个真实平台；host_step 只用 CPU 替身测过。以后可能要补的扩展点：
+运行时侧 IK 求解器（现在 IK 只能来自平台，`ik: platform`）、仿真自由运行时按 `/clock` 采样
+下发目标（free_run）、移动底盘类运动组。
 
 ## 运行平台测试
 
