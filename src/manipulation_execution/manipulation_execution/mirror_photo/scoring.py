@@ -33,6 +33,8 @@ class Candidate:
     # Camera time of the frame.
     stamp: float
     jpeg: bytes
+    # Person bounding box from the PEAR yolox frame at this stamp: (x1, y1, x2, y2) in source pixels.
+    bbox: tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -126,7 +128,6 @@ def select(
     candidates: Sequence[Candidate],
     *,
     speed_at: Callable[[float], float | None],
-    bbox_at: Callable[[float], Sequence[float] | None],
     stillness_weight: float,
     sharpness_weight: float,
     deadline_sec: float,
@@ -147,7 +148,7 @@ def select(
                 scoring = "partial"
                 break
             try:
-                measured[index] = sharpness(candidate.jpeg, bbox_at(candidate.stamp))
+                measured[index] = sharpness(candidate.jpeg, candidate.bbox)
             except ImportError:
                 scoring = "none"
                 break

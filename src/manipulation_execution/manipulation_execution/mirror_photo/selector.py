@@ -39,16 +39,24 @@ from .triggers import EVENT, STILL, UNIFORM, GestureTrigger, Trigger, UniformTri
 SCHEMA = "x2_mirror_photo/1"
 # Frames kept while MIRRORING (camera time): a trigger names a frame up to this old.
 BUFFER_SEC = 3.0
+# Anchors: PEAR yolox frame paired with camera frame. PEAR and camera stamps must match within this.
+EXACT_SEC = 0.001
+# A gesture's anchor: the nearest one within this.
+GESTURE_MATCH_SEC = 0.3
 # A trigger's frame: the nearest one within this; an event's within EVENT_MATCH_SEC, else the newest.
 MATCH_SEC = 0.1
 EVENT_MATCH_SEC = 0.5
 # A trigger up to this far ahead of the newest frame waits until the camera has
 # passed its stamp; further ahead (a clock off) only an event is kept, on the newest frame.
 PENDING_SEC = 1.0
+# PEAR frame ahead of camera by more than this: drop the pairing attempt.
+PEAR_PENDING_SEC = 1.0
+# Trigger waiting for anchor: give up after this much camera time.
+PEAR_WAIT_SEC = 1.5
 # PEAR speed and person box for a candidate: the nearest sample within this.
 SAMPLE_SEC = 0.25
 RATE_WINDOW_SEC = 60.0
-REFUSALS = ("warmup", "rate", "nomatch", "late", "badjpeg", "duplicate", "full")
+REFUSALS = ("warmup", "rate", "nomatch", "late", "badjpeg", "duplicate", "full", "no_actor", "pear_unmatched", "bad_bbox")
 
 
 @dataclass(frozen=True)
@@ -61,16 +69,16 @@ class FinishedRound:
     candidates: tuple[Candidate, ...]
     # The round's newest frame (camera time, JPEG); None if no frame came at all.
     last_frame: tuple[float, bytes] | None
+    # The last anchor (PEAR yolox frame matched with camera frame): (stamp, jpeg, bbox)
+    last_anchor: tuple[float, bytes, tuple[float, float, float, float]] | None
+    # Fallback bbox from the first anchor of this round: (bbox, stamp)
+    fallback_bbox: tuple[tuple[float, float, float, float], float] | None
     speeds: tuple[tuple[float, float], ...]
-    boxes: tuple[tuple[float, tuple[float, ...]], ...]
     refused: dict[str, int]
     frames: int
 
     def speed_at(self, stamp: float) -> float | None:
         return _nearest(self.speeds, stamp)
-
-    def bbox_at(self, stamp: float) -> tuple[float, ...] | None:
-        return _nearest(self.boxes, stamp)
 
 
 def _nearest(samples: Sequence[tuple[float, object]], stamp: float):
@@ -98,11 +106,17 @@ class _Round:
         self.first_stamp: float | None = None
         self.frames: deque[tuple[float, bytes]] = deque()
         self.frame_count = 0
+        # Anchors: (stamp, jpeg, bbox) from PEAR yolox frames matched with camera frames
+        self.anchors: deque[tuple[float, bytes, tuple[float, float, float, float]]] = deque()
+        self.anchor_count = 0
+        # Pending PEAR frames waiting for camera frame: (stamp, bbox)
+        self.pending_pear: deque[tuple[float, tuple[float, float, float, float]]] = deque()
+        # Fallback bbox from first anchor: (bbox, stamp)
+        self.fallback_bbox: tuple[tuple[float, float, float, float], float] | None = None
         self.candidates: list[Candidate] = []
         self.pending: list[Trigger] = []
         self.priority_stamps: deque[float] = deque()
         self.speeds: list[tuple[float, float]] = []
-        self.boxes: list[tuple[float, tuple[float, ...]]] = []
         self.refused = dict.fromkeys(REFUSALS, 0)
         self.provisional: Candidate | None = None
 
@@ -177,6 +191,14 @@ class PhotoCore:
 
     def _end_round(self, reason: str) -> None:
         current, self._round = self._round, None
+
+        # Resolve any remaining pending triggers at round end
+        for trigger in current.pending:
+            anchor = self._anchor_for(current, trigger)
+            if anchor is not None:
+                stamp_a, jpeg_a, bbox_a = anchor
+                self._keep(current, Candidate(trigger, stamp_a, jpeg_a, bbox_a))
+
         finished = FinishedRound(
             round_id=current.round_id,
             started_at=current.started_at,
@@ -184,8 +206,9 @@ class PhotoCore:
             reason=reason,
             candidates=tuple(current.candidates),
             last_frame=current.frames[-1] if current.frames else None,
+            last_anchor=current.anchors[-1] if current.anchors else None,
+            fallback_bbox=current.fallback_bbox,
             speeds=tuple(sorted(current.speeds)),
-            boxes=tuple(sorted(current.boxes)),
             refused=dict(current.refused),
             frames=current.frame_count,
         )
@@ -196,6 +219,9 @@ class PhotoCore:
             "frames": finished.frames,
             "candidates": _source_counts(finished.candidates),
             "refused": {key: value for key, value in finished.refused.items() if value},
+            "anchors": current.anchor_count,
+            "pear_unmatched": current.refused.get("pear_unmatched", 0),
+            "bad_bbox": current.refused.get("bad_bbox", 0),
         }
         self._on_round_end(finished)
 
@@ -214,25 +240,102 @@ class PhotoCore:
             frames.popleft()
         if current.first_stamp is None:
             current.first_stamp = stamp
+
+        # Try to pair pending PEAR frames with this camera frame
+        while current.pending_pear:
+            pear_stamp, bbox_tuple = current.pending_pear[0]
+            if abs(pear_stamp - stamp) <= EXACT_SEC:
+                # Match found
+                current.pending_pear.popleft()
+                anchor = (stamp, jpeg, bbox_tuple)
+                current.anchors.append(anchor)
+                current.anchor_count += 1
+                if current.fallback_bbox is None:
+                    current.fallback_bbox = (bbox_tuple, stamp)
+                # Drive uniform trigger from this anchor
+                if self._warm(current, stamp) and self.section.uniform.enabled:
+                    trigger = self._uniform.update(stamp)
+                    if trigger is not None:
+                        self._offer(current, trigger)
+            elif pear_stamp < stamp - EXACT_SEC:
+                # PEAR frame too old, missed pairing
+                current.pending_pear.popleft()
+                current.refused["pear_unmatched"] += 1
+            else:
+                # PEAR still ahead, keep waiting
+                break
+
+        # Clean up anchors older than BUFFER_SEC
+        while current.anchors and stamp - current.anchors[0][0] > BUFFER_SEC:
+            current.anchors.popleft()
+
         self._resolve_pending(current, stamp)
-        if self._warm(current, stamp) and self.section.uniform.enabled:
-            trigger = self._uniform.update(stamp)
-            if trigger is not None:
-                self._offer(current, trigger)
 
     def on_pear(self, stamp: float, raw, bbox: Sequence[float] | None) -> None:
         """One PEAR frame; ``bbox`` None for a frame with no actor (``center_fallback``)."""
         current = self._round
         if current is None:
             return
-        if bbox is not None:
-            current.boxes.append((stamp, tuple(float(value) for value in bbox)))
+
+        # Speed calculation for all PEAR frames
         try:
             speed = self._speed.update(stamp, raw)
         except ValueError:
             speed = None
         if speed is not None:
             current.speeds.append((stamp, speed))
+
+        # Anchor creation: PEAR yolox frame (bbox present) matched with camera frame
+        if bbox is not None:
+            bbox_tuple = tuple(float(value) for value in bbox)
+            # Validate bbox: 4 finite numbers, x2 > x1, y2 > y1
+            if (
+                len(bbox_tuple) == 4
+                and all(isinstance(v, float) and not (v != v or abs(v) == float("inf")) for v in bbox_tuple)
+                and bbox_tuple[2] > bbox_tuple[0]
+                and bbox_tuple[3] > bbox_tuple[1]
+            ):
+                # Try to pair with camera frame at same stamp
+                if stamp <= 0.0:
+                    # Camera stamp=0: node will replace with wall time, PEAR can never match
+                    current.refused["no_actor"] += 1
+                else:
+                    # Search buffered camera frames for a match
+                    matched_jpeg = None
+                    for frame_stamp, jpeg in current.frames:
+                        if abs(frame_stamp - stamp) <= EXACT_SEC:
+                            matched_jpeg = jpeg
+                            break
+
+                    if matched_jpeg is not None:
+                        # Match found, create anchor
+                        anchor = (stamp, matched_jpeg, bbox_tuple)
+                        current.anchors.append(anchor)
+                        current.anchor_count += 1
+                        if current.fallback_bbox is None:
+                            current.fallback_bbox = (bbox_tuple, stamp)
+                        # Drive uniform trigger from this anchor
+                        if self._warm(current, stamp) and self.section.uniform.enabled:
+                            trigger = self._uniform.update(stamp)
+                            if trigger is not None:
+                                self._offer(current, trigger)
+                    elif not current.frames or stamp > current.frames[-1][0]:
+                        # PEAR ahead of camera: pend if within window
+                        if not current.frames or stamp - current.frames[-1][0] <= PEAR_PENDING_SEC:
+                            current.pending_pear.append((stamp, bbox_tuple))
+                        # else: too far ahead, drop
+                    else:
+                        # Camera frame passed, we missed it
+                        current.refused["pear_unmatched"] += 1
+            else:
+                current.refused["bad_bbox"] += 1
+
+        # Resolve pending triggers after creating anchor
+        if bbox is not None and current.anchors:
+            newest_camera = current.frames[-1][0] if current.frames else 0.0
+            self._resolve_pending(current, newest_camera)
+
+        # Still trigger
         if not self.section.still.enabled:
             return
         if not self._warm(current, stamp):
@@ -279,52 +382,84 @@ class PhotoCore:
                 current.refused["rate"] += 1
                 return
             window.append(now)
-        frame = self._frame_for(current, trigger)
-        if frame is None:
+        anchor = self._anchor_for(current, trigger)
+        if anchor is None:
             return
-        self._keep(current, Candidate(trigger, frame[0], frame[1]))
+        stamp, jpeg, bbox = anchor
+        self._keep(current, Candidate(trigger, stamp, jpeg, bbox))
 
-    def _frame_for(self, current: _Round, trigger: Trigger) -> tuple[float, bytes] | None:
-        frames = current.frames
-        if not frames:
-            current.refused["nomatch"] += 1
-            return None
-        if trigger.stamp is None:
-            return frames[-1]
-        frame = _nearest_frame(frames, trigger.stamp, _tolerance(trigger))
-        if frame is not None and frame[0] >= trigger.stamp:
-            return frame
-        if trigger.stamp > frames[-1][0]:
-            if trigger.stamp - frames[-1][0] <= PENDING_SEC:
-                # The frame after the stamp may be nearer: decide once the camera has passed it.
+    def _anchor_for(self, current: _Round, trigger: Trigger) -> tuple[float, bytes, tuple[float, float, float, float]] | None:
+        """Find the anchor for this trigger; None if no match or pending."""
+        anchors = current.anchors
+        if not anchors:
+            # No anchors yet: if trigger has no stamp, refuse now
+            if trigger.stamp is None:
+                current.refused["no_actor"] += 1
+                return None
+            # Try pending if ahead of camera within wait window
+            newest_camera = current.frames[-1][0] if current.frames else 0.0
+            if trigger.stamp > newest_camera and trigger.stamp - newest_camera <= PEAR_WAIT_SEC:
                 current.pending.append(trigger)
                 return None
-            if trigger.source == EVENT:
-                return frames[-1]
-            current.refused["nomatch"] += 1
+            # Otherwise refuse
+            current.refused["no_actor"] += 1
             return None
-        if frame is not None:
-            return frame
+
+        # No timestamp: take the newest anchor
+        if trigger.stamp is None:
+            return anchors[-1]
+
+        # Find nearest anchor within tolerance
+        tolerance = GESTURE_MATCH_SEC if trigger.source == "gesture" else (
+            EVENT_MATCH_SEC if trigger.source == EVENT else MATCH_SEC
+        )
+        anchor = _nearest_anchor(anchors, trigger.stamp, tolerance)
+
+        # Found an anchor at or after the trigger stamp
+        if anchor is not None and anchor[0] >= trigger.stamp:
+            return anchor
+
+        # Trigger stamp is ahead of the newest anchor
+        newest_anchor_stamp = anchors[-1][0]
+        newest_camera = current.frames[-1][0] if current.frames else 0.0
+        if trigger.stamp > newest_anchor_stamp:
+            # Wait for a future anchor if within wait window
+            if trigger.stamp - newest_camera <= PEAR_WAIT_SEC:
+                current.pending.append(trigger)
+                return None
+            # Event gets the newest anchor regardless
+            if trigger.source == EVENT:
+                return anchors[-1]
+            current.refused["no_actor"] += 1
+            return None
+
+        # Found an anchor before the trigger
+        if anchor is not None:
+            return anchor
+
+        # No match: event gets newest, others refuse
         if trigger.source == EVENT:
-            return frames[-1]
-        current.refused["late" if trigger.stamp < frames[0][0] else "nomatch"] += 1
+            return anchors[-1]
+        current.refused["no_actor"] += 1
         return None
 
     def _resolve_pending(self, current: _Round, stamp: float) -> None:
+        """Resolve pending triggers now that camera time has advanced to stamp."""
         if not current.pending:
             return
         waiting, current.pending = current.pending, []
         for trigger in waiting:
-            if stamp < trigger.stamp:
-                current.pending.append(trigger)
-                continue
-            frame = _nearest_frame(current.frames, trigger.stamp, _tolerance(trigger))
-            if frame is None and trigger.source == EVENT:
-                frame = current.frames[-1]
-            if frame is None:
-                current.refused["nomatch"] += 1
-            else:
-                self._keep(current, Candidate(trigger, frame[0], frame[1]))
+            # Wait until camera time passes trigger stamp, or wait time expires
+            if trigger.stamp is not None and stamp < trigger.stamp:
+                elapsed = stamp - (trigger.stamp if trigger.stamp > 0 else stamp)
+                if elapsed < PEAR_WAIT_SEC:
+                    current.pending.append(trigger)
+                    continue
+            # Time to decide: find anchor now
+            anchor = self._anchor_for(current, trigger)
+            if anchor is not None:
+                stamp_a, jpeg_a, bbox_a = anchor
+                self._keep(current, Candidate(trigger, stamp_a, jpeg_a, bbox_a))
 
     def _keep(self, current: _Round, candidate: Candidate) -> None:
         if not looks_like_jpeg(candidate.jpeg):
@@ -383,10 +518,25 @@ class PhotoCore:
             status["round"] = {
                 "round_id": current.round_id,
                 "frames": current.frame_count,
+                "anchors": current.anchor_count,
                 "candidates": _source_counts(current.candidates),
                 "pending": len(current.pending),
             }
         return status
+
+
+def _nearest_anchor(
+    anchors: Sequence[tuple[float, bytes, tuple[float, float, float, float]]], stamp: float, tolerance: float
+) -> tuple[float, bytes, tuple[float, float, float, float]] | None:
+    """Find the nearest anchor within tolerance; None if outside tolerance."""
+    index = bisect.bisect_left(anchors, stamp, key=lambda anchor: anchor[0])
+    best = None
+    for near in (index - 1, index):
+        if 0 <= near < len(anchors):
+            gap = abs(anchors[near][0] - stamp)
+            if gap <= tolerance and (best is None or gap < best[0]):
+                best = (gap, anchors[near])
+    return None if best is None else best[1]
 
 
 def _tolerance(trigger: Trigger) -> float:
@@ -424,6 +574,7 @@ def photo_meta(
     trigger: Trigger | None,
     quality: str,
     bbox: Sequence[float] | None,
+    bbox_stamp: float | None,
     extra: dict,
 ) -> dict:
     """The metadata that travels with a photo (and is stored beside it in the outbox)."""
@@ -440,6 +591,7 @@ def photo_meta(
         "weight": trigger.weight if trigger else None,
         "quality": quality,
         "bbox": [round(float(value), 1) for value in bbox] if bbox is not None else None,
+        "bbox_stamp": bbox_stamp,
         "width": size[0] if size else None,
         "height": size[1] if size else None,
         "bytes": len(jpeg),
@@ -465,23 +617,41 @@ def choose_photo(
     """The round's one photo, or None when the round saw no frame at all."""
     round_info = _round_info(finished)
     if not finished.candidates:
-        if finished.last_frame is None:
-            return None, None
-        stamp, jpeg = finished.last_frame
-        meta = photo_meta(
-            finished.round_id,
-            jpeg,
-            stamp=stamp,
-            trigger=None,
-            quality="fallback",
-            bbox=finished.bbox_at(stamp),
-            extra={**round_info, "scoring": "none"},
-        )
-        return Photo(finished.round_id, jpeg, meta), None
+        # No candidates: use last_anchor if available, otherwise last_frame with fallback_bbox
+        if finished.last_anchor is not None:
+            stamp, jpeg, bbox = finished.last_anchor
+            meta = photo_meta(
+                finished.round_id,
+                jpeg,
+                stamp=stamp,
+                trigger=None,
+                quality="fallback",
+                bbox=bbox,
+                bbox_stamp=stamp,
+                extra={**round_info, "scoring": "none"},
+            )
+            return Photo(finished.round_id, jpeg, meta), None
+        if finished.last_frame is not None:
+            stamp, jpeg = finished.last_frame
+            if finished.fallback_bbox is not None:
+                bbox, bbox_stamp = finished.fallback_bbox
+            else:
+                bbox, bbox_stamp = None, None
+            meta = photo_meta(
+                finished.round_id,
+                jpeg,
+                stamp=stamp,
+                trigger=None,
+                quality="fallback",
+                bbox=bbox,
+                bbox_stamp=bbox_stamp,
+                extra={**round_info, "scoring": "none"},
+            )
+            return Photo(finished.round_id, jpeg, meta), None
+        return None, None
     choice = select(
         finished.candidates,
         speed_at=finished.speed_at,
-        bbox_at=finished.bbox_at,
         stillness_weight=section.stillness_weight,
         sharpness_weight=section.sharpness_weight,
         deadline_sec=section.scoring_deadline_sec,
@@ -494,7 +664,8 @@ def choose_photo(
         stamp=chosen.stamp,
         trigger=chosen.trigger,
         quality="normal",
-        bbox=finished.bbox_at(chosen.stamp),
+        bbox=chosen.bbox,
+        bbox_stamp=chosen.stamp,
         extra={
             **round_info,
             "scoring": choice.scoring,
@@ -515,9 +686,17 @@ def emergency_photo(finished: FinishedRound, why: str) -> Photo | None:
     """
     if finished.candidates:
         best = max(finished.candidates, key=lambda kept: (kept.trigger.weight, kept.stamp))
-        stamp, jpeg, trigger = best.stamp, best.jpeg, best.trigger
+        stamp, jpeg, trigger, bbox = best.stamp, best.jpeg, best.trigger, best.bbox
+        bbox_stamp = stamp
+    elif finished.last_anchor is not None:
+        stamp, jpeg, bbox = finished.last_anchor
+        trigger, bbox_stamp = None, stamp
     elif finished.last_frame is not None:
         (stamp, jpeg), trigger = finished.last_frame, None
+        if finished.fallback_bbox is not None:
+            bbox, bbox_stamp = finished.fallback_bbox
+        else:
+            bbox, bbox_stamp = None, None
     else:
         return None
     meta = photo_meta(
@@ -526,15 +705,14 @@ def emergency_photo(finished: FinishedRound, why: str) -> Photo | None:
         stamp=stamp,
         trigger=trigger,
         quality="fallback",
-        bbox=finished.bbox_at(stamp),
+        bbox=bbox,
+        bbox_stamp=bbox_stamp,
         extra={**_round_info(finished), "scoring": "error", "error": why},
     )
     return Photo(finished.round_id, jpeg, meta)
 
 
-def provisional_photo(
-    round_id: str, started_at: float, candidate: Candidate, bbox: Sequence[float] | None = None
-) -> Photo:
+def provisional_photo(round_id: str, started_at: float, candidate: Candidate) -> Photo:
     """The round's provisional best as a photo, for the crash copy (``quality: recovered`` once read back)."""
     meta = photo_meta(
         round_id,
@@ -542,7 +720,8 @@ def provisional_photo(
         stamp=candidate.stamp,
         trigger=candidate.trigger,
         quality="provisional",
-        bbox=bbox,
+        bbox=candidate.bbox,
+        bbox_stamp=candidate.stamp,
         extra={"round_started_at": _iso(started_at), "scoring": "none"},
     )
     return Photo(round_id, candidate.jpeg, meta)

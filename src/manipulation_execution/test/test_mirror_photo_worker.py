@@ -54,9 +54,14 @@ class Rig:
         self.woken += 1
 
     def round(self, seconds: float, start: float = 0.0) -> None:
+        import numpy as np
+        STILL_POSE = np.tile(np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), 52)
         self.core.on_state(state(STATE_MIRRORING), 0.0)
         for index in range(round(seconds * FPS)):
-            self.core.on_image(start + index / FPS, FRAME)
+            stamp = start + index / FPS
+            self.core.on_image(stamp, FRAME)
+            # Add PEAR frames to create anchors (needed for normal photos)
+            self.core.on_pear(stamp, STILL_POSE, (10.0, 10.0, 50.0, 40.0))
         self.core.on_state(state(STATE_STANDBY), 0.0)
 
     def drain(self) -> None:
@@ -83,10 +88,15 @@ def test_a_round_becomes_one_photo_and_the_crash_copy_goes(tmp_path):
 
 
 def test_the_crash_copy_is_kept_while_the_round_runs(tmp_path):
+    import numpy as np
+    STILL_POSE = np.tile(np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), 52)
     rig = Rig(tmp_path)
     rig.core.on_state(state(STATE_MIRRORING), 0.0)
     for index in range(8 * FPS):
-        rig.core.on_image(index / FPS, FRAME)
+        stamp = index / FPS
+        rig.core.on_image(stamp, FRAME)
+        # Add PEAR to create anchors and trigger provisional
+        rig.core.on_pear(stamp, STILL_POSE, (10.0, 10.0, 50.0, 40.0))
     rig.drain()
     assert rig.files() == ["current.jpg", "current.json"]
 
