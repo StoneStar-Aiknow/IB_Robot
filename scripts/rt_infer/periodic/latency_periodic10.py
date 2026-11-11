@@ -57,7 +57,9 @@ def periodic_releases(start, duration, hz, now=time.monotonic_ns, sleep=wait_unt
 
 def worker(args):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from baseline import OM, InferSession, np
+    import numpy as np
+    from ais_bench.infer.interface import InferSession
+    from baseline import OM
 
     folder = args.folder
     config = json.loads((folder / "config.json").read_text())
@@ -254,7 +256,33 @@ def worker(args):
     )
 
 
+def managed_command(ctl, priority, cpu, argv):
+    return [
+        *ctl,
+        "run",
+        "--priority",
+        str(priority),
+        "--cpu",
+        str(cpu),
+        "--",
+        "/usr/bin/env",
+        "RT_INFER_SAFE_ARGS_BATCH=" + os.environ["RT_INFER_SAFE_ARGS_BATCH"],
+        "RT_INFER_PERSISTENT_IO=" + os.environ.get("RT_INFER_PERSISTENT_IO", "0"),
+        *[
+            f"{key}={os.environ[key]}"
+            for key in ("RTINFER_PREFIX", "RTINFER_REFERENCES", "RTINFER_MODELS", "RT_INFER_PERIODIC_PATH")
+            if key in os.environ
+        ],
+        *argv,
+    ]
+
+
+def terminate_case(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def run_case(args):
+    signal.signal(signal.SIGTERM, terminate_case)
     folder = args.folder
     folder.mkdir(parents=True, exist_ok=False)
     config = {
@@ -305,19 +333,7 @@ def run_case(args):
             if args.mode == "native":
                 argv = ["taskset", "-c", str(cpu), *argv]
             else:
-                argv = [
-                    *ctl,
-                    "run",
-                    "--priority",
-                    str(config["priorities"][role]),
-                    "--cpu",
-                    str(cpu),
-                    "--",
-                    "/usr/bin/env",
-                    "RT_INFER_SAFE_ARGS_BATCH=" + os.environ["RT_INFER_SAFE_ARGS_BATCH"],
-                    "RT_INFER_PERSISTENT_IO=" + os.environ.get("RT_INFER_PERSISTENT_IO", "0"),
-                    *argv,
-                ]
+                argv = managed_command(ctl, config["priorities"][role], cpu, argv)
             log = (folder / f"{role}.log").open("x")
             logs.append(log)
             children.append(subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, start_new_session=True))

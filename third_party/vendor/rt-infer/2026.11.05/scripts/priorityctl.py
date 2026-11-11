@@ -71,10 +71,13 @@ def start(root, manifest, args):
         "pfp_batch_select": args.pfp_batch_select,
         "pfp_min_cache": args.pfp_min_cache,
         "pfp_hi_priority": args.pfp_hi_priority,
+        "pfp_mode": getattr(args, "pfp_mode", None),
+        "periodic_control": str(args.pfp_periodic) if args.pfp_periodic else None,
         "native_recovery": "reboot-required",
         "clients": [],
     }
     base.state_write(state)
+    child = None
     try:
         if not restarting:
             base.command(["insmod", str(base.artifact_path(root, manifest, "module"))], env=base.clean_environment())
@@ -144,6 +147,14 @@ def start(root, manifest, args):
     except BaseException:
         state["status"] = "start-failed"
         base.state_write(state)
+        if child is not None and child.poll() is None:
+            # Popen retains our unreaped child identity; never signal an unrelated PID.
+            child.terminate()
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                state["cleanup_error"] = "Scheduler did not exit; manual recovery required"
+                base.state_write(state)
         raise
 
 
@@ -201,6 +212,24 @@ def run(root, manifest, args):
     return code if code >= 0 else 128 - code
 
 
+def configure_pfp(args):
+    """Resolve user modes once; keep old explicit flags for reproducible comparisons."""
+    pfp = args.scheduler == "pfp"
+    mode = args.pfp_mode or ("periodic" if args.pfp_periodic else "general")
+    base.require(pfp or (args.pfp_mode is None and not args.pfp_periodic), "PFP mode requires --scheduler pfp")
+    if pfp:
+        base.require(
+            (mode == "periodic") == bool(args.pfp_periodic),
+            "Periodic mode requires --periodic-control; general mode must not have one",
+        )
+    for key in ("prefetch", "pfp_exclusive", "pfp_batch_select", "local_pool", "pfp_min_cache"):
+        if getattr(args, key) is None:
+            setattr(args, key, "on" if pfp else "off")
+    if mode == "periodic":
+        base.require(args.pfp_exclusive == "on", "Periodic admission requires exclusive PFP")
+    args.pfp_mode = mode if pfp else None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefix", type=Path)
@@ -214,23 +243,44 @@ def main():
         actions.add_parser(name)
     starter = actions.add_parser("start")
     starter.add_argument("--scheduler", choices=("fifo", "nice", "pfp"), required=True)
-    starter.add_argument("--prefetch", choices=("on", "off"), default="off")
+    starter.add_argument("--prefetch", choices=("on", "off"), default=None, help=argparse.SUPPRESS)
+    starter.add_argument("--pfp-mode", choices=("general", "periodic"), help="PFP mode (default: general)")
+    starter.add_argument(
+        "--periodic-control", dest="pfp_periodic", type=Path, help="Application release mapping for periodic mode"
+    )
     starter.add_argument("--cpu", type=int, required=True)
-    starter.add_argument("--trace", type=Path)
-    starter.add_argument("--pfp-min-cache", choices=("on", "off"), default="off")
-    starter.add_argument("--pfp-hi-priority", type=int, choices=range(8), default=1)
-    starter.add_argument("--pfp-periodic", type=Path)
-    starter.add_argument("--pfp-batch-select", choices=("on", "off"), default="off")
-    starter.add_argument("--dispatch-timing", type=Path)
-    starter.add_argument("--dispatch-audit", type=Path)
-    starter.add_argument("--local-pool", choices=("on", "off"), default="off")
-    starter.add_argument("--pfp-exclusive", choices=("on", "off"), default="off")
+    starter.add_argument("--trace", type=Path, help=argparse.SUPPRESS)
+    starter.add_argument("--pfp-min-cache", choices=("on", "off"), default=None, help=argparse.SUPPRESS)
+    starter.add_argument(
+        "--high-priority",
+        dest="pfp_hi_priority",
+        type=int,
+        choices=range(8),
+        default=0,
+        help="Periodic task priority (default: 0)",
+    )
+    starter.add_argument(
+        "--pfp-hi-priority",
+        dest="pfp_hi_priority",
+        type=int,
+        choices=range(8),
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    starter.add_argument("--pfp-periodic", type=Path, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    starter.add_argument("--pfp-batch-select", choices=("on", "off"), default=None, help=argparse.SUPPRESS)
+    starter.add_argument("--dispatch-timing", type=Path, help=argparse.SUPPRESS)
+    starter.add_argument("--dispatch-audit", type=Path, help=argparse.SUPPRESS)
+    starter.add_argument("--local-pool", choices=("on", "off"), default=None, help=argparse.SUPPRESS)
+    starter.add_argument("--pfp-exclusive", choices=("on", "off"), default=None, help=argparse.SUPPRESS)
     runner = actions.add_parser("run")
     runner.add_argument("--priority", type=int, choices=range(8), required=True)
     runner.add_argument("--cpu", type=int)
     runner.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
     try:
+        if args.action == "start":
+            configure_pfp(args)
         if args.action == "verify-bundle":
             manifest = base.verify_bundle(args.bundle)
             print(f"Verified: {manifest['version']}")

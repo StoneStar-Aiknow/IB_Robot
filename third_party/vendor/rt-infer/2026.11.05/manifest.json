@@ -79,8 +79,8 @@
     },
     {
       "path": "scripts/priorityctl.py",
-      "sha256": "bb8aa60556ee06db7d850e9906716eb0f9d7631c2dc06d488e3cc77bd9fa5c3c",
-      "size_bytes": 12106
+      "sha256": "f3ac8905e0db22a8cc291b8dbe97d5cc219635cc3adbd37eecd710395ebf8951",
+      "size_bytes": 14438
     },
     {
       "path": "scripts/summarize.py",
