@@ -677,8 +677,13 @@ def prepare_launch(
     _run_phase_hooks("preflight", hooks_by_phase["preflight"], robot_config, arguments, hook_target_state)
 
     # 13a. binding-target: write back only for the live-binding snapshot.
+    task_dispatch = robot_config.get("task_dispatch")
     live_binding_required = bool(
-        required_interface_ids(robot_config) or (robot_config.get("runtime") or {}).get("require_model")
+        required_interface_ids(robot_config)
+        or (robot_config.get("runtime") or {}).get("require_model")
+        # Multi-group task dispatch without a public model binds its gripper and
+        # motion interfaces from the live description (contract v2).
+        or (isinstance(task_dispatch, dict) and task_dispatch.get("groups"))
     )
     node_use_sim_time = target_state["node_use_sim_time"]
     if live_binding_required:

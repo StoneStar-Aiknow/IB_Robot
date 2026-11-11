@@ -1,0 +1,185 @@
+# RoboDojo dual-arm ARX X5 as an IB-Robot robot (virtual robot body).
+#
+# The runtime provider robodojo_robot serves the public contract; RoboDojo's
+# eval client (Isaac Sim, separate process) owns physics, controllers and the
+# only IK solver, so the embodied stack runs without a public model
+# (arm_surface: false) and every arm motion goes through the runtime's
+# /motion/move_to_pose with a target_group (contract v2). Success is judged by
+# RoboDojo itself. Design notes: docs/robodojo_virtual_runtime_design_zh.md.
+#
+# Body facts (joints, motion groups with their sides and grippers, TCP, cameras, tick length)
+# have one source: the runtime profile robodojo_robot/profiles/arx_x5_dual.yaml
+# (runtime.profile below). This file keeps only what its consumers read from it: the
+# arm_side -> group map, the gripper joint per group and the planner's camera topics;
+# robodojo_robot's test_body_facts_have_one_source checks they match the profile.
+#
+# Launch (the RoboDojo eval client connects to the runtime's policy server):
+#   ros2 launch embodied_bringup embodied_pipeline.launch.py robot_config:=robodojo_x5 \
+#     control_mode:=moveit_planning with_embodied:=true entry_mode:=agent authorize_motion:=true
+robot:
+  name: robodojo_x5
+  type: robodojo_arx_x5
+  robot_type: arx_x5_dual
+
+  runtime:
+    provider: robodojo_robot
+    profile: arx_x5_dual
+    require_model: false
+    # The X5 exists only in RoboDojo's simulation: launches select it without use_sim:=true.
+    target: simulation
+
+  # The robodojo simulation platform (registered by robodojo_robot in ibrobot.sim_platforms).
+  # A physics selection: every consumer runs on the runtime's /clock, which only moves while
+  # RoboDojo steps.
+  simulation:
+    platform: robodojo
+
+  # motion.move_to_pose is served (task_dispatch binds it) but cannot be listed:
+  # with arm_surface: false the loader rejects required arm-surface capabilities.
+  capabilities:
+    requires:
+      - joint.state
+      - gripper.1d
+      - runtime.stop
+
+  default_control_mode: "moveit_planning"
+  skill_required_control_mode: "moveit_planning"
+
+  control_modes:
+    moveit_planning:
+      description: "Pose motion through the runtime's motion services (RoboDojo cuRobo IK)"
+      description_cn: "经运行时运动服务的位姿运动（RoboDojo cuRobo 求逆解）"
+      runtime_mode: trajectory
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+
+  # Multi-arm task execution without a public model: one gripper action per arm
+  # (groups and gripper joints as in the runtime profile's motion_groups).
+  task_dispatch:
+    move_to_pose_interface: motion.move_to_pose
+    joint_state_interface: joint.state
+    default_group: left_arm
+    groups:
+      left_arm:
+        gripper_joint: left_gripper
+        gripper_trajectory_interface: joint.trajectory_left_gripper
+      right_arm:
+        gripper_joint: right_gripper
+        gripper_trajectory_interface: joint.trajectory_right_gripper
+
+  embodied:
+    enabled: true
+    entry_mode: agent
+    arm_surface: false
+    skill_catalog_profile: robodojo_x5
+    skill_catalog_source_mode: development
+    debug_tracing: true
+    execution_caller_scopes:
+      - agent_incubation:local_operator
+    timeouts:
+      task_budget_sec: 180.0
+      default_skill_timeout_sec: 120.0
+      robot_state_freshness_sec: 0.5
+      scene_freshness_sec: 0.5
+      model_idle_timeout_sec: 120.0
+      rpc_timeout_sec: 5.0
+      gripper_settle_sec: 1.5
+    execution:
+      # Skill arm_side -> runtime motion group (MoveToPose.target_group); the profile's
+      # motion_groups.<group>.side.
+      arm_groups:
+        left: left_arm
+        right: right_arm
+      # Speed of every Gateway-built arm motion; must stay within safety.motion_limits.
+      velocity_scaling: 0.5
+      relative_motion_step_m: 0.03
+      # The runtime's base frame is the profile's pose_frame (RoboDojo world): the arms face +y
+      # (forward) and the left arm stands at -x, so "left" is -x.
+      relative_motion_reference_frame: base
+      relative_motion_direction_mapping:
+        forward: [0.0, 1.0, 0.0]
+        backward: [0.0, -1.0, 0.0]
+        left: [-1.0, 0.0, 0.0]
+        right: [1.0, 0.0, 0.0]
+        up: [0.0, 0.0, 1.0]
+        down: [0.0, 0.0, -1.0]
+      gripper_open_position: 1.0
+      gripper_closed_position: 0.0
+      task_executor_action_name: /task_executor/execute_task_plan
+      # Gripper orientation. The X5 tool frame (TCP: profile tcp_offset) approaches along
+      # its local x axis, the fingers close along local y and joint6 turns about x, so
+      # rotate_gripper_* turn about x (SO-101's default is z). The presets are base-frame
+      # (RoboDojo world) orientations for set_gripper_approach, which keeps the TCP where it
+      # is. RoboDojo's own dual_x5 grasp direction is top-down. Reach (cuRobo probe over
+      # 300 poses per preset): top_down solves only at y <= about -0.05, down to 0.02 m
+      # above the table; tilted_45 reaches y = +0.15; horizontal is the start orientation.
+      gripper_approach:
+        axis: x
+        presets:
+          # approach +y, fingers close along x
+          horizontal: {orientation: {x: 0.0, y: 0.0, z: 0.7071068, w: 0.7071068}}
+          # approach -z (down), fingers close along x
+          top_down: {orientation: {x: -0.5, y: 0.5, z: 0.5, w: 0.5}}
+          # approach -z (down), fingers close along y (joint6 about +1.5 rad from top_down)
+          top_down_rotated: {orientation: {x: 0.0, y: 0.7071068, z: 0.0, w: 0.7071068}}
+          # approach half way between +y and -z, fingers close along x
+          tilted_45: {orientation: {x: -0.2705981, y: 0.2705981, z: 0.6532815, w: 0.6532815}}
+    # X5 safety limits (safety_guard): end-effector box in the RoboDojo world frame (just above
+    # the table top, adapter_config.table_top_z of the profile) and a speed cap.
+    safety:
+      workspace:
+        x: [-0.70, 0.70]
+        y: [-0.45, 0.30]
+        z: [0.770, 1.25]
+      motion_limits:
+        max_velocity_scaling: 0.6
+    named_poses: {}
+    agent:
+      enabled: true
+      incubation: true
+      execution_enabled: true
+      request_topic: /agent/request
+      response_topic: /agent/response
+      event_topic: /agent/event
+      control_topic: /agent/control
+      channel_id: robodojo_episode
+      principal_id: local_operator
+      caller_scope: agent_incubation:local_operator
+      # Local simulation only; the Gateway checks it on every program.
+      caller_token: robodojo-local-demo
+      test_allowlist:
+        - move_relative_ee
+        - open_gripper_skill
+        - close_gripper_skill
+        - rotate_gripper_cw
+        - rotate_gripper_ccw
+        - set_gripper_approach
+      ledger_path: /tmp/ibrobot-agent-robodojo/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-robodojo/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-robodojo/agent.lock
+      max_session_turns: 6
+      clarification_ttl_sec: 300.0
+      event_queue_size: 128
+      # Any OpenAI-compatible multimodal endpoint: set base_url and export the key named by
+      # api_key_env in the launch shell. gpt-6.1-sol reads object positions off the head
+      # camera's table grid far better than the smaller vision models that were tried.
+      # Transitional decision maker: a VLA policy would replace it behind the same skills.
+      planner:
+        mode: vlm
+        provider: openai_compatible
+        base_url: http://127.0.0.1:18080/v1
+        api_key_env: ROBODOJO_PLANNER_API_KEY
+        model: gpt-6.1-sol
+        timeout_sec: 120.0
+        temperature: 0.3
+        api_protocol: chat_completions
+        vision_topics:
+          # Head view with the calibrated table grid and grasp-point markers (robodojo_robot overlay).
+          - /robodojo/cam_head/overlay/image_raw
+          - /robodojo/cam_left_wrist/image_raw
+          - /robodojo/cam_right_wrist/image_raw
+
+  contract:
+    observations: []

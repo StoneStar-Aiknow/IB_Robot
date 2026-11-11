@@ -1,0 +1,165 @@
+# RoboDojo dual-arm ARX X5 runtime profile (robot-runtime-packaging spec).
+#
+# The robot is RoboDojo's Isaac Sim scene, on the "robodojo" simulation platform
+# (registered by this package in ibrobot.sim_platforms). RoboDojo's eval client
+# owns physics, the controllers and the only IK solver (cuRobo); IB-Robot has no
+# controller for it: the platform's embodiment starts robot_runtime_sim's
+# direct-control runtime, which writes every tick's targets and publishes /clock
+# from RoboDojo's ticks (simulated time stands still while nothing moves).
+#
+# Single source of the X5 body facts: joints, motion groups (sides, grippers, TCP, IK wrap
+# limits), cameras and tick length. robot_config/config/robots/robodojo_x5.yaml only repeats
+# the few of them its consumers read (arm_side -> group, gripper joint per group, planner camera
+# topics); test_body_facts_have_one_source checks they agree.
+
+runtime:
+  name: robodojo_robot
+  version: 0.1.0
+  type: robodojo_arx_x5
+
+use_sim: true
+sim_platforms: [robodojo]
+sim_platform: robodojo
+
+joint_state_topic: /joint_states
+joints:
+  - left_joint1
+  - left_joint2
+  - left_joint3
+  - left_joint4
+  - left_joint5
+  - left_joint6
+  - right_joint1
+  - right_joint2
+  - right_joint3
+  - right_joint4
+  - right_joint5
+  - right_joint6
+  - left_gripper
+  - right_gripper
+arm_joints: [left_joint1, left_joint2, left_joint3, left_joint4, left_joint5, left_joint6,
+             right_joint1, right_joint2, right_joint3, right_joint4, right_joint5, right_joint6]
+# Normalized opening: 0.0 closed .. 1.0 open (RoboDojo's ee_joint_state convention).
+gripper_joints: [left_gripper, right_gripper]
+
+# Motion groups: MoveToPose.target_group names one of these. Poses are in
+# RoboDojo's world frame; the arm bases sit at x = -0.3 (left) and +0.3 (right),
+# y = -0.45, z = 0.765 (table top).
+motion_groups:
+  left_arm:
+    side: left
+    joints: [left_joint1, left_joint2, left_joint3, left_joint4, left_joint5, left_joint6]
+    gripper: left_gripper
+    ee_pose_topic: /robot_status/left_arm/ee_pose
+    # Tool centre point (between the finger pads) in the link6 frame: RoboDojo reports link6,
+    # the fingers start 0.087 m ahead of it (X5A.urdf joint7) and their tips reach ~0.16 m.
+    # ee_pose topics, MoveToPose and ComputeIk all use this point. Same for both arms.
+    tcp_offset: &x5_tcp_offset [0.13, 0.0, 0.0]
+    # |q| limits used to pick the 2*pi-equivalent IK solution nearest the current joints.
+    joint_wrap_limits: &x5_joint_wrap_limits [10.0, 10.0, 10.0, 10.0, 10.0, 3.14]
+  right_arm:
+    side: right
+    joints: [right_joint1, right_joint2, right_joint3, right_joint4, right_joint5, right_joint6]
+    gripper: right_gripper
+    ee_pose_topic: /robot_status/right_arm/ee_pose
+    tcp_offset: *x5_tcp_offset
+    joint_wrap_limits: *x5_joint_wrap_limits
+default_group: left_arm
+pose_frame: world
+
+modes:
+  initial: idle
+  idle:
+    controllers: []
+    transitions: [trajectory]
+  trajectory:
+    controllers: [robodojo_joint_targets]
+    allows_trajectory: true
+    transitions: [idle]
+
+# Group identity for the gripper trajectory actions below (no streaming mode).
+command_channels:
+  - channel: left_gripper_stream
+    topic: /left_gripper_position_controller/commands
+    joints: [left_gripper]
+    modes: []
+  - channel: right_gripper_stream
+    topic: /right_gripper_position_controller/commands
+    joints: [right_gripper]
+    modes: []
+
+trajectory_actions:
+  - /left_gripper_trajectory_controller/follow_joint_trajectory
+  - /right_gripper_trajectory_controller/follow_joint_trajectory
+
+capabilities:
+  joint.state: {joint_count: 14, rate_hz: 20.0}
+  joint.trajectory: {joint_count: 2}
+  gripper.1d: {count: 2}
+  motion.ik: {endpoints: [/motion/compute_ik]}
+  motion.move_to_joint: {}
+  motion.move_to_pose: {groups: [left_arm, right_arm], default_group: left_arm}
+  perception.camera:
+    topics: [/robodojo/cam_head/image_raw, /robodojo/cam_left_wrist/image_raw, /robodojo/cam_right_wrist/image_raw]
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 1.0, torque_off_bound_s: 1.0}
+
+interfaces:
+  motion.ee_pose:
+    capability: motion.move_to_pose
+    kind: topic
+    direction: publish
+    endpoint: /robot_status/ee_pose
+    message_type: geometry_msgs/msg/PoseStamped
+    frame_id: world
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  motion.ee_pose.left_arm:
+    capability: motion.move_to_pose
+    kind: topic
+    direction: publish
+    endpoint: /robot_status/left_arm/ee_pose
+    message_type: geometry_msgs/msg/PoseStamped
+    frame_id: world
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  motion.ee_pose.right_arm:
+    capability: motion.move_to_pose
+    kind: topic
+    direction: publish
+    endpoint: /robot_status/right_arm/ee_pose
+    message_type: geometry_msgs/msg/PoseStamped
+    frame_id: world
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+
+# Settings of the robodojo platform (simulation.<platform>, like every registered platform).
+# The direct-control engine (robot_runtime_sim.direct_control) is platform neutral; everything
+# RoboDojo-specific is this package's adapter. One tick = 40 ms of sim time (10 physics steps
+# x 4 ms); idle ticks are not stepped.
+simulation:
+  robodojo:
+    clock_mode: platform_pull
+    dt_s: 0.04
+    supported_commands: [joint, gripper, pose, ik]
+    ik: platform                  # RoboDojo's cuRobo in the Isaac process is the only IK solver
+    atomic_tick_cancellable: false
+    motion:
+      max_joint_speed: 3.0          # rad/s at velocity_scaling 1.0 (the robot config caps scaling at 0.6)
+      min_motion_ticks: 6
+      max_motion_ticks: 100
+      settle_ticks: 2
+      gripper_ticks: 12
+      position_tolerance_m: 0.02
+      orientation_tolerance_rad: 0.35   # 20 deg: a pose move (e.g. set_gripper_approach) ending further turned fails
+      idle_wait_s: 0.2
+      idle_timeout_s: 600.0
+    adapter_config:
+      # RoboDojo checkout that provides XPolicyLab's ws policy server; set ROBODOJO_ROOT.
+      robodojo_root: $(env ROBODOJO_ROOT)
+      host: 127.0.0.1
+      port: 34950
+      platform_silence_s: 120.0
+      overlay_cameras: [cam_head]
+      overlay_axes: usd
+      table_top_z: 0.765
+
+# Camera images go to <camera_topic_prefix>/<camera>/image_raw (+ /overlay/image_raw).
+camera_topic_prefix: /robodojo
+cameras: [cam_head, cam_left_wrist, cam_right_wrist]

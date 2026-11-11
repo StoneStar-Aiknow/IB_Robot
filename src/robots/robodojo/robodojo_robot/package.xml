@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>robodojo_robot</name>
+  <version>0.1.0</version>
+  <description>
+    The robodojo simulation platform (an ibrobot.sim_platforms entry point) with
+    the dual-arm ARX X5 runtime profile. The RoboDojo eval client (Isaac Sim,
+    separate Python 3.11 process) owns physics, controllers and the only IK
+    solver; the platform's embodiment starts robot_runtime_sim's direct-control
+    runtime with this package's adapter, which hosts RoboDojo's policy server,
+    maps its observation and action keys to the direct-control port and hands
+    RoboDojo's own verdict to the runtime as the session's platform result.
+  </description>
+  <maintainer email="leiziting@huawei.com">leiziting</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- runtime contract layer, and the simulation platform layer this platform plugs into
+       (a simulation-only robot: the hardware-runtime independence rule does not apply) -->
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+  <exec_depend>robot_runtime_sim</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>control_msgs</exec_depend>
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>robot_runtime</test_depend>
+  <test_depend>robot_config</test_depend>
+  <test_depend>robot_runtime_sim</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
