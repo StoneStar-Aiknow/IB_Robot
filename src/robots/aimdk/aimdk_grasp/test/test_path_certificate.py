@@ -23,6 +23,7 @@ from robot_runtime.path_validation import policy_digest
 def empty_world():
     """Deliberately empty test world; tests below do not certify X2 hardware."""
     backend = object.__new__(FixedBackend)
+    backend.guard = lambda: None  # Same default as __init__; this fixture bypasses hardware setup.
     backend.hard_limits = dict.fromkeys(backend.ARM_JOINTS, (-10, 10))
     backend.fingerprint = "empty-test-world"
     backend.library = {

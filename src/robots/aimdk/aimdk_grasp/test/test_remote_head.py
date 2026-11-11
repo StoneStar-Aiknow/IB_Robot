@@ -34,6 +34,7 @@ from aimdk_grasp_msgs.srv import (  # noqa: E402
 )
 from rclpy.action import ActionServer, CancelResponse  # noqa: E402
 from rclpy.callback_groups import ReentrantCallbackGroup  # noqa: E402
+from rclpy.context import Context  # noqa: E402
 from rclpy.executors import MultiThreadedExecutor  # noqa: E402
 from rclpy.node import Node  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy  # noqa: E402
@@ -66,8 +67,8 @@ def plan(shift: float = 0.0) -> GraspPlan:
 
 
 class FakeHead(Node):
-    def __init__(self):
-        super().__init__("fake_grasp_head")
+    def __init__(self, *, context=None):
+        super().__init__("fake_grasp_head", context=context)
         names, group = head_endpoints(NAMESPACE), ReentrantCallbackGroup()
         self.ready, self.plan_seconds, self.requests, self.arm_seconds = True, 0.0, [], 0.0
         self.capture_strides = []
@@ -224,27 +225,36 @@ class FakeHead(Node):
         return response
 
 
+@pytest.fixture(scope="module")
+def ros_context():
+    # Keep context teardown after all this module's node and executor teardown;
+    # repeated global context replacement caused intermittent native crashes.
+    context = Context()
+    rclpy.init(context=context)
+    yield context
+    context.shutdown()
+
+
 @pytest.fixture
-def ros():
-    owned = not rclpy.ok()
-    if owned:
-        rclpy.init()
-    head = FakeHead()
-    pipeline = Node("remote_head_test")
+def ros(ros_context):
+    head = FakeHead(context=ros_context)
+    pipeline = Node("remote_head_test", context=ros_context)
     client = X2GraspHeadClient(pipeline, NAMESPACE, callback_group=ReentrantCallbackGroup())
-    executor = MultiThreadedExecutor(num_threads=4)
+    executor = MultiThreadedExecutor(num_threads=4, context=ros_context)
     executor.add_node(head)
     executor.add_node(pipeline)
     thread = threading.Thread(target=executor.spin, daemon=True)
     thread.start()
-    yield head, client
-    client.close()
-    executor.shutdown()
-    thread.join(timeout=5.0)
-    head.destroy_node()
-    pipeline.destroy_node()
-    if owned and rclpy.ok():
-        rclpy.shutdown()
+    try:
+        yield head, client
+    finally:
+        # Do not destroy subscriptions while another thread is waiting on DDS.
+        assert executor.shutdown(timeout_sec=5.0)
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+        client.close()
+        head.destroy_node()
+        pipeline.destroy_node()
 
 
 def capture(client):
