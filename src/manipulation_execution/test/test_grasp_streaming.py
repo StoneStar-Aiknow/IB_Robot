@@ -342,6 +342,43 @@ def test_the_shaper_raise_is_relative_to_the_segment_start():
     np.testing.assert_allclose(arm.published[-1][0], 0.3 + SAG[0] + 0.03, atol=1e-9)
 
 
+def test_a_settled_segment_reports_where_the_arm_stands_against_the_raw_plan(capsys):
+    """A sag model that raises more than the arm sags shows as end error, inside the arrival tolerance."""
+
+    class Shaper:
+        def raise_for(self, names, positions):
+            return 0.1 * positions  # the simulated arm's sag is constant: this is all overshoot
+
+    arm = SimArm()
+    executor = StreamExecutor(arm, CONFIG, shaper=Shaper())
+    outcome = run(executor, line(np.zeros(3), [0.3, 0.0, 0.0]))
+    assert outcome.state is MotionState.SUCCEEDED, outcome.reason
+    row = executor.report["segments"][-1]
+    assert row["raise_end_rad"] == pytest.approx({"l0": 0.03, "l1": 0.0, "l2": 0.0})
+    assert row["end_error_rad"]["l0"] == pytest.approx(0.03, abs=0.002)
+    assert row["start_offset_rad"] == pytest.approx(dict(zip(DRIVEN, SAG[:3], strict=True)), abs=1e-4)
+    logged = [line for line in capsys.readouterr().err.splitlines() if line.startswith('{"arm_segment"')]
+    assert '"end_error_rad"' in logged[-1] and '"name": "approach"' in logged[-1]
+
+    # The hold records the sample after the wait, against the same raw endpoint.
+    arm.measured[0] -= 0.04
+    before = arm.measured.copy()
+    commands = len(arm.published)
+    held = executor.hold(0.3, carrying=False, cancelled=lambda: False)
+    assert held.state is MotionState.SUCCEEDED
+    settled = held.report["arm_hold"]
+    assert settled["source_segment"] == "approach"
+    assert settled["elapsed_s"] == pytest.approx(0.3)
+    assert settled["feedback_age_s"] == 0
+    assert settled["plan_end_rad"] == dict(zip(DRIVEN, [0.3, 0.0, 0.0], strict=True))
+    assert settled["measured_rad"]["l0"] == arm.measured[0]
+    assert settled["measured_rad"]["l0"] > before[0] + 0.03
+    assert settled["end_error_rad"]["l0"] == pytest.approx(0.03, abs=0.002)
+    assert len(arm.published) == commands  # recording never sends a new arm target
+    assert executor.report["holds"][-1] == settled
+    assert '"source_segment": "approach"' in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(("board_off", "moves"), [(0.003, False), (0.05, True), (0.2, False)])
 def test_return_home_puts_the_command_back_where_the_goal_took_it_over(board_off, moves):
     # A task start far from any global HOME (shoulder roll 0.45): only the takeover counts.

@@ -95,6 +95,10 @@ _SCHEMA: dict[str, Any] = {
         # task-pose preparation runs; the Gateway starts it (manipulation_execution PipelineConfig).
         "prefetch_perception": _bool(),
         "prefetch_max_age_s": _POSITIVE,
+        # New candidates on the same observation after a no-complete-path planning failure
+        # (manipulation_execution PipelineConfig).
+        "resample_retries": _bool(),
+        "resample_max_age_s": _POSITIVE,
     },
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),

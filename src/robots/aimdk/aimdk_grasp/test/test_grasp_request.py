@@ -133,7 +133,7 @@ def setup(hand, gravity):
     return make, admitted, state
 
 
-def plan(planner, admitted, *, grasps=None, mask=None, estimate=None):
+def plan(planner, admitted, *, grasps=None, mask=None, estimate=None, target_points=None):
     poses, confidence = candidates() if grasps is None else grasps
     region = np.zeros((SIZE, SIZE), bool)
     region[8:12, 8:12] = True
@@ -149,7 +149,12 @@ def plan(planner, admitted, *, grasps=None, mask=None, estimate=None):
         robot_state=admitted,
     )
     proposals = Proposals(
-        region if mask is None else mask, np.zeros((16, 3)), poses, confidence, {}, scene=estimate or scene()
+        region if mask is None else mask,
+        np.zeros((16, 3)) if target_points is None else target_points,
+        poses,
+        confidence,
+        {},
+        scene=estimate or scene(),
     )
     return planner.plan(observation, proposals, deadline=time.monotonic() + 30.0, cancelled=lambda: False)
 
@@ -313,6 +318,42 @@ def test_only_an_exhausted_or_timed_out_search_is_retried_from_a_new_observation
     assert raised.value.code == NO_EXECUTABLE_CANDIDATE and raised.value.retryable is retryable
     assert raised.value.reason_code == reason
     assert str(raised.value).startswith(f"{type(error).__name__}: {error}")
+
+
+def target_at(offset_m):
+    """16 camera-frame target points around the left palm reach centre moved offset_m beyond the bound along x."""
+    center, radius = left_palm_reach()
+    torso = center + [radius + offset_m, 0.0, 0.0] + np.random.default_rng(0).normal(0.0, 0.005, (16, 3))
+    camera_from_base = np.linalg.inv(BASE_FROM_CAMERA)
+    return torso @ camera_from_base[:3, :3].T + camera_from_base[:3, 3]
+
+
+def exhausted(ik_states):
+    error = RuntimeError("No candidate produced a complete three-segment plan")
+    error.planning_report = {"contact_screen": {"ik_successful_states": ik_states}}
+    return error
+
+
+@pytest.mark.parametrize(
+    "ik_states, offset_m, out_of_reach",
+    [
+        (0, 0.03, True),  # nothing reached by the screen IK, centre beyond the palm bound: observing again cannot help
+        (0, -0.05, False),  # within the bound: an empty screen may be a crowded scene, so a new observation
+        (140, 0.03, False),  # reachable states exist (live 2026-11-10 planned centres up to 0.038 m beyond)
+    ],
+)
+def test_an_empty_ik_screen_beyond_the_palm_reach_is_out_of_reach_without_retries(
+    setup, ik_states, offset_m, out_of_reach
+):
+    make, admitted, _ = setup
+    with pytest.raises(GraspFailure) as raised:
+        plan(make(FailingService(exhausted(ik_states))), admitted, target_points=target_at(offset_m))
+    assert raised.value.code == NO_EXECUTABLE_CANDIDATE
+    if out_of_reach:
+        assert raised.value.reason_code == "OUT_OF_REACH" and not raised.value.retryable
+        assert "out of left-arm reach" in str(raised.value)
+    else:
+        assert raised.value.reason_code == "NO_COMPLETE_PATH" and raised.value.retryable
 
 
 @pytest.mark.parametrize(

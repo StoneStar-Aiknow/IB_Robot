@@ -33,6 +33,23 @@ def feedback(side, hand):
     return Feedback(0.0, positions, np.asarray(left, float), right_hand=np.asarray(right, float))
 
 
+def test_the_pair_search_finds_exactly_the_balls_the_full_matrix_finds():
+    from aimdk_grasp.place_request import _inside_any
+
+    rng = np.random.default_rng(7)
+    for points_count, balls_count in ((1, 1), (40, 1), (300, 60), (2676, 446)):
+        balls = rng.normal(size=(balls_count, 3)) * 0.05
+        ball_r = np.round(rng.lognormal(np.log(0.004), 0.9, balls_count), 3)  # repeated radii: equal quantiles
+        points = balls[rng.integers(0, balls_count, points_count)] + rng.normal(size=(points_count, 3)) * 0.01
+        point_r = rng.uniform(0.0005, 0.02, points_count)
+        # Exact copies (distance 0) and balls placed on the boundary of the test.
+        copies = rng.integers(0, balls_count, max(1, points_count // 10))
+        points[: len(copies)], point_r[: len(copies)] = balls[copies], ball_r[copies]
+        for tolerance in (0.0, 1e-4):
+            full = np.linalg.norm(points[:, None] - balls[None], axis=2) + point_r[:, None] <= ball_r[None] + tolerance
+            assert np.array_equal(_inside_any(points, point_r, balls, ball_r, tolerance), full.any(axis=1))
+
+
 @pytest.mark.parametrize("side", ["left", "right"])
 def test_every_planner_reserves_disabled_palm_spheres_that_never_hit_the_hand(side):
     kin = robot_config(feedback(side, mapping(side).preset("open")), side=side)["robot_cfg"]["kinematics"]

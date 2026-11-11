@@ -127,6 +127,38 @@ def test_the_target_comes_with_its_candidates_and_the_scene_the_planner_preloads
     assert spans["detect"][1] <= spans["grasp"][0]  # GraspGen-X needs the target's points
 
 
+def test_a_resample_draws_new_grasps_for_the_same_target_and_keeps_its_scene():
+    """The pipeline's no-complete-path retry: GraspGen-X only, on the cloud it saw before."""
+
+    class Drawing(FakeModels):
+        def generate_grasps(self, points, frame_id, stamp_ns, **kwargs):
+            assert (frame_id, stamp_ns) == (FRAME, STAMP)
+            poses, _ = super().generate_grasps(points, frame_id, stamp_ns, **kwargs)
+            poses[:, 0, 3] += 0.01 * len(self.clouds)  # a new draw every call
+            return poses, np.array([0.6, 0.5, 0.4])
+
+    models = Drawing([Detection("cup", 0.8, box(ON_TABLE))])
+    proposer = X2Proposer(models, NoSpheres(), settings=PerceptionSettings())
+    seen = observation()
+    first = proposer.propose(seen, "red cup", deadline=time.monotonic() + 30.0, cancelled=lambda: False)
+    again = proposer.resample(seen, first, deadline=time.monotonic() + 30.0, cancelled=lambda: False)
+    assert [call["service"] for call in models.calls] == ["detect", "segment", "grasps", "grasps"]
+    assert models.clouds[1] is first.target_points  # the same cloud, not a new segmentation
+    assert again.scene is first.scene and np.array_equal(again.target_mask, first.target_mask)
+    assert not np.allclose(again.grasps, first.grasps) and list(again.confidence) == [0.6, 0.5, 0.4]
+    assert again.report["resampled"] and [c["service"] for c in again.report["model_rpc"]] == ["grasps"]
+    assert again.report["prompt"] == "red cup ." and again.report["candidate_count"] == 3
+
+    class Empty(FakeModels):
+        def generate_grasps(self, *args, **kwargs):
+            return np.zeros((0, 4, 4)), np.zeros(0)
+
+    empty = X2Proposer(Empty([]), NoSpheres(), settings=PerceptionSettings())
+    with pytest.raises(GraspFailure) as raised:
+        empty.resample(seen, first, deadline=time.monotonic() + 30.0, cancelled=lambda: False)
+    assert raised.value.code == "NO_EXECUTABLE_CANDIDATE" and raised.value.retryable
+
+
 def test_a_detection_with_no_support_beneath_gives_way_to_the_next_one():
     below = Detection("cup", 0.9, box(BELOW))
     duplicate = Detection("cup", 0.85, box(BELOW) + 1)  # the same object again

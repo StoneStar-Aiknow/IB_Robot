@@ -65,6 +65,14 @@ class SceneEstimationConfig:
     self_filter_margin_m: float = 0.052
     target_mesh_pitch_m: float = 0.005
     validation_mesh_pitch_m: float = 0.005
+    # The fine check's target alone is finer: a 5 mm voxel surface stands up
+    # to a voxel proud of the points. Replaying the 48 recorded X2 pick plan
+    # calls of 2026-11-10 (Orin), of the states refused only for touching the
+    # 5 mm target 84% did not reach the raw target points; at 2.5 mm the 33
+    # successful calls kept a median of 10 instead of 9 screened candidates
+    # (never fewer, calls with <= 3 left: 2 -> 1), with no change in outcome or
+    # fine-check time (~0.10 s) and the mesh built in ~4 ms (3.5x the faces).
+    validation_target_mesh_pitch_m: float = 0.0025
     validation_self_filter_margin_m: float = 0.01
     # The segmentation mask stops a few pixels inside the target outline: on
     # the 2026-09-30 bottle captures 74-90% of the pixels 2-6 px outside it lay
@@ -113,13 +121,19 @@ class SceneEstimationConfig:
     # either way at 0.18 -> 0.20 s; shrink 2.5 / 1.5 / 1.0 cm planned 18 / 20 / 20.
     coarse_leg_boxes: bool = True
     coarse_leg_shrink_m: float = 0.02
+    # Every pixel_stride-th depth row and column becomes a point (1: all).
+    # The place capture uses 2: on 35 recorded X2 places (2026-11-10, Orin)
+    # container estimation took 0.83 -> 0.29 s, the opening's inscribed centre
+    # moved 0.34 mm (median, max 1.4) and its radius shrank 0.38 mm on average,
+    # and the 22 re-planned places planned the same. The grasp scene keeps 1.
+    pixel_stride: int = 1
 
     def __post_init__(self):
         check_side(self.arm_side)
         values = [value for value in vars(self).values() if not isinstance(value, bool | str)]
         if not np.isfinite(values).all() or any(v <= 0 for v in values):
             raise ValueError("Scene estimation parameters must be finite and positive")
-        for name in ("plane_iterations", "max_planes", "min_plane_points", "target_edge_grow_steps"):
+        for name in ("plane_iterations", "max_planes", "min_plane_points", "target_edge_grow_steps", "pixel_stride"):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f"{name} must be an integer")
         if (
@@ -139,6 +153,7 @@ class SceneEstimationConfig:
             (self.mesh_pitch_m, self.self_filter_margin_m),
             (self.target_mesh_pitch_m, target_margin),
             (self.validation_mesh_pitch_m, self.validation_self_filter_margin_m),
+            (self.validation_target_mesh_pitch_m, self.validation_self_filter_margin_m),
         ):
             if np.sqrt(3) * pitch > margin:
                 raise ValueError("Voxel diagonal must not exceed its self-filter margin")
@@ -674,6 +689,11 @@ def _voxel_surface(points, pitch):
     return vertices, faces
 
 
+def _validation_pitch(config, name):
+    """The fine (validation) scene's voxel pitch for a mesh entry."""
+    return config.validation_target_mesh_pitch_m if name == "target" else config.validation_mesh_pitch_m
+
+
 def _surface_mesh(cloud, pitch, pose):
     vertices, faces, occupied = _voxel_surface_data(cloud, pitch)
     # The six fixed templates enclose occupied grid cells with inward winding.
@@ -792,6 +812,12 @@ def prepare_scene(
         raise ValueError("Expected registered 2D depth")
     depth_m = depth.astype(np.float32) * depth_scale
     valid = np.isfinite(depth_m) & (depth_m >= config.min_depth_m) & (depth_m <= config.max_depth_m)
+    if config.pixel_stride > 1:
+        # Off-grid pixels count as unmeasured; pixel indices stay full-resolution,
+        # so full-size masks still select through PreparedScene.pixel.
+        grid = np.zeros_like(valid)
+        grid[:: config.pixel_stride, :: config.pixel_stride] = True
+        valid &= grid
     points = mask_depth_to_points(
         valid, depth_m, intrinsics, min_depth_m=config.min_depth_m, max_depth_m=config.max_depth_m
     )
@@ -1007,7 +1033,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
             continue
         pitch = config.target_mesh_pitch_m if name == "target" else config.mesh_pitch_m
         mesh, counts = _surface_mesh(cloud[planning], pitch, pose)
-        if pitch == config.validation_mesh_pitch_m and planning.all():
+        if pitch == _validation_pitch(config, name) and planning.all():
             validation_meshes[name], validation_counts[name] = mesh, counts
         meshes[name], mesh_counts[name] = mesh, counts
     finished = time.perf_counter()
@@ -1030,6 +1056,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         "self_filter_margin_m": config.self_filter_margin_m,
         "target_mesh_pitch_m": config.target_mesh_pitch_m,
         "validation_mesh_pitch_m": config.validation_mesh_pitch_m,
+        "validation_target_mesh_pitch_m": config.validation_target_mesh_pitch_m,
         "validation_self_filter_margin_m": config.validation_self_filter_margin_m,
         "voxel_diagonal_m": float(np.sqrt(3) * config.mesh_pitch_m),
         "voxel_expansion_within_self_filter_margin": bool(
@@ -1063,7 +1090,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         before = time.perf_counter()
         for name, cloud in (("environment", environment), ("target", target_points)):
             if len(cloud) and name not in validation_meshes:
-                mesh, counts = _surface_mesh(cloud, config.validation_mesh_pitch_m, pose)
+                mesh, counts = _surface_mesh(cloud, _validation_pitch(config, name), pose)
                 validation_meshes[name], validation_counts[name] = mesh, counts
         diagnostics["timings_s"]["validation_mesh"] = time.perf_counter() - before
         diagnostics["validation_materialized"] = True

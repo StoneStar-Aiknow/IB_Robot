@@ -68,12 +68,17 @@ def validate_placement_execution_config(value: Any) -> list[str]:
             if not isinstance(reserve, int | float) or not _finite_number(reserve) or reserve < 0:
                 errors.append(f"{prefix}.pipeline.execute_reserve_s must be finite and non-negative")
         perception = value.get("perception", {})
-        if not isinstance(perception, dict) or set(perception) - {"box_threshold"}:
-            errors.append(f"{prefix}.perception supports box_threshold only")
-        elif "box_threshold" in perception:
-            threshold = perception["box_threshold"]
-            if not isinstance(threshold, int | float) or not _unit_interval(threshold):
-                errors.append(f"{prefix}.perception.box_threshold must be a number in [0, 1]")
+        if not isinstance(perception, dict) or set(perception) - {"box_threshold", "scene_pixel_stride"}:
+            errors.append(f"{prefix}.perception supports box_threshold and scene_pixel_stride only")
+        else:
+            if "box_threshold" in perception:
+                threshold = perception["box_threshold"]
+                if not isinstance(threshold, int | float) or not _unit_interval(threshold):
+                    errors.append(f"{prefix}.perception.box_threshold must be a number in [0, 1]")
+            if "scene_pixel_stride" in perception:
+                stride = perception["scene_pixel_stride"]
+                if type(stride) is not int or not 1 <= stride <= 8:
+                    errors.append(f"{prefix}.perception.scene_pixel_stride must be an integer in [1, 8]")
         return errors
     allowed_keys = {
         "enabled",

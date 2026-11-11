@@ -1,5 +1,6 @@
 """Visible cavity, clearance, and Agent-provided container descriptions."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -40,6 +41,12 @@ def test_opening_requires_observed_cavity_and_object_clearance():
     with pytest.raises(GraspFailure) as error:
         opening_from_points(cloud(size=0.04), [0, 0, 1], radius_m=0.05)
     assert "inscribed radius 0.040 m" in str(error.value) and "held radius 0.050 m" in str(error.value)
+    # The restored 5 mm wall margin admits this opening; the lost 15 mm setting refused it.
+    narrow = cloud(size=0.079)
+    container = opening_from_points(narrow, [0, 0, 1], radius_m=0.065)
+    assert container.report["wall_margin_m"] == 0.005
+    with pytest.raises(GraspFailure, match="wall margin 0.015 m"):
+        opening_from_points(narrow, [0, 0, 1], radius_m=0.065, wall_margin_m=0.015)
 
 
 def visible_half_sphere(radius=0.04, step=0.002):
@@ -172,6 +179,31 @@ def test_held_center_encloses_a_one_sided_cloud_like_the_whole_object():
     assert np.linalg.norm(center - [0.1, 0.2, 0.3]) < 0.004
 
 
+def test_held_center_matches_the_two_norm_iteration_and_hands_out_copies():
+    """Producer (pick) and consumers (place) must agree exactly; the cache must not leak mutations."""
+    from aimdk_grasp.held_object import CENTER_STEPS
+
+    def two_norms(points):
+        center = points.mean(axis=0)
+        best, best_reach = center, float(np.max(np.linalg.norm(points - center, axis=1)))
+        for step in range(1, CENTER_STEPS + 1):
+            farthest = points[np.argmax(np.linalg.norm(points - center, axis=1))]
+            center = center + (farthest - center) / (step + 1)
+            reach = float(np.max(np.linalg.norm(points - center, axis=1)))
+            if reach < best_reach:
+                best, best_reach = center, reach
+        return best
+
+    rng = np.random.default_rng(3)
+    for size in (1, 2, 517, 1300):
+        points = rng.normal(size=(size, 3)) * [0.03, 0.02, 0.04] + [0.0, 0.05, 0.1]
+        expected = two_norms(points)
+        first = held_center(tuple(points.ravel()))
+        assert np.array_equal(first, expected)
+        first[:] = 9.0
+        assert np.array_equal(held_center(points), expected)
+
+
 def test_held_center_is_never_worse_than_the_mean():
     points = np.array([[0.0, 0.0, 0.0], [0.02, 0.0, 0.0], [0.0, 0.02, 0.0], [0.01, 0.01, 0.03]])
     center = held_center(points)
@@ -231,10 +263,10 @@ def test_opening_centre_is_the_largest_inscribed_circle_not_the_vertex_mean():
 
 def test_a_one_sided_rim_view_is_not_refused_as_too_small():
     # Needs 0.068 + 0.015 = 0.083 m of the 0.09 m opening: the vertex mean read about 0.06 m here.
-    container = opening_from_points(lopsided_bowl(), [0, 0, 1], radius_m=0.068)
+    container = opening_from_points(lopsided_bowl(), [0, 0, 1], radius_m=0.068, wall_margin_m=0.015)
     assert container.report["clearance_m"] == pytest.approx(0.09, abs=0.006)
     with pytest.raises(GraspFailure) as error:
-        opening_from_points(lopsided_bowl(radius=0.07), [0, 0, 1], radius_m=0.068)
+        opening_from_points(lopsided_bowl(radius=0.07), [0, 0, 1], radius_m=0.068, wall_margin_m=0.015)
     assert error.value.code == "CONTAINER_TOO_SMALL"
 
 
@@ -353,6 +385,9 @@ def test_the_holding_hand_leaves_neither_scene_within_the_coarse_margin(monkeypa
     kept = seen["prepared"]
     np.testing.assert_array_equal(kept.keep, [False, True, True, True, True])
     np.testing.assert_array_equal(kept.planning_all, [False, True, True, True, True])
+    # The container is that scene's target; its fine mesh keeps the environment's pitch, not the pick target's.
+    assert kept.config.validation_target_mesh_pitch_m == kept.config.validation_mesh_pitch_m == 0.005
+    assert replace(kept.config, validation_target_mesh_pitch_m=0.0025) == prepared.config
     line = json.loads(
         next(text for text in capsys.readouterr().err.splitlines() if text.startswith('{"estimate_container"'))
     )

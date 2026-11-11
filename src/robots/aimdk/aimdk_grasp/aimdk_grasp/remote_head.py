@@ -296,11 +296,15 @@ def _remote_capture(observation: Observation) -> RemoteCapture:
 class RemoteHeadCamera:
     """``ObservationSource``: one capture by the grasp head, decoded here."""
 
-    def __init__(self, head: X2GraspHeadClient):
-        self.head = head
+    def __init__(self, head: X2GraspHeadClient, *, scene_pixel_stride: int = 1):
+        if type(scene_pixel_stride) is not int or scene_pixel_stride < 1:
+            raise ValueError("scene_pixel_stride must be a positive integer")
+        self.head, self.scene_pixel_stride = head, scene_pixel_stride
 
     def capture(self, *, deadline: float, cancelled: Flag) -> Observation:
-        request = self.head.types[0].Request(timeout_s=max(0.0, deadline - time.monotonic()))
+        request = self.head.types[0].Request(
+            timeout_s=max(0.0, deadline - time.monotonic()), scene_pixel_stride=self.scene_pixel_stride
+        )
         asked = time.monotonic()
         response = self.head.call(self.head.capture_client, request, deadline + 1.0, cancelled)
         answered = time.monotonic()
@@ -748,11 +752,11 @@ def container_detector(services, grasp_execution, perception):
     placement perception settings (``container_perception``, from
     placement_execution.perception by the launch).
     """
-    from dataclasses import replace
-
+    from .backend import place_perception
     from .container_proposer import detect_masks
 
-    settings = replace(perception, **dict(grasp_execution.get("container_perception") or {}))
+    # Read as the place reads placement_execution.perception (scene_pixel_stride is not a detection setting).
+    settings, _ = place_perception(perception, {"perception": grasp_execution.get("container_perception") or {}})
 
     def detect(observation, query, *, deadline, cancelled):
         stop = lambda: cancelled() or time.monotonic() >= deadline  # noqa: E731

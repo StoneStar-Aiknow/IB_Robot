@@ -63,7 +63,9 @@ def test_the_container_is_detected_with_the_placement_thresholds():
         return [Detection("bowl", 0.9, np.array([0, 0, 10, 10]), np.ones((10, 10), bool))]
 
     services = SimpleNamespace(detect=detect)
-    find = container_detector(services, {"container_perception": {"box_threshold": 0.5}}, PerceptionSettings())
+    # As the launch copies placement_execution.perception, place scene density included.
+    placement = {"box_threshold": 0.5, "scene_pixel_stride": 2}
+    find = container_detector(services, {"container_perception": placement}, PerceptionSettings())
     mask = find(observation(), "a black bowl", deadline=float("inf"), cancelled=lambda: False)
     assert mask.all() and seen == [("a black bowl .", 0.5)]
     nothing = container_detector(SimpleNamespace(detect=lambda *a, **k: []), {}, PerceptionSettings())

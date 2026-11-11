@@ -15,6 +15,8 @@ Nothing here imports ROS; the message conversions take the message classes.
 
 from __future__ import annotations
 
+import os
+import pickle
 import threading
 import time
 from array import array as _array
@@ -106,9 +108,54 @@ def container_change(prefetched: PrefetchedContainer, observation: Observation, 
     container = prefetched.mask[y0:y1, x0:x1]
     changed = float(np.mean((rgb_changed | depth_changed)[container]))
     report["changed_fraction"] = round(changed, 4)
+    # Which measure moved: an exposure or shadow change shows in RGB, a moved object in depth.
+    report["rgb_changed_fraction"] = round(float(np.mean(rgb_changed[container])), 4)
+    report["depth_changed_fraction"] = round(float(np.mean(depth_changed[container])), 4)
     if changed > MAX_CHANGED_FRACTION:
         return "the container region changed", report
     return "", report
+
+
+def save_container_change(
+    directory: str, prefetched: PrefetchedContainer, observation: Observation, reason: str, measures: dict
+) -> str:
+    """Write both views of a rejected container region to ``directory`` on a thread; the file's path.
+
+    Diagnostics only: the place does not wait for the write, and a failed write is not its failure.
+    """
+    x0, y0, x1, y1 = prefetched.roi
+    record = {
+        "reason": reason,
+        "measures": dict(measures),
+        "query": prefetched.query,
+        "roi": prefetched.roi,
+        "mask": prefetched.mask[y0:y1, x0:x1].copy(),
+        "prefetched": {
+            "stamp_ns": prefetched.stamp_ns,
+            "base_from_camera": prefetched.base_from_camera,
+            "rgb": prefetched.rgb,
+            "depth_m": prefetched.depth,
+        },
+        "place": {
+            "stamp_ns": int(observation.stamp_ns),
+            "base_from_camera": np.array(observation.base_from_camera, dtype=float),
+            "rgb": np.array(observation.rgb[y0:y1, x0:x1], dtype=np.uint8),
+            "depth_m": np.array(observation.depth_m[y0:y1, x0:x1], dtype=np.float32),
+        },
+    }
+    path = os.path.join(directory, f"container_change_{int(observation.stamp_ns)}.pkl")
+
+    def write():
+        try:
+            os.makedirs(directory, exist_ok=True)
+            with open(path + ".part", "wb") as stream:
+                pickle.dump(record, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(path + ".part", path)  # a reader never sees half a record
+        except OSError:
+            pass
+
+    threading.Thread(target=write, daemon=True, name="container-change-record").start()
+    return path
 
 
 def container_to_msg(prefetched: PrefetchedContainer | None, message_class, *, encode_mask, image_class):
@@ -305,7 +352,10 @@ class PerceptionPrefetch:
         finally:
             job.perceived.set()
         try:
-            if job.container_query and self._detect_container is not None and job.observation is not None:
+            if job.container_query and self._detect_container is not None and job.observation is None:
+                # Nothing was detected because nothing was captured; say so, not "not detected".
+                job.container_error = f"no prefetched capture: {job.error or 'unknown'}"[:300]
+            elif job.container_query and self._detect_container is not None:
                 began = self._clock()
                 mask = self._detect_container(
                     job.observation, job.container_query, deadline=deadline, cancelled=stopped

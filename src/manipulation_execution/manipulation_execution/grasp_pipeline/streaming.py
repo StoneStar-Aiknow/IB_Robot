@@ -23,6 +23,8 @@ and, optionally, a ``CommandShaper`` that adds a load correction along the path
 
 from __future__ import annotations
 
+import json
+import sys
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -183,11 +185,13 @@ class StreamExecutor:
         self.report: dict = {"segments": []}
         self._feedback_sample = None
         self._command_sample = None
+        self._hold_reference: tuple[str, tuple[str, ...], np.ndarray] | None = None
 
     # -- MotionExecutor -------------------------------------------------------------
 
     def execute(self, segment: ArmSegment, *, carrying: bool, halted: Flag, cancelled: Flag) -> MotionOutcome:
         names = segment.joint_names
+        self._hold_reference = None
         self._feedback_sample = self._command_sample = None
         try:
             self._admit()
@@ -206,7 +210,11 @@ class StreamExecutor:
 
     def hold(self, seconds: float, *, carrying: bool, cancelled: Flag) -> MotionOutcome:
         """Keep the last command for ``seconds``, supervised as a segment is (tracking, locked joints, board)."""
-        ended = self.io.monotonic() + seconds
+        started = self.io.monotonic()
+        ended = started + seconds
+        row = {"name": "hold", "seconds": seconds, "carrying": carrying}
+        self.report.setdefault("holds", []).append(row)
+        self._feedback_sample = self._command_sample = None
         try:
             self._admit()
             sample = self._fresh(self.io.feedback())
@@ -216,12 +224,42 @@ class StreamExecutor:
             check = self._supervision(sample)
             while self.io.monotonic() < ended:
                 if cancelled():
-                    return MotionOutcome(MotionState.CANCELLED, "cancelled")
+                    return self._hold_end(row, started, MotionState.CANCELLED, "cancelled")
                 check()
                 self.io.wait(min(1.0 / self.config.rate_hz, max(0.0, ended - self.io.monotonic())))
         except StreamFailure as exc:
-            return MotionOutcome(MotionState.FAILED, str(exc))
-        return MotionOutcome(MotionState.SUCCEEDED)
+            return self._hold_end(row, started, MotionState.FAILED, str(exc))
+        return self._hold_end(row, started, MotionState.SUCCEEDED, "")
+
+    def _hold_end(self, row, started, state, reason) -> MotionOutcome:
+        """Record the arm after settling; diagnostics do not add an arrival gate."""
+        row["elapsed_s"] = self.io.monotonic() - started
+        row["observed_at"] = self.io.monotonic()
+        names = () if self._hold_reference is None else self._hold_reference[1]
+        if self._hold_reference is not None:
+            source, _, target = self._hold_reference
+            row["source_segment"] = source
+            row["plan_end_rad"] = dict(zip(names, target.tolist(), strict=True))
+        try:
+            # On a failure retain the triggering sample, before another read can replace it.
+            sample = self.io.feedback() if state is MotionState.SUCCEEDED else self._feedback_sample
+            if sample is not None:
+                row["feedback_age_s"] = self.io.monotonic() - sample.received_at
+                row["feedback_received_at"] = sample.received_at
+                row["feedback_healthy"] = sample.healthy
+                if names:
+                    actual = self._vector(sample, names)
+                    row["measured_rad"] = dict(zip(names, actual.tolist(), strict=True))
+                    row["end_error_rad"] = dict(zip(names, np.round(actual - target, 4).tolist(), strict=True))
+                    if self._last is not None:
+                        command = self._last[[self._channel.index(joint) for joint in names]]
+                        row["command_rad"] = dict(zip(names, command.tolist(), strict=True))
+                        row["command_error_rad"] = dict(zip(names, np.round(actual - command, 4).tolist(), strict=True))
+        except (KeyError, StreamFailure) as exc:
+            row["diagnostic_error"] = str(exc)
+        outcome = self._end(row, state, reason, ())
+        summary = {key: value for key, value in row.items() if key != "stream_diagnostics"}
+        return MotionOutcome(state, reason, report={**outcome.report, "arm_hold": summary})
 
     def supervise(self) -> Callable[[], str]:
         """A check for while something else acts (an end effector): '' while the arm holds, else why not.
@@ -286,6 +324,7 @@ class StreamExecutor:
         self._last = self._initial = self._first_at = None
         self._history.clear()
         self._stopped = ""
+        self._hold_reference = None
 
     def return_home(self, home: ArmSegment, *, cancelled: Flag) -> MotionOutcome | None:
         """Put the controller's command back where this goal took it over (None: the caller's default).
@@ -385,6 +424,15 @@ class StreamExecutor:
                 )
                 arrived_since = (arrived_since if arrived_since is not None else tick) if arrived else None
                 if arrived_since is not None and tick - arrived_since >= config.arrived_hold_s:
+                    # Where the settled arm stands against the raw plan, and the sag raise it was
+                    # commanded with there: arrival passes anything within arrival_error_rad, so a
+                    # mis-modelled sag shows only here (report only, no check).
+                    row["end_error_rad"] = dict(
+                        zip(names, np.round(actual - timed.positions[-1], 4).tolist(), strict=True)
+                    )
+                    row["raise_end_rad"] = dict(zip(names, np.round(raised[-1], 4).tolist(), strict=True))
+                    row["start_offset_rad"] = dict(zip(names, np.round(offset, 4).tolist(), strict=True))
+                    self._hold_reference = (name, tuple(names), timed.positions[-1].copy())
                     return self._end(row, MotionState.SUCCEEDED, "", names)
                 self.io.wait(max(0.0, tick + period - self.io.monotonic()))
         except StreamFailure as exc:
@@ -398,6 +446,8 @@ class StreamExecutor:
             # feedback read or finish() can replace the evidence.
             report["stream_diagnostics"] = self._failure_snapshot()
         row.update(report)
+        summary = {key: value for key, value in row.items() if key != "stream_diagnostics"}
+        print(json.dumps({"arm_segment": summary}, default=str), file=sys.stderr, flush=True)
         try:
             stopped_at = self._vector(self.io.feedback(), names)
         except (KeyError, StreamFailure):

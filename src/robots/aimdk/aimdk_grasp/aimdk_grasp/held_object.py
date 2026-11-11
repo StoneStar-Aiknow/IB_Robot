@@ -2,6 +2,7 @@
 
 import json
 import sys
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -80,6 +81,12 @@ def without_outliers(local):
 CENTER_STEPS = 1000
 
 
+#: Recent clouds' centres: a place computes the same held object's centre several times.
+CENTER_CACHE = 4
+_CENTERS: dict[bytes, np.ndarray] = {}
+_CENTERS_LOCK = threading.Lock()
+
+
 def held_center(points):
     """Centre of an approximately smallest sphere around the palm-frame object cloud.
 
@@ -91,15 +98,31 @@ def held_center(points):
     Producer and consumers of the held object must use this same centre.
     """
     points = np.asarray(points, float).reshape(-1, 3)
+    key = points.tobytes()
+    with _CENTERS_LOCK:
+        cached = _CENTERS.get(key)
+    if cached is not None:
+        return cached.copy()
     center = points.mean(axis=0)
-    best, best_reach = center, float(np.max(np.linalg.norm(points - center, axis=1)))
+    # np.linalg.norm(axis=1)'s own formula, once per step: the distances of a
+    # step's centre give both its reach and the next step's farthest point.
+    # Each place called this three times with the same cloud (~50 ms each on x86).
+    diff = points - center
+    distance = np.sqrt(np.add.reduce(diff * diff, axis=1))
+    best, best_reach = center, float(np.max(distance))
     for step in range(1, CENTER_STEPS + 1):
-        farthest = points[np.argmax(np.linalg.norm(points - center, axis=1))]
+        farthest = points[np.argmax(distance)]
         center = center + (farthest - center) / (step + 1)
-        reach = float(np.max(np.linalg.norm(points - center, axis=1)))
+        diff = points - center
+        distance = np.sqrt(np.add.reduce(diff * diff, axis=1))
+        reach = float(np.max(distance))
         if reach < best_reach:
             best, best_reach = center, reach
-    return best
+    with _CENTERS_LOCK:
+        _CENTERS[key] = best.copy()
+        while len(_CENTERS) > CENTER_CACHE:
+            _CENTERS.pop(next(iter(_CENTERS)))
+    return best.copy()
 
 
 def return_path(moves):

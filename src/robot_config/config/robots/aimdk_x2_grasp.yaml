@@ -177,5 +177,7 @@ robot:
       # Candidate for container detection; validate recall on more saved scenes.
       # The saved basket scored 0.900; false table detections scored 0.450/0.329.
       box_threshold: 0.50
+      # Place capture scene from every 2nd depth row/column (SceneEstimationConfig.pixel_stride).
+      scene_pixel_stride: 2
     pipeline:
       max_attempts: 2

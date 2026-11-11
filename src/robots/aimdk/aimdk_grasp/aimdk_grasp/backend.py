@@ -528,6 +528,19 @@ def x2_place_backends(*, node, placement_execution, grasp_execution, description
     return _place_backends(node, grasp_execution, description, placement_execution=placement_execution, remote=False)
 
 
+def place_perception(perception, placement_execution):
+    """(container perception settings, place capture pixel stride) from ``placement_execution.perception``.
+
+    ``scene_pixel_stride`` sets the place capture's scene density
+    (SceneEstimationConfig.pixel_stride; grasp captures keep full resolution);
+    the other keys override the grasp perception settings.
+    """
+    overrides = dict(placement_execution.get("perception", {}))
+    stride = overrides.pop("scene_pixel_stride", 1)
+    settings = replace(perception, **overrides)
+    return replace(settings, scene=replace(settings.scene, pixel_stride=stride)), stride
+
+
 def _place_backends(node, grasp_execution, description, *, placement_execution, remote):
     import numpy as np
     from rclpy.callback_groups import ReentrantCallbackGroup
@@ -541,7 +554,7 @@ def _place_backends(node, grasp_execution, description, *, placement_execution, 
 
     robot = x2_robot(grasp_execution)
     options, closers = robot.options, []
-    container_settings = replace(robot.perception, **placement_execution.get("perception", {}))
+    container_settings, stride = place_perception(robot.perception, placement_execution)
     try:
         robots = {side: robot_for_side(robot, side) for side in ("left", "right")}
         group = ReentrantCallbackGroup()
@@ -558,7 +571,7 @@ def _place_backends(node, grasp_execution, description, *, placement_execution, 
 
             head = X2GraspHeadClient(node, head_options(options).namespace, callback_group=group)
             closers.append(head.close)
-            camera, planner = RemoteHeadCamera(head), RemotePlacePlanner(head)
+            camera, planner = RemoteHeadCamera(head, scene_pixel_stride=stride), RemotePlacePlanner(head)
             proposer = ContainerProposer(services, settings=container_settings)
         else:
             if options["head"]:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from aimdk_grasp.joints import LEFT_ARM
 from aimdk_grasp.planner import LeftArmPlanner, PlacementSearchExhausted
 
 # Candidate k: above at x=k, z=1; release at x=k, z=0 (the stub tells them apart).
@@ -25,10 +26,11 @@ def _state(value):
     return np.full(7, value, dtype=np.float32)
 
 
-def _planner(states, *, invalid=(), descent=None, opening_invalid=()):
+def _planner(states, *, invalid=(), descent=None, opening_invalid=(), straight=False):
     """``states[(k, z)]``: the screen's successful IK states for that goal (none: unreachable).
 
     ``opening_invalid`` states collide only while the opening hand is attached.
+    ``straight`` lets the transfer try the checked straight joint path (else TrajOpt only).
     """
     calls = SimpleNamespace(screen=[], valid=[], pose=[], segment=[], goalset=0, opening_valid=[])
     attached = []
@@ -94,8 +96,15 @@ def _planner(states, *, invalid=(), descent=None, opening_invalid=()):
         _batch_contact_ik=batch,
         valid_positions=valid,
         _state=lambda q: SimpleNamespace(position=np.asarray(q, dtype=np.float32)[None]),
-        motion=SimpleNamespace(ik_solver=SimpleNamespace(solve_pose=goalset)),
+        motion=SimpleNamespace(
+            ik_solver=SimpleNamespace(solve_pose=goalset),
+            trajopt_solver=SimpleNamespace(config=SimpleNamespace(interpolation_dt=0.02)),
+        ),
         plan_pose=plan_pose,
+        arm=LEFT_ARM,
+        PLACE_STRAIGHT_TRANSFER=straight,
+        HOME_CHECK_STEP=LeftArmPlanner.HOME_CHECK_STEP,
+        HOME_JOINT_SPEED=LeftArmPlanner.HOME_JOINT_SPEED,
         _linear_grasp_segment=segment,
         _without_placed_object=Context,
         _attachment=attachment,
@@ -105,6 +114,8 @@ def _planner(states, *, invalid=(), descent=None, opening_invalid=()):
     planner._place_screen = lambda *args: LeftArmPlanner._place_screen(planner, *args)
     planner._place_opening_screen = lambda *args: LeftArmPlanner._place_opening_screen(planner, *args)
     planner._place_pair = LeftArmPlanner._place_pair
+    planner._checked_joint_path = lambda *args: LeftArmPlanner._checked_joint_path(planner, *args)
+    planner._place_transfer = lambda *args, **kwargs: LeftArmPlanner._place_transfer(planner, *args, **kwargs)
     return planner, calls
 
 
@@ -240,7 +251,8 @@ def test_place_report_times_the_screens_and_every_round_stage():
     failed, done = timings["rounds"]
     assert failed["candidate"] == 0 and failed["failed"] == "descend" and set(failed) >= {"transfer", "descend"}
     assert done["candidate"] == 1 and "failed" not in done
-    assert set(done) == {"candidate", "transfer", "descend", "opening", "retreat", "home"}
+    assert set(done) == {"candidate", "transfer", "transfer_path", "descend", "opening", "retreat", "home"}
+    assert done["transfer_path"] == "trajopt"  # the straight transfer is off in these stubs
 
 
 def test_an_exhausted_search_still_reports_its_timings():
@@ -267,3 +279,29 @@ def test_without_a_home_the_search_stops_at_the_retreat():
     )
     assert len(paths) == 3 and planner.place_report["candidate"] == 0 and not planner.place_report["failures"]
     assert not [round_ for round_ in planner.place_report["timings_s"]["rounds"] if "home" in round_]
+
+
+def test_a_free_straight_joint_path_carries_to_the_screened_above_state_without_trajopt():
+    states = {(0, ABOVE): [_state(0.3)], (0, RELEASE): [_state(0.3)]}
+    planner, calls = _planner(states, straight=True)
+    transfer = _plan(planner, 1)[0]
+    assert calls.pose == []  # no TrajOpt solve
+    np.testing.assert_allclose(transfer.positions[0], np.zeros(7))
+    np.testing.assert_allclose(transfer.positions[-1], _state(0.3), atol=1e-6)
+    # Starts and stops at rest, no joint faster than the way home's speed.
+    speed = np.abs(np.diff(transfer.positions, axis=0)) / np.diff(transfer.times)[:, None]
+    assert speed.max() <= LeftArmPlanner.HOME_JOINT_SPEED + 1e-6 and speed[0].max() < 0.05 and speed[-1].max() < 0.05
+    assert planner.place_report["timings_s"]["rounds"][0]["transfer_path"] == "straight"
+
+
+def test_a_colliding_straight_joint_path_falls_back_to_trajopt_from_the_same_seed():
+    states = {(0, ABOVE): [_state(0.3)], (0, RELEASE): [_state(0.3)]}
+    goal = _state(0.3)
+    count = int(np.ceil(float(np.max(goal)) / LeftArmPlanner.HOME_CHECK_STEP)) + 1
+    midway = np.linspace(np.zeros(7), goal, count)[count // 2]  # one of the straight path's checked samples
+    planner, calls = _planner(states, invalid=[midway], straight=True)
+    _plan(planner, 1)
+    candidate, seed = calls.pose[0]
+    assert candidate == 0
+    np.testing.assert_allclose(seed[0, 0], _state(0.3))
+    assert planner.place_report["timings_s"]["rounds"][0]["transfer_path"] == "trajopt"

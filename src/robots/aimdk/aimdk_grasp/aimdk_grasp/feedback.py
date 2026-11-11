@@ -33,15 +33,22 @@ VIEWS = ("joint.state", "joint.head_state", "joint.hand_state")
 
 #: A sample further than this from the image stamp does not describe the image.
 MAX_IMAGE_OFFSET_NS = 50_000_000
-#: The views of one assembled feedback may not straddle more than this.
-MAX_VIEW_SPREAD_NS = 100_000_000
+#: The views of one assembled feedback may not straddle more than this. 100 ms
+#: refused a real X2 capture on 2026-11-11 ("Feedback views are not
+#: synchronized", 1 of 4 picks), so the pick lost its prefetched observation
+#: and re-captured (+2.9 s); the user set 1 s.
+MAX_VIEW_SPREAD_NS = 1_000_000_000
 #: The runtime publishes its status on a one-second heartbeat (aimdk_robot
 #: runtime_node) and on every state change. A verdict older than this when the
 #: feedback is assembled no longer proves the runtime is alive: the views come
 #: from the data plane's own process, so they keep updating after the runtime's
 #: process is gone, and joints alone must not read as a healthy runtime.
 MAX_STATUS_AGE_S = 5.0
-_HISTORY = 120
+#: Samples kept per view: enough to pair an image up to the capture age limit
+#: (RevalidationConfig.capture_scene_max_age_s, 4 s) with feedback at its own
+#: time even at 150 Hz. 120 covered ~2.4 s, and a head image 2.3 s old was live
+#: on 2026-11-11.
+_HISTORY = 600
 
 
 @dataclass(frozen=True)

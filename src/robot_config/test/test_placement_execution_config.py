@@ -192,3 +192,19 @@ def test_backend_placement_rejects_invalid_container_threshold(threshold):
     assert validate_placement_execution_config(config) == []
     config["perception"]["box_threshold"] = threshold
     assert any("box_threshold" in error for error in validate_placement_execution_config(config))
+
+
+@pytest.mark.parametrize(
+    "stride,valid", [(1, True), (2, True), (8, True), (0, False), (9, False), (2.0, False), (True, False)]
+)
+def test_backend_placement_checks_the_place_scene_pixel_stride(stride, valid):
+    config = {
+        "enabled": True,
+        "executor": "placement_pipeline",
+        "required_args": ["target_name", "container_name"],
+        "action_name": "/manipulation/execute_place",
+        "backend": "aimdk_grasp.remote_head:x2_remote_place_backends",
+        "perception": {"box_threshold": 0.50, "scene_pixel_stride": stride},
+    }
+    errors = validate_placement_execution_config(config)
+    assert (errors == []) if valid else any("scene_pixel_stride" in error for error in errors)

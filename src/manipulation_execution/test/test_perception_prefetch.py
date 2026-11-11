@@ -268,6 +268,51 @@ def test_a_prefetched_container_stands_only_for_an_unchanged_view(later, query, 
     assert container_change(prefetched, later, query)[0] == reason
 
 
+def test_a_failed_prefetch_capture_is_reported_as_such_for_the_container():
+    prefetch = PerceptionPrefetch(
+        capture=Source([GraspFailure("OBSERVATION_UNAVAILABLE", "views not synchronized")]).capture,
+        propose=Proposer().propose,
+        posture=Posture(),
+        detect_container=lambda *a, **k: pytest.fail("nothing was captured to detect on"),
+    )
+    prefetch.start("an apple", "a black bowl", root_task_id="task-1")
+    assert prefetch._job.finished.wait(5.0)
+    container, report = prefetch.container("task-1")
+    assert container is None
+    assert report["reason"].startswith("no prefetched capture:") and "views not synchronized" in report["reason"]
+
+
+@pytest.mark.parametrize("later,rgb,depth", [(frame(2, rgb=200), 1.0, 0.0), (frame(2, depth=1.5), 0.0, 1.0)])
+def test_a_changed_region_reports_whether_colour_or_depth_moved(later, rgb, depth):
+    prefetched = container_snapshot(frame(1), mask(), "a black bowl")
+    _, measures = container_change(prefetched, later, "a black bowl")
+    assert (measures["rgb_changed_fraction"], measures["depth_changed_fraction"]) == (rgb, depth)
+
+
+def test_a_rejected_container_records_both_views(tmp_path):
+    held, backends = fixture()
+    backends.observation.captures = 1
+    still = container_snapshot(observation(1), np.ones((4, 4), bool), "a black bowl")
+    still = type(still)(**{**still.__dict__, "rgb": np.full_like(still.rgb, 255)})  # the view changed since
+    outcome = PlacePipeline(backends, prefetch_record_dir=str(tmp_path)).run(
+        held, "a black bowl", deadline=float("inf"), cancelled=lambda: False, prefetched=still
+    )
+    report = outcome.report["container_prefetch"]
+    assert outcome.success and report["reason"] == "the container region changed"
+    for _ in range(500):
+        written = list(tmp_path.glob("container_change_*.pkl"))
+        if written:
+            break
+        threading.Event().wait(0.01)
+    assert [str(p) for p in written] == [report["record"]]
+    import pickle
+
+    with open(written[0], "rb") as stream:
+        record = pickle.load(stream)
+    assert record["reason"] == report["reason"] and record["prefetched"]["rgb"].max() == 255
+    assert record["place"]["rgb"].shape == record["prefetched"]["rgb"].shape
+
+
 def test_the_place_reuses_an_unchanged_container_and_detects_a_changed_one():
     held, backends = fixture()
     proposed, reused = [], []

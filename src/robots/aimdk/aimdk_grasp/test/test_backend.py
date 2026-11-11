@@ -236,3 +236,15 @@ def test_place_options_reach_every_arm_and_refuse_unknown_keys():
         x2_robot({**grasp_execution, "backend_options": {"place": {"height": 0.1}}})
     with pytest.raises(ValueError, match="backend_options.place.edge_fraction"):
         x2_robot({**grasp_execution, "backend_options": {"place": {"edge_fraction": 2}}})
+
+
+def test_the_place_scene_pixel_stride_reaches_the_container_scene_and_nothing_else():
+    from aimdk_grasp.backend import place_perception
+    from aimdk_grasp.proposer import PerceptionSettings
+
+    grasp = PerceptionSettings()
+    settings, stride = place_perception(grasp, {"perception": {"box_threshold": 0.4, "scene_pixel_stride": 2}})
+    assert stride == 2 and settings.scene.pixel_stride == 2 and settings.box_threshold == 0.4
+    assert grasp.scene.pixel_stride == 1  # the grasp settings are untouched
+    settings, stride = place_perception(grasp, {})
+    assert stride == 1 and settings == grasp

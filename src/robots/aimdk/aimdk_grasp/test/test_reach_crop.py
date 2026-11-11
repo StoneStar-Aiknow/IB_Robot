@@ -312,3 +312,40 @@ def test_the_crop_and_the_palm_prefilter_follow_the_planning_arm():
     assert SceneEstimationConfig(arm_side="right").arm_side == "right"
     with pytest.raises(ValueError, match="side must be"):
         SceneEstimationConfig(arm_side="both")
+
+
+def test_a_pixel_stride_keeps_every_nth_row_and_column_at_full_size_pixel_indices():
+    values = inputs()
+
+    def prepared(config):
+        return scene_estimation.prepare_scene(
+            values["depth"],
+            values["intrinsics"],
+            values["transform"],
+            stamp_ns=values["stamp_ns"],
+            camera_frame=values["camera_frame"],
+            received_at=values["received_at"],
+            robot_spheres_torso=values["robot_spheres_torso"],
+            config=config,
+        )
+
+    # This coarse test camera (3.3 cm pixels at 1 m) leaves table points 6.7 cm apart at stride 2:
+    # coarser plane voxels keep them one support patch, and fewer points must do.
+    coarse = dict(min_plane_points=10, plane_voxel_m=0.03)
+    full = prepared(SceneEstimationConfig(**coarse))
+    sparse = prepared(SceneEstimationConfig(**coarse, pixel_stride=2))
+    width = values["depth"].shape[1]
+    kept = lambda scene: set(np.concatenate([scene.pixel, scene.dropped_pixel]).tolist())  # noqa: E731
+    assert kept(sparse) == {p for p in kept(full) if (p // width) % 2 == 0 and (p % width) % 2 == 0}
+    assert len(kept(sparse)) * 4 == len(kept(full))
+    # The full-size target mask still selects through the full-resolution pixel indices.
+    scene = scene_estimation.complete_scene(sparse, values["target_mask"])
+    expected = scene_estimation.complete_scene(full, values["target_mask"])
+    assert scene.support.normal == pytest.approx(expected.support.normal, abs=1e-6)
+    assert scene.support.target_heights_m == pytest.approx(expected.support.target_heights_m, abs=1e-6)
+
+
+@pytest.mark.parametrize("stride", [0, -1, 1.5])
+def test_a_pixel_stride_is_a_positive_integer(stride):
+    with pytest.raises(ValueError):
+        SceneEstimationConfig(pixel_stride=stride)

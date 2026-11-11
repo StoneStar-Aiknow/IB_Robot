@@ -223,12 +223,16 @@ class AutomaticHead:
         for robot in self.robots.values():
             check_initial_hand(robot.hand, admitted)
 
-    def prepare_scene(self, observation):
+    def prepare_scene(self, observation, pixel_stride=1):
+        from dataclasses import replace
+
         from .proposer import prepare_capture_scene
 
         with self.gpu:
             return {
-                side: prepare_capture_scene(observation, arm.spheres, self.robots[side].perception.scene)
+                side: prepare_capture_scene(
+                    observation, arm.spheres, replace(self.robots[side].perception.scene, pixel_stride=pixel_stride)
+                )
                 for side, arm in self.arms.items()
             }
 

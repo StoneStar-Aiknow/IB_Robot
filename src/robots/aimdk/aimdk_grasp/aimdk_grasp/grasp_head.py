@@ -34,7 +34,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 from rclpy.node import Node
@@ -111,7 +111,10 @@ class X2GraspHeadNode(Node):
         super().__init__("x2_grasp_head", **node_options)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("interface_description_json", "{}")
+        self.declare_parameter("pick_entry_pose_json", "{}")
         config = json.loads(self.get_parameter("grasp_execution_json").value)
+        # The task pose every pick starts from (split.pick_entry_pose); {} plans for the measured pose.
+        self._pick_entry = json.loads(self.get_parameter("pick_entry_pose_json").value) or None
         description = json.loads(self.get_parameter("interface_description_json").value)
         self._robot = x2_robot(config)
         names = head_endpoints(head_options(self._robot.options).namespace)
@@ -208,7 +211,7 @@ class X2GraspHeadNode(Node):
                 prepared = self._prepare_scene(observation)
                 with head.gpu:
                     estimate = self._complete_scene(prepared, None, observation)
-                head.service.prepare(admitted.live.feedback, estimate)
+                self._prepare_planners(head, admitted.live.feedback, estimate)
             except Exception as exc:  # noqa: BLE001 - retried until the robot and the camera are up
                 self.get_logger().warning(f"grasp head not ready: {exc}", throttle_duration_sec=5.0)
                 self._closing.wait(PREPARE_RETRY_S)
@@ -220,6 +223,42 @@ class X2GraspHeadNode(Node):
             self.get_logger().info("grasp head prepared; accepting captures")
             threading.Thread(target=self._refresh_loop, daemon=True, name="grasp_head_refresh").start()
             return
+
+    def _planning_feedback(self, feedback):
+        """``feedback`` with the arms and hands at the pick entry pose's targets (unchanged without one).
+
+        The planners lock the other arm, the head and the planning hand at the
+        pose they are built on, and a pick starts at the entry pose: built
+        there, the first pick after the move does not rebuild inside its
+        request (~50 s on the Orin, the first attempt then runs out of time).
+        Targets, not a measured pose: units differ by a few millimetres there
+        (LOCKED_SPHERE_SHIFT_M covers it). Hands not installed stay absent.
+        """
+        entry = getattr(self, "_pick_entry", None)
+        if not entry:
+            return feedback
+        from .backend import robot_for_side
+
+        hands = {}
+        for side, preset in (entry.get("hands") or {}).items():
+            if getattr(feedback, f"{side}_hand", None) is not None:
+                hands[f"{side}_hand"] = robot_for_side(self._robot, side).hand.preset(preset)
+        return replace(feedback, positions={**feedback.positions, **entry["joint_positions"]}, **hands)
+
+    def _prepare_planners(self, head, feedback, estimate) -> None:
+        """Build the planners for the pick entry pose; for the measured pose if that build fails."""
+        planning = self._planning_feedback(feedback)
+        if planning is feedback:
+            head.service.prepare(feedback, estimate)
+            return
+        try:
+            head.service.prepare(planning, estimate)
+            self.get_logger().info(f"planners built for the pick entry pose {self._pick_entry.get('name')!r}")
+        except Exception as exc:  # noqa: BLE001 - a planner for the measured pose still serves the picks
+            self.get_logger().warning(
+                f"planners not built for the pick entry pose ({type(exc).__name__}: {exc}); built for the measured pose"
+            )
+            head.service.prepare(feedback, estimate)
 
     def _refresh_loop(self) -> None:
         """Rebuild a planner between requests when its locked joints have moved.
@@ -243,7 +282,7 @@ class X2GraspHeadNode(Node):
             if not self._quiet():
                 return None
             feedback = head.camera.capture_state(deadline=time.monotonic() + 1.0).feedback
-            if not head.service.needs_rebuild(feedback):
+            if not head.service.needs_rebuild(self._planning_feedback(feedback)):
                 return None
             locked = np.concatenate(
                 [feedback.vector(arm_joints(side)) for side in ("left", "right")]
@@ -262,7 +301,7 @@ class X2GraspHeadNode(Node):
             prepared = self._prepare_scene(observation)
             with head.gpu:
                 estimate = self._complete_scene(prepared, None, observation)
-            if head.service.refresh(admitted.live.feedback, estimate):
+            if head.service.refresh(self._planning_feedback(admitted.live.feedback), estimate):
                 self.get_logger().info(f"planner rebuilt between requests in {time.monotonic() - began:.1f} s")
             return None
         except Exception as exc:  # noqa: BLE001 - the next request rebuilds as before
@@ -274,12 +313,13 @@ class X2GraspHeadNode(Node):
             if captured and head.imu is not None and not getattr(getattr(head, "watch", None), "armed", False):
                 head.imu.pause()  # as after the warmup: idle until a request has a plan to execute
 
-    def _prepare_scene(self, observation: Observation):
-        """The mask-independent scene stage of one capture."""
+    def _prepare_scene(self, observation: Observation, pixel_stride: int = 1):
+        """The mask-independent scene stage of one capture, from every ``pixel_stride``-th depth row and column."""
         if hasattr(self._head, "prepare_scene"):
-            return self._head.prepare_scene(observation)
+            return self._head.prepare_scene(observation, pixel_stride=pixel_stride)
         with self._head.gpu:
-            return prepare_capture_scene(observation, self._head.spheres, self._robot.perception.scene)
+            config = replace(self._robot.perception.scene, pixel_stride=pixel_stride)
+            return prepare_capture_scene(observation, self._head.spheres, config)
 
     def _complete_scene(self, prepared, mask, observation):
         if hasattr(self._head, "complete_scene"):
@@ -358,7 +398,10 @@ class X2GraspHeadNode(Node):
         if head.imu is not None:
             head.imu.pause_after(observation.stamp_ns)
         capture_id = f"{observation.stamp_ns}-{next(self._ids)}"
-        prepared = self._scene_pool.submit(self._prepare_scene, observation)
+        # A place capture asks for a sparser scene (placement_execution.perception.scene_pixel_stride);
+        # 0 (the field's default, and grasp captures) is full resolution.
+        stride = max(1, int(getattr(request, "scene_pixel_stride", 0)))
+        prepared = self._scene_pool.submit(self._prepare_scene, observation, stride)
         with self._lock:
             _remember(self._captures, capture_id, _Capture(observation, prepared))
         rgb, depth = wire.encode_rgb(observation.rgb), wire.encode_depth(observation.depth_m)
@@ -555,6 +598,8 @@ class X2GraspHeadNode(Node):
                         held=held,
                         support_hint=hint,
                         perception=self._place_planner.robots[held.arm_side].perception,
+                        # The capture's scene density: replay with perception.scene's pixel_stride replaced by it.
+                        scene_pixel_stride=getattr(getattr(prepared, "config", None), "pixel_stride", 1),
                     )
                 except Exception as exc:  # noqa: BLE001 - a diagnostic must never change the place
                     print(f"container record not built: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

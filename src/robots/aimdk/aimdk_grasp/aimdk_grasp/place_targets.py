@@ -80,7 +80,7 @@ def place_targets(container, held, current_palm, config: PlaceTargetConfig = Pla
     center = opening_centre(hull.equations)[0]
     fraction = config.edge_fraction
     samples = np.vstack([center, (1.0 - fraction) * center + fraction * polygon])
-    clearance = held.radius_m + float(container.report.get("wall_margin_m", 0.015))
+    clearance = held.radius_m + float(container.report.get("wall_margin_m", 0.005))
     fits = (samples @ hull.equations[:, :2].T + hull.equations[:, 2] <= -clearance).all(axis=1)
     if config.extra_positions == 0:
         samples = samples[:1] if fits[0] else np.empty((0, 2))  # the centre only, and only if it fits

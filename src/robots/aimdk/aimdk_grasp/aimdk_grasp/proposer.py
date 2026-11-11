@@ -334,6 +334,51 @@ class X2Proposer:
         )
         return Proposals(mask, points, poses, confidence, report, scene=estimate)
 
+    def resample(
+        self, observation: Observation, proposals: Proposals, *, deadline: float, cancelled: Flag
+    ) -> Proposals:
+        """New GraspGen-X candidates for the target ``proposals`` found in ``observation``.
+
+        The mask, the cloud GraspGen-X saw and the scene are kept; only the grasps
+        are drawn again (the sampler's diffusion noise and the resampling of the
+        cloud to the checkpoint's point budget are random on every call; live
+        2026-11-11, 3 calls on one cloud: no grasp within 5 mm and 5 deg of
+        another call's). The pipeline asks for this when planning found no
+        complete path among the last candidates and the arm has not moved.
+        """
+        if time.monotonic() >= deadline:
+            raise GraspFailure("SKILL_TIMEOUT", "goal deadline passed")
+        calls = len(self.services.calls)
+        settings = self.settings
+        report = {key: value for key, value in proposals.report.items() if key != "model_rpc"}
+        started = time.perf_counter()
+        try:
+            poses, confidence = self.services.generate_grasps(
+                proposals.target_points,
+                observation.frame_id,
+                observation.stamp_ns,
+                max_grasps=settings.max_grasps,
+                min_confidence=settings.min_confidence,
+                cancelled=cancelled,
+            )
+            if not len(poses):
+                raise RuntimeError("No grasp candidates returned")
+        except GraspFailure:
+            raise
+        except (RuntimeError, ValueError) as exc:
+            # A retry already: the pipeline captures again rather than ending the goal here.
+            raise GraspFailure(NO_EXECUTABLE_CANDIDATE, f"{type(exc).__name__}: {exc}", retryable=True) from exc
+        finally:
+            report["model_rpc"] = self.services.calls[calls:]
+        report.update(
+            resampled=True,
+            resample_timings_s={"grasp": time.perf_counter() - started},
+            candidate_count=len(poses),
+        )
+        return Proposals(
+            proposals.target_mask, proposals.target_points, poses, confidence, report, scene=proposals.scene
+        )
+
     # -- the request -----------------------------------------------------------------
 
     def _detect(self, frame, stamp_ns, prompt, count, turn, cancelled):

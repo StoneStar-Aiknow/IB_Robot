@@ -323,7 +323,7 @@ class HeadCamera:
         started, recaptured = time.monotonic(), False
         state = self.capture_state(deadline=deadline, cancelled=cancelled)
         try:
-            require_fresh(state, self.clock(), self.revalidation)
+            require_fresh(state, self.clock(), self.revalidation, capture=True)
         except ReobserveRequired:
             # A feedback sample just late (live 2026-10-14: 141 ms against the
             # 100 ms limit, 3 of 40 requests) failed the request before any
@@ -333,7 +333,7 @@ class HeadCamera:
             state = self.capture_state(deadline=deadline, cancelled=cancelled)
             recaptured = True
             try:
-                require_fresh(state, self.clock(), self.revalidation)
+                require_fresh(state, self.clock(), self.revalidation, capture=True)
             except ReobserveRequired as exc:
                 raise GraspFailure(OBSERVATION_UNAVAILABLE, str(exc), retryable=True) from None
         admitted = AdmittedState(state, self.clock(), started)

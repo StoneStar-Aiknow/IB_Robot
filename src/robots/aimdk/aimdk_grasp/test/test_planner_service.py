@@ -45,6 +45,23 @@ def test_merge_handles_coincident_and_contained_spheres():
         merge_sphere_cover(original, -1.0)
 
 
+def test_every_narrower_cap_reads_its_cover_off_one_greedy_merge():
+    from aimdk_grasp.collision_spheres import merge_sphere_cover_steps, steps_at
+
+    rng = np.random.default_rng(5)
+    for size in (1, 2, 9, 63):
+        balls = [
+            {"center": (rng.normal(size=3) * 0.04).tolist(), "radius": float(rng.uniform(0.002, 0.03))}
+            for _ in range(size)
+        ]
+        states, radii = merge_sphere_cover_steps(balls, 0.15)
+        for cap in (*np.linspace(0.001, 0.15, 30), radii[0] if radii else 0.01):
+            direct = [[*ball["center"], ball["radius"]] for ball in merge_sphere_cover(balls, float(cap))]
+            assert np.array_equal(steps_at(states, radii, float(cap)), np.array(direct, dtype=float))
+    # A step array never changes after it was handed out.
+    assert np.array_equal(states[0], [[*ball["center"], ball["radius"]] for ball in balls])
+
+
 def test_protected_merge_never_inflates_into_work_envelope():
     balls = [{"center": [x, 0, 0], "radius": 0.02} for x in (0.0, 0.03, 1.0, 1.03)]
     protected = np.array([[0.015, 0.05, 0, 0.02]])
@@ -1341,3 +1358,36 @@ def test_idle_refresh_rebuilds_only_a_moved_snapshot_and_never_waits_for_a_busy_
         release.set()
         held.result()
     assert service.refresh("b", estimate) and built == ["a", "b"]
+
+
+def test_a_preload_never_rebuilds_a_planner_built_for_another_locked_pose():
+    """A prefetch capture before the arms reach the pick entry pose must not replace that pose's planner."""
+    built, loaded = [], []
+
+    class Planner:
+        def __init__(self, feedback, estimate, received_at, **options):
+            self.locked, self._closed = feedback, False
+            built.append(feedback)
+
+        def locked_joints_match(self, feedback):
+            return feedback == self.locked
+
+        def warmup(self):
+            pass
+
+        def update_scene(self, feedback, estimate):
+            loaded.append(feedback)
+
+        def load_validation_scene(self):
+            loaded.append("fine")
+
+        def close(self):
+            self._closed = True
+
+    service = GraspPlanningService(gripper=GRIPPER, planner_factory=Planner)
+    assert service.preload("entry", SimpleNamespace(received_at=1.0)) and built == ["entry"]  # none built yet: builds
+    assert not service.preload("rest", SimpleNamespace(received_at=2.0))  # another pose: nothing loaded, no rebuild
+    assert built == ["entry"] and loaded == ["fine"]
+    assert service.preload("entry", SimpleNamespace(received_at=3.0)) and loaded == ["fine", "entry", "fine"]
+    service.prepare("rest", SimpleNamespace(received_at=4.0))  # a plan's own prepare still rebuilds
+    assert built == ["entry", "rest"]
