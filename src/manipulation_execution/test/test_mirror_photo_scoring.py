@@ -34,17 +34,15 @@ def jpeg(seed: int = 0, *, blur: float = 0.0, size=HALF, block: int = 8) -> byte
     return data.tobytes()
 
 
-def candidate(stamp: float, data: bytes, *, source: str = UNIFORM, weight: float = 0.0) -> Candidate:
-    return Candidate(Trigger(source, source, weight, 1.0, stamp), stamp, data)
+def candidate(stamp: float, data: bytes, *, source: str = UNIFORM, weight: float = 0.0, bbox: tuple[float, ...] = (10.0, 10.0, 50.0, 40.0)) -> Candidate:
+    return Candidate(Trigger(source, source, weight, 1.0, stamp), stamp, data, bbox)
 
 
-def choose(candidates, *, speeds=None, boxes=None, deadline=1.0, **kwargs):
+def choose(candidates, *, speeds=None, deadline=1.0, **kwargs):
     speeds = speeds or {}
-    boxes = boxes or {}
     return select(
         candidates,
         speed_at=lambda stamp: speeds.get(stamp),
-        bbox_at=lambda stamp: boxes.get(stamp),
         stillness_weight=0.5,
         sharpness_weight=0.5,
         deadline_sec=deadline,
@@ -171,7 +169,6 @@ def test_one_candidate_and_sharpness_off_skip_the_decoding():
     off = select(
         [candidate(1.0, b"a"), candidate(2.0, b"b")],
         speed_at=lambda _stamp: None,
-        bbox_at=lambda _stamp: None,
         stillness_weight=0.5,
         sharpness_weight=0.0,
         deadline_sec=1.0,
@@ -187,9 +184,9 @@ def test_no_candidate_is_an_error():
 
 def test_a_full_round_of_half_frames_scores_well_inside_the_deadline():
     """24 candidates at half resolution: the round's maximum. Measured here, on the board again."""
-    candidates = [candidate(float(index), jpeg(index, blur=index % 5)) for index in range(24)]
-    boxes = {float(index): (300.0, 100.0, 1000.0, 950.0) for index in range(24)}
-    choice = choose(candidates, boxes=boxes, deadline=1.0)
+    bbox = (300.0, 100.0, 1000.0, 950.0)
+    candidates = [candidate(float(index), jpeg(index, blur=index % 5), bbox=bbox) for index in range(24)]
+    choice = choose(candidates, deadline=1.0)
     print(f"24 half frames scored in {choice.elapsed_sec * 1000:.0f} ms")
     assert choice.scoring == "full"
     assert choice.elapsed_sec < 1.0
