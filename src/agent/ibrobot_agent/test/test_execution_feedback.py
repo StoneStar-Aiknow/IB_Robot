@@ -80,8 +80,7 @@ def test_completed_drop_cleanup_is_a_failed_task_that_can_accept_a_new_command()
 
 
 def test_text_feedback_bridge_checks_scope_and_never_submits_or_acknowledges():
-    # ``detailed`` narrates the observe phase; ``standard`` deliberately stays quiet until the
-    # plan, so this test asks for the mode that is supposed to speak here.
+    # Progress waits for twelve seconds of silence, independently of the selected mode.
     core = VoiceBridgeCore(
         VoiceBridgeConfig(
             channel_id="text", principal_id="operator", robot_scope="robot", feedback_only=True, speech_mode="detailed"
@@ -93,9 +92,10 @@ def test_text_feedback_bridge_checks_scope_and_never_submits_or_acknowledges():
     assert core.on_event({**payload, "event_type": "presentation"}, 0) == []
     for name in ("channel_id", "principal_id", "robot_scope"):
         assert core.on_event({**payload, "request_key": {**payload["request_key"], name: "foreign"}}, 0) == []
-    actions = core.on_event(payload, 0)
-    assert len(actions) == 1 and isinstance(actions[0], Speak) and not actions[0].then
     assert core.on_event(payload, 0) == []
+    actions = core.tick(12)
+    assert len(actions) == 1 and isinstance(actions[0], Speak) and not actions[0].then
+    assert core.on_event(payload, 12) == []
 
 
 def test_legacy_and_non_grasp_success_do_not_claim_a_grasp():

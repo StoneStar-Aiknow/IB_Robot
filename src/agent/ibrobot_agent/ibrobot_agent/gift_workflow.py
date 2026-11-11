@@ -43,6 +43,30 @@ _MESSAGE_KEYS = {
     "cancelled",
     "completed",
     "ended",
+    "waiting_pick",
+    "waiting_place",
+    "waiting_recover",
+    "retry_TARGET_NOT_VISIBLE",
+    "retry_OBSERVATION_UNAVAILABLE",
+    "retry_NO_COMPLETE_PATH",
+    "retry_NO_EXECUTABLE_CANDIDATE",
+    "retry_PLAN_TIMEOUT",
+    "retry_REOBSERVE_REQUIRED",
+    "retry_TARGET_MOVED",
+    "retry_EMPTY_GRASP",
+    "retry_GRIP_LOST",
+}
+
+_RETRY_TEXT = {
+    "TARGET_NOT_VISIBLE": "刚才没看清，我再看一眼。",
+    "OBSERVATION_UNAVAILABLE": "刚才没看清，我再看一眼。",
+    "NO_COMPLETE_PATH": "刚才没找到合适的路线，我再试试。",
+    "NO_EXECUTABLE_CANDIDATE": "刚才没找到合适的路线，我再试试。",
+    "PLAN_TIMEOUT": "刚才没找到合适的路线，我再试试。",
+    "REOBSERVE_REQUIRED": "水果的位置变了，我重新确认一下。",
+    "TARGET_MOVED": "水果的位置变了，我重新确认一下。",
+    "EMPTY_GRASP": "刚才没抓住，我再试一次。",
+    "GRIP_LOST": "刚才没拿稳，我再试一次。",
 }
 
 
@@ -81,6 +105,11 @@ class _Request:
     retries: dict[int, int] = field(default_factory=dict)
     emitted: set[tuple] = field(default_factory=set)
     place_phase_rank: dict[int, int] = field(default_factory=dict)
+    reason: str = ""
+    facts: Mapping = field(default_factory=dict)
+    skill: str = ""
+    quiet_since: float | None = None
+    last_wait: float = float("-inf")
 
 
 def _mapping(value: object) -> Mapping:
@@ -137,6 +166,41 @@ class GiftWorkflowSpeech:
         self._ended: set[str] = set()
         self._notices: OrderedDict[str, tuple[Notice, float, int]] = OrderedDict()
         self._serial = 0
+        self._playing = False
+
+    def discard(self, notice: Notice) -> None:
+        self._notices.pop(notice.token, None)
+
+    def note_playback(self, now: float, *, finished: bool = False, notice=None) -> None:
+        if finished and notice is not None:
+            self._notices.pop(notice.token, None)
+        self._playing = not finished
+        if self._current:
+            self._current.quiet_since = now
+
+    def tick(self, now: float) -> list[Notice]:
+        item = self._current
+        if not item or item.finished or not item.facts or self._playing or item.quiet_since is None:
+            return []
+        if item.skill not in {"pick_object", "place_in_container"} or item.facts.get("phase_state") != "RUNNING":
+            return []
+        if now - item.quiet_since < 12 or now - item.last_wait < 20:
+            return []
+        if any(self.is_current(record[0], now) for record in self._notices.values()):
+            return []
+        item.last_wait = now
+        key = (
+            "waiting_recover"
+            if item.facts.get("recovery_state") == "IN_PROGRESS"
+            else ("waiting_place" if item.skill == "place_in_container" else "waiting_pick")
+        )
+        text = {
+            "waiting_pick": "我还在找合适的抓取位置，再等我一下哦。",
+            "waiting_place": "我还在准备放置，再等我一下哦。",
+            "waiting_recover": "我还在做恢复处理，再等我一下哦。",
+        }[key]
+        item.emitted.discard((key, item.index, 0))
+        return self._notice(item, key, text, now)
 
     def register(self, request_id: str, session_id: str, steps: Sequence) -> bool:
         if not isinstance(request_id, str) or not request_id or not isinstance(session_id, str) or not session_id:
@@ -194,9 +258,11 @@ class GiftWorkflowSpeech:
                 fruit=item.pairs.get(index, "这个物体"),
                 container=item.containers.get(index, "指定容器"),
             )
-        marker = (key, item.index, item.retries.get(item.index, 0) if key == "F12" else 0)
+        marker = (key, item.index, item.retries.get(item.index, 0) if key == "F12" or key.startswith("retry_") else 0)
         if marker in item.emitted:
             return []
+        if key in {"F08", "F12"} or key.startswith("retry_") or terminal:
+            self._notices.clear()
         item.emitted.add(marker)
         self._serial += 1
         notice = Notice(
@@ -257,6 +323,8 @@ class GiftWorkflowSpeech:
                 item.sequence = sequence
                 item.event_sequence = event_sequence if _positive(event_sequence) else item.event_sequence
                 item.last_now = now
+                item.facts, item.skill = {}, skill
+                self._notices.clear()
             return []
         facts = _mapping(context.get("execution_detail"))
         phase, phase_state = facts.get("phase", ""), facts.get("phase_state", "")
@@ -274,8 +342,17 @@ class GiftWorkflowSpeech:
         item.execution_id = execution_id
         item.sequence = sequence
         item.event_sequence = event_sequence if _positive(event_sequence) else item.event_sequence
+        if index != item.index:
+            item.reason = ""
+            self._notices.clear()
         item.index, item.last_now = index, now
         previous_retry = item.retries.get(index, 0)
+        reason = facts.get("reason_code")
+        if reason and reason != "NONE":
+            item.reason = str(reason)
+        item.facts, item.skill = facts, skill
+        if item.quiet_since is None:
+            item.quiet_since = now
         item.retries[index] = retry
         if terminal:
             item.finished = True
@@ -298,7 +375,7 @@ class GiftWorkflowSpeech:
         # also omit recovery telemetry. Neither is evidence of a recovery fault.
         if (
             facts.get("recovery_state") == "FAILED"
-            or (facts.get("recovery_state") == "UNKNOWN" and (phase == "recover" or phase_state == "FAILED"))
+            or (facts.get("recovery_state") == "UNKNOWN" and phase == "recover" and phase_state == "FAILED")
             or (
                 skill == "place_in_container"
                 and self._release(facts) == "UNKNOWN"
@@ -309,7 +386,11 @@ class GiftWorkflowSpeech:
         if skill == "pick_object":
             if retry > previous_retry:
                 item.failed.discard(index)
-                return self._notice(item, "F12", "刚才没能拿稳，我再尝试一次。", now)
+                reason = item.reason
+                key = "retry_" + reason if reason in _RETRY_TEXT else "F12"
+                text = _RETRY_TEXT.get(reason, "刚才没能完成，我再试一次。")
+                item.reason = ""
+                return self._notice(item, key, text, now)
             if step_state == "FAILED":
                 item.failed.add(index)
                 return self._notice(item, "pick_failed", "这次没能完成抓取，请工作人员协助。", now)
@@ -451,8 +532,10 @@ class GiftWorkflowSpeech:
         if (notice.request_id, notice.session_id) != (item.request_id, item.session_id):
             return False
         age = now - record[1]
+        key = notice.token.split(":", 1)[0]
+        semantic = key in {"F05", "F12", "F08"} or key.startswith("retry_")
         return (
-            0 <= age < (60.0 if notice.terminal else 15.0)
-            and record[2] == item.generation
+            0 <= age < (60.0 if notice.terminal else 30.0 if semantic else 15.0)
+            and (record[2] == item.generation or semantic)
             and (notice.terminal or not item.finished)
         )

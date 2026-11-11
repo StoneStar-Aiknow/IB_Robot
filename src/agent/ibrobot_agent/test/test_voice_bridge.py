@@ -83,14 +83,30 @@ def test_busy_speech_is_once_per_request_and_expires_without_controlling_executi
     assert not core.speech_is_current(_of(first, Speak)[0], now=13.1)
 
 
-def test_acceptance_is_not_spoken_before_the_plan_decides_what_follows():
+def test_acceptance_speaks_one_short_receipt_without_waiting_for_the_plan():
     core = _core()
     core.on_transcript("双手侧平举", now=0.0)
     response = {"request_id": "voice-0", "accepted": True, "state": "RECEIVED"}
-    assert not _of(core.on_response(response, now=0.01), Speak)
+    (receipt,) = _of(core.on_response(response, now=0.01), Speak)
+    assert receipt.text == "好嘞，我听到了。" and not receipt.then
+    assert core.speech_is_current(receipt, 0.015)
     assert not _of(core.on_response(response, now=0.02), Speak)
     stop = core.on_partial("停", now=0.03)
     assert _of(stop, PublishControl)[0].payload["operation"] == "stop"
+    assert not core.speech_is_current(receipt, 0.04)
+
+
+def test_ready_reply_skips_unplayed_receipt_but_not_already_started_receipt():
+    core = _core()
+    core.on_transcript("双手侧平举", now=0.0)
+    (receipt,) = _of(core.on_response({"request_id": "voice-0", "accepted": True}, now=0.01), Speak)
+    reply = core._speech("我来侧平举。")
+    core.note_speech_ready(reply)
+    assert not core.speech_is_current(receipt, 0.02)
+    core.note_playback(receipt, 0.03)
+    assert core.speech_is_current(receipt, 0.04)
+    core.note_playback(receipt, 0.05, finished=True)
+    assert not core.speech_is_current(receipt, 0.06)
 
 
 def test_delayed_playback_text_and_captured_audio_cannot_trigger_busy_loop():
@@ -2555,3 +2571,43 @@ def test_ending_the_interaction_stops_while_skill_words_keep_their_route():
     # would shadow the very skills that end a round, and a goodbye must not stop the wrong thing.
     for skill in ("结束照镜子", "不玩照镜子了"):
         assert _of(_core(stop_phrases=closing).on_transcript(skill, now=0.0), PublishRequest)
+
+
+def test_failed_synthesis_releases_pending_and_gift_progress_obeys_stop_barrier():
+    core = _core()
+    core.on_transcript("拿苹果", 0)
+    core._gift.register(
+        "voice-0",
+        core._state.session_id,
+        [
+            {"skill_name": "pick_object", "target_name": "an apple"},
+            {"skill_name": "place_in_container", "target_name": "an apple", "container_name": "bowl"},
+        ],
+    )
+    payload = _event(
+        "voice-0",
+        "execution_progress",
+        "ACTIVE",
+        sequence=1,
+        detail={
+            "execution_id": "e",
+            "gateway_sequence": 1,
+            "workflow_step_index": 0,
+            "current_skill": "pick_object",
+            "state": "RUNNING",
+            "execution_detail": {
+                "schema_version": 2,
+                "phase": "observe",
+                "phase_state": "RUNNING",
+                "retry_count": 0,
+                "recovery_state": "NOT_NEEDED",
+            },
+        },
+    )
+    (start,) = _of(core.on_event(payload, 0), Speak)
+    assert not _of(core.tick(12), Speak)  # slow synthesis is pending, no extra waiting
+    core.discard_speech(start)
+    (wait,) = _of(core.tick(13), Speak)
+    assert wait.text == "我还在找合适的抓取位置，再等我一下哦。"
+    core._state.stopped_request_id = "voice-0"
+    assert not core.speech_is_current(wait, 14)

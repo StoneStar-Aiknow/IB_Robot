@@ -9,6 +9,7 @@ from string import Formatter
 
 from embodied_common.control_phrases import STOP_PHRASES
 from embodied_common.execution_detail import ExecutionDetail
+from ibrobot_agent.gift_workflow import _RETRY_TEXT
 
 _TERMINALS = {"SUCCEEDED", "FAILED", "UNKNOWN", "CANCELED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION"}
 _MESSAGES = {
@@ -56,6 +57,14 @@ _MESSAGES = {
     "mirror_unknown": "照镜子状态尚未确认，本次动作未执行，也不会排队。请操作员确认照镜子状态后重新下达指令。",
     "mirror_release_unconfirmed": "照镜子结束后的控制权释放尚未确认，后续动作未执行，也不会排队。请操作员确认机器人状态后重新下达指令。",
 }
+_MESSAGES.update({"retry_" + key: text for key, text in _RETRY_TEXT.items()})
+_MESSAGES.update(
+    {
+        "retry": "刚才没能完成，我再试一次。",
+        "waiting": "我还在找合适的抓取位置，再等我一下哦。",
+        "waiting_recover": "我还在做恢复处理，再等我一下哦。",
+    }
+)
 _PHASES = {
     "dispatch": "调度",
     "observe": "观察",
@@ -80,7 +89,7 @@ _IMPORTANT_KEYS.update(key for key in _MESSAGES if key.startswith("reason_"))
 #: before a final failure alike, so a deployment that announces only the outcome needs them gone.
 _SILENCEABLE = {"recover", "recovered"}
 #: A retry line outlives the attempt's phase changes (its synthesis alone takes about 2 s) but not this long.
-_RETRY_NOTICE_SEC = 15.0
+_RETRY_NOTICE_SEC = 30.0
 
 
 @dataclass(frozen=True)
@@ -146,6 +155,16 @@ class GraspSpeechPolicy:
         self._played: set[str] = set()
         self._targets: OrderedDict[str, str] = OrderedDict()
         self._serial = 0
+        self._playing = False
+        self._quiet_since: float | None = None
+        self._last_wait = float("-inf")
+
+    def discard(self, notice: Notice) -> None:
+        self._notices.pop(notice.token, None)
+
+    def note_playback(self, now: float, *, finished: bool = False) -> None:
+        self._playing = not finished
+        self._quiet_since = now
 
     def _remember(self, notice: Notice, now: float, generation: int) -> None:
         self._notices[notice.token] = (notice, now, generation)
@@ -203,7 +222,18 @@ class GraspSpeechPolicy:
         priority = 40 if key in {"unknown", "recovery_failed", "manual_check", "canceled"} else 20 if terminal else 10
         phase = item.phase if item else ""
         event_key = f"{key}:{item.retry_count if item else 0}:{item.generation if item else 0}"
-        notice = Notice(text, execution_id, token, terminal, important, request_id, priority, phase, event_key)
+        notice = Notice(
+            text,
+            execution_id,
+            token,
+            terminal,
+            important,
+            request_id,
+            priority,
+            phase,
+            event_key,
+            now + 15.0 if key.startswith("waiting") else float("inf"),
+        )
         # A retry line belongs to its attempt, not to the phase it was created in.
         scope = ("retry", item.retry_count) if item and key.startswith("retry") else item.generation if item else 0
         self._remember(notice, now, scope)
@@ -236,6 +266,8 @@ class GraspSpeechPolicy:
         execution_id = context.get("execution_id")
         if not isinstance(execution_id, str) or not execution_id:
             return []
+        if self._quiet_since is None:
+            self._quiet_since = now
         item = self._executions.setdefault(execution_id, _Execution(entered=now))
         self._executions.move_to_end(execution_id)
         while len(self._executions) > 256:
@@ -265,7 +297,8 @@ class GraspSpeechPolicy:
         increased = retry > item.retry_count
         old_recovery = item.recovery
         item.retry_count = max(retry, item.retry_count)
-        item.reason = str(detail.get("reason_code") or item.reason)
+        if detail.get("reason_code") not in {None, "", "NONE"}:
+            item.reason = str(detail["reason_code"])
         item.recovery = str(detail.get("recovery_state", ""))
         item.phase_state = str(detail.get("phase_state", "UNKNOWN")).upper()
         item.state = str(payload.get("state", "")).upper()
@@ -281,14 +314,11 @@ class GraspSpeechPolicy:
         if item.state not in {"ACTIVE", "RUNNING", "EXECUTING"} or item.phase_state != "RUNNING":
             return []
         key = ""
-        if item.recovery == "IN_PROGRESS" and old_recovery != "IN_PROGRESS":
+        if increased:
+            key = "retry_" + item.reason if "retry_" + item.reason in self.messages else "retry"
+            item.reason = ""
+        elif item.recovery == "IN_PROGRESS" and old_recovery != "IN_PROGRESS":
             key = "recover"
-        elif increased:
-            key = (
-                "retry_recovered"
-                if "COMPLETED" in {item.recovery, old_recovery}
-                else ("retry_" + item.reason if "retry_" + item.reason in self.messages else "retry")
-            )
         elif item.recovery == "COMPLETED" and old_recovery == "IN_PROGRESS":
             key = "recovered"
         if key:
@@ -296,7 +326,7 @@ class GraspSpeechPolicy:
             if not self.messages[key]:
                 return []
             return [self._notice(key, execution_id, now, important=True, request_id=item.request_id)]
-        return self._progress(execution_id, item, now)
+        return []
 
     @staticmethod
     def _terminal_key(item: _Execution, detail: ExecutionDetail) -> str:
@@ -332,22 +362,20 @@ class GraspSpeechPolicy:
     def _progress(self, execution_id: str, item: _Execution, now: float) -> list[Notice]:
         if item.terminal or item.state not in {"ACTIVE", "EXECUTING", "RUNNING"} or item.phase_state != "RUNNING":
             return []
-        if item.phase not in _PHASES or item.phase in {"dispatch", "recover"}:
+        if item.phase not in _PHASES or item.phase == "dispatch":
             return []
-        if now - self.last_played < self.interval:
+        if self._playing or self._quiet_since is None or now - self._quiet_since < 12:
             return []
-        delay = 10.0 if self.mode == "concise" else 4.0 if self.mode == "standard" else 0.0
-        if self.mode == "standard" and item.phase != "plan":
-            if item.phase != "approach":
-                return []
-            delay = 0.0
-        if now - item.entered < delay:
+        if now - self._last_wait < 20:
             return []
-        if item.emitted is not None and now - item.emitted < 15.0:
+        if any(
+            not n.terminal and n.token not in self._played and self.is_current(n, now)
+            for n, _, _ in self._notices.values()
+        ):
             return []
-        key = "waiting" if item.emitted is not None or self.mode == "concise" else item.phase
+        key = "waiting_recover" if item.recovery == "IN_PROGRESS" else "waiting"
+        self._last_wait = now
         item.emitted = now
-        # A repeated long-wait notice supersedes a queued earlier notice in this phase.
         item.generation += 1
         return [self._notice(key, execution_id, now, request_id=item.request_id)]
 
@@ -356,17 +384,20 @@ class GraspSpeechPolicy:
 
     def is_current(self, notice: Notice, now: float) -> bool:
         record = self._notices.get(notice.token)
-        if record is None or record[0] != notice:
+        if record is None or record[0] != notice or now >= notice.expires_at:
             return False
         if notice.terminal:
             return True
         if notice.token.startswith("start:"):
-            return 0 <= now - record[1] < 10.0
+            return 0 <= now - record[1] < 30.0 and not any(
+                item.request_id == notice.request_id and (item.terminal or item.retry_count > 0)
+                for item in self._executions.values()
+            )
         item = self._executions.get(notice.execution_id)
         if item is None or item.terminal:
             return False
         if isinstance(record[2], tuple):
-            return record[2] == ("retry", item.retry_count) and now - record[1] <= _RETRY_NOTICE_SEC
+            return record[2] == ("retry", item.retry_count) and 0 <= now - record[1] < _RETRY_NOTICE_SEC
         if item.generation != record[2]:
             return False
         if item.phase_state != "RUNNING" or item.state not in {"ACTIVE", "EXECUTING", "RUNNING"}:

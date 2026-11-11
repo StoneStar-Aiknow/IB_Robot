@@ -1156,3 +1156,77 @@ codes:
     - file: F19_03.wav
       text: 我这边结束啦，现场情况请工作人员再检查一下。
       sha256: ccab2b99fbe1113a3b0e5341fcadd8e11bfb16cc64b289471a3ac9b437e56017
+
+  # Generated locally with ZipVoice ubuntu_onnx; replace files and hashes after 310P synthesis.
+  SF01:
+    clip: speech_feedback_01
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF01_01.wav
+      text: 好嘞，我听到了。
+      sha256: 1cad14a6d63739acd09f855c3a82a4b7088c2cd5b883eabe821d59dc07336009
+  SF02:
+    clip: speech_feedback_02
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF02_01.wav
+      text: 刚才没看清，我再看一眼。
+      sha256: 7c872908e0d9a2f87b965cba566ab092a91ab1169b93cfe5e8a51eec41f567b9
+  SF03:
+    clip: speech_feedback_03
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF03_01.wav
+      text: 刚才没找到合适的路线，我再试试。
+      sha256: 25726a9ac8f928f071f9b475e20075cc0b1dae885d8cffe80e54165d02ae825a
+  SF04:
+    clip: speech_feedback_04
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF04_01.wav
+      text: 刚才没抓住，我再试一次。
+      sha256: 803b3c970065ad14459d4bc978910c260c255ce4f6cfbcd112b6ca7fa2c3f2a4
+  SF05:
+    clip: speech_feedback_05
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF05_01.wav
+      text: 刚才没拿稳，我再试一次。
+      sha256: a1cda4a0a0c0e07d4100c0e4d22df976495f1d4849487715b5dfbab72760f263
+  SF06:
+    clip: speech_feedback_06
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF06_01.wav
+      text: 刚才没能完成，我再试一次。
+      sha256: 84ce5bd31f84fefc701bf60a4cf7241a7027889236643d9dc12f0c21a482017c
+  SF07:
+    clip: speech_feedback_07
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF07_01.wav
+      text: 我还在找合适的抓取位置，再等我一下哦。
+      sha256: 8edfd5fea0ff3ad2746cd67e08b20abba1e713350d53806e716454c75dc27839
+  SF08:
+    clip: speech_feedback_08
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF08_01.wav
+      text: 我还在准备放置，再等我一下哦。
+      sha256: 77d386c27c4d825552492fcb9929b86520772541b11e43b873a1591dcaae2a08
+  SF09:
+    clip: speech_feedback_09
+    mode: random
+    consumer: speech
+    lines:
+    - file: SF09_01.wav
+      text: 我还在做恢复处理，再等我一下哦。
+      sha256: 23b550adf02ebcb329d922f61941c64a82dd1ca723b7313975f1a2e4d7fda2be

@@ -233,3 +233,85 @@ def test_completed_override_does_not_replace_unconfirmed_placement():
     (notice,) = speech.accept(event(terminal=True, release_status="RELEASED", verification_status="UNCERTAIN"), 1)
     assert notice.token.startswith("place_ended:")
     assert "工作人员" in notice.text
+
+
+def pick_event(sequence=1, phase="observe", retry=0, reason="", **fields):
+    payload = event(sequence, phase=phase, retry_count=retry, reason_code=reason, **fields)
+    payload["detail"].update(current_skill="pick_object", workflow_step_index=0)
+    return payload
+
+
+def test_start_survives_phases_but_retry_and_place_replace_it():
+    speech = policy()
+    (start,) = speech.accept(pick_event(), 0)
+    speech.accept(pick_event(2, "plan"), 1)
+    assert speech.is_current(start, 29.9)
+    assert not speech.is_current(start, 30)
+    speech.accept(pick_event(3, "close", reason="EMPTY_GRASP", recovery_state="IN_PROGRESS"), 2)
+    (retry,) = speech.accept(pick_event(4, "observe", retry=1), 3)
+    assert retry.text == "刚才没抓住，我再试一次。"
+    assert not speech.is_current(start, 3)
+    speech.accept(pick_event(5, "plan", retry=1), 4)
+    assert speech.is_current(retry, 32.9)
+    assert not speech.is_current(retry, 33)
+    speech.accept(event(6, phase="observe_container"), 5)
+    assert not speech.is_current(retry, 5)
+
+
+def test_normal_failed_phase_before_recovery_does_not_alarm_but_unknown_recovery_does():
+    speech = policy()
+    payload = pick_event(phase="plan", recovery_state="UNKNOWN", reason="PLAN_TIMEOUT")
+    payload["detail"]["execution_detail"]["phase_state"] = "FAILED"
+    assert not speech.accept(payload, 0)
+    payload = pick_event(2, "recover", recovery_state="UNKNOWN")
+    assert all(not notice.token.startswith("E06:") for notice in speech.accept(payload, 1))
+    payload = pick_event(3, "recover", recovery_state="UNKNOWN")
+    payload["detail"]["execution_detail"]["phase_state"] = "FAILED"
+    (alarm,) = speech.accept(payload, 2)
+    assert alarm.token.startswith("E06:")
+
+
+def test_gift_wait_uses_playback_end_and_global_throttle_and_releases_failed_pending():
+    speech = policy()
+    (start,) = speech.accept(pick_event(), 0)
+    speech.note_playback(1, notice=start)
+    assert not speech.tick(40)
+    speech.note_playback(41, finished=True, notice=start)
+    assert not speech.tick(52.9)
+    (waiting,) = speech.tick(53)
+    assert waiting.token.startswith("waiting_pick:")
+    assert not speech.tick(54)
+    speech.discard(waiting)  # synthesis failure, not playback
+    speech.accept(pick_event(2, "plan"), 55)
+    assert not speech.tick(72.9)
+    assert speech.tick(73)
+
+
+def test_expired_wait_does_not_permanently_block_next_wait():
+    speech = policy()
+    (start,) = speech.accept(pick_event(), 0)
+    speech.discard(start)
+    (waiting,) = speech.tick(12)
+    assert not speech.tick(13)
+    assert not speech.is_current(waiting, 27)
+    assert speech.tick(32)
+
+
+def test_duplicate_transfer_preserves_its_valid_notice_and_new_retry_replaces_old():
+    speech = policy()
+    (first,) = speech.accept(pick_event(retry=1), 0)
+    (second,) = speech.accept(pick_event(2, retry=2), 1)
+    assert not speech.is_current(first, 1)
+    assert speech.is_current(second, 1)
+    (transfer,) = speech.accept(event(3, phase="transfer"), 2)
+    assert not speech.is_current(second, 2)
+    assert speech.accept(event(4, phase="transfer"), 3) == []
+    assert speech.is_current(transfer, 3)
+
+
+def test_gift_stop_and_session_replacement_invalidate_all_progress():
+    speech = policy()
+    (start,) = speech.accept(pick_event(), 0)
+    speech.end_session("s")
+    assert not speech.is_current(start, 1)
+    assert speech.tick(40) == []

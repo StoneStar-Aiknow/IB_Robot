@@ -13,7 +13,7 @@ from ibrobot_agent.speech_policy import GraspSpeechPolicy
 from robot_config.loader import _load_robot_section, _validate_agent_voice_bridge
 
 CONFIG = Path(get_package_share_directory("robot_config")) / "config" / "robots" / "aimdk_x2_summit.yaml"
-RETRIED = "哎呀，这次没成功，我再试一下。"
+RETRIED = "刚才没抓住，我再试一次。"
 
 
 @pytest.fixture(scope="module")
@@ -74,7 +74,8 @@ def test_recovery_is_silent_and_a_retry_is_announced_once_through_its_attempt(br
     # Synthesis takes about 2 s; the attempt has moved on by the time the line can play.
     policy.observe(_payload("EXECUTING", _detail("perceive", retry_count=1)), 5.0)
     assert policy.is_current(retried, 6.5)
-    assert not policy.is_current(retried, 30.0)
+    assert policy.is_current(retried, 33.9)
+    assert not policy.is_current(retried, 34.0)
 
 
 def test_a_retry_line_dies_with_the_pick(bridge):
@@ -92,3 +93,41 @@ def test_results_cannot_be_switched_off():
 
 def test_a_pick_that_ends_after_the_put_back_speaks_the_same_result(bridge):
     assert bridge["speech_messages"]["completed"] == bridge["speech_messages"]["success"]
+
+
+def test_single_start_cannot_reappear_after_retry_and_reason_beats_recovery(bridge):
+    policy = GraspSpeechPolicy("concise", bridge["speech_messages"])
+    start = policy.start("r1", "苹果", 0)
+    policy.observe(_payload("EXECUTING", _detail("plan", "FAILED", reason_code="PLAN_TIMEOUT")), 1)
+    (retry,) = policy.observe(_payload("EXECUTING", _detail("observe", retry_count=1, recovery_state="COMPLETED")), 2)
+    assert retry.text == "刚才没找到合适的路线，我再试试。"
+    assert not policy.is_current(start, 3)
+    policy.observe(_payload("EXECUTING", _detail("plan", retry_count=1)), 3)
+    assert policy.is_current(retry, 31.9)
+    assert not policy.is_current(retry, 32)
+
+
+def test_single_wait_is_silent_for_twelve_seconds_after_actual_playback(bridge):
+    policy = GraspSpeechPolicy("concise", bridge["speech_messages"])
+    policy.observe(_payload("EXECUTING", _detail("observe")), 0)
+    policy.note_playback(1)
+    assert not policy.tick(40)
+    policy.note_playback(41, finished=True)
+    assert not policy.tick(52.9)
+    (waiting,) = policy.tick(53)
+    assert waiting.text == bridge["speech_messages"]["waiting"]
+    policy.discard(waiting)
+    policy.observe(_payload("EXECUTING", _detail("plan")), 54)
+    assert not policy.tick(72.9)
+    assert policy.tick(73)
+
+
+def test_single_expired_or_failed_wait_releases_pending_reminders(bridge):
+    policy = GraspSpeechPolicy("concise", bridge["speech_messages"])
+    policy.observe(_payload("EXECUTING", _detail("plan")), 0)
+    (first,) = policy.tick(12)
+    assert not policy.tick(13)
+    assert not policy.is_current(first, 27)
+    (second,) = policy.tick(32)
+    policy.discard(second)
+    assert policy.tick(52)

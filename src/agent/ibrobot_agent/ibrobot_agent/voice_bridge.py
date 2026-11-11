@@ -586,6 +586,11 @@ class VoiceBridgeCore:
         self._deferred_submission: tuple[str, str] | None = None
         self._speech_suppressed: set[str] = set()
         self._receipt_due: dict[str, float] = {}
+        self._accepted_receipts = _BoundedIdSet()
+        self._reply_ready = _BoundedIdSet()
+        self._pending_speech: OrderedDict[int, Speak] = OrderedDict()
+        self._playing_speech = False
+        self._playing_action: Speak | None = None
         self._announced_requests: set[str] = set()
         self._id_factory = id_factory or (lambda: f"voice-{uuid.uuid4().hex[:12]}")
         self._gate = AddresseeGate(
@@ -787,12 +792,18 @@ class VoiceBridgeCore:
             return False
         if action.request_id and action.request_id != self._latest_request_id and not self.config.feedback_only:
             return False
+        if (
+            action.kind == "accepted_receipt"
+            and action.request_id in self._reply_ready
+            and action is not self._playing_action
+        ):
+            return False
+        if action.kind == "accepted_receipt":
+            return action.request_id == self.active_request_id and self._state.stopped_request_id != action.request_id
         if action.kind == "busy_mirror":
             return not self._mirror_idle(now) and not self._mirror_stop_pending and not self._mirror_stop_request_id
         if action.notice is not None and action.event_key.startswith("MIRROR_"):
             return self._mirror_speech_policy.is_current(action.notice, now)
-        if action.notice is not None and self._gift.owns(action.request_id):
-            return self._gift.is_current(action.notice, now)
         if action.notice is not None:
             if (
                 not action.terminal
@@ -803,6 +814,8 @@ class VoiceBridgeCore:
                 )
             ):
                 return False
+            if self._gift.owns(action.request_id):
+                return self._gift.is_current(action.notice, now)
             return self._speech_policy.is_current(action.notice, now)
         return action.kind not in ("busy", "receipt") or (
             action.request_id == self.active_request_id
@@ -1458,10 +1471,15 @@ class VoiceBridgeCore:
                 actions.extend(self._say(_spoken_reply(payload.get("state"), message)))
             return actions
         if payload.get("accepted") is True and request_id == self.active_request_id:
-            # No spoken receipt: admission precedes the plan, so a receipt cannot know whether a
-            # recorded clip, an answer or execution speech follows, and it lands out of order
-            # before the clip or answer that already acknowledges the request.
-            return [Log(f"request {request_id} accepted")]
+            actions = [Log(f"request {request_id} accepted")]
+            if self.config.speak_replies and request_id not in self._accepted_receipts:
+                self._accepted_receipts.add(request_id)
+                actions.append(
+                    self._speech(
+                        "好嘞，我听到了。", request_id=request_id, kind="accepted_receipt", expires_at=now + 30.0
+                    )
+                )
+            return actions
         return []
 
     def on_event(self, payload: dict[str, Any], now: float) -> list[Action]:
@@ -1623,8 +1641,15 @@ class VoiceBridgeCore:
             for n in notices
         ]
 
-    def note_playback(self, action: Speak, now: float) -> None:
-        if (
+    def note_playback(self, action: Speak, now: float, *, finished: bool = False) -> None:
+        self._playing_speech = not finished
+        self._playing_action = None if finished else action
+        self._pending_speech.pop(id(action), None)
+        self._gift.note_playback(
+            now, finished=finished, notice=action.notice if self._gift.owns(action.request_id) else None
+        )
+        self._speech_policy.note_playback(now, finished=finished)
+        if not finished and (
             action.notice is not None
             and not self._gift.owns(action.request_id)
             and not action.event_key.startswith("MIRROR_")
@@ -1698,7 +1723,11 @@ class VoiceBridgeCore:
         ):
             self._ending_session = False
             state.session_id = ""
-        if self.config.speak_replies:
+        self._pending_speech = OrderedDict(
+            (key, action) for key, action in self._pending_speech.items() if self.speech_is_current(action, now)
+        )
+        if self.config.speak_replies and not self._playing_speech and not self._pending_speech:
+            actions += self._notices(self._gift.tick(now))
             actions += self._notices(self._speech_policy.tick(now))
         for request_id, due in list(self._receipt_due.items()):
             if now >= due:
@@ -2048,7 +2077,21 @@ class VoiceBridgeCore:
         kwargs.setdefault("request_id", self._latest_request_id)
         kwargs.setdefault("priority", 20 if kwargs.get("kind") == "terminal" else 10)
         kwargs.setdefault("gate_epoch", self._request_epoch.get(kwargs["request_id"], self._gate_epoch))
-        return Speak(text, generation=self._generation, session_id=self._state.session_id, **kwargs)
+        action = Speak(text, generation=self._generation, session_id=self._state.session_id, **kwargs)
+        self._pending_speech[id(action)] = action
+        while len(self._pending_speech) > 256:
+            self._pending_speech.popitem(last=False)
+        return action
+
+    def discard_speech(self, action: Speak) -> None:
+        self._pending_speech.pop(id(action), None)
+        if action.notice is not None:
+            policy = self._gift if self._gift.owns(action.request_id) else self._speech_policy
+            policy.discard(action.notice)
+
+    def note_speech_ready(self, action: Speak) -> None:
+        if action.kind != "accepted_receipt" and action.request_id:
+            self._reply_ready.add(action.request_id)
 
     def _say(self, text: str, *, kind: str = "reply") -> list[Action]:
         if not text or not self.config.speak_replies:
@@ -2775,7 +2818,12 @@ def _build_node_class():
                         if not self._speech_transport_failed and current:
                             self._request_publisher.publish(String(data=json.dumps(action.payload, ensure_ascii=False)))
                     elif not self._speech_transport_failed and self._speech_is_current(action):
-                        self._speech_pipeline.submit(action)
+                        if not self._speech_pipeline.submit(action):
+                            with self._core_lock:
+                                self._core.discard_speech(action)
+                    elif isinstance(action, Speak):
+                        with self._core_lock:
+                            self._core.discard_speech(action)
                 except Exception as error:
                     self._speech_transport_failed = True
                     self.get_logger().error(f"speech cancellation failed; speech held: {error}")
@@ -2794,15 +2842,34 @@ def _build_node_class():
             return super().destroy_node()
 
         def _prepare_speech(self, action: Speak) -> Any:
+            audio = None
+            try:
+                audio = self._prepare_audio(action)
+                return audio
+            finally:
+                if audio is None:
+                    with self._core_lock:
+                        self._core.discard_speech(action)
+
+        def _prepare_audio(self, action: Speak) -> Any:
             """A recorded line when ``action.text`` is one (and its file exists), else the synthesis."""
             path = choose_recorded_line(action.text, self._spoken_clips, self._spoken_last)
             if path:
-                return _RecordedAudio(path)
+                audio = _RecordedAudio(path)
+                with self._core_lock:
+                    if self._core.speech_is_current(action, time.monotonic()):
+                        self._core.note_speech_ready(action)
+                return audio
             if spoken_key(action.text) in self._spoken_clips:
                 self.get_logger().warning(f"no recorded file left for {action.text!r}; synthesizing it")
-            return self._speaker.synthesize(
+            audio = self._speaker.synthesize(
                 _tts_text(action.text, keep_english=self._tts_keep_english, pronunciations=self._pronunciations)
             )
+            if audio is not None:
+                with self._core_lock:
+                    if self._core.speech_is_current(action, time.monotonic()):
+                        self._core.note_speech_ready(action)
+            return audio
 
         def _render_speech(self, action: Speak, audio: Any) -> bool:
             text = _tts_text(action.text, keep_english=self._tts_keep_english, pronunciations=self._pronunciations)
@@ -2822,6 +2889,7 @@ def _build_node_class():
                     spoken = self._speaker.play(audio)
             finally:
                 with self._core_lock:
+                    self._core.note_playback(action, time.monotonic(), finished=True)
                     self._core.note_speech(action.text, time.monotonic(), finished=True, gate_epoch=action.gate_epoch)
             return spoken
 
