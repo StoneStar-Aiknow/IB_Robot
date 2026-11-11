@@ -15,9 +15,11 @@ import pytest
 
 from embodied_common.mirror_photo_contract import TriggerRequest
 from embodied_common.mirror_session_contract import STATE_MIRRORING, STATE_STALE_SEC, STATE_STANDBY, STATE_WAIT
-from manipulation_execution.mirror_photo.config import EventRule, Limits, PhotoSection
+from manipulation_execution.mirror_photo.config import EventRule, Limits, PhotoSection, StillRule
 from manipulation_execution.mirror_photo.selector import (
     BUFFER_SEC,
+    MAX_PENDING_PEAR,
+    MAX_PENDING_TRIGGERS,
     SCHEMA,
     PhotoCore,
     choose_photo,
@@ -74,8 +76,9 @@ class Round:
 
     def stop(self) -> None:
         self.state(STATE_STANDBY)
-        assert len(self.finished) == 1
-        return self.finished[0]
+        # Return the last finished round; tests may restart rounds mid-way.
+        assert len(self.finished) >= 1
+        return self.finished[-1]
 
     @property
     def kept(self) -> list:
@@ -351,23 +354,23 @@ def test_a_trigger_far_ahead_of_the_camera_is_dropped_an_event_takes_the_newest(
     one.frames(2.0, 2.2, pear=False)
     newest = one.core._round.frames[-1][0]
     one.core.on_pear(newest, STILL_POSE, (10.0, 10.0, 50.0, 40.0))
+    refused_before = one.core._round.refused["no_actor"]
     one.core._offer(one.core._round, Trigger(STILL, STILL, 1.5, 1.0, newest + 5.0))
     one.core.on_event(TriggerRequest("a", "b", stamp=newest + 5.0))
     assert one.core._round.pending == []
-    # Both triggers are far ahead and get no_actor; the still offered first counts as 1
-    assert one.core._round.refused["no_actor"] >= 1
+    assert one.core._round.refused["no_actor"] == refused_before + 1  # the still; the event is kept
     assert one.kept_stamps(EVENT) == [newest]
 
 
 def test_a_trigger_whose_frame_never_comes_is_given_up():
     one = started(quiet())
     one.frames(2.0, 2.2, pear=False)
+    refused_before = one.core._round.refused["no_actor"]
     one.core._offer(one.core._round, Trigger(STILL, STILL, 1.5, 1.0, 2.5))
     assert one.core._round.pending
     one.core.on_image(10.0, FRAME)
     assert not one.core._round.pending
-    # The trigger waits for PEAR_WAIT_SEC (1.5s camera time), then gives up with no_actor
-    assert one.core._round.refused["no_actor"] >= 1
+    assert one.core._round.refused["no_actor"] == refused_before + 1
 
 
 def test_an_event_ahead_of_the_camera_falls_back_to_the_newest_frame():
@@ -386,9 +389,11 @@ def test_a_stamp_older_than_the_buffer_is_late_for_a_gesture_and_the_newest_for_
     one.core.on_pear(newest, STILL_POSE, (10.0, 10.0, 50.0, 40.0))
     # Trigger with stamp 0.5 is older than buffer (BUFFER_SEC = 3.0), so frame at 2.0 has aged out
     # For a gesture, this is "late" because it's outside the time window
+    refused_before = one.core._round.refused["no_actor"]
     one.core._offer(one.core._round, Trigger(GESTURE, "Victory", 1.5, 1.0, 0.5))
     assert one.kept == []
-    assert one.core._round.refused["no_actor"] == 1  # Changed: no anchor for 0.5, so no_actor
+    # Gesture at 0.5 should be refused (warmup may have produced earlier refusals)
+    assert one.core._round.refused["no_actor"] == refused_before + 1
     one.core.on_event(TriggerRequest("a", "b", stamp=0.5))
     assert one.kept_stamps(EVENT) == [newest]
 
@@ -400,24 +405,22 @@ def test_an_event_without_a_stamp_takes_the_newest_frame():
     one.core.on_pear(newest, STILL_POSE, (10.0, 10.0, 50.0, 40.0))
     one.core.on_event(TriggerRequest("a", "b"))
     assert one.kept_stamps(EVENT) == [newest]
-    # Origin is empty string when trigger has no stamp (EVENT source uses empty origin)
-    assert one.kept[0].trigger.origin == ""
+    (event,) = [candidate for candidate in one.kept if candidate.trigger.source == EVENT]
+    assert event.trigger.origin == "a"
 
 
 def test_the_still_rule_runs_from_pear_frames():
-    one = started(quiet())
-    for index in range(20):
-        stamp = 1.5 + index / 30
-        one.core.on_image(stamp, FRAME)
-        one.core.on_pear(stamp, STILL_POSE, (10.0, 20.0, 30.0, 40.0))
-    # Still detection should trigger and create a candidate
-    assert len(one.kept_stamps(STILL)) >= 1
+    one = started(quiet())  # the warm-up already feeds still PEAR frames
+    one.frames(2.0, 2.7)
+    assert len(one.kept_stamps(STILL)) == 1
 
 
 def test_a_malformed_pear_frame_is_ignored():
     one = started(quiet())
-    one.core.on_pear(1.9, np.zeros(10), None)
+    speeds = list(one.core._round.speeds)  # the warm-up's
+    one.core.on_pear(2.0, np.zeros(10), None)  # 2.0: past the warm-up, a good pose here would add a speed
     assert one.core.mirroring
+    assert one.core._round.speeds == speeds
     # Malformed PEAR still updates speeds, just doesn't create an anchor
     # The test name says "ignored", but it only means "not an anchor", speeds are still tracked
 
@@ -433,16 +436,16 @@ def test_the_best_person_box_near_the_frame_goes_with_the_photo():
     assert photo.meta["bbox"] == [100.0, 200.0, 300.0, 400.0]
 
 
-def test_no_person_box_near_the_frame_is_sent_as_none():
+def test_no_person_box_near_the_frame_takes_the_newest_anchor_and_its_box():
+    """Was ``..._is_sent_as_none``: a photo without a box is the bug this design removes."""
     one = started()
     one.frames(2.0, 2.2, pear=False)
     one.core.on_event(TriggerRequest("a", "b"))
     photo, _ = choose_photo(one.stop(), SECTION)
-    # With anchor design: no PEAR frames means no anchors, so fallback uses last camera frame
-    # Since fallback_bbox is None (no anchors were ever created), bbox should be None
-    # But if there was already an anchor from started(), it might have a bbox
-    # Update: this test verifies the case where truly no PEAR data arrives
-    assert photo.meta.get("bbox") is None or photo.meta.get("quality") == "fallback"
+    assert photo.meta["source"] == EVENT
+    assert photo.meta["stamp"] == pytest.approx(29 / FPS)  # the warm-up's last anchor
+    assert photo.meta["bbox"] == [10.0, 10.0, 50.0, 40.0]
+    assert photo.meta["bbox_stamp"] == photo.meta["stamp"]
 
 
 # -- limits ------------------------------------------------------------------------------
@@ -523,8 +526,9 @@ def test_a_full_round_replaces_the_weakest_only_for_a_stronger_trigger():
 
 
 def test_a_cut_frame_is_not_a_candidate_but_the_round_goes_on():
-    one = started(quiet())
+    one = started(quiet(still=StillRule(enabled=False)))
     one.core.on_image(2.0, FRAME[: len(FRAME) // 2])
+    one.core.on_pear(2.0, STILL_POSE, (10.0, 10.0, 50.0, 40.0))  # the cut frame is the newest anchor
     one.core.on_event(TriggerRequest("a", "b"))
     assert one.kept == []
     assert one.core._round.refused["badjpeg"] == 1
@@ -560,16 +564,18 @@ def test_a_gesture_is_chosen_over_a_pose_and_the_rhythm():
     photo, _ = choose_photo(one.stop(), SECTION)
     assert photo.meta["source"] == GESTURE
     assert photo.meta["label"] == "Thumb_Up"
-    assert photo.meta["candidate_sources"] == {UNIFORM: 3, STILL: 1, GESTURE: 1}
+    # The warm-up's PEAR makes a still at 1.533, which takes that frame from the rhythm (same stamp, more weight)
+    assert photo.meta["candidate_sources"] == {UNIFORM: 2, STILL: 2, GESTURE: 1}
 
 
 def test_the_metadata_describes_the_photo():
     image = np.random.default_rng(1).integers(0, 256, (240, 320, 3), dtype=np.uint8)
     data = cv2.imencode(".jpg", image)[1].tobytes()
-    one = Round(quiet())
+    one = Round(quiet(still=StillRule(enabled=False)))
     one.state(STATE_MIRRORING)
     for index in range(40):
         one.core.on_image(index / FPS, data)
+        one.core.on_pear(index / FPS, STILL_POSE, (10.0, 10.0, 50.0, 40.0))
     one.core.on_event(TriggerRequest("preset_motions", "heart", 0.7))
     photo, _ = choose_photo(one.stop(), SECTION)
     assert photo.name == one.finished[0].round_id
@@ -684,31 +690,28 @@ def test_center_fallback_is_not_an_anchor():
 
 def test_gesture_takes_nearest_anchor_within_window():
     """A gesture trigger takes the nearest anchor within GESTURE_MATCH_SEC."""
-    one = started(quiet())
-    one.frames(2.0, 3.0)
+    one = started(quiet(still=StillRule(enabled=False)))
+    one.frames(2.0, 3.0, pear=False)
     one.core.on_pear(2.2, STILL_POSE, (10.0, 20.0, 30.0, 40.0))
-    one.core.on_pear(2.5, STILL_POSE, (10.0, 20.0, 30.0, 40.0))
-    # Hand gesture at 2.35 should take the nearest anchor (2.5 is 0.15 away, 2.2 is 0.15 away, take the later)
+    one.core.on_pear(37 / FPS, STILL_POSE, (10.0, 20.0, 30.0, 40.0))
+    one.core.on_hand(2.05, [("Victory", 0.9)])
     one.core.on_hand(2.35, [("Victory", 0.9)])
-    kept = one.kept_stamps(GESTURE)
-    # Both 2.2 and 2.5 are within 0.3, take the nearest
-    assert len(kept) == 1
-    assert kept[0] in [pytest.approx(2.2), pytest.approx(2.5)]
+    # 2.2 is 0.15 away, 37/15 is 0.117 away, the warm-up's 1.933 is out of the window
+    assert one.kept_stamps(GESTURE) == [37 / FPS]
+    assert one.kept[0].bbox == (10.0, 20.0, 30.0, 40.0)
 
 
 def test_fallback_bbox_is_first_anchor():
     """The first anchor's bbox becomes the fallback_bbox for this round."""
-    one = started(quiet())
-    one.frames(2.0, 3.0)
+    one = started(quiet(still=StillRule(enabled=False)))
+    one.frames(2.0, 3.0, pear=False)
     one.core.on_pear(2.2, STILL_POSE, (100.0, 200.0, 300.0, 400.0))
-    one.core.on_pear(2.5, STILL_POSE, (10.0, 20.0, 30.0, 40.0))
-    # No candidates triggered, round ends
     finished = one.stop()
-    # The fallback should use last_anchor or fallback_bbox
+    assert finished.candidates == ()
+    assert finished.fallback_bbox == ((10.0, 10.0, 50.0, 40.0), 1 / FPS)  # the warm-up's first anchor
     photo, _ = choose_photo(finished, SECTION)
-    # Should have bbox from one of the anchors
-    assert photo.meta["bbox"] is not None
     assert photo.meta["quality"] == "fallback"
+    assert photo.meta["bbox"] == [100.0, 200.0, 300.0, 400.0]  # last_anchor's own
 
 
 def test_no_anchors_uses_fallback_bbox():
@@ -808,6 +811,44 @@ def test_bbox_stamp_equals_stamp_for_normal_photos():
 
 
 # -- The big invariant test with random interleaving -------------------------------------
+
+
+def test_a_round_ending_with_a_waiting_trigger_decides_it_and_ends():
+    """A trigger still waiting for its anchor when the round ends is decided on the spot, not waited for again.
+
+    It used to be put back on the very list being walked, so the round never ended and memory grew without bound.
+    """
+    one = started(quiet())
+    newest = one.core._round.frames[-1][0]
+    refused_before = one.core._round.refused["no_actor"]
+    one.core._offer(one.core._round, Trigger(UNIFORM, UNIFORM, 1.0, 1.0, newest + 0.5))
+    one.core._offer(one.core._round, Trigger(UNIFORM, UNIFORM, 1.0, 1.0, newest + 0.05))
+    assert len(one.core._round.pending) == 2
+    finished = one.stop()
+    assert [candidate.stamp for candidate in finished.candidates] == [newest]  # the one with an anchor in its window
+    assert finished.refused["no_actor"] == refused_before + 1  # the other: none within MATCH_SEC
+
+
+def test_a_waiting_trigger_is_decided_once_the_camera_is_past_the_wait():
+    one = started(quiet())
+    newest = one.core._round.frames[-1][0]
+    one.core._offer(one.core._round, Trigger(UNIFORM, UNIFORM, 1.0, 1.0, newest + 0.05))
+    one.frames(2.0, 4.0, pear=False)  # camera moves on, no new anchor
+    assert one.core._round.pending == []
+    assert [candidate.stamp for candidate in one.kept] == [newest]
+
+
+def test_the_waiting_queues_are_capped_while_the_camera_stalls():
+    one = started(quiet())
+    newest = one.core._round.frames[-1][0]
+    for index in range(MAX_PENDING_TRIGGERS + 10):
+        one.core._offer(one.core._round, Trigger(UNIFORM, UNIFORM, 1.0, 1.0, newest + 0.001 * (index + 1)))
+    for index in range(MAX_PENDING_PEAR + 10):
+        one.core.on_pear(newest + 0.01 * (index + 1), STILL_POSE, (10.0, 10.0, 50.0, 40.0))
+    assert len(one.core._round.pending) == MAX_PENDING_TRIGGERS
+    assert len(one.core._round.pending_pear) == MAX_PENDING_PEAR
+    assert one.core._round.refused["pending_full"] == 20
+    one.stop()
 
 
 def test_anchor_invariant_200_seeds():

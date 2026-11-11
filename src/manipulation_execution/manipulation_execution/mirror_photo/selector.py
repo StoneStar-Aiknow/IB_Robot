@@ -53,10 +53,14 @@ PENDING_SEC = 1.0
 PEAR_PENDING_SEC = 1.0
 # Trigger waiting for anchor: give up after this much camera time.
 PEAR_WAIT_SEC = 1.5
+# Hard caps on the two waiting queues. Normally they drain as camera time moves (a trigger waits at most
+# PEAR_WAIT_SEC, a PEAR frame at most PEAR_PENDING_SEC); these hold even when the camera stalls.
+MAX_PENDING_TRIGGERS = 64
+MAX_PENDING_PEAR = 64
 # PEAR speed and person box for a candidate: the nearest sample within this.
 SAMPLE_SEC = 0.25
 RATE_WINDOW_SEC = 60.0
-REFUSALS = ("warmup", "rate", "nomatch", "late", "badjpeg", "duplicate", "full", "no_actor", "pear_unmatched", "bad_bbox")
+REFUSALS = ("warmup", "rate", "nomatch", "late", "badjpeg", "duplicate", "full", "no_actor", "pear_unmatched", "bad_bbox", "pending_full")
 
 
 @dataclass(frozen=True)
@@ -192,9 +196,10 @@ class PhotoCore:
     def _end_round(self, reason: str) -> None:
         current, self._round = self._round, None
 
-        # Resolve any remaining pending triggers at round end
-        for trigger in current.pending:
-            anchor = self._anchor_for(current, trigger)
+        # Resolve any remaining pending triggers at round end, with the anchors we have: no more waiting
+        waiting, current.pending = current.pending, []
+        for trigger in waiting:
+            anchor = self._anchor_for(current, trigger, final=True)
             if anchor is not None:
                 stamp_a, jpeg_a, bbox_a = anchor
                 self._keep(current, Candidate(trigger, stamp_a, jpeg_a, bbox_a))
@@ -322,6 +327,9 @@ class PhotoCore:
                     elif not current.frames or stamp > current.frames[-1][0]:
                         # PEAR ahead of camera: pend if within window
                         if not current.frames or stamp - current.frames[-1][0] <= PEAR_PENDING_SEC:
+                            if len(current.pending_pear) >= MAX_PENDING_PEAR:
+                                current.pending_pear.popleft()  # the oldest can no longer pair anyway
+                                current.refused["pending_full"] += 1
                             current.pending_pear.append((stamp, bbox_tuple))
                         # else: too far ahead, drop
                     else:
@@ -388,20 +396,23 @@ class PhotoCore:
         stamp, jpeg, bbox = anchor
         self._keep(current, Candidate(trigger, stamp, jpeg, bbox))
 
-    def _anchor_for(self, current: _Round, trigger: Trigger) -> tuple[float, bytes, tuple[float, float, float, float]] | None:
-        """Find the anchor for this trigger; None if no match or pending."""
+    def _anchor_for(
+        self, current: _Round, trigger: Trigger, *, final: bool = False
+    ) -> tuple[float, bytes, tuple[float, float, float, float]] | None:
+        """Find the anchor for this trigger; None if refused or pending.
+
+        ``final``: the round is ending, decide with the anchors we have instead of waiting.
+        """
         anchors = current.anchors
+        newest_camera = current.frames[-1][0] if current.frames else 0.0
         if not anchors:
-            # No anchors yet: if trigger has no stamp, refuse now
-            if trigger.stamp is None:
-                current.refused["no_actor"] += 1
-                return None
-            # Try pending if ahead of camera within wait window
-            newest_camera = current.frames[-1][0] if current.frames else 0.0
-            if trigger.stamp > newest_camera and trigger.stamp - newest_camera <= PEAR_WAIT_SEC:
-                current.pending.append(trigger)
-                return None
-            # Otherwise refuse
+            # No anchors yet: for event, fall back to newest camera frame with fallback bbox
+            if trigger.source == EVENT and current.frames and current.fallback_bbox:
+                stamp, jpeg = current.frames[-1]
+                bbox, _ = current.fallback_bbox
+                return (stamp, jpeg, bbox)
+            if trigger.stamp is not None and not final and _may_wait(trigger.stamp, newest_camera):
+                return self._pend(current, trigger)
             current.refused["no_actor"] += 1
             return None
 
@@ -415,25 +426,11 @@ class PhotoCore:
         )
         anchor = _nearest_anchor(anchors, trigger.stamp, tolerance)
 
-        # Found an anchor at or after the trigger stamp
-        if anchor is not None and anchor[0] >= trigger.stamp:
-            return anchor
+        # No anchor at or after the trigger yet: PEAR lags the camera, a nearer one may still come
+        if trigger.stamp > anchors[-1][0] and not final and _may_wait(trigger.stamp, newest_camera):
+            return self._pend(current, trigger)
 
-        # Trigger stamp is ahead of the newest anchor
-        newest_anchor_stamp = anchors[-1][0]
-        newest_camera = current.frames[-1][0] if current.frames else 0.0
-        if trigger.stamp > newest_anchor_stamp:
-            # Wait for a future anchor if within wait window
-            if trigger.stamp - newest_camera <= PEAR_WAIT_SEC:
-                current.pending.append(trigger)
-                return None
-            # Event gets the newest anchor regardless
-            if trigger.source == EVENT:
-                return anchors[-1]
-            current.refused["no_actor"] += 1
-            return None
-
-        # Found an anchor before the trigger
+        # Decide now: nearest anchor in the window
         if anchor is not None:
             return anchor
 
@@ -441,6 +438,13 @@ class PhotoCore:
         if trigger.source == EVENT:
             return anchors[-1]
         current.refused["no_actor"] += 1
+        return None
+
+    def _pend(self, current: _Round, trigger: Trigger) -> None:
+        if len(current.pending) >= MAX_PENDING_TRIGGERS:
+            current.refused["pending_full"] += 1
+            return None
+        current.pending.append(trigger)
         return None
 
     def _resolve_pending(self, current: _Round, stamp: float) -> None:
@@ -523,6 +527,11 @@ class PhotoCore:
                 "pending": len(current.pending),
             }
         return status
+
+
+def _may_wait(trigger_stamp: float, camera: float) -> bool:
+    """A trigger waits for its anchor until camera time is PEAR_WAIT_SEC past it (and is not absurdly ahead)."""
+    return -PEAR_WAIT_SEC <= camera - trigger_stamp < PEAR_WAIT_SEC
 
 
 def _nearest_anchor(
