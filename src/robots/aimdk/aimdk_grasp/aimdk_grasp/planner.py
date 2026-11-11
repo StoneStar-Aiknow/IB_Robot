@@ -32,8 +32,12 @@ from .trajectory import TimedTrajectory
 #: other arm's hand ~12 mm but a finger ~1 mm, and the OmniHand thumb comes to
 #: rest anywhere within ~0.05 rad of the open preset after every reopening
 #: (live 2026-11-06: hand=0.0319 rad rebuilt the planner inside a request, 39 s).
-#: 5 mm is a quarter of the optimizer's 0.02 m collision activation distance.
-LOCKED_SPHERE_SHIFT_M = 0.005
+#: 10 mm is half of the optimizer's 0.02 m collision activation distance. It was
+#: 5 mm until the head built its planners for the pick entry pose's targets
+#: (grasp_head._planning_feedback): measured at grasp_ready the other arm sat
+#: 0.012-0.020 rad (shoulder pitch) off its target, 3.9-7.0 mm of sphere motion
+#: (17 picks, new X2, 2026-11-10), and units differ.
+LOCKED_SPHERE_SHIFT_M = 0.010
 #: How much of one refused place candidate's reason its report keeps.
 PLACE_FAILURE_CHARS = 700
 #: How far (rad) past a model joint bound a measured planning-arm start may be
@@ -1555,7 +1559,7 @@ class LeftArmPlanner:
         positions = np.concatenate([batch[1] for batch in batches])
         return self._fine_valid_states(success, positions)[0].any(axis=1)
 
-    def local_branch_margin(self, feedback, camera_from_grasps, base_from_camera, offset_m, iterations=40):
+    def local_branch_margin(self, feedback, camera_from_grasps, base_from_camera, offset_m, iterations=12):
         """Per candidate: the joint-limit margin (rad) of its approach pose in the measured start's branch.
 
         Damped least squares (_dls_update) from the measured start toward each
@@ -1564,6 +1568,13 @@ class LeftArmPlanner:
         does not converge. Ranking only: live 2026-11-09 NX8 the only
         reachable way to a palm facing straight back in this branch held the
         wrist roll on its limit, so TrajOpt raised the shoulder to 2.8 rad.
+
+        Each update is one batched FK round trip (~6.4 ms on the Orin), so the
+        cost is the iteration count, not the candidates. Replay of the 33
+        planned 2026-11-10 X2 picks (281 candidates, Orin): from 10 updates on
+        every margin and every converged/below-0.10 rad ranking equals the
+        former 40 (at 8 the margins differ by up to 3 mrad, at 5 twelve
+        rankings change); 12 keeps a margin and saves ~0.19 s per pick.
         """
         grasps = np.asarray(camera_from_grasps, dtype=float)
         if not len(grasps):

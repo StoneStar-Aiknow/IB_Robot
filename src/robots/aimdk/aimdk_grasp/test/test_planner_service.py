@@ -1341,3 +1341,36 @@ def test_idle_refresh_rebuilds_only_a_moved_snapshot_and_never_waits_for_a_busy_
         release.set()
         held.result()
     assert service.refresh("b", estimate) and built == ["a", "b"]
+
+
+def test_a_preload_never_rebuilds_a_planner_built_for_another_locked_pose():
+    """A prefetch capture before the arms reach the pick entry pose must not replace that pose's planner."""
+    built, loaded = [], []
+
+    class Planner:
+        def __init__(self, feedback, estimate, received_at, **options):
+            self.locked, self._closed = feedback, False
+            built.append(feedback)
+
+        def locked_joints_match(self, feedback):
+            return feedback == self.locked
+
+        def warmup(self):
+            pass
+
+        def update_scene(self, feedback, estimate):
+            loaded.append(feedback)
+
+        def load_validation_scene(self):
+            loaded.append("fine")
+
+        def close(self):
+            self._closed = True
+
+    service = GraspPlanningService(gripper=GRIPPER, planner_factory=Planner)
+    assert service.preload("entry", SimpleNamespace(received_at=1.0)) and built == ["entry"]  # none built yet: builds
+    assert not service.preload("rest", SimpleNamespace(received_at=2.0))  # another pose: nothing loaded, no rebuild
+    assert built == ["entry"] and loaded == ["fine"]
+    assert service.preload("entry", SimpleNamespace(received_at=3.0)) and loaded == ["fine", "entry", "fine"]
+    service.prepare("rest", SimpleNamespace(received_at=4.0))  # a plan's own prepare still rebuilds
+    assert built == ["entry", "rest"]

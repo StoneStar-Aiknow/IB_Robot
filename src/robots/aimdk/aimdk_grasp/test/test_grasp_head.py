@@ -463,3 +463,61 @@ def test_the_planner_refresh_never_overlaps_a_head_call():
         assert not entered.wait(0.2)
     assert entered.wait(2.0)
     caller.join(2.0)
+
+
+def entry_head(monkeypatch, entry):
+    """A head node without ROS: only what _planning_feedback/_prepare_planners use."""
+    node = object.__new__(grasp_head.X2GraspHeadNode)
+    node._pick_entry, node._robot = entry, SimpleNamespace(side="left")
+    logged = []
+    node.get_logger = lambda: SimpleNamespace(info=logged.append, warning=logged.append)
+    presets = {"left": np.full(10, 0.1), "right": np.full(10, 0.2)}
+    monkeypatch.setattr(
+        "aimdk_grasp.backend.robot_for_side",
+        lambda robot, side: SimpleNamespace(hand=SimpleNamespace(preset=lambda name: presets[side])),
+    )
+    return node, logged
+
+
+ENTRY = {
+    "name": "grasp_ready",
+    "joint_positions": {"right_shoulder_pitch_joint": -0.0554, "left_elbow_joint": -1.45},
+    "hands": {"left": "open", "right": "open"},
+}
+
+
+def test_planners_are_built_for_the_pick_entry_pose_not_where_the_arms_rest(monkeypatch):
+    from aimdk_grasp.feedback import Feedback
+
+    node, _ = entry_head(monkeypatch, ENTRY)
+    measured = Feedback(
+        1.0, {"right_shoulder_pitch_joint": 0.36, "left_elbow_joint": -1.16, "head_yaw": 0.0}, np.zeros(10)
+    )
+    planning = node._planning_feedback(measured)
+    assert planning.positions == {"right_shoulder_pitch_joint": -0.0554, "left_elbow_joint": -1.45, "head_yaw": 0.0}
+    np.testing.assert_allclose(planning.left_hand, 0.1)
+    assert planning.right_hand is None  # not installed: stays absent
+    assert planning.received_at == measured.received_at and measured.positions["left_elbow_joint"] == -1.16
+    node._pick_entry = None
+    assert node._planning_feedback(measured) is measured
+
+
+def test_a_failed_entry_pose_build_falls_back_to_the_measured_pose(monkeypatch):
+    from aimdk_grasp.feedback import Feedback
+
+    node, logged = entry_head(monkeypatch, ENTRY)
+    measured = Feedback(1.0, {"right_shoulder_pitch_joint": 0.36, "left_elbow_joint": -1.16}, np.zeros(10))
+    built = []
+
+    def prepare(feedback, estimate):
+        built.append(feedback.positions["left_elbow_joint"])
+        if feedback is not measured:
+            raise RuntimeError("start state in collision")
+
+    node._prepare_planners(SimpleNamespace(service=SimpleNamespace(prepare=prepare)), measured, "scene")
+    assert built == [-1.45, -1.16] and "built for the measured pose" in logged[-1]
+    built.clear()
+    node._prepare_planners(
+        SimpleNamespace(service=SimpleNamespace(prepare=lambda f, e: built.append(f))), measured, "scene"
+    )
+    assert built[0].positions["left_elbow_joint"] == -1.45 and "pick entry pose 'grasp_ready'" in logged[-1]

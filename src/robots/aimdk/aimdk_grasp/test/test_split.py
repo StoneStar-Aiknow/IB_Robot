@@ -163,3 +163,20 @@ def test_the_head_binds_to_the_runtime_the_robot_side_host_runs_and_refuses_any_
     with pytest.raises(RuntimeError, match="binds an aimdk_robot runtime"):
         module.launch_setup(context)
     assert len(bound) == 2  # refused before binding anything
+
+
+def test_the_head_is_told_the_pick_entry_pose():
+    targets = {"left_elbow_joint": -1.45, "right_elbow_joint": -1.45}
+    config = {
+        "task_poses": {
+            "skill_entry_poses": {"pick_object": "grasp_ready"},
+            "poses": {"grasp_ready": {"joint_positions": targets, "hands": {"left": "open"}, "timeout_sec": 30.0}},
+        }
+    }
+    assert split.pick_entry_pose(config) == {
+        "name": "grasp_ready",
+        "joint_positions": targets,
+        "hands": {"left": "open"},
+    }
+    assert split.pick_entry_pose({}) == {}
+    assert split.pick_entry_pose({"task_poses": {"poses": {}, "skill_entry_poses": {}}}) == {}

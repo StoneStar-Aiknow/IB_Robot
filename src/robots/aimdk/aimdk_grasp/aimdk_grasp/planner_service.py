@@ -243,12 +243,29 @@ class GraspPlanningService:
 
         plan with the same estimate then finds both in place; the fine mesh
         would otherwise be built and installed at its first fine check.
+
+        Never rebuilds a built planner: returns False (nothing loaded) when its
+        locked joints do not match ``feedback``. A preload serves a capture
+        that may be taken before the arms reach the pick entry pose (the
+        perception prefetch starts with the pose preparation): live in the
+        2026-11-11 mock it rebuilt the planner the head had built for that pose
+        for the arms' earlier rest pose (~50 s, the first attempt timed out),
+        and the plan, at the entry pose, would have used the first one. The
+        plan call itself still rebuilds when its own feedback needs it.
         """
         with self._lock:
+            planner = self._planner
+            if (
+                planner is not None
+                and not getattr(planner, "_closed", False)
+                and not self._locked_match(feedback, False)
+            ):
+                return False
             self.prepare(feedback, estimate)
             load = getattr(self._planner, "load_validation_scene", None)
             if load is not None:
                 load()
+            return True
 
     def needs_rebuild(self, feedback):
         """Whether the next empty-hand request would rebuild the planner; None while the service is busy.

@@ -159,6 +159,20 @@ def isolate_launch_cpus(head: HeadOptions) -> None:
         os.sched_setaffinity(int(task), isolation.others)
 
 
+def pick_entry_pose(robot_config: Mapping[str, Any]) -> dict:
+    """The task pose every pick starts from (task_poses.skill_entry_poses.pick_object), or {} without one.
+
+    {"name", "joint_positions" (arm joint -> rad target), "hands" (side -> preset)}: the grasp head
+    builds its planners for it, so the first pick after the move there plans at once.
+    """
+    poses = robot_config.get("task_poses") or {}
+    name = (poses.get("skill_entry_poses") or {}).get("pick_object")
+    if not name:
+        return {}
+    pose = poses["poses"][name]
+    return {"name": name, "joint_positions": dict(pose["joint_positions"]), "hands": dict(pose.get("hands") or {})}
+
+
 def head_node(robot_config: Mapping[str, Any], head: HeadOptions):
     """The grasp head node, bound to the robot's live interface description and pinned to its cores."""
     from launch_ros.actions import Node
@@ -175,6 +189,7 @@ def head_node(robot_config: Mapping[str, Any], head: HeadOptions):
             {
                 "grasp_execution_json": json.dumps(robot_config.get("grasp_execution") or {}),
                 "interface_description_json": json.dumps(description),
+                "pick_entry_pose_json": json.dumps(pick_entry_pose(robot_config)),
             }
         ],
         prefix=None if isolation is None else "taskset -c " + ",".join(map(str, sorted(isolation.node))),
