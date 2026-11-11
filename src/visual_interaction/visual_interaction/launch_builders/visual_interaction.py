@@ -28,7 +28,10 @@ starts the same node in its look mode (``session.look_say``) when this section
 itself is not enabled: InternVL, never the fake, with the camera and topics of
 this section and a ``nice`` prefix so the mirror's data plane comes first. With
 both on, only this section's node runs. Without the block, or with it off,
-nothing here changes.
+nothing here changes. ``look.max_per_round: auto`` becomes a number here, from
+the operator's ``max_session_s`` read as its node reads it (mirror_session's
+``operator_max_session_s``), so the lines fill the whole session; INFO says
+which, and with no limit to read a WARNING falls back to 8.
 """
 
 from __future__ import annotations
@@ -366,7 +369,40 @@ def _look_bundle(robot_config: Mapping[str, object]):
         return None
     for warning in bundle.warnings:
         _logger().warning(warning)
-    return bundle.settings.look, look_json(bundle.settings, bundle.table)
+    settings = _resolve_per_round(robot_config, bundle.settings)
+    return settings.look, look_json(settings, bundle.table)
+
+
+def _resolve_per_round(robot_config: Mapping[str, object], settings):
+    """``settings`` with ``look.max_per_round: auto`` turned into a number."""
+    from dataclasses import replace
+
+    from embodied_common.internvl_voice_contract import (
+        FALLBACK_PER_ROUND,
+        PER_ROUND_AUTO,
+        SECTION_PATH,
+        per_round_for_session,
+    )
+
+    look = settings.look
+    if look.max_per_round != PER_ROUND_AUTO:
+        return settings
+    where = f"{SECTION_PATH}.look.max_per_round auto"
+    try:
+        from manipulation_execution.launch_builders.mirror_session import operator_max_session_s
+
+        max_session_s, path = operator_max_session_s(robot_config)
+    except Exception as exc:  # noqa: BLE001 - the look still starts, with the fallback
+        count, why = None, f"{type(exc).__name__}: {exc}"
+    else:
+        count = per_round_for_session(look, max_session_s)
+        why = f"max_session_s={max_session_s} from {path or 'no operator node'}"
+    if count is None:
+        _logger().warning(f"{where} -> {FALLBACK_PER_ROUND}: no session limit to fill ({why})")
+        count = FALLBACK_PER_ROUND
+    else:
+        _logger().info(f"{where} -> {count} ({why})")
+    return replace(settings, look=replace(look, max_per_round=count))
 
 
 def _look_nodes(robot_config: Mapping[str, object], look, look_json: str) -> list:

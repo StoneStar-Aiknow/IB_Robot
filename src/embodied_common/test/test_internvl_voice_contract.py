@@ -232,6 +232,8 @@ class TestLook:
             ("nice", 2.5),
             ("crop_actor", "yes"),
             ("max_per_round", 0),
+            ("max_per_round", 61),
+            ("max_per_round", "Auto"),
             ("gap_sec", [6.0, 3.0]),
             ("dump_dir", None),
             ("demo_root", ""),
@@ -255,6 +257,15 @@ class TestLook:
 
         assert warnings == []
         assert getattr(settings.look, key) == float(value)
+
+    @pytest.mark.parametrize("value", ["auto", 1, 60])
+    def test_max_per_round_may_be_auto_or_up_to_60(self, value):
+        look = dict(_section()["look"], max_per_round=value)
+
+        settings, warnings = contract.normalize(_section(look=look))
+
+        assert warnings == []
+        assert settings.look.max_per_round == value
 
     def test_look_enabled_typo_warns_and_is_on(self):
         look = dict(_section()["look"], enabled="ture")
@@ -667,6 +678,24 @@ class TestLookJson:
         with pytest.raises(ValueError, match="look is off"):
             contract.look_json(settings, table)
 
+    def test_an_unresolved_auto_has_no_json(self, settings_and_table):
+        """Only the launch builder knows the session limit; the node must get a number."""
+        _, table = settings_and_table
+        settings, _ = contract.normalize(_section(look=dict(_section()["look"], max_per_round="auto")))
+
+        with pytest.raises(ValueError, match="still auto"):
+            contract.look_json(settings, table)
+
+    @pytest.mark.parametrize(("value", "kept"), [(40, 40), (60, 60), ("auto", 8), (61, 8)])
+    def test_the_json_takes_a_resolved_number_only(self, settings_and_table, value, kept):
+        data = json.loads(contract.look_json(*settings_and_table))
+        data["max_per_round"] = value
+
+        parsed, warnings = contract.parse_look_json(json.dumps(data))
+
+        assert parsed["max_per_round"] == kept
+        assert len(warnings) == (kept != value)
+
     def test_bad_fields_and_foreign_pools_are_dropped(self, settings_and_table):
         data = json.loads(contract.look_json(*settings_and_table))
         data["nice"] = "low"
@@ -686,3 +715,19 @@ class TestLookJson:
         assert warnings
         assert data["pools"] == {}
         assert data["round_period_sec"] == 0.0
+
+
+class TestPerRoundForSession:
+    """``auto``: one line per shortest gap over the whole session, so the round never goes quiet early."""
+
+    @pytest.mark.parametrize(("max_session_s", "expected"), [(60.0, 24), (100.0, 40), (101.0, 41), (1.0, 1)])
+    def test_the_session_over_the_shortest_gap_rounded_up(self, max_session_s, expected):
+        assert contract.per_round_for_session(contract.LookSettings(), max_session_s) == expected
+
+    def test_it_is_at_most_60(self):
+        assert contract.per_round_for_session(contract.LookSettings(), 1000.0) == 60
+        assert contract.per_round_for_session(contract.LookSettings(gap_sec=(0.0, 1.0)), 100.0) == 60
+
+    @pytest.mark.parametrize("max_session_s", [0.0, -1.0])
+    def test_no_session_limit_is_none(self, max_session_s):
+        assert contract.per_round_for_session(contract.LookSettings(), max_session_s) is None

@@ -90,11 +90,16 @@ class TestTheBlock:
 
         Except asr: feat/x2-retarget-tune deploys "session", the mode that stopped the
         STANDBY/MIRRORING stalls on the robot. And zll (11-10) turned the key actions on,
-        with the v2 table that has their lines.
+        with the v2 table that has their lines. max_per_round is auto: the lines fill the
+        operator's session limit (11-11, 100 s); 8 is only its fallback.
         """
         settings = contract.normalize(config["internvl_voice"])[0]
         defaults = contract.Settings()
-        look = replace(defaults.look, key_actions=replace(defaults.look.key_actions, enabled=True))
+        look = replace(
+            defaults.look,
+            max_per_round=contract.PER_ROUND_AUTO,
+            key_actions=replace(defaults.look.key_actions, enabled=True),
+        )
 
         assert settings == replace(
             defaults,

@@ -442,7 +442,7 @@ robot:
       verify: true               # yes/no check before a line that names a gesture
       first_after_sec: [1.0, 2.5]
       gap_sec: [2.5, 5.0]
-      max_per_round: 8
+      max_per_round: auto        # fill mirror_session operator max_session_s (demo.yaml); 8 if none
       fresh_sec: 5.0
       pool_cooldown_sec: 10.0
       fallback_after_sec: 1.5

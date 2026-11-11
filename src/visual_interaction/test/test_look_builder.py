@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import subprocess
 import types
 from pathlib import Path
 
 import pytest
+import yaml
 from test_launch_builder import config, node_parameters
 
 from visual_interaction.launch_builders import visual_interaction as builder
@@ -24,6 +26,8 @@ BASELINE = "676fa608"
 _BUILDER_PATH = "src/visual_interaction/visual_interaction/launch_builders/visual_interaction.py"
 _REPO = Path(__file__).resolve().parents[3]
 _HALF = "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed"
+_DEMO = _REPO / "src" / "robot_config" / "config" / "mirror_session" / "demo.yaml"
+_ROBOTS = _REPO / "src" / "robot_config" / "config" / "robots"
 _TOPIC_SOURCE = {
     "topic": _HALF,
     "qos": {"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 5},
@@ -251,17 +255,112 @@ def test_a_motion_producer_beside_the_look_costs_the_look_only(logged):
     assert [warning for warning in logged.warnings if "no look" in warning and "observation-only" in warning]
 
 
-def test_the_shipped_voice_mirror_all_config_launches_the_look(logged):
-    """The real merge chain: visual_interaction off, internvl_voice.look on."""
+def _shipped(entry: str) -> dict:
+    """An entry through its real merge chain, bound to the test runtime."""
     try:
         from robot_config.loader import _load_robot_section
     except ImportError as error:
         pytest.skip(f"robot_config's loader needs the workspace packages: {error}")
-    path = _REPO / "src" / "robot_config" / "config" / "robots" / "aimdk_x2_voice_mirror_all.yaml"
-    _, robot = _load_robot_section(path)
+    _, robot = _load_robot_section(_ROBOTS / entry)
     robot.setdefault("runtime", {})["interface_description"] = config()["runtime"]["interface_description"]
-    (node,) = generate_visual_interaction_nodes(robot)
+    return robot
+
+
+@pytest.fixture
+def installed(monkeypatch):
+    """``$(find <package>)`` in the business config path resolves to the source tree."""
+    import ament_index_python.packages
+
+    monkeypatch.setattr(ament_index_python.packages, "get_package_share_directory", lambda p: str(_REPO / "src" / p))
+
+
+def test_the_shipped_voice_mirror_all_config_launches_the_look(logged, installed):
+    """The real merge chain: visual_interaction off, internvl_voice.look on."""
+    (node,) = generate_visual_interaction_nodes(_shipped("aimdk_x2_voice_mirror_all.yaml"))
     parameters = node_parameters(node)
     assert parameters["vl_implementation"] == "internvl"
     assert parameters["camera_topic"] == _HALF
     assert describe(node)["prefix"] == [("TextSubstitution", "'nice -n 10'")]
+
+
+# ---------------------------------------------------------------------------
+# max_per_round: auto fills the operator's session limit (demo.yaml).
+
+
+def _look_json(robot) -> dict:
+    (node,) = generate_visual_interaction_nodes(robot)
+    return json.loads(node_parameters(node)["look_json"])
+
+
+def _per_round_lines(log) -> list[str]:
+    return [line for line in log.infos if "max_per_round" in line]
+
+
+@pytest.mark.parametrize(
+    "entry", ["aimdk_x2_voice_mirror_all.yaml", "aimdk_x2_voice_mirror_grasp.yaml", "aimdk_x2_summit.yaml"]
+)
+def test_the_shipped_entries_fill_the_demo_session(logged, installed, entry):
+    """summit -> voice_mirror_grasp -> voice_mirror_all: auto reaches every entry and reads demo.yaml.
+
+    The session length is written in demo.yaml only (100 s on 11-11: 40 lines); this follows it.
+    """
+    max_session_s = float(yaml.safe_load(_DEMO.read_text(encoding="utf-8"))["operator"]["max_session_s"])
+    robot = _shipped(entry)
+    assert robot["internvl_voice"]["look"]["max_per_round"] == "auto"
+    lines = math.ceil(max_session_s / robot["internvl_voice"]["look"]["gap_sec"][0])
+
+    assert _look_json(robot)["max_per_round"] == lines
+    assert _per_round_lines(logged) == [
+        f"internvl_voice.look.max_per_round auto -> {lines} (max_session_s={max_session_s} from {_DEMO})"
+    ]
+    assert not [warning for warning in logged.warnings if "max_per_round" in warning]
+
+
+@pytest.mark.parametrize(("max_session_s", "lines"), [(60.0, 24), (100.0, 40)])
+def test_the_line_count_follows_the_operator_s_limit(logged, installed, tmp_path, max_session_s, lines):
+    """One number in demo.yaml moves both: the operator's timeout and the look's line count.
+
+    The operator node is given this same file (manipulation_execution's
+    test_mirror_session_launch_builder, TestOperatorMaxSession); here it is read as that node reads it.
+    """
+    from manipulation_execution.mirror_operator.config import OperatorConfig
+    from manipulation_execution.mirror_session.business import load_business_config
+
+    business = yaml.safe_load(_DEMO.read_text(encoding="utf-8"))
+    business["operator"]["max_session_s"] = max_session_s
+    demo = tmp_path / "demo.yaml"
+    demo.write_text(yaml.safe_dump(business), encoding="utf-8")
+    robot = _shipped("aimdk_x2_summit.yaml")
+    robot["mirror_session"]["business"]["config"] = str(demo)
+
+    timeout = OperatorConfig.from_mapping(load_business_config(str(demo)).operator).max_session_s
+
+    assert timeout == max_session_s
+    assert _look_json(robot)["max_per_round"] == lines
+    assert _per_round_lines(logged) == [
+        f"internvl_voice.look.max_per_round auto -> {lines} (max_session_s={max_session_s} from {demo})"
+    ]
+
+
+def test_a_number_is_kept_and_reads_no_session(logged):
+    assert _look_json(look_config(max_per_round=12))["max_per_round"] == 12
+    assert _per_round_lines(logged) == []
+
+
+@pytest.mark.parametrize(
+    ("mirror_session", "why"),
+    [
+        (None, "no operator node"),
+        ({"enabled": True, "operator": {"enabled": True}, "business": {"config": "/nowhere/demo.yaml"}}, "cannot"),
+    ],
+    ids=["no-session", "unreadable"],
+)
+def test_auto_without_a_limit_falls_back_to_8_and_warns(logged, mirror_session, why):
+    robot = look_config(max_per_round="auto")
+    if mirror_session is not None:
+        robot["mirror_session"] = mirror_session
+
+    assert _look_json(robot)["max_per_round"] == 8
+    (warning,) = [warning for warning in logged.warnings if "max_per_round" in warning]
+    assert warning.startswith("internvl_voice.look.max_per_round auto -> 8: no session limit to fill (")
+    assert why in warning

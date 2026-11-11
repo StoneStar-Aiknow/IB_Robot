@@ -84,6 +84,10 @@ when the configured table is unusable). Left out or ``enabled: false``, the
 parameters are exactly the 676fa608 ones. It needs the voice node: without
 ``mirror_session.voice.enabled`` a WARNING says so and nothing more starts.
 
+``operator_max_session_s`` reads the operator's session limit the way its
+node will (``load_business_config`` and ``OperatorConfig``, same file), for
+visual_interaction's ``look.max_per_round: auto``.
+
 ``photo.enabled`` (feat/x2-photo-capture) appends the photo node (one photo
 per MIRRORING round, sent to the upper PC) after the voice node, wired in
 ``launch_builders.mirror_photo``. Like the voice it is an extra: any error
@@ -282,6 +286,27 @@ def _operator_parameters(robot_config: Mapping, config: Mapping, session: Mappin
         **_gateway_names(robot_config),
         "status_period_sec": session["status_period_sec"],
     }
+
+
+def operator_max_session_s(robot_config: Mapping) -> tuple[float, str]:
+    """``max_session_s`` of the operator node this config launches, and the file it is read from.
+
+    0.0 (no limit) when no operator node is launched. Raises ``ValueError``
+    where the launch or the node would refuse the config.
+    """
+    from manipulation_execution.mirror_operator.config import OperatorConfig
+    from manipulation_execution.mirror_session.business import load_business_config
+
+    config = robot_config.get("mirror_session", {})
+    if not isinstance(config, Mapping):
+        raise ValueError("mirror_session must be a mapping")
+    if not _bool(config, "enabled", False):
+        return 0.0, ""
+    block = _block(config, "operator", _OPERATOR_KEYS)
+    if block is None or not _bool(block, "enabled", False, "mirror_session.operator"):
+        return 0.0, ""
+    path = _business(config, mock=False)["config"]
+    return OperatorConfig.from_mapping(load_business_config(path).operator).max_session_s, path
 
 
 def _voice_tts_unmet(voice_tts: Mapping) -> list[str]:
@@ -545,7 +570,7 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
     return actions
 
 
-__all__ = ["generate_mirror_session_nodes"]
+__all__ = ["generate_mirror_session_nodes", "operator_max_session_s"]
 
 
 # ---------------------------------------------------------------------------

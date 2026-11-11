@@ -16,6 +16,7 @@ tree before the move).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
@@ -27,7 +28,10 @@ from manipulation_execution.launch_builders.mirror_session import (
     MIRROR_SESSION_BUILDER,
     build_mirror_session,
     generate_mirror_session_nodes,
+    operator_max_session_s,
 )
+from manipulation_execution.mirror_operator.config import OperatorConfig
+from manipulation_execution.mirror_session.business import load_business_config
 from robot_config.launch_registry.registry import (
     BuildResult,
     LaunchBuildContext,
@@ -235,9 +239,7 @@ class TestOperatorNode:
     def operator_parameters(self, config):
         actions = generate_mirror_session_nodes(config)
         operator = next(
-            node
-            for node in actions
-            if isinstance(node, Node) and node._Node__node_executable == "mirror_operator_node"
+            node for node in actions if isinstance(node, Node) and node._Node__node_executable == "mirror_operator_node"
         )
         return _node_parameters(operator)
 
@@ -259,6 +261,45 @@ class TestOperatorNode:
 
         with pytest.raises(ValueError, match="needs a camera"):
             generate_mirror_session_nodes(config)
+
+
+class TestOperatorMaxSession:
+    """``operator_max_session_s`` is what the operator node will read (visual_interaction's auto line count)."""
+
+    DEMO = Path(__file__).resolve().parents[2] / "robot_config" / "config" / "mirror_session" / "demo.yaml"
+
+    def config_with_limit(self, tmp_path, max_session_s):
+        """The operator config over demo.yaml with its ``operator.max_session_s`` set."""
+        business = yaml.safe_load(self.DEMO.read_text(encoding="utf-8"))
+        business["operator"]["max_session_s"] = max_session_s
+        path = tmp_path / "demo.yaml"
+        path.write_text(yaml.safe_dump(business), encoding="utf-8")
+        config = TestOperatorNode().config_with_operator()
+        config["mirror_session"]["business"] = {"hooks": "demo", "cover_judge": "demo", "config": str(path)}
+        return config, str(path)
+
+    @pytest.mark.parametrize("max_session_s", [60.0, 100.0])
+    def test_it_is_what_the_operator_node_reads(self, tmp_path, max_session_s):
+        config, path = self.config_with_limit(tmp_path, max_session_s)
+        given = TestOperatorNode().operator_parameters(config)["business_config"]
+
+        node_reads = OperatorConfig.from_mapping(load_business_config(given).operator).max_session_s
+
+        assert operator_max_session_s(config) == (node_reads, path) == (max_session_s, given)
+
+    def test_no_operator_node_is_no_limit(self, tmp_path):
+        config, _ = self.config_with_limit(tmp_path, 100.0)
+        config["mirror_session"]["operator"]["enabled"] = False
+        assert operator_max_session_s(config) == (0.0, "")
+        config["mirror_session"]["enabled"] = False
+        assert operator_max_session_s(config) == (0.0, "")
+        assert operator_max_session_s({}) == (0.0, "")
+
+    def test_a_file_the_node_would_refuse_raises(self, tmp_path):
+        config, path = self.config_with_limit(tmp_path, -1.0)
+
+        with pytest.raises(ValueError, match="max_session_s"):
+            operator_max_session_s(config)
 
 
 class TestVoiceNode:

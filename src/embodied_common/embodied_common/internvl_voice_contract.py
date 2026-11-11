@@ -29,6 +29,7 @@ building parameters and both nodes import it at startup.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Callable, Mapping
@@ -66,8 +67,16 @@ CLIP_ID_PATTERN = re.compile(r"^[a-z]+_[a-z]+_[0-9]{2}$")
 _ASCII_ALNUM = re.compile(r"[A-Za-z0-9]")
 _FIND = re.compile(r"\$\(find\s+([A-Za-z0-9_]+)\)")
 
-# No delay or interval in a 60 s session is longer than this.
+# No delay or interval the look or the standby words wait is longer than this.
 _MAX_SEC = 60.0
+
+# ``look.max_per_round: auto``: as many lines as the operator's session limit
+# can hold (``per_round_for_session``), worked out by visual_interaction's
+# launch builder; the node only ever sees a number.
+PER_ROUND_AUTO = "auto"
+MAX_PER_ROUND = 60
+# ``auto`` with no session limit to read.
+FALLBACK_PER_ROUND = 8
 
 Interval = tuple[float, float]
 
@@ -128,7 +137,8 @@ class LookSettings:
     # Board 11-08: 5 lines left a 60 s round quiet at the end; zll wanted more.
     first_after_sec: Interval = (1.0, 2.5)
     gap_sec: Interval = (2.5, 5.0)
-    max_per_round: int = 8
+    # A number, or PER_ROUND_AUTO until the launch builder resolves it.
+    max_per_round: int | str = FALLBACK_PER_ROUND
     fresh_sec: float = 5.0
     pool_cooldown_sec: float = 10.0
     fallback_after_sec: float = 1.5
@@ -175,6 +185,12 @@ def _integer(lo: int, hi: int) -> Callable[[Any], int]:
         return value
 
     return check
+
+
+def _per_round(value: Any) -> int | str:
+    if value == PER_ROUND_AUTO:
+        return value
+    return _integer(1, MAX_PER_ROUND)(value)
 
 
 def _interval(value: Any) -> Interval:
@@ -244,7 +260,7 @@ _LOOK_CHECKS: Mapping[str, Callable[[Any], Any]] = MappingProxyType(
         "verify": _flag,
         "first_after_sec": _interval,
         "gap_sec": _interval,
-        "max_per_round": _integer(1, 20),
+        "max_per_round": _per_round,
         "fresh_sec": _seconds(positive=True),
         "pool_cooldown_sec": _seconds(),
         "fallback_after_sec": _seconds(),
@@ -271,6 +287,12 @@ def _thresholds(value: Any) -> dict[str, float]:
             raise _Bad(f"{action}: {threshold!r} is not a number in (0, 1]")
         out[action] = float(threshold)
     return out
+
+
+# look_json carries a resolved number only.
+_LOOK_JSON_CHECKS: Mapping[str, Callable[[Any], Any]] = MappingProxyType(
+    {**_LOOK_CHECKS, "max_per_round": _integer(1, MAX_PER_ROUND)}
+)
 
 
 _KEY_CHECKS: Mapping[str, Callable[[Any], Any]] = MappingProxyType(
@@ -740,10 +762,26 @@ def _plain(value: Any) -> Any:
     return list(value) if isinstance(value, tuple) else value
 
 
+def per_round_for_session(look: LookSettings, max_session_s: float) -> int | None:
+    """``auto``: every line the session can hold, one per shortest gap; None without a limit.
+
+    The round ends with the session, so this only has to be no lower than
+    what fits: ``ceil(max_session_s / gap_sec low)``, at most MAX_PER_ROUND.
+    """
+    if not max_session_s > 0:
+        return None
+    shortest = look.gap_sec[0]
+    if shortest <= 0:
+        return MAX_PER_ROUND
+    return max(1, min(MAX_PER_ROUND, math.ceil(max_session_s / shortest)))
+
+
 def look_json(settings: Settings, table: ClipTable) -> str:
     """What the look needs, as one string parameter: every ``look`` key plus the look pools."""
     if settings.look is None:
         raise ValueError(f"{SECTION_PATH}.look is off; there is no look_json")
+    if settings.look.max_per_round == PER_ROUND_AUTO:
+        raise ValueError(f"{SECTION_PATH}.look.max_per_round is still auto; resolve it first")
     data: dict[str, Any] = {key: _plain(getattr(settings.look, key)) for key in LOOK_KEYS}
     data["pools"] = {
         pool: [[clip_id, table.clips[clip_id]] for clip_id in ids]
@@ -763,7 +801,7 @@ def parse_look_json(text: str) -> tuple[dict[str, Any], list[str]]:
     path = "look_json"
     warnings: list[str] = []
     data = _load_json(text, path, warnings)
-    values = _items(data, _LOOK_CHECKS, LookSettings, path, warnings, known=("enabled", "key_actions", "pools"))
+    values = _items(data, _LOOK_JSON_CHECKS, LookSettings, path, warnings, known=("enabled", "key_actions", "pools"))
     values["key_actions"] = _plain(_key_actions(data.get("key_actions"), f"{path}.key_actions", warnings))
     if data.get("enabled", True) is not True:
         warnings.append(f"{path}.enabled: {data.get('enabled')!r} read as true")

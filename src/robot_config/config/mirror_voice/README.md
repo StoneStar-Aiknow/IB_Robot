@@ -64,7 +64,7 @@ v1 目录 `x2_mirror_clips_v1/` 不动，留着给 v1 句表。
 | `asr` | `mute`（默认：播前停 ASR，播完 `asr_resume_delay_sec` 秒后再开）、`off`、`keep` |
 | `asr_resume_delay_sec`、`asr_control_topic` | mute 的延迟和 `/voice_control` 话题 |
 | `standby.first_after_sec`、`standby.gap_sec` | 待机词：ready 播完后第一个的等待区间、之后每个的间隔区间（秒） |
-| `look.*` | InternVL 看图：`enabled`、`demo_root`、节奏（`round_period_sec`、`window_sec`、`first_after_sec`、`gap_sec`、`max_per_round` 等）、`nice`、`crop_actor`、`refine_hand`、`verify`、`dump_dir`。默认 `round_period_sec: 0`（上一次看完马上看下一次）、`window_sec: 0`（整个 MIRRORING 都看）；嫌负载高就调大这两个 |
+| `look.*` | InternVL 看图：`enabled`、`demo_root`、节奏（`round_period_sec`、`window_sec`、`first_after_sec`、`gap_sec`、`max_per_round` 等）、`nice`、`crop_actor`、`refine_hand`、`verify`、`dump_dir`。默认 `round_period_sec: 0`（上一次看完马上看下一次）、`window_sec: 0`（整个 MIRRORING 都看）；嫌负载高就调大这两个。`max_per_round` 是 1–60 的整数，或 `auto`（入口里的写法）：launch 时按 operator 的 `max_session_s`（`mirror_session/demo.yaml`，和 operator 节点读同一个文件）算成 `ceil(max_session_s / gap_sec 下限)`，最多 60，打一行 INFO；读不到时 WARNING 并用 8 |
 | `look.key_actions.*` | 关键动作：每次看都问一道选择题（给一般句用的自由描述最多每 `q1_period_sec` 一次），最近 3 次平均后点赞、挥手、张开双臂中一个连续 2 次过阈值（`thresholds`），语音空闲时马上说对应的一句（`hand.thumb` / `big.wave` / `big.open`），不占 `max_per_round`，之后 8 s 冷却。入口里 `enabled: true` |
 
 某一项写错（类型不对、超范围、未知键）时，只有这一项打 WARNING 并用默认值，其它照常，
