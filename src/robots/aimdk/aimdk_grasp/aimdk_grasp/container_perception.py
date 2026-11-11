@@ -157,6 +157,10 @@ def estimate_container(observation, mask, held, model, settings, *, prepared=Non
             keep=prepared.keep & (reach > validation_margin) & held_far,
             planning_all=prepared.planning_all & (reach > planning_margin) & held_far,
             spheres=np.vstack([prepared.spheres, np.column_stack([centers, cover[:, 3]])]),
+            # The container is the scene's "target" here; its fine mesh stays at the environment's pitch.
+            # The finer pick-target pitch was only measured on picks, and every place path is fine-checked
+            # every 0.02 rad against this mesh.
+            config=replace(prepared.config, validation_target_mesh_pitch_m=prepared.config.validation_mesh_pitch_m),
         )
         selected = np.asarray(mask, bool).reshape(-1)[prepared.pixel] & prepared.keep
         points = prepared.points[selected]

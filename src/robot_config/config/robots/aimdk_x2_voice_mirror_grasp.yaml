@@ -180,6 +180,9 @@ robot:
       execute_reserve_s: 50.0
       prefetch_preshape: true
       prefetch_perception: true
+      # No complete path among the candidates and the arm has not moved: draw new
+      # GraspGen-X candidates on the same capture instead of capturing again.
+      resample_retries: true
   placement_execution:
     enabled: true
     executor: placement_pipeline

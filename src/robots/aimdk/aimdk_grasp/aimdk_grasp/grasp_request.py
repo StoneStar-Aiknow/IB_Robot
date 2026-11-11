@@ -119,6 +119,35 @@ def left_palm_reach():
     return center, radius
 
 
+def screened_out_of_reach(planning_report, target_points_camera, base_from_camera, side: str) -> dict | None:
+    """Why a failed search is out of reach and not worth a new observation; None otherwise.
+
+    Both must hold: the screen IK (it also avoids the coarse scene) found no
+    state for any candidate, and the target's centre lies beyond the palm
+    reach bound. Live 2026-11-10 (48 plan calls): all 15 failed calls had 0
+    screen IK states and a centre 0.022-0.102 m beyond the bound (a target too
+    far, or on the right of a left-only robot); each pick retried twice more
+    from new observations (~2 s each) and failed the same way. Every planned
+    call had at least 140 IK states. Neither alone is enough: 10 planned calls
+    had their centre up to 0.038 m beyond the bound, and an empty IK screen
+    may be a crowded scene.
+    """
+    screen = (planning_report or {}).get("contact_screen") or {}
+    if screen.get("ik_successful_states") != 0 or target_points_camera is None or not len(target_points_camera):
+        return None
+    matrix = np.asarray(base_from_camera, dtype=float)
+    centre = np.asarray(target_points_camera, dtype=float).mean(axis=0) @ matrix[:3, :3].T + matrix[:3, 3]
+    shoulder, radius = palm_reach(side)
+    beyond = float(np.linalg.norm(centre - shoulder) - radius)
+    if not beyond > 0.0:
+        return None
+    return {
+        "screen_ik_states": 0,
+        "centre_beyond_palm_reach_m": round(beyond, 4),
+        "target_centre": centre.round(4).tolist(),
+    }
+
+
 def palm_reach(side: str = "left"):
     """:func:`left_palm_reach` for either arm's planning model."""
     if side == "left":
@@ -423,6 +452,20 @@ class X2GraspPlanner:
         except (TimeoutError, PlannerFault):
             raise
         except RuntimeError as exc:
+            beyond = screened_out_of_reach(
+                getattr(exc, "planning_report", None),
+                proposals.target_points,
+                transform.base_from_camera,
+                self.hand.side,
+            )
+            if beyond is not None:
+                report["out_of_reach"] = beyond
+                raise GraspFailure(
+                    NO_EXECUTABLE_CANDIDATE,
+                    f"The target is out of {self.hand.side}-arm reach: no screened candidate has an IK state and "
+                    f"its centre lies {beyond['centre_beyond_palm_reach_m']:.3f} m beyond the palm reach",
+                    reason_code="OUT_OF_REACH",
+                ) from exc
             raise _SearchExhausted() from exc
         report.update(planning)
         report["generated_candidate_index"] = int(kept[report["candidate_index"]])

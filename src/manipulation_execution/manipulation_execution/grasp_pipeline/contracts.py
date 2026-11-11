@@ -360,6 +360,10 @@ class ObservationSource(Protocol):
 class GraspProposer(Protocol):
     def propose(self, observation: Observation, query: str, *, deadline: float, cancelled: Flag) -> Proposals: ...
 
+    # Optional (PipelineConfig.resample_retries): new grasp candidates for the same
+    # observation and target as ``proposals``, keeping its mask, points and scene.
+    # def resample(self, observation, proposals, *, deadline, cancelled) -> Proposals: ...
+
 
 class GraspPlanner(Protocol):
     def plan(self, observation: Observation, proposals: Proposals, *, deadline: float, cancelled: Flag) -> GraspPlan:

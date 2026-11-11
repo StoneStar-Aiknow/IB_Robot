@@ -590,6 +590,94 @@ def test_an_observation_that_another_capture_may_fix_is_taken_again():
     assert outcome.error_code == "RPC_FAILED" and backends.observation.captures == 1 and not outcome.retries
 
 
+class ResamplingProposer(Proposer):
+    """Draws a new candidate set for the same observation and target, like GraspGen-X."""
+
+    def __init__(self):
+        self.proposed, self.resampled = 0, []
+
+    def propose(self, observation, query, *, deadline, cancelled):
+        self.proposed += 1
+        return super().propose(observation, query, deadline=deadline, cancelled=cancelled)
+
+    def resample(self, observation, proposals, *, deadline, cancelled):
+        self.resampled.append((observation.stamp_ns, proposals))
+        return Proposals(
+            proposals.target_mask, proposals.target_points, np.stack([np.eye(4)] * 3), [0.8, 0.7, 0.6], scene="kept"
+        )
+
+
+def no_path(reason="NO_COMPLETE_PATH"):
+    return GraspFailure("NO_EXECUTABLE_CANDIDATE", "no complete path", retryable=True, reason_code=reason)
+
+
+def test_no_complete_path_draws_new_candidates_on_the_same_observation():
+    """Live 2026-11-11: two re-observes of an unmoved arm cost 1.8 s each; GraspGen-X alone ~0.7 s."""
+    backends, executor, *_ = streaming()
+    proposer = ResamplingProposer()
+    backends = replace(backends, proposer=proposer)
+    backends.planner.failures = [no_path(), no_path()]
+    outcome = run(backends, config=PipelineConfig(max_attempts=3, resample_retries=True))
+    assert outcome.success and outcome.attempts == 3
+    assert backends.observation.captures == 1 and proposer.proposed == 1
+    assert [stamp for stamp, _ in proposer.resampled] == [1, 1]
+    # The second resample starts from the first resample's candidates, still on capture 1.
+    assert len(proposer.resampled[1][1].grasps) == 3
+    assert [(r["retry"], r["code"]) for r in outcome.retries] == [("resample", "NO_EXECUTABLE_CANDIDATE")] * 2
+
+
+@pytest.mark.parametrize(
+    "failure, config, proposer, clock",
+    [
+        (no_path(), PipelineConfig(), ResamplingProposer(), 0.0),  # not enabled
+        (no_path("PLAN_TIMEOUT"), PipelineConfig(resample_retries=True), ResamplingProposer(), 0.0),
+        (
+            GraspFailure("REOBSERVE_REQUIRED", "stale", retryable=True),
+            PipelineConfig(resample_retries=True),
+            ResamplingProposer(),
+            0.0,
+        ),
+        (no_path(), PipelineConfig(resample_retries=True), Proposer(), 0.0),  # cannot resample
+        (no_path(), PipelineConfig(resample_retries=True, resample_max_age_s=4.0), ResamplingProposer(), 4.5),
+    ],
+    ids=["disabled", "plan_timeout", "reobserve_required", "no_resample_method", "too_old"],
+)
+def test_other_retries_observe_again(failure, config, proposer, clock):
+    backends, executor, *_ = streaming()
+    backends = replace(backends, proposer=proposer)
+    backends.planner.failures = [failure]
+    planner = backends.planner
+    # The capture happens at 0 s; once planning has failed, the clock reads ``clock``.
+    outcome = GraspPipeline(backends, config, clock=lambda: clock if planner.calls else 0.0).run(
+        "red bottle", mode=PickMode.EXECUTE, deadline=100.0, cancelled=lambda: False
+    )
+    assert outcome.success and backends.observation.captures == 2
+    assert [r["retry"] for r in outcome.retries] == ["reobserve"]
+    assert not getattr(proposer, "resampled", [])
+
+
+def test_a_failed_resample_observes_again():
+    backends, executor, *_ = streaming()
+    proposer = ResamplingProposer()
+
+    def refuse(*args, **kwargs):
+        raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "No grasp candidates returned", retryable=True)
+
+    proposer.resample = refuse
+    backends = replace(backends, proposer=proposer)
+    backends.planner.failures = [no_path()]
+    outcome = run(backends, config=PipelineConfig(max_attempts=3, resample_retries=True))
+    assert outcome.success and backends.observation.captures == 2
+    assert [r["retry"] for r in outcome.retries] == ["resample", "reobserve"]
+
+
+def test_resample_settings_are_checked():
+    with pytest.raises(ValueError, match="resample_retries"):
+        PipelineConfig(resample_retries=1)
+    with pytest.raises(ValueError, match="resample_max_age_s"):
+        PipelineConfig(resample_max_age_s=0.0)
+
+
 def test_observation_and_planning_failures_share_the_attempts():
     backends, executor, *_ = streaming()
     backends.observation.failures = [GraspFailure("OBSERVATION_UNAVAILABLE", "gap", retryable=True)]

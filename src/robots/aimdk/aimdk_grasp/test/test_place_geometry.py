@@ -1,5 +1,6 @@
 """Visible cavity, clearance, and Agent-provided container descriptions."""
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -353,6 +354,9 @@ def test_the_holding_hand_leaves_neither_scene_within_the_coarse_margin(monkeypa
     kept = seen["prepared"]
     np.testing.assert_array_equal(kept.keep, [False, True, True, True, True])
     np.testing.assert_array_equal(kept.planning_all, [False, True, True, True, True])
+    # The container is that scene's target; its fine mesh keeps the environment's pitch, not the pick target's.
+    assert kept.config.validation_target_mesh_pitch_m == kept.config.validation_mesh_pitch_m == 0.005
+    assert replace(kept.config, validation_target_mesh_pitch_m=0.0025) == prepared.config
     line = json.loads(
         next(text for text in capsys.readouterr().err.splitlines() if text.startswith('{"estimate_container"'))
     )

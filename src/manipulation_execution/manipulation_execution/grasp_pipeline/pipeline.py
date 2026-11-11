@@ -78,9 +78,20 @@ class PipelineConfig:
     #: age is short because the planner's budget (10 s on the X2) counts from the capture.
     prefetch_perception: bool = False
     prefetch_max_age_s: float = 4.0
+    #: After a planning failure that only says this candidate set held no complete path
+    #: (``NO_EXECUTABLE_CANDIDATE`` with a reason in ``RESAMPLE_REASONS``; the arm has not
+    #: moved), ask the proposer for new candidates on the same observation and target
+    #: (``GraspProposer.resample``) instead of capturing and perceiving again, while that
+    #: observation is at most ``resample_max_age_s`` old. Live 2026-11-11 (X2, 310P): each
+    #: re-observe cost 0.53-0.56 s of capture and 1.26-1.29 s of perception, while GraspGen-X
+    #: on the same cloud answers in ~0.7 s with a new candidate set (3 calls, no grasp within
+    #: 5 mm and 5 deg of another call's). The planner still checks a fresh frame against the
+    #: planned one before anything moves. Proposers without ``resample`` observe again.
+    resample_retries: bool = False
+    resample_max_age_s: float = 4.0
 
     def __post_init__(self):
-        for name in ("release_after_success", "prefetch_preshape", "prefetch_perception"):
+        for name in ("release_after_success", "prefetch_preshape", "prefetch_perception", "resample_retries"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean")
         for name in ("max_attempts", "max_moved_replans", "max_regrasps"):
@@ -93,6 +104,14 @@ class PipelineConfig:
         age = self.prefetch_max_age_s
         if isinstance(age, bool) or not isinstance(age, int | float) or not 0 < age < float("inf"):
             raise ValueError("prefetch_max_age_s must be a finite positive number of seconds")
+        age = self.resample_max_age_s
+        if isinstance(age, bool) or not isinstance(age, int | float) or not 0 < age < float("inf"):
+            raise ValueError("resample_max_age_s must be a finite positive number of seconds")
+
+
+#: Planning failure reasons that only condemn the candidate set, not the observation:
+#: the search over these candidates found no complete three-segment path.
+RESAMPLE_REASONS = frozenset({"NO_COMPLETE_PATH"})
 
 
 @dataclass
@@ -111,7 +130,8 @@ class PickOutcome:
     #: The requested post-pick release and return completed.
     released_after_success: bool = False
     #: One entry per retry, in order: {"attempt", "retry", "code", "message"}; ``retry`` is
-    #: "reobserve" (nothing moved), "replan" (target moved, arm retreated) or "regrasp".
+    #: "reobserve" (nothing moved), "resample" (nothing moved; new candidates on the same
+    #: observation), "replan" (target moved, arm retreated) or "regrasp".
     retries: list[dict] = field(default_factory=list)
     report: dict = field(default_factory=dict)
     mode: str = "execute"
@@ -245,6 +265,8 @@ class GraspPipeline:
     def _run(self, query, mode, deadline, cancelled, stop, phase, release_after_success, outcome) -> PickOutcome:
         backends = self._backends
         planning_failures, replans, regrasps = 0, 0, 0
+        # (observation, proposals, monotonic capture time) a "resample" retry reuses.
+        resample = None
         try:
             while True:
                 self._check_budget(cancelled, deadline)
@@ -256,18 +278,29 @@ class GraspPipeline:
                     outcome.retries[-1]["state"] = "started"
                 budget = {"deadline": deadline, "cancelled": stop}
                 steps: dict[str, float] = {}
+                observation = proposals = None
+                observed_at = float("-inf")  # nothing captured yet: never resampled
                 try:
                     taken = None
                     if self._prefetch is not None and outcome.attempts == 1 and mode is not PickMode.OBSERVE_ONLY:
                         taken, outcome.report["perception_prefetch"] = self._prefetch.take(
                             query, deadline=deadline, cancelled=stop
                         )
-                    if taken is not None:
+                    if resample is not None:
+                        # New candidates on the observation the last attempt planned from.
+                        observation, previous, observed_at = resample
+                        resample = None
+                        proposals = self._step(
+                            "perceive", phase, steps, backends.proposer.resample, observation, previous, **budget
+                        )
+                    elif taken is not None:
                         # Started before the goal: recorded as this attempt's observe and perceive.
                         observation = self._step("observe", phase, steps, _same, taken.observation)
                         outcome.report["observe"] = dict(observation.report)
+                        observed_at = self._clock() - float(outcome.report["perception_prefetch"].get("age_s", 0.0))
                         proposals = self._step("perceive", phase, steps, _same, taken.proposals)
                     else:
+                        observed_at = self._clock()
                         observation = self._step("observe", phase, steps, backends.observation.capture, **budget)
                         outcome.report["observe"] = dict(observation.report)
                         self._check_budget(cancelled, deadline)
@@ -291,7 +324,11 @@ class GraspPipeline:
                         outcome.report.setdefault("planning_failures", []).append(
                             {"code": failure.code, "message": str(failure)}
                         )
-                        self._retry(outcome, "reobserve", failure.code, str(failure))
+                        if self._resamples(failure, proposals, observed_at):
+                            resample = (observation, proposals, observed_at)
+                            self._retry(outcome, "resample", failure.code, str(failure))
+                        else:
+                            self._retry(outcome, "reobserve", failure.code, str(failure))
                         continue
                     raise
                 outcome.candidate_index = plan.candidate_index
@@ -516,6 +553,17 @@ class GraspPipeline:
             outcome.report.setdefault("execution_failures", []).append(failure)
             outcome.report.setdefault("first_execution_failure", dict(failure))
         return result
+
+    def _resamples(self, failure: GraspFailure, proposals, observed_at: float) -> bool:
+        """Whether a retry may keep this observation and ask only for new candidates."""
+        return (
+            self._config.resample_retries
+            and proposals is not None
+            and failure.code == "NO_EXECUTABLE_CANDIDATE"
+            and failure.reason_code in RESAMPLE_REASONS
+            and callable(getattr(self._backends.proposer, "resample", None))
+            and self._clock() - observed_at <= self._config.resample_max_age_s
+        )
 
     @staticmethod
     def _retry(outcome: PickOutcome, retry: str, code: str, message: str) -> None:

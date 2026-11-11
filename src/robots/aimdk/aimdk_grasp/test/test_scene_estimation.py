@@ -147,6 +147,7 @@ def test_voxel_reconstruction_does_not_refill_filtered_sphere(pitch, margin):
         {"mesh_pitch_m": 0.04},
         {"validation_mesh_pitch_m": 0.01},
         {"target_mesh_pitch_m": 0.04},
+        {"validation_target_mesh_pitch_m": 0.01},
     ],
 )
 def test_scene_config_rejects_voxel_refilling_robot(change):
@@ -318,8 +319,10 @@ def test_scene_reconstruction_separates_target_and_preserves_frames_and_age():
 def test_coarse_scene_keeps_fine_target_and_restores_filtered_obstacles_in_validation():
     inputs = scene_inputs()
     inputs["robot_spheres_torso"] = np.array([[0.6, 2.4, 1.0, 0.05]])
-    estimate = estimate_scene(**inputs, config=TABLE_MESHED)
-    fine = estimate_scene(**inputs, config=replace(TABLE_MESHED, mesh_pitch_m=0.005, self_filter_margin_m=0.01))
+    # One target pitch for planning and the fine check: the planning mesh is reused as is.
+    config = replace(TABLE_MESHED, validation_target_mesh_pitch_m=TABLE_MESHED.target_mesh_pitch_m)
+    estimate = estimate_scene(**inputs, config=config)
+    fine = estimate_scene(**inputs, config=replace(config, mesh_pitch_m=0.005, self_filter_margin_m=0.01))
     assert estimate.diagnostics["planning_extra_filtered_points"] > 0
     assert estimate.diagnostics["meshes"]["environment"]["faces"] < fine.diagnostics["meshes"]["environment"]["faces"]
     assert estimate.diagnostics["validation_self_filtered_points"] == fine.diagnostics["self_filtered_points"]
@@ -332,6 +335,39 @@ def test_coarse_scene_keeps_fine_target_and_restores_filtered_obstacles_in_valid
             np.testing.assert_array_equal(
                 estimate.validation_scene["mesh"][name][field], fine.scene["mesh"][name][field]
             )
+
+
+def test_fine_check_target_is_finer_than_planning_target():
+    inputs = scene_inputs()
+    estimate = estimate_scene(**inputs, config=TABLE_MESHED, lazy_validation=False)
+    counts = estimate.diagnostics
+    assert counts["meshes"]["target"]["pitch_m"] == 0.005
+    assert counts["validation_meshes"]["target"]["pitch_m"] == 0.0025
+    assert counts["validation_meshes"]["environment"]["pitch_m"] == 0.005
+    assert estimate.scene["mesh"]["target"] is not estimate.validation_scene["mesh"]["target"]
+    # The fine target is the same (edge-grown) target cloud voxelized at 2.5 mm,
+    # and the planning scene is untouched by it.
+    finer = estimate_scene(**inputs, config=replace(TABLE_MESHED, target_mesh_pitch_m=0.0025), lazy_validation=False)
+    for field in ("vertices", "faces", "pose"):
+        np.testing.assert_array_equal(
+            estimate.validation_scene["mesh"]["target"][field], finer.scene["mesh"]["target"][field]
+        )
+    fives = estimate_scene(
+        **inputs, config=replace(TABLE_MESHED, validation_target_mesh_pitch_m=0.005), lazy_validation=False
+    )
+    for name in ("target", "environment"):
+        for field in ("vertices", "faces", "pose"):
+            np.testing.assert_array_equal(estimate.scene["mesh"][name][field], fives.scene["mesh"][name][field])
+    np.testing.assert_array_equal(
+        estimate.validation_scene["mesh"]["environment"]["faces"],
+        fives.validation_scene["mesh"]["environment"]["faces"],
+    )
+    # Each target point here sits in its own voxel (~36 mm apart): a finer
+    # pitch keeps the faces but halves every face's edge.
+    fine_face = np.ptp(estimate.validation_scene["mesh"]["target"]["vertices"][:4], axis=0)
+    five_face = np.ptp(fives.validation_scene["mesh"]["target"]["vertices"][:4], axis=0)
+    np.testing.assert_allclose(fine_face, five_face / 2)
+    assert sorted(fine_face) == pytest.approx([0.0, 0.0025, 0.0025])
 
 
 def test_coarse_planning_target_keeps_fine_validation_target():
@@ -487,13 +523,14 @@ def test_lazy_fine_scene_owns_inputs_and_builds_once_for_concurrent_readers(monk
     lazy = estimate_scene(**inputs, config=TABLE_MESHED)
     assert isinstance(lazy.validation_scene, module.LazyScene)
     assert not lazy.validation_scene.built
-    assert calls == [0.03, 0.005]  # coarse environment and fine target only
+    assert calls == [0.03, 0.005]  # the coarse environment and target only
     inputs["depth"][:] = 0.0
     inputs["transform"].base_from_camera[:] = 0.0
     with ThreadPoolExecutor(4) as pool:
         results = list(pool.map(lambda _: lazy.validation_scene.materialize(), range(4)))
     assert all(value is results[0] for value in results)
-    assert calls == [0.03, 0.005, 0.005]
+    # Deferred: the fine environment and the finer fine-check target, once.
+    assert calls == [0.03, 0.005, 0.005, 0.0025]
     assert lazy.received_at == 7.0 and lazy.stamp_ns == 123
     for name in ("environment", "target"):
         for field in ("vertices", "faces", "pose"):
