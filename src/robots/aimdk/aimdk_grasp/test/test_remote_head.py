@@ -70,6 +70,7 @@ class FakeHead(Node):
         super().__init__("fake_grasp_head")
         names, group = head_endpoints(NAMESPACE), ReentrantCallbackGroup()
         self.ready, self.plan_seconds, self.requests, self.arm_seconds = True, 0.0, [], 0.0
+        self.capture_strides = []
         self.arm_refusal, self.sessions = "", []
         #: The capture's failure as (error_code, message), or None to answer.
         self.capture_failure = None
@@ -142,6 +143,7 @@ class FakeHead(Node):
 
     def _capture(self, request, response):
         self.requests.append(("capture", request.timeout_s))
+        self.capture_strides.append(request.scene_pixel_stride)
         if not self.ready:
             response.error_code, response.message = NOT_READY, "warming up"
             return response
@@ -247,6 +249,16 @@ def ros():
 
 def capture(client):
     return RemoteHeadCamera(client).capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+
+
+def test_a_place_camera_asks_the_head_for_its_scene_pixel_stride(ros):
+    head, client = ros
+    capture(client)
+    RemoteHeadCamera(client, scene_pixel_stride=2).capture(deadline=time.monotonic() + 5.0, cancelled=lambda: False)
+    assert head.capture_strides == [1, 2]
+    for stride in (0, 1.5, True):
+        with pytest.raises(ValueError, match="scene_pixel_stride"):
+            RemoteHeadCamera(client, scene_pixel_stride=stride)
 
 
 def test_a_capture_decodes_into_an_observation_the_head_keeps(ros):

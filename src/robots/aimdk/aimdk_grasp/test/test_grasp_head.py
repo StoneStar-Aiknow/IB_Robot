@@ -202,6 +202,22 @@ def ready(node):
     assert node._ready.wait(5.0)
 
 
+def test_a_place_capture_prepares_its_scene_at_the_requested_pixel_stride(head, monkeypatch):
+    node = head.node
+    ready(node)
+    strides = {}
+
+    def prepare(observation, model, config):
+        strides[observation.stamp_ns] = config.pixel_stride
+        return ("prepared", model)
+
+    monkeypatch.setattr(grasp_head, "prepare_capture_scene", prepare)
+    for requested, expected in ((0, 1), (2, 2)):  # 0: the field's default, a grasp capture
+        response = call(node._on_capture, CaptureGraspObservation, timeout_s=1.0, scene_pixel_stride=requested)
+        assert node._capture(response.capture_id).prepared.result(5.0) == ("prepared", "spheres")
+        assert strides[response.stamp_ns] == expected
+
+
 def test_captures_wait_for_the_warmup_and_start_their_scene(head):
     node, parts = head.node, head.parts
     ready(node)

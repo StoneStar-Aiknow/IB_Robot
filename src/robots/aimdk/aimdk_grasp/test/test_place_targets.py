@@ -128,6 +128,13 @@ def test_edge_fraction_moves_the_extra_positions_toward_the_rim():
 
 def test_no_release_position_clear_of_the_rim_is_reported_as_too_small():
     container, held, palm, _, _ = _scene(opening_radius=0.05, held_radius=0.04)
+    assert place_targets(container, held, palm, PlaceTargetConfig(extra_positions=0))
+    container.report["wall_margin_m"] = 0.015
+    with pytest.raises(GraspFailure) as failure:
+        place_targets(container, held, palm, PlaceTargetConfig(extra_positions=0))
+    assert failure.value.code == "CONTAINER_TOO_SMALL"
+    # The default still refuses openings with less than 5 mm of wall clearance.
+    container, held, palm, _, _ = _scene(opening_radius=0.044, held_radius=0.04)
     with pytest.raises(GraspFailure) as failure:
         place_targets(container, held, palm, PlaceTargetConfig(extra_positions=0))
     assert failure.value.code == "CONTAINER_TOO_SMALL"

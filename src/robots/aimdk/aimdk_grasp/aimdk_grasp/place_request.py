@@ -11,7 +11,7 @@ import numpy as np
 from manipulation_execution.grasp_pipeline.contracts import Effect, EffectorAction, GraspFailure, Move, PlacePlan
 
 from .arm_gravity import require_executable
-from .collision_spheres import merge_sphere_cover
+from .collision_spheres import merge_sphere_cover_steps, steps_at
 from .grasp_request import segment
 from .held_object import held_center
 from .inputs_record import INPUTS_DIR_ENV, inputs_directory, save_record
@@ -48,6 +48,35 @@ def save_place_inputs(directory: Path, recorded: dict) -> threading.Thread:
     return save_record(directory, "place", recorded)
 
 
+def _inside_any(points, point_r, balls, ball_r, tolerance, *, groups=8):
+    """Whether each point ball lies inside some ball: ``|p - b| + r_p <= r_b + tolerance``.
+
+    The same test and arithmetic as over the full point x ball matrix, evaluated
+    only on the pairs within reach of each ball. A KD-tree finds them per radius
+    group (the hand's radii span 0.9-46 mm), so a group of small balls is not
+    searched at the largest ball's reach. For the opening sweep the full matrix was
+    2676 x 446 (39 ms on x86); this checks ~37k pairs (4.5 ms).
+    """
+    from scipy.spatial import cKDTree
+
+    inside = np.zeros(len(points), dtype=bool)
+    edges = np.quantile(ball_r, np.linspace(0.0, 1.0, groups + 1))
+    tree = cKDTree(points)
+    for group in range(groups):
+        upper = ball_r < edges[group + 1] if group < groups - 1 else True
+        members = np.nonzero((ball_r >= edges[group]) & upper)[0]
+        if not len(members):
+            continue
+        # Slack far above the trees' own rounding: a missed passing pair would change the cover.
+        reach = float(np.max(ball_r[members])) + tolerance + 1e-6
+        pairs = tree.sparse_distance_matrix(cKDTree(balls[members]), reach, output_type="ndarray")
+        i, j = pairs["i"], members[pairs["j"]]
+        diff = points[i] - balls[j]
+        distance = np.sqrt(np.add.reduce(diff * diff, axis=1))
+        inside[i[distance + point_r[i] <= ball_r[j] + tolerance]] = True
+    return inside
+
+
 def _hand_cover(model, feedback, side, hands, slots, *, margin_m=0.01, voxel_m=0.02):
     """Palm-frame spheres covering ``hands`` (finger poses) beyond the open-hand model.
 
@@ -80,8 +109,7 @@ def _hand_cover(model, feedback, side, hands, slots, *, margin_m=0.01, voxel_m=0
     radii = spheres[0, moving, 3]
     reference, swept = local[-1], local[:-1].reshape(-1, 3)
     swept_r = np.tile(radii, len(hands))
-    distance = np.linalg.norm(swept[:, None] - reference[None], axis=2)
-    outside = ~(distance + swept_r[:, None] <= radii[None] + 1e-4).any(axis=1)
+    outside = ~_inside_any(swept, swept_r, reference, radii, 1e-4)
     if not outside.any():
         return np.empty((0, 4))
     points, point_r = swept[outside], swept_r[outside] + margin_m
@@ -94,17 +122,19 @@ def _hand_cover(model, feedback, side, hands, slots, *, margin_m=0.01, voxel_m=0
             {"center": center.tolist(), "radius": float(np.max(np.linalg.norm(member - center, axis=1) + member_r))}
         )
     low, high = 0.0, 0.15
-    cover = merge_sphere_cover(balls, max_radius_m=high)
+    # One greedy merge at the widest cap; every narrower cap's cover is one of its steps.
+    states, radii = merge_sphere_cover_steps(balls, max_radius_m=high)
+    cover = steps_at(states, radii, high)
     if len(cover) > slots:
         raise GraspFailure("PLACE_PLAN_FAILED", "hand cover does not fit the reserved spheres")
     while high - low > 0.005:
         cap = (low + high) / 2
-        candidate = merge_sphere_cover(balls, max_radius_m=cap)
+        candidate = steps_at(states, radii, cap)
         if len(candidate) <= slots:
             high, cover = cap, candidate
         else:
             low = cap
-    return np.asarray([[*ball["center"], ball["radius"]] for ball in cover], dtype=float)
+    return np.array(cover, dtype=float)
 
 
 def held_return_path(held):

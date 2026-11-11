@@ -193,6 +193,7 @@ robot:
     backend: aimdk_grasp.remote_head:x2_remote_place_backends
     perception:
       box_threshold: 0.5
+      scene_pixel_stride: 2
     pipeline:
       max_attempts: 2
       verify_placement: false

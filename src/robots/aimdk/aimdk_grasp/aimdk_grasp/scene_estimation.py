@@ -121,13 +121,19 @@ class SceneEstimationConfig:
     # either way at 0.18 -> 0.20 s; shrink 2.5 / 1.5 / 1.0 cm planned 18 / 20 / 20.
     coarse_leg_boxes: bool = True
     coarse_leg_shrink_m: float = 0.02
+    # Every pixel_stride-th depth row and column becomes a point (1: all).
+    # The place capture uses 2: on 35 recorded X2 places (2026-11-10, Orin)
+    # container estimation took 0.83 -> 0.29 s, the opening's inscribed centre
+    # moved 0.34 mm (median, max 1.4) and its radius shrank 0.38 mm on average,
+    # and the 22 re-planned places planned the same. The grasp scene keeps 1.
+    pixel_stride: int = 1
 
     def __post_init__(self):
         check_side(self.arm_side)
         values = [value for value in vars(self).values() if not isinstance(value, bool | str)]
         if not np.isfinite(values).all() or any(v <= 0 for v in values):
             raise ValueError("Scene estimation parameters must be finite and positive")
-        for name in ("plane_iterations", "max_planes", "min_plane_points", "target_edge_grow_steps"):
+        for name in ("plane_iterations", "max_planes", "min_plane_points", "target_edge_grow_steps", "pixel_stride"):
             if not isinstance(getattr(self, name), int):
                 raise ValueError(f"{name} must be an integer")
         if (
@@ -806,6 +812,12 @@ def prepare_scene(
         raise ValueError("Expected registered 2D depth")
     depth_m = depth.astype(np.float32) * depth_scale
     valid = np.isfinite(depth_m) & (depth_m >= config.min_depth_m) & (depth_m <= config.max_depth_m)
+    if config.pixel_stride > 1:
+        # Off-grid pixels count as unmeasured; pixel indices stay full-resolution,
+        # so full-size masks still select through PreparedScene.pixel.
+        grid = np.zeros_like(valid)
+        grid[:: config.pixel_stride, :: config.pixel_stride] = True
+        valid &= grid
     points = mask_depth_to_points(
         valid, depth_m, intrinsics, min_depth_m=config.min_depth_m, max_depth_m=config.max_depth_m
     )

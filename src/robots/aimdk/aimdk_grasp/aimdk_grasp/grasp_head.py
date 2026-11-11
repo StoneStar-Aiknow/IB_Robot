@@ -313,12 +313,13 @@ class X2GraspHeadNode(Node):
             if captured and head.imu is not None and not getattr(getattr(head, "watch", None), "armed", False):
                 head.imu.pause()  # as after the warmup: idle until a request has a plan to execute
 
-    def _prepare_scene(self, observation: Observation):
-        """The mask-independent scene stage of one capture."""
+    def _prepare_scene(self, observation: Observation, pixel_stride: int = 1):
+        """The mask-independent scene stage of one capture, from every ``pixel_stride``-th depth row and column."""
         if hasattr(self._head, "prepare_scene"):
-            return self._head.prepare_scene(observation)
+            return self._head.prepare_scene(observation, pixel_stride=pixel_stride)
         with self._head.gpu:
-            return prepare_capture_scene(observation, self._head.spheres, self._robot.perception.scene)
+            config = replace(self._robot.perception.scene, pixel_stride=pixel_stride)
+            return prepare_capture_scene(observation, self._head.spheres, config)
 
     def _complete_scene(self, prepared, mask, observation):
         if hasattr(self._head, "complete_scene"):
@@ -397,7 +398,10 @@ class X2GraspHeadNode(Node):
         if head.imu is not None:
             head.imu.pause_after(observation.stamp_ns)
         capture_id = f"{observation.stamp_ns}-{next(self._ids)}"
-        prepared = self._scene_pool.submit(self._prepare_scene, observation)
+        # A place capture asks for a sparser scene (placement_execution.perception.scene_pixel_stride);
+        # 0 (the field's default, and grasp captures) is full resolution.
+        stride = max(1, int(getattr(request, "scene_pixel_stride", 0)))
+        prepared = self._scene_pool.submit(self._prepare_scene, observation, stride)
         with self._lock:
             _remember(self._captures, capture_id, _Capture(observation, prepared))
         rgb, depth = wire.encode_rgb(observation.rgb), wire.encode_depth(observation.depth_m)
@@ -594,6 +598,8 @@ class X2GraspHeadNode(Node):
                         held=held,
                         support_hint=hint,
                         perception=self._place_planner.robots[held.arm_side].perception,
+                        # The capture's scene density: replay with perception.scene's pixel_stride replaced by it.
+                        scene_pixel_stride=getattr(getattr(prepared, "config", None), "pixel_stride", 1),
                     )
                 except Exception as exc:  # noqa: BLE001 - a diagnostic must never change the place
                     print(f"container record not built: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

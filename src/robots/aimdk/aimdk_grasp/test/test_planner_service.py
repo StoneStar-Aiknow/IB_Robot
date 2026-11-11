@@ -45,6 +45,23 @@ def test_merge_handles_coincident_and_contained_spheres():
         merge_sphere_cover(original, -1.0)
 
 
+def test_every_narrower_cap_reads_its_cover_off_one_greedy_merge():
+    from aimdk_grasp.collision_spheres import merge_sphere_cover_steps, steps_at
+
+    rng = np.random.default_rng(5)
+    for size in (1, 2, 9, 63):
+        balls = [
+            {"center": (rng.normal(size=3) * 0.04).tolist(), "radius": float(rng.uniform(0.002, 0.03))}
+            for _ in range(size)
+        ]
+        states, radii = merge_sphere_cover_steps(balls, 0.15)
+        for cap in (*np.linspace(0.001, 0.15, 30), radii[0] if radii else 0.01):
+            direct = [[*ball["center"], ball["radius"]] for ball in merge_sphere_cover(balls, float(cap))]
+            assert np.array_equal(steps_at(states, radii, float(cap)), np.array(direct, dtype=float))
+    # A step array never changes after it was handed out.
+    assert np.array_equal(states[0], [[*ball["center"], ball["radius"]] for ball in balls])
+
+
 def test_protected_merge_never_inflates_into_work_envelope():
     balls = [{"center": [x, 0, 0], "radius": 0.02} for x in (0.0, 0.03, 1.0, 1.03)]
     protected = np.array([[0.015, 0.05, 0, 0.02]])

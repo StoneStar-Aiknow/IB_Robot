@@ -7,6 +7,7 @@ import pytest
 from aimdk_grasp.dual_arm import (
     ArmScenes,
     ArmWatch,
+    AutomaticHead,
     AutomaticPlanner,
     ExecutionSelection,
     SelectedPart,
@@ -226,3 +227,30 @@ def test_executor_and_hand_follow_each_accepted_plan_and_refuse_mismatched_joint
     with pytest.raises(GraspFailure, match="trajectory joints disagree"):
         selection.accept(wrong)
     assert selection.side == "left"
+
+
+def test_both_arms_prepare_the_capture_scene_at_the_requested_pixel_stride(monkeypatch):
+    from contextlib import nullcontext
+
+    from aimdk_grasp.scene_estimation import SceneEstimationConfig
+
+    seen = []
+    monkeypatch.setattr(
+        "aimdk_grasp.proposer.prepare_capture_scene",
+        lambda observation, model, config: seen.append((model, config.arm_side, config.pixel_stride)) or model,
+    )
+    head = object.__new__(AutomaticHead)
+    head.gpu = nullcontext()
+    head.arms = {side: SimpleNamespace(spheres=f"{side} spheres") for side in ("left", "right")}
+    head.robots = {
+        side: SimpleNamespace(perception=SimpleNamespace(scene=SceneEstimationConfig(arm_side=side)))
+        for side in ("left", "right")
+    }
+    assert head.prepare_scene("observation", pixel_stride=2) == {"left": "left spheres", "right": "right spheres"}
+    assert head.prepare_scene("observation") == {"left": "left spheres", "right": "right spheres"}
+    assert seen == [
+        ("left spheres", "left", 2),
+        ("right spheres", "right", 2),
+        ("left spheres", "left", 1),
+        ("right spheres", "right", 1),
+    ]

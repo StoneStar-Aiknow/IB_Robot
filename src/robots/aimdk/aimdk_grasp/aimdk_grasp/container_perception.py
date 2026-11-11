@@ -16,7 +16,7 @@ from .proposer import holding_hand_spheres, prepare_capture_scene, within_sphere
 from .scene_estimation import NoSupportError, complete_scene, plane_basis
 
 
-def opening_from_points(points, normal, *, radius_m, wall_margin_m=0.015):
+def opening_from_points(points, normal, *, radius_m, wall_margin_m=0.005):
     """A convex rim with visible depth below it and room for the held sphere.
 
     Heights are along the fitted support normal. Require cavity evidence in
