@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import os
 import threading
 import time
 from collections import deque
@@ -51,7 +52,11 @@ class PlacePipelineNode(Node):
         self.identity = delegated_executor_identity(
             name="placement_pipeline", endpoint_name=action, configuration=config
         )
-        self.pipeline = PlacePipeline(self.backends, **config.get("pipeline", {}))
+        self.pipeline = PlacePipeline(
+            self.backends,
+            prefetch_record_dir=os.environ.get("IBROBOT_PREFETCH_RECORD_DIR") or None,
+            **config.get("pipeline", {}),
+        )
         self.custody = HeldObjectClient(self)
         self.lock, self.active = threading.Lock(), False
         self.server = ActionServer(

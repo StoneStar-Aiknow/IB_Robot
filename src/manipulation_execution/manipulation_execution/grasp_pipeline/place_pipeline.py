@@ -10,7 +10,7 @@ from embodied_common.execution_detail import ExecutionDetail, place_execution_de
 
 from .contracts import GraspFailure
 from .place_sequence import PlaceSequence
-from .prefetch import container_change
+from .prefetch import container_change, save_container_change
 
 
 @dataclass
@@ -36,7 +36,14 @@ class PlaceOutcome:
 
 class PlacePipeline:
     def __init__(
-        self, backends, *, max_attempts=2, execute_reserve_s=15.0, verify_placement=True, clock=time.monotonic
+        self,
+        backends,
+        *,
+        max_attempts=2,
+        execute_reserve_s=15.0,
+        verify_placement=True,
+        prefetch_record_dir=None,
+        clock=time.monotonic,
     ):
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("max_attempts must be positive")
@@ -52,6 +59,8 @@ class PlacePipeline:
         if type(verify_placement) is not bool:
             raise ValueError("verify_placement must be a boolean")
         self.verify_placement = verify_placement
+        # Where both views of a rejected prefetched container are written (None: not written).
+        self.prefetch_record_dir = prefetch_record_dir or None
 
     def run(self, held, query, *, deadline, cancelled, on_phase=lambda *_: None, prefetched=None):
         """``prefetched`` (prefetch.PrefetchedContainer): the container the pick detected on its capture.
@@ -167,6 +176,10 @@ class PlacePipeline:
                     reuse = None
                     if prefetched is not None and attempt == 0:
                         reason, measures = container_change(prefetched, observation, query)
+                        if reason and self.prefetch_record_dir and "changed_fraction" in measures:
+                            measures["record"] = save_container_change(
+                                self.prefetch_record_dir, prefetched, observation, reason, measures
+                            )
                         if reason or getattr(backends.proposer, "from_mask", None) is None:
                             reason = reason or "the container proposer cannot take a mask"
                         result.report["container_prefetch"] = {"used": not reason, "reason": reason, **measures}
