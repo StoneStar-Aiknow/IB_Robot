@@ -26,10 +26,12 @@ class Arm:
         return np.arange(len(names), dtype=float)
 
 
-def hand(healthy=True):
+def hand(healthy=True, age=0.0):
     positions = {name: 0.1 * index for index, name in enumerate(CHANNEL)}
-    sample = SimpleNamespace(healthy=healthy, positions=positions)
-    return SimpleNamespace(io=SimpleNamespace(feedback=lambda: sample, channel_joints=CHANNEL))
+    sample = SimpleNamespace(healthy=healthy, positions=positions, received_at=10.0)
+    return SimpleNamespace(
+        io=SimpleNamespace(feedback=lambda: sample, channel_joints=CHANNEL, monotonic=lambda: 10.0 + age)
+    )
 
 
 def test_posture_is_both_arms_the_head_and_only_the_installed_hands():
@@ -49,6 +51,12 @@ def test_an_automatic_arm_measures_through_the_left_part_and_an_unhealthy_hand_r
     with pytest.raises(RuntimeError, match="unhealthy"):
         x2_posture(selected, hands, ("left",))()
     assert arm.asked == [ARMS]
+
+
+@pytest.mark.parametrize("age", [-0.1, 0.2])
+def test_recovery_posture_refuses_future_or_stale_hand_feedback(age):
+    with pytest.raises(RuntimeError, match="stale"):
+        x2_posture(Arm(), hand(age=age), ("left",))()
 
 
 def observation():

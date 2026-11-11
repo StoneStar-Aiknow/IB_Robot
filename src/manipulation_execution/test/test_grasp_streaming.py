@@ -342,7 +342,8 @@ def test_the_shaper_raise_is_relative_to_the_segment_start():
     np.testing.assert_allclose(arm.published[-1][0], 0.3 + SAG[0] + 0.03, atol=1e-9)
 
 
-def test_a_settled_segment_reports_where_the_arm_stands_against_the_raw_plan(capsys):
+@pytest.mark.parametrize("record_paths", [False, True])
+def test_a_settled_segment_reports_where_the_arm_stands_against_the_raw_plan(capsys, record_paths):
     """A sag model that raises more than the arm sags shows as end error, inside the arrival tolerance."""
 
     class Shaper:
@@ -351,8 +352,15 @@ def test_a_settled_segment_reports_where_the_arm_stands_against_the_raw_plan(cap
 
     arm = SimArm()
     executor = StreamExecutor(arm, CONFIG, shaper=Shaper())
-    outcome = run(executor, line(np.zeros(3), [0.3, 0.0, 0.0]))
+    executor.record_paths = record_paths
+    segment = line(np.zeros(3), [0.3, 0.0, 0.0])
+    outcome = run(executor, segment)
     assert outcome.state is MotionState.SUCCEEDED, outcome.reason
+    if record_paths:
+        np.testing.assert_allclose(outcome.report["executed_path"]["positions"], segment.positions)
+        np.testing.assert_allclose(outcome.report["executed_path"]["times"], segment.times)
+    else:
+        assert "executed_path" not in outcome.report
     row = executor.report["segments"][-1]
     assert row["raise_end_rad"] == pytest.approx({"l0": 0.03, "l1": 0.0, "l2": 0.0})
     assert row["end_error_rad"]["l0"] == pytest.approx(0.03, abs=0.002)

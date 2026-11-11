@@ -49,6 +49,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ExecutionEvent.msg"
   "msg/ExecutionDetail.msg"
   "msg/HeldObject.msg"
+  "msg/InterruptedPick.msg"
   "msg/PrefetchedContainer.msg"
   "srv/ClaimHeldObject.srv"
   "srv/PrefetchGrasp.srv"

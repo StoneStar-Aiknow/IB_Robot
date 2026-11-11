@@ -101,6 +101,7 @@ class GraspSequence:
         self._home_tolerance = float(home_tolerance_rad)
         self._on_phase = on_phase
         self._current_phase = ""
+        self._journal = None
 
     def run(
         self,
@@ -114,6 +115,10 @@ class GraspSequence:
         """``preshaped``: a successful PRESHAPE the caller already ran (while planning); the
         plan's first PRESHAPE step is recorded from it instead of acting again."""
         result = SequenceResult()
+        provider = self._backends.interrupted_pick
+        self._journal = provider
+        if provider is not None:
+            provider.begin(plan)
         done: list[Step] = []
         state = {"carrying": False, "moved": None, "failed": None}
         grip_lost: list[str | None] = []
@@ -309,6 +314,8 @@ class GraspSequence:
             self._stop(result, "INTERNAL_ERROR", f"{type(exc).__name__}: {exc}")
             return result
         finally:
+            if self._journal is not None:
+                self._journal.end(result)
             result.execution_report = deepcopy(getattr(self._backends.executor, "report", {}))
 
     # -- steps -----------------------------------------------------------------
@@ -335,7 +342,11 @@ class GraspSequence:
     def _move(self, segment: ArmSegment, carrying: bool, halted: Flag, cancelled: Flag, result) -> MotionOutcome:
         self._current_phase = segment.name
         self._on_phase(segment.name, "start", {"kind": segment.kind.value, "carrying": carrying})
+        if self._journal is not None:
+            self._journal.moving(segment)
         outcome = self._backends.executor.execute(segment, carrying=carrying, halted=halted, cancelled=cancelled)
+        if self._journal is not None:
+            self._journal.moved(segment, outcome)
         self._phase(result, segment.name, outcome, carrying=carrying)
         return outcome
 
@@ -403,7 +414,11 @@ class GraspSequence:
                 fault.append(reason)
             return bool(reason)
 
+        if self._journal is not None:
+            self._journal.effect_started(action)
         outcome = self._backends.effector.act(action, halted=halted, cancelled=stopped)
+        if self._journal is not None:
+            self._journal.effect_finished(action, outcome)
         self._phase(result, action.value, outcome, held=outcome.held, halted=outcome.halted)
         if fault:
             raise _Stopped("MOTION_FAILED", f"arm during {action.value}: {fault[0]}")

@@ -6,6 +6,7 @@ import json
 import threading
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import rclpy
@@ -59,6 +60,21 @@ def make_backends(*, node, grasp_execution, description):
 
 
 WARMUP = {"ready": threading.Event(), "attempts": 0}
+
+
+def make_recovery_backends(*, node, grasp_execution, description):
+    backends = make_backends(node=node, grasp_execution=grasp_execution, description=description)
+    journal = SimpleNamespace(
+        status=SimpleNamespace(nonce="interrupted-1", state="pending", reason="PICK_INTERRUPTED"), calls=[]
+    )
+
+    def recover(nonce, **budget):
+        journal.calls.append(nonce)
+        assert not budget["cancelled"]()
+        journal.status = None
+
+    journal.recover = recover
+    return replace(backends, interrupted_pick=journal)
 
 
 def make_warming_backends(*, node, grasp_execution, description):
@@ -120,6 +136,14 @@ def test_admission_names_the_first_broken_rule():
     assert pick_goal_rejection(delegated, identity(config), now) == ""
 
 
+def test_recovery_mode_requires_a_nonce():
+    config = configuration()
+    message = goal(config, now_s=1000, mode=PickObject.Goal.MODE_RECOVER)
+    assert "recovery_nonce" in pick_goal_rejection(message, identity(config), 1000)
+    message.recovery_nonce = "matching-interruption"
+    assert pick_goal_rejection(message, identity(config), 1000) == ""
+
+
 def test_pipeline_options_are_checked_and_verification_follows_the_close():
     assert pipeline_config({"pipeline": {"max_moved_replans": 0}}).max_moved_replans == 0
     with pytest.raises(ValueError, match="unknown keys"):
@@ -169,6 +193,27 @@ def wait(future, seconds=20.0):
         time.sleep(0.01)
     assert future.done()
     return future.result()
+
+
+def test_recovery_crosses_ros_action_and_blocks_new_pick_and_stale_nonce(ros):
+    config = configuration(backend=f"{__name__}:make_recovery_backends")
+    node, client_node, client, executor, thread = serve(config)
+    try:
+        message = goal(config, now_s=node._now_s())
+        assert not wait(client.send_goal_async(message)).accepted
+        message.mode, message.recovery_nonce = PickObject.Goal.MODE_RECOVER, "stale"
+        assert not wait(client.send_goal_async(message)).accepted
+        message.recovery_nonce = "interrupted-1"
+        handle = wait(client.send_goal_async(message))
+        assert handle.accepted
+        result = wait(handle.get_result_async()).result
+        assert result.success and result.interrupted_pick.state == "clear"
+        assert result.interrupted_pick.nonce == "interrupted-1"
+        assert node._interrupted.calls == ["interrupted-1"]
+        assert node._backends.executor.log == []
+        assert not wait(client.send_goal_async(message)).accepted  # Replay cannot recover twice.
+    finally:
+        stop(node, client_node, executor, thread)
 
 
 def test_the_node_runs_a_goal_through_the_configured_backends(ros):

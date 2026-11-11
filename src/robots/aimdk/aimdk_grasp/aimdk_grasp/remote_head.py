@@ -207,6 +207,12 @@ class X2GraspHeadClient:
         self.capture_client = node.create_client(CaptureGraspObservation, names.capture, callback_group=callback_group)
         self.scene_client = node.create_client(CompleteGraspScene, names.scene, callback_group=callback_group)
         self.refine_client = node.create_client(RefineGraspPlan, names.refine, callback_group=callback_group)
+        from aimdk_grasp_msgs.srv import ValidatePickRetreat
+
+        self.retreat_type = ValidatePickRetreat
+        self.retreat_client = node.create_client(
+            ValidatePickRetreat, names.validate_retreat, callback_group=callback_group
+        )
         self.watch_client = node.create_client(WatchGraspTarget, names.watch, callback_group=callback_group)
         self.plan_client = ActionClient(node, PlanGraspCandidates, names.plan, callback_group=callback_group)
         self.plan_type = PlanGraspCandidates
@@ -223,6 +229,26 @@ class X2GraspHeadClient:
             STATUS_DEPTH,
             lambda message, received: self._received.append((message, received_at_or_stale(received))),
         )
+
+    def validate_retreat(self, side, steps, nonce, hand, *, deadline, cancelled, held=None, plan_id=""):
+        from manipulation_execution.held_custody import held_to_msg
+
+        request = self.retreat_type.Request(
+            arm_side=side,
+            steps=[wire.step_to_msg(s) for s in steps],
+            recovery_nonce=nonce,
+            hand_positions=list(hand),
+            timeout_s=max(0.0, deadline - time.monotonic()),
+            plan_id=plan_id,
+        )
+        if held is not None:
+            request.held_object = held_to_msg(held)
+        response = self.call(self.retreat_client, request, deadline, cancelled)
+        if cancelled() or time.monotonic() >= deadline:
+            raise GraspFailure("CANCELED", "retreat validation no longer belongs to an active request")
+        if not response.success or response.recovery_nonce != nonce:
+            raise GraspFailure("PICK_MANUAL_CHECK", response.message or "recovery nonce mismatch")
+        return wire.from_json(response.report_json)
 
     def statuses(self) -> list:
         """``(WatchStatus, received)`` pairs taken since the last call; ``received`` on this host's monotonic clock.
@@ -704,7 +730,30 @@ def x2_remote_grasp_backends(
             closer()
 
     from .held_object import held_builder
+    from .interrupted_pick import InterruptedPick
 
+    posture = x2_posture(executor, effector, installed_hands(options))
+
+    def validate(steps, nonce, *, deadline, cancelled, held=None, plan_id=""):
+        side = executor.selection.side if hasattr(executor, "selection") else robot.side
+        hand = getattr(effector, "parts", {}).get(side, effector)
+        return head.validate_retreat(
+            side, steps, nonce, hand._measured(), deadline=deadline, cancelled=cancelled, held=held, plan_id=plan_id
+        )
+
+    import hashlib
+    import os
+    from pathlib import Path
+
+    identity = str((description.get("robot") or {}).get("id", "x2")) + str(
+        grasp_execution.get("action_name", "/manipulation/execute_pick")
+    )
+    state_path = (
+        Path(os.environ.get("ROS_HOME", str(Path.home() / ".ros")))
+        / "ibrobot"
+        / ("x2_pick_" + hashlib.sha256(identity.encode()).hexdigest()[:16] + ".json")
+    )
+    interrupted = InterruptedPick(executor, effector, posture, validate, state_path=state_path)
     return GraspBackends(
         camera,
         proposer,
@@ -716,7 +765,8 @@ def x2_remote_grasp_backends(
         prepare=prepare,
         held_object=held_builder(node, executor, effector),
         plan_home=RemotePlacePlanner(head).plan_home,
-        posture=x2_posture(executor, effector, installed_hands(options)),
+        posture=posture,
+        interrupted_pick=interrupted,
         container_detector=container_detector(services, grasp_execution, robot.perception),
     )
 
@@ -734,8 +784,8 @@ def x2_posture(executor, effector, sides):
         values = [np.asarray(arm.measured(names), dtype=float)]
         if hand is not None:
             sample = hand.io.feedback()
-            if not sample.healthy:
-                raise RuntimeError("hand feedback unhealthy")
+            if not sample.healthy or not 0 <= hand.io.monotonic() - sample.received_at <= 0.1:
+                raise RuntimeError("hand feedback unhealthy or stale")
             channel = hand.io.channel_joints
             for side in sides:
                 joints = channel[HAND_OFFSETS[side] : HAND_OFFSETS[side] + len(HAND_PARTS)]

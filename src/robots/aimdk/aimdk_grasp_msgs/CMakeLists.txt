@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/CaptureGraspObservation.srv"
   "srv/CompleteGraspScene.srv"
   "srv/RefineGraspPlan.srv"
+  "srv/ValidatePickRetreat.srv"
   "srv/WatchGraspTarget.srv"
   "action/PlanGraspCandidates.action"
   "action/PlanPlace.action"

@@ -17,6 +17,9 @@
 uint8 MODE_EXECUTE=0
 uint8 MODE_PLAN_ONLY=1
 uint8 MODE_OBSERVE_ONLY=2
+# Internal recovery before task-pose preparation; release only at verified source contact.
+uint8 MODE_RECOVER=3
+string recovery_nonce
 
 DispatchBinding dispatch_binding
 string target_query
@@ -37,6 +40,7 @@ uint8 VERIFICATION_FAILED=2
 uint8 VERIFICATION_UNCERTAIN=3
 
 bool success
+InterruptedPick interrupted_pick
 string error_code
 string message
 uint32 attempts

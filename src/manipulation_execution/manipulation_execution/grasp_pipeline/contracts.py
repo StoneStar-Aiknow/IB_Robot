@@ -475,6 +475,8 @@ class GraspBackends:
     #: (observation, container_query, *, deadline, cancelled) -> HxW mask or None: the container of
     #: a following place, detected on a prefetched capture and handed over with the held object.
     container_detector: Callable | None = None
+    #: Robot-owned interruption journal/recovery. Absent backends retain existing behavior.
+    interrupted_pick: object | None = None
 
 
 @dataclass(frozen=True)

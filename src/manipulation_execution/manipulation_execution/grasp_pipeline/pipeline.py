@@ -32,6 +32,7 @@ from .contracts import (
     GraspBackends,
     GraspFailure,
     GraspPlan,
+    Move,
     Observation,
     Proposals,
 )
@@ -498,6 +499,13 @@ class GraspPipeline:
                     outcome.report.setdefault("on_closed_errors", []).append(f"{type(exc).__name__}: {exc}")
 
         sequence = GraspSequence(self._backends, home_tolerance_rad=self._config.home_tolerance_rad, on_phase=on_phase)
+        interruption = self._backends.interrupted_pick
+        if interruption is not None and self._backends.held_object is not None:
+            # Build geometry only if a later recovery needs it. The journal supplies
+            # the actual executed contact path, including any online refinement.
+            interruption.held_factory = lambda moves: self._backends.held_object(
+                "interrupted pick", observation, proposals, replace(plan, steps=tuple(Move(move) for move in moves))
+            )
         if watch is not None:
             watch.arm(observation, proposals, plan)
         outcome.at_rest = False

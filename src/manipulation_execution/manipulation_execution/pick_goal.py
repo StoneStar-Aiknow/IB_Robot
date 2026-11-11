@@ -15,7 +15,12 @@ from embodied_common.dispatch_binding import delegated_executor_identity_matches
 from ibrobot_msgs.action import PickObject
 
 PICK_MODES = frozenset(
-    {PickObject.Goal.MODE_EXECUTE, PickObject.Goal.MODE_PLAN_ONLY, PickObject.Goal.MODE_OBSERVE_ONLY}
+    {
+        PickObject.Goal.MODE_EXECUTE,
+        PickObject.Goal.MODE_PLAN_ONLY,
+        PickObject.Goal.MODE_OBSERVE_ONLY,
+        PickObject.Goal.MODE_RECOVER,
+    }
 )
 
 
@@ -59,6 +64,8 @@ def pick_goal_rejection(goal, identity: dict[str, str], now_s: float) -> str:
         or timeout_sec <= 0.0
     ):
         return "task_budget or timeout_sec is invalid or already expired"
+    if goal.mode == PickObject.Goal.MODE_RECOVER and not goal.recovery_nonce:
+        return "recovery_nonce is required for recovery"
     if int(goal.mode) not in PICK_MODES:
         return f"unknown mode {goal.mode}"
     return ""

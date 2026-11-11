@@ -1,0 +1,15 @@
+# Read-only validation of exactly these moves on a newly captured world.
+string arm_side
+GraspPlanStep[] steps
+string recovery_nonce
+float64[] hand_positions
+float64 timeout_s
+# Optional verified grasp geometry, only for retracing the lift and opening at contact.
+ibrobot_msgs/HeldObject held_object
+string plan_id
+---
+bool success
+string error_code
+string message
+string recovery_nonce
+string report_json

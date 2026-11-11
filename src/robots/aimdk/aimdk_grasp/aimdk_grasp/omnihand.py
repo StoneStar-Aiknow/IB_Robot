@@ -252,7 +252,7 @@ class OmniHandEffector:
             }
         )
 
-    def restore(self, state: str) -> None:
+    def restore(self, state: str, *, send: bool = True) -> None:
         import json
 
         grip = json.loads(state)
@@ -272,7 +272,10 @@ class OmniHandEffector:
         self._measured()  # Require healthy, fresh feedback before publishing.
         self._grip = dict(contacts=contacts, command=command.copy(), direction=direction.copy())
         self._lost_since = None
-        self._send(command)
+        if send:
+            self._send(command)
+        else:
+            self.command = command.copy()
 
     def released(self) -> bool:
         """Fresh open-hand feedback and no tactile contact are required."""

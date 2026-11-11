@@ -235,6 +235,23 @@ def test_missing_touch_after_handover_is_unknown_until_fresh_contact_returns(map
     assert "no longer press" in place.holding()
 
 
+def test_interrupted_grip_observation_can_be_restored_without_sending_any_hand_command(mapping):
+    hand = SimHand(mapping.preset("open"))
+    effector = OmniHandEffector(hand, mapping)
+    for finger in ("thumb", "index"):
+        flex = FINGERS[finger][1]
+        hand.block(
+            finger, mapping.preset("open")[flex] + 0.4 * (mapping.preset("close")[flex] - mapping.preset("open")[flex])
+        )
+    assert act(effector, EffectorAction.CLOSE).held is True
+    snapshot = effector.snapshot()
+    effector.finish()
+    before = len(hand.full_published)
+    effector.restore(snapshot, send=False)
+    assert effector.holding() == "" and effector.snapshot() == snapshot
+    assert len(hand.full_published) == before
+
+
 def test_unknown_joint_feedback_interrupts_the_grip_loss_debounce(mapping):
     hand = SimHand(mapping.preset("open"))
     effector = OmniHandEffector(hand, mapping)

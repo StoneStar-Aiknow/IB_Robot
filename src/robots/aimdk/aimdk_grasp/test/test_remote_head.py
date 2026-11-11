@@ -30,6 +30,7 @@ from aimdk_grasp_msgs.srv import (  # noqa: E402
     CaptureGraspObservation,
     CompleteGraspScene,
     RefineGraspPlan,
+    ValidatePickRetreat,
     WatchGraspTarget,
 )
 from rclpy.action import ActionServer, CancelResponse  # noqa: E402
@@ -87,6 +88,8 @@ class FakeHead(Node):
         self.create_service(CaptureGraspObservation, names.capture, self._capture, callback_group=group)
         self.create_service(CompleteGraspScene, names.scene, self._scene, callback_group=group)
         self.create_service(RefineGraspPlan, names.refine, self._refine, callback_group=group)
+        self.retreat_nonce = None
+        self.create_service(ValidatePickRetreat, names.validate_retreat, self._retreat, callback_group=group)
         self.create_service(WatchGraspTarget, names.watch, self._watch, callback_group=group)
         ActionServer(
             self,
@@ -193,6 +196,13 @@ class FakeHead(Node):
             )
         return PlanGraspCandidates.Result(success=True, plan_id="p1", plan=wire.plan_to_msg(plan()))
 
+    def _retreat(self, request, response):
+        self.requests.append(("retreat", request))
+        response.success = True
+        response.recovery_nonce = self.retreat_nonce or request.recovery_nonce
+        response.report_json = '{"checked_samples": 42}'
+        return response
+
     def _refine(self, request, response):
         self.requests.append(("refine", request.plan_id, request.completed))
         response.success, response.plan = True, wire.plan_to_msg(plan(shift=0.05))
@@ -285,6 +295,31 @@ def test_a_capture_decodes_into_an_observation_the_head_keeps(ros):
     with pytest.raises(GraspFailure) as raised:
         capture(client)
     assert raised.value.code == NOT_READY and not raised.value.retryable
+
+
+def test_retreat_paths_and_held_geometry_cross_ros_and_a_stale_reply_cannot_authorize_motion(ros):
+    head, client = ros
+    held = HeldObject("custody-7", "an apple", "right", JOINTS, (0.3, 0.2), (0.0, 0.0), 0.04, (0.0,) * 3, "{}")
+    steps = (plan().steps[1], Effect(EffectorAction.RELEASE))
+    report = client.validate_retreat(
+        "right",
+        steps,
+        "nonce-1",
+        np.zeros(10),
+        held=held,
+        plan_id="source-1",
+        deadline=time.monotonic() + 5,
+        cancelled=lambda: False,
+    )
+    request = head.requests[-1][1]
+    assert report == {"checked_samples": 42}
+    assert request.recovery_nonce == "nonce-1" and request.plan_id == "source-1"
+    assert request.held_object.custody_id == "custody-7" and len(request.steps) == 2
+    head.retreat_nonce = "old-nonce"
+    with pytest.raises(GraspFailure, match="nonce mismatch"):
+        client.validate_retreat(
+            "right", steps, "nonce-2", np.zeros(10), deadline=time.monotonic() + 5, cancelled=lambda: False
+        )
 
 
 def test_an_observation_the_head_could_not_take_is_retryable_and_nothing_else_is(ros):

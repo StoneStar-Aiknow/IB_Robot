@@ -54,6 +54,7 @@ class HeadEndpoints:
     watch: str
     status: str
     plan_place: str
+    validate_retreat: str
 
 
 def head_endpoints(namespace: str = DEFAULT_NAMESPACE) -> HeadEndpoints:
@@ -66,4 +67,5 @@ def head_endpoints(namespace: str = DEFAULT_NAMESPACE) -> HeadEndpoints:
         watch=f"{root}/watch",
         status=f"{root}/watch_status",
         plan_place=f"{root}/plan_place",
+        validate_retreat=f"{root}/validate_retreat",
     )

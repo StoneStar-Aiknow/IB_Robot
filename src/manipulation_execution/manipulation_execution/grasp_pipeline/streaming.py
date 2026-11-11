@@ -186,10 +186,18 @@ class StreamExecutor:
         self._feedback_sample = None
         self._command_sample = None
         self._hold_reference: tuple[str, tuple[str, ...], np.ndarray] | None = None
+        self.record_paths = False
 
     # -- MotionExecutor -------------------------------------------------------------
 
     def execute(self, segment: ArmSegment, *, carrying: bool, halted: Flag, cancelled: Flag) -> MotionOutcome:
+        return self._execute(segment, carrying=carrying, halted=halted, cancelled=cancelled)
+
+    def execute_checked(self, segment: ArmSegment, *, carrying: bool, halted: Flag, cancelled: Flag) -> MotionOutcome:
+        """Replay validated geometry unchanged; only its timebase may be slowed."""
+        return self._execute(segment, carrying=carrying, halted=halted, cancelled=cancelled, checked=True)
+
+    def _execute(self, segment, *, carrying, halted, cancelled, checked=False):
         names = segment.joint_names
         self._hold_reference = None
         self._feedback_sample = self._command_sample = None
@@ -199,7 +207,16 @@ class StreamExecutor:
                 raise StreamFailure(f"segment joints {sorted(set(names) - set(self._channel))} are not on the stream")
             sample = self._fresh(self.io.feedback())
             here = self._vector(sample, names)
-            timed = self._timed(segment, here)
+            if checked:
+                if segment.kind is not SegmentKind.TRAJECTORY or np.max(np.abs(here - segment.start)) > 0.005:
+                    raise StreamFailure("validated retreat start differs from the measured arm")
+                needed = (
+                    np.max(np.abs(np.diff(segment.positions, axis=0)), axis=1) / self.config.max_velocity_rad_s * 1.001
+                )
+                times = np.r_[0.0, np.cumsum(np.maximum(np.diff(segment.times), needed))]
+                timed = ArmSegment(segment.name, segment.kind, names, segment.positions, times)
+            else:
+                timed = self._timed(segment, here)
             raised = self._raise(timed)
             offset, held = self._baseline(sample, names)
         except StreamFailure as exc:
@@ -374,13 +391,29 @@ class StreamExecutor:
         started = last_tick = self.io.monotonic()
         arrived_since = None
         last_command = None
+        path_report = (
+            {"executed_path": {"positions": timed.positions.tolist(), "times": timed.times.tolist()}}
+            if self.record_paths
+            else {}
+        )
         try:
             start_sample = self._fresh(self.io.feedback())
             locked_start = self._vector(start_sample, locked) if locked else np.zeros(0)
             while True:
                 tick = self.io.monotonic()
                 if cancelled():
-                    return self._end(row, MotionState.CANCELLED, "cancelled", names)
+                    return self._end(
+                        row,
+                        MotionState.CANCELLED,
+                        "cancelled",
+                        names,
+                        report={
+                            "path_progress": self._path_progress(timed.times, last_tick - started)
+                            if last_command is not None
+                            else 0.0,
+                            **path_report,
+                        },
+                    )
                 if halted() and last_command is not None:
                     # Nothing more is sent: the last command stands and stays alive.
                     progress = self._path_progress(timed.times, last_tick - started)
@@ -433,7 +466,7 @@ class StreamExecutor:
                     row["raise_end_rad"] = dict(zip(names, np.round(raised[-1], 4).tolist(), strict=True))
                     row["start_offset_rad"] = dict(zip(names, np.round(offset, 4).tolist(), strict=True))
                     self._hold_reference = (name, tuple(names), timed.positions[-1].copy())
-                    return self._end(row, MotionState.SUCCEEDED, "", names)
+                    return self._end(row, MotionState.SUCCEEDED, "", names, report=path_report)
                 self.io.wait(max(0.0, tick + period - self.io.monotonic()))
         except StreamFailure as exc:
             return self._end(row, MotionState.FAILED, str(exc), names)

@@ -35,6 +35,7 @@ from embodied_common.dispatch_binding import (
 )
 from embodied_common.execution_detail import ExecutionDetail, fill_execution_detail, short_message
 from ibrobot_msgs.action import PickObject
+from ibrobot_msgs.msg import InterruptedPick as InterruptedPickMsg
 from manipulation_execution.grasp_pipeline.backends import backend_spec, load_backends
 from manipulation_execution.grasp_pipeline.outcome_message import outcome_message
 from manipulation_execution.grasp_pipeline.pipeline import GraspPipeline, PickMode, PickOutcome, PipelineConfig
@@ -245,6 +246,26 @@ class GraspPipelineNode(Node):
         )
         self._backends = load_backends(spec, node=self, grasp_execution=config, description=description)
         self._pipeline = GraspPipeline(self._backends, pipeline_config(config))
+        self._interrupted = self._backends.interrupted_pick
+        self._recovery_publisher = None
+        if self._interrupted is not None:
+            from rclpy.qos import DurabilityPolicy
+
+            self._recovery_publisher = self.create_publisher(
+                InterruptedPickMsg,
+                f"{self._action_name}/interrupted",
+                QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+            )
+            from ibrobot_msgs.srv import AuthorizeHeldReset
+
+            self._reset_service = self.create_service(
+                AuthorizeHeldReset,
+                f"{self._action_name}/authorize_reset",
+                self._reset_interrupted,
+                callback_group=ReentrantCallbackGroup(),
+            )
+            self._publish_interrupted()
+
         self._custody = None
         if self._backends.held_object is not None:
             from manipulation_execution.held_custody import HeldCustodyServer
@@ -283,10 +304,49 @@ class GraspPipelineNode(Node):
             f"prefetch={'on' if self._prefetch_service is not None else 'off'}"
         )
 
+    def _publish_interrupted(self):
+        if self._recovery_publisher is not None:
+            status = self._interrupted.status
+            if status is not None:
+                self._last_interrupted_nonce = status.nonce
+            self._recovery_publisher.publish(
+                InterruptedPickMsg(
+                    nonce=status.nonce if status else getattr(self, "_last_interrupted_nonce", ""),
+                    state=status.state if status else "clear",
+                    reason_code=status.reason if status else "",
+                )
+            )
+
+    def _reset_interrupted(self, request, response):
+        with self._goal_lock:
+            if self._goal_active or self._closing.is_set():
+                response.error_code = "SKILL_BUSY"
+                return response
+            try:
+                if request.schema_version != 1 or not request.request_id.strip():
+                    raise ValueError("schema 1 and operator request ID required")
+                self._interrupted.confirm_manual_reset(
+                    request.custody_id, confirmed_empty=request.operator_confirmed_empty, note=request.operator_note
+                )
+                response.success, response.custody_id = True, request.custody_id
+                response.state = "clear"
+                self.get_logger().info(
+                    "interrupted pick manually checked: "
+                    + json.dumps(
+                        {"request_id": request.request_id, "nonce": request.custody_id, "note": request.operator_note}
+                    )
+                )
+            except Exception as exc:
+                response.error_code, response.message = "PICK_MANUAL_CHECK", str(exc)
+            self._publish_interrupted()
+            return response
+
     def _on_prefetch(self, request, response):
         """Start perceiving a pick's target (and its place's container) before its goal; never moves anything."""
         reason = ""
-        if not self._ready.is_set():
+        if self._interrupted is not None and self._interrupted.status is not None:
+            reason = "an interrupted pick must be recovered first"
+        elif not self._ready.is_set():
             reason = "the grasp backends are still warming up"
         elif self._goal_active or (self._custody is not None and self._custody.custody.occupied):
             reason = "a goal or a held object owns the robot"
@@ -334,6 +394,13 @@ class GraspPipelineNode(Node):
         if not self._ready.is_set():
             self.get_logger().warning("PickObject goal rejected: the grasp backends are still warming up")
             return GoalResponse.REJECT
+        pending = self._interrupted.status if self._interrupted is not None else None
+        if pending is not None and (goal.mode != PickObject.Goal.MODE_RECOVER or goal.recovery_nonce != pending.nonce):
+            return GoalResponse.REJECT
+        if goal.mode == PickObject.Goal.MODE_RECOVER and (
+            pending is None or pending.state != "pending" or goal.retain_for_place or goal.release_after_success
+        ):
+            return GoalResponse.REJECT
         if goal.retain_for_place and (self._custody is None or goal.release_after_success):
             return GoalResponse.REJECT
         with self._goal_lock:
@@ -360,7 +427,14 @@ class GraspPipelineNode(Node):
                 )
             else:
                 outcome = self._run(goal_handle, time.monotonic() + remaining, timer)
+            self._publish_interrupted()
             result = pick_result(outcome, self._identity)
+            status = self._interrupted.status if self._interrupted is not None else None
+            result.interrupted_pick = InterruptedPickMsg(
+                nonce=status.nonce if status else (goal.recovery_nonce or getattr(self, "_last_interrupted_nonce", "")),
+                state=status.state if status else "clear",
+                reason_code=status.reason if status else "",
+            )
             result.last_feedback_sequence = goal_handle.phase_sequence
             result.execution_history = list(goal_handle.phase_history)
             handover = outcome.report.get("handover_s")
@@ -386,6 +460,16 @@ class GraspPipelineNode(Node):
 
     def _run(self, goal_handle, deadline: float, timer: PreMotionTimer | None = None) -> PickOutcome:
         goal = goal_handle.request
+        if goal.mode == PickObject.Goal.MODE_RECOVER:
+            try:
+                self._interrupted.recover(
+                    goal.recovery_nonce, deadline=deadline, cancelled=lambda: goal_handle.is_cancel_requested
+                )
+                return PickOutcome(success=True)
+            except Exception as exc:
+                return PickOutcome(error_code=getattr(exc, "code", "PICK_MANUAL_CHECK"), message=str(exc))
+            finally:
+                self._publish_interrupted()
         progress = {"value": 0.0, "attempt": 0}
 
         def on_phase(name: str, event: str, detail: dict) -> None:

@@ -136,6 +136,7 @@ class RuntimeSnapshot:
     held_object_state: str = ""
     held_object_reason: str = ""
     held_object_manual_reset: bool = False
+    interrupted_pick_state: str = ""
 
     @property
     def is_busy(self) -> bool:
@@ -719,6 +720,15 @@ class GatewayPolicy:
                 message="another root execution is active",
                 **decision_args,
             )
+        if snapshot.interrupted_pick_state and (
+            snapshot.interrupted_pick_state != "pending" or skill_name not in {"pick_object", "return_to_task_pose"}
+        ):
+            return GatewayDecision(
+                admitted=False,
+                error_code="HELD_OBJECT_RECOVERY_REQUIRED",
+                message="interrupted pick requires recovery or manual inspection",
+                **decision_args,
+            )
         held = _held_object_rejection(owner, snapshot, skill_name)
         if held:
             return GatewayDecision(
@@ -859,6 +869,8 @@ class GatewayPolicy:
                 return SKILL_BUSY, None
             if snapshot.is_busy:
                 return SKILL_BUSY, None
+            if snapshot.interrupted_pick_state:
+                return HELD_OBJECT_RECOVERY_REQUIRED, None
             if _held_object_rejection(None, snapshot, ""):
                 return _held_object_error(snapshot), None
             duplicate = ledger.query(task_id, payload_hash)
@@ -923,6 +935,13 @@ class GatewayPolicy:
                 and not held_object_recovery_allowed(snapshot, skill_names)
             ):
                 return _held_object_error(snapshot), None
+            names = tuple(skill_names)
+            if snapshot.interrupted_pick_state and (
+                snapshot.interrupted_pick_state != "pending"
+                or not names
+                or names[0] not in {"pick_object", "return_to_task_pose"}
+            ):
+                return HELD_OBJECT_RECOVERY_REQUIRED, None
             if timeout_sec > self._task_budget_sec:
                 return TIMEOUT_EXCEEDS_POLICY, None
             token = lease.acquire(owner)

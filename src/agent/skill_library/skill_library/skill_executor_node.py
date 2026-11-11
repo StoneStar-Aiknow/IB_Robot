@@ -9,7 +9,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -82,6 +82,7 @@ from ibrobot_msgs.action import (
 from ibrobot_msgs.msg import (
     ExecutionEvent,
     HeldObject,
+    InterruptedPick,
     RuntimeStatus,
     SkillCapabilityStatus,
     SkillDiagnostic,
@@ -1118,6 +1119,21 @@ class SkillExecutorNode(Node):
                 callback_group=callback_group,
             )
         self._held_object = None
+        self._interrupted_pick = None
+        if self._grasp_execution.get("backend") == "aimdk_grasp.remote_head:x2_remote_grasp_backends":
+            self._interrupted_pick = InterruptedPick(state="manual", reason_code="PICK_RECOVERY_STATE_UNKNOWN")
+            self._pick_reset_client = self.create_client(
+                AuthorizeHeldReset, f"{self._pick_action_name}/authorize_reset", callback_group=callback_group
+            )
+            self.create_subscription(
+                InterruptedPick,
+                f"{self._pick_action_name}/interrupted",
+                self._handle_interrupted_pick,
+                QoSProfile(
+                    depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL
+                ),
+                callback_group=callback_group,
+            )
         if self._placement_execution.get("backend"):
             # A pick that hands over to place keeps custody between the two steps;
             # the latched state gates every other admission until it ends.
@@ -3726,11 +3742,12 @@ class SkillExecutorNode(Node):
         try:
             with self._state_guard():
                 snapshot = self._runtime_snapshot()
-                held = self._held_object
+                interruption = getattr(self, "_interrupted_pick", None)
+                held = interruption if interruption is not None else self._held_object
                 if request.schema_version == 1 and request.inspect_only:
                     response.success = True
                     if held is not None:
-                        response.custody_id = held.custody_id
+                        response.custody_id = interruption.nonce if interruption is not None else held.custody_id
                         response.state, response.reason_code = held.state, held.reason_code
                     return response
                 if (
@@ -3751,9 +3768,9 @@ class SkillExecutorNode(Node):
                     return response
                 if (
                     held is None
-                    or held.state != "uncertain"
+                    or (interruption is None and held.state != "uncertain")
                     or not request.custody_id
-                    or held.custody_id != request.custody_id
+                    or (interruption.nonce if interruption is not None else held.custody_id) != request.custody_id
                 ):
                     response.error_code = "STALE_CUSTODY"
                     response.message = "the operator check must match the current uncertain custody"
@@ -3770,7 +3787,7 @@ class SkillExecutorNode(Node):
                     response.error_code = "SKILL_BUSY"
                     return response
             started = time.monotonic()
-            client = self._authorize_held_reset_client
+            client = self._pick_reset_client if interruption is not None else self._authorize_held_reset_client
             if not client.wait_for_service(timeout_sec=self._rpc_timeout):
                 response.error_code = "SERVER_UNAVAILABLE"
                 return response
@@ -3786,6 +3803,18 @@ class SkillExecutorNode(Node):
             response.success, response.error_code, response.message = result.success, result.error_code, result.message
             response.custody_id, response.remaining_sec = result.custody_id, result.remaining_sec
             response.state, response.reason_code = held.state, held.reason_code
+            if result.success and interruption is not None:
+                with self._state_guard():
+                    current = getattr(self, "_interrupted_pick", None)
+                    if result.custody_id != interruption.nonce or (
+                        current is not None and current.nonce != interruption.nonce
+                    ):
+                        response.success, response.error_code = False, "STALE_CUSTODY"
+                        return response
+                    self._remember_cleared_pick_nonce(interruption.nonce)
+                    self._interrupted_pick = None
+                response.state = "clear"
+                return response
             if result.success:
                 with self._state_guard():
                     self._manual_reset_authorization = (request.custody_id, started + result.remaining_sec)
@@ -3853,6 +3882,28 @@ class SkillExecutorNode(Node):
         with self._state_guard():
             self._latest_ee_pose = msg
             self._latest_ee_pose_monotonic = time.monotonic()
+
+    def _remember_cleared_pick_nonce(self, nonce):
+        self._cleared_pick_nonce = nonce
+        cleared = getattr(self, "_cleared_pick_nonces", None)
+        if cleared is None:
+            cleared = self._cleared_pick_nonces = set()
+        cleared.add(nonce)
+
+    def _handle_interrupted_pick(self, msg):
+        with self._state_guard():
+            current = getattr(self, "_interrupted_pick", None)
+            if msg.state != "clear":
+                if (
+                    msg.nonce
+                    and msg.nonce not in getattr(self, "_cleared_pick_nonces", ())
+                    and (current is None or current.nonce != msg.nonce or current.state != "manual")
+                ):
+                    self._interrupted_pick = msg
+            elif current is None or not current.nonce or msg.nonce == current.nonce:
+                if msg.nonce:
+                    self._remember_cleared_pick_nonce(msg.nonce)
+                self._interrupted_pick = None
 
     def _handle_held_object(self, msg: HeldObject) -> None:
         with self._state_guard():
@@ -3922,6 +3973,7 @@ class SkillExecutorNode(Node):
             held_object_state=held_state,
             held_object_reason=held_reason,
             held_object_manual_reset=self._manual_held_reset_is_current(),
+            interrupted_pick_state=str(getattr(getattr(self, "_interrupted_pick", None), "state", "")),
         )
 
     def _manual_held_reset_is_current(self):
@@ -4222,6 +4274,12 @@ class SkillExecutorNode(Node):
                 ledger=self._gateway_ledger,
                 lease=self._gateway_lease,
             )
+            validation_snapshot = snapshot
+            if snapshot.interrupted_pick_state == "pending" and steps[0].skill_name in {
+                "pick_object",
+                "return_to_task_pose",
+            }:
+                validation_snapshot = replace(snapshot, interrupted_pick_state="")
             for index, step in enumerate(steps):
                 if step.timeout_sec > 0.0 and step.timeout_sec > duration_sec:
                     return self._set_begin_failure(
@@ -4249,7 +4307,7 @@ class SkillExecutorNode(Node):
                         yaw=step.yaw,
                         timeout_sec=step.timeout_sec or None,
                     ),
-                    snapshot,
+                    validation_snapshot,
                     owner=owner,
                 )
                 if not decision.admitted:
@@ -6695,6 +6753,7 @@ class SkillExecutorNode(Node):
         template: dict,
         *,
         effective_timeout_sec: float | None = None,
+        recovery_nonce: str = "",
     ) -> SkillCommand.Result:
         goal = goal_handle.request
         result = SkillCommand.Result()
@@ -6770,19 +6829,23 @@ class SkillExecutorNode(Node):
             pick_goal.expected_executor,
             expected_executor,
         )
-        pick_goal.target_query = goal.target_name
+        pick_goal.target_query = "interrupted pick recovery" if recovery_nonce else goal.target_name
         pick_goal.timeout_sec = timeout_sec
         # SkillCommand is the only public motion boundary. The Gateway owns
         # delegated PickObject policy and deliberately exposes the canonical
         # execute path only; diagnostic modes and post-success release are not
         # caller-controlled fields in the v1 catalog contract.
         pick_goal.mode = PickObject.Goal.MODE_EXECUTE
+        if recovery_nonce:
+            pick_goal.mode = PickObject.Goal.MODE_RECOVER
+            pick_goal.recovery_nonce = recovery_nonce
         pick_goal.supervised_direct = False
         pick_goal.release_after_success = False
         workflow = getattr(self, "_active_workflow", None)
         placement = getattr(self, "_placement_execution", {})
         pick_goal.retain_for_place = bool(
-            placement.get("backend")
+            not recovery_nonce
+            and placement.get("backend")
             and workflow is not None
             and retains_for_place(workflow.workflow_steps, int(goal.dispatch_binding.workflow_step_index))
         )
@@ -6795,6 +6858,24 @@ class SkillExecutorNode(Node):
         )
         delegated_terminal = False
         late_cleanup = _LateCleanupConfirmation()
+        pick_result_future = [None]
+
+        def retain_interruption_before_cleanup():
+            future = pick_result_future[0]
+            if future is not None and future.done():
+                wrapped = future.result()
+                terminal = getattr(wrapped, "result", None)
+                interruption = getattr(terminal, "interrupted_pick", None)
+                identity = getattr(terminal, "actual_executor", None)
+                if (
+                    interruption is not None
+                    and interruption.state
+                    and identity is not None
+                    and delegated_executor_identity_matches(identity, expected_executor)
+                ):
+                    self._handle_interrupted_pick(interruption)
+
+        late_cleanup.add_callback(retain_interruption_before_cleanup)
         late_cleanup.add_callback(
             lambda: self._confirm_delegated_terminal(delegated_admission, delegated_nonce, cleanup_key)
         )
@@ -6832,6 +6913,7 @@ class SkillExecutorNode(Node):
                 )
 
             result_future = pick_handle.get_result_async()
+            pick_result_future[0] = result_future
             deadline = time.monotonic() + timeout_sec
             timed_out = False
             while rclpy.ok() and not result_future.done():
@@ -6929,6 +7011,16 @@ class SkillExecutorNode(Node):
                 result.executed_primitives,
                 "SKILL_EXECUTOR_IDENTITY_MISMATCH",
                 "pick executor identity does not match the registry snapshot",
+            )
+        if hasattr(pick_result, "interrupted_pick") and pick_result.interrupted_pick.state:
+            self._handle_interrupted_pick(pick_result.interrupted_pick)
+        if (
+            recovery_nonce
+            and pick_result.success
+            and (pick_result.interrupted_pick.state != "clear" or pick_result.interrupted_pick.nonce != recovery_nonce)
+        ):
+            return self._abort_skill(
+                result, goal_handle, [], "PICK_MANUAL_CHECK", "recovery result does not clear the matching interruption"
             )
         if not pick_result.success:
             fill_execution_detail(result.execution_detail, pick_result.execution_detail)
@@ -7928,6 +8020,49 @@ class SkillExecutorNode(Node):
         self._set_result_catalog_identity(result, workflow.bundle)
         return result
 
+    def _recover_interrupted_pick(self, goal_handle, effective_timeout_sec):
+        """Return (failure or None, remaining budget); never prepare or open hands here."""
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        interruption = getattr(self, "_interrupted_pick", None)
+        if interruption is not None:
+            if interruption.state != "pending" or goal.skill_name not in {"pick_object", "return_to_task_pose"}:
+                return self._abort_skill(
+                    result, goal_handle, [], "PICK_MANUAL_CHECK", "interrupted pick needs inspection"
+                ), effective_timeout_sec
+            if effective_timeout_sec is None:
+                bundle = getattr(self, "_active_runtime_bundle", None)
+                templates = bundle.snapshot.templates if bundle is not None else getattr(self, "_skill_templates", {})
+                template = templates.get(goal.skill_name, {})
+                effective_timeout_sec = float(goal.timeout_sec or template.get("timeout_sec", 120.0))
+            recovery_started = time.monotonic()
+            child = _DeferredTerminalGoalHandle(goal_handle)
+            recovered = self._execute_pick_skill(
+                child,
+                {},
+                effective_timeout_sec=effective_timeout_sec,
+                recovery_nonce=interruption.nonce,
+            )
+            if not recovered.success:
+                child.commit()
+                return recovered, effective_timeout_sec
+            with self._state_guard():
+                current = getattr(self, "_interrupted_pick", None)
+                if current is not None and (current.nonce != interruption.nonce or current.state != "pending"):
+                    return self._abort_skill(
+                        result, goal_handle, [], "PICK_MANUAL_CHECK", "recovery gate changed"
+                    ), effective_timeout_sec
+                self._remember_cleared_pick_nonce(interruption.nonce)
+                self._interrupted_pick = None
+            if effective_timeout_sec is not None:
+                effective_timeout_sec -= time.monotonic() - recovery_started
+                if effective_timeout_sec <= 0:
+                    return self._abort_skill(
+                        result, goal_handle, [], "SKILL_TIMEOUT", "recovery exhausted task budget"
+                    ), effective_timeout_sec
+
+        return None, effective_timeout_sec
+
     def _execute_skill_child(
         self,
         goal_handle,
@@ -8003,6 +8138,10 @@ class SkillExecutorNode(Node):
                 ExecutionDetail(1, "admission", "FAILED", "admission", mirror_reason, "NOT_NEEDED", 0, "WAIT_USER"),
             )
             return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", mirror_message)
+
+        recovery_failure, effective_timeout_sec = self._recover_interrupted_pick(goal_handle, effective_timeout_sec)
+        if recovery_failure is not None:
+            return recovery_failure
 
         control_mode_ready, control_mode_reason = self._ensure_skill_control_mode(goal.skill_name, goal_handle)
         if not control_mode_ready:

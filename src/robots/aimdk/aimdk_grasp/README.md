@@ -382,6 +382,33 @@ live; `--coarse-leg-boxes SHRINK_M` replaces the coarse scene's leg boxes for co
 
 ## Streaming the arm
 
+### Stop and recover a pick
+
+The remote X2 backend records the executed joint paths. Cancellation stops in
+place and sends no retreat or release. Its `InterruptedPick` state gates the
+Gateway before prefetch, task-pose preparation, other skills, workflows and
+external primitives. A subsequent `pick_object` or `return_to_task_pose` first
+recovers the interrupted pick; other motions remain refused.
+
+An open, empty hand retraces only the executed path. A completed, verified
+grasp first retraces its lift, opens at the original grasp contact, and then
+retraces the empty approach. The head checks a new RGB-D collision scene,
+the carried-object envelope, the original support and the finger opening;
+it checks again immediately before opening and after depositing the object.
+Recovery may slow the recorded path but cannot replace its geometry with a
+straight move. The original start must be reached within 0.02 rad per joint.
+
+Incomplete hand actions, execution faults, changed posture, missing grip or
+geometry, obstructed paths, expired observations and another stop during
+recovery require manual inspection. They never start another pick. The
+interruption marker is persisted under
+`${ROS_HOME:-~/.ros}/ibrobot/x2_pick_<identity>.json`; after a process restart,
+an unfinished marker always requires manual inspection. The operator-reset
+service requires the matching interruption nonce, an explicit empty-hand
+confirmation, a note, fresh open-hand feedback and the arm at its original
+start. It only checks and clears state; it commands no motion. Normal picks
+perform no additional scene validation for this recovery mechanism.
+
 The X2 arm is driven through the robot-agnostic streaming executor of
 `manipulation_execution` (`aimdk_grasp.arm_stream.x2_arm_executor`) on the
 runtime's `joint.arm_stream`, starting from and checked against the MC command

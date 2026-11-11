@@ -160,6 +160,14 @@ class X2GraspHeadNode(Node):
             (RefineGraspPlan, names.refine, self._on_refine),
         ):
             self.create_service(kind, name, self._answering(handler), callback_group=group)
+        from aimdk_grasp_msgs.srv import ValidatePickRetreat
+
+        self.create_service(
+            ValidatePickRetreat,
+            names.validate_retreat,
+            self._answering(self._on_validate_retreat),
+            callback_group=group,
+        )
         self.create_service(
             WatchGraspTarget,
             names.watch,
@@ -516,6 +524,56 @@ class X2GraspHeadNode(Node):
         else:
             goal_handle.succeed()
         return result
+
+    def _on_validate_retreat(self, request, response):
+        from .backend import robot_for_side
+        from .retreat_validation import validate_retreat
+
+        response.recovery_nonce = request.recovery_nonce
+        try:
+            if not np.isfinite(request.timeout_s) or request.timeout_s <= 0:
+                raise ValueError("finite positive retreat budget required")
+            if not self._ready.is_set() or not request.recovery_nonce:
+                raise ValueError("head not ready or recovery nonce missing")
+            parts = self._head.arms[request.arm_side] if hasattr(self._head, "arms") else self._head
+            robot = robot_for_side(self._robot, request.arm_side)
+            if parts.spheres.side != request.arm_side:
+                raise ValueError("head arm does not match recovery")
+            held, support, contact = None, None, None
+            if request.held_object.custody_id:
+                from manipulation_execution.held_custody import held_from_msg
+
+                held = held_from_msg(request.held_object)
+                with self._lock:
+                    kept = self._plans.get(request.plan_id)
+                    capture = self._captures.get(kept[0]) if kept is not None else None
+                if capture is None or capture.estimate is None:
+                    raise ValueError("original grasp support is no longer available")
+                estimates = getattr(capture.estimate, "estimates", {})
+                estimate = estimates.get(request.arm_side, capture.estimate)
+                support = estimate.support
+                from manipulation_execution.grasp_pipeline.contracts import Effect, EffectorAction, Move
+
+                for step in kept[1].steps:
+                    if isinstance(step, Move):
+                        contact = step.segment.end
+                    elif isinstance(step, Effect) and step.action is EffectorAction.CLOSE:
+                        break
+            report = validate_retreat(
+                parts,
+                robot,
+                tuple(wire.step_from_msg(s) for s in request.steps),
+                request.hand_positions,
+                deadline=time.monotonic() + min(20.0, request.timeout_s),
+                cancelled=self._closing.is_set,
+                held=held,
+                support=support,
+                contact=contact,
+            )
+            response.success, response.report_json = True, wire.to_json(report)
+        except Exception as exc:
+            return self._fail(response, "PICK_MANUAL_CHECK", str(exc))
+        return response
 
     def _on_refine(self, request, response):
         with self._lock:
