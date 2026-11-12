@@ -23,7 +23,10 @@ Lifecycle (one platform session = one generation)::
   accepted observation, summed over every session of this process (it never goes back at a
   reset), and ``on_clock`` hears each new value. Idle, the time stands still.
 * ``stop`` cancels every command and stops ticking until ``resume``; ``cancel`` withdraws one
-  command. A tick already handed to the platform is never undone.
+  command. A tick already handed to the platform is never undone. A command that ended before
+  it was queued (e.g. cancelled by an action watcher first) is never queued or ticked.
+* A move keeps its requested speed: one that needs more than ``max_motion_ticks`` ticks at it
+  is refused before any physical tick, never squeezed into fewer ticks.
 * A command id seen before in this generation returns the first command's result instead
   of executing again; the same id with different content is rejected.
 * One writer only: ``claim_writer`` binds the tick loop to one driver (platform pull or host
@@ -98,7 +101,7 @@ class WriterConflict(RuntimeError):
 class MotionConfig:
     max_joint_speed: float = 1.5  # rad/s at velocity_scaling 1.0
     min_motion_ticks: int = 8
-    max_motion_ticks: int = 100
+    max_motion_ticks: int = 100  # a move needing more ticks at its requested speed is refused, never sped up
     settle_ticks: int = 3
     gripper_ticks: int = 12
     idle_wait_s: float = 0.2  # how long one idle tick request waits for a command before answering idle
@@ -156,10 +159,14 @@ class Command:
 def motion_ticks(
     start: Sequence[float], end: Sequence[float], cfg: MotionConfig, velocity_scaling: float, dt_s: float
 ) -> int:
+    """Ticks this move needs at its requested speed (at least ``min_motion_ticks``; no upper cap).
+
+    The caller refuses a move above ``max_motion_ticks``; shortening it would raise its speed.
+    """
     scale = velocity_scaling if 0.0 < velocity_scaling <= 1.0 else 1.0
     dq = max((abs(a - b) for a, b in zip(start, end, strict=True)), default=0.0)
     ticks = math.ceil(dq / (cfg.max_joint_speed * scale * dt_s)) if dq > 0 else 0
-    return max(cfg.min_motion_ticks, min(cfg.max_motion_ticks, ticks))
+    return max(cfg.min_motion_ticks, ticks)
 
 
 class SimulationCore:
@@ -460,6 +467,9 @@ class SimulationCore:
             cmd.finish(OUTCOME_REJECTED, refusal)
             return cmd.result
         with self._cv:
+            if cmd.done.is_set():
+                # Ended before it got here (a cancel watcher overtook the submit): never queue it.
+                return dict(cmd.result)
             if cmd.command_id and cmd.command_id in self._tombstones:
                 cmd.finish(
                     OUTCOME_CANCELLED,
@@ -685,29 +695,46 @@ class SimulationCore:
             if cmd.kind == COMMAND_IK:
                 cmd.finish(OUTCOME_SUCCEEDED, "IK solved", joints=joints)
                 continue
-            self._start_track(cmd, joints)
+            if not self._start_track(cmd, joints) and cmd is self._active:
+                self._active = None
 
     def _ik_request(self, cmd: Command) -> IkRequest:
         flange = shift_pose(cmd.pose, self._groups[cmd.group].tcp_offset, -1.0)
         return IkRequest(request_id=cmd.seq, group=cmd.group, pose=tuple(flange))
 
-    def _start_track(self, cmd: Command, joints: list[float]) -> None:
+    def _start_track(self, cmd: Command, joints: list[float]) -> bool:
+        """Make ``cmd`` the active track; False (and the command REJECTED) if it cannot keep its speed."""
         group = self._groups[cmd.group]
         start = self._commanded[cmd.group]["joints"]
         limits = group.joint_wrap_limits or (math.pi,) * group.dof
         joints = nearest_equivalent(start, joints, limits)
         n = motion_ticks(start, joints, self.cfg, cmd.velocity_scaling, self.descriptor.dt_s)
-        cmd.result_extra = {"max_joint_delta_rad": max(abs(a - b) for a, b in zip(start, joints, strict=True))}
+        delta = max(abs(a - b) for a, b in zip(start, joints, strict=True))
+        if n > self.cfg.max_motion_ticks:
+            cmd.finish(
+                OUTCOME_REJECTED,
+                f"a {delta:.2f} rad move at velocity_scaling {cmd.velocity_scaling:g} needs {n} ticks, more than "
+                f"max_motion_ticks={self.cfg.max_motion_ticks}; not executed (a shorter move or a higher "
+                "velocity_scaling fits)",
+                max_joint_delta_rad=delta,
+                ticks_executed=0,
+                ticks=0,
+            )
+            return False
+        cmd.result_extra = {"max_joint_delta_rad": delta}
         cmd.joint_target = joints
         cmd.track = deque(interpolate(start, joints, n))
         cmd.settle_left = self.cfg.settle_ticks
         self._active = cmd
+        return True
 
     def _next_tick(self) -> TickDecision | None:
         if self._commanded is None or self._state not in _TICKS or self._halted:
             return None
-        if self._active is None and self._queue:
+        while self._active is None and self._queue:
             cmd = self._queue.popleft()
+            if cmd.done.is_set():
+                continue  # ended while queued: nothing that ended may reach the platform
             if cmd.kind in (COMMAND_POSE, COMMAND_IK):
                 self._ik_out[cmd.seq] = cmd
                 cmd.handed_over = True
@@ -720,7 +747,7 @@ class SimulationCore:
                     command_seq=cmd.seq,
                 )
             if cmd.kind == COMMAND_JOINT:
-                self._start_track(cmd, cmd.joints)
+                self._start_track(cmd, cmd.joints)  # refused: the loop takes the next command
             elif cmd.kind == COMMAND_GRIPPER:
                 start = self._commanded[cmd.group]["gripper"]
                 if abs(float(start) - float(cmd.opening)) <= self.cfg.gripper_tolerance:

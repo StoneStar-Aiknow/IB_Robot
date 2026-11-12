@@ -47,6 +47,13 @@ def test_motion_ticks_scale_with_distance_velocity_and_dt():
     assert motion_ticks([0.0], [0.4], cfg, 0.5, 0.04) == 20
     assert motion_ticks([0.0], [0.4], cfg, 1.0, 0.02) == 20  # a shorter tick needs more of them
     assert motion_ticks([0.0], [0.0], MotionConfig(min_motion_ticks=8), 1.0, 0.04) == 8
+    # no upper cap: the ticks a move needs at its speed (the engine refuses one above the limit)
+    assert (
+        motion_ticks(
+            [0.0], [4.0], MotionConfig(max_joint_speed=1.0, min_motion_ticks=1, max_motion_ticks=10), 1.0, 0.04
+        )
+        == 100
+    )
 
 
 def test_nearest_equivalent_avoids_a_full_turn():

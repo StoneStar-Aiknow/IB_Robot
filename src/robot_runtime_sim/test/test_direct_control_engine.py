@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import threading
 import time
 
 import pytest
@@ -13,6 +14,7 @@ from robot_runtime_sim.direct_control.engine import (
     OUTCOME_REJECTED,
     OUTCOME_SUCCEEDED,
     OUTCOME_UNKNOWN,
+    STATE_FAILED,
     STATE_FINALIZED,
     STATE_READY,
     STATE_RESETTING,
@@ -113,7 +115,7 @@ def _run_host_session(loop):
 def test_stop_cancels_a_running_move_and_no_further_tick_is_submitted():
     core, env, platform, _events, _native = pull_rig(step_delay_s=0.01)
     platform.start()
-    thread, box = submit_async(core, Command(kind="joint", group="a", joints=[2.0] * 6))  # 20 ticks (FAST cap)
+    thread, box = submit_async(core, Command(kind="joint", group="a", joints=[1.2] * 6))  # 19 ticks (FAST cap 20)
     assert wait_for(lambda: env.tick >= 3)
     assert core.stop("operator stop") == 1
     thread.join(timeout=2.0)
@@ -431,7 +433,7 @@ def test_a_tick_request_that_waited_across_a_reset_is_refused():
 def test_cancelling_one_command_withdraws_it_and_holds_its_group():
     core, env, platform, _events, _native = pull_rig(step_delay_s=0.01)
     platform.start()
-    queued_first = Command(kind="joint", group="a", joints=[2.0] * 6)  # 20 ticks (FAST cap)
+    queued_first = Command(kind="joint", group="a", joints=[1.2] * 6)  # 19 ticks (FAST cap 20)
     t1, b1 = submit_async(core, queued_first)
     early = Command(kind="gripper", group="a", opening=0.0)
     t2, b2 = submit_async(core, early)
@@ -501,7 +503,7 @@ def test_a_blocked_rotation_or_missing_pose_feedback_is_not_reached():
 def test_cancel_by_id_withdraws_only_that_command():
     core, env, platform, _events, _native = pull_rig(step_delay_s=0.01)
     platform.start()
-    thread, box = submit_async(core, Command(kind="joint", group="a", joints=[2.0] * 6, command_id="task:step0:move"))
+    thread, box = submit_async(core, Command(kind="joint", group="a", joints=[1.2] * 6, command_id="task:step0:move"))
     assert wait_for(lambda: env.tick >= 3)
     cancelled, result = core.cancel_by_id("task:step0:move")
     at_ack = env.tick
@@ -590,3 +592,127 @@ def test_a_cancel_that_overtakes_its_command_leaves_a_tombstone():
     platform.join()
     core.reset()
     assert "late:step0:move" not in core._tombstones
+
+
+# ---------------------------------------------------------------- review round 2 (F2, F4, F5)
+
+
+def test_a_command_cancelled_before_its_submit_is_never_queued_or_ticked():
+    """F2: a cancel watcher that wins the race against submit: CANCELLED, no target, no tick."""
+    core, env, platform, _events, _native = pull_rig(step_delay_s=0.01)
+    platform.start()
+    cmd = Command(kind="gripper", group="a", opening=0.0)
+    assert core.cancel(cmd, "gripper goal cancelled")  # the watcher ran first: cmd not yet registered
+    result = core.submit(cmd, 2.0)
+    assert result["outcome"] == OUTCOME_CANCELLED
+    assert cmd not in core._queue and core._active is None and not cmd.command_id
+    assert wait_for(lambda: platform.idle_polls >= 3)
+    assert env.tick == 0 and env.grip["a"] == 1.0
+    platform.join()
+
+
+def test_an_ended_command_left_in_the_queue_is_skipped_not_ticked():
+    """F2 (defensive): whatever ended while queued never reaches the platform."""
+    core, env, platform, _events, _native = pull_rig()
+    ended = Command(kind="gripper", group="a", opening=0.0, seq=99, command_id="ended")
+    ended.finish(OUTCOME_CANCELLED, "ended elsewhere")
+    with core._cv:
+        core._queue.append(ended)
+    decision = core.next_tick(platform.WRITER, platform.session_id, platform.generation)
+    assert decision.targets is None and not core._queue and core._active is None
+    assert env.tick == 0
+
+
+def test_a_move_that_needs_more_ticks_than_allowed_is_refused_not_sped_up():
+    """F4: max_motion_ticks bounds a move; it never compresses one (which would raise its speed)."""
+    core, env, platform, _events, _native = pull_rig()
+    platform.start()
+    # 1.9 rad at FAST speed (0.06 rad/tick) needs 32 ticks; the cap is 20.
+    slow = core.submit(Command(kind="joint", group="a", joints=[2.0] * 6), 2.0)
+    assert slow["outcome"] == OUTCOME_REJECTED and "needs 32 ticks" in slow["message"]
+    assert "max_motion_ticks=20" in slow["message"] and slow["ticks_executed"] == 0
+    # a pose: refused after its IK reply, still before any physical tick
+    far = core.submit(Command(kind="pose", group="b", pose=[2.1, 0.1, 0.1, 1, 0, 0, 0], velocity_scaling=0.5), 2.0)
+    assert far["outcome"] == OUTCOME_REJECTED and "max_motion_ticks" in far["message"]
+    assert env.tick == 0
+    # within the budget: no tick moves faster than max_joint_speed * velocity_scaling
+    ok = core.submit(Command(kind="joint", group="a", joints=[0.5] * 6, velocity_scaling=0.5), 5.0)
+    assert ok["outcome"] == OUTCOME_SUCCEEDED and env.q["a"] == pytest.approx([0.5] * 6)
+    limit = FAST.max_joint_speed * 0.5 * core.descriptor.dt_s
+    path = [[0.1] * 6] + [step["a"]["joints"] for step in env.steps]
+    assert (
+        max(abs(b - a) for prev, cur in zip(path, path[1:], strict=False) for a, b in zip(prev, cur, strict=True))
+        <= limit + 1e-9
+    )
+    platform.join()
+
+
+class _FailingStepEnv(SingleArmEnv):
+    """The host-step toy whose reset, IK or step call raises (after two good steps)."""
+
+    def __init__(self, descriptor, fail_on: str):
+        super().__init__(descriptor, step_lim=1000)
+        self.fail_on = fail_on
+
+    def reset(self, seed=None):
+        if self.fail_on == "reset":
+            raise RuntimeError("reset failed")
+        return super().reset(seed)
+
+    def solve_ik(self, request):
+        if self.fail_on == "ik":
+            raise RuntimeError("ik failed")
+        return super().solve_ik(request)
+
+    def step(self, native_action):
+        if self.fail_on == "step" and self.tick >= 2:
+            raise RuntimeError("step failed")
+        return super().step(native_action)
+
+
+@pytest.mark.parametrize("fail_on", ["reset", "ik", "step"])
+def test_a_failing_host_step_platform_call_interrupts_its_session_once(fail_on):
+    """F5: in-flight work ends at once, one interrupted end, no verdict, no later physics tick."""
+    native = []
+    core = SimulationCore(single_arm_descriptor(), FAST, on_platform_result=native.append)
+    env = _FailingStepEnv(core.descriptor, fail_on)
+    loop = HostStepLoop(core, SingleArmCodec(core.descriptor), env)
+    box = {}
+
+    def run():
+        try:
+            loop.run_session({"task": "toy"})
+        except RuntimeError as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    if fail_on != "reset":
+        assert wait_for(lambda: core.state == STATE_READY)
+        if fail_on == "ik":
+            cmd = Command(kind="pose", group="arm", pose=[0.3, 0.2, 0.1, 1, 0, 0, 0])
+        else:
+            cmd = Command(kind="joint", group="arm", joints=[0.5] * 7)
+        started = time.monotonic()
+        result = core.submit(cmd, 5.0)
+        assert time.monotonic() - started < 2.0  # ended by the interrupt, not by its wall deadline
+        assert result["outcome"] == OUTCOME_UNKNOWN  # handed to the platform when the call failed
+    thread.join(timeout=5.0)
+    assert not thread.is_alive() and f"{fail_on} failed" in str(box["error"])
+    assert len(native) == 1 and native[0]["interrupted"] is True and native[0]["native_success"] is None
+    assert core.state in (STATE_FAILED, STATE_UNKNOWN)
+    steps = env.tick
+    time.sleep(0.1)
+    assert env.tick == steps
+
+
+def test_a_stale_host_step_driver_does_not_interrupt_the_next_session():
+    """F5: an old driver's failure never ends a newer generation."""
+    native = []
+    core = SimulationCore(single_arm_descriptor(), FAST, on_platform_result=native.append)
+    loop = HostStepLoop(core, SingleArmCodec(core.descriptor), SingleArmEnv(core.descriptor))
+    old = core.reset()
+    current = core.reset()
+    core.begin_session({"task": "toy"})
+    loop._interrupt({"session_id": old["session_id"], "generation": old["generation"]}, RuntimeError("late"))
+    assert core.state == STATE_RESETTING and core.generation == current["generation"] and native == []

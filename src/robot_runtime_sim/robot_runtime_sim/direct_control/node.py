@@ -19,8 +19,10 @@ One process, two faces:
     never carry the platform's result, which goes to result listeners only (logged by default).
   - ``/clock``: simulated time, the time of the latest observation over every session of this
     process. It only moves while the platform steps, so it stands still while the runtime is
-    idle; consumers on ``use_sim_time`` measure motion in simulated time. This node itself
-    runs on wall time (it is the clock source), and stamps every message with simulated time.
+    idle, and it never goes back (the observation thread and the state timer both publish it;
+    an older value that loses the race is dropped). Consumers on ``use_sim_time`` stamp and
+    time against it. This node itself runs on wall time (it is the clock source), and stamps
+    every message with simulated time.
 
 Optional layers (an evaluation layer, for one) attach through ``extensions``: ``module:attr``
 callables run once with this node after it is built. They may install the engine's motion
@@ -205,6 +207,10 @@ class SimulationRuntime(Node):
         self._session_pub = self.create_publisher(String, SESSION_TOPIC, latched)
         self._clock_pub = self.create_publisher(String, CLOCK_TOPIC, 10)
         self._ros_clock_pub = self.create_publisher(Clock, ROS_CLOCK_TOPIC, 10)
+        # One publish path for /clock: compare and publish under one lock, so a value read
+        # before a newer one was published can never follow it.
+        self._ros_clock_lock = threading.Lock()
+        self._ros_clock_last_s: float | None = None
         self._result_listeners: list[Callable[[dict], None]] = []
         self._core = SimulationCore(
             descriptor,
@@ -334,9 +340,13 @@ class SimulationRuntime(Node):
         return ros_time(self._core.sim_time_s())
 
     def _publish_ros_clock(self, seconds: float) -> None:
-        msg = Clock()
-        msg.clock = ros_time(seconds)
-        self._ros_clock_pub.publish(msg)
+        with self._ros_clock_lock:
+            if self._ros_clock_last_s is not None and seconds < self._ros_clock_last_s:
+                return  # read before a newer value went out: /clock never goes back
+            self._ros_clock_last_s = seconds
+            msg = Clock()
+            msg.clock = ros_time(seconds)
+            self._ros_clock_pub.publish(msg)
 
     def _publish_status(self) -> None:
         self._status_pub.publish(self._state.to_msg(self._sim_now()))

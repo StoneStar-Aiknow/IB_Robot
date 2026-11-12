@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,7 +19,7 @@ from trajectory_msgs.msg import JointTrajectoryPoint  # noqa: E402
 from ibrobot_msgs.srv import MoveToConfiguration, SetRuntimeMode, StopRuntime  # noqa: E402
 from robot_runtime_sim.direct_control.node import SimulationRuntime  # noqa: E402
 from robot_runtime_sim.testing.direct_control_fakes import TOY_PROFILE as PROFILE  # noqa: E402
-from robot_runtime_sim.testing.direct_control_fakes import ToyAdapter  # noqa: E402
+from robot_runtime_sim.testing.direct_control_fakes import ToyAdapter, wait_until  # noqa: E402
 
 EXTENSION = "robot_runtime_sim.testing.direct_control_fakes:attach_toy_gate"
 
@@ -183,3 +184,45 @@ def test_the_platform_result_goes_to_listeners_only(rig):
         {"session_id": core.session_id, "generation": core.generation}, PlatformResult(native_success=True)
     )
     assert heard and heard[-1]["native_success"] is True and heard[-1]["session_id"] == core.session_id
+
+
+# ---------------------------------------------------------------- review round 2 (F1, F2, F3)
+
+
+def test_a_gripper_goal_cancelled_before_its_submit_never_moves(rig):
+    """F2 on the real watcher path: the watcher's cancel lands first; submit must not queue the command."""
+    from action_msgs.msg import GoalStatus
+
+    runtime, client, adapter = rig
+    core = runtime.core
+    assert _call(client, SetRuntimeMode, "/runtime/set_mode", SetRuntimeMode.Request(mode="trajectory")).success
+    real_submit, seen = core.submit, {}
+
+    def submit_after_the_watcher(cmd, timeout_s):  # barrier: hold the submit until the watcher cancelled
+        seen["cmd"] = cmd
+        assert wait_until(cmd.done.is_set)
+        return real_submit(cmd, timeout_s)
+
+    core.submit = submit_after_the_watcher
+    action = ActionClient(client, FollowJointTrajectory, "/a_grip_trajectory_controller/follow_joint_trajectory")
+    assert action.wait_for_server(timeout_sec=10.0)
+    handle = _wait(action.send_goal_async(_gripper_goal(0.0)))
+    assert handle.accepted and wait_until(lambda: "cmd" in seen)
+    _wait(handle.cancel_goal_async())
+    assert _wait(handle.get_result_async()).status == GoalStatus.STATUS_CANCELED
+    time.sleep(0.3)
+    assert seen["cmd"] not in core._queue and core._active is None
+    assert adapter.env.tick == 0 and adapter.env.grip["a"] == 1.0  # no tick, the gripper never moved
+
+
+def test_a_clock_value_read_before_a_newer_one_was_published_is_dropped(rig):
+    """F3: state timer reads 0.40, the observation thread publishes 0.44, the timer then publishes 0.40."""
+    runtime, _client, _adapter = rig
+    sent = []
+    runtime._ros_clock_pub = SimpleNamespace(publish=lambda msg: sent.append(msg.clock.sec + msg.clock.nanosec * 1e-9))
+    runtime._publish_ros_clock(0.44)  # the observation thread: the newer tick went out first
+    runtime._core.sim_time_s = lambda: 0.40  # what the state timer had read before that
+    runtime._publish_clock()  # ...and now publishes
+    runtime._publish_ros_clock(0.48)
+    assert sent == sorted(sent) and pytest.approx(0.48) == sent[-1]
+    assert all(round(value, 2) != 0.40 for value in sent)

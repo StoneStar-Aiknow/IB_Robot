@@ -20,6 +20,7 @@ FORBIDDEN_CONSTANTS = re.compile(r"\bTICK_S\b|\bARM_DOF\b|\bARMS\b")
 ALLOWED_IMPORT_ROOTS = {
     "__future__",
     "collections",
+    "contextlib",
     "dataclasses",
     "importlib",
     "itertools",

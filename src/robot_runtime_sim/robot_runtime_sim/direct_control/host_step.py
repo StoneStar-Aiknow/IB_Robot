@@ -4,16 +4,18 @@ The second clock mode of the port. A platform-pull adapter is driven by the
 platform's own main loop; a host-step platform only exposes reset and step, so this loop
 plays that main loop. Both feed the same ``SimulationCore``: idle means no ``step`` call, a
 finishing session steps with unchanged targets, and the platform's result goes to the
-engine's result listener only.
+engine's result listener only. A platform call that raises interrupts this session (its
+commands end at once, the listener hears one interrupted end) before the error propagates.
 """
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-from robot_runtime_sim.direct_control.engine import SimulationCore
+from robot_runtime_sim.direct_control.engine import SessionError, SimulationCore
 from robot_runtime_sim.direct_control.ports import IkReply, IkRequest, PlatformCodec, PlatformResult
 
 
@@ -50,18 +52,29 @@ class HostStepLoop:
         core, env = self._core, self._env
         ident = core.reset()
         session_id, generation = ident["session_id"], ident["generation"]
-        core.begin_session(info)
-        native = env.reset(seed)
-        core.on_observation(self._codec.decode_observation(native, session_id=session_id, generation=generation))
-        replies: list[IkReply] = []
-        while not env.done() and not self._abort.is_set():
-            decision = core.next_tick(self.WRITER, session_id, generation, replies)
-            replies = [env.solve_ik(request) for request in decision.ik_requests]
-            if decision.targets is None:
-                continue  # idle: physics is not stepped
-            native = env.step(self._codec.encode_action(decision.targets))
-            frame = self._codec.decode_observation(native, session_id=session_id, generation=generation)
-            core.on_observation(frame)
-        result = env.native_result()
-        core.session_end({"session_id": session_id, "generation": generation}, result)
+        public = {"session_id": session_id, "generation": generation}
+        try:
+            core.begin_session(info)
+            native = env.reset(seed)
+            core.on_observation(self._codec.decode_observation(native, session_id=session_id, generation=generation))
+            replies: list[IkReply] = []
+            while not env.done() and not self._abort.is_set():
+                decision = core.next_tick(self.WRITER, session_id, generation, replies)
+                replies = [env.solve_ik(request) for request in decision.ik_requests]
+                if decision.targets is None:
+                    continue  # idle: physics is not stepped
+                native = env.step(self._codec.encode_action(decision.targets))
+                frame = self._codec.decode_observation(native, session_id=session_id, generation=generation)
+                core.on_observation(frame)
+            result = env.native_result()
+        except Exception as exc:
+            self._interrupt(public, exc)
+            raise
+        core.session_end(public, result)
         return result
+
+    def _interrupt(self, public: Mapping[str, Any], exc: BaseException) -> None:
+        """End this session (and only this one) after a failed platform call; no verdict is made up."""
+        # A newer session may already have replaced this one: stopping it is not this driver's call.
+        with contextlib.suppress(SessionError):
+            self._core.interrupt(public, f"platform call failed: {exc!r}")
