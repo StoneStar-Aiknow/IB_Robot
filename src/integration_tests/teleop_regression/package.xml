@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>teleop_regression</name>
+  <version>0.1.0</version>
+  <description>Test-only integration regressions for teleoperation and robot runtimes</description>
+  <maintainer email="maintainer@example.com">IB-Robot Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- Integration tests own the application-to-provider dependency. -->
+  <test_depend>robot_teleop</test_depend>
+  <test_depend>robot_runtime</test_depend>
+  <test_depend>robot_config</test_depend>
+  <test_depend>so101_robot</test_depend>
+  <test_depend>so101_hardware</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>rclpy</test_depend>
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>std_msgs</test_depend>
+  <test_depend>ros2launch</test_depend>
+  <test_depend>domain_coordinator</test_depend>
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>python3-yaml</test_depend>
+  <!-- The full setup profile supplies placo; the gate fails if it is absent. -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
