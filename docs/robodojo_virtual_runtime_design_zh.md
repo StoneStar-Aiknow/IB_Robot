@@ -18,7 +18,7 @@
 
 本实现修改了 Gateway、`safety_guard` 和 `task_dispatch`。修改都是可选扩展：机器人配置不声明对应字段时，契约摘要与行为不变。
 
-1. 多臂：`MoveToPose`、`ComputeIk`、`TaskStep`、`PrimitiveCommand`、`ValidatePrimitive` 增加 `target_group`；技能参数 `arm_side` 由 `embodied.execution.arm_groups` 映射到运动组；`safety_guard` 按组检查工作空间和速度上限；`task_dispatch` 按组绑定夹爪动作。
+1. 多臂：`MoveToPose`、`ComputeIk`、`TaskStep`、`PrimitiveCommand`、`ValidatePrimitive` 增加 `target_group`；技能参数 `arm_side` 由 `embodied.execution.arm_groups` 映射到运动组；`safety_guard` 校验 `target_group` 是本机的运动组（工作空间和速度上限仍是整机一套，不分组）；`task_dispatch` 按组绑定夹爪动作。
 2. 夹爪姿态：`approach` 字段与 `set_gripper_approach` 技能，预设来自 `embodied.execution.gripper_approach`。
 3. Agent 规划器可把配置的相机最新帧附到提示词（`planner.vision_topics`）。
 
@@ -33,17 +33,18 @@
 2. 没有命令时运行时回答 idle，客户端不调用 `take_action`，仿真时间不前进。
 3. 三种时间各管一件事：
    1. 步号：会话内记账、平台的步数预算。
-   2. ROS 时间 `/clock`：本进程所有会话累计的仿真时间（拍数 × 40 ms），reset 不回退；只在 RoboDojo 推进时前进。消费者都用 `use_sim_time`，动作超时按仿真时间计，Isaac 慢不会误判超时；Agent 思考时整个世界停住。
-   3. 墙钟期限：只判断链路还活着没有，单条命令的墙钟上限（55 s）、平台长时间无调用（120 s）。
+   2. ROS 时间 `/clock`：本进程所有会话累计的仿真时间（拍数 × 40 ms），reset 不回退，发布序列也不回跳；只在 RoboDojo 推进时前进，Agent 思考时整个世界停住。运行时发布的状态、关节、图像的时间戳都是仿真时间，订阅方用 `use_sim_time`，`now()` 和时间戳在同一条时间轴上。
+   3. 墙钟：任务和动作的期限都按墙钟算，包括 task_dispatch 单步运动 60 s、技能执行器等待动作结果、运行时单条命令 55 s、平台长时间无调用 120 s。这些期限用来发现链路卡死，取值远大于正常动作所需的墙钟时间；Isaac 极慢时可能先到期，此时命令以超时或 UNKNOWN 结束，不会当成成功。
 4. 运行时节点自己用墙钟（它是时钟源）：状态、关节、图像按墙钟定时发布，仿真暂停时照常发布；时间戳是对应观测的仿真时间。
 5. 取消命令有 2 种方式：
-   1. 按 `command_id` 撤销一条命令：`/simulation/cancel_command`（`CancelSimulationCommand`）。如果取消比命令先到达运行时，运行时在本代次记下该 `command_id`，之后到达的同 ID 请求直接以 CANCELLED 结束，不推进任何拍。夹爪动作的 action 取消也只撤销该命令。
+   1. 按 `command_id` 撤销一条命令：`/simulation/cancel_command`（`CancelSimulationCommand`）。如果取消比命令先到达运行时，运行时在本代次记下该 `command_id`，之后到达的同 ID 请求直接以 CANCELLED 结束，不推进任何拍。task_dispatch 给每个 MOVE_TO_POSE 步骤的 `MoveToPose` 请求带上自己生成的 `command_id`；任务被取消或单步超时时，经 `task_dispatch.cancel_command_interface` 绑定的这个服务撤销该命令，等运行时确认、`MoveToPose` 也返回后，这一步才结束。夹爪动作的 action 取消也只撤销该命令；在命令入队前就被取消的，不会入队、不推进任何拍。
    2. 全局停止：`StopRuntime` 或切到 idle 模式。
 6. 已交给平台的一拍不能撤回，取消从下一拍生效。
-7. 客户端启动前清除 ROS 与 venv 环境变量（`run_eval_client.sh` 白名单重启），避免 3.10 包进入 conda 解释器。
-8. 运行时回答 reset 后，客户端把 RoboDojo ws 客户端的重连预算收紧到 30 s（`IBROBOT_RUNTIME_RECONNECT_S`，只改本次会话的配置对象，不改 RoboDojo 仓）。
-9. 客户端向运行时的调用被拒绝或断联时，客户端立即停止调用 `take_action`，写 `interrupted` 工件（无判分），把该局标为 unstable，RoboDojo 不计分也不保留视频。
-10. 局结束前，客户端上传最后一拍后的观测，所以会话结束事件的 `ticks` 等于平台的 `take_action_cnt`（另记 `platform_ticks`）。
+7. 一次运动按请求速度需要的拍数超过 `max_motion_ticks` 时直接拒绝（REJECTED，不推进任何拍），不压缩轨迹，所以不会比请求的速度快。
+8. 客户端启动前清除 ROS 与 venv 环境变量（`run_eval_client.sh` 白名单重启），避免 3.10 包进入 conda 解释器。
+9. 运行时回答 reset 后，客户端把 RoboDojo ws 客户端的重连预算收紧到 30 s（`IBROBOT_RUNTIME_RECONNECT_S`，在白名单里，可从启动环境传入；只改本次会话的配置对象，不改 RoboDojo 仓）。
+10. 客户端向运行时的调用被拒绝或断联时，客户端立即停止调用 `take_action`，写 `interrupted` 工件（无判分），把该局标为 unstable，RoboDojo 不计分也不保留视频。
+11. 局结束前，客户端上传最后一拍后的观测，所以会话结束事件的 `ticks` 等于平台的 `take_action_cnt`（另记 `platform_ticks`）。
 
 ## 4. 会话生命周期
 

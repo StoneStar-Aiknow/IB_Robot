@@ -21,7 +21,7 @@ if [[ "${IBROBOT_CLIENT_ENV_CLEAN:-}" != 1 ]]; then
         CUDA_VISIBLE_DEVICES NVIDIA_VISIBLE_DEVICES http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY
         NO_PROXY all_proxy ALL_PROXY OMNI_KIT_ACCEPT_EULA
         ROBODOJO_ROOT CONDA_SH CONDA_ENV POLICY_NAME TASK SEED PORT HOST GPU EVAL_NUM ROBODOJO_RUN_ID
-        IBROBOT_RUNTIME_ARTIFACT_DIR IBROBOT_RUNTIME_GRIPPER_DEFAULT AGENT_EVAL_RUN_ID AGENT_EVAL_LAYOUT)
+        IBROBOT_RUNTIME_ARTIFACT_DIR IBROBOT_RUNTIME_RECONNECT_S)
   args=(IBROBOT_CLIENT_ENV_CLEAN=1 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin)
   for name in "${keep[@]}"; do
     [[ -n "${!name+x}" ]] && args+=("${name}=${!name}")
