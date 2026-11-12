@@ -9,13 +9,19 @@ float64 velocity_scaling          # 0.0 = use default, otherwise 0.0-1.0
 # capability ("groups"). Empty = the runtime's default group, which is the only
 # group of a single-arm runtime; callers that predate this field keep working.
 string target_group
+# Caller's id for this motion, unique within the session; empty = the runtime assigns one.
+# A runtime that can withdraw a command by id (the direct-control runtime's
+# /simulation/cancel_command) lets the caller cancel exactly this motion with it when it
+# stops waiting (task cancelled, deadline). Runtimes without such a service ignore it.
+string command_id
 ---
 bool success
 string message
 float64 execution_time_s
 # Outcome class: SUCCEEDED | REJECTED | PLANNING_FAILED | EXECUTION_FAILED | CANCELLED
-# (REJECTED: runtime stopped or mode disallows trajectory execution;
-#  CANCELLED: a StopRuntime request pre-empted this move.)
+# (REJECTED: runtime stopped, mode disallows trajectory execution, or the move cannot keep
+#  its velocity_scaling within the runtime's motion budget;
+#  CANCELLED: a StopRuntime request or a cancel by command_id pre-empted this move.)
 string outcome
 # Achieved end-effector error relative to target_pose after execution.
 float64 position_error_m

@@ -199,3 +199,85 @@ def test_groups_need_a_default_group(dual_config):
     dual_config["task_dispatch"]["default_group"] = "torso"
     with pytest.raises(InterfaceBindingError):
         node_for(dual_config)._configure_interfaces()
+
+
+# ---- withdrawing a motion the executor stops waiting for (cancel / deadline) ----
+
+CANCEL_INTERFACE = {
+    "kind": "service",
+    "direction": "serve",
+    "message_type": "ibrobot_msgs/srv/CancelSimulationCommand",
+    "endpoint": "/unit/cancel_command",
+}
+
+
+def test_the_cancel_service_binding_is_optional_and_typed(dual_config):
+    node = node_for(dual_config)
+    node._configure_interfaces()
+    assert node._cancel_service_name is None  # unbound: the legacy local-only cancel
+    dual_config["runtime"]["interface_description"]["interfaces"]["motion.cancel_command"] = CANCEL_INTERFACE
+    dual_config["task_dispatch"]["cancel_command_interface"] = "motion.cancel_command"
+    node._configure_interfaces()
+    assert node._cancel_service_name == "/unit/cancel_command"
+    dual_config["task_dispatch"]["cancel_command_interface"] = "motion.move_to_pose"
+    with pytest.raises(InterfaceBindingError):
+        node._configure_interfaces()
+
+
+class _Future:
+    def __init__(self, result=None, done=True):
+        self._result, self._done, self.cancelled = result, done, False
+
+    def done(self):
+        return self._done
+
+    def result(self):
+        return self._result
+
+    def cancel(self):
+        self.cancelled = True
+
+
+class _CancelClient:
+    def __init__(self, reply):
+        self.reply, self.ids = reply, []
+
+    def service_is_ready(self):
+        return True
+
+    def wait_for_service(self, timeout_sec=None):
+        return True
+
+    def call_async(self, request):
+        self.ids.append(request.command_id)
+        return self.reply
+
+
+def _executor(cancel_client):
+    node = object.__new__(TaskExecutorNode)
+    node._cancel_client = cancel_client
+    node.get_logger = Mock
+    return node
+
+
+def test_without_a_cancel_service_only_the_local_wait_is_dropped():
+    move = _Future(done=False)
+    ok, message = _executor(None)._withdraw_motion(move, "task-1", "Cancelled during motion")
+    assert not ok and message == "Cancelled during motion" and move.cancelled
+
+
+def test_a_withdrawn_motion_is_reported_only_after_the_runtime_confirmed_it():
+    client = _CancelClient(_Future(SimpleNamespace(outcome="CANCELLED", ticks_executed=4)))
+    move = _Future(SimpleNamespace(outcome="CANCELLED"))
+    ok, message = _executor(client)._withdraw_motion(move, "task-1", "Cancelled during motion")
+    assert not ok and client.ids == ["task-1"]
+    assert "runtime withdrew motion task-1 (CANCELLED, 4 ticks)" in message and not move.cancelled
+
+
+def test_an_unconfirmed_withdrawal_says_so(monkeypatch):
+    import task_dispatch.task_executor_node as module
+
+    monkeypatch.setattr(module, "_WITHDRAW_CONFIRM_SEC", 0.05)
+    move = _Future(done=False)
+    ok, message = _executor(_CancelClient(_Future(done=False)))._withdraw_motion(move, "task-1", "Motion timed out")
+    assert not ok and "did not confirm withdrawing motion task-1" in message and move.cancelled

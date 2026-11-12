@@ -12,7 +12,8 @@ One process, two faces:
   group, ``/joint_states``, per-group ``ee_pose`` topics plus the default group's
   ``/robot_status/ee_pose``, camera images, and the simulation surface:
 
-  - ``/simulation/cancel_command`` (CancelSimulationCommand): withdraw one command by id;
+  - ``/simulation/cancel_command`` (CancelSimulationCommand): withdraw one command by id (the
+    ``command_id`` a caller put in its MoveToPose request, e.g. task_dispatch on a cancel);
     ``/simulation/finish_session`` (Trigger): hold position until the platform ends the session.
     ``/simulation/abort_session`` (Trigger): stop writing and end the session without a result.
   - ``/simulation/session`` and ``/simulation/clock``: public lifecycle and tick status. They
@@ -535,6 +536,9 @@ class SimulationRuntime(Node):
             group=group,
             pose=[p.x, p.y, p.z, q.w, q.x, q.y, q.z],
             velocity_scaling=float(request.velocity_scaling) or 1.0,
+            # The caller's id (empty: the engine assigns one), so /simulation/cancel_command can
+            # withdraw exactly this motion when the caller stops waiting for it.
+            command_id=str(request.command_id),
             generation=self._core.generation,
         )
         result = self._core.submit(cmd, MOTION_TIMEOUT_S)
@@ -545,7 +549,7 @@ class SimulationRuntime(Node):
         response.position_error_m = float(result.get("position_error_m", 0.0))
         response.orientation_error_rad = float(result.get("orientation_error_rad", 0.0))
         self.get_logger().info(
-            f"move_to_pose {group} -> {response.outcome} ({response.message}; "
+            f"move_to_pose {group} {cmd.command_id} -> {response.outcome} ({response.message}; "
             f"err={response.position_error_m:.4f} m, {result.get('ticks', 0)} ticks, "
             f"max dq={result.get('max_joint_delta_rad', 0.0):.2f} rad)"
         )

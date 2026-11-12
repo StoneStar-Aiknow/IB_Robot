@@ -16,6 +16,9 @@ ROS Interfaces:
         ~/execute_task_plan (ibrobot_msgs/action/ExecuteTaskPlan)
     Service Client:
         Bound motion.move_to_pose or /motion/move_to_pose (ibrobot_msgs/srv/MoveToPose)
+        Optional task_dispatch.cancel_command_interface (ibrobot_msgs/srv/CancelSimulationCommand):
+        when bound, a motion this node stops waiting for (task cancelled, deadline) is withdrawn
+        in the runtime by its command_id, and the step ends only after the runtime confirmed it.
     Action Client:
         /{gripper_controller}/follow_joint_trajectory (control_msgs/action/FollowJointTrajectory)
     Subscribers:
@@ -28,6 +31,7 @@ Parameters (all loaded from robot_config YAML):
 import math
 import threading
 import time
+import uuid
 
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -41,7 +45,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from ibrobot_msgs.action import ExecuteTaskPlan
 from ibrobot_msgs.msg import TaskStep
-from ibrobot_msgs.srv import MoveToPose
+from ibrobot_msgs.srv import CancelSimulationCommand, MoveToPose
 from robot_config.contract_utils import qos_profile_from_dict
 from robot_config.interface_binding import InterfaceBindingError, resolve_robot_interfaces
 from robot_config.loader import load_robot_section, robot_requires_arm_surface
@@ -67,6 +71,11 @@ def _load_robot_yaml(config_path: str) -> dict:
 
 # Poll interval for goal/result futures (see skill_executor_node._WAIT_POLL_SEC).
 _WAIT_POLL_SEC = 0.005
+
+# How long a withdrawn motion may take to be confirmed by the runtime's cancel service, and
+# then for its own MoveToPose reply to arrive (wall seconds each). The runtime answers a
+# cancel at once, after the command is out of its tick loop.
+_WITHDRAW_CONFIRM_SEC = 5.0
 
 # Every gripper command used to take this fixed time, including a full open or
 # close; durations now scale with distance but never exceed this speed.
@@ -142,6 +151,12 @@ class TaskExecutorNode(Node):
             self._move_service_name,
             callback_group=self._cb_group,
         )
+        # Optional: withdraw a motion by command_id when this node stops waiting for it.
+        self._cancel_client = (
+            self.create_client(CancelSimulationCommand, self._cancel_service_name, callback_group=self._cb_group)
+            if self._cancel_service_name
+            else None
+        )
 
         # ---- Action Clients: Gripper trajectory controller, one per motion group ----
         self._gripper_clients = {
@@ -188,6 +203,7 @@ class TaskExecutorNode(Node):
     def _configure_interfaces(self) -> None:
         self._group_bindings = None
         self._configure_single_group()
+        self._cancel_service_name = self._resolve_cancel_service()
         # Contract v2: TaskStep.target_group names the motion group; "" = the default group.
         if self._group_bindings:
             self._default_group = self._group_default
@@ -272,6 +288,21 @@ class TaskExecutorNode(Node):
                 "interface_mismatch", path, f"requires {kind} {message_type} {expected_direction}"
             )
         return interface
+
+    def _resolve_cancel_service(self) -> str | None:
+        """Endpoint of the bound ``task_dispatch.cancel_command_interface``; None when unbound."""
+        runtime = self._robot_cfg.get("runtime") or {}
+        bindings = self._robot_cfg.get("task_dispatch") or {}
+        interface_id = bindings.get("cancel_command_interface") if isinstance(bindings, dict) else None
+        if not runtime.get("provider") or interface_id is None:
+            return None
+        return self._resolve_interface(
+            runtime,
+            "task_dispatch.cancel_command_interface",
+            interface_id,
+            "service",
+            "ibrobot_msgs/srv/CancelSimulationCommand",
+        )["endpoint"]
 
     def _configure_groups(self, runtime: dict, bindings: dict) -> None:
         """Multi-arm runtime without a public model: one gripper binding per motion group.
@@ -466,6 +497,8 @@ class TaskExecutorNode(Node):
         req.target_pose = step.target_pose
         req.velocity_scaling = step.velocity_scaling
         req.target_group = getattr(step, "target_group", "")
+        # A stable identity for this motion, so it can be withdrawn in the runtime by id.
+        req.command_id = f"task-{uuid.uuid4().hex[:16]}"
 
         future = self._move_client.call_async(req)
 
@@ -473,11 +506,9 @@ class TaskExecutorNode(Node):
         t0 = time.monotonic()
         while not future.done():
             if self._cancel_requested:
-                future.cancel()
-                return False, "Cancelled during motion"
+                return self._withdraw_motion(future, req.command_id, "Cancelled during motion")
             if time.monotonic() - t0 > motion_timeout:
-                future.cancel()
-                return False, f"Motion timed out after {motion_timeout}s"
+                return self._withdraw_motion(future, req.command_id, f"Motion timed out after {motion_timeout}s")
             time.sleep(0.1)
 
         resp = future.result()
@@ -487,6 +518,45 @@ class TaskExecutorNode(Node):
             return False, resp.message
         self.get_logger().info(f"    Motion completed in {resp.execution_time_s:.1f}s")
         return True, "ok"
+
+    def _withdraw_motion(self, future, command_id: str, reason: str) -> tuple:
+        """Stop waiting for a motion; with a bound cancel service, end only once the runtime withdrew it.
+
+        Cancelling the local future does not stop the server's callback, so without a cancel
+        service the runtime may still be moving when this returns (said in the message).
+        """
+        client = getattr(self, "_cancel_client", None)
+        if client is None:
+            future.cancel()
+            return False, reason
+        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=1.0):
+            future.cancel()
+            return False, f"{reason}; cancel service unavailable, motion {command_id} may still be running"
+        request = CancelSimulationCommand.Request()
+        request.command_id = command_id
+        cancel = client.call_async(request)
+        if not self._wait_done(cancel, _WITHDRAW_CONFIRM_SEC):
+            cancel.cancel()
+            future.cancel()
+            return False, f"{reason}; the runtime did not confirm withdrawing motion {command_id}"
+        reply = cancel.result()
+        # Withdrawn (or already ended): the motion's own reply follows at once; wait for it so
+        # nothing of this step is still pending when the step reports.
+        if not self._wait_done(future, _WITHDRAW_CONFIRM_SEC):
+            future.cancel()
+        outcome = reply.outcome if reply is not None else "?"
+        ticks = reply.ticks_executed if reply is not None else 0
+        self.get_logger().info(f"    Motion {command_id} withdrawn: {outcome} after {ticks} ticks")
+        return False, f"{reason}; runtime withdrew motion {command_id} ({outcome}, {ticks} ticks)"
+
+    @staticmethod
+    def _wait_done(future, timeout_sec: float) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while not future.done():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_WAIT_POLL_SEC)
+        return True
 
     def _exec_gripper(self, step: TaskStep) -> tuple:
         """Execute a GRIPPER step via FollowJointTrajectory action."""

@@ -59,6 +59,8 @@ robot:
   # (groups and gripper joints as in the runtime profile's motion_groups).
   task_dispatch:
     move_to_pose_interface: motion.move_to_pose
+    # A cancelled or timed-out MOVE_TO_POSE step is withdrawn in the runtime by its command_id.
+    cancel_command_interface: motion.cancel_command
     joint_state_interface: joint.state
     default_group: left_arm
     groups:

@@ -189,6 +189,18 @@ def test_the_platform_result_goes_to_listeners_only(rig):
 # ---------------------------------------------------------------- review round 2 (F1, F2, F3)
 
 
+def _pose_request(command_id: str = "", x: float = 2.0):
+    from ibrobot_msgs.srv import MoveToPose
+
+    request = MoveToPose.Request()
+    request.target_pose.position.x, request.target_pose.position.y, request.target_pose.position.z = x, 0.1, 0.1
+    request.target_pose.orientation.w = 1.0
+    request.velocity_scaling = 1.0  # 1.9 rad at 0.06 rad/tick: 32 ticks of 20 ms wall each
+    request.target_group = "a"
+    request.command_id = command_id
+    return request
+
+
 def test_a_gripper_goal_cancelled_before_its_submit_never_moves(rig):
     """F2 on the real watcher path: the watcher's cancel lands first; submit must not queue the command."""
     from action_msgs.msg import GoalStatus
@@ -226,3 +238,26 @@ def test_a_clock_value_read_before_a_newer_one_was_published_is_dropped(rig):
     runtime._publish_ros_clock(0.48)
     assert sent == sorted(sent) and pytest.approx(0.48) == sent[-1]
     assert all(round(value, 2) != 0.40 for value in sent)
+
+
+def test_a_pose_move_is_withdrawn_by_its_callers_command_id(rig):
+    """F1 (runtime side): the MoveToPose command_id is the id /simulation/cancel_command withdraws."""
+    from ibrobot_msgs.srv import CancelSimulationCommand, MoveToPose
+
+    runtime, client, adapter = rig
+    assert _call(client, SetRuntimeMode, "/runtime/set_mode", SetRuntimeMode.Request(mode="trajectory")).success
+    move_client = client.create_client(MoveToPose, "/motion/move_to_pose")
+    assert move_client.wait_for_service(timeout_sec=10.0)
+    move = move_client.call_async(_pose_request("task-abc"))
+    assert wait_until(lambda: adapter.env.tick >= 3)
+    cancel = _call(
+        client,
+        CancelSimulationCommand,
+        "/simulation/cancel_command",
+        CancelSimulationCommand.Request(command_id="task-abc"),
+    )
+    at_ack = adapter.env.tick
+    assert cancel.success and cancel.outcome == "CANCELLED" and cancel.ticks_executed >= 2
+    assert _wait(move).outcome == "CANCELLED"
+    time.sleep(0.3)
+    assert adapter.env.tick <= at_ack + 1  # at most the tick already handed to the platform

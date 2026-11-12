@@ -25,6 +25,7 @@ capabilities:
   joint.state: {joint_count: 7, rate_hz: 20.0}
   joint.trajectory: {joint_count: 1}
   gripper.1d: {count: 1}
+  motion.move_to_pose: {groups: [a], default_group: a}
   perception.camera: {topics: [/toy/cam/image_raw]}
   runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 1.0, torque_off_bound_s: 1.0}
 sim_platforms: [sdk, toy]
@@ -33,5 +34,6 @@ simulation:
   toy:
     clock_mode: platform_pull
     dt_s: 0.04
-    supported_commands: [joint, gripper]
+    supported_commands: [joint, gripper, pose]
+    ik: platform                # the toy's exact IK (flange xyz = first three joints)
     motion: {gripper_ticks: 100, settle_ticks: 1, idle_wait_s: 0.01}

@@ -128,6 +128,14 @@ interfaces:
     message_type: geometry_msgs/msg/PoseStamped
     frame_id: world
     qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  # Withdraw one motion by the command_id of its MoveToPose request (task_dispatch binds it,
+  # so a cancelled task stops the motion in the runtime, not only its own wait).
+  motion.cancel_command:
+    capability: motion.move_to_pose
+    kind: service
+    direction: serve
+    endpoint: /simulation/cancel_command
+    message_type: ibrobot_msgs/srv/CancelSimulationCommand
 
 # Settings of the robodojo platform (simulation.<platform>, like every registered platform).
 # The direct-control engine (robot_runtime_sim.direct_control) is platform neutral; everything
