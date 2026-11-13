@@ -1,289 +1,93 @@
-# SO-101 Single Arm Robot Configuration - RGBD variant
-# Use this config for data collection with RealSense D435i (color + aligned depth + pointcloud).
+# SO-101 single arm with the RealSense front camera for RGB-D data collection
+# (colour + aligned depth + pointcloud).
+#
+# Overlay of the so101_single_arm provider configuration: only the
+# application deltas are declared here - the front RealSense with all three
+# streams, the top and wrist cameras disabled, teleop as the default mode and
+# the RGB-D contract. Hardware, serial ports, calibration, controllers and the
+# camera drivers are runtime-owned (so101_robot/profiles/so101_single_arm.yaml);
+# a deployment with different ports or camera serials overrides them through
+# the runtime profile or the runtime peripherals fragment, not here.
 #
 # Launch:
 #   ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm_rgbd \
 #       control_mode:=teleop record:=true record_mode:=episodic
 #
-# Recorded topics:
-#   /camera/front_camera/color/image_raw
-#   /camera/front_camera/aligned_depth_to_color/image_raw
-#   /camera/front_camera/depth/color/points
+# Recorded topics (runtime camera naming):
+#   /camera/front/image_raw
+#   /camera/front/aligned_depth_to_color/image_raw
+#   /camera/front/depth/color/points
 #   /joint_states
-
 robot:
   name: so101_single_arm_rgbd
-  type: so101
-  robot_type: so_101  # For LeRobot dataset metadata
+  base_config: so101_single_arm
 
-  # ============================================
-  # Unified joint definitions (Single Source of Truth)
-  # ============================================
-  joints:
-    arm:
-      - "1"
-      - "2"
-      - "3"
-      - "4"
-      - "5"
-    gripper:
-      - "6"
-    all: ["1", "2", "3", "4", "5", "6"]
-
-  # ============================================
-  # MoveIt configuration
-  # ============================================
-  moveit:
-    arm_group_name: arm
-    base_link: base
-    ee_link: gripper
-    shoulder_link: shoulder
-
-  # Control mode management
-  default_control_mode: "teleop"  # teleop model_inference moveit_planning
+  default_control_mode: teleop
 
   control_modes:
-    # Human teleoperation mode (direct control via leader arm/gamepad)
-    teleop:
-      description: "Human teleoperation mode (direct control)"
-      description_cn: "人工遥操作模式（直接控制）"
-      controllers:
-        - joint_state_broadcaster
-        - arm_position_controller
-        - gripper_position_controller
-      inference:
-        enabled: false
-      executor:
-        type: topic
-        mode: teleop
-        queue_size: 100
-        control_frequency: 50.0
-
-    # Model inference mode (ACT/pi0 end-to-end control)
     model_inference:
-      description: "High-frequency end-to-end control mode (ACT/pi0)"
-      description_cn: "高频端到端控制模式（ACT/pi0）"
-      controllers:
-        - joint_state_broadcaster
-        - arm_position_controller
-        - gripper_position_controller
       inference:
-        enabled: true
         pipelines:
           policy:
             model_path: models/so101_single_arm_rgbd/pretrained_model
-            deployment: cpu
-            execution_mode: monolithic
-            request_timeout: 5.0
-      executor:
-        type: topic  # topic | action
-        mode: model_inference
-        inference_pipeline: policy
-        queue_size: 100
-        control_frequency: 50.0
 
-    moveit_planning:
-      description: "MoveIt trajectory planning mode (VoxPoser/VLM)"
-      description_cn: "MoveIt轨迹规划模式（VoxPoser/VLM）"
-      controllers:
-        - joint_state_broadcaster
-        - arm_trajectory_controller
-        - gripper_trajectory_controller
-      inference:
-        enabled: false  # MoveIt模式不需要推理
-      executor:
-        type: action
-        mode: moveit_planning
-
-  # ros2_control configuration
-  ros2_control:
-    hardware_plugin: so101_hardware/SO101SystemHardware
-    port: /dev/ttyACM2
-    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
-    joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Semantic reset positions (optional); hardware activation holds the measured position.
-    reset_positions:
-      "1": 0.0
-      "2": 0.0
-      "3": 0.0
-      "4": 0.0
-      "5": 0.0
-    urdf_path: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
-
-    # Controllers configuration
-    controllers_config: $(find so101_hardware)/config/so101_controllers.yaml
-
-    # List of controllers to auto-start
-    controllers:
-      - joint_state_broadcaster  # Publishes joint states to /joint_states
-      - arm_controller           # Controls the robot arm joints
-      - gripper_controller       # Controls the gripper
-
-  # Peripheral devices (cameras, microphones, etc.)
   peripherals:
     - type: camera
+      name: top
+      disabled: true
+    - type: camera
+      name: wrist
+      disabled: true
+    - type: camera
       name: front
-      driver: realsense
-      serial_number: ""  # Optional: specific serial number
-      width: 640
-      height: 480
-      fps: 30
-      pixel_format: bgr8
-      streams:          # Declare which data streams to enable
-        - color         # RGB: /camera/front_camera/color/image_raw
-        - depth         # Aligned depth (640x480): /camera/front_camera/aligned_depth_to_color/image_raw
-        - pointcloud    # Unorganized colored pointcloud: /camera/front_camera/depth/color/points
-      frame_id: camera_front_link
-      optical_frame_id: camera_front_optical_frame
-      # Camera position relative to base_link
-      transform:
-        parent_frame: base
-        x: 0.1
-        y: 0.0
-        z: 0.2
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
+      streams: [color, depth, pointcloud]
 
-  # Rosetta contract integration
   contract:
-    base_contract: $(find robot_config)/config/contracts/act_grab_pan.yaml
-    rate_hz: 20
-    max_duration_s: 90.0
-
     observations:
       - key: observation.images.front
-        topic: /camera/front_camera/color/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: front
+        interface: camera.front.color
+        requires: {width: 640, height: 480, min_fps: 15}
         image:
           resize: [480, 640]
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
+          max_age_ms: 500
 
-      - key: observation.images.front.depth       # key 以 .depth 结尾触发 bag_to_lerobot 深度元数据标记
-        topic: /camera/front_camera/aligned_depth_to_color/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: front
+      # A key ending in .depth makes bag_to_lerobot mark the depth metadata.
+      - key: observation.images.front.depth
+        interface: camera.front.aligned_depth
         image:
           resize: [480, 640]
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
+          max_age_ms: 500
 
       - key: observation.pointcloud.front
-        topic: /camera/front_camera/depth/color/points
-        type: sensor_msgs/msg/PointCloud2
+        interface: camera.front.points
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 5
+          max_age_ms: 500
 
       - key: observation.state
-        topic: /joint_states
-        type: sensor_msgs/msg/JointState
+        interface: joint.state
         selector: { names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"] }
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 50
+          max_age_ms: 500
 
       - key: observation.current
-        topic: /so101_follower/joint_currents
-        type: ibrobot_msgs/msg/JointCurrent
+        interface: joint.current
         selector: { names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"] }
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 50
-
-    actions:
-      # Arm joints (1-5) - uses same key "action" for consolidation
-      - key: action
-        selector:
-          names:
-            - "action.0"
-            - "action.1"
-            - "action.2"
-            - "action.3"
-            - "action.4"
-        publish:
-          topic: /arm_position_controller/commands
-          type: std_msgs/msg/Float64MultiArray
-          layout: flat
-          qos:
-            reliability: best_effort
-            history: keep_last
-            depth: 10
-          strategy:
-            mode: nearest
-            tolerance_ms: 500
-        safety_behavior: hold
-
-      # Gripper joint (6) - uses same key "action" for consolidation
-      - key: action
-        selector:
-          names:
-            - "action.5"
-        publish:
-          topic: /gripper_position_controller/commands
-          type: std_msgs/msg/Float64MultiArray
-          layout: flat
-          qos:
-            reliability: best_effort
-            history: keep_last
-            depth: 10
-          strategy:
-            mode: nearest
-            tolerance_ms: 500
-        safety_behavior: hold
-
-  # ============================================
-  # Teleoperation Configuration (for human teleop mode)
-  # ============================================
-  teleoperation:
-    enabled: true
-    active_device: "so101_leader"
-    devices:
-      - name: "so101_leader"
-        type: "leader_arm"
-        port: "/dev/ttyACM3"
-        calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
-    safety:
-      joint_limits:
-        "1": {"min": -2.0693, "max": 2.0709}
-        "2": {"min": -1.92, "max": 1.92}
-        "3": {"min": -1.6813, "max": 1.6828}
-        "4": {"min": -1.65806, "max": 1.65806}
-        "5": {"min": -2.9115, "max": 2.9115}
-        "6": {"min": 0.0, "max": 1.0}  # Gripper
-
-  # ============================================
-  # Recording Configuration
-  # ============================================
-  recording:
-    bag_base_dir: "~/rosbag/episodes"
-    storage: mcap
+          max_age_ms: 500
