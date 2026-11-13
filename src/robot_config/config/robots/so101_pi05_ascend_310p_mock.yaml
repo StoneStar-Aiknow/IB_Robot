@@ -1,21 +1,22 @@
-# SO-101 PI0.5 Ascend310P contract-mock validation profile.
+# SO-101 PI0.5 Ascend310P inference validation without hardware.
+#
+# Overlay of the so101_single_arm provider configuration. Run it with
+# use_sim:=true: the so101_robot runtime serves the SDK simulation platform
+# (vendor SDK virtual bus, production controllers, synthetic camera images on
+# the runtime camera topics), so the policy runs against the same public
+# interfaces as on the real arm. The front camera is disabled to match the
+# two-camera PI0.5 bundle.
+#
+#   TASK_QUEUE_ENABLE=0 ros2 launch robot_config robot.launch.py \
+#       robot_config:=so101_pi05_ascend_310p_mock use_sim:=true control_mode:=model_inference
 robot:
   name: so101_pi05_ascend_310p_mock
-  type: so101
-  robot_type: so_101
-
-  joints:
-    arm: ["1", "2", "3", "4", "5"]
-    gripper: ["6"]
-    all: ["1", "2", "3", "4", "5", "6"]
-
-  default_control_mode: model_inference
+  base_config: so101_single_arm
 
   control_modes:
     model_inference:
-      description: "PI0.5 Ascend310P native Torch inference with contract mock hardware"
+      description: "PI0.5 Ascend310P native Torch inference on the SO-101 SDK simulation platform"
       inference:
-        enabled: true
         pipelines:
           policy:
             model_path: models/pi05/pi05-doublecam-fp32/019200-torch-npu
@@ -30,110 +31,48 @@ robot:
             runtime_options:
               model_dtype: fp16
       executor:
-        type: topic
-        mode: model_inference
-        inference_pipeline: policy
-        queue_size: 100
         watermark_threshold: 20
-        control_frequency: 20.0
-
-  ros2_control:
-    urdf_path: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
 
   peripherals:
     - type: camera
-      name: top
-      driver: mock
-      width: 640
-      height: 480
-      fps: 20
-      frame_id: camera_top_frame
-      optical_frame_id: camera_top_optical_frame
-
-    - type: camera
-      name: wrist
-      driver: mock
-      width: 640
-      height: 480
-      fps: 20
-      frame_id: camera_wrist_frame
-      optical_frame_id: camera_wrist_optical_frame
-
-  simulation:
-    platform: mock
-    scene: null
-
-  hardware_mock:
-    joint_state_rate_hz: 20
-    image_sources:
-      top:
-        kind: checkerboard
-        tile: 32
-      wrist:
-        kind: gradient
+      name: front
+      disabled: true
 
   contract:
-    rate_hz: 20
-    max_duration_s: 90.0
-
     observations:
       - key: observation.images.top
-        topic: /camera/top/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: top
+        interface: camera.top.color
+        requires: {width: 640, height: 480, min_fps: 15}
         image:
           resize: [480, 640]
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
+          max_age_ms: 500
 
       - key: observation.images.wrist
-        topic: /camera/wrist/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: wrist
+        interface: camera.wrist.color
+        requires: {width: 640, height: 480, min_fps: 15}
         image:
           resize: [480, 640]
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
+          max_age_ms: 500
 
       - key: observation.state
-        topic: /joint_states
-        type: sensor_msgs/msg/JointState
+        interface: joint.state
         selector:
           names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"]
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 50
+          max_age_ms: 500
 
-    actions:
-      - key: action
-        selector:
-          names: ["action.0", "action.1", "action.2", "action.3", "action.4", "action.5"]
-        publish:
-          topic: /joint_commands
-          type: std_msgs/msg/Float64MultiArray
-          layout: flat
-          qos:
-            reliability: best_effort
-            history: keep_last
-            depth: 10
-          strategy:
-            mode: nearest
-            tolerance_ms: 500
-        safety_behavior: hold
+  # The PI0.5 bundle was trained with the range_m100_100 joint normalization;
+  # the so101_single_arm base switches to degrees for its ACT policy.
+  recording:
+    lerobot_norm_mode: range_m100_100

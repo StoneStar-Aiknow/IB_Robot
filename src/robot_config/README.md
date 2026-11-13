@@ -2015,10 +2015,7 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm
 # 启动仿真
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
 
-# 契约级 mock 仿真
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true sim_platform:=mock control_mode:=model_inference
-
-# PI0.5 hardware_mock: first package both modes with package-pi05-ascend-deployments.
+# PI0.5 on the SO-101 SDK simulation platform: first package both modes with package-pi05-ascend-deployments.
 # The YAML defaults to fast; switch the adjacent commented deployment line for fidelity.
 TASK_QUEUE_ENABLE=0 ros2 launch robot_config robot.launch.py robot_config:=so101_pi05_ascend_310p_mock use_sim:=true control_mode:=model_inference
 
