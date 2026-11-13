@@ -594,39 +594,49 @@ def test_absent_scheduler_produces_legacy_dispatcher_only(tmp_path: Path) -> Non
     assert "global_inference_scheduler_node" not in executables
 
 
+_SO101_PROFILE = (
+    Path(__file__).resolve().parents[2] / "robots" / "so101" / "so101_robot" / "profiles" / "so101_single_arm.yaml"
+)
+
+
 @pytest.mark.parametrize(
-    "filename,expected_joints",
+    "filename,action_count",
     [
-        ("test_single_arm_single_cam.yaml", ["1", "2", "3", "4", "5", "6"]),
-        ("dev_rtp_single_camera.yaml", []),
-        ("dev_rtp_multi_camera.yaml", []),
+        ("test_single_arm_single_cam.yaml", 2),
+        ("dev_rtp_single_camera.yaml", 0),
+        ("dev_rtp_multi_camera.yaml", 0),
     ],
 )
-def test_repository_configs_load_and_build_dispatcher(tmp_path, filename, expected_joints):
-    path = Path(__file__).resolve().parents[1] / "config" / "robots" / filename
-    config = load_robot_config_dict(path)
-    contract = build_contract_from_robot_config_dict(config)
-    assert config["joints"]["all"] == expected_joints
-    if expected_joints:
-        state = next(obs for obs in config["contract"]["observations"] if obs["key"] == "observation.state")
-        assert expected_joints == state["selector"]["names"]
-        assert len(contract.actions) == 2
-    else:
-        assert not contract.actions
+def test_repository_configs_load_and_build_dispatcher(tmp_path, filename, action_count):
+    from robot_config.testing.provider_binding import bind_offline
 
-    # Supply a local bundle for the development placeholder or the contract-only profile.
+    path = Path(__file__).resolve().parents[1] / "config" / "robots" / filename
+    deferred = load_robot_config_dict(path, defer_interface_binding=True)
+    assert deferred["runtime"]["provider"] == "so101_robot"
+    config = bind_offline(deferred, _SO101_PROFILE)
+    # The RTP development contracts observe only; the joints still come from the runtime.
+    assert len(build_contract_from_robot_config_dict(config).actions) == action_count
+
     bundle = _create_bundle(tmp_path / "bundle")
-    if "control_modes" not in config:
-        config["control_modes"] = _legacy_robot_config(path, bundle)["control_modes"]
-    else:
-        config["control_modes"]["model_inference"]["inference"]["pipelines"]["dev_policy"]["model_path"] = str(bundle)
+    inference = config["control_modes"]["model_inference"]["inference"]
+    inference["enabled"] = True
+    inference["pipelines"]["policy"]["model_path"] = str(bundle)
     nodes = generate_execution_nodes(config, "model_inference")
     dispatcher = next(node for node in nodes if node.node_executable == "action_dispatcher_node")
-    params = _node_parameters(dispatcher)
-    if expected_joints:
-        assert params["joint_names"] == expected_joints
-    else:
-        assert "joint_names" not in params
+    assert _node_parameters(dispatcher)["joint_names"] == ["1", "2", "3", "4", "5", "6"]
+
+
+def test_single_camera_test_config_starts_no_policy():
+    from robot_config.testing.provider_binding import bind_offline
+
+    path = Path(__file__).resolve().parents[1] / "config" / "robots" / "test_single_arm_single_cam.yaml"
+    config = bind_offline(load_robot_config_dict(path, defer_interface_binding=True), _SO101_PROFILE)
+
+    from robot_config.launch_registry.preparation import _derive_inference
+
+    # Neither the default mode nor an explicit model_inference launch starts a policy.
+    assert _derive_inference({"with_inference": ""}, config, config["default_control_mode"]) is False
+    assert _derive_inference({"with_inference": ""}, config, "model_inference") is False
 
 
 def test_missing_joint_list_error_links_to_existing_documentation(tmp_path):

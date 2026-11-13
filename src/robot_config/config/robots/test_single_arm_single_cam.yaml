@@ -1,78 +1,45 @@
-# 创建一个最小测试配置
+# SO-101 single arm with one camera, for development tests.
+#
+# Overlay of the so101_single_arm provider configuration: only the top camera
+# is enabled and observed, and no policy is loaded (teleop by default, the
+# inherited inference pipeline disabled). Actions, hardware and camera
+# drivers come from the base configuration and the so101_robot runtime profile.
 robot:
   name: test_single_arm_single_cam
-  type: so101
-  robot_type: so_101 
+  base_config: so101_single_arm
 
-  ros2_control:
-    hardware_plugin: so101_hardware/SO101SystemHardware
-    port: /dev/ttyACM0
-    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
-    joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Reset positions (optional) - safe folded position for dog-mounted arm
-    # reset_positions:
-    #   "1": 0.0813
-    #   "2": 3.7905
-    #   "3": 7.0379
-    #   "4": -0.6228
-    #   "5": 2.3869
-    urdf_path: $(find lerobot_description)/urdf/so101.urdf.xacro
+  default_control_mode: teleop
 
-  # Unified joint definitions
-  joints:
-    all: ["1", "2", "3", "4", "5", "6"]
-    arm:
-      - "1"
-      - "2"
-      - "3"
-      - "4"
-      - "5"
-
-  # MoveIt configuration
-  moveit:
-    arm_group_name: arm
-    base_link: base
-    ee_link: gripper
-    shoulder_link: shoulder
+  control_modes:
+    model_inference:
+      inference:
+        enabled: false
 
   peripherals:
     - type: camera
-      name: test
-      driver: opencv
-      index: 0
-      width: 1280
-      height: 1024
-      fps: 60
-      pixel_format: yuyv
-      frame_id: camera_test_frame
-      optical_frame_id: camera_test_optical_frame
-      camera_info_url: file:///home/xqw/.ros/camera_info/test.yaml
-      transform:
-        parent_frame: base_link
-        x: 0.0
-        y: 0.0
-        z: 0.5
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
+      name: wrist
+      disabled: true
+    - type: camera
+      name: front
+      disabled: true
 
   contract:
     rate_hz: 30.0
     observations:
-      - key: observation.images.test
-        topic: /camera/test/image_raw
-        peripheral: test
+      - key: observation.images.top
+        interface: camera.top.color
+        image:
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
       - key: observation.state
-        topic: /joint_states
-        selector: { names: ["1", "2", "3", "4", "5", "6"] }
-    actions:
-      - key: arm_action
-        selector: { names: [0, 5] }  # 前5个关节
-        publish:
-          topic: /arm_controller/commands
-          type: std_msgs/msg/Float64MultiArray
-      - key: gripper_action
-        selector: { names: [5, 6] }  # 第6个关节
-        publish:
-          topic: /gripper_controller/commands
-          type: std_msgs/msg/Float64MultiArray
+        interface: joint.state
+        selector: { names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"] }
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500

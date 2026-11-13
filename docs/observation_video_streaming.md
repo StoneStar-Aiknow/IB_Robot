@@ -482,12 +482,14 @@ DistributedInferenceRequest:
 
 ## 参考配置
 
-完整的 SO-101 单臂双相机配置示例见：
-- 机器人侧 YAML: `src/robot_config/config/robots/dev_rtp_single_camera.yaml`
-- 云端 YAML: `src/robot_config/config/robots/dev_rtp_multi_camera.yaml`（示例中为多相机，可简化为双相机）
+开发用 SO-101 单臂配置：
+- 单相机：`src/robot_config/config/robots/dev_rtp_single_camera.yaml`
+- 双相机（top + wrist）：`src/robot_config/config/robots/dev_rtp_multi_camera.yaml`
 
-多相机配置示例（三相机）见：
-- `src/robot_config/config/robots/dev_rtp_multi_camera.yaml`
+这两个配置都是 `so101_single_arm` 的 overlay，接口 ID 由 `so101_robot` runtime 解析。机器人侧
+`robot.launch.py` 完成绑定后，日志会输出 `Runtime interfaces bound; consumer snapshot: <路径>`。
+云端 `cloud_inference.launch.py` 的 `robot_config_path` 必须使用这份绑定后的快照（拷贝到云端主机），
+不能直接使用源码中的 YAML：源码 YAML 没有 runtime 接口描述，云端加载时会报 `description_required`。
 
 ## 相关文档
 
