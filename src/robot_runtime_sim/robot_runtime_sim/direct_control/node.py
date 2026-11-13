@@ -26,7 +26,8 @@ One process, two faces:
     every message with simulated time.
 
 Optional layers (an evaluation layer, for one) attach through ``extensions``: ``module:attr``
-callables run once with this node after it is built. They may install the engine's motion
+callables run once with this node after it is built, named by the profile's
+``simulation.<platform>.extensions`` or by the ``extensions`` parameter. They may install the engine's motion
 gate, add platform-result listeners and serve their own interfaces; the node knows none of them.
 
 Every pose is the tool centre point of its group (the group's ``tcp_offset`` ahead of the
@@ -98,6 +99,7 @@ from robot_runtime_sim.direct_control.ports import (
     COMMAND_POSE,
     ObservationFrame,
     ik_request_refusal,
+    platform_extensions,
     platform_settings,
     profile_mismatches,
 )
@@ -276,7 +278,9 @@ class SimulationRuntime(Node):
                 )
             )
 
-        for reference in [str(r).strip() for r in self.get_parameter("extensions").value if str(r).strip()]:
+        # The profile's simulation.<platform>.extensions first, then the parameter's; each once.
+        parameter = [str(r).strip() for r in self.get_parameter("extensions").value if str(r).strip()]
+        for reference in dict.fromkeys(platform_extensions(sim, self._platform) + parameter):
             resolve_reference(reference)(self)
             self.get_logger().info(f"extension {reference} attached")
 

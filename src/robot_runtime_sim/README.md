@@ -122,6 +122,11 @@ simulation:
 （`SimulationCore.set_motion_gate`）、监听平台结果（`add_platform_result_listener`）并提供
 自己的接口。不挂时，平台自己的判分结果只写日志，不发布到任何话题。
 
+挂哪些层写在 profile 的 `simulation.<platform>.extensions`（列表），节点启动时自己读，再并上
+节点参数 `extensions`。随包发布的 profile 不写这一项；要挂的一方（例如一次评测）把 profile
+复制一份、在副本里列出来，再让 robot_config 的 `runtime.profile` 指向这份副本，启动链路
+不用改。
+
 ### 接入一个没有控制器的平台
 
 1. 在 profile 里声明平台：`use_sim: true`、`sim_platforms: [my_platform]`、

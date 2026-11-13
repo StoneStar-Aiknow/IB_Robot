@@ -31,6 +31,7 @@ from robot_runtime_sim.direct_control.ports import (
     ObservationFrame,
     PlatformResult,
     descriptor_from_profile,
+    platform_extensions,
 )
 from robot_runtime_sim.testing.direct_control_fakes import (
     FAST,
@@ -81,6 +82,13 @@ def test_descriptor_from_profile_takes_groups_dof_and_dt_from_the_profile():
     assert descriptor.dt_s == 0.02 and descriptor.cameras == ("front",)
     with pytest.raises(DescriptorError):
         descriptor_from_profile({"motion_groups": profile["motion_groups"]}, platform="p", clock_mode="host_step")
+
+
+def test_platform_extensions_are_a_list_of_references_and_none_by_default():
+    assert platform_extensions({}, "p") == []
+    assert platform_extensions({"extensions": [" pkg.mod:attach ", ""]}, "p") == ["pkg.mod:attach"]
+    with pytest.raises(DescriptorError):
+        platform_extensions({"extensions": "pkg.mod:attach"}, "p")  # a string, not a list
 
 
 def test_unsupported_command_kind_is_rejected_not_approximated():

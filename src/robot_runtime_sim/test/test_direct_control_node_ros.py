@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 rclpy = pytest.importorskip("rclpy")
 
@@ -30,8 +32,16 @@ def rig(request):
     adapter = ToyAdapter()
     from rclpy.parameter import Parameter
 
-    overrides = [Parameter("profile", value=str(PROFILE)), Parameter("platform", value="toy")]
-    if getattr(request, "param", None) == "gated":
+    profile = str(PROFILE)
+    mode = getattr(request, "param", None)
+    if mode == "gated_by_profile":
+        # How a caller selects a layer: its own copy of the profile lists it.
+        document = yaml.safe_load(PROFILE.read_text())
+        document["simulation"]["toy"]["extensions"] = [EXTENSION]
+        profile = str(request.getfixturevalue("tmp_path") / "toy_with_extension.yaml")
+        Path(profile).write_text(yaml.safe_dump(document))
+    overrides = [Parameter("profile", value=profile), Parameter("platform", value="toy")]
+    if mode == "gated":
         overrides.append(Parameter("extensions", value=[EXTENSION]))
     runtime = SimulationRuntime(adapter=adapter, node_name="toy_runtime", parameter_overrides=overrides)
     client = Node("toy_client")
@@ -73,7 +83,7 @@ def _wait(future, timeout=10.0):
     return future.result()
 
 
-@pytest.mark.parametrize("rig", ["gated"], indirect=True)
+@pytest.mark.parametrize("rig", ["gated", "gated_by_profile"], indirect=True)
 def test_an_extension_gate_holds_motion_and_a_cancelled_gripper_goal_ends_cancelled(rig):
     runtime, client, adapter = rig
     core = runtime.core
