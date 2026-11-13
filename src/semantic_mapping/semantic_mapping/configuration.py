@@ -15,6 +15,8 @@ _CONSTRUCTION_ROLES = ("sam2_masks", "ram_plus_tags", "siglip2_image")
 
 def load_semantic_mapping_robot_config(robot_config_name: str, config_path_override: str = "") -> dict:
     """Load one validated robot config for a standalone semantic mapping launch."""
+    if not config_path_override and not robot_config_name:
+        raise ValueError("Specify config_path or robot_config for an enabled semantic mapping deployment")
     if config_path_override:
         config_path = Path(config_path_override)
     else:

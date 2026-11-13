@@ -36,7 +36,8 @@ def fixture_urdf(profile: dict[str, Any]) -> str:
 def offline_description(config: dict[str, Any], profile_path: str | Path) -> dict[str, Any]:
     """An SDK-simulated description built from the profile, for binding tests.
 
-    The interfaces follow the profile and the effective peripherals; the model
+    The interfaces follow the profile, effective peripherals and enabled
+    navigation.fast_lio fragment, just as runtime composition does; the model
     comes from :func:`fixture_urdf`, so the joint limits and frames are fixtures
     rather than the rendered xacro or a calibrated arm. It proves that a
     configuration's interface IDs and peripheral overrides resolve, not that
@@ -50,6 +51,9 @@ def offline_description(config: dict[str, Any], profile_path: str | Path) -> dic
     runtime = config.get("runtime") or {}
     overrides = list(config.get("peripherals") or []) + list(runtime.get("_disabled_peripherals") or [])
     effective = {**profile, "peripherals": merge_peripherals(profile.get("peripherals"), overrides)}
+    fast_lio = (config.get("navigation") or {}).get("fast_lio") or {}
+    if fast_lio.get("enabled"):
+        effective["fast_lio"] = {**(profile.get("fast_lio") or {}), **fast_lio}
     return build_description(
         effective,
         robot_description=fixture_urdf(effective),

@@ -191,9 +191,20 @@ def _interaction_demo_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict
 
 
 def required_interface_ids(config: Mapping[str, Any]) -> list[str]:
-    """Return all explicitly bound interfaces, in contract order (never guessed from topics)."""
+    """Return bound interfaces and active consumers' live requirements, never guessed from topics."""
     ids = [item["interface"] for item, _, _ in _bindings(config)]
     ids.extend(item["interface"] for item, _ in _endpoint_bindings(config))
+    teleop = config.get("teleoperation") or {}
+    if (config.get("runtime") or {}).get("provider") and teleop.get("enabled", False):
+        active = teleop.get("active_device")
+        if active and any(
+            device.get("name") == active and device.get("type") == "joy_teleop"
+            for device in teleop.get("devices") or []
+        ):
+            # The gamepad consumes the live description directly, rather than
+            # materializing a contract topic. Offline capture/config readers
+            # need no snapshot; launch must bind before constructing teleop.
+            ids.append("base.cmd_vel")
     return list(dict.fromkeys(ids))
 
 

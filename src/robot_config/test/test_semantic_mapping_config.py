@@ -15,13 +15,30 @@ from robot_config.loader import (
     validate_semantic_mapping_config,
 )
 
-CONFIG_PATH = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_realsense_mapping.yaml"
+CONFIG_PATH = Path(__file__).parents[1] / "test" / "config" / "semantic_mapping_fixture.yaml"
 FIXTURE_PATH = Path(__file__).parents[2] / "semantic_mapping" / "test" / "perception_bundle_fixture.py"
 FIXTURE_SPEC = importlib.util.spec_from_file_location("semantic_perception_bundle_fixture", FIXTURE_PATH)
 FIXTURE_MODULE = importlib.util.module_from_spec(FIXTURE_SPEC)
 assert FIXTURE_SPEC.loader is not None
 FIXTURE_SPEC.loader.exec_module(FIXTURE_MODULE)
 configure_perception_bundles = FIXTURE_MODULE.configure_perception_bundles
+
+
+def test_shipped_semantic_config_without_calibration_reports_validation_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    shipped = Path(__file__).parents[1] / "config/robots/lekiwi_nav_grasp.yaml"
+    with pytest.raises(ValueError, match="semantic_mapping.camera.parent_frame must match"):
+        load_robot_config_dict(shipped, defer_interface_binding=True, require_local_model_artifacts=False)
+
+
+def test_semantic_validator_accepts_null_mount_as_a_validation_failure(tmp_path):
+    config = _enabled_config(tmp_path)
+    config["runtime"] = {"provider": "lekiwi_robot"}
+    camera = next(p for p in config["peripherals"] if p["name"] == config["semantic_mapping"]["camera"]["peripheral"])
+    camera["transform"] = None
+    assert "semantic_mapping.camera.parent_frame must match the camera peripheral transform parent_frame" in (
+        validate_semantic_mapping_config(config)
+    )
 
 
 def _enabled_config(tmp_path: Path) -> dict:

@@ -730,7 +730,9 @@ LeKiwi 配置及其状态：
 | `lekiwi_hybrid_switch_test`、`lekiwi_nav_grasp_sound_real` | 受支持（经 `base_config: lekiwi_nav_grasp` 继承） | overlay |
 | `lekiwi_sensor_calib` | 受支持（runtime provider） | `lekiwi_calibration` 工作流启动它 |
 | `lekiwi_handeye_realsense_grasp`、`lekiwi_handeye_realsense_grasp_pc` | 不支持（底盘已关闭，仅保留供测试加载） | 改用 `lekiwi_nav_grasp` 的 `grasp` stage |
-| `lekiwi_realsense_mapping`、`lekiwi_realsense_navigation`、`lekiwi_semantic_capture` | 不支持（底盘已关闭） | 改用 `lekiwi_lidar` / `lekiwi_nav_grasp` 的对应 stage |
+| `lekiwi_realsense_mapping` | 已删除 | 改用 `lekiwi_lidar nav_stage:=mapping`（MID-360） |
+| `lekiwi_semantic_capture` | 受支持（overlay → `lekiwi_lidar` mapping） | aligned D435i + MID-360 + MCAP；默认 runtime 手柄 |
+| `lekiwi_realsense_navigation` | 不支持（底盘已关闭） | 改用 `lekiwi_lidar nav_stage:=navigation` |
 | `lekiwi_rtp_distributed` | 不支持（动作空间未迁移） | 底盘动作直写轮速控制器、绕过 runtime 门控；runtime 底盘动作契约由后续变更定义 |
 | `lekiwi` | 不可启动，刻意保留 | 缺少 `sts_hardware_interface` 插件与驱动；仍是 `sim_controllers`、EKF 导航块和 `imu_sensor_broadcaster` 的唯一测试夹具 |
 

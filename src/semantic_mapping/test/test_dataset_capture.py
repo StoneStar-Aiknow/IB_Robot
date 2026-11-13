@@ -117,7 +117,7 @@ def test_validate_mcap_metadata_uses_actual_topic_type_count_and_time_coverage(t
     }
     assert result["topic_validation"]["required_nonzero"] == sorted(dataset_capture.SEMANTIC_REQUIRED_NONZERO_TOPICS)
     assert result["topic_validation"]["reported_optional"]["/cmd_vel"] == 0
-    assert result["topic_validation"]["missing_optional"] == ["/wheel/odom"]
+    assert result["topic_validation"]["missing_optional"] == ["/odom"]
     assert result["time_coverage"]["status"] == "validated"
     assert result["time_coverage"]["files_end_ns"] == 500
 

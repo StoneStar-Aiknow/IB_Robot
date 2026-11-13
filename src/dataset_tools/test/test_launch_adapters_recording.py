@@ -9,14 +9,31 @@ Assertions are verbatim; only the import paths changed.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from ament_index_python.packages import get_package_share_directory
 from launch.actions import EmitEvent
 from launch.events import Shutdown
 
 import dataset_tools.launch_builders.recording as recording_module
 from robot_config.launch_registry.registry import LaunchBuildContext
+from robot_config.loader import load_robot_config_dict
 from robot_config.runtime_target import RuntimeTarget
+
+
+def test_managed_semantic_capture_forces_continuous_mcap(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_path = Path(get_package_share_directory("robot_config")) / "config/robots/lekiwi_semantic_capture.yaml"
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
+    assert recording_module.resolve_recording_launch(config, requested=False, mode="continuous") == (True, "continuous")
+    with pytest.raises(ValueError, match="require continuous"):
+        recording_module.resolve_recording_launch(config, requested=True, mode="episodic")
+    command = recording_module.build_continuous_recording_command(config, "fixture")
+    assert command[command.index("-s") + 1] == "mcap"
+    assert command[command.index("-o") + 1].endswith("lekiwi_semantic_capture_fixture/bag")
+    assert set(config["recording"]["topics"]) <= set(command)
 
 
 class _FakeNode:

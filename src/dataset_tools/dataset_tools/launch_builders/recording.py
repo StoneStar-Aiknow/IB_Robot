@@ -29,7 +29,7 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
-from robot_config.interface_binding import required_interface_ids, resolve_robot_interfaces
+from robot_config.interface_binding import resolve_robot_interfaces
 from robot_config.launch_registry.builder_support import rerun_visualizer_requested
 from robot_config.launch_registry.launch_options import ArgumentSpec
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
@@ -513,7 +513,11 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         ['/joint_states', '/arm_position_controller/commands', '/camera/cam0/image_raw', ...]
     """
     robot_config = resolve_robot_interfaces(robot_config)
-    logical_bindings = bool(required_interface_ids(robot_config))
+    # Record from the runtime description only when one is materialized. An
+    # active provider gamepad needs a live binding at launch, but an offline
+    # configuration whose contract binds nothing carries no description.
+    description = (robot_config.get("runtime") or {}).get("interface_description")
+    logical_bindings = isinstance(description, dict)
     recording = robot_config.get("recording", {})
     topics = []
 
@@ -542,7 +546,6 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         _append((action.get("publish") or {}).get("topic", ""))
 
     if logical_bindings:
-        description = robot_config["runtime"]["interface_description"]
         for interface in description["interfaces"].values():
             if interface["kind"] == "topic" and interface["direction"] == "publish":
                 _append(interface["endpoint"])

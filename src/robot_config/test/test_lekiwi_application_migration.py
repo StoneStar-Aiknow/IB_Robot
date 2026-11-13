@@ -1,6 +1,6 @@
 """Configuration migration tests (openspec lekiwi-application-migration 1.6).
 
-Pins the application-half migration on the three migrated configurations:
+Pins the application-half migration on the managed configurations:
 
 - provider/profile identity and the require_model choice per configuration;
 - runtime-owned data (ros2_control, controller lists, the motion_mode
@@ -10,7 +10,7 @@ Pins the application-half migration on the three migrated configurations:
   stages declare boot-time gate intent, application policy stays put;
 - overlays inherit the migrated parent coherently with no silently ignored
   legacy keys;
-- the six provider-less configurations 1.5 records as unsupported stay
+- the remaining provider-less configurations stay
   loadable fixtures without a bridge block.
 """
 
@@ -26,14 +26,12 @@ ROOT = Path(__file__).resolve().parents[3]
 ROBOTS = ROOT / "src/robot_config/config/robots"
 PROFILES = ROOT / "src/robots/lekiwi/lekiwi_robot/profiles"
 
-MIGRATED = ("lekiwi_lidar", "lekiwi_nav_grasp", "lekiwi_sensor_calib")
+MIGRATED = ("lekiwi_lidar", "lekiwi_nav_grasp", "lekiwi_sensor_calib", "lekiwi_semantic_capture")
 UNSUPPORTED = (
     "lekiwi_handeye_realsense_grasp",
     "lekiwi_handeye_realsense_grasp_pc",
-    "lekiwi_realsense_mapping",
     "lekiwi_realsense_navigation",
     "lekiwi_rtp_distributed",
-    "lekiwi_semantic_capture",
 )
 
 
@@ -69,7 +67,7 @@ def test_no_migrated_configuration_uses_require_model():
     profile's ownership of every hardware fact carry the A2 guarantee instead.
     """
     for name in MIGRATED:
-        assert "require_model" not in _raw(name)["runtime"], name
+        assert "require_model" not in _raw(name).get("runtime", {}), name
 
 
 @pytest.mark.parametrize("name", MIGRATED)
@@ -295,12 +293,12 @@ def test_hybrid_switch_test_overlay_overrides_stage_policy():
     assert peripherals["speaker"]["enabled"] is False
 
 
-# --- the unsupported six stay loadable fixtures (A5) ---------------------------
+# --- the remaining unsupported configs stay loadable fixtures (A5) ---------------------------
 
 
 @pytest.mark.parametrize(
     "name",
-    ["lekiwi_realsense_mapping", "lekiwi_realsense_navigation", "lekiwi_rtp_distributed", "lekiwi_semantic_capture"],
+    ["lekiwi_realsense_navigation", "lekiwi_rtp_distributed"],
 )
 def test_unsupported_configurations_remain_loadable_without_a_bridge(name):
     config = _load(name)

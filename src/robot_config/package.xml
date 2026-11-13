@@ -24,6 +24,7 @@
   <!-- Shipped so101_robot overlays bind offline against its runtime profile
        (robot_config.testing.provider_binding). -->
   <test_depend>so101_robot</test_depend>
+  <test_depend>lekiwi_robot</test_depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp_components</depend>
   <depend>rosgraph_msgs</depend>

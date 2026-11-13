@@ -30,7 +30,7 @@ SEMANTIC_RECORDED_TOPIC_TYPES = {
     "/cloud_registered_body": "sensor_msgs/msg/PointCloud2",
     "/scan": "sensor_msgs/msg/LaserScan",
     "/map": "nav_msgs/msg/OccupancyGrid",
-    "/wheel/odom": "nav_msgs/msg/Odometry",
+    "/odom": "nav_msgs/msg/Odometry",
     "/cmd_vel": "geometry_msgs/msg/Twist",
     "/camera/front/image_raw": "sensor_msgs/msg/Image",
     "/camera/front/depth/image_rect_raw": "sensor_msgs/msg/Image",
@@ -41,7 +41,7 @@ SEMANTIC_RECORDED_TOPIC_TYPES = {
     "/tf": "tf2_msgs/msg/TFMessage",
     "/tf_static": "tf2_msgs/msg/TFMessage",
 }
-SEMANTIC_OPTIONAL_TOPICS = {"/wheel/odom", "/cmd_vel"}
+SEMANTIC_OPTIONAL_TOPICS = {"/odom", "/cmd_vel"}
 SEMANTIC_REQUIRED_NONZERO_TOPICS = set(SEMANTIC_RECORDED_TOPIC_TYPES) - SEMANTIC_OPTIONAL_TOPICS
 
 
