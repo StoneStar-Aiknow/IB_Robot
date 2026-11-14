@@ -242,7 +242,7 @@ robot:
         - 代码仓库：扫旁边的二维码。
         - 机器人基于 openEuler 开发（openEuler Embedded），openEuler 是基于 Linux 的发行版；芯片是昇腾 310P。
         - 照镜子：通过头部摄像头识别人体姿态，实时跟随手臂动作，只学手臂，学不了腿；体验中会自动留图，结束后自己选。
-        - 礼物：柠檬、苹果、橙子三选一，礼物藏在水果里；每次有效唤醒欧拉欧拉开始新领取轮次，每轮送一份，重新唤醒可以再领；水果放进碗里，顺着滑道滑到领取盒，由参观者自己拿；不能扔，不能递到手里；没确认送到之前先别取。
+        - 礼物：柠檬、苹果、橙子三选一，礼物藏在水果里；水果礼物可以依次领取，每次任务处理一个水果，当前任务结束后可以再次请求；水果放进碗里，顺着滑道滑到领取盒，由参观者自己拿；不能扔，不能递到手里；没确认送到之前先别取。
         - 现场的水果是道具，不能吃。
         - 机器人主要说中文。
         - 安全：不做不会伤害人这类保证，请按现场提示互动。
@@ -263,8 +263,8 @@ robot:
           unavailable_fruit_skill: fruit_not_available
           unsupported_skill: decline_unsupported
           lines:
-            only_one: 嘿嘿，这轮只能选一份哦～
-            already_given: 这轮已经送过礼物啦，重新叫欧拉欧拉可以开始新一轮。
+            only_one: 嘿嘿，一次只能选一个水果哦，任务结束后可以再选～
+            already_given: 礼物已送到，当前任务结束后可以再选一个水果。
             confirm_pick: 可以呀，现在就给你拿吗？
             recommend: 每个都有礼物哦，要我帮你挑吗？
             random_pick: 每个都有礼物，我帮你挑一个！
@@ -638,11 +638,11 @@ robot:
       - chat_not_understood
       - chat_dont_know
       gift_state:
-        enabled: true
+        enabled: false
       # Lifecycle helpers launch from the workspace root; state paths are relative to it.
-      ledger_path: log/agent_interaction/state/requests.sqlite3
-      conversation_path: log/agent_interaction/state/conversation.sqlite3
-      deployment_lock_path: log/agent_interaction/state/agent.lock
+      ledger_path: log/agent_interaction/x2_robot_03/state/requests.sqlite3
+      conversation_path: log/agent_interaction/x2_robot_03/state/conversation.sqlite3
+      deployment_lock_path: log/agent_interaction/x2_robot_03/state/agent.lock
     runtime_play_audio:
       clips:
         self_intro: $(env WORKSPACE)/commissioning/audio/self_introduction.wav
@@ -656,7 +656,7 @@ robot:
         - raise_hand
         - blow_kiss
         - clap
-    execution_store_path: log/agent_interaction/state/executions.sqlite3
+    execution_store_path: log/agent_interaction/x2_robot_03/state/executions.sqlite3
   mirror_session:
     voice:
       enabled: true
@@ -665,13 +665,14 @@ robot:
     enabled: false
     hands_installed:
     - true
-    - true
+    - false
   internvl_voice:
     enabled: true
   preset_motions:
     enabled: false
     motion_enabled: false
   runtime:
+    instance_id: x2_robot_03
     cancel_return_motions: wave,short_wave,invite,self_intro,explain
     profile: commissioning/profiles/x2_ultra_omnihand_external.yaml
   default_control_mode: model_inference

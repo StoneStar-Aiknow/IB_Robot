@@ -1165,7 +1165,7 @@ codes:
     lines:
     - file: SF01_01.wav
       text: 好嘞，我听到了。
-      sha256: 1cad14a6d63739acd09f855c3a82a4b7088c2cd5b883eabe821d59dc07336009
+      sha256: 6957ab9008f71edcb8b963eba59d684940df46c9cbc47fa0da8b1ed776c2c94b
   SF02:
     clip: speech_feedback_02
     mode: random
@@ -1173,7 +1173,7 @@ codes:
     lines:
     - file: SF02_01.wav
       text: 刚才没看清，我再看一眼。
-      sha256: 7c872908e0d9a2f87b965cba566ab092a91ab1169b93cfe5e8a51eec41f567b9
+      sha256: 5ff94528adaa0ff9d88314c888f8a28ea0cce7eda29fa404b580de7611756a2e
   SF03:
     clip: speech_feedback_03
     mode: random
@@ -1181,7 +1181,7 @@ codes:
     lines:
     - file: SF03_01.wav
       text: 刚才没找到合适的路线，我再试试。
-      sha256: 25726a9ac8f928f071f9b475e20075cc0b1dae885d8cffe80e54165d02ae825a
+      sha256: 5311d8795441fe4b9e38b89d2a423908d61a88c0e25e3d3444d2a3e92279e8a5
   SF04:
     clip: speech_feedback_04
     mode: random
@@ -1189,7 +1189,7 @@ codes:
     lines:
     - file: SF04_01.wav
       text: 刚才没抓住，我再试一次。
-      sha256: 803b3c970065ad14459d4bc978910c260c255ce4f6cfbcd112b6ca7fa2c3f2a4
+      sha256: b7d9779e3f00cea7ffa2872907ddae1f71e5fccf828e8c878d9350e577873d2c
   SF05:
     clip: speech_feedback_05
     mode: random
@@ -1197,7 +1197,7 @@ codes:
     lines:
     - file: SF05_01.wav
       text: 刚才没拿稳，我再试一次。
-      sha256: a1cda4a0a0c0e07d4100c0e4d22df976495f1d4849487715b5dfbab72760f263
+      sha256: 41f3540cec0ddde5279b93d02224d27a11b5a0029677ef04676e40e2316bd1c0
   SF06:
     clip: speech_feedback_06
     mode: random
@@ -1205,7 +1205,7 @@ codes:
     lines:
     - file: SF06_01.wav
       text: 刚才没能完成，我再试一次。
-      sha256: 84ce5bd31f84fefc701bf60a4cf7241a7027889236643d9dc12f0c21a482017c
+      sha256: 25f80f362f64b828094499cf6fef5891af54a3c0a79098b8be2e60fcc232bc9b
   SF07:
     clip: speech_feedback_07
     mode: random
@@ -1213,7 +1213,7 @@ codes:
     lines:
     - file: SF07_01.wav
       text: 我还在找合适的抓取位置，再等我一下哦。
-      sha256: 8edfd5fea0ff3ad2746cd67e08b20abba1e713350d53806e716454c75dc27839
+      sha256: 57f6a94bc3b4e42bb4b6745f11bf1d12c03d1b0da2f595c012329e8b9594b114
   SF08:
     clip: speech_feedback_08
     mode: random
@@ -1221,7 +1221,7 @@ codes:
     lines:
     - file: SF08_01.wav
       text: 我还在准备放置，再等我一下哦。
-      sha256: 77d386c27c4d825552492fcb9929b86520772541b11e43b873a1591dcaae2a08
+      sha256: 9b2f68022a247c03ba5b3f428452def647a7efd3e3a13f2491ec2195ea871c98
   SF09:
     clip: speech_feedback_09
     mode: random
@@ -1229,4 +1229,4 @@ codes:
     lines:
     - file: SF09_01.wav
       text: 我还在做恢复处理，再等我一下哦。
-      sha256: 23b550adf02ebcb329d922f61941c64a82dd1ca723b7313975f1a2e4d7fda2be
+      sha256: f8c3756f22c82368b3feb4f5846fb22d69b7341d7319503c2b583b16715f670a
