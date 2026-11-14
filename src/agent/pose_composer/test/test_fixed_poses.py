@@ -19,6 +19,7 @@ from aimdk_grasp.hand_restore import (
     GatewayState,
     HandRestorer,
     Observation,
+    RestoreError,
     RuntimeState,
     build_hand_plans,
 )
@@ -427,6 +428,188 @@ def test_fixed_dispatch_refuses_changed_start_before_sending(fault):
     assert not ok and code == expected[fault]
 
 
+def _entry_server(start, *, during_check=None, collide_on=None):
+    """A fixed-mode server whose geometry check records what it was given."""
+    from aimdk_grasp.path_validation import ValidationGate
+
+    joints = LEFT_ARM + RIGHT_ARM
+    server = object.__new__(PoseComposerNode)
+    calls, dispatched = [], []
+
+    def arm_check(_feedback, _joints, rows, **kwargs):
+        calls.append(("hand", np.array(rows), kwargs.get("start_tolerance_rad")))
+        if during_check is not None and kwargs.get("start_tolerance_rad") is not None:
+            during_check(server)
+        if collide_on is not None and _entry_validations(calls) == collide_on:
+            raise RestoreError("HAND_SWEEP_COLLISION", "mock entry collision")
+
+    backend = SimpleNamespace(
+        library={},
+        model=SimpleNamespace(ARM_JOINTS=joints),
+        ARM_JOINTS=joints,
+        body_geometry=SimpleNamespace(
+            check_path=lambda _j, rows, **kw: calls.append(("body", np.array(rows), kw.get("start_tolerance_rad")))
+        ),
+        prepare_execution=lambda plan, **_: plan,
+        check_pose=lambda _, **_kw: SimpleNamespace(ok=True),
+    )
+    server._selected_backend = backend
+    server._hand_config = {"enabled": True}
+    server._execution_gate = ValidationGate(backend, {"hand": "online", "body": "online"})
+    baseline = SimpleNamespace(feedback=SimpleNamespace(positions=dict.fromkeys(HEAD, 0.0)))
+    server._hand_restorer = lambda: SimpleNamespace(
+        ports=SimpleNamespace(prepare=lambda _: None),
+        arm_baseline=lambda _: baseline,
+        geometry=SimpleNamespace(check_arm_path=arm_check),
+        guard_arm_motion=lambda *_: baseline,
+    )
+    server._joint_lock = Lock()
+    server._positions = dict(zip(joints, start, strict=True))
+    server._joint_received = dict.fromkeys(joints, time.monotonic())
+
+    def dispatch(goal):
+        dispatched.append(goal)
+        return ready(SimpleNamespace(accepted=False))
+
+    server._traj = SimpleNamespace(wait_for_server=lambda **_: True, send_goal_async=dispatch)
+    return server, calls, dispatched
+
+
+def _run_entry(server):
+    from robot_runtime.pose_backend import Plan, Report, Trajectory
+
+    plan = Plan(Trajectory([0.0, 1.0], [np.zeros(14), np.full(14, 0.1)]), True, [], Report(True))
+    goal = SimpleNamespace(
+        request=ExecuteArmPose.Goal(gateway_task_id="mock_task", timeout_sec=90.0), is_cancel_requested=False
+    )
+    return server._run_trajectory(goal, plan)
+
+
+def test_entry_is_checked_from_the_measured_start_with_only_the_drift_radius():
+    from pose_composer.node import FIXED_ENTRY_DRIFT_RAD
+
+    start = np.zeros(14)
+    start[0] = 0.0012  # inside the 0.005 plan-start admission
+    server, calls, dispatched = _entry_server(start)
+    ok, code, _ = _run_entry(server)
+    assert code == "POSE_RUNTIME_REJECTED" and len(dispatched) == 1  # reached the runtime
+    entries = [c for c in calls if c[2] is not None]  # full-path checks pass no start tolerance
+    assert {part for part, _, _ in entries} == {"hand", "body"}
+    for _part, rows, tolerance in entries:
+        np.testing.assert_allclose(rows[0], start)  # measured start, not the plan start
+        np.testing.assert_allclose(rows[1], np.full(14, 0.1))
+        assert tolerance == FIXED_ENTRY_DRIFT_RAD == 0.002
+    report = server._execution_gate.report["entry_start"]
+    assert report["reference"] == "measured" and report["plan_start_drift_rad"] == pytest.approx(0.0012)
+    assert report["dispatch_drift_rad"] == 0.0
+
+
+@pytest.mark.parametrize("jitter,validations", [(0.000916, 1), (0.001221, 1), (0.002, 1), (0.00201, 2)])
+def test_jitter_within_the_checked_radius_needs_no_second_validation(jitter, validations):
+    """Feedback steps of ~0.000305 rad; 0.001 refused 3-4 steps of jitter on X2."""
+    start = np.zeros(14)
+    start[0] = 0.0012
+    seen = []
+
+    def jitter_during_check(server):
+        seen.append(True)
+        if len(seen) == 1:
+            server._positions[LEFT_ARM[0]] = 0.0012 + jitter
+
+    server, calls, dispatched = _entry_server(start, during_check=jitter_during_check)
+    ok, code, _ = _run_entry(server)
+    assert dispatched and _entry_validations(calls) == validations
+    assert server._execution_gate.report["entry_start"]["validations"] == validations
+
+
+def test_plan_start_admission_still_bounds_the_measured_start():
+    start = np.zeros(14)
+    start[0] = 0.0051
+    server, calls, dispatched = _entry_server(start)
+    ok, code, message = _run_entry(server)
+    assert code == "POSE_START_CHANGED" and "before validation" in message
+    assert not calls and not dispatched  # refused before any geometry work
+
+
+def test_drift_toward_the_plan_start_limit_after_validation_still_refuses():
+    start = np.zeros(14)
+    start[0] = 0.0045
+
+    def drift(server):
+        server._positions[LEFT_ARM[0]] = 0.0052  # inside the drift radius, outside the plan-start bound
+
+    server, _calls, dispatched = _entry_server(start, during_check=drift)
+    ok, code, message = _run_entry(server)
+    assert code == "POSE_START_CHANGED" and "plan start" in message and not dispatched
+
+
+def _entry_validations(calls):
+    return sum(1 for part, _rows, tolerance in calls if part == "hand" and tolerance is not None)
+
+
+def test_an_arm_still_settling_is_checked_again_from_its_new_start():
+    """11-12 on X2: left wrist roll moved 0.002136 rad right after arriving at arms_rest."""
+    start = np.zeros(14)
+    start[6] = 0.0012
+    seen = []
+
+    def settle(server):
+        seen.append(True)
+        if len(seen) == 1:
+            server._positions[LEFT_ARM[6]] = 0.0012 + 0.002136
+
+    server, calls, dispatched = _entry_server(start, during_check=settle)
+    ok, code, _ = _run_entry(server)
+    assert code == "POSE_RUNTIME_REJECTED" and len(dispatched) == 1
+    assert _entry_validations(calls) == 2
+    recheck = [rows for part, rows, tolerance in calls if part == "hand" and tolerance is not None][1]
+    assert recheck[0][6] == pytest.approx(0.0012 + 0.002136)  # rechecked from where the arm is
+    report = server._execution_gate.report["entry_start"]
+    assert report["validations"] == 2 and len(report["rechecks"]) == 1
+    assert report["dispatch_drift_rad"] == 0.0
+
+
+def test_an_arm_that_keeps_moving_is_refused_after_bounded_validations():
+    from pose_composer.node import FIXED_ENTRY_VALIDATIONS
+
+    start = np.zeros(14)
+    start[6] = -0.0045
+
+    def creep(server):
+        server._positions[LEFT_ARM[6]] += 0.0021
+
+    server, calls, dispatched = _entry_server(start, during_check=creep)
+    ok, code, message = _run_entry(server)
+    assert code == "POSE_START_CHANGED" and f"after {FIXED_ENTRY_VALIDATIONS} entry validations" in message
+    assert _entry_validations(calls) == FIXED_ENTRY_VALIDATIONS == 3 and not dispatched
+
+
+def test_a_recheck_that_finds_a_collision_refuses_before_sending():
+    start = np.zeros(14)
+    seen = []
+
+    def settle(server):
+        seen.append(True)
+        if len(seen) == 1:
+            server._positions[LEFT_ARM[6]] = 0.0025
+
+    server, calls, dispatched = _entry_server(start, during_check=settle, collide_on=2)
+    ok, code, _ = _run_entry(server)
+    assert code == "HAND_SWEEP_COLLISION" and not dispatched
+
+
+def test_recheck_requires_a_successful_check_of_the_same_trajectory():
+    from aimdk_grasp.path_validation import ValidationGate
+
+    from robot_runtime.pose_backend import Plan, Report, Trajectory
+
+    gate = ValidationGate(SimpleNamespace(ARM_JOINTS=LEFT_ARM + RIGHT_ARM), {"hand": "online", "body": "online"})
+    plan = Plan(Trajectory([0.0, 1.0], [np.zeros(14), np.full(14, 0.1)]), True, [], Report(True))
+    with pytest.raises(RestoreError, match="no successful check") as error:
+        gate.recheck_entry(None, None, plan, np.zeros(14), 0.002)
+    assert error.value.code == "POSE_START_UNVALIDATED"
+
+
 def test_fixed_runtime_imports_when_mujoco_is_forbidden():
     code = """
 import sys
@@ -503,7 +686,7 @@ def test_range_failure_cancels_once_and_unknown_stop_blocks_next_request(monkeyp
     server._joint_received = dict.fromkeys(LEFT_ARM + RIGHT_ARM, clock.now)
     server._hand_config = {"enabled": True}
     baseline = SimpleNamespace(feedback=None)
-    server._execution_gate = SimpleNamespace(report={"stages": {}}, monitor=None, check=lambda *_: baseline)
+    server._execution_gate = SimpleNamespace(report={"stages": {}}, monitor=None, check=lambda *_, **__: baseline)
 
     def guard(*_):
         if sent:

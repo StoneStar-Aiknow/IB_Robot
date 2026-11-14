@@ -46,6 +46,17 @@ from pose_composer.memory import PoseMemory
 
 POINT_RATE_HZ = 25.0
 FIXED_START_TOLERANCE_RAD = START_TOLERANCE_RAD
+#: How far the arm may move between the measured entry the geometry checked and
+#: the dispatch sample. The entry is checked from the measured start, so this
+#: radius covers only drift during validation (feedback steps are ~0.000305 rad;
+#: 0.001 refused routine 3-4 step jitter on X2, 2026-11-12). It is also the
+#: entry box in the geometry check: raising it widens every entry bound.
+FIXED_ENTRY_DRIFT_RAD = 0.002
+#: Entry validations per dispatch: the first plus rechecks from a newer measured
+#: start when the arm drifted past FIXED_ENTRY_DRIFT_RAD meanwhile (an arm that
+#: has just arrived still settles: 0.002136 rad at the left wrist roll right after
+#: arms_rest, 2026-11-12). Each recheck redoes only the entry segment (~0.3 s).
+FIXED_ENTRY_VALIDATIONS = 3
 
 _trace = create_trace_logger("ib_trace.pose_composer")
 
@@ -607,6 +618,32 @@ class PoseComposerNode(Node):
             raise ComposeError("POSE_RUNTIME_UNAVAILABLE", "runtime is not active or has a latched stop")
         return str(status.active_mode)
 
+    def _fresh_arm_vector(self, joints):
+        """The latest arm sample in ``joints`` order, or None unless every joint is finite and at most 0.5 s old."""
+        with self._joint_lock:
+            now = time.monotonic()
+            if any(
+                n not in self._positions
+                or not math.isfinite(self._positions[n])
+                or not 0 <= now - self._joint_received.get(n, float("-inf")) <= 0.5
+                for n in joints
+            ):
+                return None
+            return np.array([self._positions[n] for n in joints], dtype=float)
+
+    @staticmethod
+    def _start_drift_refusal(joints, current, reference, tolerance, label, phase):
+        delta = np.abs(np.asarray(current, dtype=float) - np.asarray(reference, dtype=float))
+        worst = int(np.argmax(delta))
+        if delta[worst] <= tolerance:
+            return None
+        return (
+            False,
+            "POSE_START_CHANGED",
+            f"{phase}: {joints[worst]} is {delta[worst]:.6f} rad from the {label} "
+            f"(limit {tolerance:.6f} rad); no motion sent",
+        )
+
     def _run_trajectory(
         self, goal_handle, plan, *, deadline=None, commands=None, verify_completion=True
     ) -> tuple[bool, str, str]:
@@ -646,6 +683,18 @@ class PoseComposerNode(Node):
             return False, "HAND_CAPABILITY_MISSING", "fixed candidates require measured body and hand checks"
         hand_guard = None
         gate = None
+        entry_start = None
+        if getattr(backend_for(self), "library", None) is not None and getattr(self, "_hand_config", None):
+            # The entry is validated from where the arm is, not from the plan start.
+            joints = backend_for(self).ARM_JOINTS
+            entry_start = self._fresh_arm_vector(joints)
+            if entry_start is None:
+                return False, "TASK_POSE_STALE_STATE", "fresh finite arm state required before entry validation"
+            refusal = self._start_drift_refusal(
+                joints, entry_start, positions[0], FIXED_START_TOLERANCE_RAD, "plan start", "before validation"
+            )
+            if refusal:
+                return refusal
         if getattr(self, "_hand_config", None):
             from aimdk_grasp.hand_restore import RestoreContext, RestoreError
 
@@ -664,7 +713,14 @@ class PoseComposerNode(Node):
                         backend_for(self), getattr(self, "_validation_policy", None)
                     )
                     self._path_report = gate.report
-                    baseline = gate.check(restorer, context, plan, FIXED_START_TOLERANCE_RAD)
+                    baseline = gate.check(
+                        restorer,
+                        context,
+                        plan,
+                        FIXED_START_TOLERANCE_RAD,
+                        entry_start=entry_start,
+                        entry_tolerance_rad=FIXED_ENTRY_DRIFT_RAD,
+                    )
                 else:
                     restorer.ports.prepare(context)
                     baseline = restorer.check_arm_path(context, backend_for(self).model.ARM_JOINTS, positions)
@@ -706,18 +762,51 @@ class PoseComposerNode(Node):
             return refusal
         if getattr(backend_for(self), "library", None) is not None:
             joints = backend_for(self).ARM_JOINTS
-            with self._joint_lock:
-                now = time.monotonic()
-                if any(
-                    n not in self._positions
-                    or not math.isfinite(self._positions[n])
-                    or not 0 <= now - self._joint_received.get(n, float("-inf")) <= 0.5
-                    for n in joints
-                ):
+            current = self._fresh_arm_vector(joints)
+            if current is None:
+                return False, "TASK_POSE_STALE_STATE", "fresh finite arm state required before dispatch"
+            refusal = self._start_drift_refusal(
+                joints, current, positions[0], FIXED_START_TOLERANCE_RAD, "plan start", "at dispatch"
+            )
+            if refusal:
+                return refusal
+            validations = 1
+            while entry_start is not None:
+                refusal = self._start_drift_refusal(
+                    joints, current, entry_start, FIXED_ENTRY_DRIFT_RAD, "validated measured start", "at dispatch"
+                )
+                if gate is not None:
+                    delta = np.abs(current - entry_start)
+                    gate.report.setdefault("entry_start", {}).update(
+                        dispatch_positions_rad=current.tolist(),
+                        dispatch_drift_rad=float(np.max(delta)),
+                        dispatch_worst_joint=joints[int(np.argmax(delta))],
+                        validations=validations,
+                    )
+                if not refusal:
+                    break
+                if validations >= FIXED_ENTRY_VALIDATIONS:
+                    return refusal[0], refusal[1], f"{refusal[2]} after {validations} entry validations"
+                stop = named_refusal()
+                if stop:
+                    return stop
+                # Still settling: check the entry again from where the arm is now.
+                entry_start = current
+                try:
+                    gate.recheck_entry(restorer, context, plan, entry_start, FIXED_ENTRY_DRIFT_RAD)
+                except RestoreError as exc:
+                    return False, exc.code, str(exc)
+                except (ValueError, RuntimeError) as exc:
+                    return False, "UNSAFE_POSE", str(exc)
+                validations += 1
+                current = self._fresh_arm_vector(joints)
+                if current is None:
                     return False, "TASK_POSE_STALE_STATE", "fresh finite arm state required before dispatch"
-                current = {n: self._positions[n] for n in joints}
-            if any(abs(current[n] - positions[0][i]) > FIXED_START_TOLERANCE_RAD for i, n in enumerate(joints)):
-                return False, "POSE_START_CHANGED", "arms moved while the fixed path was being checked; no motion sent"
+                refusal = self._start_drift_refusal(
+                    joints, current, positions[0], FIXED_START_TOLERANCE_RAD, "plan start", "at dispatch"
+                )
+                if refusal:
+                    return refusal
         if hand_guard is not None:
             try:
                 hand_guard()

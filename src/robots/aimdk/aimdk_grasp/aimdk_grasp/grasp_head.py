@@ -76,6 +76,10 @@ REFRESH_PERIOD_S = 5.0
 REFRESH_IDLE_S = 10.0
 #: Locked joints (rad) between two checks one period apart that count as still.
 REFRESH_STILL_RAD = 0.01
+#: An entry joint this close to its target means the arms are at the pick entry
+#: pose: build on the measured state there (_planning_feedback). The task-pose
+#: arrival tolerance; arrivals measured 0.012-0.030 rad (2026-11-10/12).
+ENTRY_POSE_NEAR_RAD = 0.1
 
 
 @dataclass
@@ -204,7 +208,10 @@ class X2GraspHeadNode(Node):
     # -- warmup -------------------------------------------------------------------
 
     def _prepare(self) -> None:
-        """Warm cuRobo on a fresh image with the hand open; captures are refused until it succeeds."""
+        """Warm cuRobo on a fresh image; captures are refused until it succeeds.
+
+        The hands need to be open only for a build on the measured hands (_check_planning_hands).
+        """
         head = self._head
         while not self._closing.is_set():
             try:
@@ -212,10 +219,7 @@ class X2GraspHeadNode(Node):
                     deadline=time.monotonic() + WARMUP_BUDGET_S, cancelled=self._closing.is_set
                 )
                 admitted = observation.robot_state
-                if hasattr(head, "check_hands"):
-                    head.check_hands(admitted)  # both arms' hands
-                else:
-                    check_initial_hand(self._robot.hand, admitted)
+                self._check_planning_hands(head, admitted)
                 prepared = self._prepare_scene(observation)
                 with head.gpu:
                     estimate = self._complete_scene(prepared, None, observation)
@@ -233,25 +237,67 @@ class X2GraspHeadNode(Node):
             return
 
     def _planning_feedback(self, feedback):
-        """``feedback`` with the arms and hands at the pick entry pose's targets (unchanged without one).
+        """The state to build the planners on (see :meth:`_planning_state`)."""
+        return self._planning_state(feedback)[0]
+
+    def _planning_state(self, feedback):
+        """The state to build the planners on, and whether it carries the measured hands.
 
         The planners lock the other arm, the head and the planning hand at the
         pose they are built on, and a pick starts at the entry pose: built
         there, the first pick after the move does not rebuild inside its
         request (~50 s on the Orin, the first attempt then runs out of time).
-        Targets, not a measured pose: units differ by a few millimetres there
-        (LOCKED_SPHERE_SHIFT_M covers it). Hands not installed stay absent.
+
+        Arms: while they are elsewhere, that pose is anticipated from its
+        targets. Once every entry joint is within ENTRY_POSE_NEAR_RAD of its
+        target, the arms are there and the measured state is what the next
+        request plans from: a request always compares the measured state, so
+        building on targets the arm settles off by more than
+        LOCKED_SPHERE_SHIFT_M rebuilds every pick and then again between picks
+        (other_arm 10.0-12.7 mm on X2, 2026-11-12: four picks, eight ~40 s
+        rebuilds, each first attempt PLAN_TIMEOUT).
+
+        Hands: a pick starts with them open (checked per request), so a hand
+        that is not open now -- a fist at boot, a hand left half closed -- is
+        built on the entry pose's preset, as the arms are; an open one is used
+        as measured. Only a build on measured hands needs them open: a start
+        with closed hands still warms up (X2 2026-11-13, left hand 1.57 rad
+        from open kept the head "warming up"). Hands not installed stay absent.
         """
         entry = getattr(self, "_pick_entry", None)
         if not entry:
-            return feedback
+            return feedback, True
+        try:
+            arrived = all(
+                abs(float(feedback.positions[name]) - float(target)) <= ENTRY_POSE_NEAR_RAD
+                for name, target in entry["joint_positions"].items()
+            )
+        except (KeyError, TypeError, ValueError):
+            arrived = False
         from .backend import robot_for_side
+        from .hand import is_open
 
-        hands = {}
+        hands, measured_hands = {}, True
         for side, preset in (entry.get("hands") or {}).items():
-            if getattr(feedback, f"{side}_hand", None) is not None:
-                hands[f"{side}_hand"] = robot_for_side(self._robot, side).hand.preset(preset)
-        return replace(feedback, positions={**feedback.positions, **entry["joint_positions"]}, **hands)
+            measured = getattr(feedback, f"{side}_hand", None)
+            if measured is None:
+                continue
+            target = robot_for_side(self._robot, side).hand.preset(preset)
+            if arrived and preset == "open" and is_open(measured, target):
+                continue  # at the entry pose and open: as measured
+            hands[f"{side}_hand"], measured_hands = target, False
+        if arrived:
+            return (replace(feedback, **hands) if hands else feedback), measured_hands
+        return replace(feedback, positions={**feedback.positions, **entry["joint_positions"]}, **hands), not hands
+
+    def _check_planning_hands(self, head, admitted) -> None:
+        """Require open measured hands only when the planners are built on them (_planning_state)."""
+        if not self._planning_state(admitted.live.feedback)[1]:
+            return
+        if hasattr(head, "check_hands"):
+            head.check_hands(admitted)  # both arms' hands
+        else:
+            check_initial_hand(self._robot.hand, admitted)
 
     def _prepare_planners(self, head, feedback, estimate) -> None:
         """Build the planners for the pick entry pose; for the measured pose if that build fails."""
@@ -302,10 +348,7 @@ class X2GraspHeadNode(Node):
             began, captured = time.monotonic(), True
             observation = head.camera.capture(deadline=began + WARMUP_BUDGET_S, cancelled=self._closing.is_set)
             admitted = observation.robot_state
-            if hasattr(head, "check_hands"):
-                head.check_hands(admitted)
-            else:
-                check_initial_hand(self._robot.hand, admitted)
+            self._check_planning_hands(head, admitted)
             prepared = self._prepare_scene(observation)
             with head.gpu:
                 estimate = self._complete_scene(prepared, None, observation)

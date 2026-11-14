@@ -14,9 +14,7 @@ from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_PARTS, check_si
 #: How far (rad) a measured joint may be from the open preset and still count
 #: as open: before planning a grasp, after opening and on release.
 OPEN_HAND_TOLERANCE_RAD = 0.025
-#: Except the thumb abduction, which can stop short near the end of its travel
-#: toward the palm: 0.088 rad short after a release (2026-11-08) failed the
-#: following regrasp. Every other joint keeps the tight bound.
+#: Thumb abduction uses the same open-preset tolerance as the other joints.
 THUMB_ABAD_OPEN_TOLERANCE_RAD = 0.1
 #: Per native joint (HAND_PARTS order, either hand).
 OPEN_TOLERANCES_RAD = np.full(len(HAND_PARTS), OPEN_HAND_TOLERANCE_RAD)

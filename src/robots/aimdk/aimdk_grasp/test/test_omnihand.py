@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from aimdk_grasp.dual_arm import AutomaticPreshape
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.joints import HAND_SIGNS, LEFT_HAND
 from aimdk_grasp.omnihand import (
@@ -501,6 +502,68 @@ def test_grasp_and_release_preserve_the_other_open_hand(mapping, right_mapping, 
     other.require_open(io.other)
     active.require_open(io.measured)
     assert io.released == 1
+
+
+def test_automatic_preshape_opens_both_real_effectors_on_one_simulated_channel(mapping, right_mapping):
+    state = SimpleNamespace(
+        t=10.0,
+        measured=np.concatenate([RELEASE, np.asarray(RELEASE) * HAND_SIGNS]),
+        command=None,
+        owner=None,
+        published=[],
+    )
+
+    class HandView:
+        channel_joints = SimHand.channel_joints
+        touch_configured = False
+
+        def __init__(self, side):
+            self.side = side
+
+        def feedback(self):
+            return JointSample(state.t, dict(zip(self.channel_joints, state.measured, strict=True)))
+
+        def publish(self, positions):
+            assert state.owner in (None, self.side), "two publishers own the full hand channel"
+            state.owner = self.side
+            state.command = np.asarray(positions)
+            state.published.append((self.side, state.command.copy()))
+
+        def release(self):
+            assert state.owner in (None, self.side)
+            state.owner = None
+
+        def refusal(self):
+            return None
+
+        def monotonic(self):
+            return state.t
+
+        def wait(self, seconds):
+            state.t += seconds
+            state.measured += (state.command - state.measured) * min(1.0, seconds / 0.02)
+
+    pairs = {
+        side: (SimpleNamespace(supervise=lambda: lambda: ""), OmniHandEffector(HandView(side), hand_mapping))
+        for side, hand_mapping in (("left", mapping), ("right", right_mapping))
+    }
+    prepare = AutomaticPreshape(pairs, [])
+    # A retry must discard the previous preservation baseline and use fresh feedback.
+    for _ in range(2):
+        state.measured = np.concatenate([RELEASE, np.asarray(RELEASE) * HAND_SIGNS])
+        state.published.clear()
+        result = prepare(cancelled=lambda: False)
+        assert result.succeeded, result.reason
+        assert state.owner is None
+        mapping.require_open(state.measured[:10])
+        right_mapping.require_open(state.measured[10:])
+        sides = [side for side, _ in state.published]
+        assert set(sides) == {"left", "right"}
+        boundary = sides.index("right")
+        assert sides[:boundary] == ["left"] * boundary and set(sides[boundary:]) == {"right"}
+        preserved = state.published[boundary][1][:10]
+        for _, command in state.published[boundary:]:
+            np.testing.assert_array_equal(command[:10], preserved)
 
 
 @pytest.mark.parametrize("side", ["left", "right"])

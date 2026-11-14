@@ -518,6 +518,99 @@ def test_planners_are_built_for_the_pick_entry_pose_not_where_the_arms_rest(monk
     assert node._planning_feedback(measured) is measured
 
 
+def test_planners_are_built_on_the_measured_state_once_the_arms_are_at_the_entry_pose(monkeypatch):
+    """2026-11-12 on X2: the other arm settled 10.0-12.7 mm off its targets; built on targets,
+    every pick rebuilt inside its request and the idle refresh rebuilt back again."""
+    from aimdk_grasp.feedback import Feedback
+
+    node, _ = entry_head(monkeypatch, ENTRY)
+    opened = np.full(10, 0.1)  # entry_head's left open preset
+    arrived = Feedback(1.0, {"right_shoulder_pitch_joint": -0.0554 + 0.0296, "left_elbow_joint": -1.45 - 0.012}, opened)
+    assert node._planning_feedback(arrived) is arrived
+    near = grasp_head.ENTRY_POSE_NEAR_RAD
+    edge = Feedback(1.0, {"right_shoulder_pitch_joint": -0.0554 + near, "left_elbow_joint": -1.45}, opened)
+    assert node._planning_feedback(edge) is edge
+    beyond = Feedback(1.0, {"right_shoulder_pitch_joint": -0.0554 + near + 0.001, "left_elbow_joint": -1.45}, opened)
+    assert node._planning_feedback(beyond).positions["right_shoulder_pitch_joint"] == -0.0554
+    missing = Feedback(1.0, {"left_elbow_joint": -1.45}, opened)
+    assert node._planning_feedback(missing).positions["right_shoulder_pitch_joint"] == -0.0554
+
+
+def test_the_idle_refresh_does_not_undo_a_build_on_the_arrived_arms(monkeypatch):
+    """The refresh compares the same state a request does once the arms are at the entry pose."""
+    import threading
+    import time
+
+    from aimdk_grasp.feedback import Feedback
+
+    node, _ = entry_head(monkeypatch, ENTRY)
+    arrived = Feedback(
+        1.0, {"right_shoulder_pitch_joint": -0.0554 + 0.0296, "left_elbow_joint": -1.45}, np.full(10, 0.1)
+    )
+    built = {"positions": dict(arrived.positions)}  # what the last request built on
+    asked = []
+
+    def needs_rebuild(feedback):
+        asked.append(feedback)
+        return feedback.positions != built["positions"]
+
+    camera = SimpleNamespace(capture_state=lambda deadline: SimpleNamespace(feedback=arrived))
+    node._head = SimpleNamespace(
+        camera=camera, service=SimpleNamespace(needs_rebuild=needs_rebuild), watch=None, imu=None
+    )
+    node._activity_lock, node._refresh_gate = threading.Lock(), threading.Lock()
+    node._active_calls, node._last_activity = 0, time.monotonic() - grasp_head.REFRESH_IDLE_S - 1
+    assert node._refresh_once(node._head, None) is None
+    assert asked == [arrived]  # no rebuild requested: nothing to capture or build
+
+
+def test_the_rebuild_limit_stays_well_inside_the_optimizer_activation_distance():
+    """The fine check does not absorb a stale locked group; only the optimizer's activation tends to."""
+    from aimdk_grasp.planner import LOCKED_SPHERE_SHIFT_M, LeftArmPlanner
+
+    assert LOCKED_SPHERE_SHIFT_M == 0.015
+    assert LeftArmPlanner._optimizer_activation_m - LOCKED_SPHERE_SHIFT_M >= 0.005
+
+
+def test_a_closed_hand_is_built_on_its_preset_and_does_not_block_the_warmup(monkeypatch):
+    """X2 2026-11-13: the left hand 1.57 rad from open kept the head "warming up" forever."""
+    from aimdk_grasp.feedback import Feedback
+
+    node, _ = entry_head(monkeypatch, ENTRY)
+    fist = np.zeros(10)
+    fist[4] = 1.5692  # one finger curled to its limit
+    at_entry = {"right_shoulder_pitch_joint": -0.0554 + 0.02, "left_elbow_joint": -1.45}
+    for positions in (at_entry, {"right_shoulder_pitch_joint": 0.36, "left_elbow_joint": -1.16}):
+        planning, measured_hands = node._planning_state(Feedback(1.0, positions, fist))
+        np.testing.assert_allclose(planning.left_hand, 0.1)  # the entry pose's open preset
+        assert measured_hands is False
+    # At the entry pose the arms stay measured; only the hand comes from the preset.
+    planning, _ = node._planning_state(Feedback(1.0, at_entry, fist))
+    assert planning.positions == at_entry
+    # An open hand at the entry pose: everything as measured, and it must be checked.
+    opened = Feedback(1.0, at_entry, np.full(10, 0.1))
+    assert node._planning_state(opened) == (opened, True)
+
+    checked = []
+    head = SimpleNamespace(check_hands=lambda admitted: checked.append(admitted))
+    for feedback, expected in ((Feedback(1.0, at_entry, fist), 0), (opened, 1)):
+        node._check_planning_hands(head, SimpleNamespace(live=SimpleNamespace(feedback=feedback)))
+        assert len(checked) == expected
+
+
+def test_without_an_entry_pose_the_measured_hands_are_always_checked(monkeypatch):
+    from aimdk_grasp.feedback import Feedback
+
+    node, _ = entry_head(monkeypatch, None)
+    fist = Feedback(1.0, {"left_elbow_joint": -1.16}, np.full(10, 1.5))
+    assert node._planning_state(fist) == (fist, True)
+    checked = []
+    node._check_planning_hands(
+        SimpleNamespace(check_hands=checked.append), SimpleNamespace(live=SimpleNamespace(feedback=fist))
+    )
+    assert len(checked) == 1
+
+
 def test_a_failed_entry_pose_build_falls_back_to_the_measured_pose(monkeypatch):
     from aimdk_grasp.feedback import Feedback
 

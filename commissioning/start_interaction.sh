@@ -70,6 +70,8 @@ PY
     [[ -n "$X2_PLANNER_API_KEY" ]] || { echo "Planner credential is empty" >&2; exit 1; }
 fi
 mkdir -p "$STATE"
+exec 9>"$STATE/lifecycle.lock"
+flock -x 9
 if [[ -f "$STATE/$NAME.pgid" ]]; then
     GROUP=$(cat "$STATE/$NAME.pgid")
     [[ "$GROUP" =~ ^[0-9]+$ && "$GROUP" -gt 1 ]] || { echo "Invalid process group: $GROUP" >&2; exit 1; }
@@ -80,15 +82,19 @@ if [[ -f "$STATE/$NAME.pgid" ]] && pgrep -g "$(cat "$STATE/$NAME.pgid")" >/dev/n
     [[ "$OWNER" == *"$LAUNCH"* && "$OWNER" == *"config_path:=$CONFIG"* ]] || { echo "PID ownership mismatch: $GROUP" >&2; exit 1; }
     echo "$NAME already running: pgid $GROUP"
 else
+    if ! python3 "$INTERACTION_ROOT/commissioning/interaction_processes.py" check --root "$INTERACTION_ROOT" --launch "${LAUNCH##* }"; then
+        echo "Checkout-owned nodes remain; run stop_prepared_pipeline.sh before starting" >&2
+        exit 1
+    fi
     LOG="$STATE/${NAME}_$(date +%Y%m%d_%H%M%S).log"
     if [[ "$ROLE" == head ]]; then
-        setsid ros2 launch aimdk_grasp x2_grasp_head.launch.py \
+        IBROBOT_INTERACTION_OWNER="$INTERACTION_ROOT" setsid ros2 launch aimdk_grasp x2_grasp_head.launch.py \
             config_path:="$CONFIG" control_mode:=model_inference runtime_timeout:=60 \
-            >"$LOG" 2>&1 </dev/null &
+            >"$LOG" 2>&1 </dev/null 9>&- &
     else
-        setsid ros2 launch embodied_bringup embodied_pipeline.launch.py \
+        IBROBOT_INTERACTION_OWNER="$INTERACTION_ROOT" setsid ros2 launch embodied_bringup embodied_pipeline.launch.py \
             config_path:="$CONFIG" control_mode:=model_inference with_moveit:=false \
-            use_sim:=false authorize_motion:=true >"$LOG" 2>&1 </dev/null &
+            use_sim:=false authorize_motion:=true >"$LOG" 2>&1 </dev/null 9>&- &
     fi
     echo $! > "$STATE/$NAME.pgid"
     ln -sfn "$LOG" "$STATE/${NAME}_latest.log"

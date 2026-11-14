@@ -10,6 +10,16 @@ message libraries.
 
 The migration is incremental; this README records what has landed.
 
+When `pipeline.prefetch_preshape` is enabled, automatic-arm picks open both
+hands while planning through a selection-independent `GraspBackends.preshape`
+callback. Dedicated preparation effectors open left then right, release each
+publisher before starting the next, and supervise both arms and the head.
+This serial hand-channel handover avoids competing full-channel commands and
+lets planning choose either arm independently. The pipeline waits for preparation
+before execution and reuses a successful result for the first PRESHAPE step.
+A failed preparation falls back to that step on the selected arm. Per-hand
+outcomes are recorded in `preshape_prefetch`; no arm trajectory is sent by preparation.
+
 ## Rejected placement paths and recovery evidence
 
 When `plan_pose` rejects an interpolated candidate, its exception includes the

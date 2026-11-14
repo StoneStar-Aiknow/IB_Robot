@@ -9,6 +9,7 @@ from aimdk_grasp.dual_arm import (
     ArmWatch,
     AutomaticHead,
     AutomaticPlanner,
+    AutomaticPreshape,
     ExecutionSelection,
     SelectedPart,
     SelectingPlanner,
@@ -20,14 +21,17 @@ from manipulation_execution.grasp_pipeline.contracts import (
     ArmSegment,
     Effect,
     EffectorAction,
+    EffectorOutcome,
     GraspBackends,
     GraspFailure,
     GraspPlan,
+    MotionOutcome,
+    MotionState,
     Move,
     Proposals,
     SegmentKind,
 )
-from manipulation_execution.grasp_pipeline.pipeline import GraspPipeline, PickMode
+from manipulation_execution.grasp_pipeline.pipeline import GraspPipeline, PickMode, PipelineConfig
 
 
 @pytest.mark.parametrize(
@@ -227,6 +231,136 @@ def test_executor_and_hand_follow_each_accepted_plan_and_refuse_mismatched_joint
     with pytest.raises(GraspFailure, match="trajectory joints disagree"):
         selection.accept(wrong)
     assert selection.side == "left"
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+@pytest.mark.parametrize("planning_fails", [False, True])
+def test_both_hands_preshape_while_planning_without_selecting_an_arm(side, planning_fails):
+    import threading
+    from dataclasses import replace
+
+    selection = ExecutionSelection()
+    # A later goal/retry can choose a different side from the previous goal.
+    selection.side = "left"
+    opening = threading.Event()
+    planned = threading.Event()
+    active = []
+    calls = []
+
+    def execution_hand(which):
+        def act(action, **flags):
+            assert not active, "a preparation publisher was still running during execution"
+            assert selection.side == which
+            calls.append((which, action))
+            return EffectorOutcome(True, held=action is EffectorAction.CLOSE)
+
+        return SimpleNamespace(act=act, finish=lambda: calls.append((which, "execution_finish")))
+
+    hands = {which: execution_hand(which) for which in ("left", "right")}
+
+    def execute(segment, **flags):
+        assert not active
+        calls.append((selection.side, "move"))
+        return MotionOutcome(MotionState.SUCCEEDED, stopped_at=segment.end)
+
+    executor = SelectedPart(
+        {
+            which: SimpleNamespace(execute=execute, finish=lambda: None, measured=lambda names: np.zeros(7))
+            for which in hands
+        },
+        selection,
+    )
+    effector = SelectedPart(hands, selection)
+
+    def preparation_hand(which):
+        def act(action, *, halted, cancelled):
+            assert not active, "two full-hand publishers ran at the same time"
+            active.append(which)
+            assert action is EffectorAction.PRESHAPE and not halted() and not cancelled()
+            calls.append((which, "prepare"))
+            opening.set()
+            assert planned.wait(5.0), "planning did not run during preshape"
+            return EffectorOutcome(True)
+
+        def finish():
+            assert active == [which]
+            active.clear()
+
+        return SimpleNamespace(act=act, finish=finish)
+
+    pairs = {which: (SimpleNamespace(supervise=lambda: lambda: ""), preparation_hand(which)) for which in hands}
+    preshape = AutomaticPreshape(pairs, list(hands.values()))
+
+    def planning(*args, **budget):
+        assert opening.wait(5.0), "no hand opened before planning"
+        try:
+            if planning_fails:
+                raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "neither arm can reach")
+            chosen = plan(side)
+            return selection.accept(replace(chosen, steps=(Effect(EffectorAction.PRESHAPE), *chosen.steps)))
+        finally:
+            planned.set()
+
+    backends = GraspBackends(
+        SimpleNamespace(capture=lambda **budget: SimpleNamespace(report={})),
+        SimpleNamespace(propose=lambda *args, **budget: SimpleNamespace(report={})),
+        SimpleNamespace(plan=planning),
+        executor,
+        effector,
+        preshape=preshape,
+    )
+    outcome = GraspPipeline(
+        backends, config=PipelineConfig(prefetch_preshape=True, max_attempts=1), clock=lambda: 0
+    ).run("apple", mode=PickMode.EXECUTE, deadline=10.0, cancelled=lambda: False)
+    assert not active
+    assert [(which, name) for which, name in calls if name == "prepare"] == [("left", "prepare"), ("right", "prepare")]
+    assert not any(name is EffectorAction.PRESHAPE for _, name in calls)
+    if planning_fails:
+        assert outcome.error_code == "NO_EXECUTABLE_CANDIDATE"
+        assert not any(name == "move" or name is EffectorAction.CLOSE for _, name in calls)
+    else:
+        assert outcome.success and outcome.held
+        assert (side, "move") in calls and (side, EffectorAction.CLOSE) in calls
+        assert selection.side == side
+    (row,) = outcome.report["preshape_prefetch"]
+    assert row["succeeded"] and set(row["report"]) == {"left", "right"}
+
+
+@pytest.mark.parametrize("problem", ["cancelled", "supervision", "blocked", "exception"])
+def test_automatic_preshape_stops_and_releases_before_starting_another_hand(problem):
+    calls = []
+    interrupted = False
+
+    def act(action, *, halted, cancelled):
+        nonlocal interrupted
+        calls.append("left open")
+        interrupted = True
+        if problem == "exception":
+            raise RuntimeError("hand feedback unavailable")
+        if problem in ("cancelled", "supervision"):
+            assert cancelled()
+        return EffectorOutcome(False, "open failed")
+
+    pairs = {
+        "left": (
+            SimpleNamespace(supervise=lambda: lambda: "arm moved" if problem == "supervision" and interrupted else ""),
+            SimpleNamespace(act=act, finish=lambda: calls.append("left release")),
+        ),
+        "right": (
+            SimpleNamespace(supervise=lambda: lambda: ""),
+            SimpleNamespace(act=lambda *args, **flags: pytest.fail("right hand must not open")),
+        ),
+    }
+    prepare = AutomaticPreshape(pairs, [SimpleNamespace(finish=lambda: calls.append("old release"))])
+    if problem == "exception":
+        with pytest.raises(RuntimeError, match="feedback unavailable"):
+            prepare(cancelled=lambda: False)
+    else:
+        result = prepare(cancelled=lambda: problem == "cancelled" and interrupted)
+        assert not result.succeeded
+        if problem == "supervision":
+            assert result.reason == "arm moved"
+    assert calls == ["old release", "left open", "left release"]
 
 
 def test_both_arms_prepare_the_capture_scene_at_the_requested_pixel_stride(monkeypatch):

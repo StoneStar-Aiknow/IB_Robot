@@ -419,13 +419,23 @@ class GraspPipeline:
         and a hand that drags it or a controller that drops its target stops it.
         """
         effector = self._backends.effector
-        if not self._config.prefetch_preshape or getattr(effector, "act", None) is None:
+        if not self._config.prefetch_preshape:
             return None
-        supervise = getattr(self._backends.executor, "supervise", None)
         box: dict = {"began": time.monotonic()}
 
         def run() -> None:
             try:
+                if self._backends.preshape is not None:
+                    box["outcome"] = self._backends.preshape(cancelled=stop)
+                    return
+                # Optional capability lookup can itself fail: an automatic-arm
+                # proxy has no selected effector before planning. Keep that
+                # failure inside the speculative operation, so planning and
+                # the sequence's normal preshape can still run.
+                act = getattr(effector, "act", None)
+                if act is None:
+                    return
+                supervise = getattr(self._backends.executor, "supervise", None)
                 check = supervise() if supervise is not None else (lambda: "")
 
                 def stopped() -> bool:
@@ -436,7 +446,7 @@ class GraspPipeline:
                         box["fault"] = reason
                     return bool(reason)
 
-                box["outcome"] = effector.act(EffectorAction.PRESHAPE, halted=lambda: False, cancelled=stopped)
+                box["outcome"] = act(EffectorAction.PRESHAPE, halted=lambda: False, cancelled=stopped)
             except Exception as exc:  # noqa: BLE001 - the sequence runs the preshape itself
                 box["error"] = f"{type(exc).__name__}: {exc}"
             finally:
@@ -461,6 +471,8 @@ class GraspPipeline:
             row["fault"] = box["fault"]
         elif result is not None:
             row.update(succeeded=bool(result.succeeded), reason=result.reason)
+            if result.report:
+                row["report"] = dict(result.report)
         outcome.report.setdefault("preshape_prefetch", []).append(row)
         if result is None or box.get("fault") or "error" in box or not result.succeeded or result.halted:
             return None

@@ -32,12 +32,18 @@ from .trajectory import TimedTrajectory
 #: other arm's hand ~12 mm but a finger ~1 mm, and the OmniHand thumb comes to
 #: rest anywhere within ~0.05 rad of the open preset after every reopening
 #: (live 2026-11-06: hand=0.0319 rad rebuilt the planner inside a request, 39 s).
-#: 10 mm is half of the optimizer's 0.02 m collision activation distance. It was
-#: 5 mm until the head built its planners for the pick entry pose's targets
-#: (grasp_head._planning_feedback): measured at grasp_ready the other arm sat
-#: 0.012-0.020 rad (shoulder pitch) off its target, 3.9-7.0 mm of sphere motion
-#: (17 picks, new X2, 2026-11-10), and units differ.
-LOCKED_SPHERE_SHIFT_M = 0.010
+#: It is also how far the locked geometry (other arm, head, hand) may be from
+#: where it really is. Nothing absorbs that offset in the final check: the fine
+#: collision check runs at 0 activation against the locked groups as built.
+#: Only the optimizer's 0.02 m activation (_optimizer_activation_m) tends to
+#: keep trajectories that far from them, so this must stay well inside it.
+#: History: 5 mm; 10 mm once the head built its planners for the pick entry
+#: pose's targets (other arm 3.9-7.0 mm off, 17 picks, 2026-11-10); 15 mm after
+#: other_arm=10.0-12.7 mm rebuilt the planner twice per pick (2026-11-12),
+#: together with building on the measured state at the entry pose
+#: (grasp_head._planning_feedback), which removes that target offset itself.
+#: Every millimetre more is a millimetre the other arm may be off unchecked.
+LOCKED_SPHERE_SHIFT_M = 0.015
 #: How much of one refused place candidate's reason its report keeps.
 PLACE_FAILURE_CHARS = 700
 #: How far (rad) past a model joint bound a measured planning-arm start may be

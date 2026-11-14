@@ -420,14 +420,19 @@ def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: 
 
 
 def automatic_execution(node, robot, description, closers, planner):
-    from .dual_arm import ExecutionSelection, SelectedPart, SelectingPlanner
+    from .dual_arm import AutomaticPreshape, ExecutionSelection, SelectedPart, SelectingPlanner
 
     pairs = {side: arm_and_hand(node, robot_for_side(robot, side), description, closers) for side in ("left", "right")}
+    preparation = {
+        side: arm_and_hand(node, robot_for_side(robot, side), description, closers)
+        for side in installed_hands(robot.options)
+    }
     selection = ExecutionSelection()
     return (
         SelectingPlanner(planner, selection),
         SelectedPart({side: pair[0] for side, pair in pairs.items()}, selection),
         SelectedPart({side: pair[1] for side, pair in pairs.items()}, selection),
+        AutomaticPreshape(preparation, [pair[1] for pair in pairs.values()]),
     )
 
 
@@ -454,6 +459,7 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
             callback_group=ReentrantCallbackGroup(),
         )
         source, planner = head.camera, head.planner
+        preshape = None
         if options["arm_side"] == "auto":
 
             def local_scene(observation, mask, timeout_s, cancelled):
@@ -465,7 +471,7 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
                 return scenes
 
             proposer = X2Proposer(services, None, settings=robot.perception, remote_scene=local_scene)
-            planner, executor, effector = automatic_execution(node, robot, description, closers, planner)
+            planner, executor, effector, preshape = automatic_execution(node, robot, description, closers, planner)
         else:
             proposer = X2Proposer(services, head.spheres, settings=robot.perception, preload=head.service.preload)
             executor, effector = arm_and_hand(node, robot, description, closers)
@@ -521,6 +527,7 @@ def x2_grasp_backends(*, node, grasp_execution: Mapping[str, Any], description: 
         prepare=prepare,
         held_object=held,
         plan_home=X2PlacePlanner(head, robots).plan_home,
+        preshape=preshape,
     )
 
 

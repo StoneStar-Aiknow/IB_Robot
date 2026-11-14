@@ -5,7 +5,7 @@ from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from manipulation_execution.grasp_pipeline.contracts import GraspFailure, Move
+from manipulation_execution.grasp_pipeline.contracts import EffectorAction, EffectorOutcome, GraspFailure, Move
 
 from .joints import arm_joints, check_side
 
@@ -121,6 +121,52 @@ class SelectedPart:
             finish = getattr(self.parts[self.selection.side], "finish", None)
             if finish is not None:
                 finish()
+
+
+class AutomaticPreshape:
+    """Open candidate hands without selecting an execution arm.
+
+    Dedicated preparation effectors keep planner acceptance/cleanup independent
+    of an in-flight open. Each hand stream commands both hands, so finish one
+    publisher before starting the next; it preserves the other's measured pose.
+    The pipeline joins this operation before executing the accepted plan.
+    """
+
+    def __init__(self, pairs, execution_effectors):
+        self.pairs = pairs
+        self.execution_effectors = execution_effectors
+
+    def __call__(self, *, cancelled):
+        # A retry may still have the preceding attempt's hand keepalive. Retire
+        # it before the dedicated preparation stream publishes anything.
+        for effector in self.execution_effectors:
+            effector.finish()
+        checks = [executor.supervise() for executor, _ in self.pairs.values()]
+        fault = ""
+        reports = {}
+
+        def stopped():
+            nonlocal fault
+            if cancelled():
+                return True
+            for check in checks:
+                reason = check()
+                if reason:
+                    fault = reason
+                    return True
+            return False
+
+        for side, (_, effector) in self.pairs.items():
+            if stopped():
+                return EffectorOutcome(False, fault or "cancelled before preshape", report=reports)
+            try:
+                result = effector.act(EffectorAction.PRESHAPE, halted=lambda: False, cancelled=stopped)
+                reports[side] = dict(succeeded=result.succeeded, reason=result.reason, report=dict(result.report))
+            finally:
+                effector.finish()
+            if not result.succeeded or result.halted or stopped():
+                return EffectorOutcome(False, fault or result.reason or "preshape interrupted", report=reports)
+        return EffectorOutcome(True, report=reports)
 
 
 class ExecutionSelection:

@@ -477,6 +477,8 @@ class GraspBackends:
     container_detector: Callable | None = None
     #: Robot-owned interruption journal/recovery. Absent backends retain existing behavior.
     interrupted_pick: object | None = None
+    #: Selection-independent preparation; releases hand publishers before returning.
+    preshape: Callable[..., EffectorOutcome] | None = None
 
 
 @dataclass(frozen=True)

@@ -1025,3 +1025,46 @@ def test_a_planning_failure_waits_for_the_prefetched_preshape_and_does_not_move_
     assert effector.log == [EffectorAction.PRESHAPE] and names(executor) == []
     (row,) = outcome.report["preshape_prefetch"]
     assert row["succeeded"] is True
+
+
+@pytest.mark.parametrize("part_name", ["effector", "executor"])
+@pytest.mark.parametrize("planning_fails", [False, True])
+def test_unselected_execution_capabilities_do_not_prevent_planning(part_name, planning_fails):
+    import threading
+
+    backends, executor, effector, planner, _ = streaming()
+    looked_up = threading.Event()
+    selected = threading.Event()
+    delegate = getattr(backends, part_name)
+
+    class SelectionProxy:
+        def __getattr__(self, name):
+            if name == "finish":
+                return lambda: None
+            if not selected.is_set():
+                looked_up.set()
+                raise GraspFailure("INTERNAL_ERROR", "No arm has been selected by a grasp plan")
+            return getattr(delegate, name)
+
+    backends = replace(backends, **{part_name: SelectionProxy()})
+    original = planner.plan
+
+    def planning(*args, **kwargs):
+        assert looked_up.wait(5.0), "the speculative capability was not queried"
+        if planning_fails:
+            raise GraspFailure("NO_EXECUTABLE_CANDIDATE", "nothing reachable")
+        result = original(*args, **kwargs)
+        selected.set()
+        return result
+
+    planner.plan = planning
+    outcome = run(backends, config=PipelineConfig(prefetch_preshape=True, max_attempts=1))
+    (row,) = outcome.report["preshape_prefetch"]
+    assert "No arm has been selected" in row["error"]
+    assert outcome.success is not planning_fails
+    if planning_fails:
+        assert outcome.error_code == "NO_EXECUTABLE_CANDIDATE"
+        assert effector.log == [] and names(executor) == []
+    else:
+        assert effector.log == [EffectorAction.PRESHAPE, EffectorAction.CLOSE]
+        assert names(executor) == ["approach", "grasp", "lift", "hold"]

@@ -8,7 +8,7 @@ from aimdk_grasp.collision_spheres import merge_sphere_cover
 from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.hand import HandMapping
 from aimdk_grasp.joints import HEAD, LEFT_ARM, RIGHT_ARM
-from aimdk_grasp.planner import LeftArmPlanner, robot_config
+from aimdk_grasp.planner import LOCKED_SPHERE_SHIFT_M, LeftArmPlanner, robot_config
 from aimdk_grasp.planner_service import GraspPlanningService
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS
@@ -1310,11 +1310,16 @@ def test_a_thumb_resting_short_of_open_does_not_rebuild_the_planner():
     assert planner.locked_shift_m(_home_feedback(hand=hand), carrying=True)["hand"] == 0.0
 
 
-def test_the_other_arm_moving_the_same_angle_still_rebuilds_the_planner():
+def test_the_other_arm_is_judged_by_sphere_motion_not_by_angle():
+    """0.0296 rad shoulder pitch (X2 arrival, 2026-11-12) moves the other arm ~11 mm: kept.
+    The same joint 0.05 rad off (~18 mm) rebuilds, while the hand's fingers move ~1 mm per such angle."""
     planner = _locked_planner(_home_feedback())
-    moved = _home_feedback(right_shoulder_pitch_joint=0.4 + 0.0319)
-    shift = planner.locked_shift_m(moved)
-    assert shift["other_arm"] > 0.005 and shift["hand"] == 0.0
+    settled = _home_feedback(right_shoulder_pitch_joint=0.4 + 0.0296)
+    shift = planner.locked_shift_m(settled)
+    assert 0.010 < shift["other_arm"] < LOCKED_SPHERE_SHIFT_M and shift["hand"] == 0.0
+    assert planner.locked_joints_match(settled)
+    moved = _home_feedback(right_shoulder_pitch_joint=0.4 + 0.05)
+    assert planner.locked_shift_m(moved)["other_arm"] > LOCKED_SPHERE_SHIFT_M
     assert not planner.locked_joints_match(moved)
 
 

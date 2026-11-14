@@ -705,8 +705,9 @@ def x2_remote_grasp_backends(
         camera = RemoteHeadCamera(head)
         proposer = X2Proposer(services, None, settings=robot.perception, remote_scene=head.complete_scene)
         planner = RemotePlanner(head)
+        preshape = None
         if options["arm_side"] == "auto":
-            planner, executor, effector = automatic_execution(node, robot, description, closers, planner)
+            planner, executor, effector, preshape = automatic_execution(node, robot, description, closers, planner)
         else:
             executor, effector = arm_and_hand(node, robot, description, closers)
     except BaseException:
@@ -768,6 +769,7 @@ def x2_remote_grasp_backends(
         posture=posture,
         interrupted_pick=interrupted,
         container_detector=container_detector(services, grasp_execution, robot.perception),
+        preshape=preshape,
     )
 
 
