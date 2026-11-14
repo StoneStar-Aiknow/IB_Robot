@@ -611,6 +611,26 @@ def test_without_an_entry_pose_the_measured_hands_are_always_checked(monkeypatch
     assert len(checked) == 1
 
 
+def test_warmup_and_refresh_scenes_tolerate_a_table_out_of_view_but_requests_do_not(monkeypatch):
+    calls, logged = [], []
+    node = object.__new__(grasp_head.X2GraspHeadNode)
+    node.get_logger = lambda: SimpleNamespace(warning=lambda message, **_: logged.append(message))
+
+    def complete(prepared, mask, observation, *, placeholder_support=False):
+        options = {"placeholder_support": True} if placeholder_support else {}
+        calls.append(options)
+        return SimpleNamespace(diagnostics={"support_placeholder": placeholder_support})
+
+    node._head = SimpleNamespace(complete_scene=complete)
+    node._warmup_scene("prepared", "observation")
+    assert calls[-1] == {"placeholder_support": True} and "placeholder table" in logged[-1]
+    node._complete_scene("prepared", "mask", "observation")
+    assert calls[-1] == {}  # a request: the real table or a refusal
+    node._head = SimpleNamespace(complete_scene=lambda prepared, mask, observation: calls.append("legacy"))
+    node._warmup_scene("prepared", "observation")  # a head without the option is called as before
+    assert calls[-1] == "legacy"
+
+
 def test_a_failed_entry_pose_build_falls_back_to_the_measured_pose(monkeypatch):
     from aimdk_grasp.feedback import Feedback
 

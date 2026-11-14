@@ -928,7 +928,28 @@ def _reuse_support(hint, torso_from_camera, near_points, target_points, config):
     return SupportPlane(point, normal, inliers, heights), dict(report, accepted=True)
 
 
-def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation=True, support_hint=None):
+#: Where (torso frame, m) a warmup with no visible table puts its placeholder
+#: table (complete_scene(placeholder_support=True)): behind and below the robot,
+#: far outside both arms' reach. Only its slot matters: the planner reserves
+#: cuboid capacity from the warmup scene, and a warmup without a table would
+#: make the first pick's real table overflow it and rebuild (~40 s) in-request.
+PLACEHOLDER_TABLE_TORSO_M = (-1.5, 0.0, -1.5)
+PLACEHOLDER_TABLE_HALF_M = 0.05
+
+
+def _placeholder_support(torso_from_camera, up_camera):
+    """A 10 cm placeholder table at PLACEHOLDER_TABLE_TORSO_M, camera frame, for warmup only."""
+    rotation, translation = torso_from_camera[:3, :3], torso_from_camera[:3, 3]
+    centre = np.asarray(PLACEHOLDER_TABLE_TORSO_M, float)
+    half = PLACEHOLDER_TABLE_HALF_M
+    corners = centre + np.array([[-half, -half, 0], [-half, half, 0], [half, -half, 0], [half, half, 0]])
+    to_camera = lambda torso: (np.asarray(torso) - translation) @ rotation  # noqa: E731
+    return SupportPlane(to_camera(centre), up_camera, to_camera(corners), {})
+
+
+def complete_scene(
+    prepared: PreparedScene, target_mask=None, *, lazy_validation=True, support_hint=None, placeholder_support=False
+):
     """The mask-dependent half of estimate_scene; see prepare_scene.
 
     ``support_hint`` (a torso-frame SupportPlane from an earlier capture of the
@@ -991,8 +1012,15 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         plane_camera, support_reuse = _reuse_support(
             support_hint, torso_from_camera, points[near], points[target], config
         )
+    placeholder = False
     if plane_camera is None:
-        plane_camera = select_support_plane(points[near], points[target], up_camera, config)
+        try:
+            plane_camera = select_support_plane(points[near], points[target], up_camera, config)
+        except NoSupportError:
+            # Warmup only (no target): a pick always needs the real table.
+            if not placeholder_support or target_mask is not None:
+                raise
+            plane_camera, placeholder = _placeholder_support(torso_from_camera, up_camera), True
     support_fitted = time.perf_counter()
     rotation, translation = torso_from_camera[:3, :3], torso_from_camera[:3, 3]
     support = SupportPlane(
@@ -1038,6 +1066,7 @@ def complete_scene(prepared: PreparedScene, target_mask=None, *, lazy_validation
         meshes[name], mesh_counts[name] = mesh, counts
     finished = time.perf_counter()
     diagnostics = {
+        "support_placeholder": placeholder,
         "support_reuse": support_reuse,
         "depth_points": prepared.depth_points,
         "reach_cropped_points": prepared.depth_points - input_count,

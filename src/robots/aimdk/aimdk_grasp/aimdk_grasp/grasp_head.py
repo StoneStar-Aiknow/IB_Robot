@@ -222,7 +222,7 @@ class X2GraspHeadNode(Node):
                 self._check_planning_hands(head, admitted)
                 prepared = self._prepare_scene(observation)
                 with head.gpu:
-                    estimate = self._complete_scene(prepared, None, observation)
+                    estimate = self._warmup_scene(prepared, observation)
                 self._prepare_planners(head, admitted.live.feedback, estimate)
             except Exception as exc:  # noqa: BLE001 - retried until the robot and the camera are up
                 self.get_logger().warning(f"grasp head not ready: {exc}", throttle_duration_sec=5.0)
@@ -351,7 +351,7 @@ class X2GraspHeadNode(Node):
             self._check_planning_hands(head, admitted)
             prepared = self._prepare_scene(observation)
             with head.gpu:
-                estimate = self._complete_scene(prepared, None, observation)
+                estimate = self._warmup_scene(prepared, observation)
             if head.service.refresh(self._planning_feedback(admitted.live.feedback), estimate):
                 self.get_logger().info(f"planner rebuilt between requests in {time.monotonic() - began:.1f} s")
             return None
@@ -372,10 +372,35 @@ class X2GraspHeadNode(Node):
             config = replace(self._robot.perception.scene, pixel_stride=pixel_stride)
             return prepare_capture_scene(observation, self._head.spheres, config)
 
-    def _complete_scene(self, prepared, mask, observation):
+    def _complete_scene(self, prepared, mask, observation, *, placeholder_support=False):
+        """The scene of one capture; ``placeholder_support`` (warmup only) tolerates a table out of view."""
+        import inspect
+
         if hasattr(self._head, "complete_scene"):
-            return self._head.complete_scene(prepared, mask, observation)
-        return complete_scene(prepared, mask, lazy_validation=mask is not None)
+            method, args = self._head.complete_scene, (prepared, mask, observation)
+            options = {}
+        else:
+            method, args = complete_scene, (prepared, mask)
+            options = {"lazy_validation": mask is not None}
+        # Only a scene builder that knows the option gets it; any other is called as before.
+        if placeholder_support and "placeholder_support" in inspect.signature(method).parameters:
+            options["placeholder_support"] = True
+        return method(*args, **options)
+
+    def _warmup_scene(self, prepared, observation):
+        """A planner-building scene: a placeholder table when the real one is out of view (mirroring, arms up).
+
+        Every pick captures and completes its own scene, which still requires
+        the real table; this one only builds the planners ahead of it.
+        """
+        estimate = self._complete_scene(prepared, None, observation, placeholder_support=True)
+        scenes = getattr(estimate, "estimates", None) or {"*": estimate}
+        if any(getattr(scene, "diagnostics", {}).get("support_placeholder") for scene in scenes.values()):
+            self.get_logger().warning(
+                "no table in view: planners built with a placeholder table; each pick still needs the real one",
+                throttle_duration_sec=30.0,
+            )
+        return estimate
 
     # -- requests -----------------------------------------------------------------
 

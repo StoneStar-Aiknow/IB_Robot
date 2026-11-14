@@ -586,3 +586,44 @@ def test_largest_cluster_mask_drops_a_disconnected_second_object_only():
     assert cleaned[20:50, 30:50].all() and not cleaned[50:56].any()
     same, none = largest_cluster_mask(cleaned, depth, intrinsics)
     assert none == 0 and np.array_equal(same, cleaned)
+
+
+def _prepared(depth):
+    from aimdk_grasp.scene_estimation import prepare_scene
+
+    inputs = scene_inputs()
+    inputs["depth"] = depth
+    inputs.pop("target_mask")
+    return prepare_scene(**inputs, config=SceneEstimationConfig())
+
+
+def test_a_warmup_without_a_table_in_view_gets_a_placeholder_with_the_same_slots():
+    """Mirroring 2026-11-13: arms in front of the camera left no table; warmup must still build the planner."""
+    from aimdk_grasp.scene_estimation import PLACEHOLDER_TABLE_TORSO_M, complete_scene
+
+    table = complete_scene(_prepared(np.ones((50, 50), dtype=np.float32)), None, placeholder_support=True)
+    assert table.diagnostics["support_placeholder"] is False
+    sparse = np.zeros((50, 50), dtype=np.float32)
+    sparse[20:25, 20:25] = 1.0  # 25 points: below min_plane_points, so no support
+    prepared = _prepared(sparse)
+    with pytest.raises(NoSupportError):
+        complete_scene(prepared, None)
+    warm = complete_scene(prepared, None, placeholder_support=True)
+    assert warm.diagnostics["support_placeholder"] is True
+    # Same cuboid slots as a scene with a real table: the first pick's table fits without a rebuild.
+    assert set(warm.scene["cuboid"]) == set(table.scene["cuboid"])
+    centre = np.asarray(warm.scene["cuboid"]["table"]["pose"][:3])
+    np.testing.assert_allclose(centre[:2], PLACEHOLDER_TABLE_TORSO_M[:2], atol=0.06)
+    assert centre[2] < PLACEHOLDER_TABLE_TORSO_M[2] + 0.01  # at or below the placeholder top
+    assert max(warm.scene["cuboid"]["table"]["dims"][:2]) < 0.2
+
+
+def test_a_pick_never_gets_a_placeholder_table():
+    from aimdk_grasp.scene_estimation import complete_scene
+
+    sparse = np.zeros((50, 50), dtype=np.float32)
+    sparse[20:25, 20:25] = 1.0
+    mask = np.zeros((50, 50), dtype=bool)
+    mask[21:24, 21:24] = True
+    with pytest.raises(NoSupportError):
+        complete_scene(_prepared(sparse), mask, placeholder_support=True)

@@ -282,7 +282,7 @@ class AutomaticHead:
                 for side, arm in self.arms.items()
             }
 
-    def complete_scene(self, prepared, mask, observation):
+    def complete_scene(self, prepared, mask, observation, *, placeholder_support=False):
         from .rgbd_to_cloud import mask_depth_to_points
         from .scene_estimation import NoSupportError, complete_scene
 
@@ -305,7 +305,12 @@ class AutomaticHead:
         with self.gpu:
             for side in sides:
                 try:
-                    estimates[side] = complete_scene(prepared[side], mask, lazy_validation=mask is not None)
+                    estimates[side] = complete_scene(
+                        prepared[side],
+                        mask,
+                        lazy_validation=mask is not None,
+                        placeholder_support=placeholder_support,
+                    )
                 except NoSupportError as exc:
                     errors[side] = dict(code="NO_SUPPORT", message=str(exc))
         if not estimates:
