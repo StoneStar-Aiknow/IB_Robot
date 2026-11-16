@@ -15,3 +15,6 @@ uint32 completed_step_count
 string error_code
 string message
 builtin_interfaces/Time created_at
+uint32 workflow_step_index
+string current_skill
+ExecutionDetail execution_detail

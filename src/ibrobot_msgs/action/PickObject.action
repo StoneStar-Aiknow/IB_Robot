@@ -17,6 +17,15 @@
 uint8 MODE_EXECUTE=0
 uint8 MODE_PLAN_ONLY=1
 uint8 MODE_OBSERVE_ONLY=2
+# The Gateway's automatic put-back of a custody the pick still holds, after the
+# Gateway has been idle (no root task) for held_custody_contract.IDLE_PUT_BACK_S:
+# release at its verified source contact, then return home. Needs custody_id,
+# custody_epoch and request_id. The owner refuses unless the custody_id and
+# epoch match and the pick still holds it; without a verified contact, or when
+# the body moved since the grasp, it refuses and keeps holding (NO_PUT_BACK).
+# A repeated request_id returns the first result. The current scene is checked again and
+# old collision certificates never authorize the motion.
+uint8 MODE_RECOVER=3
 
 DispatchBinding dispatch_binding
 string target_query
@@ -26,7 +35,16 @@ DelegatedExecutorIdentity expected_executor
 # all catalog callers must leave this false and use a Gateway delegated nonce.
 bool supervised_direct
 uint8 mode
+# Release the object after a successful pick; otherwise the pick keeps holding
+# it (custody HELD) for a later place or the Gateway's idle put-back.
 bool release_after_success
+# MODE_RECOVER only: the custody to recover, the owner epoch the Gateway
+# decided on (HeldObject.custody_epoch) and an idempotency key.
+string custody_id
+string custody_epoch
+string request_id
+# Optional grasp intent; schema_version=0 means none.
+GraspSpec grasp_spec
 ---
 # --- Result ---
 uint8 VERIFICATION_NOT_RUN=0
@@ -46,9 +64,25 @@ DelegatedExecutorIdentity actual_executor
 int32 candidate_index
 bool released_after_success
 string pipeline_timings_json
+# Custody this goal created or recovered (HeldObject.custody_id); empty if none.
+string custody_id
+# Failure category (embodied_common.pick_contract.FAILURE_CLASSES); empty on success.
+string failure_class
+# A new plan from the current state may succeed (no manual check needed first).
+bool recoverable
+# The last phase the robot physically reached (not the last planned one).
+string measured_phase
+ExecutionDetail execution_detail
+# Last emitted phase feedback; zero for executors without sequenced feedback.
+uint64 last_feedback_sequence
+# Bounded tail, ordered by sequence; first = last_feedback_sequence - length + 1.
+# Recovers feedback overtaken by the Action result (no prose parsing).
+ExecutionDetail[<=256] execution_history
 ---
 # --- Feedback ---
 string phase
 float32 progress
 uint32 attempt
 string detail
+ExecutionDetail execution_detail
+uint64 sequence

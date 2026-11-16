@@ -1,0 +1,25 @@
+# Served by the Gateway, which checks the operator identity and forwards it to
+# the custody owner. The operator confirms that an UNKNOWN custody's hand is
+# empty, after their own open-hand and return-home commands. It is checked when
+# it arrives: the custody becomes EMPTY only if fresh feedback then shows an
+# empty hand settled at the robot's configured home (not one from the custody
+# record); otherwise it is refused (WRONG_STATE) and nothing is remembered.
+# Bound to custody_id and custody_epoch; idempotent per request_id.
+uint32 schema_version
+string request_id
+string custody_id
+string custody_epoch
+bool operator_confirmed_empty
+string operator_note
+# Only report the current custody (custody_id, state, reason_code); change nothing.
+bool inspect_only
+---
+bool success
+# Why it was refused (held_custody_contract.CUSTODY_ERRORS, or the Gateway's own
+# admission codes); empty on success.
+string error_code
+string message
+string custody_id
+# The custody's state and reason after the request (HeldObject.state / reason_code).
+string state
+string reason_code
