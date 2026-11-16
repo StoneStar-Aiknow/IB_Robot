@@ -381,7 +381,7 @@ IB_Robot/
 │   ├── torch_models/            # Torch 模型实现与适配
 │   ├── model_utils/             # 模型导出与转换工具
 │   ├── dataset_tools/           # 数据采集、转换、评估与可视化
-│   ├── benchmark/               # Benchmark 运行时与 LIBERO 适配
+│   ├── benchmark/               # Benchmark 运行时与 LIBERO 适配、Agent 评测（agent_eval）
 │   ├── agent/                   # Agent 栈（技能目录、Gateway、规划、CLI、自然语言 Agent）
 │   │   ├── ibrobot_agent/       # 自然语言 Agent（孵化）
 │   │   ├── robot_skill_cli/     # Agent 受控 CLI 与集成接口

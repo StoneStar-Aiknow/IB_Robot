@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>agent_eval_robodojo</name>
+  <version>0.1.0</version>
+  <description>
+    RoboDojo platform plugin and suites for agent_eval: starts the IB-Robot stack on the
+    robodojo simulation platform and RoboDojo's eval client for each layout pass. Kept out of
+    robodojo_robot so the platform package does not depend on the evaluation layer.
+  </description>
+  <maintainer email="leiziting@huawei.com">leiziting</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>agent_eval</exec_depend>
+  <exec_depend>robodojo_robot</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>agent_eval</test_depend>
+  <test_depend>robodojo_robot</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

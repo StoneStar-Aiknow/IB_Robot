@@ -11,8 +11,9 @@ episode from ``run_eval``. The policy server behind ``model_client`` is the IB_R
   only exists in this process; the replies travel with the next ``get_action``,
 * reports the native verdict (``TASK_ENV.success``) with ``episode_end`` and writes the
   per-episode artifact (``artifacts.EpisodeRecorder``: every tick's action, every motion
-  command, native success, failure reason). The runtime forwards the verdict to the
-  evaluation channel only; the Agent never sees it.
+  command, native success, failure reason). The runtime hands the verdict to its result
+  listeners only (an evaluation layer attached to it publishes it for the evaluator; without
+  one it is logged); the Agent never sees it.
 
 Every call carries the runtime's ``episode_id`` and ``generation`` from ``reset``; a reply
 or observation of an older generation is refused by the runtime. When a call is refused or

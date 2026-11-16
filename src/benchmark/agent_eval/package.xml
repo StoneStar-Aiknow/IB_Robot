@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>agent_eval</name>
+  <version>0.1.0</version>
+  <description>Platform-neutral Agent evaluation: task specs, the runtime's evaluation extension, episode runner, suites and run reports</description>
+  <maintainer email="leiziting@huawei.com">leiziting</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>ibrobot_msgs</depend>
+  <depend>benchmark_runtime</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>robot_config</depend>
+  <depend>ament_index_python</depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+  <test_depend>ibrobot_agent</test_depend>
+  <test_depend>robot_config</test_depend>
+  <!-- the toy direct-control runtime the extension is attached to in its node test -->
+  <test_depend>robot_runtime_sim</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

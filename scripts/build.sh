@@ -272,8 +272,10 @@ require_setup_environment
 # dependencies — that is how a robot flag "brings its base" automatically.
 # ============================================================================
 declare -A GROUP_PATHS=(
-    [base]="ibrobot_msgs robot_config robot_runtime robot_teleop tensormsg model_utils hardware_mock observation_transport perception_service manipulation_service action_dispatch task_dispatch inference_service inference_manifest torch_models ibrobot_tracing voice_asr_service voice_tts_service manipulation_execution semantic_mapping object_tracker sim_models dataset_tools benchmark aero_hand_hardware attention_viz pymoveit2"
-    [agent]="agent embodied_common"
+    [base]="ibrobot_msgs robot_config robot_runtime robot_teleop tensormsg model_utils hardware_mock observation_transport perception_service manipulation_service action_dispatch task_dispatch inference_service inference_manifest torch_models ibrobot_tracing voice_asr_service voice_tts_service manipulation_execution semantic_mapping object_tracker sim_models dataset_tools benchmark/benchmark_runtime benchmark/adapters aero_hand_hardware attention_viz pymoveit2"
+    # agent_eval (Agent evaluation) needs the Agent stack; its RoboDojo plugin
+    # (benchmark/agent_eval_robodojo), like robodojo_robot, is in no group.
+    [agent]="agent embodied_common benchmark/agent_eval"
     [so101]="robots/so101 robots/feetech"
     [lekiwi]="robots/lekiwi robots/feetech robot_navigation fast_calib fast_lio livox_ros_driver2"
     # Includes aimdk_robot and the independent aimdk_mujoco simulation.
