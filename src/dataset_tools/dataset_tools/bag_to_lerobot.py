@@ -12,7 +12,7 @@ The conversion pipeline:
 
 1) Preflight all selected episodes using their dataset-embedded contract and conversion metadata
 2) Scan a bag once; decode each contract topic using shared `decode_value`.
-3) Select timestamps per a policy (`contract` / `bag` / `header`).
+3) Select timestamps per a policy (`contract` / `receive` / `header`).
 4) Resample each stream at the contract rate and assemble frames.
 5) Coerce/resize images with the shared helpers and write to LeRobot.
 
@@ -41,11 +41,16 @@ Options of note:
 
 The removed `--robot-config` option is rejected; legacy datasets without snapshots are unsupported.
 
-- `--timestamp {contract,bag,header}`
+- `--timestamp {contract,receive,bag,header}`
     How to pick per-message timestamps before resampling:
     * contract: per-spec `stamp_src` (default)
-    * bag:      use the bag receive time
+    * receive:  use the bag receive time (`bag` is an alias)
     * header:   prefer `msg.header.stamp` with bag time as fallback
+    Annex-B side-car video always keeps its recorded capture timestamps.
+
+- `--header-skew-warn-ms MS`
+    Warn when an image stream's receive-header offset differs from the non-image header streams of
+    the same bag (paired by receive time) by more than MS (default 200; 0 disables). Diagnostic only.
 
 - `--no-videos`
     Store PNG images instead of H.264/MP4 videos.
@@ -558,6 +563,93 @@ def _selected_indices_for_ticks(
     return out
 
 
+TIMESTAMP_SOURCES = ("contract", "receive", "header")
+_TIMESTAMP_SOURCE_ALIASES = {"bag": "receive"}
+
+
+def _normalize_timestamp_source(value: str) -> str:
+    """Return the canonical timestamp policy, mapping ``bag`` to ``receive``.
+
+    Unknown values are rejected instead of silently falling back to the contract policy.
+    """
+    canonical = _TIMESTAMP_SOURCE_ALIASES.get(value, value)
+    if canonical not in TIMESTAMP_SOURCES:
+        accepted = ", ".join((*TIMESTAMP_SOURCES, *_TIMESTAMP_SOURCE_ALIASES))
+        raise ValueError(f"unknown timestamp_source {value!r}; expected one of: {accepted}")
+    return canonical
+
+
+def _uses_header_alignment(timestamp_source: str, stamp_src: str) -> bool:
+    if timestamp_source == "header":
+        return True
+    return timestamp_source == "contract" and stamp_src == "header"
+
+
+def _header_offset_warnings(
+    *,
+    header_offsets_ns: dict[str, list[tuple[int, int]]],
+    image_keys: Iterable[str],
+    external_video_keys: Iterable[str],
+    header_aligned_keys: Iterable[str],
+    warn_ms: float,
+) -> list[str]:
+    """Print per-stream ``receive - header`` offsets and return warnings for skewed image streams.
+
+    ``header_offsets_ns`` maps a stream key to ``(receive_ns, receive_ns - header_ns)`` samples.
+    Each image sample is paired with the non-image header sample nearest in receive time, and the
+    median of the paired differences is the image stream's skew. Pairing by receive time cancels a
+    clock domain shared by all streams even when it drifts against wall time (for example sim time
+    running slower than real time); an image driver whose header clock is shifted (#246) does not
+    cancel. The skew still includes normal transport latency, so this is a diagnostic only.
+    """
+    if warn_ms <= 0:
+        return []
+    image_keys = list(image_keys)
+    external = set(external_video_keys)
+    aligned = set(header_aligned_keys)
+    samples = {
+        key: np.asarray(pairs, dtype=np.int64).reshape(-1, 2) for key, pairs in header_offsets_ns.items() if pairs
+    }
+    if samples:
+        details = ", ".join(f"{key}={float(np.median(samples[key][:, 1])) / 1e6:.1f}" for key in sorted(samples))
+        print(f"[bag_to_lerobot] median receive-header offset ms: {details}")
+    reference = sorted(key for key in samples if key not in image_keys)
+    if reference:
+        ref = np.concatenate([samples[key] for key in reference])
+        ref = ref[np.argsort(ref[:, 0], kind="stable")]
+
+    warnings: list[str] = []
+    for key in image_keys:
+        if key in external:
+            print(f"[bag_to_lerobot] header offset unchecked for {key}: Annex-B video has no receive time")
+            continue
+        if key not in samples:
+            print(f"[bag_to_lerobot] header offset unchecked for {key}: no header stamps")
+            continue
+        if not reference:
+            print(f"[bag_to_lerobot] header offset unchecked for {key}: no non-image header stream to compare")
+            continue
+        receive_ns, offset_ns = samples[key][:, 0], samples[key][:, 1]
+        index = np.searchsorted(ref[:, 0], receive_ns)
+        left = np.clip(index - 1, 0, len(ref) - 1)
+        right = np.clip(index, 0, len(ref) - 1)
+        nearest = np.where(np.abs(ref[left, 0] - receive_ns) <= np.abs(ref[right, 0] - receive_ns), left, right)
+        skew_ms = float(np.median(offset_ns - ref[nearest, 1])) / 1e6
+        if abs(skew_ms) <= warn_ms:
+            continue
+        usage = "used for alignment" if key in aligned else "not used for alignment"
+        message = (
+            f"{key}: receive-header offset differs from the non-image header streams "
+            f"({', '.join(reference)}) by {skew_ms:+.0f} ms (> {warn_ms:g} ms, {usage}; "
+            "positive = header earlier than receive time). "
+            "Images may be misaligned with state/action; a usb_cam 0.8.1 binary shows this "
+            "(issue #246). Check the driver, or convert with --timestamp receive."
+        )
+        print(f"⚠️  [bag_to_lerobot] {message}")
+        warnings.append(message)
+    return warnings
+
+
 def _log_image_stream_diagnostics(
     streams: dict[str, _Stream],
     ticks_ns: np.ndarray,
@@ -806,6 +898,7 @@ def export_bags_to_lerobot(
     video_mb: int = 500,
     timestamp_source: str = "contract",
     video_codec: str = "auto",
+    header_skew_warn_ms: float = 200.0,
 ) -> None:
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
 
@@ -830,8 +923,13 @@ def export_bags_to_lerobot(
         Target data file size in MB per chunk.
     video_mb : int, default 500
         Target video file size in MB per chunk.
-    timestamp_source : {"contract","receive","header"}, default "contract"
-        Timestamp selection policy per decoded message.
+    timestamp_source : {"contract","receive","bag","header"}, default "contract"
+        Timestamp selection policy per decoded message; ``bag`` is an alias of ``receive``.
+        Annex-B side-car video keeps its recorded capture timestamps under every policy.
+    header_skew_warn_ms : float, default 200.0
+        Warn when an image stream's receive-header offset differs from the non-image header
+        streams of the same bag (paired by receive time) by more than this; 0 disables (and
+        skips collecting the offsets). Diagnostic only.
 
     Raises
     ------
@@ -840,6 +938,10 @@ def export_bags_to_lerobot(
     RuntimeError
         If a bag contains no usable/decodable messages.
     """
+    timestamp_source = _normalize_timestamp_source(timestamp_source)
+    header_skew_warn_ms = float(header_skew_warn_ms)
+    if not math.isfinite(header_skew_warn_ms) or header_skew_warn_ms < 0:
+        raise ValueError("header_skew_warn_ms must be a finite value >= 0")
     contract, preflight = _preflight_bags(bag_dirs)
     fps = int(contract.rate_hz)
     if fps <= 0:
@@ -1042,6 +1144,7 @@ def export_bags_to_lerobot(
 
         # Counters for light diagnostics
         decoded_msgs = sum(len(st.val) for st in streams.values())
+        header_offsets_ns: dict[str, list[tuple[int, int]]] = {}
 
         # Decode single pass
         while reader.has_next():
@@ -1054,16 +1157,13 @@ def export_bags_to_lerobot(
                 sv = st.spec
 
                 # Timestamp selection policy
-                if timestamp_source == "receive":
+                hdr = stamp_from_header_ns(msg)
+                if hdr is not None and header_skew_warn_ms > 0:
+                    header_offsets_ns.setdefault(key, []).append((int(bag_ns), int(bag_ns) - int(hdr)))
+                if hdr is not None and _uses_header_alignment(timestamp_source, sv.stamp_src):
+                    ts_sel = int(hdr)
+                else:
                     ts_sel = int(bag_ns)
-                elif timestamp_source == "header":
-                    ts_sel = stamp_from_header_ns(msg) or int(bag_ns)
-                else:  # 'contract' (per-spec stamp_src)
-                    ts_sel = int(bag_ns)
-                    if sv.stamp_src == "header":
-                        hdr = stamp_from_header_ns(msg)
-                        if hdr is not None:
-                            ts_sel = int(hdr)
 
                 val = decode_value(st.ros_type, msg, sv)
 
@@ -1106,6 +1206,16 @@ def export_bags_to_lerobot(
         # Ticks
         n_ticks = int(dur_ns // step_ns) + 1
         ticks_ns = start_ns + np.arange(n_ticks, dtype=np.int64) * step_ns
+
+        _header_offset_warnings(
+            header_offsets_ns=header_offsets_ns,
+            image_keys=[key for key in streams if features.get(key, {}).get("dtype") in ("video", "image")],
+            external_video_keys=video_adapters,
+            header_aligned_keys=[
+                key for key, st in streams.items() if _uses_header_alignment(timestamp_source, st.spec.stamp_src)
+            ],
+            warn_ms=header_skew_warn_ms,
+        )
 
         _log_image_stream_diagnostics(
             streams=streams,
@@ -1415,11 +1525,21 @@ Example:
     )
     ap.add_argument(
         "--timestamp",
-        choices=("contract", "bag", "header"),
+        choices=(*TIMESTAMP_SOURCES, *_TIMESTAMP_SOURCE_ALIASES),
         default="contract",
         help=(
-            "Which time base to use when resampling: "
-            "'contract' (per-spec), 'bag' (receive), or 'header' (message header)."
+            "Which time base to use when resampling: 'contract' (per-spec), 'receive' "
+            "(bag receive time; 'bag' is an alias), or 'header' (message header). "
+            "Annex-B side-car video always keeps its capture timestamps."
+        ),
+    )
+    ap.add_argument(
+        "--header-skew-warn-ms",
+        type=float,
+        default=200.0,
+        help=(
+            "Warn when an image stream's receive-header offset differs from the non-image header "
+            "streams of the same bag by more than this many ms (0 disables)."
         ),
     )
     return ap.parse_args()
@@ -1458,6 +1578,7 @@ def main() -> None:
         video_mb=args.video_mb,
         timestamp_source=args.timestamp,
         video_codec=args.video_codec,
+        header_skew_warn_ms=args.header_skew_warn_ms,
     )
 
 

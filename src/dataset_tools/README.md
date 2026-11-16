@@ -342,7 +342,8 @@ ros2 run dataset_tools bag_to_lerobot \
 | `--out` | 输出数据集目录 | 必需 |
 | `--repo-id` | 数据集 repo_id | `rosbag_v30` |
 | `--no-videos` | 存储 PNG 图像而非视频 | `false` |
-| `--timestamp` | 时间戳来源 (contract/bag/header) | `contract` |
+| `--timestamp` | 时间戳来源 (contract/receive/header；`bag` 是 `receive` 的别名) | `contract` |
+| `--header-skew-warn-ms` | 图像 header 偏移告警阈值（ms，`0` 关闭；只告警） | `200` |
 | `--image-threads` | 图像写入线程数 | `4` |
 | `--chunk-size` | 每个 chunk 的帧数 | `1000` |
 
