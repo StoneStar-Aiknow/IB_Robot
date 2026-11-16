@@ -63,6 +63,15 @@ must pass.
   `robot_runtime_sim`; the boundary is enforced by
   `test/test_sim_boundary.py`).
 - **Conformance suite** (`test/test_conformance.py`): the executable contract.
+- **Task poses and fixed-pose support** (`task_poses.py`, `path_validation.py`,
+  `pose_backend.py`, `hand_mounts.py`): startup-only, runtime-neutral data
+  shared by robot configuration, the skill catalog and robot grasp backends —
+  the immutable task-pose snapshot and its digest (named arm targets such as
+  the pick entry pose, optional transition routes and hand-open actions), the
+  fixed-pose path-validation policy and its digest, the neutral pose-planning
+  result types with a joint-limit intersection that never widens runtime
+  travel, and the explicit hand-mount declaration (missing feedback never
+  implies a removed hand). No file is reread while a task runs.
 
 ## Prohibited
 
