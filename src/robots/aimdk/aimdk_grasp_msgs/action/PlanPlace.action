@@ -1,0 +1,20 @@
+string capture_id
+sensor_msgs/CompressedImage container_mask
+ibrobot_msgs/HeldObject held_object
+float64 timeout_s
+# After a drop while carried: plan only the empty, open hand's way home from a
+# fresh capture, for held_object's arm and home pose. capture_id and
+# container_mask are unused; the single home move is returned in retreat.
+bool return_home
+---
+bool success
+string error_code
+string message
+bool retryable
+GraspPlanStep[] transfer
+GraspPlanStep[] release
+GraspPlanStep[] retreat
+string container_json
+string report_json
+---
+string phase

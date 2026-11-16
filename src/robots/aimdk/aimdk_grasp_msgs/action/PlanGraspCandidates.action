@@ -9,6 +9,7 @@ float64 timeout_s
 ---
 bool success
 string error_code
+string reason_code
 string message
 # The failure may pass with another observation (e.g. a target recheck that saw flicker).
 bool retryable

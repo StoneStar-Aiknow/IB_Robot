@@ -2,6 +2,9 @@
 # under capture_id for the scene, plan and watch requests that follow.
 
 float64 timeout_s
+# The head's scene from every n-th depth row and column (a place capture);
+# 0 or 1 is full resolution (a grasp capture).
+uint16 scene_pixel_stride
 ---
 bool success
 # Empty on success; a grasp pipeline failure code otherwise (e.g.
