@@ -115,6 +115,9 @@ ensure_ros_third_party_patch_stacks() {
     _apply_ros_patch_once \
         "${usb_cam_src}" \
         "${WORKSPACE}/third_party/patches/usb_cam/0.8.1/0001-upstream-pr378-raw-mjpeg-routing.patch" || return 1
+    _apply_ros_patch_once \
+        "${usb_cam_src}" \
+        "${WORKSPACE}/third_party/patches/usb_cam/0.8.1/0002-upstream-epoch-time-shift-microseconds.patch" || return 1
 
     _require_ros_submodule_commit \
         "${livox_sdk_src}" "f5d9375f84efe2b15bc0a052d3e18482ed13adf4" "Livox-SDK2" || return 1

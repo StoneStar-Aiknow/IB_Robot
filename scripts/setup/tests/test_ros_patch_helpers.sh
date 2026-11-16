@@ -61,7 +61,20 @@ log_done() { :; }
 ensure_ros_third_party_patch_stacks
 grep -Fx "base ${WORKSPACE}/src/usb_cam cb2ae6bc0a312de629f84fef933fb3e07dac1ef8" "${TMP}/calls"
 grep -Fx "patch ${WORKSPACE}/src/usb_cam ${WORKSPACE}/third_party/patches/usb_cam/0.8.1/0001-upstream-pr378-raw-mjpeg-routing.patch" "${TMP}/calls"
-echo 'PASS: ROS dispatcher wires the single usb_cam patch directly'
+grep -Fx "patch ${WORKSPACE}/src/usb_cam ${WORKSPACE}/third_party/patches/usb_cam/0.8.1/0002-upstream-epoch-time-shift-microseconds.patch" "${TMP}/calls"
+test "$(grep -c "^patch ${WORKSPACE}/src/usb_cam " "${TMP}/calls")" = 2
+echo 'PASS: ROS dispatcher wires both usb_cam patches directly'
+
+# Both real usb_cam patches must apply, in order, to the pinned 0.8.1 tree.
+# Only checked when the submodule is present (full profile); the CI gate runs setup first.
+if [[ -e "${ROOT}/src/usb_cam/.git" ]]; then
+    git -C "${ROOT}/src/usb_cam" archive cb2ae6bc0a312de629f84fef933fb3e07dac1ef8 | tar -x -C "${TMP}/workspace" --one-top-level=usb_cam_pinned
+    for patch in "${ROOT}"/third_party/patches/usb_cam/0.8.1/*.patch; do
+        git -C "${TMP}/workspace/usb_cam_pinned" apply "${patch}"
+    done
+    grep -Fq 'epoch_time.tv_sec * 1000000 + epoch_time.tv_usec;' "${TMP}/workspace/usb_cam_pinned/include/usb_cam/utils.hpp"
+    echo 'PASS: usb_cam patch stack applies to pinned 0.8.1 and keeps tv_usec in microseconds'
+fi
 
 # The pymoveit2 managed patch (review r1 item 1): the dispatcher must pin the
 # 900c137 base and apply the planned-trajectory-evidence patch from
