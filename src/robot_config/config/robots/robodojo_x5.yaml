@@ -177,6 +177,8 @@ robot:
         timeout_sec: 120.0
         temperature: 0.3
         api_protocol: chat_completions
+        # Frames from before the current simulation session started are never attached.
+        vision_epoch_topic: /simulation/clock
         vision_topics:
           # Head view with the calibrated table grid and grasp-point markers (robodojo_robot overlay).
           - /robodojo/cam_head/overlay/image_raw
