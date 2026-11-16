@@ -802,7 +802,8 @@ def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
     assert interfaces["camera.top.color"]["qos"]["reliability"] == "reliable"
     assert interfaces["camera.front.depth"]["qos"]["reliability"] == "reliable"
     assert interfaces["camera.front.depth_info"]["qos"]["reliability"] == "reliable"
-    # non-mujoco platforms keep the historical best-effort sensor contract
+    # off mujoco the trait does not apply: hardware follows each driver's own
+    # publisher (usb_cam publishes reliable, realsense stays best-effort)
     physical = build_description(
         {
             "runtime": {"name": "test_robot", "version": "0.1.0"},
@@ -811,7 +812,9 @@ def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
             "peripherals": peripherals,
         }
     )
-    assert physical["interfaces"]["camera.top.color"]["qos"]["reliability"] == "best_effort"
+    assert physical["interfaces"]["camera.top.color"]["qos"]["reliability"] == "reliable"
+    assert physical["interfaces"]["camera.front.color"]["qos"]["reliability"] == "best_effort"
+    assert physical["interfaces"]["camera.front.depth"]["qos"]["reliability"] == "best_effort"
     # 5b.3: the advertised frames follow the shared convention (opencv →
     # frame_id, realsense → optical), identical to hardware/sdk/gazebo
     assert interfaces["camera.top.color"]["frame_id"] == "camera_top_frame"

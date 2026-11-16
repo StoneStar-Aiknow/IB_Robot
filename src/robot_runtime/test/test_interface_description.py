@@ -494,8 +494,34 @@ def test_monitor_subscription_mirrors_declared_qos(profile):
     assert description_qos.reliability == ReliabilityPolicy.RELIABLE
     assert description_qos.durability == DurabilityPolicy.TRANSIENT_LOCAL
     camera_qos = node.subscribed["/camera/front/image_raw"][1]
-    assert camera_qos.reliability == ReliabilityPolicy.BEST_EFFORT
+    # the hardware usb_cam fixture camera is declared reliable (issue #247)
+    assert camera_qos.reliability == ReliabilityPolicy.RELIABLE
     assert camera_qos.durability == DurabilityPolicy.VOLATILE
+
+
+def test_hardware_usb_cam_camera_is_declared_reliable(profile):
+    # usb_cam publishes reliable; a best-effort reader drops whole large frames
+    # on any lost fragment, so hardware usb_cam streams are offered reliable.
+    doc = build_description(profile)
+    assert doc["execution"] != "simulated"
+    assert doc["interfaces"]["camera.front.color"]["qos"]["reliability"] == "reliable"
+    assert doc["interfaces"]["camera.front.color_info"]["qos"]["reliability"] == "reliable"
+
+
+def test_sdk_and_non_usb_cam_cameras_keep_best_effort(profile):
+    # the SDK platform's synthetic publishers keep their declared QoS
+    sdk = build_description(profile, use_sim=True)
+    assert sdk["interfaces"]["camera.front.color"]["qos"]["reliability"] == "best_effort"
+    assert sdk["interfaces"]["camera.front.color_info"]["qos"]["reliability"] == "best_effort"
+    # other hardware drivers are unchanged until their publisher QoS is checked
+    profile["peripherals"][0] = {**profile["peripherals"][0], "driver": "camera_ros", "format": "MJPEG"}
+    other = build_description(profile)
+    assert other["interfaces"]["camera.front.color"]["qos"]["reliability"] == "best_effort"
+    # realsense on hardware is relayed best-effort, so its contract stays best-effort
+    profile["peripherals"][0] = {"type": "camera", "name": "front", "driver": "realsense", "serial_number": ""}
+    realsense = build_description(profile)["interfaces"]
+    assert realsense["camera.front.color"]["qos"]["reliability"] == "best_effort"
+    assert realsense["camera.front.depth"]["qos"]["reliability"] == "best_effort"
 
 
 def test_synthetic_perception_publishes_an_unstamped_message(profile):
