@@ -28,7 +28,7 @@ from aimdk_grasp_msgs.srv import (  # noqa: E402
     WatchGraspTarget,
 )
 
-from manipulation_execution.pick.pipeline.contracts import (  # noqa: E402
+from manipulation_execution.shared.contracts import (  # noqa: E402
     ArmSegment,
     Effect,
     EffectorAction,

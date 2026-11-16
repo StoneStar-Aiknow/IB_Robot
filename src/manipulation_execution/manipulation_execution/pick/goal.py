@@ -5,6 +5,12 @@ complete dispatch binding with registry identity and a live task budget, and
 asks for a known mode. A supervised direct goal carries no dispatch nonce; a
 Gateway goal must carry one. Which executor serves the action does not change
 these rules.
+
+Fields an executor does not serve are refused before any motion, never
+ignored: a grasp spec its effector cannot honour (``GRASP_SPEC_UNSUPPORTED``,
+also for an unknown spec version) or that is malformed
+(``GRASP_SPEC_INVALID``), and custody fields, which only the custody put-back
+(``MODE_RECOVER``, not served yet) uses.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from __future__ import annotations
 import math
 
 from embodied_common.dispatch_binding import delegated_executor_identity_matches
+from embodied_common.pick_contract import GraspCapability, check_grasp_spec
 from ibrobot_msgs.action import PickObject
 
 PICK_MODES = frozenset(
@@ -23,8 +30,12 @@ def _seconds(stamp) -> float:
     return stamp.sec + stamp.nanosec / 1_000_000_000
 
 
-def pick_goal_rejection(goal, identity: dict[str, str], now_s: float) -> str:
-    """Why ``goal`` must be rejected at ``now_s`` (ROS time, seconds), or "" to admit it."""
+def pick_goal_rejection(goal, identity: dict[str, str], now_s: float, capability: GraspCapability | None = None) -> str:
+    """Why ``goal`` must be rejected at ``now_s`` (ROS time, seconds), or "" to admit it.
+
+    ``capability`` is what this executor's effector declares; the default
+    honours no grasp spec field.
+    """
     if not str(goal.target_query).strip():
         return "empty target_query"
     if not delegated_executor_identity_matches(goal.expected_executor, identity):
@@ -61,6 +72,11 @@ def pick_goal_rejection(goal, identity: dict[str, str], now_s: float) -> str:
         return "task_budget or timeout_sec is invalid or already expired"
     if int(goal.mode) not in PICK_MODES:
         return f"unknown mode {goal.mode}"
+    _, spec_error = check_grasp_spec(goal.grasp_spec, capability or GraspCapability())
+    if spec_error:
+        return f"{spec_error}: this executor cannot honour the requested grasp spec"
+    if any(str(getattr(goal, name)).strip() for name in ("custody_id", "custody_epoch", "request_id")):
+        return "custody fields are only for MODE_RECOVER, which this executor does not serve"
     return ""
 
 

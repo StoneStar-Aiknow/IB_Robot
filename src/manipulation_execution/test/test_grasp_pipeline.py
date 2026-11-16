@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 
 from manipulation_execution.pick.pipeline.backends import BackendLoadError, backend_spec, load_backends
-from manipulation_execution.pick.pipeline.contracts import (
+from manipulation_execution.pick.pipeline.pipeline import GraspPipeline, PickMode, PipelineConfig
+from manipulation_execution.shared.contracts import (
     ArmSegment,
     Effect,
     EffectorAction,
@@ -29,7 +30,6 @@ from manipulation_execution.pick.pipeline.contracts import (
     Proposals,
     SegmentKind,
 )
-from manipulation_execution.pick.pipeline.pipeline import GraspPipeline, PickMode, PipelineConfig
 
 JOINTS = tuple(f"j{i}" for i in range(3))
 HOME = np.zeros(3)

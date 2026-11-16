@@ -1,4 +1,4 @@
-"""What a robot provides to the robot-agnostic grasp pipeline.
+"""What a robot provides to the robot-agnostic pick and place pipelines.
 
 The pipeline serves ``PickObject`` for any robot: it observes, asks the grasp
 models for candidates, has the robot's planner choose one and plan it, and runs
@@ -18,6 +18,9 @@ Two robot shapes must fit, and the contract tests drive both:
 Models are reached only through the typed perception services, whatever
 accelerator serves them (Ascend 310P or CUDA): a backend's ``propose`` calls
 services, it never loads a model.
+
+Pick and place share these types (``HeldObject`` crosses from one to the
+other), so they live in ``shared``; the module imports nothing from the package.
 """
 
 from __future__ import annotations
@@ -28,6 +31,9 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
+
+from embodied_common import held_custody_contract as custody
+from embodied_common.pick_contract import FAILURE_CLASSES
 
 #: A zero-argument predicate polled between frames or calls, e.g. goal cancellation.
 Flag = Callable[[], bool]
@@ -45,13 +51,31 @@ class GraspFailure(RuntimeError):
     """A failure that ends the goal with a ``PickObject`` error code.
 
     ``retryable`` failures (e.g. no executable candidate in this observation)
-    let the pipeline observe again while attempts remain.
+    let the pipeline observe again while attempts remain. ``reason_code`` is
+    the finer cause behind ``code`` (defaults to it). ``failure_class``
+    (``embodied_common.pick_contract.FAILURE_CLASSES``) and ``recoverable``
+    (a new plan from the current state may succeed) are reported to callers;
+    empty and False when the backend does not say.
     """
 
-    def __init__(self, code: str, message: str, *, retryable: bool = False):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        reason_code: str = "",
+        failure_class: str = "",
+        recoverable: bool = False,
+    ):
         super().__init__(message)
+        if failure_class and failure_class not in FAILURE_CLASSES:
+            raise ValueError(f"unknown failure class {failure_class!r}")
         self.code = code
+        self.reason_code = reason_code or code
         self.retryable = retryable
+        self.failure_class = failure_class
+        self.recoverable = recoverable
 
 
 @dataclass(frozen=True)
@@ -101,6 +125,8 @@ class Proposals:
     model's order (confidence-sorted); ``report`` carries what the services said.
     ``scene`` belongs to the backend that proposed (e.g. a collision scene built
     alongside the candidates) and is passed to the same robot's planner unread.
+    It is opaque for now; a typed, versioned scene model shared by planning,
+    candidate filtering, place and watch is meant to replace it later.
     """
 
     target_mask: np.ndarray
@@ -266,7 +292,27 @@ class Move:
 
 @dataclass(frozen=True)
 class Effect:
+    """Actuate the end effector. The parameters stay generic and optional:
+
+    ``grasp_type`` shapes a PRESHAPE for one declared grasp type; ``fingers``
+    and ``target_force_n`` say which fingers a CLOSE must bring into contact
+    and how hard it grips. Empty means the effector's default; an effector
+    that cannot honour a non-empty parameter must fail the step, not ignore it.
+    """
+
     action: EffectorAction
+    grasp_type: str = ""
+    fingers: tuple[str, ...] = ()
+    target_force_n: float = 0.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "fingers", tuple(self.fingers))
+        if self.grasp_type and self.action is not EffectorAction.PRESHAPE:
+            raise ValueError("only a preshape takes a grasp type")
+        if (self.fingers or self.target_force_n) and self.action is not EffectorAction.CLOSE:
+            raise ValueError("only a close takes fingers and a target force")
+        if not np.isfinite(self.target_force_n) or self.target_force_n < 0:
+            raise ValueError("target force must be finite and non-negative")
 
     @property
     def name(self) -> str:
@@ -301,6 +347,9 @@ class GraspPlan:
     candidate_index: int
     release: tuple[Step, ...] | None = None
     report: Mapping = field(default_factory=dict)
+    #: Alternative steps after the grasp that end at the carry handover pose
+    #: (moves only); None when the planner offers none.
+    carry_steps: tuple[Step, ...] | None = None
 
     def __post_init__(self):
         steps = tuple(self.steps)
@@ -315,6 +364,11 @@ class GraspPlan:
             raise ValueError("a release never closes the end effector")
         if self.release is not None:
             object.__setattr__(self, "release", tuple(self.release))
+        if self.carry_steps is not None:
+            carry = tuple(self.carry_steps)
+            if not carry or not all(isinstance(s, Move) for s in carry):
+                raise ValueError("carry steps are one or more moves")
+            object.__setattr__(self, "carry_steps", carry)
 
 
 class MotionState(enum.Enum):
@@ -355,6 +409,10 @@ class ObservationSource(Protocol):
 
 class GraspProposer(Protocol):
     def propose(self, observation: Observation, query: str, *, deadline: float, cancelled: Flag) -> Proposals: ...
+
+    # Optional (PipelineConfig.resample_retries): new grasp candidates for the same
+    # observation and target as ``proposals``, keeping its mask, points and scene.
+    # def resample(self, observation, proposals, *, deadline, cancelled) -> Proposals: ...
 
 
 class GraspPlanner(Protocol):
@@ -442,12 +500,43 @@ class TargetWatch(Protocol):
 
 
 @dataclass(frozen=True)
+class GraspVerdict:
+    """A verifier's answer after CLOSE; ``failure_class`` names why it failed."""
+
+    success: bool
+    failure_class: str = ""
+    reason_code: str = ""
+    confidence: float = 0.0
+    report: Mapping = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.failure_class and self.failure_class not in FAILURE_CLASSES:
+            raise ValueError(f"unknown failure class {self.failure_class!r}")
+        if self.success and self.failure_class:
+            raise ValueError("a successful verdict has no failure class")
+
+
+class GraspVerifier(Protocol):
+    """Optional check that what was gripped is what was asked for (beyond the
+    effector's own ``held``): the object, the part, the required fingers."""
+
+    def verify(
+        self, observation: Observation, plan: GraspPlan, outcome: EffectorOutcome, *, deadline: float, cancelled: Flag
+    ) -> GraspVerdict: ...
+
+
+@dataclass(frozen=True)
 class GraspBackends:
-    """One robot's implementations. ``watch`` is optional.
+    """One robot's implementations. ``watch`` and every field after it are optional.
 
     ``prepare``, when given, warms the robot's backends up (loads planners,
     runs the models once) before the first goal: it is called again until it
     returns without raising, and goals are refused until then.
+
+    ``prepare_retry(*, deadline, cancelled)``, when given, brings the robot
+    back to where it observes before a retry observes again (e.g. a hand-eye
+    camera's observation pose, settled); the first attempt's preparation uses
+    the same implementation.
     """
 
     observation: ObservationSource
@@ -458,3 +547,271 @@ class GraspBackends:
     watch: TargetWatch | None = None
     close: Callable[[], None] = lambda: None
     prepare: Callable[[], None] | None = None
+    held_object: Callable | None = None
+    #: The robot's measured joints as one vector (both arms, head, hands): a capture made before
+    #: the goal is used only when this has not changed since.
+    posture: Callable[[], np.ndarray] | None = None
+    #: (observation, container_query, *, deadline, cancelled) -> HxW mask or None: the container of
+    #: a following place, detected on a prefetched capture and handed over with the held object.
+    container_detector: Callable | None = None
+    #: Selection-independent preparation; releases hand publishers before returning.
+    preshape: Callable[..., EffectorOutcome] | None = None
+    verifier: GraspVerifier | None = None
+    prepare_retry: Callable[..., None] | None = None
+
+
+@dataclass(frozen=True)
+class HeldObject:
+    """What one arm carries, from the pick that lifted it to the place that releases it.
+
+    ``points_in_palm`` (xyz triples in the palm frame) is the object's geometry;
+    ``radius_m`` is a bound derived from those points by the backend, for
+    consumers that need one number.
+    """
+
+    custody_id: str
+    target_query: str
+    arm_side: str
+    joint_names: tuple[str, ...]
+    joint_positions: tuple[float, ...]
+    home_positions: tuple[float, ...]
+    radius_m: float
+    points_in_palm: tuple[float, ...]
+    effector_state_json: str
+    lift_m: float = 0.0
+    observation_id: str = ""
+    lifted_at_ns: int = 0
+    frame_id: str = ""
+    #: The way from the handover pose back to ``home_positions`` that pick
+    #: drove (its moves reversed), row-major Nxjoints, with N times from zero.
+    #: Empty when the backend records none.
+    return_positions: tuple[float, ...] = ()
+    return_times: tuple[float, ...] = ()
+    #: Arm joints at the verified grasp contact; empty when unknown (no put-back).
+    contact_positions: tuple[float, ...] = ()
+
+    def __post_init__(self):
+        if not self.custody_id or not self.target_query or not self.arm_side:
+            raise ValueError("held object needs an identity, target and arm")
+        if not self.joint_names or len(set(self.joint_names)) != len(self.joint_names):
+            raise ValueError("held object needs distinct joint names")
+        for values in (self.joint_positions, self.home_positions):
+            if len(values) != len(self.joint_names) or not np.isfinite(values).all():
+                raise ValueError("held object needs finite handover and home positions")
+        if self.contact_positions and (
+            len(self.contact_positions) != len(self.joint_names) or not np.isfinite(self.contact_positions).all()
+        ):
+            raise ValueError("contact positions need one finite value per joint")
+        if not np.isfinite(self.radius_m) or self.radius_m <= 0:
+            raise ValueError("held object needs a positive radius")
+        if len(self.points_in_palm) % 3 or not np.isfinite(self.points_in_palm).all():
+            raise ValueError("held points must be finite xyz triples")
+        if self.return_positions or self.return_times:
+            rows = len(self.return_times)
+            times = np.asarray(self.return_times, float)
+            if (
+                rows < 2
+                or len(self.return_positions) != rows * len(self.joint_names)
+                or not np.isfinite(self.return_positions).all()
+                or times[0] != 0
+                or np.any(np.diff(times) <= 0)
+            ):
+                raise ValueError("return path needs N >= 2 finite rows and times increasing from zero")
+
+
+#: HeldObject fields copied one to one to ``ibrobot_msgs/HeldObject``; ``frame_id``
+#: travels as ``header.frame_id`` and ``lifted_at_ns`` as ``lifted_at``.
+_HELD_WIRE_FIELDS = (
+    "custody_id",
+    "target_query",
+    "arm_side",
+    "joint_names",
+    "joint_positions",
+    "home_positions",
+    "radius_m",
+    "points_in_palm",
+    "effector_state_json",
+    "lift_m",
+    "observation_id",
+    "return_positions",
+    "return_times",
+    "contact_positions",
+)
+_HELD_SEQUENCES = frozenset(
+    {
+        "joint_names",
+        "joint_positions",
+        "home_positions",
+        "points_in_palm",
+        "return_positions",
+        "return_times",
+        "contact_positions",
+    }
+)
+
+
+def _check_custody(custody_epoch: str, state: str, owner: str, reason_code: str) -> None:
+    custody.validate_custody(state, owner, reason_code)
+    if not custody_epoch:
+        raise ValueError("a published custody needs its owner's epoch")
+
+
+def _fill_custody_fields(target, custody_epoch, state, owner, reason_code, goal_active) -> None:
+    target.schema_version = custody.SCHEMA_VERSION
+    target.custody_epoch = custody_epoch
+    target.state, target.owner, target.reason_code = state, owner, reason_code
+    target.goal_active = bool(goal_active)
+
+
+def fill_custody_msg(
+    target: object,
+    *,
+    custody_id: str,
+    arm_side: str,
+    custody_epoch: str,
+    state: str,
+    owner: str = "",
+    reason_code: str = "",
+    goal_active: bool = False,
+) -> None:
+    """Fill a generated ``ibrobot_msgs/HeldObject`` for a custody without a
+    carried object to describe (EMPTY, or RECOVERING / UNKNOWN without geometry).
+
+    Checked like ``fill_held_msg``; HELD always carries its object, so it raises.
+    """
+    _check_custody(custody_epoch, state, owner, reason_code)
+    if state == custody.HELD:
+        raise ValueError("a HELD custody carries its object: use fill_held_msg")
+    if not arm_side or not custody_id:
+        raise ValueError("a custody needs its arm and a non-empty custody_id")
+    target.custody_id, target.arm_side = custody_id, arm_side
+    _fill_custody_fields(target, custody_epoch, state, owner, reason_code, goal_active)
+
+
+def fill_held_msg(
+    target: object,
+    held: HeldObject,
+    *,
+    custody_epoch: str,
+    state: str,
+    owner: str,
+    reason_code: str = "",
+    goal_active: bool = False,
+) -> None:
+    """Fill a generated ``ibrobot_msgs/HeldObject`` without importing ROS.
+
+    The custody fields are checked against ``held_custody_contract`` first, so
+    a combination the owner must never publish raises before anything is set.
+    ``header.stamp`` is left to the publisher. A custody without an object to
+    describe uses ``fill_custody_msg``.
+    """
+    _check_custody(custody_epoch, state, owner, reason_code)
+    for name in _HELD_WIRE_FIELDS:
+        value = getattr(held, name)
+        setattr(target, name, list(value) if name in _HELD_SEQUENCES else value)
+    target.header.frame_id = held.frame_id
+    target.lifted_at.sec, target.lifted_at.nanosec = divmod(held.lifted_at_ns, 1_000_000_000)
+    _fill_custody_fields(target, custody_epoch, state, owner, reason_code, goal_active)
+
+
+def held_from_msg(message: object) -> HeldObject:
+    """The carried object of a generated ``ibrobot_msgs/HeldObject``.
+
+    Only for a custody that holds something: an EMPTY message has no geometry
+    and raises ValueError, like any other invalid one.
+    """
+    values = {
+        name: tuple(getattr(message, name)) if name in _HELD_SEQUENCES else getattr(message, name)
+        for name in _HELD_WIRE_FIELDS
+    }
+    stamp = message.lifted_at
+    return HeldObject(
+        **values,
+        frame_id=message.header.frame_id,
+        lifted_at_ns=stamp.sec * 1_000_000_000 + stamp.nanosec,
+    )
+
+
+@dataclass(frozen=True)
+class ContainerEstimate:
+    #: Convex opening vertices in base coordinates, ordered around its normal.
+    opening: np.ndarray
+    normal: np.ndarray
+    rim_height_m: float
+    report: Mapping = field(default_factory=dict)
+    scene: object = None
+
+    def __post_init__(self):
+        opening = _frozen(
+            self.opening,
+            float,
+            lambda a: a.ndim == 2 and a.shape[1] == 3 and len(a) >= 3 and np.isfinite(a).all(),
+            "opening needs finite Nx3 vertices",
+        )
+        normal = _frozen(
+            self.normal,
+            float,
+            lambda a: a.shape == (3,) and np.isfinite(a).all() and np.isclose(np.linalg.norm(a), 1),
+            "normal must be a unit vector",
+        )
+        object.__setattr__(self, "opening", opening)
+        object.__setattr__(self, "normal", normal)
+
+
+@dataclass(frozen=True)
+class PlacePlan:
+    transfer: tuple[Step, ...]
+    release: tuple[Step, ...]
+    retreat: tuple[Step, ...]
+    container: ContainerEstimate
+    report: Mapping = field(default_factory=dict)
+
+    def __post_init__(self):
+        if not any(isinstance(s, Move) for s in self.transfer):
+            raise ValueError("placement must move the held object")
+        if sum(isinstance(s, Effect) and s.action is EffectorAction.RELEASE for s in self.release) != 1:
+            raise ValueError("placement releases exactly once")
+        if any(isinstance(s, Effect) for s in (*self.transfer, *self.retreat)):
+            raise ValueError("transfer and retreat cannot actuate the hand")
+        if any(isinstance(s, Effect) and s.action is not EffectorAction.RELEASE for s in self.release):
+            raise ValueError("placement cannot close or preshape the hand")
+
+
+@dataclass(frozen=True)
+class PlaceVerdict:
+    success: bool
+    reason_code: str = ""
+    report: Mapping = field(default_factory=dict)
+
+
+class ContainerProposer(Protocol):
+    def propose(self, observation: Observation, query: str, held: HeldObject, *, deadline: float, cancelled: Flag): ...
+
+
+class PlacePlanner(Protocol):
+    def plan(
+        self, observation: Observation, container, held: HeldObject, *, deadline: float, cancelled: Flag
+    ) -> PlacePlan: ...
+
+    # Optional: the empty hand's collision-checked way home from where it is now.
+    # A drop during the place is EMPTY (DROPPED) and the Gateway's single return
+    # home may use this; the place itself never moves after a drop.
+    def plan_home(self, held: HeldObject, *, deadline: float, cancelled: Flag) -> Move: ...
+
+
+class PlaceVerifier(Protocol):
+    def verify(
+        self, observation: Observation, plan: PlacePlan, held: HeldObject, *, deadline: float, cancelled: Flag
+    ) -> PlaceVerdict: ...
+
+
+@dataclass(frozen=True)
+class PlaceBackends:
+    observation: ObservationSource
+    proposer: ContainerProposer
+    planner: PlacePlanner
+    verifier: PlaceVerifier
+    executor: MotionExecutor
+    effector: EndEffector
+    restore: Callable[[HeldObject], None]
+    close: Callable[[], None] = lambda: None

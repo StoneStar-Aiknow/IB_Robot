@@ -39,8 +39,8 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from manipulation_execution.pick.pipeline.contracts import GraspBackends, GraspFailure
 from manipulation_execution.pick.pipeline.perception import PerceptionServices
+from manipulation_execution.shared.contracts import GraspBackends, GraspFailure
 
 from .execution_watch import MAX_TIMEOUT_S, WatchTimeouts, finite_seconds
 from .feedback import FeedbackHistory

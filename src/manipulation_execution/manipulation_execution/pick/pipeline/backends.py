@@ -11,7 +11,7 @@ from __future__ import annotations
 import importlib
 from collections.abc import Mapping
 
-from .contracts import GraspBackends
+from manipulation_execution.shared.contracts import GraspBackends
 
 
 class BackendLoadError(ValueError):

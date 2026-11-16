@@ -184,12 +184,20 @@ def make_backends(*, node, grasp_execution, description) -> GraspBackends:
 | `grasp_execution` | 完整的 `grasp_execution` 配置映射，含 `backend_options`。 |
 | `description` | 绑定到机器人的 interface description。`runtime.provider` 已配置时取 `runtime.interface_description`。 |
 
-`GraspBackends` 的字段（`pick/pipeline/contracts.py`）：
+`GraspBackends` 的字段（`shared/contracts.py`，pick 和 place 共用）：
 
 - 必填 5 个：`observation`、`proposer`、`planner`、`executor`、`effector`。
 - `watch` 可选。没有 `watch` 时，管线不检查目标移动。
 - `close()` 在节点销毁时调用一次，后端在这里释放它创建的 ROS 资源。
 - `prepare()` 可选，见下节。
+- 其余字段可选，供后续 PR 迁入的功能使用（P1 只定接口，管线还不调用）：`held_object`、
+  `posture`、`container_detector`（pick 与 place 之间的持有物交接和预取）、`preshape`（与选臂无关的预成形）、
+  `verifier`（`GraspVerifier`，核对抓到的物体、部位和手指，失败时带 `failure_class`）、`prepare_retry`
+  （重试前回到观测位，与首次准备共用实现）。
+- `Effect` 可带参数：PRESHAPE 带 `grasp_type`，CLOSE 带 `fingers` 和 `target_force_n`；末端不能满足非空参数时
+  该步失败，不能忽略。`GraspFailure` 可带 `reason_code`、`failure_class` 和 `recoverable`。
+- place 用的类型（`HeldObject`、`ContainerEstimate`、`PlacePlan`、`PlaceBackends` 等）也在这里。`HeldObject`
+  以掌内点云为主，`radius_m` 是后端从点云导出的包络半径。
 
 节点拥有所有机器人共享的部分：goal 准入（`pick/goal.py`，规则与 `pick_executor_node` 一致）、
 单 goal 串行、预算、取消、feedback 和 result 映射。close 步骤的结果映射为

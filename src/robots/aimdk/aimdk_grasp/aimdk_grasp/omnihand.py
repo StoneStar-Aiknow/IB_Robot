@@ -25,8 +25,8 @@ from typing import Protocol
 
 import numpy as np
 
-from manipulation_execution.pick.pipeline.contracts import EffectorAction, EffectorOutcome, Flag
 from manipulation_execution.pick.pipeline.streaming import JointSample, received_at_or_stale
+from manipulation_execution.shared.contracts import EffectorAction, EffectorOutcome, Flag
 
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
 from .joints import LEFT_HAND

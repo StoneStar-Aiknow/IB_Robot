@@ -18,9 +18,9 @@ from test_grasp_pipeline import Effector, Executor, Proposer, Source, StreamingP
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity
 from ibrobot_msgs.action import PickObject
 from manipulation_execution.pick.goal import pick_goal_rejection, remaining_budget_s
-from manipulation_execution.pick.pipeline.contracts import EffectorAction, GraspBackends, MotionOutcome, MotionState
 from manipulation_execution.pick.pipeline.pipeline import PickOutcome
 from manipulation_execution.pick.pipeline_node import GraspPipelineNode, pipeline_config, verification_status
+from manipulation_execution.shared.contracts import EffectorAction, GraspBackends, MotionOutcome, MotionState
 
 ACTION = "/test/grasp_pipeline/execute_pick"
 FACTORY_CALLS = []
@@ -109,6 +109,44 @@ def test_admission_names_the_first_broken_rule():
     delegated = goal(config, now_s=now)
     delegated.supervised_direct, delegated.dispatch_binding.dispatch_nonce = False, "nonce-1"
     assert pick_goal_rejection(delegated, identity(config), now) == ""
+
+
+def test_new_goal_fields_the_executor_does_not_serve_are_refused_before_motion():
+    from embodied_common.pick_contract import GRASP_SPEC_INVALID, GRASP_SPEC_UNSUPPORTED, GraspCapability
+
+    config = configuration()
+    now = 1000.0
+
+    def spec(**fields):
+        message = goal(config, now_s=now)
+        message.grasp_spec.schema_version = 1
+        for name, value in fields.items():
+            setattr(message.grasp_spec, name, value)
+        return message
+
+    # An empty spec (schema_version 0) changes nothing.
+    assert pick_goal_rejection(goal(config, now_s=now), identity(config), now) == ""
+    for message in (
+        spec(avoid_parts=["rim"]),
+        spec(part="handle"),
+        spec(fingers=["thumb", "index"]),
+        spec(target_force_n=5.0),
+        spec(grasp_type="pinch"),
+    ):
+        assert GRASP_SPEC_UNSUPPORTED in pick_goal_rejection(message, identity(config), now)
+    newer = goal(config, now_s=now)
+    newer.grasp_spec.schema_version = 2  # a newer caller is refused as unsupported, never ignored
+    assert GRASP_SPEC_UNSUPPORTED in pick_goal_rejection(newer, identity(config), now)
+    assert GRASP_SPEC_INVALID in pick_goal_rejection(spec(target_force_n=-1.0), identity(config), now)
+    # An effector that declares a field may take it.
+    pinch = GraspCapability(grasp_types=("pinch",))
+    assert pick_goal_rejection(spec(grasp_type="pinch"), identity(config), now, pinch) == ""
+    for name in ("custody_id", "custody_epoch", "request_id"):
+        message = goal(config, now_s=now)
+        setattr(message, name, "c1")
+        assert "MODE_RECOVER" in pick_goal_rejection(message, identity(config), now)
+    recover = goal(config, now_s=now, mode=PickObject.Goal.MODE_RECOVER)
+    assert "unknown mode" in pick_goal_rejection(recover, identity(config), now)
 
 
 def test_pipeline_options_are_checked_and_verification_follows_the_close():

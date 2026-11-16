@@ -5,7 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from manipulation_execution.pick.pipeline.contracts import ArmSegment, MotionState, SegmentKind
 from manipulation_execution.pick.pipeline.sequence import GraspSequence
 from manipulation_execution.pick.pipeline.streaming import (
     CommandSample,
@@ -13,6 +12,7 @@ from manipulation_execution.pick.pipeline.streaming import (
     StreamConfig,
     StreamExecutor,
 )
+from manipulation_execution.shared.contracts import ArmSegment, MotionState, SegmentKind
 
 DRIVEN = ("l0", "l1", "l2")
 CHANNEL = DRIVEN + ("r0", "r1")
@@ -361,7 +361,7 @@ def test_a_sequence_ends_a_retreat_where_the_executor_says():
     class Executor:
         def return_home(self, home, *, cancelled):
             calls.append(home.name)
-            from manipulation_execution.pick.pipeline.contracts import MotionOutcome
+            from manipulation_execution.shared.contracts import MotionOutcome
 
             return MotionOutcome(MotionState.SUCCEEDED, "at the home command")
 
@@ -370,8 +370,8 @@ def test_a_sequence_ends_a_retreat_where_the_executor_says():
 
     backends = SimpleNamespace(executor=Executor())
     sequence = GraspSequence(backends)
-    from manipulation_execution.pick.pipeline.contracts import Effect, EffectorAction, GraspPlan, Move
     from manipulation_execution.pick.pipeline.sequence import SequenceResult
+    from manipulation_execution.shared.contracts import Effect, EffectorAction, GraspPlan, Move
 
     plan = GraspPlan((Move(line(np.zeros(3), np.ones(3))), Effect(EffectorAction.CLOSE)), 0)
     result = SequenceResult()
