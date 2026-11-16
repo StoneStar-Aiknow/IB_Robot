@@ -70,6 +70,7 @@ def generate_perception_model_nodes(
     instance_ids: set[str] | None = None,
     configuration_generation: int = 0,
     require_semantic_identity: bool = False,
+    use_sim_time: bool = False,
 ) -> list[Node]:
     runtime = parse_perception_runtime_config(robot_config)
     mapping = robot_config.get("semantic_mapping", {})
@@ -96,6 +97,13 @@ def generate_perception_model_nodes(
                     "configuration_generation": configuration_generation,
                     "require_semantic_identity": require_semantic_identity,
                     "runtime_options_json": json.dumps(dict(service.runtime_options), sort_keys=True),
+                    # R3 (lekiwi-nav-grasp-mobile-manipulation revision 2): a
+                    # model service whose consumers stamp against the
+                    # simulation clock must share it — the same generic clock
+                    # decision every other stamped consumer gets
+                    # (LaunchBuildContext.node_use_sim_time, physics platforms
+                    # only). Hardware and mock stay on wall time (default False).
+                    "use_sim_time": use_sim_time,
                 }
             ],
             additional_env=_graspgenx_npu_environment(service) or None,
@@ -143,7 +151,9 @@ def model_services_requested(context: LaunchBuildContext) -> bool:
 def build_perception_models(context: LaunchBuildContext) -> BuildResult:
     from inference_service.launch_builders.perception_models import generate_perception_model_nodes
 
-    return BuildResult(actions=list(generate_perception_model_nodes(context.robot_config)))
+    return BuildResult(
+        actions=list(generate_perception_model_nodes(context.robot_config, use_sim_time=context.node_use_sim_time))
+    )
 
 
 PERCEPTION_MODELS_BUILDER = BuilderSpec(

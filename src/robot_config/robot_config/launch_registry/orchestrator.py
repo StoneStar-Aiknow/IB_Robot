@@ -176,9 +176,14 @@ def build_prepared_launch(
     # the second plan pass reuses the resolved world without re-launching it.
     # On Gazebo that starts the world processes; on MuJoCo (D7) it resolves
     # the scene and spawn pose the provider include needs (no process).
+    # sim-platform-registry D5: the platform set comes from the registry —
+    # any registered physics platform whose provider owns the world side
+    # takes the bootstrap, not just the first-party names.
     world_prelude: list[Any] = []
     simulation_startup = None
-    if prepared.use_sim and prepared.sim_platform in ("gazebo", "mujoco"):
+    from robot_runtime.sim_platforms import is_physics_selection
+
+    if is_physics_selection(prepared.use_sim, prepared.sim_platform):
         sim_spec = next((spec for spec in plan.specs if spec.id == "simulation"), None)
         if sim_spec is not None:
             world_result = resolve_builder_factory(sim_spec.factory)(context)

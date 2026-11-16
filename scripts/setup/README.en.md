@@ -15,6 +15,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | `tests/test_openeuler_cv_bridge_abi.sh` | Tests installation of the OpenCV 4.13-compatible openEuler `cv_bridge` RPM. |
 | `tests/test_setup_profile_training.sh` | Asserts `--profile training` never triggers ROS 2 / rosdep / colcon while `full` / `inference` keep their behaviour. |
 | `tests/test_mujoco_sim_pin.sh` | Tests the three MuJoCo-sim-pin install orders, the benchmark `mujoco<3.9` constraint, the inference-profile skip, and the stdlib-only verification on an unbuilt workspace (issue #190). |
+| `tests/test_shrc_local_venv.sh` | Tests the `.shrc_local` `IBROBOT_VENV` selector: local-venv default, explicit override, fail-closed invalid values, and repeated-source idempotency on Bash + Zsh (temp fixtures only; no shared venv). |
 
 ## Setup profiles (dependency-scope parameterization)
 
@@ -93,7 +94,7 @@ libmujoco, therefore:
   package that is too old or broken names the apt command, because rosdep
   never upgrades an installed package.
 - The runtime adds a strict check
-  (`robot_runtime.mujoco.check_simulator_versions`): on an inconsistent or
+  (`robot_runtime_sim.mujoco.check_simulator_versions`): on an inconsistent or
   too-old simulator, `sim_platform:=mujoco` fails before model composition
   with an installation diagnostic.
 - openEuler ships no MuJoCo rpm: beyond the existing

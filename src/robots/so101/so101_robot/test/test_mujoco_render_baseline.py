@@ -22,8 +22,8 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 
-from robot_runtime.mujoco import render_robot_mjcf
 from robot_runtime.profile import load_profile
+from robot_runtime_sim.mujoco import render_robot_mjcf
 
 _GOLDEN = Path(__file__).resolve().parent / "golden_mjcf" / "so101_single_arm_mjcf_baseline.xml"
 

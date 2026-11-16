@@ -1,0 +1,7 @@
+# XPolicyLab wrapper config for the IB_Robot virtual runtime. RoboDojo's eval client
+# reads protocol / eval_batch from here; the policy server is the robodojo_runtime
+# ROS node (robodojo_robot/runtime_node.py), not XPolicyLab/setup_policy_server.py.
+policy_name: ibrobot_direct_control
+protocol: ws
+eval_batch: false
+action_type: joint

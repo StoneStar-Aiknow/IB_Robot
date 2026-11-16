@@ -49,16 +49,36 @@ def test_profile_declares_supported_platforms_and_default():
     assert data["simulated"] is False
 
 
-def test_profile_may_declare_mujoco_and_physics_platforms_vocabulary():
-    from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
-
+def test_profile_may_declare_first_party_and_unknown_platforms():
+    """D2: declaration is syntax — unknown platform names are valid declarations."""
     data = _minimal()
     data["sim_platforms"] = ["sdk", "gazebo", "mujoco"]
     data["sim_platform"] = "mujoco"
     validate_profile(data, "unit")
     assert data["sim_platform"] == "mujoco"
-    # the physics vocabulary is exactly the non-sdk platforms (D1)
-    assert set(PHYSICS_SIM_PLATFORMS) == set(SIM_PLATFORMS) - {"sdk"}
+    # an unregistered platform is a valid declaration too: a hardware-only
+    # host still loads a profile that lists it (registration is required
+    # only for the effective selection, never at load time)
+    unknown = _minimal()
+    unknown["sim_platforms"] = ["sdk", "testsim"]
+    unknown["sim_platform"] = "testsim"
+    validate_profile(unknown, "unit")
+    assert unknown["sim_platform"] == "testsim"
+
+
+def test_profile_loading_never_consults_the_registry(monkeypatch):
+    """D2: profile loading with a raising discovery still loads a gazebo-listing profile."""
+    import robot_runtime.sim_platforms as sim_platforms
+
+    def _raise(*, entry_points=None):
+        raise AssertionError("profile loading must not query the sim-platform registry")
+
+    monkeypatch.setattr(sim_platforms, "discover_sim_platforms", _raise)
+    data = _minimal()
+    data["sim_platforms"] = ["sdk", "gazebo", "mujoco"]
+    data["sim_platform"] = "gazebo"
+    validate_profile(data, "unit")
+    assert data["sim_platform"] == "gazebo"
 
 
 def test_simulated_alias_disagreeing_with_use_sim_fails_naming_both():
@@ -69,7 +89,7 @@ def test_simulated_alias_disagreeing_with_use_sim_fails_naming_both():
         validate_profile(data, "unit")
 
 
-@pytest.mark.parametrize("sim_platforms", [[], "gazebo", ["sdk", "sdk"], ["teleport"]])
+@pytest.mark.parametrize("sim_platforms", [[], "gazebo", ["sdk", "sdk"], ["Gazebo"], ["teleport-fast!"]])
 def test_invalid_sim_platforms_list_rejected(sim_platforms):
     data = _minimal()
     data["sim_platforms"] = sim_platforms
@@ -79,8 +99,15 @@ def test_invalid_sim_platforms_list_rejected(sim_platforms):
 
 def test_unknown_sim_platform_value_rejected():
     data = _minimal()
-    data["sim_platform"] = "teleport"
-    with pytest.raises(ProfileError, match="'sim_platform' must be one of"):
+    data["sim_platform"] = "teleport"  # an identifier: valid syntax, outside the declared set
+    with pytest.raises(ProfileError, match=r"sim_platform 'teleport'.*not in the supported platforms \['sdk'\]"):
+        validate_profile(data, "unit")
+
+
+def test_malformed_sim_platform_value_rejected():
+    data = _minimal()
+    data["sim_platform"] = "teleport-fast!"  # not an identifier: rejected outright (D2)
+    with pytest.raises(ProfileError, match="must be an identifier matching"):
         validate_profile(data, "unit")
 
 

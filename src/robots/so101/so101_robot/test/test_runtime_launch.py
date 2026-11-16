@@ -18,6 +18,7 @@ from pathlib import Path
 
 import launch
 import yaml
+from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
 _PACKAGE = Path(__file__).resolve().parents[1]
@@ -39,8 +40,7 @@ def _render(extra):
         "simulated": "",
         "use_sim": "",
         "sim_platform": "",
-        "gazebo_world": "",
-        "mujoco_scene": "",
+        "sim_world": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.0",
@@ -91,7 +91,7 @@ def test_gazebo_platform_threads_world_spawn_pose_and_sim_time():
         {
             "use_sim": "true",
             "sim_platform": "gazebo",
-            "gazebo_world": "demo",
+            "sim_world": "demo",
             "spawn_x": "0.5",
             "spawn_y": "-0.25",
             "spawn_z": "0.1",
@@ -110,8 +110,6 @@ def test_gazebo_platform_threads_world_spawn_pose_and_sim_time():
     assert _text(motion_args["motion_hardware_feedback_topic"]) == ""
 
     # the create node waits behind the clock handler and carries the full pose
-    from launch.actions import RegisterEventHandler
-
     deferred = []
     for action in actions:
         if isinstance(action, RegisterEventHandler):
@@ -131,9 +129,13 @@ def test_unknown_platform_fails_fast_before_any_action():
 
     from robot_runtime.launch_support import RuntimeProfileError
 
-    # a platform outside the runtime vocabulary fails on the spot
-    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'webots'"):
+    # a well-formed platform the profile does not declare fails naming the
+    # profile's declared set (sim-platform-registry D2)
+    with pytest.raises(RuntimeProfileError, match="'webots' is not supported by this runtime profile"):
         _render({"use_sim": "true", "sim_platform": "webots"})
+    # a malformed name still fails as an unknown platform, before the profile check
+    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'web-ots'"):
+        _render({"use_sim": "true", "sim_platform": "Web-Ots"})
 
 
 def test_gazebo_platform_applies_a_peripheral_toggle_exactly_once(tmp_path):
@@ -218,9 +220,36 @@ def test_physical_selection_passes_no_platform_to_the_facade():
     )
 
 
-def test_provider_gazebo_urdf_mounts_cameras_at_the_runtime_poses(tmp_path):
-    from robot_runtime.launch_support import render_gazebo_description
+def test_provider_gazebo_render_freezes_the_gripper_effort(tmp_path):
+    """lekiwi-nav-grasp D7 "Gazebo gripper effort" (task 2.0b): only the
+    Gazebo render path applies the profile's platform-scoped
+    simulation.gazebo.xacro_args — the Gazebo-simulated joint-6 limit is
+    the PROFILE's frozen measured value (the URDF default 10 ejects the
+    grasped cube), while every hardware/SDK/MoveIt render keeps the
+    default 10 byte-identically (review round 1, item 10: the value lives
+    in the profile, no longer a launch_support constant)."""
+    import xml.etree.ElementTree as ET
+
+    from robot_runtime.launch_support import render_robot_description
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
+
+    def joint_six_effort(urdf):
+        root = ET.fromstring(urdf)
+        return root.find("joint[@name='6']/limit").get("effort")
+
+    profile = load_profile(_PROFILE)
+    # the frozen measured value flows from the PROFILE through the render
+    frozen = str(profile["simulation"]["gazebo"]["xacro_args"]["gripper_effort"])
+    gazebo = render_gazebo_description(profile, _PROFILE, spawn_pose=(0.0, 0.0, 0.0, 0.0))
+    assert joint_six_effort(gazebo) == frozen
+    hardware = render_robot_description(profile, _PROFILE, simulated=False)
+    assert joint_six_effort(hardware) == "10"
+
+
+def test_provider_gazebo_urdf_mounts_cameras_at_the_runtime_poses(tmp_path):
+    from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     profile = load_profile(_PROFILE)
     urdf = render_gazebo_description(profile, _PROFILE, spawn_pose=(0.0, 0.0, 0.0, 0.0))
@@ -244,9 +273,9 @@ def test_provider_gazebo_urdf_mounts_cameras_at_the_runtime_poses(tmp_path):
 
 
 def test_saved_camera_override_takes_precedence_on_the_provider_path(tmp_path, monkeypatch):
-    from robot_runtime.gazebo import camera_sensor_urdf
     from robot_runtime.peripherals import merge_peripherals
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo import camera_sensor_urdf
 
     home = tmp_path / "home"
     override_dir = home / ".ros" / "ibrobot" / "sim_camera_overrides"
@@ -280,8 +309,8 @@ def test_shipped_profile_declares_mujoco_and_keeps_the_golden_camera_poses():
     """The MuJoCo defaults are runtime-owned and hold the provider-less
     path's preset values verbatim (top/wrist) plus the old generic base
     preset for front."""
-    from robot_runtime.mujoco import resolve_mujoco_camera_pose
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.mujoco import resolve_mujoco_camera_pose
 
     profile = load_profile(_PROFILE)
     assert "mujoco" in profile["sim_platforms"]
@@ -315,7 +344,7 @@ def _inject_simulator_versions(monkeypatch):
     """
     import mujoco
 
-    import robot_runtime.mujoco as mujoco_helpers
+    import robot_runtime_sim.mujoco as mujoco_helpers
 
     monkeypatch.setattr(
         mujoco_helpers,
@@ -324,7 +353,7 @@ def _inject_simulator_versions(monkeypatch):
     )
 
 
-def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
+def test_sim_world_argument_reaches_the_mujoco_composition(monkeypatch):
     import sim_models.scene_compiler as scene_compiler
 
     _inject_simulator_versions(monkeypatch)
@@ -336,7 +365,7 @@ def test_mujoco_scene_argument_reaches_the_composition(monkeypatch):
         return Path("/tmp/ibrobot_fake_composed.mjb")
 
     monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
-    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "mujoco_scene": "pick_banana"})
+    actions = _render({"use_sim": "true", "sim_platform": "mujoco", "sim_world": "pick_banana"})
     assert captured["scene"] == "pick_banana"
     assert captured["sdf_meshes"] == ["wrist_roll_follower", "moving_jaw"]
     mujoco_nodes = [
@@ -366,7 +395,7 @@ def test_mujoco_version_mismatch_fails_the_launch_setup(monkeypatch):
     import mujoco
     import pytest
 
-    import robot_runtime.mujoco as mujoco_helpers
+    import robot_runtime_sim.mujoco as mujoco_helpers
     import sim_models.scene_compiler as scene_compiler
     from robot_runtime.launch_support import RuntimeProfileError
 
@@ -390,8 +419,8 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
     """D3/D6: the camera plugin parameters ride a params file keyed under the
     upstream mujoco_ros2_control_node name."""
     import sim_models.scene_compiler as scene_compiler
-    from robot_runtime.launch_support import MUJOCO_SIMULATION_NODE
-    from robot_runtime.mujoco import CAMERA_PLUGIN_INSTANCE, CAMERA_PLUGIN_TYPE
+    from robot_runtime_sim.mujoco import CAMERA_PLUGIN_INSTANCE, CAMERA_PLUGIN_TYPE
+    from robot_runtime_sim.mujoco_embodiment import MUJOCO_SIMULATION_NODE
 
     _inject_simulator_versions(monkeypatch)
     monkeypatch.setattr(
@@ -429,11 +458,11 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
 
 
 def test_provider_alone_empty_scene_composes_ground_and_light(tmp_path):
-    """5b.2: provider-alone with an empty mujoco_scene carries the lit ground."""
+    """5b.2: provider-alone with an empty sim_world carries the lit ground."""
     import mujoco
 
-    from robot_runtime.launch_support import render_mujoco_description
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.mujoco_embodiment import render_mujoco_description
     from sim_models.scene_compiler import composed_model_path
 
     profile = load_profile(_PROFILE)
@@ -452,8 +481,8 @@ def test_advertised_camera_frames_are_identical_on_every_platform():
     import xml.etree.ElementTree as ET
 
     from robot_runtime.interface_description import build_description
-    from robot_runtime.launch_support import render_mujoco_description
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.mujoco_embodiment import render_mujoco_description
 
     profile = load_profile(_PROFILE)
     cameras = [str(p["name"]) for p in profile.get("peripherals") or [] if p.get("type") == "camera"]
@@ -476,7 +505,7 @@ def test_advertised_camera_frames_are_identical_on_every_platform():
     description = render_mujoco_description(profile, _PROFILE, profile.get("peripherals"), scene="")
     root = ET.fromstring(description)
     assert root.findall(".//ros2_control/sensor") == []
-    from robot_runtime.mujoco import camera_plugin_parameters
+    from robot_runtime_sim.mujoco import camera_plugin_parameters
 
     instance = camera_plugin_parameters(profile, profile.get("peripherals"))["mujoco_plugins"]["ibrobot_cameras"]
     plugin_frames = {
@@ -592,8 +621,8 @@ def test_override_top_resolution_reaches_every_consumer(tmp_path):
     mujoco_description = _facade_description(actions)
     configured = mujoco_description["interfaces"]["camera.top.color"]["configured_profile"]
     assert (configured["width"], configured["height"]) == (1280, 720)
-    from robot_runtime.mujoco import mujoco_camera_publish_rate
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.mujoco import mujoco_camera_publish_rate
 
     profile = load_profile(_PROFILE)
     merged = merge_peripherals_for_test(profile, fragment)
@@ -673,3 +702,35 @@ def test_launch_declares_the_peripherals_argument():
         if isinstance(action, DeclareLaunchArgument)
     }
     assert "peripherals" in names
+
+
+def test_provider_gazebo_render_uses_the_coacd_jaw_hulls():
+    """lekiwi-nav-grasp D7 (maintainer decision 2026-10-29): the Gazebo render
+    path collides with the same CoACD jaw hulls MuJoCo simulates
+    (wrist_roll_follower_col_*/moving_jaw_col_*, poses as so101.xml.template)
+    so both physics platforms present the same grasp geometry; the hardware
+    render keeps the raw jaw STLs byte-identically."""
+    import xml.etree.ElementTree as ET
+
+    from robot_runtime.launch_support import render_robot_description
+    from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
+
+    def jaw_collision_meshes(urdf):
+        root = ET.fromstring(urdf)
+        return {
+            link.get("name"): sorted(
+                mesh.get("filename").rsplit("/", 1)[-1].removesuffix(".stl")
+                for mesh in link.findall("collision/geometry/mesh")
+            )
+            for link in root.findall("link")
+            if link.get("name") in ("gripper", "jaw")
+        }
+
+    profile = load_profile(_PROFILE)
+    gazebo = jaw_collision_meshes(render_gazebo_description(profile, _PROFILE))
+    assert gazebo["jaw"] == sorted(f"moving_jaw_col_{i}" for i in range(8))
+    assert gazebo["gripper"] == sorted(["sts3215_03a_v1"] + [f"wrist_roll_follower_col_{i}" for i in range(8)])
+    hardware = jaw_collision_meshes(render_robot_description(profile, _PROFILE, simulated=False))
+    assert hardware["jaw"] == ["moving_jaw_so101_v1"]
+    assert hardware["gripper"] == ["sts3215_03a_v1", "wrist_roll_follower_so101_v1"]

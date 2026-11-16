@@ -1,5 +1,75 @@
 # inference_service
 
+## Dynamic runtime creation and process ownership
+
+`runtime_creation` is an explicit construction transaction. When scheduling is enabled,
+`RuntimeEnvironment` acquires Global initialization ownership before loading, binds a single
+runtime and publishes its host. Global unavailability never authorizes a local fallback.
+Disabled scheduling and explicit simulation/offline purposes retain process cleanup ownership
+without Global admission. Existing direct callers are not forced through this new entry point.
+Custom `RuntimeProviders.create(acl_provider, admissions)` also creates this process owner by
+default, without ROS entities while scheduling is disabled. Default and injected providers
+consume the same node scheduling configuration and share the same shutdown entry point.
+
+`load_model_runtime` uses `ModelRuntimeFactory.load_session` with explicit registries and
+providers for both tensor and domain Sessions. `load_streaming_model_runtime` shares that
+assembly and rollback path; its Session must supply all four stream operations and a matching
+validated stream contract. No separate native-runtime wrapper is introduced. Policy stage
+binding and business host migration remain separate changes.
+Session builders create unloaded descriptors and validate arguments. Native resources must be acquired
+in Session.load(), after Factory/Handle owns rollback. Assembly failures after a Session is returned
+use that Session's cleanup path.
+
+Placement preserves the shared identity contract: Torch CUDA/NPU profiles without a resolved
+device index are rejected before initialization, never silently assigned to device zero.
+Disabled scheduling does not introduce this online placement check.
+
+The Global directory supports dynamic lifecycle groups, boot/generation fencing and replayable
+initialization begin/finish/abort receipts. UNKNOWN keeps a resource quarantined. Public Close
+retains ownership and transport until native cleanup and Global retirement are proven; retries
+reuse the original operation identity. `HostRequests` and `host_stop_signals` stop admission
+while control callbacks remain available within the shutdown budget. Callers must still close
+their providers and handle pending cleanup.
+
+Global's ledger is in memory. Restarting Global while retaining old Hosts is unsupported.
+After a Global crash or ledger loss, stop every old Host and establish completion of its native device
+work before starting Global and Hosts together. Process exit alone is not device-completion evidence;
+without that evidence, no new loading or execution may start. Supervisors must not restart Global alone.
+An old epoch is checked only when that Host reports: `COORDINATED_RESTART_REQUIRED` neither proves
+cross-restart device ownership nor blocks a new initialization that arrives first.
+
+If a receiver explicitly reports missing recovery history after the retry window, Reset cannot
+be replayed on that evidence. If Global confirms that the old receipt is absent, the current call
+still reports an unknown outcome and releases its cached ID. A later explicit Reset uses a new ID;
+the current call never automatically repeats Reset. Global only collects settled receipts or those
+superseded by a new recovery barrier. Close may start a new drain/cleanup transaction; Host command
+retries are limited to repeatable drain, irreversible Close and generation-checked activation.
+Retirement of the same boot settles completed non-Close receipts without shortening their
+replay windows. UNKNOWN ownership does not expire merely with time.
+An explicit `OPERATION_EXPIRED` rejection of the first recovery send releases its ID for a later call.
+While the receipt still exists, retries after lost replies or unknown results retain its identity and UNKNOWN quarantine.
+
+Full Session execution uses the `model_runtime` composition identity; role and Session stream execution use
+`model_runtime/role` and `model_runtime/stream`. Their workload profiles are not interchangeable.
+`load_model_runtime` derives this identity from `role_execution` / `streaming_execution`. Explicit
+`runtime_creation` scopes declare `session_execution="full"|"role"|"stream"` (default: full).
+Targets must match the actual load options and execution choice, which Factory checks before the Session builder.
+Business adapter/stage targets remain part of their host migration PRs.
+The first construction atomically reads and freezes provider configuration. Without providers, explicit hosts
+retain an environment on the node so the same freeze applies across calls. Explicit targets consume the node
+endpoint and initialization timeout, and creation confirms registration before returning. Publication reuses
+the temporary control executor when the node has no serving executor. Disabled online scheduling treats target
+descriptors as dormant and permits local loading; local construction does not freeze the ROS domain.
+Runtime discovery's `configured_target_id` and the ROS parameter `configured_target_ids` require exact,
+full catalogue IDs such as `perception/depth_front`. Configuration compilation's `instance_ids` still
+select service IDs such as `depth_front`; these selectors are not interchangeable.
+Initialization waits for already accepted requests queued on the same device.
+Before dynamic loading or reloading, callers must pause new submissions on that device and drain accepted work.
+Initialization acquires permission only when the device is idle. Busy retries do not reserve a queue position
+or guarantee progress under continuous traffic. Resume business submissions after creation completes.
+Global acknowledges receipt of failure evidence before Host can collect it after the replay window; Global keeps
+UNKNOWN quarantined. Host reserves drain and Close/activation capacity, and Global reserves a Close transaction.
+
 `inference_service` is IB-Robot's unified inference runtime. It selects one model bundle and one named deployment,
 then runs the model through Torch, Ascend, Hisilicon, RKNN, or HMM. Policy models additionally use a stable pipeline
 ID and support monolithic or distributed edge/cloud execution.
@@ -24,6 +94,7 @@ leases, buffers, and workers.
 
 `runtime_context_defaults` scopes the `priority_scheduling` and `managed_execution` defaults to one context.
 Explicit values take precedence; leaving the context restores the previous values and other threads do not inherit them.
+Public local and isolated construction override both scoped defaults to False.
 Pipeline and Manager factories inherit the scoped priority default when the argument is omitted; explicit False overrides it.
 Standalone `AscendOmModelSession` construction reads the same priority default.
 The existing monolithic policy node sets both defaults from `robot.runtime_scheduler.enable`:
@@ -32,7 +103,9 @@ Typed model services do not yet consume that switch; the policy interface does n
 `TorchModelSession` and `LeRobotTorchModelSession` share `torch_execution_scope()`. Failures preserve the original
 exception and its execution, recovery and cleanup evidence. Synchronization supplements completion evidence for work
 that has started; explicit pre-execution rejection stays NOT_STARTED. Successful inference adds a
-completion wait only with `managed_execution=True`. Failure and close wait in both modes; LeRobot reset also waits
+completion wait only with `managed_execution=True`. Managed loading also drains the selected device before READY
+and initialization settlement. Both Torch Session types expose that drain for UNKNOWN recovery; Sessions without
+native reset support still require Close and reconstruction. Failure and close wait in both modes; LeRobot reset also waits
 before mutating policy state. A direct result discarded on delivery timeout or cancellation also waits for device
 completion; a failed wait retains an unknown outcome. The public Session API remains available.
 Raw cancellation or deadline exceptions inside a callable still require a device fence; their default flags are not
@@ -52,7 +125,8 @@ and fault recovery retain conservative device-wide waits. `force_completion_on_e
 `complete_on_success` independently controls successful-return completion. SpeechDirection FullSubNet Torch
 also uses completion checks on execution failure and fences fault recovery/Close, retaining resources if completion fails.
 A device stuck in a sticky error never reports completion; after 2 consecutive failed close drains the
-executor abandons the wait, releases the references, and lets close terminate. The abandoned completion
+local executor abandons the wait, releases the references, and lets close terminate. Managed Torch Sessions retain
+resources until synchronization succeeds. The abandoned local completion
 state is unknown and the abandonment is logged.
 Healthy FullSubNet reset reuses completion proved by its host output and does not wait for unrelated streams.
 After reset initializes state, only the CUDA stream submitting that initialization is synchronized.
@@ -101,6 +175,7 @@ Video codec probing treats FFmpeg driver errors as an unavailable device.
 `LoadRollback` releases resources in reverse order and retains a failing callback and its dependencies for retry.
 `ModelSession` and the Factory share this rollback mechanism. Factory errors expose a retryable `cleanup_owner`.
 `RuntimeProviders.retain_cleanup()` retains failed Factory and plugin construction owners until shutdown retries them.
+When a creation scope supplies neither node nor providers, the Factory's providers retain unfinished Handle cleanup.
 Perception and ZipVoice plugins first close a failed Handle and retain it only when cleanup is unfinished.
 ZipVoice marks itself closed only after Handle Close succeeds and keeps the original load error when rollback fails. Manager startup failures expose
 their cleanup owner. Pipeline and Model Service nodes transfer pending shutdown to providers before dropping ownership.
@@ -959,3 +1034,198 @@ String stream IDs have idempotent Close receipts for the most recent 128 closure
 Direct stateless synchronous errors retain known completion unless native evidence says otherwise. LeRobot CUDA/NPU
 execution pins the resolved device at load; resource domains remain conservative device-family groups such as
 `torch:npu`, not per-device identifiers.
+
+## Common runtime scheduling
+
+The foundation provides native/session factories, host execution control, shared
+FIFO/EDF device queues, v2 workload profiles and `global_runtime_scheduler_node`.
+Membership supports dynamic registration. Existing policy scheduling, profiles and direct
+callers remain available.
+
+### Configuration and execution boundary
+
+The public infrastructure covers PR-06 through PR-16, including policy/perception configuration compilation.
+Callers use the public creation boundary or supply explicit `RuntimeExecutionTarget` descriptors.
+Host and Global must agree on resource descriptors.
+Existing business launches do not automatically create these components.
+
+| Global node parameter | Default and constraint |
+| --- | --- |
+| `runtime_targets_json` | `[]`; an array of initial targets with unique Host endpoints. |
+| `runtime_resources_json` | `{}`; resource objects keyed by `hardware_resource_id`. |
+| `runtime_scheduler_endpoint` | `/inference/runtime/v1`; must differ from every Host endpoint. |
+| `priority_zero_policy` | `fifo` or `edf`; the old `global_policy` name is rejected. |
+| `status_stale_timeout_ns` | `2000000000` ns; must exceed two heartbeat intervals (200 ms). |
+| `profile_min_samples` | `10000`; the ROS production minimum is 10000. |
+| `profile_max_age_days` | `30`; a positive integer. |
+
+Required Target fields are `target_id`, `endpoint`, `hardware_resource_id`, `physical_device`,
+`deployment_fingerprint`, `composition_fingerprint`, `lifecycle_group`, `configuration_generation`,
+`interface`, `model_type` and `operation`. Use the loaded deployment fingerprint and the actual composition
+identity. The Adapter checks loaded deployment/device identity; the caller remains responsible for the
+composition descriptor. Defaults per Target are 1 in-flight execution, 8 pending requests, 4096 records,
+64 MiB each of retained inputs/results, a 5000 ms request timeout and a 30000 ms retry window.
+See `inference_manifest.runtime_target` for target fields and shared validation.
+A lifecycle group contains at most 16 members and its complete control envelope must fit 32 KiB.
+Configuration, initialization and group binding validate that aggregate budget.
+Initial admission windows are capped at 300 seconds independently of the caller's total model loading budget.
+
+Each resource requires `physical_device`; `mode` defaults to `serial`. `ascend_concurrent` requires
+`verified_concurrency=true` and backend concurrency evidence. Prediction requires serial FIFO,
+`managed_coverage=true`, a hardware fingerprint, and predictive profiles for every Target sharing the resource.
+Resource and Target mode, prediction flag, hardware fingerprint and safety margin must agree.
+
+Host and Global must run on the same machine: operation identity uses the Linux boot clock and monotonic
+expiry, not ROS simulation time. Bind with `SchedulerRuntimeAdapter(node, target, handle)` after loading
+Sessions inside `runtime_context_defaults(priority_scheduling=False, managed_execution=True)`. Business callers then use the existing
+Handle `execute`, `reset` and `close` APIs. Public `runtime_creation` and `bind_runtime` also support
+managed stream Open, step, Reset and Close. Business streaming hosts still require migration.
+Direct single-stream Sessions retain their existing stream contract.
+`create_session()` returns an unloaded Handle. An in-process Controller may bind it before loading;
+the ROS Adapter rejects a validated, unloaded Handle with `RUNTIME_LOAD_REQUIRED` before binding.
+CUDA/NPU device indices are resolved during loading.
+
+`create_session(role_execution=True)` rejects deployments with `device_links`: separate role calls cannot
+establish one producer/consumer request transaction. Complete executors that use device links continue through
+the existing assembly entry. Role execution requires non-empty deployment roles and a callable Session
+`execute_role()` method. The Factory rejects unsupported combinations before loading and rolls back
+any constructed Session. Domain Torch callbacks run under `torch.no_grad()` in the executing thread.
+Algorithms requiring local differentiation must explicitly enable it and return detached results.
+Callbacks transfer output storage: neither the SDK nor the callback may mutate returned storage on later
+requests or Close. An SDK that reuses output buffers requires the callback to return an independent NumPy
+`copy()` or Torch `detach().clone()`; a view or `detach()` alone does not copy storage. Perform device copies
+inside the callback so the existing execution scope also owns their completion barrier.
+`create_session()` and `load_session()` do not orchestrate executor-owned iteration: deployments declaring
+`iterative` with `orchestration_visibility=executor` must use an existing iterative assembler.
+Both entries call `BackendRegistry.validate()` with the selected registry and `allowed_deployments`
+before constructing a Session.
+
+### Control, results and shutdown
+
+Global supports `describe`, `register`, `measurements`, `submit`, `query` and `cancel`.
+Host supports `execute`, `query`, `cancel` and `ack`. Only identity and execution evidence cross the control
+service; business data and results remain in the Host. `<runtime_scheduler_endpoint>/ready` is a
+`std_srvs/Trigger` readiness service.
+
+The Host freezes inputs before calculating request identity. Result capacity charges supported retained
+storage. Torch results owning an autograd graph or `.grad` payload fail with `RESULT_RETAINS_AUTOGRAD`.
+External NumPy CPU buffers and non-resizable CPU Tensor storage are copied into independent results and charged.
+Non-resizable device Tensor storage remains unsupported; result retention does not copy device data.
+Opaque objects, structured NumPy dtypes, dtypes with object references or metadata (including nested
+field/subarray dtypes and retained array bases), and quantized Torch inputs/results are rejected.
+Input mapping keys, identity selectors and request IDs must be plain `str` values.
+The Host validates control encoding and its byte budget before retaining an operation record;
+this covers the longest request envelope and receipts with a 256-character error and 64-bit timestamps.
+Unencodable or oversized priority values do not consume record capacity.
+Ordinary owned NumPy/Torch storage is retained without copying and shared allocations are charged once.
+Accounting proves allocation size, not exclusive mutation rights: producers must stop mutating returned
+storage. Borrowed mutable outputs are unsupported; the Controller does not implicitly copy every result.
+Limits do not bound process RSS or model caches. Abandoning a business waiter never releases unproven execution
+ownership: only `NOT_STARTED` proves
+that execution did not begin; `UNKNOWN` remains quarantined and holds resources.
+
+Completed, acknowledged history leaves the dispatch/report loop while remaining available for query and
+idempotent replay. Global collects it only after both the retry window and business deadline expire.
+
+Hosts actively report terminal evidence and replay unacknowledged receipts; Query reconciles lost responses.
+Each Host scans and sends at most 32 terminal reports per callback, including backoff entries in the scan budget.
+Each Host retains at most 64 in-flight terminal RPCs. Fresh evidence enters ahead of the replay backlog; retries rotate.
+Stage peers publish their complete lifecycle group through `bind_registration_group()`.
+Independent models use distinct lifecycle groups. Concurrent Host Close is supported.
+Wait for Global to confirm each retirement through its owner's
+`shutdown_pending()` view. Neither local Close return nor the Host's ACK flag proves Global confirmation.
+When Close releases resources but retains a cleanup diagnostic, the Host includes `close_complete=true`
+in its terminal report. Global preserves the diagnostic and retires after the ACK barrier; an error
+terminal without release evidence cannot authorize retirement.
+Keep Host transport and executors alive until confirmation; then reclaim transport at the owning executor's
+quiescent boundary, or stop the executor before destroying the node.
+
+Concurrent Close, shared lifecycle groups, lost-ACK recovery and dynamic retirement are available in public infrastructure.
+After the final unregister, Global serves response replays for one control RPC budget (5 seconds).
+Retain owners when cleanup is unknown; rebinding cannot bypass quarantine. An invalid `boot_id` is rejected
+before binding, so the same Handle can retry with corrected parameters.
+Native Torch SDK Close errors permit another SDK Close only with explicit `NOT_STARTED` evidence.
+An unknown release outcome retains the owner and requires process restart; a successful SDK Close is not
+repeated if the subsequent device drain fails.
+
+### Continuous sampling and profile generation
+
+Global retains only the latest 1024 measurements, so an export after the experiment cannot produce a
+production profile. `runtime_profile_collect` continuously follows an epoch-bound cursor and writes JSONL
+for one Target. It starts at the latest sequence at collector startup and records only subsequent samples.
+Before creating the output file, the collector checks the paginated fixed catalogue for an identical Target.
+An absent or mismatched Target, or an epoch change during that check, fails immediately.
+Overrun, epoch change or identity mismatch stops collection with an error. The existing prefix remains for
+diagnosis; it is not a complete collection. Retry into a new output file.
+
+Prerequisites: a serial resource with owner-attested `managed_coverage=true`, accurate hardware fingerprint
+and runtime version, prediction disabled during sampling, and a warmed-up model. Collect at least 10000
+successful samples per workload bucket using representative and expensive contents.
+
+1. Save the Target descriptor used by Host and Global as `target.json`.
+2. Start collection:
+
+```bash
+source .shrc_local && ros2 run inference_service runtime_profile_collect \
+  --target target.json --endpoint /inference/runtime/v1 \
+  --output models/_work/my_model/profiling/warm-samples.jsonl --count 10000
+```
+
+3. After the output file appears, submit the workload from another terminal.
+4. After successful collector exit, generate the profile:
+
+```bash
+source .shrc_local && ros2 run inference_service runtime_profile \
+  --target target.json --samples models/_work/my_model/profiling/warm-samples.jsonl \
+  --output models/_work/my_model/profiling/runtime.json --min-samples 10000 --margin 1.2
+```
+
+`--count` is the total for the Target, not for each bucket. Increase it for multiple buckets until every
+bucket meets the threshold; the writer rejects undersampled buckets. Estimates use each bucket's maximum
+observed occupancy multiplied by the margin. Occupancy includes dispatch through terminal confirmation,
+not kernel time alone. An empirical bound is not a worst-case execution-time proof.
+The writer accepts at most 1,000,000 samples per profile and operation identifiers of at most 127 characters
+using the control protocol's identifier syntax. These limits bound deduplication state even when the JSONL
+reader streams a larger file. At the production minimum, at most 100 fully sampled buckets fit in one run.
+Exceeding a limit rejects the run before replacing an existing profile.
+
+5. Set the Target's `profile_path` to the generated file.
+6. Enable predictive admission on the resource and all participating Targets.
+7. Restart Global and Hosts and verify readiness.
+
+A v2 profile must match deployment, composition, resource, device, mode, execution kind, hardware fingerprint,
+runtime version and declared observation inputs. Legacy policy profiles cannot be reused. Keep conversion
+and sampling artifacts under `models/_work/`.
+
+Explicit `runtime_creation(node=..., targets=...)` removes construction records after confirmed Close.
+`run_model_node()` collects retired transport between `spin_once()` calls and defaults to two executor
+threads, including hosts that load models after their first spin. Its default business callback group serializes
+synchronous callers. `HostRequests.request(context)` rejects concurrent or nested reuse of the same context before
+entering business code; the original scope remains tracked for cancellation and drain.
+Explicit hosts read `runtime_scheduler_enabled` (default false); target descriptors do not enable scheduling.
+Custom executors must leave a worker available for control responses and call
+`collect_node_runtime_transport(node, executor)` between spins on the sole spin owner.
+Bare `executor.spin()` does not provide ongoing entity collection. Library callers needing an independent
+control thread use `RuntimeEnvironment`.
+
+Recovery receipts retain their immutable request identity across renewed windows. Host receipts remain until
+Global acknowledges the result; Global receipts remain until their caller acknowledges completion. Expiry alone
+cannot discard unacknowledged recovery evidence. Business waiters and background terminal reporting share one
+receipt. Background acknowledgement also adds closed streams to the bounded 128-entry history. Bindings on one
+detached node serialize temporary control-executor ownership. `max_registered_targets` counts configured targets
+and retained directory entries; `MAX_RUNTIME_GROUP_MEMBERS` defines the shared lifecycle-group limit.
+
+Resource drain proves completion of old work, not Reset of every model. Close never resets another
+lifecycle group's model. Only configured required targets impose resource-wide business readiness;
+a clean dynamic peer may still need its own Reset without blocking healthy peers. Reset registration
+refresh requires readiness of its own lifecycle group, not the whole device. A completed Reset remains
+completed if registration or its final ACK fails; retry settles the same receipt. A cancelled
+recovery-lock waiter cannot change the active owner's outcome.
+
+While a resource is fenced, an expired clean heartbeat cannot remove a registered participant or replace
+its boot. Recovery or acknowledged retirement must prove that the old owner no longer holds device work.
+
+Local construction failures release the explicit node's record once factory validation proves non-start,
+or all handles are closed with no pending cleanup owners. Incomplete cleanup remains retained.
+`retry_pending_stream_closes()` only retries Close intent or undelivered Opens whose original delivery
+deadline expired; an Open still inside that bounded window remains available for normal delivery.

@@ -5,13 +5,32 @@ from __future__ import annotations
 import json
 from typing import Any
 
-EXIT_SUCCESS = 0
-EXIT_INVALID_INPUT = 2
-EXIT_GATEWAY_REJECTED = 3
-EXIT_ROS_UNAVAILABLE = 4
-EXIT_TIMEOUT = 124
-EXIT_SIGINT = 130
-EXIT_SIGTERM = 143
+# The exit status values are a cross-package process contract owned by
+# embodied_common; this module keeps the historical import path working.
+from embodied_common.exit_codes import (
+    EXIT_GATEWAY_REJECTED,
+    EXIT_INVALID_INPUT,
+    EXIT_ROS_UNAVAILABLE,
+    EXIT_SIGINT,
+    EXIT_SIGTERM,
+    EXIT_SUCCESS,
+    EXIT_TIMEOUT,
+)
+
+__all__ = [
+    "EXIT_GATEWAY_REJECTED",
+    "EXIT_INVALID_INPUT",
+    "EXIT_ROS_UNAVAILABLE",
+    "EXIT_SIGINT",
+    "EXIT_SIGTERM",
+    "EXIT_SUCCESS",
+    "EXIT_TIMEOUT",
+    "error_envelope",
+    "feedback_event",
+    "json_dumps",
+    "result_event",
+    "success_envelope",
+]
 
 
 def json_dumps(value: Any) -> str:

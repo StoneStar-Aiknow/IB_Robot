@@ -7,7 +7,7 @@
     the URDF base_link -> base fixed-chain pose when a profile declares
     simulation.mujoco.attachments (lekiwi_nav_grasp).
 
-    Substitutions before XML parse (robot_runtime.mujoco.render_robot_mjcf):
+    Substitutions before XML parse (robot_runtime_sim.mujoco.render_robot_mjcf):
       {{MESHES_DIR}}      -> absolute path of lekiwi_description/meshes/mujoco/
                              (the decimated visual meshes, D2b: MuJoCo 3.12.0
                              loads at most 200000 faces per STL and the shipped

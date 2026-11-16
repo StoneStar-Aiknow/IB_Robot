@@ -79,6 +79,14 @@ PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "g1_29dof_dex3.yaml
 with open(PROFILE) as _handle:
     _PROFILE: dict[str, Any] = yaml.safe_load(_handle)
 _VENDOR: dict[str, Any] = _PROFILE["vendor"]
+_PRESET_PROFILE = PROFILE.with_name("g1_29dof_arm_presets.yaml")
+with open(_PRESET_PROFILE) as _handle:
+    _PRESET_VENDOR: dict[str, Any] = yaml.safe_load(_handle)["vendor"]
+# The mock intentionally echoes the profile's own table; it exercises the
+# confirmation mechanism, not the firmware facts. test_firmware_action_names.py
+# pins that table to the saved 2026-11-07/09 GET-only report, so this derived
+# fixture is not the authority for the name strings.
+_PRESET_ACTION_NAMES = [str(entry["action_name"]) for entry in _PRESET_VENDOR["arm_actions"].values()]
 _TOPICS: dict[str, str] = _VENDOR["topics"]
 _CHANNELS = {str(entry["channel"]): entry for entry in _PROFILE["command_channels"]}
 JOINTS = [str(joint) for joint in _PROFILE["joints"]]
@@ -479,13 +487,13 @@ def harness(make_harness):
 # --- startup (design D10) --------------------------------------------------------
 
 
-def test_preset_only_reaches_active_without_hands_and_dispatches_only_15(make_harness):
+def test_preset_only_reaches_active_without_hands_and_enforces_firmware_limits(make_harness):
     harness = make_harness(
         runtime_profile=PROFILE.with_name("g1_29dof_arm_presets.yaml"),
         preset_test_transport=True,
         hand_missing="both",
         initial_fsm_id=802,
-        action_list=["both_hands_up"],
+        action_list=_PRESET_ACTION_NAMES,
     )
     status = harness.wait_active()
     assert status.active_mode == "idle"
@@ -493,22 +501,40 @@ def test_preset_only_reaches_active_without_hands_and_dispatches_only_15(make_ha
     assert "base.cmd_vel" not in status.capabilities
     assert "runtime.stop" not in status.capabilities
     client = _named_client(harness)
-    goal = _send_goal(harness, client, "arms_horizontal")
-    assert goal.accepted
-    future = goal.get_result_async()
-    harness.wait_until(future.done, "preset result")
-    assert future.result().result.success
+
+    def dispatch(name: str):
+        goal = _send_goal(harness, client, name)
+        assert goal.accepted, f"{name!r} was not advertised"
+        future = goal.get_result_async()
+        harness.wait_until(future.done, f"{name} result")
+        return future.result().result
+
+    assert dispatch("arms_horizontal").success
     assert harness.mock.record("last_action_id") == 15
+    # ID 99 is a control-ownership operation, but the user explicitly opened it.
+    assert dispatch("release_arm").success
+    assert harness.mock.record("last_action_id") == 99
+    # Action 1 reports FSM 500/501 only; FSM 802 is read-only, so admission
+    # rejects it with the reason instead of switching FSM.
+    blocked = dispatch("turn_back_wave")
+    assert not blocked.success
+    assert blocked.error_code == ExecuteNamedMotion.Result.RUNTIME_UNAVAILABLE
+    assert "FSM [500, 501]" in blocked.message
+    assert "FSM feedback is unavailable" in blocked.message
+    assert "preset not dispatched" in blocked.message
+    assert harness.mock.record("last_action_id") == 99  # rejected before dispatch
+    # Mode-machine 5 is one of the two generations the firmware reports.
+    assert dispatch("make_heart_with_both_hands").success
+    assert harness.mock.record("last_action_id") == 20
     assert harness.arm_sdk_count() == 0
     assert harness.mock.record("last_velocity") is None
     assert harness.loco_requests(projection.LOCO_API_IDS["set_fsm_id"]) == 0
     assert harness.loco_requests(projection.LOCO_API_IDS["switch_to_user_ctrl"]) == 0
-    assert not _send_goal(harness, client, "release_arm").accepted
     assert not harness.set_mode("stream").success
     stopped = harness.stop("HOLD")
     assert not stopped.success and stopped.idle_latency_s == -1.0
     assert not harness.set_mode("idle").success
-    assert harness.mock.record("last_action_id") == 15  # no automatic recovery
+    assert harness.mock.record("last_action_id") == 20  # no automatic recovery
     client.destroy()
 
 
@@ -522,6 +548,50 @@ def test_startup_reaches_active_in_idle_mode(harness):
         assert capability in status.capabilities
     names = json.loads(status.capabilities_json)["motion.named"]["names"]
     assert set(names) == set(_VENDOR["arm_actions"]), "the mock reports the full action table"
+
+
+def test_failed_vendor_wiring_closes_the_facade_and_allows_a_fresh_start(make_harness):
+    """A wiring failure after initialize() must not leak the half-open facade.
+
+    The fake facade fails on its second state feed (after initialize), which is
+    the shape of a vendor wiring fault mid-setup: the constructor must close
+    the facade it already opened and destroy its half-built node before the
+    error surfaces, and the same process must still bring a runtime up after
+    the failed start (repeated startup).
+    """
+
+    class _FailingFacade:
+        def __init__(self) -> None:
+            self.feeds = 0
+            self.closed = 0
+
+        def initialize(self, _domain_id, _network_interface) -> None:
+            pass
+
+        def state_feed(self, *_args, **_kwargs):
+            self.feeds += 1
+            if self.feeds > 1:
+                raise RuntimeError("wiring fault injection: the second state feed is refused")
+            return object()
+
+        def close(self) -> None:
+            self.closed += 1
+
+    facade = _FailingFacade()
+    with pytest.raises(RuntimeError, match="wiring fault injection"):
+        UnitreeG1RuntimeNode(
+            sdk_factory=lambda: facade,
+            parameter_overrides=[
+                Parameter("profile", value=str(PROFILE)),
+                Parameter("vendor_domain_id", value=TEST_DOMAIN_ID),
+                Parameter("vendor_network_interface", value="lo"),
+            ],
+        )
+    assert facade.closed == 1, "the half-wired facade was not closed before the failure surfaced"
+
+    harness = make_harness()
+    status = harness.wait_active()
+    assert status.active_mode == "idle", "a fresh runtime did not start after a failed wiring"
 
 
 def test_commands_outside_their_mode_are_not_dispatched(harness):
@@ -944,6 +1014,34 @@ def test_rpc_timeout_fails_the_call_and_is_not_resent(make_harness):
     time.sleep(0.3)  # a retry would have crossed in this window
     assert harness.loco_requests(switch) == 1, "a motion-changing RPC was re-sent after its timeout"
     assert harness.arm_sdk_count() == 0
+
+
+def test_rpc_call_refuses_new_commands_while_a_dispatcher_is_wedged(harness):
+    """A dispatcher held past the client timeout is a call stuck in the vendor
+    library (Issue #207's blocking DDS write). It is not cancelled, not killed
+    and not answered for — NEW commands are refused within a bound instead of
+    queueing behind it forever, and nothing is dispatched while it is held."""
+    get_fsm_id = projection.LOCO_API_IDS["get_fsm_id"]
+    harness.wait_active()
+    before = harness.loco_requests(get_fsm_id)
+    dispatcher = harness.runtime._rpc_dispatchers["loco"]
+    assert dispatcher.acquire(blocking=False), "the loco dispatcher must be free before the wedge"
+    original_timeout = harness.runtime._rpc_timeout_s
+    started = time.monotonic()
+    try:
+        # Shrink the wedge bound (client timeout + margin) so the refusal is
+        # observed quickly; the production bound is the profile's rpc timeout.
+        harness.runtime._rpc_timeout_s = 0.2
+        result = harness.runtime.rpc_call("loco", "get_fsm_id", None)
+        elapsed = time.monotonic() - started
+    finally:
+        harness.runtime._rpc_timeout_s = original_timeout
+        dispatcher.release()
+    assert not result.ok and result.timed_out, "the wedged dispatcher must refuse the new command"
+    assert result.api_id == "get_fsm_id"
+    assert elapsed >= 1.0, "the refusal must not preempt the dispatcher's own call bound"
+    assert elapsed < 5.0, "the refusal is bounded, unlike the previous unbounded queue"
+    assert harness.loco_requests(get_fsm_id) == before, "the refused call must not reach the vendor"
 
 
 # --- named motions and postures (design D7) -------------------------------------------------------

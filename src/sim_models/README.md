@@ -112,6 +112,26 @@ Gazebo 走 `SetEntityPose`，两平台同索引同位姿。
   （接收时刻距今 ≤ `POSE_STALE_S = 1.0 s`）。仿真暂停、插件断流或话题停发超过
   该阈值时，readiness 拒绝一切任务操作（服务返回 `backend not ready`），恢复后自动放行。
 
+## 布局栅格化与 `mobile_manipulation`（#205 抓取阶段）
+
+`scene_compiler.rasterize_static_geometry(layout, *, resolution, origin, size)` 从场景
+`layout.yaml` 的 `static_geometry`（带 yaw 的盒体 + 圆柱）直接栅格化占用栅格，
+`write_layout_map` 写出三值 P5 PGM（0 占用 / 254 空闲，行序自上而下，与
+`map_server` 一致）。CLI：
+
+```bash
+# 重新生成某个场景的导航地图（提交的 nav_grasp_room.{yaml,pgm} 即由此生成，
+# robot_navigation 的再生成测试保证字节一致）
+ros2 run sim_models layout_map nav_grasp_room <输出前缀>
+```
+
+`nav_grasp_room/layout.yaml` 的 `mobile_manipulation:` 小节是该场景移动抓取任务
+数据的唯一定义（`mobile_manipulation_spec` 校验：object 必须是 `type: dynamic`、
+table 必须是 static、staging 不得落在障碍物内、阈值为正）：`object` /
+`table` / `staging_pose`（Nav2 目标，map 系）/ `success`（lift_m、hold_s、
+max_object_tilt_deg）。两个手写模板（Gazebo world / MuJoCo MJCF）是被一致性测试
+约束的镜像，`layout.yaml` 才是权威。
+
 ## 与其他包的关系
 
 ```text

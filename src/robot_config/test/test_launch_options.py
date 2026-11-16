@@ -5,7 +5,7 @@ legacy ``robot.launch.py`` declarations (declared_default) and the legacy
 ``launch_setup`` reads (absent_fallback), so any drift introduced by the
 refactor is caught here instead of at board bring-up. Since openspec
 change ``migrate-builtin-builder-metadata`` the core table keeps only
-the 14 infrastructure parameters; the 11 business parameters come from
+the 17 infrastructure parameters; the 11 business parameters come from
 their owning BuilderSpec declarations, and the composed (core +
 registry-contributed) set must equal the legacy table exactly.
 """
@@ -55,6 +55,16 @@ LEGACY_DECLARED_DEFAULTS = {
     "trace_session_name": "ib_robot_trace",
 }
 
+# Fresh-launch operator commissioning parameters added after the frozen legacy
+# table; they are part of the current expected set, not the historical oracle.
+FRESH_LAUNCH_ARGUMENTS = {
+    "runtime_network_interface": "",
+    "preset_operator_confirmed": "false",
+    "preset_expected_fsm_id": "",
+}
+
+EXPECTED_DECLARED_DEFAULTS = {**LEGACY_DECLARED_DEFAULTS, **FRESH_LAUNCH_ARGUMENTS}
+
 # The core table after migrate-builtin-builder-metadata: infrastructure and
 # preparation-core parameters only (design decision 3).
 CORE_ARGUMENT_NAMES = (
@@ -65,6 +75,9 @@ CORE_ARGUMENT_NAMES = (
     "auto_start_controllers",
     "control_mode",
     "nav_stage",
+    "runtime_network_interface",
+    "preset_operator_confirmed",
+    "preset_expected_fsm_id",
     "with_inference",
     "inference_pipeline",
     "inference_execution_mode",
@@ -129,11 +142,11 @@ class TestCoreTableMatchesLegacyDeclarations:
         and is the only allowed difference). The full legacy set — including
         the migrated business arguments — is pinned end to end by the
         baseline argument-table equivalence of this openspec change."""
-        expected = set(LEGACY_DECLARED_DEFAULTS) - set(MIGRATED_BUSINESS_ARGUMENTS)
+        expected = set(EXPECTED_DECLARED_DEFAULTS) - set(MIGRATED_BUSINESS_ARGUMENTS)
         table = _composed_table()
         assert set(table) == expected, f"missing={sorted(expected - set(table))} extra={sorted(set(table) - expected)}"
         for name in expected:
-            assert table[name].declared_default == LEGACY_DECLARED_DEFAULTS[name], name
+            assert table[name].declared_default == EXPECTED_DECLARED_DEFAULTS[name], name
 
     @pytest.mark.parametrize(
         "name,expected_default",
@@ -145,6 +158,9 @@ class TestCoreTableMatchesLegacyDeclarations:
             ("auto_start_controllers", "true"),
             ("control_mode", ""),
             ("nav_stage", ""),
+            ("runtime_network_interface", ""),
+            ("preset_operator_confirmed", "false"),
+            ("preset_expected_fsm_id", ""),
             ("with_inference", ""),
             ("inference_pipeline", ""),
             ("inference_execution_mode", ""),
@@ -267,7 +283,7 @@ class TestReadSemantics:
         registry = build_builtin_registry()
         specs = compose_argument_specs(registry.contributed_arguments())
         values = read_launch_arguments({}, specs)
-        assert set(values) == set(LEGACY_DECLARED_DEFAULTS) - set(MIGRATED_BUSINESS_ARGUMENTS)
+        assert set(values) == set(EXPECTED_DECLARED_DEFAULTS) - set(MIGRATED_BUSINESS_ARGUMENTS)
         assert values["with_moveit"] == ""
         assert values["with_embodied"] == ""
 

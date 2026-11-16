@@ -6,7 +6,16 @@ transport — the in-repo vendor mock that stands in for the robot's own stack.
 
     ros2 launch unitree_g1_robot runtime.launch.py profile:=<path-or-name> \
         [simulated:=true] [instance_id:=<id>] [initial_mode:=<mode>] \
-        [network_interface:=<nic>] [peripherals:=<fragment.yaml>]
+        [network_interface:=<nic>] [peripherals:=<fragment.yaml>] \
+        [runtime_network_interface:=<nic>] [preset_operator_confirmed:=true] \
+        [preset_expected_fsm_id:=<fsm-id>]
+
+The arm-preset physical path additionally requires ``preset_operator_confirmed:=true``,
+a non-loopback ``runtime_network_interface`` and an expected FSM id (explicitly,
+or an audited ``vendor.operator_validation.expected_fsm_id`` in the profile).
+The confirmation, NIC and FSM are passed to the node as ROS parameters for this
+run only: no temporary or deployment profile is written, and the source profile
+never carries ``confirmed: true``.
 
 DDS (design D2, revised by Issue #171 PR 2): the vendor tier speaks
 CycloneDDS **inside the official SDK**, which binds its own cyclonedds-python
@@ -67,7 +76,11 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import resolve_profile_argument, resolve_sim_selection
+from robot_runtime.launch_support import (
+    resolve_profile_argument,
+    resolve_sim_selection,
+    sim_embodiment_actions,
+)
 from robot_runtime.peripherals import (
     fast_lio_nodes,
     load_peripherals_file,
@@ -76,6 +89,7 @@ from robot_runtime.peripherals import (
     synthetic_perception_nodes,
 )
 from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import is_physics_selection
 
 #: The vendored description ships exactly one URDF (29 DoF + Dex3 hands).
 URDF_NAME = "g1_29dof_with_hand_rev_1_0.urdf"
@@ -137,6 +151,83 @@ def _cyclonedds_uri(network_interface: str) -> str:
         return f"file://{handle.name}"
 
 
+_PRESET_DISABLED = "PRESET_HARDWARE_DISABLED"
+
+
+def _parse_preset_confirmation(raw: str) -> bool:
+    """Strict boolean for the per-run confirmation flag (default false)."""
+    text = str(raw or "").strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("", "0", "false", "no", "off"):
+        return False
+    raise RuntimeError(f"preset_operator_confirmed must be a boolean, got {raw!r}")
+
+
+def _parse_expected_fsm_id(raw: object, *, source: str) -> int:
+    """Parse a positive vendor FSM id, naming the argument on failure."""
+    text = str(raw or "").strip()
+    try:
+        fsm_id = int(text)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"{source} must be a positive integer FSM id, got {raw!r}") from exc
+    if fsm_id <= 0:
+        raise RuntimeError(f"{source} must be a positive integer FSM id, got {raw!r}")
+    return fsm_id
+
+
+def _preset_run_binding(profile: dict, context) -> tuple[str, int]:
+    """Resolve the per-run (NIC, expected FSM) binding for the preset path.
+
+    The confirmation is per launch invocation and never read from a persisted
+    ``confirmed: true`` profile. The FSM may come from the explicit argument or
+    an audited profile field; two disagreeing values are a conflict.
+    """
+    validation = (profile.get("vendor") or {}).get("operator_validation") or {}
+    if not isinstance(validation, dict):
+        raise RuntimeError("vendor.operator_validation must be a mapping")
+    if not _parse_preset_confirmation(context.launch_configurations.get("preset_operator_confirmed", "false")):
+        raise RuntimeError(
+            f"{_PRESET_DISABLED}: on-site operator confirmation required (preset_operator_confirmed:=true)"
+        )
+    nic = str(context.launch_configurations.get("runtime_network_interface", "") or "").strip()
+    if not nic or nic == "lo":
+        raise RuntimeError(
+            f"{_PRESET_DISABLED}: runtime_network_interface must name the robot-facing NIC (non-empty, not loopback)"
+        )
+    profile_nic = str(validation.get("network_interface", "") or "").strip()
+    if profile_nic and profile_nic != nic:
+        raise RuntimeError(
+            "preset commissioning has conflicting network interface overrides: "
+            f"runtime_network_interface={nic!r}, vendor.operator_validation.network_interface={profile_nic!r}"
+        )
+    configured_nic = str(context.launch_configurations.get("network_interface", "") or "").strip()
+    if configured_nic and configured_nic != nic:
+        raise RuntimeError(
+            "preset commissioning has conflicting network interface overrides: "
+            f"network_interface={configured_nic!r}, runtime_network_interface={nic!r}"
+        )
+    explicit_fsm = str(context.launch_configurations.get("preset_expected_fsm_id", "") or "").strip()
+    profile_fsm = validation.get("expected_fsm_id")
+    if explicit_fsm:
+        expected_fsm = _parse_expected_fsm_id(explicit_fsm, source="preset_expected_fsm_id")
+        if profile_fsm not in (None, ""):
+            audited_fsm = _parse_expected_fsm_id(profile_fsm, source="vendor.operator_validation.expected_fsm_id")
+            if audited_fsm != expected_fsm:
+                raise RuntimeError(
+                    "preset commissioning has conflicting expected FSM ids: "
+                    f"preset_expected_fsm_id={expected_fsm}, "
+                    f"vendor.operator_validation.expected_fsm_id={audited_fsm}"
+                )
+        return nic, expected_fsm
+    if profile_fsm not in (None, ""):
+        return nic, _parse_expected_fsm_id(profile_fsm, source="vendor.operator_validation.expected_fsm_id")
+    raise RuntimeError(
+        f"{_PRESET_DISABLED}: preset_expected_fsm_id is required (or an audited "
+        "vendor.operator_validation.expected_fsm_id in the profile)"
+    )
+
+
 def _launch_setup(context, *_args, **_kwargs):
     profile_path = resolve_profile_argument("unitree_g1_robot", LaunchConfiguration("profile").perform(context))
     profile = load_profile(profile_path)
@@ -156,11 +247,8 @@ def _launch_setup(context, *_args, **_kwargs):
 
     if (profile.get("vendor") or {}).get("preset_only") is True:
         if not simulated:
-            validation = profile["vendor"].get("operator_validation") or {}
-            nic = str(validation.get("network_interface", "")).strip()
-            if validation.get("confirmed") is not True or not nic or nic == "lo":
-                raise RuntimeError("PRESET_HARDWARE_DISABLED: explicit operator validation profile required")
-            if peripherals_file or (network_interface and network_interface != nic):
+            nic, expected_fsm_id = _preset_run_binding(profile, context)
+            if peripherals_file:
                 raise RuntimeError("preset commissioning has conflicting network/peripheral overrides")
             description = build_description(profile, use_sim=False)
             return [
@@ -173,6 +261,8 @@ def _launch_setup(context, *_args, **_kwargs):
                             "initial_mode": initial_mode,
                             "preset_operator_confirmed": True,
                             "preset_test_transport": False,
+                            "runtime_network_interface": nic,
+                            "preset_expected_fsm_id": expected_fsm_id,
                             "vendor_domain_id": 0,
                             "vendor_network_interface": nic,
                             "interface_description_json": json.dumps(description),
@@ -245,8 +335,13 @@ def _launch_setup(context, *_args, **_kwargs):
     if instance_id:
         profile["runtime"]["instance_id"] = instance_id
     # D6: the description is projected from the profile alone — the URDF is
-    # never passed, so no public model is published.
-    description = build_description(profile, peripherals=peripherals, use_sim=simulated)
+    # never passed, so no public model is published. ``sim_platform`` selects
+    # the execution identity (and the effective sensor traits) of the
+    # description, so the physics branch's embodiment receives one carrying
+    # the platform the launch resolved.
+    description = build_description(
+        profile, peripherals=peripherals, use_sim=simulated, sim_platform=_sim_platform, profile_path=profile_path
+    )
 
     # E1: the vendor tier's domain/NIC binding is a node parameter, never a
     # CYCLONEDDS_URI side effect — the SDK builds its own CycloneDDS domain
@@ -313,6 +408,28 @@ def _launch_setup(context, *_args, **_kwargs):
             *fast_lio_nodes(fast_lio_config, bridge_package="unitree_g1_robot", use_sim=False),
         ]
 
+    if is_physics_selection(use_sim, _sim_platform):
+        # sim-platform-registry D3: a physics platform dispatches to the
+        # effective embodiment (the profile's simulation.<platform>.embodiment
+        # override when declared, else the platform's registered default) —
+        # the vendor mock and the synthetic data plane are the sdk stand-ins
+        # and have no place on a physics platform. No G1 physics route is
+        # shipped; a test platform proves the branch.
+        sim_world = LaunchConfiguration("sim_world").perform(context).strip()
+        spawn_pose = tuple(
+            float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw")
+        )
+        return sim_embodiment_actions(
+            profile,
+            profile_path,
+            str(_sim_platform),
+            peripherals_file,
+            instance_id,
+            interface_description=description,
+            world=sim_world,
+            spawn_pose=spawn_pose,
+        )
+
     # Simulated transport: the in-repo vendor mock stands in for the robot's
     # own stack on the vendor DDS tier — the runtime's D10 startup wait
     # tolerates the discovery race, so the nodes need no stagger — and the
@@ -359,6 +476,18 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="",
                 description="Deprecated alias of use_sim (a warning names use_sim)",
             ),
+            DeclareLaunchArgument(
+                "sim_world",
+                default_value="",
+                description="Platform-neutral world hand-off: the Gazebo world name or the MuJoCo scene name "
+                "(empty: the runtime starts its own minimal world/scene)",
+            ),
+            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo platform)"),
+            DeclareLaunchArgument("spawn_z", default_value="0.0", description="Robot spawn pose z (Gazebo platform)"),
+            DeclareLaunchArgument(
+                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo platform)"
+            ),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),
             DeclareLaunchArgument(
                 "initial_mode",
@@ -384,6 +513,23 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="",
                 description="Deployment peripherals fragment {peripherals: [...], fast_lio: {...}} "
                 "(overrides profile defaults by (type, name))",
+            ),
+            DeclareLaunchArgument(
+                "runtime_network_interface",
+                default_value="",
+                description="Robot-facing NIC for the physical arm-preset commissioning path "
+                "(non-empty and not loopback; never persisted)",
+            ),
+            DeclareLaunchArgument(
+                "preset_operator_confirmed",
+                default_value="false",
+                description="Per-run operator confirmation for physical arm-preset dispatch; false fails closed",
+            ),
+            DeclareLaunchArgument(
+                "preset_expected_fsm_id",
+                default_value="",
+                description="Expected vendor FSM id for the physical arm-preset session; "
+                "empty uses an audited vendor.operator_validation.expected_fsm_id",
             ),
             OpaqueFunction(function=_launch_setup),
         ]

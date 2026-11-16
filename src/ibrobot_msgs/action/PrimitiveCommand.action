@@ -34,6 +34,9 @@ float32[] joint_waypoints
 uint32 joint_waypoint_count
 float32 waypoint_duration_sec
 float32 timeout_sec
+# Motion group (arm) the primitive acts on, resolved by the Gateway from the
+# skill's arm_side. Empty = the robot's default group.
+string target_group
 ---
 # --- Result ---
 bool success

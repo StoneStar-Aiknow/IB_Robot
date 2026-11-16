@@ -24,6 +24,13 @@ def resolve_public_target(config):
         "home": "ibrobot_msgs/action/ArmReturnHome",
         "lease": "std_msgs/msg/Empty",
     }
+    # Session endpoints are optional while clients migrate; a target that names
+    # them gets them validated like the required ones.
+    optional = {
+        "session_start": "ibrobot_msgs/srv/StartArmSession",
+        "session_lease": "ibrobot_msgs/msg/SessionLease",
+    }
+    types.update({key: kind for key, kind in optional.items() if key in target["interfaces"]})
     for key, message_type in types.items():
         item = interfaces[target["interfaces"][key]]
         units = {
@@ -32,7 +39,7 @@ def resolve_public_target(config):
             "linear": {"linear": "m/s"},
             "angular": {"angular": "rad/s"},
         }
-        kind = "action" if key == "home" else "service" if key in ("start", "stop") else "topic"
+        kind = "action" if key == "home" else "service" if key in ("start", "stop", "session_start") else "topic"
         if (
             item["message_type"] != message_type
             or item["target_group"] != group

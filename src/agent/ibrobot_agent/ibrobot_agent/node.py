@@ -16,9 +16,10 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
@@ -821,7 +822,14 @@ class IncubationAgentNode(Node):
         self._bridge = None
         catalog = catalog_port or _UnavailableCatalog()
         execution = execution_port
-        active_planner = planner or _planner_from_config(str(self.get_parameter("planner_config_json").value))
+        self._planner_images = None
+        if planner is None:
+            planner_config_raw = str(self.get_parameter("planner_config_json").value)
+            vision_topics = _planner_vision_topics(planner_config_raw)
+            if vision_topics:
+                self._planner_images = _LatestCameraFrames(self, vision_topics)
+            planner = _planner_from_config(planner_config_raw, images=self._planner_images)
+        active_planner = planner
         self._injected_ready = catalog_port is not None
         self._gateway_ready = self._injected_ready
         if catalog_port is None:
@@ -1135,7 +1143,79 @@ def planner_prompt_builder(*, request, context, catalog):
     return build_planner_messages(request=request, context=context, catalog=planner_catalog_view(catalog))
 
 
-def _planner_from_config(raw: str):
+def _planner_vision_topics(raw: str) -> list[str]:
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    topics = config.get("vision_topics", []) if isinstance(config, dict) else []
+    if not isinstance(topics, list) or any(not isinstance(t, str) or not t.startswith("/") for t in topics):
+        raise ValueError("embodied.agent.planner.vision_topics must be a list of absolute image topics")
+    return list(topics)
+
+
+class _LatestCameraFrames:
+    """Latest frame of each configured camera, attached to the planner prompt as images.
+
+    Opt-in through ``planner.vision_topics``; without it the planner stays text-only.
+    Frames are JPEG-encoded at request time; a camera without a frame is listed as missing.
+    """
+
+    def __init__(self, node: Node, topics: list[str], *, max_width: int = 640, jpeg_quality: int = 85) -> None:
+        from sensor_msgs.msg import Image
+
+        self._base_builder = build_planner_messages
+        self._lock = threading.Lock()
+        self._frames: dict[str, Image] = {}
+        self._topics = list(topics)
+        self._max_width = max_width
+        self._jpeg_quality = jpeg_quality
+        for topic in self._topics:
+            node.create_subscription(Image, topic, lambda msg, t=topic: self._store(t, msg), 2)
+
+    def set_base_builder(self, builder) -> None:
+        self._base_builder = builder
+
+    def _store(self, topic: str, msg) -> None:
+        with self._lock:
+            self._frames[topic] = msg
+
+    def _encode(self, msg) -> str | None:
+        import base64
+        import io
+
+        from PIL import Image as PILImage
+
+        if msg.encoding not in ("rgb8", "bgr8"):
+            return None
+        image = PILImage.frombytes("RGB", (msg.width, msg.height), bytes(msg.data))
+        if msg.encoding == "bgr8":
+            b, g, r = image.split()
+            image = PILImage.merge("RGB", (r, g, b))
+        if image.width > self._max_width:
+            image = image.resize((self._max_width, round(image.height * self._max_width / image.width)))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=self._jpeg_quality)
+        return base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    def prompt_builder(self, *, request: Any, context: Mapping[str, Any], catalog: Mapping[str, Any]):
+        messages = self._base_builder(request=request, context=context, catalog=catalog)
+        with self._lock:
+            frames = {topic: self._frames.get(topic) for topic in self._topics}
+        parts: list[dict[str, Any]] = []
+        for topic, msg in frames.items():
+            data = self._encode(msg) if msg is not None else None
+            if data is None:
+                parts.append({"type": "text", "text": f"[camera {topic}: no frame]"})
+                continue
+            parts.append({"type": "text", "text": f"[camera {topic}]"})
+            parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{data}"}})
+        user = messages[-1]
+        messages[-1] = {**user, "content": [{"type": "text", "text": str(user["content"])}, *parts]}
+        return messages
+
+
+def _planner_from_config(raw: str, *, images: _LatestCameraFrames | None = None):
     try:
         config = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -1161,7 +1241,7 @@ def _planner_from_config(raw: str):
         model=config["model"],
         timeout_sec=float(config.get("timeout_sec", 120.0)),
         temperature=float(config.get("temperature", 0.0)),
-        multimodal=False,
+        multimodal=images is not None,
         api_protocol=str(config.get("api_protocol", "chat_completions")),
     )
     from ibrobot_agent.contracts import PlannerIdentity
@@ -1183,10 +1263,13 @@ def _planner_from_config(raw: str):
         raise ValueError("Agent planner stream must be a boolean")
     if stream and str(config.get("api_protocol", "chat_completions")) == "responses":
         raise ValueError("Agent planner stream requires api_protocol chat_completions")
+    base_builder = build_planner_messages if catalog_view == "full" else planner_prompt_builder
+    if images is not None:
+        images.set_base_builder(base_builder)
 
     return PlannerAdapter(
         client,
-        prompt_builder=build_planner_messages if catalog_view == "full" else planner_prompt_builder,
+        prompt_builder=images.prompt_builder if images is not None else base_builder,
         enable_thinking=enable_thinking,
         max_tokens=max_tokens,
         extra_body=extra_body,

@@ -1,7 +1,77 @@
+# Static catalog for the G1 preset-only deployment. The 23 names are the public
+# skill aliases owned by profiles/g1_29dof_arm_presets.yaml; the exact firmware
+# action_name strings and IDs stay in that runtime profile and are not
+# duplicated here.
 schema_version: 1
 name: unitree_g1_arm_presets
 robot_name: unitree_g1_arm_presets
 enabled_skills:
-  - name: arms_horizontal
-    implementation: g1_preset_v1
-    planner_visible: true
+- name: release_arm
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: turn_back_wave
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: blow_kiss_with_both_hands
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: blow_kiss_with_left_hand
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: blow_kiss_with_right_hand
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: arms_horizontal
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: clap
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: high_five
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: hug
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: make_heart_with_both_hands
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: make_heart_with_right_hand
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: refuse
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: right_hand_up
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: ultraman_ray
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: wave_under_head
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: wave_above_head
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: shake_hand
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: box_left_hand_win
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: box_right_hand_win
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: box_both_hand_win
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: right_hand_on_heart
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: both_hands_up_deviate_right
+  implementation: g1_preset_v1
+  planner_visible: true
+- name: forward_push
+  implementation: g1_preset_v1
+  planner_visible: true

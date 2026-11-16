@@ -127,8 +127,7 @@ admission.
 
 生产快照还支持可选的 `display_name`（本地化显示名称）和 `tags`（分类标识）。
 `capability_presentation.presentation_errors()` 为编译器和快照验证共用格式检查；
-`skill_catalog.derive_capability_digest()` 将这些字段纳入严格字段集合与摘要；
-`skill_catalog.verify_snapshot_response()` 返回的 `VerifiedCatalogView.capability_view` 保留这些字段，
+`embodied_common.catalog_digest` 将这些字段纳入严格字段集合与摘要。`RobotClient` 的列表和详情保留这些字段，
 但执行请求仍使用原始 `name`。显示名称与标签不代表动作授权或真机验证结果。
 
 `skill_request` 为 Gateway 请求提供同一套规范化规则：技能名和可选字符串会去首尾空白，

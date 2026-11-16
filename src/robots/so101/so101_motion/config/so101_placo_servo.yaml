@@ -39,6 +39,34 @@ ik_link_name: gripper            # target frame in the URDF (== moveit.ee_link).
                                  # no special case). arm_joint_names is injected
                                  # by teleop.py.
 
+# reference_reset_threshold_m: a managed start keeps the frozen command-side
+# reference while it is within this distance of the measured EE position, so
+# gravity sag does not enter the clutch origin. Must exceed the normal sag:
+# measured 2026-11-04 at up to 40.6 mm (arm fully extended, gripper frame), so
+# 0.09 is about 2.2x that. Re-measure after changing servo gains, servos, or
+# ik_link_name (tcp has a longer lever arm). A push smaller than this during
+# HOLD is not detected; the next start pulls the arm back under the QP limits.
+reference_reset_threshold_m: 0.09
+
+# max_pose_step_m: in managed teleop, a pose whose target is farther than this
+# from the current command-side reference ends the session (no clamping). The
+# runtime profile's teleoperation.max_pose_step_m overrides it and is published
+# in the interface description. VR data on 2026-11-04: fast hand motion stepped
+# up to 46 mm between targets; tracking-loss jumps were 202 mm and 402 mm.
+max_pose_step_m: 0.10
+
+# Managed reference feedback: tracking=false once the commanded pose stays
+# farther than tracking_tolerance_m from the reference while moving less than
+# tracking_stall_m per tick, for tracking_lost_ticks ticks (15 = 0.3 s at
+# 50 Hz). The stall condition excludes lag: in fast motion the command trails
+# the reference at the diffik_max_task_step speed. The tolerance stays above
+# the 20-49 mm the soft orientation task pulls the position off. Replaying the
+# 2026-11-04 VR data, every reported episode was a target outside the workspace
+# or one reachable only in another elbow branch past a joint limit.
+tracking_tolerance_m: 0.06
+tracking_stall_m: 0.002
+tracking_lost_ticks: 15
+
 # --- differential-IK mode -------------------------------------------------
 # position_only=false adds a low-weight soft OrientationTask so angular joystick
 # input can steer the EE attitude without dominating the under-actuated arm.

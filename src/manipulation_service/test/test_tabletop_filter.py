@@ -3,15 +3,18 @@ import pytest
 
 from manipulation_service import graspgen_wrapper
 from manipulation_service.graspgen_wrapper import (
-    _VALID_TABLETOP_FILTER_MODES,
     DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
     GraspGenWrapper,
+)
+from manipulation_service.table_plane import (
+    VALID_TABLETOP_FILTER_MODES,
     TablePlane,
+    fit_table_plane_ransac,
 )
 
 
 def test_tabletop_filter_modes_include_diagnostic():
-    assert "diagnostic" in _VALID_TABLETOP_FILTER_MODES
+    assert "diagnostic" in VALID_TABLETOP_FILTER_MODES
 
 
 def test_source_gripper_tabletop_sweep_defaults_disabled():
@@ -25,7 +28,7 @@ def test_table_plane_ransac_stops_early_for_dominant_plane():
     outliers = rng.uniform([-0.2, -0.2, 0.05], [0.2, 0.2, 0.15], size=(100, 3))
     scene = np.vstack([plane_points, outliers]).astype(np.float32)
 
-    fit = graspgen_wrapper.fit_table_plane_ransac(
+    fit = fit_table_plane_ransac(
         scene,
         positive_reference=np.array([0.0, 0.0, 0.1]),
         distance_threshold=0.001,
@@ -42,7 +45,7 @@ def test_table_plane_ransac_stops_early_for_dominant_plane():
 def test_table_plane_ransac_uses_full_budget_without_consensus():
     scene = np.random.default_rng(11).uniform(-1.0, 1.0, size=(1000, 3)).astype(np.float32)
 
-    fit = graspgen_wrapper.fit_table_plane_ransac(
+    fit = fit_table_plane_ransac(
         scene,
         distance_threshold=1e-6,
         min_inlier_ratio=0.15,
@@ -114,10 +117,10 @@ def test_disabled_source_gripper_sweep_preserves_table_and_object_top(monkeypatc
 
     monkeypatch.setattr(
         graspgen_wrapper,
-        "_depth_and_segmentation_to_point_clouds",
+        "depth_and_segmentation_to_point_clouds",
         lambda **_kwargs: (scene_pc, object_pc, None, None),
     )
-    monkeypatch.setattr(graspgen_wrapper, "_point_cloud_outlier_removal", lambda points: (points, None))
+    monkeypatch.setattr(graspgen_wrapper, "point_cloud_outlier_removal", lambda points: (points, None))
 
     wrapper = object.__new__(GraspGenWrapper)
     wrapper.inference_backend = "ascend_local"

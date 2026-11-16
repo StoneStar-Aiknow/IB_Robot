@@ -20,6 +20,7 @@
 | `tests/test_openeuler_cv_bridge_abi.sh` | 验证 openEuler 安装匹配 OpenCV 4.13 的 `cv_bridge` RPM。 |
 | `tests/test_setup_profile_training.sh` | 验证 `--profile training` 不触发 ROS 2 / rosdep / colcon，且 `full` / `inference` 行为不变。 |
 | `tests/test_mujoco_sim_pin.sh` | 验证 MuJoCo 仿真钉的三种安装顺序、benchmark `mujoco<3.9` 约束、inference 跳过与未构建工作区的 stdlib 校验（issue #190）。 |
+| `tests/test_shrc_local_venv.sh` | 验证 `.shrc_local` 的 `IBROBOT_VENV` 选择器：本地 venv 默认、显式覆盖、非法值 fail-closed、重复 source 幂等，Bash + Zsh（临时 fixture，不碰共享 venv）。 |
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 
@@ -91,7 +92,7 @@ libmujoco 完全一致，因此：
   `SETUP_ROS_SETUP_PATH`）；其余 profile 与 benchmark venv 只输出提示行。
   包缺失时提示用 sudo 重新运行 `./scripts/setup.sh`，由其中的 rosdep 安装；
   包已安装但版本过旧或已损坏时提示 apt 命令，因为 rosdep 不会升级已安装的包。
-- 运行时还有一道严格检查（`robot_runtime.mujoco.check_simulator_versions`）：
+- 运行时还有一道严格检查（`robot_runtime_sim.mujoco.check_simulator_versions`）：
   版本不一致或仿真器过旧时，`sim_platform:=mujoco` 在模型组装前直接失败并
   给出安装诊断。
 - openEuler 无 MuJoCo rpm：rosdep skip 键在 `mujoco_ros2_control` /

@@ -32,6 +32,13 @@ class GraspVerificationInput:
     current_contact_threshold_a: float
     wrist_depth: DepthVisibilityStats | None = None
     expected_target_width_m: float = 0.0
+    #: The joint's fully-open reference. ``None`` (an unconfigured caller)
+    #: keeps the legacy rule where any opening past ``gripper_contact_min_opening``
+    #: counts as contact; configured, a jaw reading at/near this position is
+    #: "never moved from open" and can never be contact evidence.
+    gripper_open_position: float | None = None
+    #: How close to ``gripper_open_position`` still counts as fully open.
+    gripper_fully_open_tolerance: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -89,11 +96,24 @@ def evaluate_grasp(
         evidence.append("gripper_position: unavailable")
     else:
         opening_from_closed = abs(input_data.gripper_position - input_data.gripper_closed_position)
+        at_fully_open = (
+            input_data.gripper_open_position is not None
+            and abs(input_data.gripper_position - input_data.gripper_open_position)
+            <= input_data.gripper_fully_open_tolerance
+        )
         evidence.append(
             f"gripper_position: joint={input_data.gripper_joint or 'unknown'} "
             f"value={input_data.gripper_position:.4f} opening_from_closed={opening_from_closed:.4f}"
         )
-        if opening_from_closed >= input_data.gripper_contact_min_opening:
+        if at_fully_open:
+            # Gazebo acceptance fix 3 (2026-11-02, e2e/gazebo-155516): the
+            # close goal "succeeded" with the joint still at the fully-open
+            # end (value 1.0001, goal 0.00) and this branch awarded the full
+            # contact score. A jaw that never left open holds nothing, so it
+            # is failure evidence, never contact evidence.
+            failure_score += w.gripper_contact_failure
+            evidence.append("gripper_contact: jaw at/near fully open after close goal")
+        elif opening_from_closed >= input_data.gripper_contact_min_opening:
             success_score += w.gripper_contact_success
             evidence.append("gripper_contact: stopped before fully closing")
         elif opening_from_closed <= input_data.gripper_no_contact_max_opening:

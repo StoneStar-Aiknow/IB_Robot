@@ -44,7 +44,6 @@ _EXPORTS = {
     "generate_virtual_camera_relays": ("perception", "generate_virtual_camera_relays"),
     "generate_runtime_provider_actions": ("runtime", "generate_runtime_provider_actions"),
     "runtime_provider": ("runtime", "runtime_provider"),
-    "generate_gazebo_nodes": ("simulation", "generate_gazebo_nodes"),
 }
 
 
@@ -77,8 +76,6 @@ __all__ = [
     "generate_lidar_nodes",
     "generate_tf_nodes",
     "generate_virtual_camera_relays",
-    # Simulation
-    "generate_gazebo_nodes",
     # MoveIt
     "generate_runtime_provider_actions",
     "runtime_provider",

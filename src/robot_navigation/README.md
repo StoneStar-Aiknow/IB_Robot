@@ -694,7 +694,7 @@ colcon test --packages-select robot_navigation --base-paths src --event-handlers
 `test/test_lidar_odometry_gate.py` 是 LeKiwi 的 FAST-LIO 精度门禁（openspec change
 `lekiwi-gazebo-runtime-platform` D14），说明见 `lekiwi_robot` README 的「Lidar-odometry regression gate」一节。
 该门禁通过 `robot_config` 的通用入口启动仿真器（Gazebo 与 MuJoCo 各一条腿）与 Nav2，所以放在本包，不放在 `lekiwi_robot`：运行时包的
-测试依赖也计入 `scripts/verify_runtime_independence.sh` 的依赖闭包审计。Ubuntu 上默认执行；openEuler 上或设置
+测试依赖计入 `scripts/verify_runtime_independence.sh` 的测试闭包（但不出现在其执行闭包审计里，运行时执行面不依赖仿真包）。Ubuntu 上默认执行；openEuler 上或设置
 `NAV_TEST_PROFILE=minimal` 时跳过。只跑该门禁：
 
 ```bash
@@ -713,7 +713,7 @@ NAV_TEST_PROFILE=minimal colcon test --packages-select robot_config --base-paths
 
 ### 4. robot_config full 仿真测试
 
-Ubuntu 且已安装仿真器时运行 full profile。该测试由 `robot_config` 维护，按 `PHYSICS_SIM_PLATFORMS` 参数化。每个平台启动一次 `lekiwi_lidar` 的导航 stage。stage 包含 ros2_control、控制器、FAST-LIO、AMCL、Nav2 和 `robot_navigation` 节点。两个平台的阈值与断言一致（openspec `lekiwi-mujoco-runtime-platform` D15）。
+Ubuntu 且已安装仿真器时运行 full profile。该测试由 `robot_config` 维护，按固定的一线物理仿真平台矩阵（`gazebo`、`mujoco`）参数化，未安装的平台插件按能力探测 skip（验收运行用 `IBROBOT_REQUIRE_SIM_PLATFORMS` 转 fail）。每个平台启动一次 `lekiwi_lidar` 的导航 stage。stage 包含 ros2_control、控制器、FAST-LIO、AMCL、Nav2 和 `robot_navigation` 节点。两个平台的阈值与断言一致（openspec `lekiwi-mujoco-runtime-platform` D15）。
 
 ```bash
 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation

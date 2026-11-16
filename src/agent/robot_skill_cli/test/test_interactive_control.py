@@ -313,13 +313,13 @@ def test_classify_closed_grammar():
     assert ic.classify("") == ic.INTENT_UNKNOWN
 
 
-def test_discover_is_readonly_and_queries_catalog(rig):
+def test_load_catalog_is_readonly_and_queries_catalog(rig):
     controller, bridge = rig
-    result = controller.discover()
+    result = controller.load_catalog()
 
     methods = [call[0] for call in bridge.calls]
     assert methods == ["get_status", "get_skill_snapshot"]
-    assert controller.state == ic.DISCOVERED
+    assert controller.state == ic.CATALOG_LOADED
     assert result["robot_name"] == "test_robot"
     assert "nod_yes" in result["planner_visible_names"]
     assert "internal_only" not in result["planner_visible_names"]
@@ -330,7 +330,7 @@ def test_discover_is_readonly_and_queries_catalog(rig):
 
 def test_reject_out_of_catalog_blocks_planning(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
 
     with pytest.raises(ic.OutOfCatalogError) as exc_info:
         controller.prepare_workflow("ghost motion", [_step("ghost_skill")])
@@ -346,7 +346,7 @@ def test_reject_out_of_catalog_blocks_planning(rig):
 
 def test_prepare_then_confirm_presentation_and_nl_grammar(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
 
     presentation = controller.prepare_workflow("点个头", [_step("nod_yes")])
 
@@ -373,7 +373,7 @@ def test_prepare_then_confirm_presentation_and_nl_grammar(rig):
 
 def test_binding_log_sanitizes_ids_without_changing_request_identity(rig, caplog, monkeypatch):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
     request_id = "Bearer synthetic-marker"
     monkeypatch.setattr(ic._trace, "propagate", True)
     with caplog.at_level(logging.INFO, logger=ic._trace.name):
@@ -390,7 +390,7 @@ def test_execute_success_reaches_succeeded_terminal(rig):
     bridge.result_future = FakeFuture(None, done=True)
     bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
     bridge.plan_result_status = 4
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm("确认")
 
@@ -413,7 +413,7 @@ def test_program_stop_persists_cancel_and_converges_from_execution_store():
         sleep=clock.sleep,
         view_resolver=lambda snapshot, status: _capability_view(),
     )
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")], request_id="request-1")
     controller.confirm("确认")
     stopped = False
@@ -436,7 +436,7 @@ def test_program_stop_persists_cancel_and_converges_from_execution_store():
 
 def test_confirm_plan_runs_without_grammar_gate(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
 
     confirmed = controller.confirm_plan()
@@ -480,7 +480,7 @@ def test_run_rejects_changed_expected_registry_identity_before_planning(rig):
     methods = [method for method, _ in bridge.calls]
     assert "plan_agent_command" not in methods
     assert "send_agent_plan_goal" not in methods
-    assert controller.state == ic.DISCOVERED
+    assert controller.state == ic.CATALOG_LOADED
 
 
 def test_submission_callback_failure_blocks_goal_submission(rig):
@@ -595,7 +595,7 @@ def test_run_no_gate_stop_interrupts(rig):
         controller.confirm_plan()
 
 
-def test_run_latches_stop_during_discovery(rig):
+def test_run_latches_stop_during_catalog_load(rig):
     controller, bridge = rig
     bridge.status_hook = controller.request_stop
 
@@ -666,13 +666,13 @@ def test_run_releases_starting_state_after_prepare_failure(rig):
     with pytest.raises(ic.InteractiveControlError):
         controller.run("点个头", [_step("nod_yes")], presentation_callback=lambda _presentation: None)
 
-    assert controller.state == ic.DISCOVERED
+    assert controller.state == ic.CATALOG_LOADED
 
 
 def test_execute_releases_ownership_when_server_is_unavailable(rig):
     controller, bridge = rig
     bridge.server_ready = False
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
 
@@ -685,7 +685,7 @@ def test_execute_releases_ownership_when_server_is_unavailable(rig):
 
 def test_execute_acceptance_transport_failure_converges(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
     bridge.wait_future_hook = lambda: (_ for _ in ()).throw(RuntimeError("transport failed"))
@@ -701,7 +701,7 @@ def test_execute_acceptance_transport_failure_converges(rig):
 
 def test_confirm_response_loss_invalidates_operation(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     bridge.confirm_hook = lambda: (_ for _ in ()).throw(RuntimeError("response lost"))
 
@@ -735,7 +735,7 @@ def test_execute_stop_reaches_definite_stopped_terminal(rig):
     controller, bridge = rig
     bridge.plan_result_status = 5  # GoalStatus.CANCELED
     bridge.plan_result.update(success=False, error_code="SKILL_CANCELLED", message="cancelled", completed_step_count=0)
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm("确认")
     bridge.clock.sleep_hook = controller.request_stop
@@ -752,7 +752,7 @@ def test_execute_stop_reaches_definite_stopped_terminal(rig):
 def test_execute_stop_unknown_refuses_continue(rig):
     controller, bridge = rig
     bridge.plan_result_status = 0  # never converges to a terminal GoalStatus
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm("确认")
     bridge.clock.sleep_hook = controller.request_stop
@@ -774,7 +774,7 @@ def test_continue_uses_fresh_state_and_new_ids(rig):
     bridge.result_future = FakeFuture(None, done=True)
     bridge.plan_result_status = 5
     bridge.plan_result.update(success=False, error_code="SKILL_CANCELLED", message="cancelled", completed_step_count=0)
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm("确认")
     bridge.clock.sleep_hook = controller.request_stop
@@ -790,7 +790,7 @@ def test_continue_uses_fresh_state_and_new_ids(rig):
 
     assert controller.state == ic.PREPARED
     assert presentation["continues_from"]["state"] == ic.STOPPED
-    # Fresh discover happened again (second status + snapshot after the first batch).
+    # Fresh catalog load happened again (second status + snapshot after the first batch).
     method_counts = {m: sum(1 for mm, _ in bridge.calls if mm == m) for m in ("get_status", "get_skill_snapshot")}
     assert method_counts["get_status"] >= 2
     assert method_counts["get_skill_snapshot"] >= 2
@@ -806,7 +806,7 @@ def test_continue_preserves_canceled_proof_after_replanning_failure(rig):
     bridge.result_future = FakeFuture(None, done=True)
     bridge.plan_result_status = 5
     bridge.plan_result.update(success=False, error_code="SKILL_CANCELLED", message="cancelled", completed_step_count=0)
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
     bridge.clock.sleep_hook = controller.request_stop
@@ -827,7 +827,7 @@ def test_continue_preserves_canceled_proof_after_replanning_failure(rig):
 
 def test_continue_requires_definite_terminal(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm("确认")
     assert controller.state == ic.CONFIRMED
@@ -852,7 +852,7 @@ def test_request_stop_from_another_thread_reaches_stopped(rig):
     controller, bridge = rig
     bridge.plan_result_status = 5
     bridge.plan_result.update(success=False, error_code="SKILL_CANCELLED", message="cancelled", completed_step_count=0)
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm("确认")
 
@@ -892,7 +892,7 @@ def test_request_stop_does_not_block_on_goal_submission(rig):
         assert release_send.wait(timeout=5.0)
 
     bridge.send_hook = block_send
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
     result_holder = {}
@@ -924,7 +924,7 @@ def test_execute_rejects_concurrent_caller(rig):
         assert release_send.wait(timeout=5.0)
 
     bridge.send_hook = block_send
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
     result_holder = {}
@@ -954,7 +954,7 @@ def test_presentation_uses_authoritative_planned_steps(rig):
     bridge.plan_agent_command = canonical_plan
     requested = _step("nod_yes")
     requested["motion_distance"] = 0.1
-    controller.discover()
+    controller.load_catalog()
 
     presentation = controller.prepare_workflow("点个头", [requested])
 
@@ -973,7 +973,7 @@ def test_prepare_rejects_noncanonical_float_difference(rig):
     bridge.plan_agent_command = noncanonical_plan
     requested = _step("nod_yes")
     requested["motion_distance"] = 0.1
-    controller.discover()
+    controller.load_catalog()
 
     with pytest.raises(ic.InteractiveControlError) as exc_info:
         controller.prepare_workflow("点个头", [requested])
@@ -991,7 +991,7 @@ def test_prepare_rejects_server_plan_identity_mismatch(rig):
         return result
 
     bridge.plan_agent_command = wrong_identity
-    controller.discover()
+    controller.load_catalog()
 
     with pytest.raises(ic.InteractiveControlError) as exc_info:
         controller.prepare_workflow("点个头", [_step("nod_yes")])
@@ -1032,7 +1032,7 @@ def test_terminal_proof_mismatch_is_unknown(rig, status, updates, expected_error
     bridge.result_future = FakeFuture(None, done=True)
     bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
     bridge.plan_result_status = status
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
     bridge.plan_result.update(updates)
@@ -1048,7 +1048,7 @@ def test_nonterminal_result_triggers_single_cancel(rig):
     bridge.result_future = FakeFuture(None, done=True)
     bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
     bridge.plan_result_status = 2
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
 
@@ -1064,7 +1064,7 @@ def test_stable_aborted_result_is_failed(rig):
     bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
     bridge.plan_result_status = 6
     bridge.plan_result.update(success=False, error_code="CAPABILITY_NOT_READY", completed_step_count=0)
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点个头", [_step("nod_yes")])
     controller.confirm_plan()
 
@@ -1079,7 +1079,7 @@ def test_continue_resume_is_rejected_without_server_admission(rig):
     bridge.plan_result_status = 5  # GoalStatus.CANCELED -> STOPPED
     bridge.plan_result.update(success=False, error_code="SKILL_CANCELLED", message="cancelled", completed_step_count=2)
     plan_steps = [_step("nod_yes"), _step("wave_hand"), _step("nod_yes"), _step("wave_hand")]
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点头挥手四步", plan_steps)
     controller.confirm("确认")
     first_task_id = controller._pending["task_id"]
@@ -1096,7 +1096,7 @@ def test_continue_resume_is_rejected_without_server_admission(rig):
 
 def test_continue_resume_requires_definite_terminal(rig):
     controller, bridge = rig
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("点头", [_step("nod_yes")])
     controller.confirm("确认")
     assert controller.state == ic.CONFIRMED
@@ -1110,7 +1110,7 @@ def test_continue_resume_unknown_refused(rig):
     controller, bridge = rig
     bridge.plan_result_status = 0  # never converges -> UNKNOWN
     bridge.plan_result["completed_step_count"] = 2
-    controller.discover()
+    controller.load_catalog()
     controller.prepare_workflow("四步", [_step("nod_yes"), _step("wave_hand"), _step("nod_yes"), _step("wave_hand")])
     controller.confirm("确认")
     bridge.clock.sleep_hook = controller.request_stop

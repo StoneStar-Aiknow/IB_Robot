@@ -1,0 +1,13 @@
+# CancelSimulationCommand.srv - Withdraw one command of a simulation runtime by its id.
+#
+# Served by the simulation runtime at /simulation/cancel_command. A caller that stops waiting
+# for a command (task cancel, deadline) uses it so the runtime stops ticking for that
+# command; the reply comes after the runtime removed it, so no later tick carries it. A
+# tick the platform already took is not undone. Other commands keep running.
+
+string command_id
+---
+bool success          # true: the command was running or queued and is now cancelled
+string outcome        # final outcome of the command (CANCELLED, or how it had already ended)
+string message
+int32 ticks_executed  # ticks the command had used when it ended

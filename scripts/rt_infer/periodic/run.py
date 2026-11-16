@@ -2,6 +2,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -12,10 +13,44 @@ from metrics import analyze_case
 from periodic_control import PeriodicControl
 
 
+def run_workload(argv, **kwargs):
+    """Let the case reap its workers before stopping their scheduler."""
+    timeout = kwargs.pop("timeout", 600)
+    with subprocess.Popen(argv, **kwargs) as child:
+        try:
+            code = child.wait(timeout=timeout)
+            if code:
+                raise subprocess.CalledProcessError(code, argv)
+        finally:
+            if child.poll() is None:
+                child.terminate()
+                try:
+                    child.wait(timeout=35)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+                    raise RuntimeError("Case did not cleanly exit; inspect surviving workers before recovery") from None
+
+
+def require_idle(status):
+    if status.get("device_users") or status.get("state", {}).get("status") in {
+        "running",
+        "starting",
+        "start-failed",
+        "recovery-required",
+    }:
+        raise RuntimeError("Device or scheduler is busy; coordinate an idle test window")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    missing = [name for name in ("numpy", "ais_bench", "aclruntime") if importlib.util.find_spec(name) is None]
+    if missing:
+        raise RuntimeError(
+            f"Missing dependencies in {sys.executable}: {', '.join(missing)}; configure the project environment before starting"
+        )
     prefix = Path(os.environ["RTINFER_PREFIX"]).resolve()
     references = Path(os.environ["RTINFER_REFERENCES"]).resolve()
     models = json.loads(Path(os.environ["RTINFER_MODELS"]).read_text())
@@ -49,8 +84,7 @@ def main():
     subprocess.run(ctl + ["verify-bundle", "--bundle", str(prefix)], check=True)
     subprocess.run(ctl + ["doctor"], check=True)
     status = json.loads(subprocess.check_output(ctl + ["status"], text=True))
-    if status.get("device_users") or status.get("status") == "running":
-        raise RuntimeError("Device or scheduler is busy; coordinate an idle test window")
+    require_idle(status)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     environment = {
@@ -72,21 +106,11 @@ def main():
                     "start",
                     "--scheduler",
                     "pfp",
-                    "--prefetch",
-                    "on",
                     "--cpu",
                     "15",
-                    "--pfp-exclusive",
-                    "on",
-                    "--pfp-batch-select",
-                    "on",
-                    "--local-pool",
-                    "on",
-                    "--pfp-min-cache",
-                    "on",
-                    "--pfp-hi-priority",
-                    "0",
-                    "--pfp-periodic",
+                    "--pfp-mode",
+                    "periodic",
+                    "--periodic-control",
                     str(path),
                 ],
                 check=True,
@@ -95,7 +119,7 @@ def main():
             env = os.environ.copy()
             env.update(RT_INFER_SAFE_ARGS_BATCH="1", RT_INFER_PERSISTENT_IO="1", RT_INFER_PERIODIC_PATH=str(path))
             with (output / f"{label}.log").open("x") as log:
-                subprocess.run(
+                run_workload(
                     [
                         sys.executable,
                         str(Path(__file__).with_name("latency_periodic10.py")),
@@ -117,7 +141,6 @@ def main():
                     env=env,
                     stdout=log,
                     stderr=subprocess.STDOUT,
-                    check=True,
                     timeout=600,
                 )
             summaries[label] = analyze_case(output / label)

@@ -36,6 +36,9 @@ _LAZY_EXPORTS = {
     ),
     "load_robot_config": ("robot_config.loader", "load_robot_config"),
     "load_robot_config_dict": ("robot_config.loader", "load_robot_config_dict"),
+    "load_transport_robot_config": ("robot_config.loader", "load_transport_robot_config"),
+    "TransportRobotConfig": ("robot_config.loader", "TransportRobotConfig"),
+    "TRANSPORT_ENDPOINT_KEYS": ("robot_config.loader", "TRANSPORT_ENDPOINT_KEYS"),
     "load_robot_section": ("robot_config.loader", "load_robot_section"),
     "resolve_robot_config_path": ("robot_config.config_path", "resolve_robot_config_path"),
     "validate_config": ("robot_config.loader", "validate_config"),
@@ -56,10 +59,6 @@ _LAZY_EXPORTS = {
     "generate_virtual_camera_relays": (
         "robot_config.launch_builders",
         "generate_virtual_camera_relays",
-    ),
-    "generate_gazebo_nodes": (
-        "robot_config.launch_builders",
-        "generate_gazebo_nodes",
     ),
     "validate_joint_config": (
         "robot_config.launch_builders",
@@ -95,6 +94,9 @@ __all__ = [
     "bind_robot_interfaces",
     "load_robot_config",
     "load_robot_config_dict",
+    "load_transport_robot_config",
+    "TransportRobotConfig",
+    "TRANSPORT_ENDPOINT_KEYS",
     "load_robot_section",
     "resolve_robot_config_path",
     "build_contract_from_robot_config_dict",
@@ -113,7 +115,6 @@ __all__ = [
     "generate_camera_nodes",
     "generate_tf_nodes",
     "generate_virtual_camera_relays",
-    "generate_gazebo_nodes",
     "validate_joint_config",
     # Utilities
     "resolve_ros_path",

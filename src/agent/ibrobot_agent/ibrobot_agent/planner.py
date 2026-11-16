@@ -320,7 +320,7 @@ def build_planner_messages(
         "to that kind (especially summary and steps). For every workflow step, schema_version is a JSON "
         "integer, never a string, float, or omitted: copy the schema_version of that skill's CATALOG entry, and "
         "use 1 when the entry has none. A step may contain only schema_version, skill_name, target_name, "
-        "container_name, place_name, arm_side, motion_direction, motion_distance, imitation_duration_sec "
+        "container_name, place_name, arm_side, approach, motion_direction, motion_distance, imitation_duration_sec "
         "and timeout_sec; never nest a parameters object. Example conversation: "
         '{"kind":"conversation","user_message":"简短回答"}. Example workflow: '
         '{"kind":"workflow","user_message":"好的，点个头。","summary":"nod_yes",'

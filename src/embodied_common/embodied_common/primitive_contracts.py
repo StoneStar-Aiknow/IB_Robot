@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -424,6 +424,36 @@ _V2_NAVIGATION_DESCRIPTOR_LIST = (
 )
 
 
+# Optional primitives a robot context opts into. A contract carries one only
+# when the robot context declares the matching surface, so robots that do not
+# declare it keep their primitive contract and registry digests unchanged.
+GRIPPER_APPROACH_EXTENSION = "gripper_approach"
+_GRIPPER_APPROACH_PROPERTIES = {
+    "approach": _property("string"),
+    "approach_from_request": _property("boolean"),
+}
+_EXTENSION_DESCRIPTORS = {
+    # Turn the gripper to one of the robot's named approach orientations while the
+    # tool centre point stays where it is (dispatched as one MOVE_TO_POSE step).
+    GRIPPER_APPROACH_EXTENSION: (
+        _descriptor(
+            "set_gripper_approach",
+            dispatch_kind="task_executor_action",
+            capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
+            properties=_GRIPPER_APPROACH_PROPERTIES,
+            one_of=(
+                _closed_branch({"approach": _property("string")}, ("approach",)),
+                _closed_branch(
+                    {"approach_from_request": {"type": "boolean", "const": True}},
+                    ("approach_from_request",),
+                ),
+            ),
+        ),
+    ),
+}
+PRIMITIVE_EXTENSIONS = frozenset(_EXTENSION_DESCRIPTORS)
+
+
 def _descriptor_mapping(descriptors: tuple[PrimitiveDescriptor, ...]) -> MappingProxyType:
     return MappingProxyType({descriptor.name: descriptor for descriptor in descriptors})
 
@@ -471,7 +501,7 @@ SUPPORTED_PRIMITIVES = frozenset(PRIMITIVE_CONTRACT_V1.descriptors)
 PRIMITIVE_CONTRACT_DIGEST = PRIMITIVE_CONTRACT_V1.digest
 
 
-def primitive_contract_for_version(version: int) -> PrimitiveContractSet:
+def _base_contract_for_version(version: int) -> PrimitiveContractSet:
     if not isinstance(version, int) or isinstance(version, bool):
         raise ValueError(f"SKILL_SCHEMA_INVALID: unsupported primitive contract version: {version}")
     if version == 1:
@@ -481,6 +511,40 @@ def primitive_contract_for_version(version: int) -> PrimitiveContractSet:
     if version == 3:
         return PRIMITIVE_CONTRACT_V3
     raise ValueError(f"SKILL_SCHEMA_INVALID: unsupported primitive contract version: {version}")
+
+
+_EXTENDED_CONTRACTS: dict[tuple[int, tuple[str, ...]], PrimitiveContractSet] = {}
+
+
+def primitive_contract_for_version(version: int, extensions: Iterable[str] = ()) -> PrimitiveContractSet:
+    """The contract of one context schema version, plus the optional primitives it opts into."""
+
+    base = _base_contract_for_version(version)
+    selected = tuple(sorted(set(extensions)))
+    if not selected:
+        return base
+    unknown = sorted(set(selected) - PRIMITIVE_EXTENSIONS)
+    if unknown:
+        raise ValueError(f"SKILL_SCHEMA_INVALID: unsupported primitive contract extensions: {unknown}")
+    key = (version, selected)
+    if key not in _EXTENDED_CONTRACTS:
+        added = tuple(descriptor for name in selected for descriptor in _EXTENSION_DESCRIPTORS[name])
+        _EXTENDED_CONTRACTS[key] = PrimitiveContractSet(
+            base.schema_version,
+            _descriptor_mapping(tuple(base.descriptors.values()) + added),
+        )
+    return _EXTENDED_CONTRACTS[key]
+
+
+def primitive_extensions_for_context(robot_context: Any) -> tuple[str, ...]:
+    """Extensions a robot context (dataclass or registry mapping) declares."""
+
+    if isinstance(robot_context, Mapping):
+        gripper_approach = robot_context.get("gripper_approach")
+    else:
+        gripper_approach = getattr(robot_context, "gripper_approach", None)
+    presets = gripper_approach.get("presets") if isinstance(gripper_approach, Mapping) else None
+    return (GRIPPER_APPROACH_EXTENSION,) if isinstance(presets, Mapping) and presets else ()
 
 
 def get_primitive_descriptor(name: str) -> PrimitiveDescriptor:

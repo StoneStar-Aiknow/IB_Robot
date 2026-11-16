@@ -18,8 +18,10 @@ from inference_service.backends.errors import (
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.model_sessions.base import ModelSession
 from inference_service.model_sessions.torch_completion import (
+    drain_torch_device,
     drain_torch_device_before_release,
     resolve_torch_device,
+    torch_device_scope,
     torch_execution_scope,
 )
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
@@ -58,10 +60,15 @@ class TorchModelSession(ModelSession):
         self._device_name: str | None = None
         self._module: object | None = None
         self._release_drain_failures = 0
+        self._managed_execution = False
 
     @property
     def runtime_version(self) -> str:
         return self._runtime_version(self._torch)
+
+    @property
+    def runtime_device_index(self) -> int | None:
+        return getattr(self._device, "index", None)
 
     def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         profile = context.backend_profile
@@ -75,7 +82,7 @@ class TorchModelSession(ModelSession):
                 "TorchModelSession requires a tensor_model deployment with a typed cpu/cuda/npu Torch profile",
                 code="invalid_deployment",
             )
-        unknown_options = sorted(context.runtime_options)
+        unknown_options = sorted(set(context.runtime_options) - {"torch_device_index"})
         if unknown_options:
             raise BackendLoadError(
                 f"unknown Torch model-session options: {unknown_options}", code="invalid_runtime_options"
@@ -100,37 +107,43 @@ class TorchModelSession(ModelSession):
             if not callable(is_available) or not is_available():
                 raise BackendLoadError(f"Torch {device_name} device is unavailable", code="device_unavailable")
         try:
-            device = resolve_torch_device(torch_module, device_name)
+            device = resolve_torch_device(
+                torch_module, device_name, torch_device_index=context.runtime_options.get("torch_device_index")
+            )
         except BackendError:
             raise
         except Exception as exc:
             raise BackendLoadError(
                 f"unable to resolve Torch device {device_name!r}: {exc}", code="device_unavailable"
             ) from exc
+        self._managed_execution = context.managed_execution
         self._torch = torch_module
         self._device = device
         self._device_name = device_name
         # Register the device drain before construction can enqueue native work.
         rollback.defer(self._release)
-        try:
-            self._module = module = self._module_loader(context)
-        except BackendError:
-            raise
-        except Exception as exc:
-            raise BackendLoadError(f"unable to load callable Torch module: {exc}") from exc
-        if not callable(module):
-            raise BackendLoadError("Torch module loader did not return a callable", code="invalid_model")
-        move = getattr(module, "to", None)
-        if callable(move):
-            moved = move(device)
-            if moved is not None:
-                self._module = moved
-                module = moved
-        evaluate = getattr(module, "eval", None)
-        if callable(evaluate):
-            evaluated = evaluate()
-            if evaluated is not None:
-                self._module = evaluated
+        with torch_device_scope(torch_module, device_name, device):
+            try:
+                self._module = module = self._module_loader(context)
+            except BackendError:
+                raise
+            except Exception as exc:
+                raise BackendLoadError(f"unable to load callable Torch module: {exc}") from exc
+            if not callable(module):
+                raise BackendLoadError("Torch module loader did not return a callable", code="invalid_model")
+            move = getattr(module, "to", None)
+            if callable(move):
+                moved = move(device)
+                if moved is not None:
+                    self._module = moved
+                    module = moved
+            evaluate = getattr(module, "eval", None)
+            if callable(evaluate):
+                evaluated = evaluate()
+                if evaluated is not None:
+                    self._module = evaluated
+            if context.managed_execution:
+                self.drain_uncertain_operations()
 
     def _execute(self, request: ModelRequest, context: ExecutionContext) -> Mapping[str, object]:
         with torch_execution_scope(
@@ -190,6 +203,10 @@ class TorchModelSession(ModelSession):
             outputs = {descriptors[0].semantic: outputs}
         return {name: self._to_host(value) for name, value in outputs.items()}
 
+    def drain_uncertain_operations(self):
+        if self._torch is not None:
+            drain_torch_device(self._torch, self._device_name, self._device)
+
     def _close(self) -> None:
         self._release()
 
@@ -199,7 +216,8 @@ class TorchModelSession(ModelSession):
         if torch_module is not None:
             # A failed device drain keeps completion unknown, so the references
             # are retained for a retry. A device stuck in a sticky error state
-            # never completes; after bounded drain failures the release abandons
+            # never completes; only local mode may abandon the drain after bounded
+            # failures. Managed cleanup always retains ownership. Local release abandons
             # the wait, drops the references, and lets close terminate. Drain
             # failures during the load's own rollback path do not count: the
             # load error handling retries the release before any public close,
@@ -211,6 +229,7 @@ class TorchModelSession(ModelSession):
                     device_name,
                     self._device,
                     failed_attempts=self._release_drain_failures,
+                    managed=self._managed_execution,
                     owner="Torch model session release",
                 )
             except BackendLifecycleError:

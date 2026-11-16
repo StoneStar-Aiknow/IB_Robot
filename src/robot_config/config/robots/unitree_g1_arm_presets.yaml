@@ -1,9 +1,13 @@
-# Offline Gateway integration for the preset action 15 surface.
+# Static 23-action Gateway integration for the preset arm surface.
 #
-# Physical execution is not blocked outright: it needs the runtime profile's
-# vendor.operator_validation block (confirmed + robot-facing NIC + expected FSM)
-# and the node's preset_operator_confirmed flag, so only an operator-supervised
-# session can dispatch. Offline runs use the vendor mock on loopback.
+# Physical execution is not blocked outright: it needs the per-run launch
+# arguments preset_operator_confirmed=true, a robot-facing
+# runtime_network_interface, and an expected FSM id (explicit or audited in the
+# profile), so only an operator-supervised session can dispatch. The launch
+# builds the run-scoped profile internally; nothing is persisted here.
+# Offline runs use the vendor mock on loopback.
+# The table is static: a startup GetActionList only shrinks it, never discovers
+# actions, so a name the running firmware does not report stays unadvertised.
 robot:
   name: unitree_g1_arm_presets
   type: g1_29dof_arm_presets

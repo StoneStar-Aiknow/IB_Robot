@@ -328,24 +328,30 @@ vendor:
     sit: {fsm_id: 3}
     squat: {fsm_id: 2}
     stand_up: {fsm_id: 4}
-  # motion.named names -> `arm` service actions (SDK action_map). The vendor
-  # table also carries two-hand kiss 11 / left kiss 12 / right kiss 12 (note the
-  # vendor's own duplicate id 12), face wave 25, right heart 21, reject 22,
-  # right hand up 23, x-ray 24; the subset below has unique ids. GetActionList
-  # is queried at startup and compared against this table (D7, phase 2). An
-  # action's completion is its ExecuteAction RPC answer; unverified: whether
-  # rt/arm/action/state reports progress the bridge must wait for instead
-  # (gate 6.3).
+  # motion.named names -> `arm` service actions (SDK action_map). The keys are
+  # this profile's public skill names, not translations of the firmware strings.
+  # ID 17 is the operator-confirmed two-hand applause gesture: the public key
+  # `clap` is its semantic name, while firmware token `clamp` is historical and
+  # stays the exact action_name (2026-11-10 on-site confirmation, not a camera
+  # recording or an Agent real-robot test). action_name is the exact
+  # firmware string from the operator's GET-only GetActionList report on
+  # 2026-11-07/09 (ID 12 is the left-hand kiss and ID 13 the right-hand kiss).
+  # GetActionList is queried at startup and compared by exact id+name (D7,
+  # phase 2): a firmware that names an action differently does not advertise it,
+  # so a name change needs a fresh report and a profile update, never an id-only
+  # or fuzzy match. An action's completion is its ExecuteAction RPC answer;
+  # unverified: whether rt/arm/action/state reports progress the bridge must wait
+  # for instead (gate 6.3).
   arm_actions:
-    release_arm: {action_id: 99, action_name: "release arm"}
-    blow_kiss: {action_id: 11, action_name: "two-hand kiss"}
-    hands_up: {action_id: 15, action_name: "hands up"}
-    clap: {action_id: 17, action_name: "clap"}
-    high_five: {action_id: 18, action_name: "high five"}
-    hug: {action_id: 19, action_name: "hug"}
-    heart: {action_id: 20, action_name: "heart"}
-    wave: {action_id: 26, action_name: "high wave"}
-    shake_hand: {action_id: 27, action_name: "shake hand"}
+    release_arm: {action_id: 99, action_name: release_arm}
+    blow_kiss: {action_id: 11, action_name: blow_kiss_with_both_hands}
+    hands_up: {action_id: 15, action_name: both_hands_up}
+    clap: {action_id: 17, action_name: clamp}
+    high_five: {action_id: 18, action_name: high_five}
+    hug: {action_id: 19, action_name: hug}
+    heart: {action_id: 20, action_name: make_heart_with_both_hands}
+    wave: {action_id: 26, action_name: wave_above_head}
+    shake_hand: {action_id: 27, action_name: shake_hand}
   # arm_sdk (shared-weight 17-joint frame, design D4). The weight is the q
   # field of motor_cmd[29] (the first slot after JointIndex 0-28); it is shared
   # by 14 arm + 3 waist joints, so all 17 must carry targets whenever any

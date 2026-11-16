@@ -40,5 +40,38 @@ capability:
     required:
     - motion_distance
   recovery_policy: ask_user
+capability_variants:
+  robodojo_arx_x5_v1:
+    summary: Twist one arm's wrist clockwise (seen facing the fingers) about the gripper's approach axis by a requested angle.
+    parameters:
+      type: object
+      additionalProperties: false
+      properties:
+        arm_side:
+          type: string
+          enum:
+          - left
+          - right
+          - auto
+        motion_distance:
+          type: number
+          exclusiveMinimum: 0
+          unit: degrees
+      required:
+      - motion_distance
 implementations:
+  robodojo_arx_x5_v1: implementations/robodojo_arx_x5_v1.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
+description_variants:
+  robodojo_arx_x5_v1:
+    summary: Twist one arm's wrist clockwise (seen facing the fingers) about the gripper's approach axis; the grasp point stays put and the line the two fingers close along turns by the angle.
+    category: rotation
+    when_to_use:
+    - turn the fingers so they close across a long thin object (handle, shaft) instead of along it
+    - align the finger opening with the narrow side of an object before descending
+    do_not_use:
+    - condition: twist counter-clockwise
+      instead_use: rotate_gripper_ccw
+    motion_scope:
+    - wrist
+    intensity: moderate

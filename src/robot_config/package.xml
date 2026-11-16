@@ -12,9 +12,14 @@
   <depend>sensor_msgs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>robot_runtime</depend>
+  <!-- The description builder and the sim peripheral bridge import the
+       Gazebo platform code, and the provider-less Gazebo adapter launches
+       wait_for_clock, from robot_runtime_sim (sim-platform-registry D6). -->
+  <exec_depend>robot_runtime_sim</exec_depend>
   <!-- docs/testing.md: every sibling imported by tests is declared as an
        explicit test_depend; <depend> covers build+exec scope only. -->
   <test_depend>robot_runtime</test_depend>
+  <test_depend>robot_runtime_sim</test_depend>
   <test_depend>ibrobot_msgs</test_depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp_components</depend>

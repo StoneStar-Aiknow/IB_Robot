@@ -1,6 +1,7 @@
 import json
 from types import SimpleNamespace
 
+from robot_client.transport import GatewayTransport
 from robot_skill_cli import closed_loop_runner
 
 
@@ -24,8 +25,8 @@ class _Controller:
     def __init__(self, bridge, **_kwargs):
         self.bridge = bridge
 
-    def discover(self):
-        return {"state": "discovered"}
+    def load_catalog(self):
+        return {"state": "catalog_loaded"}
 
     def prepare_workflow(self, _raw_command, _steps):
         return {"state": "prepared"}
@@ -46,7 +47,7 @@ class _Controller:
 def _install_runner(monkeypatch, terminals):
     _Controller.terminals = list(terminals)
     context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}})
-    transport = SimpleNamespace(
+    transport = GatewayTransport(
         status_service="status",
         snapshot_service="snapshot",
         reload_service="reload",
@@ -56,10 +57,48 @@ def _install_runner(monkeypatch, terminals):
         validate_plan_service="validate_plan",
         confirm_plan_service="confirm_plan",
         execute_plan_action="execute_plan",
+        # The runner reads the identity fields too; it pins robot_id="" itself
+        # so the wire shape stays unchanged.
+        robot_id="robot-under-test",
+        caller_scope="robot_skill_cli",
     )
-    monkeypatch.setattr(closed_loop_runner, "load_runtime_context", lambda **_kwargs: (context, transport))
+    monkeypatch.setattr(closed_loop_runner, "load_transport_context", lambda **_kwargs: (context, transport))
     monkeypatch.setattr(closed_loop_runner, "RosBridge", _Bridge)
     monkeypatch.setattr(closed_loop_runner, "InteractiveController", _Controller)
+    return transport
+
+
+def test_runner_binds_the_transport_without_compiling_the_local_catalog(monkeypatch):
+    """The online driver must work when the local skill source is absent."""
+
+    def forbidden(**_kwargs):
+        raise AssertionError("closed-loop runner compiled the local catalog")
+
+    _install_runner(monkeypatch, [{"state": "succeeded"}])
+    monkeypatch.setattr(closed_loop_runner, "load_runtime_context", forbidden, raising=False)
+
+    assert closed_loop_runner.main(["--raw-command", "点头", "--skill", "nod_yes"]) == 0
+
+
+def test_runner_builds_the_bridge_from_the_shared_transport_mapping(monkeypatch):
+    """The driver must not re-enumerate endpoint names by hand (drift risk)."""
+    _install_runner(monkeypatch, [{"state": "succeeded"}])
+    seen_kwargs = {}
+
+    class _RecordingBridge(_Bridge):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            seen_kwargs.update(kwargs)
+
+    monkeypatch.setattr(closed_loop_runner, "RosBridge", _RecordingBridge)
+
+    exit_code = closed_loop_runner.main(["--raw-command", "点头", "--skill", "nod_yes"])
+
+    assert exit_code == 0
+    assert seen_kwargs["status_service"] == "status"
+    assert seen_kwargs["skill_action"] == "skill"
+    assert seen_kwargs["robot_id"] == "", "the driver keeps the empty robot_id it has always sent"
+    assert seen_kwargs["caller_scope"] == "robot_skill_cli"
 
 
 def test_runner_suppresses_feedback_after_terminal(monkeypatch, capsys):

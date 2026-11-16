@@ -33,6 +33,11 @@
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
   <test_depend>python3-pytest</test_depend>
+  <!-- The mobile-pick E2E imports ibrobot_msgs directly (RuntimeStatus,
+       PickObject, the Gateway services) — review r2 finding 12: transitive
+       availability in this workspace does not satisfy the direct
+       test-dependency rule. -->
+  <test_depend>ibrobot_msgs</test_depend>
   <!-- The migrated launch-builder tests import the perception-model node
        generator and the recording builder from their owning packages
        (openspec change ``migrate-business-launch-builders``, design
@@ -64,6 +69,29 @@
   <!-- lekiwi_robot ships the runtime profile the runtime-backed LeKiwi
        grasp configs resolve. -->
   <test_depend>lekiwi_robot</test_depend>
+  <!-- The moved mobile-grasp E2E support (lekiwi-nav-grasp revision 2, R8):
+       the judge and planning-scene construction import numpy, and the
+       collision-object regression builds moveit_msgs/shape_msgs/
+       geometry_msgs messages. The pick-sim staging resolves the shipped
+       Nav2 parameters and the skill packages through the robot_navigation
+       and skill_catalog shares (skill_catalog is an exec_depend above). -->
+  <test_depend>python3-numpy</test_depend>
+  <test_depend>moveit_msgs</test_depend>
+  <test_depend>sim_models</test_depend>
+  <test_depend>nav2_msgs</test_depend>
+  <test_depend>tf2_ros</test_depend>
+  <test_depend>std_msgs</test_depend>
+  <test_depend>sensor_msgs</test_depend>
+  <test_depend>shape_msgs</test_depend>
+  <test_depend>geometry_msgs</test_depend>
+  <test_depend>robot_navigation</test_depend>
+  <!-- The E2E's sim-clock subscription and the reach test read /clock
+       (review r1 item 12). -->
+  <test_depend>rosgraph_msgs</test_depend>
+  <!-- The interface-startup suite passes voice_asr_realtime_pre_roll_seconds
+       and expects the voice_asr launch-builder hook to apply it; that hook
+       registers from this package. -->
+  <test_depend>voice_asr_service</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

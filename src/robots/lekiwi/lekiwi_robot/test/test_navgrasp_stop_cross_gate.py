@@ -61,10 +61,11 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode, StopRuntime
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict, rest_verdict
-from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     open_ground_truth,
     terminate_marked_processes,
@@ -74,12 +75,35 @@ PACKAGE = "lekiwi_robot"
 MODEL_NAME = "lekiwi_robot"
 WORLD_NAME = "empty"
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_nav_grasp.yaml"
+#: The fixed first-party physics matrix the gate is parametrized over
+#: (openspec sim-platform-registry D2); the capability probe reports an
+#: unregistered platform so the shared require-or-skip rule decides.
+PHYSICS_PLATFORMS = ("gazebo", "mujoco")
 ARM_JOINTS = ["1", "2", "3", "4", "5", "6"]
 #: The stowed pose = ``hardware.reset_positions`` (joints 1-5; D4).
 STOWED_TARGET = [0.0, -1.5854, 1.5708, 0.7854, 0.0]
 #: A stream target more than 0.1 rad from the stowed pose on joint 2.
-STREAM_TARGET = [0.0, -0.5, 1.5708, 0.7854, 0.0]
-FURTHER_TARGET = [0.0, 0.3, 1.5708, 0.7854, 0.0]
+#: MEASURED 2026-10-30 (chunk D follow-up): the previous joint-3 value
+#: 1.5708 put the gripper 40.5 mm INSIDE the chassis at this joint-2 lift —
+#: with the profile's D7 solver override (noslip_iterations 20, cone
+#: elliptic) the non-penetration constraint then holds the arm 0.145 rad
+#: short of the streamed target (a steady offset, later motion 4e-7 rad;
+#: the old pyramidal/no-noslip solver tolerated the penetration and let the
+#: arm within 0.05). The value below is the closest CONTACT-FREE member of
+#: the same family: joint 2 unchanged (-0.5, 1.0854 rad from stowed), joint
+#: 3 lowered to 1.2 — verified offline by loading the provider's composed
+#: model, setting qpos at the target and listing mj_forward contacts
+#: (wheel/table contacts only; gripper-chassis clear).
+STREAM_TARGET = [0.0, -0.5, 1.2, 0.7854, 0.0]
+#: The later stream command (the idle variant): MEASURED 2026-10-30 — the
+#: previous joint-3 value 1.5708 put the gripper 12.6 mm inside the chassis
+#: at this joint-2 lift (the same defect class as STREAM_TARGET above; it
+#: passed only because the shallower penetration maps to an offset below
+#: the threshold). The value below is the closest contact-free member of
+#: the family: joint 2 unchanged (0.3), joint 3 lowered to 0.9 — 0.8 rad
+#: from STREAM_TARGET, verified by the same offline mj_forward contact
+#: check and pinned by test_navgrasp_targets_contact_free.py.
+FURTHER_TARGET = [0.0, 0.3, 0.9, 0.7854, 0.0]
 #: The (e) trajectory target: joints 1-2 +0.25 rad from the stowed pose (a
 #: real executed trajectory, displacement > 0.1 rad; the direct JTC path has
 #: no FCL, so the MoveIt-invalid stream region is irrelevant here).
@@ -113,13 +137,17 @@ def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
 
 
 def _platform_capabilities_missing(sim_platform: str) -> list[str]:
-    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+    from robot_runtime_sim.testing.sim_ground_truth import UnsupportedGroundTruth
 
     missing = []
     try:
         open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
     except UnsupportedGroundTruth as error:
         missing.append(f"ground truth: {error}")
+    try:
+        get_sim_platform(sim_platform)
+    except Exception as error:  # noqa: BLE001  (SimPlatformError: the platform is not installed)
+        missing.append(f"sim platform: {error}")
     supported = [str(entry) for entry in load_profile(PROFILE).get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
@@ -265,7 +293,7 @@ def _launch(sim_platform: str, environment: dict, log_path: Path):
         f"sim_platform:={sim_platform}",
     ]
     if sim_platform == "mujoco":
-        arguments.append(f"mujoco_scene:={WORLD_NAME}")
+        arguments.append(f"sim_world:={WORLD_NAME}")
     return subprocess.Popen(
         arguments, stdout=log_path.open("w"), stderr=subprocess.STDOUT, env=environment, start_new_session=True
     )
@@ -321,7 +349,7 @@ def _wait_sim_seconds(node, ground_truth, seconds: float, drive: float | None = 
     raise AssertionError(f"simulation time did not advance {seconds} s")
 
 
-@pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
+@pytest.mark.parametrize("sim_platform", PHYSICS_PLATFORMS)
 def test_nav_grasp_stop_cross_assertions(tmp_path, sim_platform):
     missing = _platform_capabilities_missing(sim_platform)
     if missing:

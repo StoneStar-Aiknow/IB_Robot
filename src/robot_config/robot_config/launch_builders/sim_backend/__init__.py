@@ -4,24 +4,23 @@ Usage:
     from robot_config.launch_builders.sim_backend import get_sim_backend
 
     adapter = get_sim_backend("gazebo")      # GazeboAdapter instance
-    adapter = get_sim_backend("mujoco")      # MujocoAdapter instance (T6)
     adapter = get_sim_backend("mock")        # MockAdapter instance
 
 The platform string comes from robot_config['simulation']['platform'] in
-the robot YAML (e.g., so101_single_arm.yaml).
+the robot YAML (e.g., so101_single_arm.yaml). MuJoCo is not here: it is
+served through a runtime provider, whose world side generic launch owns
+through the platform's world hook (sim-platform-registry D5/D8).
 """
 
 from .base_adapter import SimBackendAdapter
 from .gazebo_adapter import GazeboAdapter
 from .mock_adapter import MockAdapter
-from .mujoco_adapter import MujocoAdapter
 
-__all__ = ["SimBackendAdapter", "GazeboAdapter", "MockAdapter", "MujocoAdapter", "get_backend_caps", "get_sim_backend"]
+__all__ = ["SimBackendAdapter", "GazeboAdapter", "MockAdapter", "get_backend_caps", "get_sim_backend"]
 
 _BACKEND_REGISTRY: dict[str, type[SimBackendAdapter]] = {
     "gazebo": GazeboAdapter,
     "mock": MockAdapter,
-    "mujoco": MujocoAdapter,
 }
 
 
@@ -45,7 +44,7 @@ def get_sim_backend(platform: str) -> SimBackendAdapter:
     """Instantiate a simulation backend adapter by platform name.
 
     Args:
-        platform: Backend identifier, e.g. 'gazebo', 'mujoco', or 'mock'.
+        platform: Backend identifier, e.g. 'gazebo' or 'mock'.
                   Must match a key in _BACKEND_REGISTRY.
 
     Returns:

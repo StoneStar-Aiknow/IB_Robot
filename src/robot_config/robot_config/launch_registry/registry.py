@@ -298,19 +298,21 @@ class SimulationStartup:
     the controller-startup entry for the entity -> controller chain
     (provider-less launches).
 
-    ``world_name`` and ``spawn_pose`` carry the world hand-off to a runtime
+    ``world`` and ``spawn_pose`` carry the world hand-off to a runtime
     provider on a physics transport (runtime-simulation-transport D3):
     generic launch owns the world and resolves the scene, so the provider
-    receives the resolved world name and the full robot spawn pose
-    (x, y, z, yaw) instead of recomputing them. ``scene_name`` carries the
-    scene identity on the MuJoCo transport (so101-mujoco-runtime-platform
-    D3/D7): the world owner resolves the scene by name and the provider
-    composes its robot MJCF with it. All stay empty/None when generic launch
-    owns no world (provider-less or sdk transports).
+    receives the resolved world identifier (the gz world instance name on
+    Gazebo, the scene name on MuJoCo) and the full robot spawn pose
+    (x, y, z, yaw) instead of recomputing them. ``scene_name`` keeps the
+    scene identity separate from the platform hand-off: the scene asset
+    name the world owner selected (possibly ``""`` when the configured
+    scene failed to load), set on every platform (sim-platform-registry
+    D5). All stay empty/None when generic launch owns no world
+    (provider-less or sdk transports).
     """
 
     entity_action: Any = None
-    world_name: str = ""
+    world: str = ""
     spawn_pose: tuple[float, float, float, float] | None = None
     scene_name: str = ""
 

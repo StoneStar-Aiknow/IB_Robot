@@ -1,5 +1,24 @@
 # robot_config
 
+## Runtime 资源与目标编译
+
+`runtime_target_config.build_runtime_target_directory()` 从 robot SSOT 编译 policy 和
+perception 目标；`build_runtime_resources()` 生成物理设备资源目录。它们校验资源别名、
+容量、endpoint 冲突、workload profile 路径及预测准入覆盖。配置层不导入 inference_service。
+profile 路径展开 `~`，相对路径以 `WORKSPACE` 为基准，并检查文件存在。
+profile 内容和身份由 Global 启动时的 `RuntimeProfileRegistry` 校验。
+`launch_builders.model_runtime.model_runtime_connection_parameters()` 只投影连接参数；
+现有业务 launch 不会因引入该工具自动切换宿主。
+
+`runtime_scheduler.resources` 声明资源 ID、canonical physical_device、资源模式和覆盖证明。
+`managed_perception` 可覆写目标优先级、超时、容量、profile_path 和 runtime_version。
+policy 新增 `runtime_limits`、`runtime_profile_path`、`runtime_version`、
+`profile_observation_inputs`。其中 `runtime_profile_path` 指向 runtime_execution v2 证据；
+旧 `profile_path` 继续服务既有 policy scheduler，不能用 v2 文件替换。
+
+本阶段只编译 policy/perception；尚未迁移的启用中语音或本地模型参与者不能被视为已受管，
+预测准入的覆盖检查会保守拒绝。调度关闭、simulation 或 benchmark 不生成在线目标目录。
+
 ros2_control 和外设的统一机器人配置系统。
 
 ## 概述
@@ -363,10 +382,12 @@ deployment artifacts 只在托管主机校验。
 
 ## Sim camera pose override（仅限仿真标定，opt-in）
 
-仿真启动时，URDF / MJCF 中相机位姿默认来自 robot YAML 与
-`launch_builders/sim_backend/camera_presets.py:PRESETS`。为了让开发者在仿真里
-调出的视角可以跨重启复用，launch adapter 层会通过
-`launch_builders/sim_backend/camera_overrides.py` 读取一条不进版本控制的用户级旁路：
+仿真启动时，URDF / MJCF 中相机位姿默认来自 robot YAML 外设自身的
+`simulation.<platform>.transform`（+ `fovy`）与顶层 `transform` 字段
+（sim-platform-registry D9 起，平台级 preset 表 `camera_presets.py` 已删除；
+历史 Gazebo/MuJoCo 预设值由各 runtime profile 的 `simulation.<platform>.transform`
+承接）。为了让开发者在仿真里调出的视角可以跨重启复用，launch adapter 层会读取
+一条不进版本控制的用户级旁路：
 
 | 项 | 说明 |
 |---|---|
@@ -374,8 +395,8 @@ deployment artifacts 只在托管主机校验。
 | 写入方 | `dataset_tools.camera_alignment`（stub）和 `sim_models.sim_camera_adjuster`（真实位姿） |
 | 字段 | `parent_frame`, `pose.{x,y,z,roll,pitch,yaw}`, `fovy_deg` |
 | 直接生效平台 | `gazebo` |
-| MuJoCo 路径 | 不直接读取同一套角度，而是由 `mujoco_adapter.py` 做显式坐标系转换 |
-| 文件缺失或 stub | 回退到 `PRESETS`，保持历史默认行为 |
+| MuJoCo 路径 | 不直接读取同一套角度，而是由 `robot_runtime_sim.mujoco` 做显式坐标系转换 |
+| 文件缺失或 stub | 回退到 YAML 声明值，保持历史默认行为 |
 
 这条 override 只服务于开发者标定，不应该被运行时业务逻辑当作新的 SSOT。
 如果仿真相机姿态和 YAML 里看到的不一致，先检查这个目录里是否残留了历史 override。
@@ -800,6 +821,16 @@ dispatch、`navigation_command_server` 的 Action server 注册以及 `nav_cmd` 
 `grasp` / `mapping` 使用 V1 context，独立 `navigation` 使用 V2 context，`hybrid` 使用 V3 context。
 V3 同时携带 V1 操作 primitive 与 V2 导航 primitive，并在 digest preimage 中加入
 `supported_control_modes`，防止与旧 snapshot 混用。
+
+### 运行时 provider 的按次操作员确认参数
+
+`robot.launch.py`（以及 `embodied_pipeline.launch.py`）声明三个按次参数：
+`runtime_network_interface`、`preset_operator_confirmed`（默认 `false`）、
+`preset_expected_fsm_id`（默认空）。参数只转发给明确声明支持的 provider
+（当前为 `unitree_g1_robot`）；其他 provider 不会收到未知参数。G1 preset
+物理路径要求确认值为 `true`、NIC 非空且非 `lo`、FSM 显式或来自已审
+profile；冲突的重叠取值直接拒绝。确认值只存在于本次启动，不写入配置或
+profile 文件。
 
 ### `base_navigation` 控制模式
 

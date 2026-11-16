@@ -39,9 +39,23 @@ capability:
     properties: {}
     required: []
   recovery_policy: never_retry
+capability_variants:
+  robodojo_arx_x5_v1:
+    parameters:
+      type: object
+      additionalProperties: false
+      properties:
+        arm_side:
+          type: string
+          enum:
+          - left
+          - right
+          - auto
+      required: []
 implementations:
   lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
   lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
+  robodojo_arx_x5_v1: implementations/robodojo_arx_x5_v1.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
   lekiwi_handeye_realsense_grasp:

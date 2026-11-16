@@ -11,6 +11,9 @@ sensor_msgs/JointState seed
 float64 orientation_tolerance
 # Solver timeout (s); 0 means the runtime default.
 float64 timeout
+# Motion group (arm) to solve for, as declared by motion.move_to_pose "groups".
+# Empty = the runtime's default group (the only group of a single-arm runtime).
+string target_group
 ---
 bool success
 string message

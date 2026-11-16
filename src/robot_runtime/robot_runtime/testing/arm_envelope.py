@@ -94,7 +94,12 @@ def envelope_verdict(
     values, and every joint within ``tolerance`` of its reset pose.
     """
     joints = sorted(reset)
-    window = sorted((stamp, positions) for stamp, positions in samples if begin <= stamp <= end)
+    # key on the stamp alone: duplicate-stamped samples (two messages at
+    # one sim time under load) must not fall through to comparing the
+    # position dicts
+    window = sorted(
+        ((stamp, positions) for stamp, positions in samples if begin <= stamp <= end), key=lambda sample: sample[0]
+    )
     violations = _freshness_violations(window, begin, end, max_gap)
     checked = _checked_samples(window, joints, violations)
     worst = max(

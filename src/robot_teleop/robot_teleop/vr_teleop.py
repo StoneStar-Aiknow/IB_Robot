@@ -407,6 +407,11 @@ class VRTeleopNode(Node):
         self.declare_parameter("port", 8889)
         self.declare_parameter("managed_teleop", False)
         self.declare_parameter("command_lease_topic", "")
+        # Managed session endpoints. When set they replace so101_start_service
+        # (Trigger) and command_lease_topic (Empty): the start response carries
+        # the clutch origin, and the stamped lease cannot keep a later session alive.
+        self.declare_parameter("session_start_service", "")
+        self.declare_parameter("session_lease_topic", "")
         self.declare_parameter("gripper_joint_name", "")
         self.declare_parameter("joint_limits", "{}", ParameterDescriptor(read_only=True))
         self.declare_parameter("runtime_status_topic", "/runtime/status")
@@ -628,7 +633,17 @@ class VRTeleopNode(Node):
             self._so101_gripper_pub = self.create_publisher(
                 JointState, self.get_parameter("so101_gripper_topic").value, 1
             )
-            self._managed_lease_pub = self.create_publisher(Empty, self.get_parameter("command_lease_topic").value, 1)
+            session_lease_topic = str(self.get_parameter("session_lease_topic").value)
+            if session_lease_topic:
+                from ibrobot_msgs.msg import SessionLease
+
+                self._managed_lease_pub = self.create_publisher(SessionLease, session_lease_topic, 1)
+                self._lease_type = SessionLease
+            else:
+                self._managed_lease_pub = self.create_publisher(
+                    Empty, self.get_parameter("command_lease_topic").value, 1
+                )
+                self._lease_type = Empty
             from ibrobot_msgs.msg import RuntimeStatus
 
             self.create_subscription(
@@ -638,7 +653,15 @@ class VRTeleopNode(Node):
             self._so101_gripper_pub = self.create_publisher(
                 Float64MultiArray, self.get_parameter("so101_gripper_topic").value, 10
             )
-        self._so101_start_cli = self.create_client(Trigger, self.get_parameter("so101_start_service").value)
+        session_start_service = str(self.get_parameter("session_start_service").value) if self._managed else ""
+        if session_start_service:
+            from ibrobot_msgs.srv import StartArmSession
+
+            self._start_type = StartArmSession
+            self._so101_start_cli = self.create_client(StartArmSession, session_start_service)
+        else:
+            self._start_type = Trigger
+            self._so101_start_cli = self.create_client(Trigger, self.get_parameter("so101_start_service").value)
         self._so101_stop_cli = self.create_client(Trigger, self.get_parameter("so101_stop_service").value)
         self._so101_home_cli = ActionClient(self, ArmReturnHome, self.get_parameter("so101_home_action").value)
         self.create_subscription(Bool, self.get_parameter("estop_topic").value, self._on_estop, 10)
@@ -704,7 +727,7 @@ class VRTeleopNode(Node):
             self.get_logger().warn("SO101 servo start service not ready; will retry")
             return
         self._so101_start_inflight = True
-        future = self._so101_start_cli.call_async(Trigger.Request())
+        future = self._so101_start_cli.call_async(self._start_type.Request())
         future.add_done_callback(self._on_so101_start_response)
 
     def _on_so101_start_response(self, future) -> None:
@@ -821,7 +844,7 @@ class VRTeleopNode(Node):
         if self._so101_recalib_inflight:
             return True
         self._so101_recalib_inflight = True
-        future = self._so101_start_cli.call_async(Trigger.Request())
+        future = self._so101_start_cli.call_async(self._start_type.Request())
         future.add_done_callback(self._on_so101_recalib_response)
         return True
 
@@ -1087,10 +1110,15 @@ class VRTeleopNode(Node):
         linear, angular = self._compute_velocities(ctrl, state)
         self._publish_so101(linear, angular, ctrl.grip_value)
 
+    def _publish_lease(self) -> None:
+        message = self._lease_type()
+        if hasattr(message, "header"):
+            # The servo drops a lease stamped at or before its session start.
+            message.header.stamp = self.get_clock().now().to_msg()
+        self._managed_lease_pub.publish(message)
+
     def _control_managed(self, ctrl):
         """Fresh trigger edges own the runtime session in both VR modes."""
-        from std_msgs.msg import Empty
-
         if self._estop_active:
             return
         if ctrl is None or not ctrl.enabled:
@@ -1104,7 +1132,7 @@ class VRTeleopNode(Node):
                 self._so101_stalled = False
             return
         if self._so101_home_inflight:
-            self._managed_lease_pub.publish(Empty())
+            self._publish_lease()
             return
         if not self._so101_started:
             if self._managed_release_required or self._so101_stop_pending or self._so101_recalib_inflight:
@@ -1114,7 +1142,7 @@ class VRTeleopNode(Node):
             self._pose_calib_rot = ctrl.rotation
             self._recalibrate_so101_baseline()
             return
-        self._managed_lease_pub.publish(Empty())
+        self._publish_lease()
         secondary = bool(ctrl.secondary_button)
         if secondary and not self._secondary_prev:
             self._secondary_prev = True

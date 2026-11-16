@@ -42,6 +42,8 @@ def test_npu_device_name_uses_physical_sku() -> None:
 
 
 def test_lerobot_validation_failure_retains_acquired_policy_until_device_drain(tmp_path, monkeypatch):
+    import torch
+
     from inference_manifest import TorchRuntimeProfile
     from inference_service.backends import BackendState, RuntimeContext
     from inference_service.unified_runtime import ExecutionFailure, ModelRuntimeHandle, RuntimeAssembly
@@ -59,8 +61,10 @@ def test_lerobot_validation_failure_retains_acquired_policy_until_device_drain(t
 
     modules = {
         "torch": SimpleNamespace(
-            device=lambda name: name,
-            cuda=SimpleNamespace(is_available=lambda: True, synchronize=sync, current_device=lambda: 0),
+            device=torch.device,
+            cuda=SimpleNamespace(
+                is_available=lambda: True, synchronize=sync, current_device=lambda: 0, device=lambda _: nullcontext()
+            ),
         ),
         "lerobot.configs.policies": SimpleNamespace(
             PreTrainedConfig=type(

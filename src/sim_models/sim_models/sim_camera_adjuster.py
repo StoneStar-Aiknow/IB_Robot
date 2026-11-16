@@ -31,8 +31,7 @@ Design notes
 - ros_gz_bridge is spawned as a subprocess and terminated on exit.
 - Initial pose priority:
     1. ~/.ros/ibrobot/sim_camera_overrides/<camera>.yaml  (previous session)
-    2. camera_presets.get_preset(platform, camera_name)   (use_default_transform=true)
-    3. robot YAML transform field                          (use_default_transform=false)
+    2. robot YAML transform field                          (simulation.<platform>.transform)
 """
 
 from __future__ import annotations
@@ -144,26 +143,9 @@ def _load_initial_pose(
         except Exception as exc:
             print(f"[adjuster] WARNING: failed to parse override YAML: {exc}")
 
-    # 2. Try camera_presets (use_default_transform path)
-    try:
-        from robot_config.launch_builders.sim_backend.camera_presets import get_preset
-
-        preset = get_preset(platform, camera_name)
-        if preset:
-            print(f"[adjuster] Loaded initial pose from camera_presets ({platform}/{camera_name})")
-            return {
-                "x": float(preset.get("x", 0.0)),
-                "y": float(preset.get("y", 0.0)),
-                "z": float(preset.get("z", 0.5)),
-                "roll": float(preset.get("roll", 0.0)),
-                "pitch": float(preset.get("pitch", 0.0)),
-                "yaw": float(preset.get("yaw", 0.0)),
-                "fovy_deg": float(preset.get("fovy", 60.0)),
-            }
-    except Exception as exc:
-        print(f"[adjuster] camera_presets unavailable: {exc}")
-
-    # 3. Try reading from robot YAML transform field
+    # 2. Try reading from robot YAML transform field
+    # (the platform preset table was removed in sim-platform-registry D9: the
+    #  camera default pose lives in the peripheral's simulation.<platform>.transform)
     if robot_config:
         try:
             pose = _load_pose_from_yaml(robot_config, camera_name)
@@ -940,14 +922,26 @@ def _lookup_gazebo_link_pose(
     return best
 
 
-def _get_parent_frame(camera_name: str, platform: str) -> str:
-    """Return parent_frame from camera_presets (e.g. 'gripper' or 'base')."""
-    try:
-        from robot_config.launch_builders.sim_backend.camera_presets import get_preset
+def _get_parent_frame(camera_name: str, robot_config: str) -> str:
+    """Return the camera's parent_frame from the robot YAML (e.g. 'gripper' or 'base').
 
-        preset = get_preset(platform, camera_name)
-        if preset:
-            return str(preset.get("parent_frame", "base"))
+    The platform preset table was removed in sim-platform-registry D9; the
+    peripheral's own ``transform.parent_frame`` is the source. Falls back to
+    'base' when the YAML cannot be read or carries no parent_frame.
+    """
+    try:
+        from ament_index_python.packages import get_package_share_directory
+
+        share = get_package_share_directory("robot_config")
+        yaml_path = Path(share) / "config" / "robots" / f"{robot_config}.yaml"
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+        peripherals = data.get("robot", {}).get("peripherals", [])
+        for cam in peripherals:
+            if cam.get("name") == camera_name and cam.get("type") == "camera":
+                parent = (cam.get("transform") or {}).get("parent_frame")
+                if parent:
+                    return str(parent)
+                break
     except Exception:
         pass
     return "base"
@@ -1323,14 +1317,14 @@ class SimCameraAdjuster:
         )
 
         # Resolve initial pose (always stored as link-relative offset for TF cameras,
-        # or world-absolute for static cameras — camera_presets stores the right values)
+        # or world-absolute for static cameras — the YAML transform stores the right values)
         self._initial_pose = _load_initial_pose(self._cam_name, platform, robot_config)
         self._pose = dict(self._initial_pose)
 
         # --- Parent-link world-pose snapshot for moving-frame cameras ---
         # Detect whether the camera is mounted on a moving link by reading parent_frame
-        # from camera_presets.  For "world" / "map" / "odom" cameras, skip lookup.
-        self._parent_frame: str = _get_parent_frame(self._cam_name, platform)
+        # from the robot YAML.  For "world" / "map" / "odom" cameras, skip lookup.
+        self._parent_frame: str = _get_parent_frame(self._cam_name, robot_config)
         self._tf_snap: tuple[tuple, tuple] | None = None  # (xyz, rpy) of parent in world
 
         if self._parent_frame not in _STATIC_PARENT_FRAMES:

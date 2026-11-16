@@ -1,0 +1,42 @@
+schema_version: 1
+name: turn_back_wave
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Turn back and wave (firmware action 1). Firmware reports FSM 500/501 only;
+    the current FSM 802 runtime is read-only, so admission rejects it instead of switching
+    FSM.
+  category: social_greeting
+  when_to_use:
+  - wave goodbye while turning away
+  aliases_zh:
+  - 转身挥手
+  aliases_en:
+  - turn back wave
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Run the G1 turn-back wave preset (action 1); only FSM 500/501 is supported
+    and the runtime never switches FSM.
+  display_name: 转身挥手
+  tags:
+  - preset
+  - unitree_action_id_1
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  g1_preset_v1: implementations/g1_preset_v1.yaml

@@ -150,7 +150,8 @@ sensors always sit exactly at the mount.
 accuracy gate for this runtime. It lives in `robot_navigation`, not here:
 it launches the generic application entry, and this package may not declare
 test dependencies on generic packages (the independence gate below audits
-the whole dependency closure, test dependencies included). It is
+the execution closure; test dependencies only reach its test closure, never
+the runtime's execution surface). It is
 parametrized over profile (`lekiwi_lidar`, `lekiwi_nav_grasp`) as well as
 platform: the mobile manipulator runs the SAME thresholds over the SAME
 route, staged from the gate's own
@@ -211,7 +212,7 @@ and — independently — when the platform's simulator is unavailable
 matching Python `mujoco` for MuJoCo). Acceptance runs set
 `IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco` to turn any such skip into a
 failure. The environment probe and the require-or-skip rule are shared
-through `robot_runtime.testing.sim_environment` (one copy for this gate, the
+through `robot_runtime_sim.testing.sim_environment` (one copy for this gate, the
 chassis gate below and robot_config's navigation e2e). The overlay is staged
 per platform (`robot_navigation`'s `test/config/lekiwi_lio_sim.yaml` pins
 `platform: gazebo`; the gate rewrites the staged copy).
@@ -222,7 +223,8 @@ per platform (`robot_navigation`'s `test/config/lekiwi_lio_sim.yaml` pins
 check of the same navigation stage: it sends `NavigateToPose` goals (to a
 point and back to the spawn) and a cancel-based stop, asserting the D3 stop
 thresholds and single-publisher `map -> odom` ownership (AMCL) on simulator
-ground truth. It is parametrized over `PHYSICS_SIM_PLATFORMS` — goals,
+ground truth. It is parametrized over the first-party physics platforms
+(`gazebo`, `mujoco`) — goals,
 thresholds and assertions are identical on Gazebo and MuJoCo — and over the
 staging base (`lekiwi_lidar`, `lekiwi_nav_grasp`): the mobile manipulator
 runs the same goals through its own overlay
@@ -233,7 +235,7 @@ with the stowed-arm envelope asserted throughout every navigation phase.
 The staged overlay copy (not the shipped one) carries the platform under
 test. The same capability/environment/require rule as the gate applies
 (`IBROBOT_REQUIRE_SIM_PLATFORMS` turns a skip of a listed platform into a
-failure); the shared rule lives in `robot_runtime.testing.sim_environment`
+failure); the shared rule lives in `robot_runtime_sim.testing.sim_environment`
 (robot_config must not import lekiwi_robot's test assets).
 
 ```bash
@@ -268,7 +270,7 @@ the URDF-derived pose (D2/D8):
 ```bash
 # provider alone, headless (no display): sensors, admission, wheels
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch lekiwi_robot runtime.launch.py \
-  profile:=lekiwi_lidar sim_platform:=mujoco [mujoco_scene:=nav_room \
+  profile:=lekiwi_lidar sim_platform:=mujoco [sim_world:=nav_room \
   spawn_x:=-1.5 spawn_y:=-1.5 spawn_z:=0.05]
 
 # navigation (FAST-LIO + Nav2/AMCL) through the robot_config entry,
@@ -277,7 +279,7 @@ ros2 launch robot_config robot.launch.py config_path:=<staged>/lekiwi_lio_sim.ya
   use_sim:=true sim_platform:=mujoco nav_stage:=navigation
 ```
 
-An empty `mujoco_scene` composes the shared `empty` scene. Use a fresh
+An empty `sim_world` composes the shared `empty` scene. Use a fresh
 `ROS_DOMAIN_ID` and kill stray `ros2_control_node` processes afterwards; the
 composed model lands under `/tmp/ibrobot_sim_models/<ROS_DOMAIN_ID>/` (an
 extension-declaring model is delivered as XML — the C++ node compiles it
@@ -353,7 +355,7 @@ printf 'fast_lio:\n  enabled: true\n' > /tmp/lekiwi_fastlio.yaml
 
 # terminal 1 — the runtime with the viewer (no IBROBOT_MUJOCO_HEADLESS)
 ros2 launch lekiwi_robot runtime.launch.py profile:=lekiwi_lidar \
-  sim_platform:=mujoco mujoco_scene:=nav_room spawn_x:=-1.5 spawn_y:=-1.5 \
+  sim_platform:=mujoco sim_world:=nav_room spawn_x:=-1.5 spawn_y:=-1.5 \
   peripherals:=/tmp/lekiwi_fastlio.yaml
 
 # terminal 2 — RViz with the FAST-LIO topics (/cloud_registered with a decay
@@ -387,7 +389,7 @@ parameter variant — the shipped base-only config keeps 0.22).
 ```bash
 # provider alone (sensors, admission, wheels, arm, MoveIt stack), either platform
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch lekiwi_robot runtime.launch.py \
-  profile:=lekiwi_nav_grasp sim_platform:=mujoco [mujoco_scene:=nav_room]
+  profile:=lekiwi_nav_grasp sim_platform:=mujoco [sim_world:=nav_room]
 IBROBOT_GAZEBO_HEADLESS=1 IGN_PARTITION=<fresh> GZ_PARTITION=<fresh> \
   ros2 launch lekiwi_robot runtime.launch.py \
   profile:=lekiwi_nav_grasp sim_platform:=gazebo
@@ -452,6 +454,216 @@ controllers follow the ordinary lifecycle on both platforms (released in
 `idle`); on MuJoCo their released position actuators keep the last goal
 (the settle-at-target semantics above), on Gazebo the zero-velocity hold
 applies (with the release-race caveat above).
+
+### Mobile manipulation in simulation (the grasp stage, #205)
+
+The navigate-then-grasp E2E runs the **production `pick_object` pipeline** in
+the `nav_grasp_room` scene — `nav_room`'s navigation geometry plus a static
+low table (0.4 × 0.5 × 0.015 m slab, top 0.015 m above the floor, west edge
+at map x = 1.0) and one dynamic magenta cube (0.03 m edge, centre 0.025 m
+inside the edge; it settles to z = 0.03).
+`sim_models/scenes/nav_grasp_room/layout.yaml` is the single authority, and
+its `mobile_manipulation:` section carries the task data: the object prompt
+("magenta cube") and the success thresholds (lift ≥ 0.05 m, hold 3 s, ≤ 10°
+rotation and ≤ 0.01 m drift in the gripper frame).
+
+**What the E2E exercises** (`embodied_bringup/test/test_mobile_pick_simulation.py`,
+revision 2): the production pipeline end to end — the `PickObject` action →
+`pick_executor_node` → GraspGen `grasp_planner` + `grasp_verifier` + the
+grounded-SAM2 detection service, every arm motion as a Gateway primitive
+through `skill_executor`/`task_executor` (`move_to_configuration`; the
+gripper through the gripper trajectory controller), and the supervised-direct
+pick through the production `pick_action_client`. Inference runs on **CUDA**
+(the shipped CUDA fixture's deployment values, each annotated with its source
+line in the overlay). The stage is a **test overlay staged at test time**
+(`lekiwi_nav_grasp_pick_sim`: peripherals `[wrist, mid360]`, the grasp
+detection service on CUDA, HRI and semantic mapping off) — **no shipped
+config changes**; the skill catalog is a development staging catalog
+(test-only profile with `pick_object` and the skills its implementation
+needs). Around the pick: `NavigateToPose` with the no-motion-recovery BT and
+the `/cmd_vel` attribution audit, `SetRuntimeMode("trajectory")`, the
+chassis-only planning scene (the table is deliberately absent — production
+never puts it in MoveIt's scene; the maintainer decision of 2026-11-02), the
+R6 audit of every executed arm sample against `/check_state_validity` on
+EVERY attempted execution — a failed pick that never moved the arm records
+explicit no-motion evidence — the timestamped runtime-status and sim-clock
+invariants, and the all-ground-truth judge (a continuous one-second frozen
+rest window, the layout's `lift_m` pre-lift boundary, the model-TCP grasp
+region, the base roll/pitch tilt). The verdict is assigned only after the
+invariants, the audit, the judge and the whole cleanup complete: cleanup
+failures stay hard failures even behind an approved failure code.
+
+**Simulation-only settings** (hardware, SDK and MoveIt renders stay
+byte-identical — golden tests pin this):
+
+- MuJoCo runs the grasp stage with `noslip_iterations: 20`,
+  `cone: elliptic` (the profile's `simulation.mujoco.option` override): with
+  the host defaults the jaw contacts fired at 0.01–0.07 N and the cube was
+  not holdable; with the override the hold drift is 0.0 mm. The scene also
+  declares its default free-camera view (`<statistic>` centred on the
+  staging/table area, extent 0.75), so the MuJoCo viewer opens ~1.1 m from
+  the robot at the table — a view-only setting, no physics effect.
+- Gazebo renders the jaws as the same CoACD convex hulls MuJoCo simulates
+  (`jaw_collision: hulls`, set only by the Gazebo render path of
+  `so101_base.xacro`) and sets `gripper_effort: 1.0` — the URDF default
+  (10) ejects the cube through the hull faces on Gazebo (measured sweep:
+  10/2.75/2.0/1.5 eject, 1.0 captures 5/5).
+- The test overlay stages a **test-only Nav2 parameter variant** (generated
+  at staging time, never committed): final-approach inflation radius 0.12 —
+  the shipped 0.20 stalls MPPI at the cost cliff in front of the goal and
+  stops the base 0.35 m from the table edge, where every top-confidence
+  GraspGen candidate fails preparation IK; 0.12 stops ~0.27 m from the edge.
+  The staging goal is the layout's single definition —
+  `mobile_manipulation.staging_pose` (0.785, 0.40), read through
+  `mobile_manipulation_spec` — which brings the base to ~0.24 m from the
+  cube (the real robot's validated pick band).
+
+**Hardware-visible production fixes shipped with the stage** (all need
+on-robot verification):
+
+1. **Simulation time in the embodied nodes and the perception model service**
+   (R3): every embodied node that exchanges stamped data gets `use_sim_time`
+   from the launch's clock decision on physics platforms.
+2. **`pick_action_client` ROS-clock budgets** (R3): `DispatchBinding.task_budget`
+   is built from the node's ROS clock (wall time remains for
+   process/watchdog timeouts) — budgets read on the ROS clock must be
+   written on it.
+3. **IK workers get the runtime arm description** (our own !550 regression):
+   `motion.launch` passes the same robot description it gives the primary
+   `move_group` to `ik_workers.launch`, so the workers plan in `arm_root`
+   like the primary instead of rendering their own `world`-rooted model.
+4. **`motion.fk` advertises the global endpoint only** (`/motion/compute_fk`):
+   the motion server registers per-worker IK only, so the worker FK
+   advertisement could never be served and failed the pick executor's
+   service gate at pick start.
+5. **Planning failures are per-candidate** (2026-11-02): the motion server
+   classifies a MoveIt planning-phase abort (no trajectory execution
+   started) as `PLANNING_FAILED`, and the Gateway reports the distinct
+   `PRIMITIVE_ARM_PLANNING_FAILED` code, which the pick executor retries
+   with the next candidate; a failure after motion started stays
+   non-retryable.
+6. **The runtime-status heartbeat owns its callback group** (2026-11-02):
+   a slow readiness check can no longer delay the facade's heartbeat past
+   the Gateway's freshness budget (measured on Gazebo: the blocked-close
+   load starved the shared callback group and the next primitive was
+   refused as stale).
+7. **The grasp verifier's open-jaw rule** (2026-11-02): a jaw reading at or
+   near the fully-open reference after a close goal is never contact
+   evidence — it scores as failure evidence ("jaw at/near fully open after
+   close goal"); "stopped before fully closing" applies only to a jaw that
+   actually moved from open.
+
+**Known Gazebo issues** (maintainer decision 2026-11-02: the pick E2E is
+**accepted on MuJoCo**; on Gazebo the run still happens and only the two
+measured pick-failure classes below are reported as known issues —
+`pytest.xfail` raised only AFTER the continuous invariants, the R6 audit and
+the whole cleanup complete, with both modes in the reason; every other
+failure — startup, navigation, the invariants (runtime status, sim clock,
+ground-truth resets or missing/unsynchronized evidence), the arm-sample
+audit, cleanup, models — stays a hard failure that overrides the xfail, and
+a Gazebo pass is a plain pass; reach accuracy and every other Gazebo test
+stay required). The 2026-11-02 acceptance sequence: 6 runs, 0 passes. Two
+modes:
+
+- **Retry-budget exhaustion at the stop-pose band** (base 0.177–0.267 m from
+  the table edge): the marginal-candidate preparation codes (IK orientation,
+  contact realign/compensation over-limit) — including deep-descend
+  candidates whose **moving-jaw CoACD hull wedges the table slab at the
+  fully-open end** so the close goal never moves the jaw (measured
+  e2e/gazebo-180245, -183150: desired ramps 1.0 → 0.0 while the joint stays
+  at exactly 1.0001; the tip hull rests on the 0.015 m slab and the closing
+  arc drives it deeper — self-locking; the 1.0 N·m gripper effort cannot
+  break it; the zero-tolerance JTC reports the goal successful). Root cause:
+  the production FK tabletop filter checks the raw-STL jaw mesh
+  (`tabletop_clearance_m: -0.025`) while Gazebo's physics uses the CoACD
+  hulls whose faces sit up to ~14 mm outside the raw STL. The
+  `GRASP_UNCERTAIN` member of this class is granted only on the verifier's
+  specific jaw-at-open wedge evidence carried in the PickObject failure
+  message; a missing/stale-sensor "No usable grasp-verification evidence"
+  or a generic fused-uncertain close is a hard failure.
+- **A verified-contact close that does not survive the transport swing**: the
+  jaw blocks on the cube at q6 ≈ 0.40 (MuJoCo's validated blocking band) and
+  the verifier confirms contact (the `verification_status` enum), but the
+  effort-1.0 grip slips and the cube is never carried (e2e/gazebo-174538,
+  -183757, -184202). This class requires the judge's PAIRED gripper-frame
+  evidence showing the object outside the jaws; missing or unsynchronized
+  ground-truth evidence is a hard failure. MuJoCo holds the same blocking
+  band through the full transport.
+
+**Known Gazebo modes that stay hard failures** (documented 2026-11-03,
+review r2 — none of these is an approved xfail class; all measured on the
+fixed tree, runs/e2e/r2fix-gate-*):
+
+- **The Gateway's runtime-status admission can refuse under heavy host load**
+  (`CONTROL_MODE_MISMATCH`, "runtime status is stale or its clock is
+  unsynchronized"): the Gateway's admission applies a zero-tolerance lower
+  bound on the status SOURCE age (`0 <= source_age <= 3.0 s`), and under load
+  the Gateway's own `/clock` view can lag the facade's heartbeat stamps.
+  Measured (review r2, the instrumented legs): 1 pick-phase occurrence in 5
+  Gazebo legs — at host load 31.86, right after a verified 3.9-s wall close;
+  the heartbeat itself was fresh at the E2E probe throughout (receipt wall
+  gaps ≤ 2.75 s vs the 3.0-s budget, source-stamp ages ≤ 7 ms), and the
+  Gateway-side refusal log measured `receipt_age` 1.1–1.5 s (healthy) with
+  `source_age` −6 → −12 s (the Gateway's clock view behind the facade's
+  stamps). Legs at load 2.87–23.07 never showed it; MuJoCo (RTF ~1.0) never.
+  A follow-up issue owns the skew-tolerance decision (the analogous
+  `action_dispatch` admission carries one); the refusal log stays in the
+  admission path as diagnostics.
+- **A marginal base-planar-speed reading** (`0.021 m/s` vs the spec's
+  `0.02 m/s` bound, ONE sample during the descend) rejected an otherwise
+  verified-contact pick (r2fix-gate-2). The spec number stands — the judge
+  stays strict.
+- **Arm self-contact grazes at the observe-move start** can fail the R6
+  audit: the two recorded invalid states from the r1 run gazebo-shot-155025
+  were replayed through `/check_state_validity` (r2,
+  runs/e2e/gazebo-r2state-replay/state_replay.json): both are
+  `gripper ↔ upper_arm` SELF-CONTACTS (depths 0.12 mm and 0.04 mm) with no
+  contact against the chassis box — the earlier "chassis AABB graze"
+  attribution is refuted. The audit stays strict; the base's roll/pitch tilt
+  is recorded (max over the hold window) but judged by planar speed only
+  (maintainer decision 2026-11-03).
+
+**Running the tests** (a clean shell per the project rules —
+`source .shrc_local` / the worktree variant; fresh `ROS_DOMAIN_ID` per solo
+run; batch `colcon test` keeps the domain unset; both simulators headless
+except screenshot runs):
+
+```bash
+# the pick E2E on the accepted platform (formal verdict: colcon test)
+mkdir -p /tmp/grasp_artifacts
+ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 IBROBOT_MUJOCO_HEADLESS=1 \
+IBROBOT_REQUIRE_SIM_PLATFORMS=mujoco \
+IBROBOT_E2E_RUN_DIR=/tmp/grasp_artifacts \
+python3 -m pytest src/agent/embodied_bringup/test/test_mobile_pick_simulation.py -k mujoco
+
+# the pick E2E on Gazebo — still runs; only the two approved pick-failure
+# classes above xfail at their verdict (retry-budget exhaustion with the
+# listed preparation codes or the jaw-at-open wedge GRASP_UNCERTAIN; a
+# true-contact grasp whose transport physically slips, with paired
+# gripper-frame evidence) — everything else stays a hard failure
+ROS_DOMAIN_ID=219 ROS_LOCALHOST_ONLY=1 IBROBOT_GAZEBO_HEADLESS=1 \
+IGN_PARTITION=<fresh> GZ_PARTITION=<fresh> \
+IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo \
+IBROBOT_E2E_RUN_DIR=/tmp/grasp_artifacts \
+python3 -m pytest src/agent/embodied_bringup/test/test_mobile_pick_simulation.py -k gazebo
+
+# reach accuracy against simulator ground truth (D4) — still required on
+# BOTH platforms (4 targets, <= 0.015 m / <= 10 deg each)
+ROS_DOMAIN_ID=216 ROS_LOCALHOST_ONLY=1 IBROBOT_MUJOCO_HEADLESS=1 \
+IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco \
+python3 -m pytest src/robots/lekiwi/lekiwi_robot/test/test_navgrasp_reach_accuracy.py -k mujoco
+
+# the formal verdict for the package (domain unset; the root conftest
+# allocates one per pytest process)
+colcon test --packages-select embodied_bringup
+```
+
+Acceptance (2026-11-02): the pick E2E passed **twice in a row on MuJoCo**
+(mujoco-153742, -154120) and the regression run after the Gazebo fixes
+passed (mujoco-184750: judge OK 3.56 s hold, 0.1° in-gripper, 0.0 mm drift,
+0.313 m lift, RTF 1.002); Gazebo 0/6 with the two known modes above. Reach
+accuracy passes on both platforms. Evidence: the #205 change's
+`acceptance.md`.
 
 ### Hardware-visible changes (D8/D13 — all need on-robot verification)
 
@@ -525,3 +737,37 @@ import -window root root.png
 convert root.png -crop <WxH+X+Y> +repage mujoco_navgrasp_nav.png
 convert root.png -crop <WxH+X+Y> +repage rviz_navgrasp_nav.png
 ```
+
+## Known simulation issues
+
+- **Jaw contact jam at the folded spawn pose (Gazebo).** With the arm in the
+  folded `reset_positions` configuration the gripper jaw is wedged by a
+  contact constraint and cannot track position commands (the JTC open aborts
+  with GOAL_TOLERANCE_VIOLATED while the joint stays at 0.0). Moving the arm
+  out of the spawn pose (the production pick's observe-first ordering) frees
+  it; MuJoCo is unaffected. The pick E2E's observe-first ordering avoids it.
+- **Open-jaw table wedge at deep-descend candidates (Gazebo).** The
+  production FK tabletop filter checks the raw-STL jaw mesh while Gazebo's
+  physics uses the CoACD hulls (faces up to ~14 mm outside the STL), so a
+  descend admitted by the filter can rest the moving-jaw tip hull on the
+  0.015 m table slab at the fully-open end; the closing arc drives the tip
+  deeper (self-locking) and the 1.0 N·m gripper effort cannot break the wedge
+  — the close goal never moves the joint while the zero-tolerance JTC
+  reports success (measured e2e/gazebo-180245, -183150: desired 1.0 → 0.0
+  with the joint frozen at exactly 1.0001). The verifier's open-jaw rule
+  turns this into a retryable uncertain verdict, never a false success.
+- **The effort-1.0 grip does not survive the transport swing (Gazebo).** A
+  close that blocks on the cube at q6 ≈ 0.40 (MuJoCo's validated blocking
+  band) verifies as true contact, but the cube slips out during the
+  transport to the container pose — the object is never carried (judge:
+  carried 0; e2e/gazebo-174538, -183757, -184202). MuJoCo holds the same
+  blocking band through the full transport. The pick E2E is accepted on
+  MuJoCo; on Gazebo its failure is reported as these known issues
+  (`xfail(strict=False)`, 2026-11-02).
+- **Per-worker FK is not served (hardware-visible).** The motion server
+  registers the global `/motion/compute_fk` plus per-worker **IK** only
+  (`/<namespace>/motion/compute_ik`); `lekiwi_nav_grasp` therefore advertises
+  `motion.fk` with the global endpoint only
+  (`/ik_worker_0/motion/compute_fk` was advertised but never served, which
+  failed the pick executor's SERVICE_UNAVAILABLE gate at pick start).
+

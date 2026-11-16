@@ -1,0 +1,40 @@
+schema_version: 1
+name: right_hand_up
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Raise the right hand with the G1 preset; no automatic recovery.
+  category: social_greeting
+  when_to_use:
+  - ask a question or volunteer
+  aliases_zh:
+  - 右手举起
+  - 举右手
+  aliases_en:
+  - right hand up
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Run the G1 right-hand-up preset (action 23); no automatic recovery.
+  display_name: 右手举起
+  tags:
+  - preset
+  - unitree_action_id_23
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  g1_preset_v1: implementations/g1_preset_v1.yaml

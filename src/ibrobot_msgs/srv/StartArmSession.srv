@@ -1,0 +1,23 @@
+# Start a managed single-arm teleoperation session (motion.arm.session_start).
+#
+# Pose commands on motion.arm.pose are clutch_relative: each one is a
+# displacement and a base-frame rotation delta from the clutch origin returned
+# here. The origin is the runtime's command-side reference (the end-effector
+# target it is holding), not the measured pose, so gravity sag is not taken
+# into the origin. The runtime replaces the reference with the measured pose
+# only when no valid reference exists or when the two differ by more than its
+# reset threshold; reference_reset reports that.
+#
+# Pose and lease messages stamped at or before the session start are dropped,
+# so late messages from an earlier session cannot act on this one.
+---
+bool success
+string message
+# Clutch origin of this session in the base frame; header.stamp is the
+# session start time.
+geometry_msgs/PoseStamped reference
+# m; distance between the reference and the measured end-effector position at
+# start. NaN when success is false.
+float64 position_error_m
+# True when the reference was (re)built from the measured pose for this session.
+bool reference_reset

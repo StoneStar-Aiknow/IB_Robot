@@ -109,6 +109,7 @@ def canonical_skill_payload(
     has_x: Any = None,
     has_y: Any = None,
     has_yaw: Any = None,
+    approach: Any = None,
     default_timeout_sec: Any,
 ) -> dict[str, str | float | bool | int | None]:
     """Normalize a skill request into the exact payload hashed by the Gateway."""
@@ -147,6 +148,10 @@ def canonical_skill_payload(
                 "imitation_duration_sec": normalized_imitation_duration,
             }
         )
+    # Optional gripper approach name: hashed only when present, so other requests keep their digests.
+    normalized_approach = _normalized_string(approach, "approach", lowercase=True)
+    if normalized_approach:
+        payload["approach"] = normalized_approach
     if (
         normalized_direction
         or normalized_nav_distance

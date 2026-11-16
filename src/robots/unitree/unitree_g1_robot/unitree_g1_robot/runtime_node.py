@@ -61,9 +61,11 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -96,7 +98,13 @@ from robot_runtime.state import RuntimeState
 from unitree_g1_robot import projection
 from unitree_g1_robot import vendor_gateway as vg
 from unitree_g1_robot.named_motion import NamedMotionServer
+from unitree_g1_robot.preset_commissioning import resolve_preset_commissioning
 from unitree_g1_robot.projection import CommandRejected, ProjectionError
+from unitree_g1_robot.teardown import (
+    TEARDOWN_FAILURE_EXIT_CODE,
+    bounded_executor_teardown,
+    teardown_failure_message,
+)
 
 #: Neutral IMU endpoint, as the profile's interfaces declare it. The frame_id
 #: stays unset: which URDF frame LowState.imu_state reports is unverified
@@ -123,6 +131,16 @@ ARM_HANDOVER_WARNING = (
     "ARM_HANDOVER_UNCONFIRMED: the zero-weight frame was published locally; the vendor's own arm "
     "handover is not acknowledged by this interface"
 )
+
+#: How long rpc_call waits for a service's dispatcher before declaring that
+#: service wedged. The vendor client bounds its own call by the timeout it was
+#: constructed with, so a dispatcher still held one client-timeout-plus-margin
+#: later is a call stuck inside the vendor library (Issue #207: the DDS write
+#: can block indefinitely). Such a call cannot be cancelled or killed safely —
+#: no thread is torn down and no fake completion is reported — so NEW commands
+#: are refused instead while the stuck call's outcome stays unknown (motion
+#: callers latch the stop and never re-send).
+_DISPATCH_MARGIN_S = 1.0
 
 #: How long startup waits for the vendor's RPC servers to match our request
 #: publishers. A request published before DDS matching completes is silently
@@ -185,11 +203,38 @@ def vendor_dds_binding(domain_id: int, network_interface: str) -> tuple[int, str
     return domain_id, network_interface
 
 
+def _default_sdk_factory() -> UnitreeSdk:
+    """The production adapter facade (tests inject a fault-injection fake)."""
+    return UnitreeSdk(now=time.monotonic)
+
+
 class UnitreeG1RuntimeNode(Node):
     """Bridge between the public runtime contract and the G1 vendor DDS tier."""
 
-    def __init__(self, **node_kwargs: Any) -> None:
+    def __init__(self, *, sdk_factory: Callable[[], Any] | None = None, **node_kwargs: Any) -> None:
         super().__init__("unitree_g1_runtime", **node_kwargs)
+        try:
+            self._wire(sdk_factory)
+        except BaseException:
+            # A half-wired runtime must not leak what it already opened. The
+            # order matches process teardown: close the SDK facade first (its
+            # reader threads stop delivering into this node's handlers), then
+            # destroy the half-built rclpy node, then surface the failure. The
+            # vendor channel factory itself has no teardown API (its reader
+            # threads are daemons), so a factory-level bind survives a failed
+            # wiring — the one part of an initialization failure that cannot
+            # be cleaned here.
+            sdk = getattr(self, "_sdk", None)
+            if sdk is not None:
+                with contextlib.suppress(Exception):
+                    sdk.close()
+            with contextlib.suppress(Exception):
+                self.destroy_node()
+            raise
+
+    def _wire(self, sdk_factory: Callable[[], Any] | None) -> None:
+        """Declare, load and wire everything between the rclpy node and the vendor tier."""
+        self._sdk_factory = sdk_factory if sdk_factory is not None else _default_sdk_factory
         self.declare_parameter("profile", str(_default_profile()))
         self.declare_parameter("startup_timeout_s", 10.0)
         # The launch entry builds the description from the same profile it
@@ -217,18 +262,45 @@ class UnitreeG1RuntimeNode(Node):
         self._preset_only = self._vendor.get("preset_only") is True
         self.declare_parameter("preset_test_transport", False)
         self.declare_parameter("preset_operator_confirmed", False)
+        self.declare_parameter("runtime_network_interface", "")
+        self.declare_parameter("preset_expected_fsm_id", 0)
+        # The vendor DDS binding belongs to the same run. Declare it here so
+        # the commissioning gate can refuse a confirmation whose NIC is not
+        # the NIC the SDK will actually bind.
+        self.declare_parameter("vendor_domain_id", 0)
+        self.declare_parameter("vendor_network_interface", "")
         self._preset_physical = self._preset_only and self.get_parameter("preset_test_transport").value is not True
-        # Explicit, operator-supervised commissioning. The shipped
-        # profile stays disabled; simulation still requires loopback isolation.
+        self._preset_expected_fsm_id: int | None = None
+        # Explicit, operator-supervised commissioning. The shipped profile
+        # stays disabled; simulation still requires loopback isolation. The
+        # node repeats the launch-side gate because a direct `ros2 run` must
+        # not be able to skip it by pointing at a stale, confirmed profile.
         if self._preset_only:
-            if self._preset_physical and self.get_parameter("preset_operator_confirmed").value is not True:
-                raise RuntimeError("PRESET_HARDWARE_DISABLED: on-site operator confirmation required")
+            if self._preset_physical:
+                declared_fsm = self.get_parameter("preset_expected_fsm_id").value
+                try:
+                    _nic, self._preset_expected_fsm_id = resolve_preset_commissioning(
+                        self._profile,
+                        confirmed=self.get_parameter("preset_operator_confirmed").value,
+                        runtime_network_interface=self.get_parameter("runtime_network_interface").value,
+                        # 0 is the declared "not supplied" default; an audited
+                        # profile FSM may fill it. There is no auto selection.
+                        expected_fsm_id=None if declared_fsm == 0 else declared_fsm,
+                        vendor_network_interface=self.get_parameter("vendor_network_interface").value,
+                    )
+                except RuntimeError as exc:
+                    raise RuntimeError(str(exc)) from exc
             if self._profile.get("command_channels") or self._vendor.get("postures"):
                 raise RuntimeError("preset-only profile cannot expose streams or postures")
             allowed = (self._vendor.get("preset_commissioning") or {}).get("allowed_arm_actions")
             if not allowed or self._vendor.get("arm_actions") != allowed:
                 raise RuntimeError(
                     "preset-only commissioning permits only the profile's preset_commissioning.allowed_arm_actions"
+                )
+            named = ((self._profile.get("capabilities") or {}).get("motion.named") or {}).get("names")
+            if not isinstance(named, list) or set(named) != set(allowed):
+                raise RuntimeError(
+                    "preset-only profile capabilities.motion.named.names must match the allowed action table"
                 )
         projection.expert_tier_gate(bool((self._vendor.get("expert_joint_tier") or {}).get("enabled", False)))
 
@@ -285,8 +357,6 @@ class UnitreeG1RuntimeNode(Node):
         # on the robot's production domain (domain 0, any NIC), and
         # ``CYCLONEDDS_URI`` cannot constrain the result because the SDK hands
         # its own configuration to ``Domain(id, config)``, which overrides it.
-        self.declare_parameter("vendor_domain_id", 0)
-        self.declare_parameter("vendor_network_interface", "")
         self._vendor_domain_id, self._vendor_network_interface = self._vendor_dds_binding()
 
         # --- shared mutable state (guarded by _lock) -------------------------
@@ -373,7 +443,7 @@ class UnitreeG1RuntimeNode(Node):
         """
         vg.require_vendor()
         topics = self._vendor["topics"]
-        self._sdk = UnitreeSdk(now=time.monotonic)
+        self._sdk = self._sdk_factory()
         self._sdk.initialize(self._vendor_domain_id, self._vendor_network_interface)
         self._feeds: dict[str, Any] = {}
         # queue_len=1: the SDK delivers through its queue thread, so the
@@ -655,6 +725,11 @@ class UnitreeG1RuntimeNode(Node):
         superseded it — the dispatcher it waited on is the same one the stop's
         zero uses. A refused guard returns ``dropped=True`` (nothing was sent,
         so there is no unknown fate to latch).
+
+        A dispatcher still held one client timeout plus :data:`_DISPATCH_MARGIN_S`
+        later is a call stuck inside the vendor library (Issue #207's blocking
+        DDS write): it is not cancelled, not killed and not answered for — the
+        refusal below only keeps NEW commands off the wedged service.
         """
         try:
             method_name = self.RPC_METHODS[f"{service}:{api_name}"]
@@ -667,10 +742,20 @@ class UnitreeG1RuntimeNode(Node):
         # for the no-arg queries); the vendor's JSON shapes live inside the
         # SDK wrappers, not at these call sites.
         args = tuple(parameter) if parameter is not None else ()
-        with dispatcher, client.call_timeout(timeout_s):
-            if guard is not None and not guard():
-                return vg.RpcResult(ok=False, code=-1, motion=motion, api_id=api_name, dropped=True)
-            outcome = method(*args)
+        if not dispatcher.acquire(timeout=self._rpc_timeout_s + _DISPATCH_MARGIN_S):
+            self.get_logger().error(
+                f"the vendor {service!r} dispatcher is still held past the client timeout "
+                f"({self._rpc_timeout_s:.1f}s); refusing {api_name!r} without dispatching: "
+                "a previous call is stuck inside the vendor library and its outcome is unknown"
+            )
+            return vg.RpcResult(ok=False, code=-1, timed_out=True, motion=motion, api_id=api_name)
+        try:
+            with client.call_timeout(timeout_s):
+                if guard is not None and not guard():
+                    return vg.RpcResult(ok=False, code=-1, motion=motion, api_id=api_name, dropped=True)
+                outcome = method(*args)
+        finally:
+            dispatcher.release()
         if isinstance(outcome, tuple) and len(outcome) == 2:
             from unitree_g1_adapter.clients import SdkCallResult  # noqa: PLC0415 - single adapter import site
 
@@ -1573,11 +1658,66 @@ class UnitreeG1RuntimeNode(Node):
 
     # --- accessors used by helper modules -------------------------------------------
 
-    def admit_preset_attempt(self) -> tuple[bool, str]:
+    def preset_constraint_failure(self, motion: str) -> str:
+        """Return the local reason a firmware action is unavailable, or ``""``.
+
+        Only limits the profile records are enforced here. Both the live
+        lowstate freshness and the observed ``mode_machine`` come from the
+        newest LowState; the FSM comes from the vendor's own ``GetFsmId``.
+        The check is read-only: it never calls ``SetFsmId`` and never invents a
+        limit for an action the profile does not constrain.
+        """
+        if not motion:
+            return ""
+        actions = self._vendor.get("arm_actions") or {}
+        entry = actions.get(motion) if isinstance(actions, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return ""
+        allowed_modes = entry.get("mode_machine")
+        fsm_ids = entry.get("fsm_ids")
+        if not allowed_modes and not fsm_ids:
+            return ""
+        with self._lock:
+            lowstate_fresh = projection.is_fresh(self._lowstate_stamp, time.monotonic(), self._feedback_window_s)
+            observed_mode = self._mode_machine_observed
+        if not lowstate_fresh:
+            return (
+                f"firmware constraint: preset {motion!r} needs fresh lowstate feedback to verify "
+                "its FSM/mode_machine limit; feedback is stale; preset not dispatched"
+            )
+        if allowed_modes and (type(observed_mode) is not int or observed_mode not in allowed_modes):
+            return (
+                f"firmware constraint: preset {motion!r} requires mode_machine {allowed_modes}; "
+                f"observed mode_machine is {observed_mode}; preset not dispatched"
+            )
+        if fsm_ids:
+            try:
+                current_fsm = self._reported_fsm_id()
+            except Exception:  # noqa: BLE001 - a missing/raising FSM probe fails closed
+                current_fsm = None
+            if current_fsm is None:
+                return (
+                    f"firmware constraint: preset {motion!r} requires FSM {fsm_ids}; "
+                    "FSM feedback is unavailable; preset not dispatched"
+                )
+            if current_fsm not in fsm_ids:
+                return (
+                    f"firmware constraint: preset {motion!r} requires FSM {fsm_ids}; "
+                    f"current FSM is {current_fsm}; the runtime will not switch FSM"
+                )
+        return ""
+
+    def admit_preset_attempt(self, motion: str = "") -> tuple[bool, str]:
         """Read-only preflight for each independent request; dispatch is serialized."""
         with self._lock:
             if self._state.stop_latched:
                 return False, "preset stop latched or prior outcome unknown; no dispatch"
+        constraint = ""
+        if motion:
+            checker = getattr(self, "preset_constraint_failure", None)
+            constraint = checker(motion) if callable(checker) else ""
+        if constraint:
+            return False, constraint
         if not self._preset_physical:
             return True, "mock transport"
         try:
@@ -1608,7 +1748,11 @@ class UnitreeG1RuntimeNode(Node):
                 ):
                     return False, f"{name} is not confirmed running"
             fsm = self.rpc_call("loco", "get_fsm_id", None)
-            expected = (self._vendor.get("operator_validation") or {}).get("expected_fsm_id")
+            # The expected FSM is the per-run commissioning input resolved at
+            # startup, not a profile field a stale confirmed profile could
+            # carry. A bare node (tests, an old caller) has no resolved value
+            # and therefore fails closed instead of guessing.
+            expected = getattr(self, "_preset_expected_fsm_id", None)
             if not fsm.ok or type(expected) is not int or type(fsm.data) is not int or fsm.data != expected:
                 return False, "FSM changed or unavailable; no automatic mode switch"
             with self._lock:
@@ -1647,11 +1791,27 @@ class UnitreeG1RuntimeNode(Node):
         return confirmed | set(self._vendor.get("postures") or {})
 
 
-def main(argv=None) -> int:
+def main(argv=None, *, node_factory: Callable[[], Node] | None = None) -> int:
+    """Run the runtime entry point.
+
+    ``node_factory`` is the constructor seam the lifecycle tests use to run this
+    entry point with a node whose callback outlives the teardown wait; ``None``
+    uses the standard runtime node.
+    """
     # SIGTERM included so `timeout`/systemd stops exit spin via the ordinary
     # ExternalShutdownException path instead of dying inside an rcl wait set.
     rclpy.init(args=argv, signal_handler_options=SignalHandlerOptions.ALL)
-    node = UnitreeG1RuntimeNode()
+    try:
+        node = node_factory() if node_factory is not None else UnitreeG1RuntimeNode()
+    except Exception as exc:  # noqa: BLE001 - startup must be one clean, bounded, nonzero exit
+        # The constructor already closed its SDK facade and destroyed its
+        # half-built node; this path only releases the rclpy context so a
+        # supervisor sees a bounded failure with guidance instead of a
+        # traceback with the context left initialized.
+        print(f"unitree_g1_runtime: startup failed: {exc}", file=sys.stderr, flush=True)
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 1
     # Mode switches and stops block their own callbacks for the weight ramp
     # and vendor confirmations; the output ticks must keep running meanwhile,
     # so the executor needs more threads than the default one-per-callback-group.
@@ -1661,14 +1821,39 @@ def main(argv=None) -> int:
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception as exc:  # noqa: BLE001 - only the shutdown race reaches this arm
+        if rclpy.ok():
+            raise
+        # SIGTERM's rclpy.shutdown() races the executor's wait-set rebuild:
+        # the RCLError "the given context is not valid" is that race, not a
+        # fault — the context is already down, so take the ordinary teardown
+        # path instead of exiting through a traceback (observed on SIGTERM;
+        # the mock's main has the same guard).
+        print(f"unitree_g1_runtime: executor stopped after the shutdown signal: {exc}", file=sys.stderr, flush=True)
     finally:
-        node.destroy_node()
-        # Release the adapter's channels; the vendor factory itself is a
-        # process-wide singleton with no teardown API (its reader threads
-        # are daemons), so closing the feeds/writers/clients is the full
-        # cleanup the SDK offers. Teardown must not mask the exit path.
-        with contextlib.suppress(Exception):
-            node._sdk.close()
+        # Bounded teardown, not a quiesce. shutdown(timeout_sec=...) waits at
+        # most the bound for callbacks that are already executing and returns
+        # False when it expires; rclpy does not cancel that callback, and the
+        # executor's ThreadPoolExecutor workers are joined at interpreter exit,
+        # so returning from main() would not bound the process either. A failed
+        # step must not be mistaken for a completed cleanup: on timeout the SDK
+        # and node stay open (a callback may still use them), a close failure
+        # leaves the node alive (its handlers may still be reached), and a
+        # destroy failure is reported as such. Any failure exits
+        # TEARDOWN_FAILURE_EXIT_CODE with one diagnostic naming the step;
+        # os._exit skips the interpreter's thread joins so the exit stays
+        # bounded while Python can run. On success, close the adapter's
+        # channels BEFORE the node dies: the SDK's reader threads deliver into
+        # this node's handlers, and a delivery that lands after destroy_node
+        # touches a destroyed node (the mock's close_vendor_tier and the bridge
+        # harness order teardown the same way). The vendor factory itself is a
+        # process-wide singleton with no teardown API (its reader threads are
+        # daemons), so closing the feeds/writers/clients is the full cleanup
+        # the SDK offers. Teardown must not mask the exit path.
+        result = bounded_executor_teardown(executor, node, node._sdk.close)
+        if not result.ok:
+            print(teardown_failure_message("unitree_g1_runtime", result), file=sys.stderr, flush=True)
+            os._exit(TEARDOWN_FAILURE_EXIT_CODE)
         if rclpy.ok():
             rclpy.shutdown()
     return 0

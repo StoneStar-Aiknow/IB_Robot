@@ -42,6 +42,12 @@ from robot_runtime.joint_conversion import (
 from robot_runtime.joint_conversion import (
     resolve_calibration_key as _resolve_calibration_key,
 )
+from robot_runtime.sim_platforms import (
+    SIM_PLATFORM_NAME_PATTERN as SIM_PLATFORM_NAME_PATTERN,
+)
+from robot_runtime.sim_platforms import (
+    is_valid_sim_platform_name as is_valid_sim_platform_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,30 +128,32 @@ def prepare_writable_file_path(path):
     return resolved_path
 
 
-#: Simulation platforms the runtime-provider path supports
-#: (runtime-simulation-transport D4; so101-mujoco-runtime-platform D1):
-#: ``sdk`` delegates the whole transport to the provider as before;
-#: ``gazebo`` starts the world only; ``mujoco`` resolves the scene and spawn
-#: pose only, with the simulator started by the provider.
-PROVIDER_SIM_PLATFORMS = ("sdk", "gazebo", "mujoco")
-
-
 def provider_sim_platform_error(sim_platform: str, provider: str) -> str:
-    """Shared provider/simulation-platform predicate (D4).
+    """Shared provider/simulation-platform predicate (sim-platform-registry D2).
 
-    Returns '' when the combination is supported, else an error naming the
+    Returns '' when the combination is loadable, else an error naming the
     platform and the provider. Loader validation and launch preparation both
     call this one predicate so the two gates cannot drift.
+
+    At load time only malformed names and the provider-less ``mock`` backend
+    are rejected: an unknown platform name is a valid declaration (it may be
+    registered by an installed plugin), and registration is checked later —
+    in launch preparation, once the CLI override and the use_sim/target
+    resolution have fixed the effective selection. ``sdk`` delegates the
+    whole transport to the provider.
     """
     platform = str(sim_platform or "").strip().lower()
-    if platform in PROVIDER_SIM_PLATFORMS:
-        return ""
-    return (
-        f"runtime.provider={provider} supports simulation.platform in {list(PROVIDER_SIM_PLATFORMS)} only "
-        f"(got {platform!r}): sdk delegates the transport to the provider, gazebo starts the world only, "
-        "mujoco resolves the scene only (the provider starts the simulator); the legacy mock backend is "
-        "not interchangeable with a provider transport"
-    )
+    if platform == "mock":
+        return (
+            f"runtime.provider={provider} supports simulation.platform in [sdk] plus every registered physics "
+            f"platform (got {platform!r}): the legacy mock backend is not interchangeable with a provider transport"
+        )
+    if not is_valid_sim_platform_name(platform):
+        return (
+            f"runtime.provider={provider} requires a simulation.platform identifier matching "
+            f"{SIM_PLATFORM_NAME_PATTERN.pattern} (got {platform!r})"
+        )
+    return ""
 
 
 def providerless_sim_platform_error(sim_platform: str) -> str:

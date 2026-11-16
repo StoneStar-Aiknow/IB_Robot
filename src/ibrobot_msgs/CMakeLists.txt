@@ -19,6 +19,7 @@ find_package(sensor_msgs REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "srv/RuntimeControlV1.srv"
   "msg/Variant.msg"
   "msg/VariantsList.msg"
   "msg/InferenceError.msg"
@@ -78,6 +79,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/HumanHandState.msg"
   "msg/StampedFloat32MultiArray.msg"
   "msg/PowerState.msg"
+  "msg/SessionLease.msg"
+  "msg/ArmCommandReference.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
@@ -102,10 +105,12 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetHotwords.srv"
   "srv/MoveToConfiguration.srv"
   "srv/MoveToPose.srv"
+  "srv/CancelSimulationCommand.srv"
   "srv/SetRuntimeMode.srv"
   "srv/GetRuntimeStatus.srv"
   "srv/ExecuteInteractionDemo.srv"
   "srv/StopRuntime.srv"
+  "srv/StartArmSession.srv"
   "srv/ComputeFk.srv"
   "srv/ComputeIk.srv"
   "srv/ValidateSkill.srv"

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 from geometry_msgs.msg import Pose
+from moveit_msgs.msg import MoveItErrorCodes
 
 _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts")
 if _SCRIPTS_DIR not in sys.path:
@@ -72,6 +73,31 @@ class FakeMoveIt2:
         self.move_to_configuration_calls = []
         self.cancel_called = threading.Event()
         self.dispatch = True
+        # Mirrors pymoveit2 (including the managed patch): the last
+        # execution error code, the planned-trajectory evidence and the
+        # monotonic GOAL SEQUENCE are cleared/advanced when a goal is
+        # actually sent (the sequence is the positive dispatch evidence —
+        # the send path can return without dispatching), and the evidence
+        # is set from that goal's result before the wrapper reports IDLE.
+        # When abort_error_code is set, the fake terminalizes the goal
+        # shortly after the send with that MoveIt error code — or
+        # SYNCHRONOUSLY, before the caller's first state query, when
+        # `synchronous` is set (review r2 finding 1's race).
+        # abort_delivers_result=False models a goal REJECTED by the action
+        # server: it terminalizes without a result — the evidence stays
+        # None and motion_suceeded keeps the previous goal's value
+        # (pymoveit2 does not reset it on send). abort_plans_trajectory
+        # models the result carrying a plan (execution-phase failures)
+        # versus no plan at all (planning aborts). `succeed` models a
+        # synchronously successful goal.
+        self.last_error_code = None
+        self.last_motion_planned = None
+        self.goal_sequence = 0
+        self.abort_error_code = None
+        self.abort_delivers_result = True
+        self.abort_plans_trajectory = False
+        self.synchronous = False
+        self.succeed = False
 
     def query_state(self):
         with self._lock:
@@ -86,15 +112,52 @@ class FakeMoveIt2:
         self.cancel_called.set()
 
     def get_last_execution_error_code(self):
-        return None
+        return self.last_error_code
+
+    def get_last_motion_planned(self):
+        return self.last_motion_planned
+
+    def get_last_goal_sequence(self):
+        return self.goal_sequence
 
     def clear_goal_constraints(self):
         pass
 
     def move_to_configuration(self, joint_positions):
         self.move_to_configuration_calls.append(list(joint_positions))
-        if self.dispatch:
-            self.set_state(MoveIt2State.REQUESTING)
+        if not self.dispatch:
+            return  # the send path skipped the call: no goal, no sequence bump
+        self.goal_sequence += 1
+        self.set_state(MoveIt2State.REQUESTING)
+        self.last_error_code = None
+        self.last_motion_planned = None
+
+        def finish():
+            if self.succeed:
+                self.motion_suceeded = True
+                self.last_error_code = SimpleNamespace(val=1)
+                self.last_motion_planned = True
+            elif self.abort_delivers_result:
+                # a terminal result: the goal went through EXECUTING before
+                # its result arrived (motion_suceeded and the evidence are
+                # set from the result)
+                self.set_state(MoveIt2State.EXECUTING)
+                self.motion_suceeded = False
+                self.last_error_code = SimpleNamespace(val=self.abort_error_code)
+                self.last_motion_planned = self.abort_plans_trajectory
+            # else: rejected by the action server — no result, no evidence,
+            # motion_suceeded keeps the previous goal's value, and the
+            # wrapper flips straight back to IDLE without EXECUTING
+            self.set_state(MoveIt2State.IDLE)
+
+        if self.succeed:
+            finish()  # a synchronously successful goal
+        elif self.abort_error_code is not None:
+            if self.synchronous:
+                finish()  # review r2 finding 1's race: terminal before the first state query
+            else:
+                threading.Timer(0.005, finish).start()
+        # else: the goal stays in flight (REQUESTING) until the test moves it
 
 
 class FakeTfBuffer:
@@ -105,7 +168,13 @@ class FakeTfBuffer:
         self.stamp_ns = int(stamp_ns)
 
     def lookup_transform(self, *_args, **_kwargs):
-        return SimpleNamespace(header=_header(self.stamp_ns))
+        return SimpleNamespace(
+            header=_header(self.stamp_ns),
+            transform=SimpleNamespace(
+                translation=SimpleNamespace(x=0.0, y=0.0, z=0.0),
+                rotation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+            ),
+        )
 
 
 def _header(stamp_ns: int):
@@ -209,6 +278,341 @@ def test_concurrent_service_request_returns_busy_without_dispatch():
     assert not first_thread.is_alive()
 
 
+@pytest.mark.parametrize(
+    "planning_error_code",
+    [
+        MoveItErrorCodes.PLANNING_FAILED,
+        MoveItErrorCodes.INVALID_MOTION_PLAN,
+        MoveItErrorCodes.NO_IK_SOLUTION,
+        MoveItErrorCodes.START_STATE_IN_COLLISION,
+        MoveItErrorCodes.GOAL_IN_COLLISION,
+        MoveItErrorCodes.GOAL_CONSTRAINTS_VIOLATED,
+    ],
+)
+def test_move_to_configuration_planning_abort_reports_planning_failed(planning_error_code):
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = planning_error_code
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_PLANNING_FAILED
+
+
+@pytest.mark.parametrize(
+    "execution_error_code",
+    [
+        MoveItErrorCodes.CONTROL_FAILED,
+        MoveItErrorCodes.TIMED_OUT,
+        MoveItErrorCodes.MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE,
+        MoveItErrorCodes.PREEMPTED,
+        MoveItErrorCodes.ABORT,
+    ],
+)
+def test_move_to_configuration_execution_failure_keeps_execution_failed(execution_error_code):
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = execution_error_code
+    gateway.moveit2.abort_plans_trajectory = True
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+@pytest.mark.parametrize(
+    "cancellation_or_execution_code",
+    [
+        # Review r1 (revision 2) item 3: a cancellation/execution code stays
+        # EXECUTION_FAILED EVEN WHEN THE RESULT CARRIES NO TRAJECTORY — the
+        # goal may have ended at any phase of execution (a PREEMPTED goal
+        # aborted before the plan reached a controller on a cancelled run),
+        # so the arm must be treated as having moved. The empty-trajectory
+        # evidence classifies only the generic FAILURE planning abort.
+        MoveItErrorCodes.PREEMPTED,
+        MoveItErrorCodes.CONTROL_FAILED,
+        MoveItErrorCodes.TIMED_OUT,
+        MoveItErrorCodes.ABORT,
+        MoveItErrorCodes.MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE,
+    ],
+)
+def test_cancellation_and_execution_codes_stay_execution_failed_with_an_empty_trajectory(
+    cancellation_or_execution_code,
+):
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = cancellation_or_execution_code
+    gateway.moveit2.abort_plans_trajectory = False  # the result carries NO plan
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+@pytest.mark.parametrize(
+    "planning_error_code",
+    [
+        MoveItErrorCodes.PLANNING_FAILED,
+        MoveItErrorCodes.GOAL_IN_COLLISION,
+        MoveItErrorCodes.START_STATE_IN_COLLISION,
+    ],
+)
+def test_planning_phase_codes_win_even_when_the_result_carries_a_plan(planning_error_code):
+    """The planning-phase set wins even when the result carries a plan."""
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = planning_error_code
+    gateway.moveit2.abort_plans_trajectory = True
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_PLANNING_FAILED
+
+
+def test_move_to_configuration_rejected_goal_without_error_code_is_execution_failed():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.PLANNING_FAILED
+    gateway.moveit2.abort_delivers_result = False
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+def test_move_to_configuration_generic_failure_without_a_plan_reports_planning_failed():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.FAILURE
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_PLANNING_FAILED
+
+
+def test_move_to_configuration_generic_failure_after_a_plan_keeps_execution_failed():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.FAILURE
+    gateway.moveit2.abort_plans_trajectory = True
+
+    service = gateway._move_to_configuration_service_cb
+
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+def test_move_to_configuration_does_not_reuse_a_stale_error_code():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.PLANNING_FAILED
+    service = gateway._move_to_configuration_service_cb
+    first = service(make_configuration_request(), make_response())
+    assert first.outcome == C.OUTCOME_PLANNING_FAILED
+
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.CONTROL_FAILED
+    gateway.moveit2.abort_plans_trajectory = True
+    second = service(make_configuration_request(), make_response())
+
+    assert second.success is False
+    assert second.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+# ---------------------------------------------------------------------------
+# Review r2 finding 1: synchronous completion — a dispatched goal that
+# terminalizes BEFORE the first state query is classified through the
+# conservative result classifier, never as a planning failure
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "execution_error_code",
+    [
+        MoveItErrorCodes.CONTROL_FAILED,
+        MoveItErrorCodes.PREEMPTED,
+        MoveItErrorCodes.TIMED_OUT,
+        MoveItErrorCodes.ABORT,
+    ],
+)
+def test_synchronous_execution_failure_stays_execution_failed(execution_error_code):
+    """
+    A synchronously terminal execution failure keeps its execution outcome.
+
+    A dispatched goal that terminalizes with an execution/cancellation
+    result before the first state query is never a planning failure — the
+    old move_to_joint read IDLE + not-succeeded as "not dispatched" and
+    reported PLANNING_FAILED (retryable) for an arm that may have moved.
+    """
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = execution_error_code
+    gateway.moveit2.abort_plans_trajectory = True
+    gateway.moveit2.synchronous = True
+
+    service = gateway._move_to_configuration_service_cb
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+def test_synchronous_generic_failure_without_a_plan_is_planning_failed():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.FAILURE
+    gateway.moveit2.synchronous = True
+
+    service = gateway._move_to_configuration_service_cb
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_PLANNING_FAILED
+
+
+def test_synchronous_generic_failure_after_a_plan_stays_execution_failed():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.FAILURE
+    gateway.moveit2.abort_plans_trajectory = True
+    gateway.moveit2.synchronous = True
+
+    service = gateway._move_to_configuration_service_cb
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+@pytest.mark.parametrize(
+    "planning_error_code",
+    [
+        MoveItErrorCodes.PLANNING_FAILED,
+        MoveItErrorCodes.GOAL_IN_COLLISION,
+        MoveItErrorCodes.NO_IK_SOLUTION,
+    ],
+)
+def test_synchronous_planning_abort_is_planning_failed(planning_error_code):
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = planning_error_code
+    gateway.moveit2.synchronous = True
+
+    service = gateway._move_to_configuration_service_cb
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_PLANNING_FAILED
+
+
+def test_synchronous_rejection_is_execution_failed_even_after_a_previous_success():
+    """
+    A synchronously rejected goal is a failure even after a previous success.
+
+    The stale-success trap (review r2 finding 1): pymoveit2 does not reset
+    `motion_suceeded` on send, so a REJECTED goal that terminalizes without
+    a result keeps the previous success flag — the wait path must require
+    THIS goal's result evidence and report the rejection as a failure.
+    """
+    gateway = make_gateway()
+    service = gateway._move_to_configuration_service_cb
+
+    # any code: the goal is rejected (no result delivered)
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.PLANNING_FAILED
+    gateway.moveit2.abort_delivers_result = False
+    gateway.moveit2.synchronous = True
+    response = service(make_configuration_request(), make_response())
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+    # a previous SUCCESSFUL goal leaves motion_suceeded True with its result
+    # evidence — the next rejected goal must not inherit it (the post-motion
+    # feedback barrier has its own dedicated tests below)
+    gateway._wait_for_post_motion_feedback = lambda *_args, **_kwargs: True
+    gateway.moveit2.succeed = True
+    gateway.moveit2.abort_delivers_result = True
+    gateway.moveit2.abort_error_code = None
+    assert service(make_configuration_request(), make_response()).success is True
+    gateway.moveit2.succeed = False
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.PLANNING_FAILED
+    gateway.moveit2.abort_delivers_result = False
+    response = service(make_configuration_request(), make_response())
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+def test_synchronous_success_completes_through_the_wait_path():
+    gateway = make_gateway()
+    gateway.moveit2.succeed = True
+    gateway._wait_for_post_motion_feedback = lambda *_args, **_kwargs: True
+
+    service = gateway._move_to_configuration_service_cb
+    response = service(make_configuration_request(), make_response())
+
+    assert response.success is True
+    assert response.outcome == C.OUTCOME_SUCCEEDED
+    assert gateway.motion_status_pub.messages == ["executing", "succeeded", "idle"]
+    assert gateway._active_motion_token is None  # the ownership fence released
+
+
+def test_move_to_pose_synchronous_execution_failure_stays_execution_failed():
+    """
+    The MoveToPose twin keeps a synchronous execution failure's outcome.
+
+    The same shortcut went through solve_and_move -> move_to_joint — a
+    synchronously terminal execution failure must keep its execution
+    outcome there too (review r2 finding 1).
+    """
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.CONTROL_FAILED
+    gateway.moveit2.abort_plans_trajectory = True
+    gateway.moveit2.synchronous = True
+
+    class _DoneFuture:
+        @staticmethod
+        def done():
+            return True
+
+    gateway.moveit2.compute_ik_async = lambda **_kwargs: _DoneFuture()
+    ik_solution = SimpleNamespace(name=["1", "2"], position=[0.1, 0.2])
+    gateway.moveit2.get_compute_ik_result = lambda _future: ik_solution
+    gateway._wait_for_post_motion_feedback = lambda *_args, **_kwargs: True
+    request = SimpleNamespace(target_pose=Pose())
+
+    response = gateway._move_to_pose_service_cb(request, make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_EXECUTION_FAILED
+
+
+def test_move_to_pose_planning_abort_reports_planning_failed():
+    gateway = make_gateway()
+    gateway.moveit2.abort_error_code = MoveItErrorCodes.FAILURE
+
+    class _DoneFuture:
+        @staticmethod
+        def done():
+            return True
+
+    gateway.moveit2.compute_ik_async = lambda **_kwargs: _DoneFuture()
+    ik_solution = SimpleNamespace(name=["1", "2"], position=[0.1, 0.2])
+    gateway.moveit2.get_compute_ik_result = lambda _future: ik_solution
+    gateway._wait_for_post_motion_feedback = lambda *_args, **_kwargs: True
+    request = SimpleNamespace(target_pose=Pose())
+
+    response = gateway._move_to_pose_service_cb(request, make_response())
+
+    assert response.success is False
+    assert response.outcome == C.OUTCOME_PLANNING_FAILED
+
+
 def test_service_is_rejected_while_cmd_pose_owns_motion():
     gateway = make_gateway()
     entered = threading.Event()
@@ -235,7 +639,12 @@ def test_service_is_rejected_while_cmd_pose_owns_motion():
     cmd_thread.join(timeout=1.0)
     assert not cmd_thread.is_alive()
 
+    # the watchdog finalizes the deferred cmd_pose goal from THIS goal's
+    # result evidence (review r2 finding 1: the stale motion_suceeded flag
+    # alone is never success)
     gateway.moveit2.motion_suceeded = True
+    gateway.moveit2.last_motion_planned = True
+    gateway.moveit2.last_error_code = SimpleNamespace(val=1)
     gateway.moveit2.set_state(MoveIt2State.IDLE)
     gateway._motion_watchdog_callback()
     assert gateway._active_motion_token is None

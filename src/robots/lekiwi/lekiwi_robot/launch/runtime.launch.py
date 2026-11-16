@@ -11,14 +11,14 @@ simulator: the description is rendered once with the platform's renderer (the
 public model and interface description derive from that exact render), the
 base node, FAST-LIO and the scan converter carry ``use_sim_time``, and
 ``runtime_stack_actions`` hands the embodiment the world/scene name and spawn
-pose. On Gazebo (D7) the world comes from ``gazebo_world``; on MuJoCo
-(lekiwi-mujoco-runtime-platform D7) the scene comes from ``mujoco_scene``
-(default the shared ``empty`` scene) and headless mode follows
-``IBROBOT_MUJOCO_HEADLESS``.
+pose. The world hand-off is the platform-neutral ``sim_world`` (the gz world
+name on Gazebo, the scene name on MuJoCo). On MuJoCo
+(lekiwi-mujoco-runtime-platform D7) an empty scene composes the shared
+``empty`` scene and headless mode follows ``IBROBOT_MUJOCO_HEADLESS``.
 
     ros2 launch lekiwi_robot runtime.launch.py profile:=<path-or-name> \
         [use_sim:=true] [sim_platform:=gazebo|mujoco] \
-        [gazebo_world:=<name>] [mujoco_scene:=<name>] [spawn_x/y/z/yaw:=…] \
+        [sim_world:=<name>] [spawn_x/y/z/yaw:=…] \
         [display:=true] [peripherals:=<fragment.yaml>]
 """
 
@@ -38,15 +38,15 @@ from robot_runtime.interface_description import build_description
 from robot_runtime.launch_support import (
     motion_launch_arguments,
     peripheral_stack_actions,
-    render_gazebo_description,
-    render_mujoco_description,
     render_robot_description,
+    render_sim_description,
     resolve_profile_argument,
     resolve_sim_selection,
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import fast_lio_nodes, load_peripherals_file, merge_peripherals
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import is_physics_selection
 
 
 def _launch_setup(context, *_args, **_kwargs):
@@ -81,7 +81,7 @@ def _launch_setup(context, *_args, **_kwargs):
         base_params["publish_tf"] = False
     # Physics platforms run the base node on simulation time (D7); wheel
     # odometry always owns odom -> base_link in simulation (D4).
-    base_params["use_sim_time"] = simulated and (sim_platform or "") in PHYSICS_SIM_PLATFORMS
+    base_params["use_sim_time"] = is_physics_selection(simulated, sim_platform or "")
     base_node = Node(
         package="lekiwi_robot",
         executable="base_node",
@@ -109,25 +109,29 @@ def _launch_setup(context, *_args, **_kwargs):
     # robot_state_publisher load it, and the facade derives the robot model and
     # the teleoperation interfaces from the same rendering. The arm-only model
     # above is what so101_motion plans against; it is not the public model.
-    # D7: one platform-aware render — on a physics platform the public model
-    # and the interface description derive from the exact platform rendering
-    # (sensors included); hardware and SDK keep the ordinary renderer. On
-    # MuJoCo (lekiwi-mujoco-runtime-platform D7) the render composes the robot
-    # MJCF into the named scene (empty scene name composes ``empty``).
-    mujoco_scene = LaunchConfiguration("mujoco_scene").perform(context).strip()
-    if simulated and sim_platform in PHYSICS_SIM_PLATFORMS:
+    # D7/sim-platform-registry D3: one generic render entry — on a physics
+    # platform the effective embodiment renders (the public model and the
+    # interface description derive from that exact render, sensors included);
+    # hardware and SDK keep the ordinary renderer. The world hand-off is the
+    # platform-neutral ``sim_world`` (the gz world name on Gazebo; the scene
+    # name on MuJoCo, empty composes ``empty``).
+    # default="" mirrors the declared argument: a caller (or test context)
+    # that never sets sim_world resolves like an empty value, not an error.
+    sim_world = LaunchConfiguration("sim_world", default="").perform(context).strip()
+    if is_physics_selection(simulated, sim_platform):
         spawn_pose = tuple(
             float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw")
         )
     else:
         spawn_pose = (0.0, 0.0, 0.0, 0.0)
-    if simulated and sim_platform == "gazebo":
-        robot_description = render_gazebo_description(
-            {**profile, "peripherals": merged_peripherals}, profile_path, spawn_pose=spawn_pose
-        )
-    elif simulated and sim_platform == "mujoco":
-        robot_description = render_mujoco_description(
-            {**profile, "peripherals": merged_peripherals}, profile_path, spawn_pose=spawn_pose, scene=mujoco_scene
+    if is_physics_selection(simulated, sim_platform):
+        robot_description = render_sim_description(
+            {**profile, "peripherals": merged_peripherals},
+            profile_path,
+            sim_platform,
+            simulated=True,
+            spawn_pose=spawn_pose,
+            world=sim_world,
         )
     else:
         robot_description = render_robot_description(profile, profile_path, simulated)
@@ -137,6 +141,7 @@ def _launch_setup(context, *_args, **_kwargs):
         use_sim=simulated,
         sim_platform=sim_platform,
         robot_description=robot_description,
+        profile_path=profile_path,
     )
     peripherals = [
         *peripheral_stack_actions(
@@ -156,8 +161,7 @@ def _launch_setup(context, *_args, **_kwargs):
             robot_description=robot_description,
             interface_description=description,
             sim_platform=sim_platform or "",
-            gazebo_world=LaunchConfiguration("gazebo_world").perform(context).strip(),
-            mujoco_scene=mujoco_scene,
+            sim_world=sim_world,
             spawn_pose=spawn_pose,
         ),
         base_node,
@@ -178,8 +182,8 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "sim_platform",
                 default_value="",
-                description="Simulation platform: sdk | gazebo | mujoco (sdk: the vendor SDK virtual bus, no "
-                "physics; gazebo/mujoco: the physics simulators); implies use_sim:=true when given alone",
+                description="Simulation platform: sdk or any registered physics platform (sdk: the vendor SDK virtual "
+                "bus, no physics; gazebo/mujoco: the physics simulators); implies use_sim:=true when given alone",
             ),
             DeclareLaunchArgument(
                 "simulated",
@@ -187,14 +191,10 @@ def generate_launch_description():
                 description="Deprecated alias of use_sim (a warning names use_sim)",
             ),
             DeclareLaunchArgument(
-                "gazebo_world",
+                "sim_world",
                 default_value="",
-                description="Gazebo world name to spawn into (empty: the runtime starts a minimal empty world)",
-            ),
-            DeclareLaunchArgument(
-                "mujoco_scene",
-                default_value="",
-                description="MuJoCo scene name to compose the robot into (empty: the shared 'empty' scene)",
+                description="Platform-neutral world hand-off: the Gazebo world name or the MuJoCo scene name "
+                "(empty: the runtime starts its own minimal world/scene)",
             ),
             DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (physics platforms)"),
             DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (physics platforms)"),

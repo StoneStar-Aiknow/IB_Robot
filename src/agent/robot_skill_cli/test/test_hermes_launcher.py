@@ -152,7 +152,7 @@ def test_runtime_check_allows_unauthorized_motion_but_requires_agent_interfaces(
     monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
     monkeypatch.setattr(
         hermes_launcher,
-        "load_runtime_context",
+        "load_transport_context",
         lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
     )
     monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: bridge)
@@ -160,6 +160,39 @@ def test_runtime_check_allows_unauthorized_motion_but_requires_agent_interfaces(
     assert hermes_launcher._check_robot_runtime("test", None) == config_path
     assert bridge.closed is True
     assert bridge.timeouts == [15.0, 15.0]
+
+
+def test_runtime_check_binds_the_transport_without_compiling_the_local_catalog(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+
+    class Bridge:
+        def start(self):
+            return True
+
+        def get_status(self, **_kwargs):
+            return {"control_plane_ready": True, "control_plane_error_code": ""}
+
+        def wait_for_agent_plan_interfaces(self, **_kwargs):
+            return True
+
+        def close(self):
+            pass
+
+    def forbidden(**_kwargs):
+        raise AssertionError("Hermes preflight compiled the local catalog")
+
+    monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_transport_context",
+        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
+        raising=False,
+    )
+    monkeypatch.setattr(hermes_launcher, "load_runtime_context", forbidden, raising=False)
+    monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: Bridge())
+
+    assert hermes_launcher._check_robot_runtime("test", None) == config_path
 
 
 def test_runtime_check_visual_game_mode_does_not_require_motion_plan_interfaces(tmp_path, monkeypatch) -> None:
@@ -185,12 +218,7 @@ def test_runtime_check_visual_game_mode_does_not_require_motion_plan_interfaces(
     monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
     monkeypatch.setattr(
         hermes_launcher,
-        "load_runtime_context",
-        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
-    )
-    monkeypatch.setattr(
-        hermes_launcher,
-        "load_visual_game_runtime_context",
+        "load_transport_context",
         lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
     )
     monkeypatch.setattr(hermes_launcher, "_resolve_preflight_mode", lambda *_args: "visual-games")
@@ -231,7 +259,7 @@ def test_runtime_check_both_mode_requires_motion_and_visual_interfaces(tmp_path,
     monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
     monkeypatch.setattr(
         hermes_launcher,
-        "load_runtime_context",
+        "load_transport_context",
         lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
     )
     monkeypatch.setattr(hermes_launcher, "_resolve_preflight_mode", lambda *_args: "both")
@@ -568,7 +596,7 @@ def test_runtime_check_retries_transient_read_only_status_timeout(tmp_path, monk
     monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
     monkeypatch.setattr(
         hermes_launcher,
-        "load_runtime_context",
+        "load_transport_context",
         lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
     )
     monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: bridges.pop(0))

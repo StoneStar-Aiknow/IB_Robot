@@ -141,6 +141,10 @@ teleoperation:
   # Board scheduling budget for input, lease and managed joint feedback.
   # Deployment profiles may tighten it; the public contract caps it at 1 s.
   command_stale_s: 0.5
+  # Largest accepted distance (m) between a pose target and the current
+  # reference; a larger jump ends the session. Fast VR motion stepped up to
+  # 46 mm; tracking-loss jumps were 202 mm and more (measured 2026-11-04).
+  max_pose_step_m: 0.10
   servo_config: $(find so101_motion)/config/so101_placo_servo.yaml
   # Leader hardware acquisition: the runtime launches the read-only source
   # node, never the application. Serial and calibration are deployment data,
@@ -175,10 +179,25 @@ interfaces:
 # estimate derived from the simulated joint effort (/joint_states effort ×
 # scale, republished by robot_runtime/joint_current_publisher). Scale 1
 # matches the hardware adapter's effort-as-current semantics.
+#
+# The platform-scoped xacro_args below are the LeKiwi grasp profile's D7
+# maintainer decisions (2026-10-29 / 2026-10-30), applied to the shared
+# Gazebo render path of so101_base.xacro: every Gazebo-simulated render
+# collides with the same CoACD jaw hulls MuJoCo simulates
+# (wrist_roll_follower_col_*/moving_jaw_col_*), and the Gazebo-simulated
+# joint-6 effort limit is 1.0 — the URDF default 10 (and 2.75/2.0/1.5)
+# ejects the grasped cube during the close (spike 1.1r/1.5r diagnostics:
+# the squeeze torque slides it up the fixed finger's slope); 1.0 blocks on
+# the cube exactly like MuJoCo's +-2.75 actuator forcerange (5/5 captures).
+# Hardware/SDK/MoveIt renders never pass these args and keep the raw STL /
+# default 10 byte-identically.
 simulation:
   gazebo:
     joint_current:
       scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    xacro_args:
+      jaw_collision: hulls
+      gripper_effort: "1.0"
   # MuJoCo embodiment (so101-mujoco-runtime-platform D2/D6): the runtime-
   # private robot MJCF template and meshes, the SDF-collision gripper meshes
   # (robot-specific input to the robot-agnostic composition API) and the

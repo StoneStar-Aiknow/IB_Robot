@@ -51,6 +51,8 @@ CAPABILITY_PARAMETER_NAMES_V1 = frozenset(
         "motion_distance",
         "arm_side",
         "imitation_duration_sec",
+        # Named gripper approach orientation (set_gripper_approach); the robot declares the names.
+        "approach",
     }
 )
 CAPABILITY_PARAMETER_NAMES = frozenset(
@@ -80,9 +82,14 @@ MANIFEST_FIELDS = frozenset(
         "description",
         "description_variants",
         "capability",
+        "capability_variants",
         "implementations",
     }
 )
+# Per-implementation capability overrides: one robot's implementation may take
+# parameters (e.g. a multi-arm robot's arm_side) without changing the shared
+# capability other robots compile.
+CAPABILITY_VARIANT_FIELDS = frozenset({"summary", "parameters"})
 DESCRIPTION_FIELDS = frozenset(
     {
         "summary",
@@ -307,6 +314,41 @@ def validate_manifest(
         )
     else:
         _validate_capability(capability, diagnostics, source_relative_path, schema_version=manifest_version)
+    capability_variants = manifest.get("capability_variants", {})
+    implementation_names = manifest.get("implementations", {})
+    if not isinstance(capability_variants, Mapping):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "capability_variants must be an object",
+            source_relative_path=source_relative_path,
+            field_path="capability_variants",
+        )
+    elif isinstance(capability, Mapping):
+        for variant_name, variant in capability_variants.items():
+            field_prefix = f"capability_variants.{variant_name}"
+            if (
+                not isinstance(variant_name, str)
+                or not isinstance(implementation_names, Mapping)
+                or variant_name not in implementation_names
+                or not isinstance(variant, Mapping)
+                or not variant
+                or set(variant) - CAPABILITY_VARIANT_FIELDS
+            ):
+                _error(
+                    diagnostics,
+                    "SKILL_SCHEMA_INVALID",
+                    "capability variant must name an implementation and override only summary or parameters",
+                    source_relative_path=source_relative_path,
+                    field_path=field_prefix,
+                )
+                continue
+            _validate_capability(
+                selected_capability(manifest, variant_name),
+                diagnostics,
+                source_relative_path,
+                schema_version=manifest_version,
+            )
     implementations = manifest.get("implementations")
     if not isinstance(implementations, Mapping) or not implementations:
         _error(
@@ -328,6 +370,17 @@ def validate_manifest(
             field_path="implementations",
         )
     return diagnostics
+
+
+def selected_capability(manifest: Mapping[str, Any], implementation_name: str) -> Mapping[str, Any]:
+    """The manifest capability with the implementation's capability variant applied."""
+
+    capability = manifest.get("capability", {})
+    variants = manifest.get("capability_variants", {})
+    variant = variants.get(implementation_name) if isinstance(variants, Mapping) else None
+    if not isinstance(capability, Mapping) or not isinstance(variant, Mapping):
+        return capability
+    return {**capability, **variant}
 
 
 def validate_implementation(
@@ -523,7 +576,9 @@ def validate_implementation(
         else:
             _validate_executor(executor, diagnostics, source_relative_path, "executor")
         required_args = implementation.get("required_args")
-        capability_parameters = manifest.get("capability", {}).get("parameters", {}).get("properties", {})
+        capability_parameters = (
+            selected_capability(manifest, implementation_name).get("parameters", {}).get("properties", {})
+        )
         if runtime_named:
             _validate_runtime_named_motion(
                 implementation,
@@ -1073,6 +1128,16 @@ def _validate_robot_compatibility(
                     source_relative_path=path,
                     field_path=f"primitive_sequence[{index}].pose_name",
                 )
+        if primitive_name == "set_gripper_approach" and "approach" in step:
+            presets = (getattr(context, "gripper_approach", {}) or {}).get("presets", {})
+            if step.get("approach") not in presets:
+                _error(
+                    diagnostics,
+                    "SKILL_REFERENCE_MISSING",
+                    "approach preset does not exist",
+                    source_relative_path=path,
+                    field_path=f"primitive_sequence[{index}].approach",
+                )
         if primitive_name in {"move_to_joint_positions", "move_to_configuration"}:
             values = step.get("joint_positions") or step.get("joint_position_offsets")
             if isinstance(values, Mapping):
@@ -1222,7 +1287,57 @@ def validate_robot_context(context: SkillRobotContext) -> list[SkillDiagnostic]:
             f"execution endpoint roles must match the v{context.context_schema_version} closed set",
             field_path="execution_endpoints",
         )
+    _validate_gripper_approach(getattr(context, "gripper_approach", {}), diagnostics)
     return diagnostics
+
+
+GRIPPER_APPROACH_AXES = frozenset({"x", "y", "z"})
+
+
+def _validate_gripper_approach(gripper_approach: Mapping[str, Any], diagnostics: list[SkillDiagnostic]) -> None:
+    if not gripper_approach:
+        return
+    if not isinstance(gripper_approach, Mapping) or set(gripper_approach) - {"axis", "presets"}:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "gripper_approach allows only axis and presets",
+            field_path="gripper_approach",
+        )
+        return
+    if gripper_approach.get("axis", "z") not in GRIPPER_APPROACH_AXES:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "gripper_approach.axis must be x, y or z",
+            field_path="gripper_approach.axis",
+        )
+    presets = gripper_approach.get("presets", {})
+    if not isinstance(presets, Mapping):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "gripper_approach.presets must be an object",
+            field_path="gripper_approach.presets",
+        )
+        return
+    for name, preset in presets.items():
+        field_path = f"gripper_approach.presets.{name}"
+        orientation = preset.get("orientation") if isinstance(preset, Mapping) else None
+        values = [orientation.get(axis) for axis in ("x", "y", "z", "w")] if isinstance(orientation, Mapping) else []
+        if (
+            not isinstance(name, str)
+            or not NAME_PATTERN.match(name)
+            or len(values) != 4
+            or any(not isinstance(v, int | float) or isinstance(v, bool) or not math.isfinite(float(v)) for v in values)
+            or abs(math.sqrt(sum(float(v) * float(v) for v in values)) - 1.0) > 1e-3
+        ):
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                "approach preset needs a name and a unit orientation quaternion {x, y, z, w}",
+                field_path=field_path,
+            )
 
 
 def _exact_fields(

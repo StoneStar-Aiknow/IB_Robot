@@ -1,7 +1,10 @@
 """Unit tests for sim_backend adapter registry and sim_peripheral_bridge.
 
-Tests cover both Gazebo and MuJoCo backends without requiring
-a ROS or Gazebo runtime environment.
+Tests cover the Gazebo and mock provider-less backends without requiring
+a ROS or Gazebo runtime environment. MuJoCo has no adapter here: it is
+served through a runtime provider (sim-platform-registry D8); its
+world-side hand-off is covered by test_runtime_provider_platform.py and
+test_sim_platform_generic_launch.py.
 """
 
 from pathlib import Path
@@ -16,10 +19,9 @@ from robot_config.launch_builders.sim_backend import (
 )
 from robot_config.launch_builders.sim_backend.gazebo_adapter import GazeboAdapter
 from robot_config.launch_builders.sim_backend.mock_adapter import MockAdapter
-from robot_config.launch_builders.sim_backend.mujoco_adapter import MujocoAdapter
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Registry tests (unchanged from T2)
+# Registry tests
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -30,11 +32,10 @@ def test_registry_gazebo():
     assert isinstance(adapter, SimBackendAdapter)
 
 
-def test_registry_mujoco():
-    """get_sim_backend('mujoco') returns a MujocoAdapter instance."""
-    adapter = get_sim_backend("mujoco")
-    assert isinstance(adapter, MujocoAdapter)
-    assert isinstance(adapter, SimBackendAdapter)
+def test_registry_mujoco_is_not_a_backend():
+    """MuJoCo is served through a runtime provider, not this registry (D8)."""
+    with pytest.raises(ValueError, match="Unknown sim platform"):
+        get_sim_backend("mujoco")
 
 
 def test_registry_mock():
@@ -58,39 +59,7 @@ def test_backend_caps_mock():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MuJoCo no-op tests
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-def test_mujoco_noop_methods_return_empty():
-    """MuJoCo no-op adapter methods return empty launch action lists."""
-    adapter = get_sim_backend("mujoco")
-
-    assert adapter.load_scene("fake.xml") == []
-    assert adapter.ensure_controller_manager({}) == []
-    assert adapter.update_object_pose("box", None) is None
-
-
-def test_mujoco_spawn_peripheral_bridges_returns_empty():
-    """MujocoAdapter.spawn_peripheral_bridges returns [] (no bridge nodes needed).
-
-    MuJoCo publishes ROS2 topics directly. T6 will configure topic names
-    to match the contract /camera/{name}/image_raw without extra bridge nodes.
-    """
-    adapter = get_sim_backend("mujoco")
-    result = adapter.spawn_peripheral_bridges([])
-    assert result == []
-    # Also works with non-empty peripherals list
-    result = adapter.spawn_peripheral_bridges(
-        [
-            {"type": "camera", "name": "top", "frame_id": "camera_top_frame"},
-        ]
-    )
-    assert result == []
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# sim_peripheral_bridge tests (T3)
+# sim_peripheral_bridge tests
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -142,7 +111,7 @@ def test_sim_peripheral_bridge_depth_camera_entries():
     nodes = generate_peripheral_sim_bridges(peripherals, model_name="test_robot")
     assert len(nodes) == 1
 
-    bridge_config = yaml.safe_load(Path("/tmp/ros_gz_camera_bridge.yaml").read_text())
+    bridge_config = yaml.safe_load(Path(_config_file_of(nodes[0])).read_text())
     ros_topics = {entry["ros_topic_name"] for entry in bridge_config}
     gz_topics = {entry["gz_topic_name"] for entry in bridge_config}
 
@@ -152,10 +121,30 @@ def test_sim_peripheral_bridge_depth_camera_entries():
     assert "/front_camera/depth_image" in gz_topics
 
 
-def test_sim_peripheral_bridge_lidar_and_imu_supported():
-    """LiDAR + IMU peripherals share one bridge_node in Gazebo."""
-    from launch_ros.actions import Node
+def test_sim_peripheral_bridge_writes_a_unique_config_per_construction(tmp_path):
+    """Two constructions get two distinct config files with their own content (D9)."""
+    import os
 
+    from robot_config.launch_builders.sim_peripheral_bridge import generate_peripheral_sim_bridges
+
+    peripherals = [{"type": "camera", "name": "top", "frame_id": "camera_top_frame"}]
+    first = generate_peripheral_sim_bridges(peripherals, model_name="robot_a")
+    second = generate_peripheral_sim_bridges(
+        [{"type": "camera", "name": "wrist", "frame_id": "camera_wrist_frame"}], model_name="robot_b"
+    )
+    path_a = _config_file_of(first[0])
+    path_b = _config_file_of(second[0])
+    assert path_a != path_b, "each construction must own its bridge config file"
+    assert os.path.basename(path_a).startswith("ros_gz_camera_bridge_")
+    assert os.path.basename(path_b).startswith("ros_gz_camera_bridge_")
+    topics_a = {entry["ros_topic_name"] for entry in yaml.safe_load(Path(path_a).read_text())}
+    topics_b = {entry["ros_topic_name"] for entry in yaml.safe_load(Path(path_b).read_text())}
+    assert topics_a == {"/camera/top/image_raw", "/camera/top/camera_info"}
+    assert topics_b == {"/camera/wrist/image_raw", "/camera/wrist/camera_info"}
+
+
+def test_sim_peripheral_bridge_ignores_lidar_and_imu_peripherals():
+    """Only cameras bridge on the generic path (D9); lidar/IMU are dead here."""
     from robot_config.launch_builders.sim_peripheral_bridge import (
         generate_peripheral_sim_bridges,
     )
@@ -164,9 +153,27 @@ def test_sim_peripheral_bridge_lidar_and_imu_supported():
         {"type": "lidar", "name": "main_lidar", "params": {"laser_scan_topic_name": "/scan"}},
         {"type": "imu", "name": "imu_sensor", "topic": "/imu_sensor_broadcaster/imu"},
     ]
-    nodes = generate_peripheral_sim_bridges(peripherals, model_name="test_robot")
-    assert len(nodes) == 1
-    assert isinstance(nodes[0], Node)
+    assert generate_peripheral_sim_bridges(peripherals, model_name="test_robot") == []
+
+
+def _config_file_of(node) -> str:
+    """The ``config_file`` parameter of a generated bridge_node.
+
+    launch_ros abbreviates parameter values as ``<value>\\n...\\n`` in the
+    unevaluated Node; strip that suffix to recover the written path.
+    """
+
+    def text(value):
+        if isinstance(value, list | tuple):
+            return "".join(text(item) for item in value)
+        return str(getattr(value, "text", value))
+
+    for entry in node._Node__parameters or []:
+        if isinstance(entry, dict) and "config_file" in {text(k) for k in entry}:
+            (value,) = entry.values()
+            path = text(value)
+            return path.removesuffix("\n...\n")
+    raise AssertionError("the bridge_node must carry a config_file parameter")
 
 
 def test_mock_start_backend_reuses_contract_mock():
@@ -180,6 +187,17 @@ def test_mock_start_backend_reuses_contract_mock():
     assert len(actions) == 1
     assert isinstance(actions[0], Node)
     assert actions[0].node_package == "hardware_mock"
+
+
+def test_mock_start_backend_warns_about_a_configured_scene(caplog):
+    """A configured scene stays a warning: contract mock has no scene objects."""
+    adapter = get_sim_backend("mock")
+    with caplog.at_level("WARNING", logger="robot_config.sim_backend.mock"):
+        actions, _create_node = adapter.start_backend(
+            {"_config_path": "/tmp/robot.yaml", "simulation": {"scene": "pick_banana"}}
+        )
+    assert actions
+    assert "pick_banana" in caplog.text and "ignored by mock backend" in caplog.text
 
 
 def test_gazebo_start_backend_returns_create_node():
@@ -205,120 +223,8 @@ def test_gazebo_adapter_bridge_delegates():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# World-only mode (runtime-simulation-transport D4, task 3.2)
+# The provider world hand-off through build_simulation (registry-driven, D5)
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-def test_gazebo_world_only_emits_server_and_clock_but_no_embodiment():
-    from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable
-    from launch_ros.actions import Node
-
-    adapter = get_sim_backend("gazebo")
-    actions, world_name, spawn_pose = adapter.start_world_only(
-        {
-            "name": "test_robot",
-            "gazebo_world_name": "demo",
-            "simulation": {"platform": "gazebo"},
-        }
-    )
-    assert world_name == "demo"
-    assert spawn_pose == (0.0, 0.0, 0.0, 0.0)
-    executables = {node._Node__node_executable for node in actions if isinstance(node, Node)}
-    assert "parameter_bridge" in executables, "the world owner bridges /clock"
-    assert "create" not in executables, "the provider spawns its own embodiment"
-    assert "bridge_node" not in executables, "camera bridges are embodiment"
-    assert "wait_for_clock" not in executables, "the provider gates its own create"
-    assert sum(isinstance(action, IncludeLaunchDescription) for action in actions) == 1
-    # no description-derived resource paths: the provider's description carries
-    # absolute file:// mesh URIs and the scene world resolves its own assets
-    assert not any(isinstance(action, SetEnvironmentVariable) for action in actions)
-
-
-def test_gazebo_world_only_resolves_scene_world_and_full_spawn_pose():
-    adapter = get_sim_backend("gazebo")
-    config = {
-        "name": "test_robot",
-        "gazebo_world_name": "demo",
-        "simulation": {
-            "platform": "gazebo",
-            "scene": "pick_banana",
-            "robot_spawn": {"x": 0.25, "y": -0.1, "z": -0.03, "yaw": 0.7},
-        },
-    }
-    actions, world_name, spawn_pose = adapter.start_world_only(config)
-    assert world_name == "demo"
-    assert spawn_pose == (0.25, -0.1, -0.03, 0.7)
-    # the robot_spawn precedence beats the scene layout (pick_banana: 0.0/0.30/-0.03)
-    from launch.actions import IncludeLaunchDescription
-
-    include = next(action for action in actions if isinstance(action, IncludeLaunchDescription))
-    (gz_args,) = [
-        value
-        for key, value in include.launch_arguments
-        if str(key[0].text if hasattr(key[0], "text") else key) == "gz_args"
-    ]
-    assert "sim_models_pick_banana.world" in str(gz_args[0].text if hasattr(gz_args[0], "text") else gz_args)
-
-
-def test_gazebo_world_only_falls_back_to_the_scene_layout_spawn():
-    adapter = get_sim_backend("gazebo")
-    config = {
-        "name": "test_robot",
-        "gazebo_world_name": "demo",
-        "simulation": {"platform": "gazebo", "scene": "pick_banana"},
-    }
-    _actions, _world, spawn_pose = adapter.start_world_only(config)
-    assert spawn_pose == (0.0, 0.30, -0.03, 0.0)
-
-
-def _gz_server_args(actions) -> str:
-    """The gz_args string of the single ros_gz_sim server include."""
-    from launch.actions import IncludeLaunchDescription
-
-    include = next(action for action in actions if isinstance(action, IncludeLaunchDescription))
-    (gz_args,) = [
-        value
-        for key, value in include.launch_arguments
-        if str(key[0].text if hasattr(key[0], "text") else key) == "gz_args"
-    ]
-    return str(gz_args[0].text if hasattr(gz_args[0], "text") else gz_args)
-
-
-def test_gazebo_world_only_without_scene_uses_the_empty_scene_world():
-    """No scene configured: the generic fallback is the sim_models empty scene.
-
-    ``simulation.robot_spawn`` is ignored (spawn only applies with a scene)
-    and no ``initial_pose_*`` is written back to the config.
-    """
-    adapter = get_sim_backend("gazebo")
-    config = {
-        "name": "test_robot",
-        "gazebo_world_name": "demo",
-        "simulation": {
-            "platform": "gazebo",
-            "robot_spawn": {"x": 0.25, "y": -0.1, "z": -0.03, "yaw": 0.7},
-        },
-    }
-    actions, world_name, spawn_pose = adapter.start_world_only(config)
-    assert world_name == "demo"
-    assert spawn_pose == (0.0, 0.0, 0.0, 0.0)
-    for key in ("initial_pose_x", "initial_pose_y", "initial_pose_z"):
-        assert key not in config
-    assert "sim_models_empty.world" in _gz_server_args(actions)
-
-
-def test_gazebo_world_only_unknown_scene_falls_back_to_the_empty_scene_world():
-    """A configured scene that fails to load falls back to the empty scene world."""
-    adapter = get_sim_backend("gazebo")
-    config = {
-        "name": "test_robot",
-        "gazebo_world_name": "demo",
-        "simulation": {"platform": "gazebo", "scene": "no_such_scene"},
-    }
-    actions, world_name, spawn_pose = adapter.start_world_only(config)
-    assert world_name == "demo"
-    assert spawn_pose == (0.0, 0.0, 0.0, 0.0)
-    assert "sim_models_empty.world" in _gz_server_args(actions)
 
 
 def test_provider_gazebo_simulation_startup_carries_world_and_pose():
@@ -343,7 +249,7 @@ def test_provider_gazebo_simulation_startup_carries_world_and_pose():
     result = build_simulation(context)
     assert result.simulation_startup is not None
     assert result.simulation_startup.entity_action is None
-    assert result.simulation_startup.world_name == "demo"
+    assert result.simulation_startup.world == "demo"
     assert result.simulation_startup.spawn_pose == (0.1, 0.2, 0.3, 0.5)
     # world-only: no create, no joint-state bridge, no camera bridges
     from launch_ros.actions import Node
@@ -358,7 +264,7 @@ def test_preseeded_simulation_startup_is_reused_without_relaunching():
     from robot_config.launch_registry.registry import LaunchBuildContext, SimulationStartup
     from robot_config.runtime_target import RuntimeTarget
 
-    preseed = SimulationStartup(entity_action=None, world_name="demo", spawn_pose=(0.0, 0.3, -0.03, 0.0))
+    preseed = SimulationStartup(entity_action=None, world="demo", spawn_pose=(0.0, 0.3, -0.03, 0.0))
     context = LaunchBuildContext(
         robot_config={"name": "test_robot", "runtime": {"provider": "test_robot", "profile": "p"}},
         runtime_target=RuntimeTarget.SIMULATION,
@@ -385,4 +291,4 @@ def test_provider_sdk_simulation_still_yields_the_empty_startup():
     result = build_simulation(context)
     assert result.actions == []
     assert result.simulation_startup.entity_action is None
-    assert result.simulation_startup.world_name == ""
+    assert result.simulation_startup.world == ""

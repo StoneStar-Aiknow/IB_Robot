@@ -175,3 +175,25 @@ def test_canonical_navigation_payload_rejects_non_finite_numbers(field_name, val
 def test_canonical_navigation_payload_rejects_negative_magnitudes(field_name):
     with pytest.raises(ValueError, match=field_name):
         canonical_skill_payload("nav", schema_version=2, default_timeout_sec=1.0, **{field_name: -0.01})
+
+
+def test_approach_enters_the_hashed_payload_only_when_present():
+    base = canonical_skill_payload(
+        "move_relative_ee", motion_direction="down", motion_distance=0.05, schema_version=1, default_timeout_sec=30.0
+    )
+    assert "approach" not in base
+    assert (
+        canonical_skill_payload(
+            "move_relative_ee",
+            motion_direction="down",
+            motion_distance=0.05,
+            schema_version=1,
+            default_timeout_sec=30.0,
+            approach="",
+        )
+        == base
+    )
+    posed = canonical_skill_payload(
+        "set_gripper_approach", approach="Top_Down", schema_version=1, default_timeout_sec=30.0
+    )
+    assert posed["approach"] == "top_down"

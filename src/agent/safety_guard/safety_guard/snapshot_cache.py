@@ -8,7 +8,7 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
-from embodied_common.primitive_contracts import primitive_contract_for_version
+from embodied_common.primitive_contracts import primitive_contract_for_version, primitive_extensions_for_context
 from skill_catalog.consumer import CatalogIdentity, verify_snapshot_response
 from skill_catalog.digest import (
     deep_freeze,
@@ -118,7 +118,9 @@ class SafetySnapshotCache:
         if not isinstance(skills, list):
             raise SnapshotCacheError("SKILL_SCHEMA_INVALID", "registry skills must be an array")
         try:
-            primitive_contract = primitive_contract_for_version(robot_context.get("context_schema_version"))
+            primitive_contract = primitive_contract_for_version(
+                robot_context.get("context_schema_version"), primitive_extensions_for_context(robot_context)
+            )
         except ValueError as exc:
             raise SnapshotCacheError("SKILL_SCHEMA_INVALID", str(exc)) from exc
         if registry_preimage.get("primitive_contract_digest") != primitive_contract.digest:

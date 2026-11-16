@@ -32,7 +32,7 @@ import rclpy
 # TF2 and MoveIt 2 imports
 import tf2_ros
 from geometry_msgs.msg import Pose, PoseStamped
-from moveit_msgs.msg import Constraints, OrientationConstraint, PositionIKRequest
+from moveit_msgs.msg import Constraints, MoveItErrorCodes, OrientationConstraint, PositionIKRequest
 from moveit_msgs.srv import GetPositionFK, GetPositionIK
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -45,6 +45,44 @@ from ibrobot_msgs.msg import JointCurrent, RuntimeStatus
 from ibrobot_msgs.srv import ComputeFk, ComputeIk, MoveToConfiguration, MoveToPose
 from pymoveit2 import MoveIt2, MoveIt2State
 from robot_runtime import contract as C
+
+# MoveIt error codes (moveit_msgs/MoveItErrorCodes) that end a motion during
+# planning, before any trajectory is sent to a controller: the arm did not
+# move, so a caller may safely retry with another target (the Gateway maps
+# the resulting PLANNING_FAILED outcome to its per-candidate primitive code).
+# Codes that can also occur after execution began (CONTROL_FAILED, TIMED_OUT,
+# PREEMPTED, MOTION_PLAN_INVALIDATED_BY_ENVIRONMENT_CHANGE, ABORT, ...)
+# deliberately stay out and keep the EXECUTION_FAILED outcome.
+MOVEIT_PLANNING_PHASE_ERROR_CODES = frozenset(
+    int(code)
+    for code in (
+        MoveItErrorCodes.PLANNING_FAILED,
+        MoveItErrorCodes.INVALID_MOTION_PLAN,
+        MoveItErrorCodes.NO_IK_SOLUTION,
+        MoveItErrorCodes.START_STATE_IN_COLLISION,
+        MoveItErrorCodes.START_STATE_VIOLATES_PATH_CONSTRAINTS,
+        MoveItErrorCodes.GOAL_IN_COLLISION,
+        MoveItErrorCodes.GOAL_VIOLATES_PATH_CONSTRAINTS,
+        MoveItErrorCodes.GOAL_CONSTRAINTS_VIOLATED,
+        MoveItErrorCodes.GOAL_STATE_INVALID,
+    )
+)
+
+
+# The single declaration of the served motion surface — __init__ registers
+# exactly these endpoints and the served-endpoint audits (lekiwi_robot's
+# test_motion_endpoints_served) derive their expected set from this function,
+# never from a hand-written list: the global /motion/* services from the
+# robot_runtime contract, plus one /<namespace>/motion/compute_ik per isolated
+# IK worker (the workers build ComputeIk services only — per-worker FK has
+# no server).
+def registered_motion_service_endpoints(ik_worker_namespaces) -> list[str]:
+    """Return the motion service endpoints the server registers for a worker set."""
+    endpoints = [C.MOVE_TO_POSE_SERVICE, C.MOVE_TO_JOINT_SERVICE, C.COMPUTE_FK_SERVICE]
+    for namespace in ik_worker_namespaces:
+        prefix = f"/{str(namespace).strip('/')}" if str(namespace).strip("/") else ""
+        endpoints.append(f"{prefix}{C.COMPUTE_IK_SERVICE}")
+    return endpoints
 
 
 class MotionServer(Node):
@@ -179,44 +217,52 @@ class MotionServer(Node):
             callback_group=self.callback_group,
         )
 
-        # 8. Runtime motion services (canonical names from robot_runtime.contract)
-        self.move_to_pose_srv = self.create_service(
-            MoveToPose,
-            C.MOVE_TO_POSE_SERVICE,
-            self._move_to_pose_service_cb,
-            callback_group=self.callback_group,
-        )
-        self.move_to_configuration_srv = self.create_service(
-            MoveToConfiguration,
-            C.MOVE_TO_JOINT_SERVICE,
-            self._move_to_configuration_service_cb,
-            callback_group=self.callback_group,
-        )
-        self._fk_client = self.create_client(GetPositionFK, "compute_fk", callback_group=self.callback_group)
-        self.compute_fk_srv = self.create_service(
-            ComputeFk, C.COMPUTE_FK_SERVICE, self._compute_fk_service_cb, callback_group=self.callback_group
-        )
-        # One ComputeIk endpoint per MoveIt IK endpoint: "" is the primary
-        # move_group, others are isolated ik_workers.launch.py namespaces.
+        # 8. Runtime motion services (canonical names from robot_runtime.contract).
+        # The served surface comes from registered_motion_service_endpoints —
+        # the declared registration function — never a second hand-written
+        # list here: __init__ registers exactly what it declares.
         self._ik_clients: dict[str, object] = {}
         self.compute_ik_srvs = []
         self.ik_endpoints: list[str] = []
-        for namespace in self._ik_worker_namespaces:
-            prefix = f"/{namespace.strip('/')}" if namespace.strip("/") else ""
-            moveit_ik = f"{prefix}/compute_ik"
-            endpoint = f"{prefix}{C.COMPUTE_IK_SERVICE}"
-            self._ik_clients[endpoint] = self.create_client(
-                GetPositionIK, moveit_ik, callback_group=self.callback_group
-            )
-            self.compute_ik_srvs.append(
-                self.create_service(
-                    ComputeIk,
+        for endpoint in registered_motion_service_endpoints(self._ik_worker_namespaces):
+            if endpoint == C.MOVE_TO_POSE_SERVICE:
+                self.move_to_pose_srv = self.create_service(
+                    MoveToPose,
                     endpoint,
-                    lambda req, resp, ep=endpoint: self._compute_ik_service_cb(req, resp, ep),
+                    self._move_to_pose_service_cb,
                     callback_group=self.callback_group,
                 )
-            )
-            self.ik_endpoints.append(endpoint)
+            elif endpoint == C.MOVE_TO_JOINT_SERVICE:
+                self.move_to_configuration_srv = self.create_service(
+                    MoveToConfiguration,
+                    endpoint,
+                    self._move_to_configuration_service_cb,
+                    callback_group=self.callback_group,
+                )
+            elif endpoint == C.COMPUTE_FK_SERVICE:
+                self._fk_client = self.create_client(GetPositionFK, "compute_fk", callback_group=self.callback_group)
+                self.compute_fk_srv = self.create_service(
+                    ComputeFk, endpoint, self._compute_fk_service_cb, callback_group=self.callback_group
+                )
+            else:
+                # One ComputeIk endpoint per MoveIt IK endpoint: "" is the
+                # primary move_group, others are isolated ik_workers.launch.py
+                # namespaces. The workers build ComputeIk services only —
+                # per-worker FK has no server.
+                prefix = endpoint[: -len(C.COMPUTE_IK_SERVICE)]
+                moveit_ik = f"{prefix}/compute_ik"
+                self._ik_clients[endpoint] = self.create_client(
+                    GetPositionIK, moveit_ik, callback_group=self.callback_group
+                )
+                self.compute_ik_srvs.append(
+                    self.create_service(
+                        ComputeIk,
+                        endpoint,
+                        lambda req, resp, ep=endpoint: self._compute_ik_service_cb(req, resp, ep),
+                        callback_group=self.callback_group,
+                    )
+                )
+                self.ik_endpoints.append(endpoint)
         self.get_logger().info(f"Motion services registered; IK endpoints: {self.ik_endpoints}")
 
         self.timer = self.create_timer(0.1, self.publish_ee_pose, callback_group=self.callback_group)
@@ -837,8 +883,55 @@ class MotionServer(Node):
             self.get_logger().error(f"Failed to query MoveIt2 state: {e}")
             return None
 
+    def _moveit_failure_outcome(self) -> str:
+        """
+        Classify a failed motion by THIS goal's MoveIt evidence.
+
+        The planning-phase MoveIt error codes are the positive signal. The
+        generic FAILURE (99999) that move_group reports for a planning abort
+        ("Catastrophic failure") is classified by the trajectory evidence:
+        a goal whose result carries no planned trajectory never handed a
+        trajectory to a controller — nothing was executed and the arm did not
+        move, so the caller may retry with another target. That
+        empty-trajectory evidence applies ONLY to the generic FAILURE code
+        (and the planning-phase set): a cancellation or execution code
+        (PREEMPTED, CONTROL_FAILED, TIMED_OUT, MOTION_PLAN_INVALIDATED_BY_
+        ENVIRONMENT_CHANGE, ...) stays EXECUTION_FAILED even when the result
+        carries no trajectory — the goal may have ended at any phase of
+        execution and the arm must be treated as having moved. pymoveit2
+        clears both signals when a goal is sent and sets them from that
+        goal's action result before the wrapper reports IDLE, so evidence
+        read after the completion wait belongs to the goal just waited on
+        (None when the goal was rejected or never reached a terminal state).
+        """
+        if self.moveit2 is None:
+            return C.OUTCOME_EXECUTION_FAILED
+        error_code = self.moveit2.get_last_execution_error_code()
+        if error_code is not None and int(error_code.val) in MOVEIT_PLANNING_PHASE_ERROR_CODES:
+            return C.OUTCOME_PLANNING_FAILED
+        if (
+            error_code is not None
+            and int(error_code.val) == MoveItErrorCodes.FAILURE
+            and self.moveit2.get_last_motion_planned() is False
+        ):
+            return C.OUTCOME_PLANNING_FAILED
+        return C.OUTCOME_EXECUTION_FAILED
+
     def _motion_execution_succeeded(self) -> bool:
+        """
+        Report whether this goal's own result reported success.
+
+        ``motion_suceeded`` alone is stale evidence — pymoveit2 does not
+        reset it when a goal is sent, so a rejected goal terminalizes
+        without a result while the previous goal's flag stays in place.
+        ``get_last_motion_planned()`` is None exactly while no result has
+        arrived for the current goal (review r2 finding 1: a dispatched
+        goal that terminalizes without a result is a failure, never a
+        stale success).
+        """
         if self.moveit2 is None or not self.moveit2.motion_suceeded:
+            return False
+        if self.moveit2.get_last_motion_planned() is None:
             return False
         error_code = self.moveit2.get_last_execution_error_code()
         return error_code is None or int(error_code.val) == 1
@@ -960,7 +1053,7 @@ class MotionServer(Node):
                 if response.success and not self._wait_for_post_motion_feedback():
                     response.success = False
                     response.message = "Motion completed but fresh joint feedback was not observed"
-                response.outcome = C.OUTCOME_SUCCEEDED if response.success else C.OUTCOME_EXECUTION_FAILED
+                response.outcome = C.OUTCOME_SUCCEEDED if response.success else self._moveit_failure_outcome()
             else:
                 response.success = False
                 response.message = "IK/planning failed"
@@ -1036,7 +1129,7 @@ class MotionServer(Node):
                 if response.success and not self._wait_for_post_motion_feedback(arm_feedback_targets):
                     response.success = False
                     response.message = "Motion completed but joint feedback did not converge to the target"
-                response.outcome = C.OUTCOME_SUCCEEDED if response.success else C.OUTCOME_EXECUTION_FAILED
+                response.outcome = C.OUTCOME_SUCCEEDED if response.success else self._moveit_failure_outcome()
             else:
                 response.success = False
                 response.message = "Joint planning failed"
@@ -1394,14 +1487,36 @@ class MotionServer(Node):
             return False
 
     def move_to_joint(self, joint_positions):
+        """
+        Dispatch a joint goal; report whether a goal was actually sent.
+
+        Review r2 finding 1: True means MoveIt accepted the send — the goal
+        is in flight OR already terminal with ANY result — so the caller
+        MUST classify the outcome through the completion-wait path
+        (``_wait_for_motion_completion`` plus ``_moveit_failure_outcome``):
+        a dispatched goal that terminalizes before the first state query
+        may still have moved the arm and is never a planning failure. False
+        means nothing was dispatched (no engine, a send exception, or the
+        goal sequence proves the send path skipped the call): the arm did
+        not move.
+        """
         if not self.moveit2:
             return False
         self.get_logger().info("Moving to joints...")
         try:
+            sequence_before = self.moveit2.get_last_goal_sequence()
             self.moveit2.clear_goal_constraints()
             self.moveit2.move_to_configuration(joint_positions)
-            state = self._query_moveit_state()
-            return state in (MoveIt2State.REQUESTING, MoveIt2State.EXECUTING) or self._motion_execution_succeeded()
+            dispatched = self.moveit2.get_last_goal_sequence() != sequence_before
+            if not dispatched:
+                # pymoveit2 skips the send silently when the action server
+                # is unavailable or `ignore_new_calls_while_executing` is
+                # set with a goal still in flight; the unchanged sequence is
+                # the positive proof that no goal left.
+                self.get_logger().warning(
+                    "MoveIt did not accept a goal (server unavailable or busy); no motion dispatched"
+                )
+            return dispatched
         except Exception as e:
             self.get_logger().error(f"Move error: {e}")
             return False

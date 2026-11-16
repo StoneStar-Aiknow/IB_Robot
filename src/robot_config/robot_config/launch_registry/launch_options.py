@@ -119,6 +119,33 @@ CORE_ARGUMENT_SPECS: tuple[ArgumentSpec, ...] = (
         ),
     ),
     ArgumentSpec(
+        name="runtime_network_interface",
+        declared_default="",
+        absent_fallback="",
+        description=(
+            "Robot-facing network interface for the runtime provider's physical "
+            "commissioning path. Empty leaves the provider default."
+        ),
+    ),
+    ArgumentSpec(
+        name="preset_operator_confirmed",
+        declared_default="false",
+        absent_fallback="false",
+        description=(
+            "Per-run operator confirmation for physical preset dispatch. The value "
+            "is deliberately not persisted; false fails closed."
+        ),
+    ),
+    ArgumentSpec(
+        name="preset_expected_fsm_id",
+        declared_default="",
+        absent_fallback="",
+        description=(
+            "Expected vendor FSM id for the physical preset session. Empty uses an "
+            "audited runtime-profile value and otherwise fails closed."
+        ),
+    ),
+    ArgumentSpec(
         name="with_inference",
         declared_default="",
         absent_fallback="",

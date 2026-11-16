@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import tempfile
 from pathlib import Path
 
 import launch
@@ -22,6 +23,7 @@ import yaml
 from launch_ros.actions import Node
 
 _PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "g1_29dof_dex3.yaml"
+_PRESET_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "g1_29dof_arm_presets.yaml"
 _LAUNCH = Path(__file__).resolve().parents[1] / "launch" / "runtime.launch.py"
 
 #: The simulated-transport binding the shipped profile declares. Tests compare
@@ -29,6 +31,12 @@ _LAUNCH = Path(__file__).resolve().parents[1] / "launch" / "runtime.launch.py"
 #: so the profile stays the single source and no test hardcodes one.
 _PROFILE_SIM = yaml.safe_load(_PROFILE.read_text(encoding="utf-8"))["sim"]
 _SIM_DOMAIN = int(_PROFILE_SIM["vendor_domain_id"])
+
+
+def _text(value):
+    if isinstance(value, list | tuple):
+        return "".join(_text(item) for item in value)
+    return str(getattr(value, "text", value))
 
 
 def _runtime_launch_module():
@@ -73,6 +81,36 @@ def _render_transport(simulated: str, network_interface: str):
         }
     )
     return _runtime_launch_module()._launch_setup(context)
+
+
+def _render_preset(**overrides):
+    """One render of the arm-preset profile on the requested transport."""
+    context = launch.LaunchContext()
+    configurations = {
+        "profile": str(_PRESET_PROFILE),
+        "use_sim": "false",
+        "sim_platform": "",
+        "simulated": "",
+        "instance_id": "",
+        "initial_mode": "",
+        "network_interface": "",
+        "vendor_domain_id": "",
+        "peripherals": "",
+        "runtime_network_interface": "",
+        "preset_operator_confirmed": "false",
+        "preset_expected_fsm_id": "",
+    }
+    configurations.update(overrides)
+    context.launch_configurations.update(configurations)
+    return _runtime_launch_module()._launch_setup(context)
+
+
+def _profile_with_validation(tmp_path, **validation):
+    profile = yaml.safe_load(_PRESET_PROFILE.read_text(encoding="utf-8"))
+    profile["vendor"]["operator_validation"] = validation
+    path = tmp_path / "g1_29dof_arm_presets_with_validation.yaml"
+    path.write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    return path
 
 
 def _node_params(node):
@@ -170,6 +208,126 @@ def test_arm_preset_simulation_is_loopback_and_has_no_dex3_description(monkeypat
     description = json.loads(params["interface_description_json"])
     assert description["execution"] == "simulated"
     assert "motion.named" in description["interfaces"]
+
+
+def test_arm_preset_launch_declares_the_per_run_commissioning_arguments():
+    from launch.actions import DeclareLaunchArgument
+
+    description = _runtime_launch_module().generate_launch_description()
+    arguments = {
+        _text(action._DeclareLaunchArgument__name): action
+        for action in description.entities
+        if isinstance(action, DeclareLaunchArgument)
+    }
+    assert arguments["preset_operator_confirmed"].default_value[0].text == "false"
+    assert arguments["runtime_network_interface"].default_value[0].text == ""
+    assert arguments["preset_expected_fsm_id"].default_value[0].text == ""
+
+
+def test_arm_preset_physical_defaults_fail_closed():
+    with pytest.raises(RuntimeError, match="PRESET_HARDWARE_DISABLED"):
+        _render_preset()
+
+
+@pytest.mark.parametrize("runtime_network_interface", ["", "lo", "  "])
+def test_arm_preset_physical_requires_a_robot_facing_nic(runtime_network_interface):
+    with pytest.raises(RuntimeError, match="PRESET_HARDWARE_DISABLED.*runtime_network_interface"):
+        _render_preset(
+            preset_operator_confirmed="true",
+            runtime_network_interface=runtime_network_interface,
+            preset_expected_fsm_id="802",
+        )
+
+
+@pytest.mark.parametrize("expected_fsm", ["", "0", "-1", "802.0", "not-an-id"])
+def test_arm_preset_physical_requires_a_valid_expected_fsm(expected_fsm):
+    with pytest.raises(RuntimeError, match="PRESET_HARDWARE_DISABLED|positive integer FSM id"):
+        _render_preset(
+            preset_operator_confirmed="true",
+            runtime_network_interface="eth9",
+            preset_expected_fsm_id=expected_fsm,
+        )
+
+
+def test_arm_preset_physical_rejects_an_unparseable_confirmation():
+    with pytest.raises(RuntimeError, match="preset_operator_confirmed must be a boolean"):
+        _render_preset(
+            preset_operator_confirmed="on-site",
+            runtime_network_interface="eth9",
+            preset_expected_fsm_id="802",
+        )
+
+
+def test_arm_preset_physical_passes_per_run_parameters_without_a_profile_file(monkeypatch):
+    def _no_temp_profile(*_args, **_kwargs):
+        raise AssertionError("physical preset commissioning must not write a profile file")
+
+    monkeypatch.setattr(tempfile, "NamedTemporaryFile", _no_temp_profile)
+    actions = _render_preset(
+        preset_operator_confirmed="true",
+        runtime_network_interface="eth9",
+        preset_expected_fsm_id="802",
+    )
+    runtime = next(node for node in actions if isinstance(node, Node))
+    params = _node_params(runtime)
+    assert params["preset_operator_confirmed"] is True
+    assert params["runtime_network_interface"] == "eth9"
+    assert params["preset_expected_fsm_id"] == 802
+    assert params["vendor_network_interface"] == "eth9"
+    assert params["vendor_domain_id"] == 0
+    assert params["preset_test_transport"] is False
+    # The node reads the audited source profile; the per-run values ride as
+    # ROS parameters, so no run-scoped or confirmed profile exists anywhere.
+    assert params["profile"] == str(_PRESET_PROFILE)
+    source_profile = yaml.safe_load(_PRESET_PROFILE.read_text(encoding="utf-8"))
+    assert "operator_validation" not in source_profile["vendor"]
+
+
+def test_arm_preset_physical_accepts_an_audited_profile_fsm(tmp_path):
+    profile = _profile_with_validation(tmp_path, expected_fsm_id=500)
+    actions = _render_preset(
+        profile=str(profile),
+        preset_operator_confirmed="true",
+        runtime_network_interface="eth9",
+    )
+    params = _node_params(next(node for node in actions if isinstance(node, Node)))
+    assert params["profile"] == str(profile)
+    assert params["preset_expected_fsm_id"] == 500
+
+
+def test_arm_preset_physical_rejects_conflicting_overrides(tmp_path):
+    profile = _profile_with_validation(tmp_path, expected_fsm_id=500)
+    with pytest.raises(RuntimeError, match="conflicting expected FSM ids"):
+        _render_preset(
+            profile=str(profile),
+            preset_operator_confirmed="true",
+            runtime_network_interface="eth9",
+            preset_expected_fsm_id="802",
+        )
+    with pytest.raises(RuntimeError, match="conflicting network interface overrides"):
+        _render_preset(
+            preset_operator_confirmed="true",
+            runtime_network_interface="eth9",
+            preset_expected_fsm_id="802",
+            network_interface="eth0",
+        )
+    profile_nic = _profile_with_validation(tmp_path, network_interface="eth0", expected_fsm_id=802)
+    with pytest.raises(RuntimeError, match="conflicting network interface overrides"):
+        _render_preset(
+            profile=str(profile_nic),
+            preset_operator_confirmed="true",
+            runtime_network_interface="eth9",
+        )
+
+
+def test_arm_preset_simulation_does_not_apply_the_physical_gate():
+    nodes = [
+        item for item in _render_preset(use_sim="true", preset_expected_fsm_id="ignored") if isinstance(item, Node)
+    ]
+    runtime = next(node for node in nodes if node._Node__node_executable == "runtime_node")
+    params = _node_params(runtime)
+    assert params["preset_test_transport"] is True
+    assert params["vendor_network_interface"] == "lo"
 
 
 # --- E1: the vendor DDS binding is a parameter on every path -------------------

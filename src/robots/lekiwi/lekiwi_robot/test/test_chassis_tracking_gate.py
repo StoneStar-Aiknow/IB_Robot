@@ -51,10 +51,11 @@ from std_srvs.srv import SetBool
 
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import get_sim_platform
 from robot_runtime.testing.arm_envelope import envelope_verdict
-from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     open_ground_truth,
     terminate_marked_processes,
@@ -80,13 +81,17 @@ _LIDAR_PROFILE = _PROFILES / "lekiwi_lidar.yaml"
 #: EVERY motion phase (the shared envelope rule covers the whole phase,
 #: edges included — a stale or out-of-envelope sample fails).
 GATE_PROFILES = ("lekiwi_lidar", "lekiwi_nav_grasp")
+#: The fixed first-party physics matrix the gate is parametrized over
+#: (openspec sim-platform-registry D2); the capability probe reports an
+#: unregistered platform so the shared require-or-skip rule decides.
+PHYSICS_PLATFORMS = ("gazebo", "mujoco")
 _ARM_RESET = {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0}
 _ARM_TOLERANCE = 0.1
 _ARM_MAX_SAMPLE_GAP_SEC = 0.5
 
 
 def _environment_missing(sim_platform: str) -> str | None:
-    """The shared environment probe (robot_runtime.testing.sim_environment).
+    """The shared environment probe (robot_runtime_sim.testing.sim_environment).
 
     Kept as a local name for the call sites; the Gazebo probe accepts EITHER
     stack (``ign gazebo`` / ``gz sim``) and the MuJoCo probe names every
@@ -101,14 +106,18 @@ def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
 
 
 def _platform_capabilities_missing(sim_platform: str, profile: str) -> list[str]:
-    """The gate's code capabilities: ground truth and the profile platform."""
-    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+    """The gate's code capabilities: ground truth, the registered platform and the profile platform."""
+    from robot_runtime_sim.testing.sim_ground_truth import UnsupportedGroundTruth
 
     missing = []
     try:
         open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
     except UnsupportedGroundTruth as error:
         missing.append(f"ground truth: {error}")
+    try:
+        get_sim_platform(sim_platform)
+    except Exception as error:  # noqa: BLE001  (SimPlatformError: the platform is not installed)
+        missing.append(f"sim platform: {error}")
     supported = [str(entry) for entry in load_profile(_PROFILES / f"{profile}.yaml").get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
@@ -206,7 +215,7 @@ def _angle_within(measured: float, expected: float, tolerance: float) -> bool:
 
 
 @pytest.mark.parametrize("profile", GATE_PROFILES)
-@pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
+@pytest.mark.parametrize("sim_platform", PHYSICS_PLATFORMS)
 def test_chassis_tracking_gate(tmp_path, sim_platform, profile):
     missing = _platform_capabilities_missing(sim_platform, profile)
     if missing:
@@ -249,7 +258,7 @@ def test_chassis_tracking_gate(tmp_path, sim_platform, profile):
         f"sim_platform:={sim_platform}",
     ]
     if sim_platform == "mujoco":
-        launch_arguments.append(f"mujoco_scene:={WORLD_NAME}")
+        launch_arguments.append(f"sim_world:={WORLD_NAME}")
     launch = subprocess.Popen(
         launch_arguments,
         stdout=launch_log.open("w"),

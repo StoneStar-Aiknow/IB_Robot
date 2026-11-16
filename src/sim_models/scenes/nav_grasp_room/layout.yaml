@@ -1,0 +1,113 @@
+# Scene: nav_grasp_room — the mobile-manipulation scene (#205 grasp stage D1).
+#
+# nav_room's walls, obstacles, spawn and gate route (identical entries, so
+# the same navigation geometry) plus the mobile-manipulation furniture: a
+# low static table and one dynamic magenta cube. The task data (staging
+# pose, success thresholds) lives in `mobile_manipulation` — one definition
+# read through `sim_models.scene_compiler.mobile_manipulation_spec`.
+
+scene_name: nav_grasp_room
+description: "nav_room navigation geometry + a grasp table and cube (#205)"
+
+# Robot spawn: as nav_room (the z default lifts the LeKiwi wheels just
+# above the ground plane; wheel lowest point 0.0406 m below base_link).
+robot_spawn:
+  x: -1.5
+  y: -1.5
+  z: 0.05
+  yaw: 0.0
+
+# Static collision geometry of the scene: nav_room's walls and obstacles
+# (identical entries — the same convention D14.7 established there) plus
+# the grasp table. Every simulator template of this scene must carry
+# exactly this geometry (the scene consistency test compares template
+# against layout, naming the element and both values on mismatch), and the
+# rasteriser (D2) draws the navigation map from the same list.
+static_geometry:
+  - name: wall_north
+    primitive: box
+    size: [4.2, 0.1, 1.0]
+    pose: [0.0, 2.0, 0.5, 0.0, 0.0, 0.0]
+  - name: wall_south
+    primitive: box
+    size: [4.2, 0.1, 1.0]
+    pose: [0.0, -2.0, 0.5, 0.0, 0.0, 0.0]
+  - name: wall_east
+    primitive: box
+    size: [0.1, 4.2, 1.0]
+    pose: [2.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+  - name: wall_west
+    primitive: box
+    size: [0.1, 4.2, 1.0]
+    pose: [-2.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+  - name: obstacle_box
+    primitive: box
+    size: [0.4, 0.4, 0.5]
+    pose: [0.0, 0.0, 0.25, 0.0, 0.0, 0.0]
+  - name: obstacle_cylinder
+    primitive: cylinder
+    size: [0.2, 0.6]
+    pose: [1.0, -0.5, 0.3, 0.0, 0.0, 0.0]
+  # ── mobile-manipulation table (D1, lowered 2026-11-02, maintainer
+  # decision) ──────────────────────────────────────────────────────────────
+  # A low slab: top 0.015 m above the floor, matching the real robot's
+  # validated grasp surface (lekiwi_nav_grasp: fitted tabletop plane
+  # z_base = -0.061; the previous 0.08 m table put the grasp surface at
+  # z_base = +0.019 and every GraspGen candidate failed preparation IK).
+  # Long side (0.50 m) facing the west approach; east half, >= 0.5 m clear
+  # of the obstacles and walls, outside the west-half gate route.
+  - name: table
+    primitive: box
+    size: [0.40, 0.50, 0.015]
+    pose: [1.2, 0.4, 0.0075, 0.0, 0.0, 0.0]
+
+# Dynamic graspable cube (D1): edge 0.03 m, mass 0.05 kg, centre 0.025 m
+# INSIDE the table's west (approach) edge at x = 1.0 (face 0.010 m from
+# the edge), yaw 0 (spike 1.1r D0 decision (a): the cube yaw aligned with
+# the approach); spawns 1 cm above the table top (0.015 m) and settles.
+objects:
+  - name: grasp_object
+    type: dynamic
+    primitive: box
+    size: [0.03, 0.03, 0.03]
+    position: [1.025, 0.4, 0.04]
+    rotation_euler_rad: [0.0, 0.0, 0.0]
+    mass_kg: 0.05
+    friction: 1.0
+    rgba: [0.85, 0.1, 0.85, 1.0]
+    description: "Magenta grasp cube (hue 300 deg, mask band 270-330)"
+
+# Mobile-manipulation task data (D1), validated by
+# sim_models.scene_compiler.mobile_manipulation_spec. The staging pose is
+# the FROZEN Nav2 goal (spike 1.1r re-run): x = 0.72 keeps base_link 0.28 m
+# from the table's west edge (x = 1.0) — the footprint boundary — and the
+# cube lands at the pan-radius the verified candidates need; yaw faces the
+# table (approach along map +x, matching the cube yaw).
+mobile_manipulation:
+  object: grasp_object
+  table: table
+  # R5 (lekiwi-nav-grasp-mobile-manipulation revision 2): the grounded_sam2
+  # prompt the production perception pipeline grounds this scene's object with
+  # — one definition, validated with the rest of the task data.
+  object_prompt: magenta cube
+  # The staging goal the E2E navigates to (the single definition, D1): with
+  # the test-only Nav2 inflation 0.12 this goal stops the base ~0.24 m from
+  # the cube — the band where the production pick's candidates prepare.
+  # Was 0.72 (D0's pre-tuning value); 0.785 measured 2026-11-01/02.
+  staging_pose: {x: 0.785, y: 0.40, yaw: 0.0}
+    # The hold rigidity rule (Revision-2 corrections): the object's
+  # orientation IN THE GRIPPER LINK frame changes <= 10 deg over the
+  # hold window — a rigidly carried cube passes at ANY world tilt (the
+  # transport pose legitimately holds it ~114 deg from vertical).
+  success: {lift_m: 0.05, hold_s: 3.0, max_object_rotation_in_gripper_deg: 10.0}
+
+# The lidar-odometry gate route (nav_room's, identical entries — the same
+# west-half loop; one definition shared by the route-clearance test and
+# robot_navigation's gate).
+gate_route:
+  - {segment: 1, kind: forward, start: [-1.5, -1.5], end: [-0.7, -1.5], yaw_deg: [0.0, 0.0], speed: 0.10}
+  - {segment: 2, kind: rotate, point: [-0.7, -1.5], yaw_deg: [0.0, 90.0], speed: 0.35}
+  - {segment: 3, kind: forward, start: [-0.7, -1.5], end: [-0.7, 1.2], yaw_deg: [90.0, 90.0], speed: 0.10}
+  - {segment: 4, kind: lateral, start: [-0.7, 1.2], end: [-1.5, 1.2], yaw_deg: [90.0, 90.0], speed: 0.08}
+  - {segment: 5, kind: rotate, point: [-1.5, 1.2], yaw_deg: [90.0, 0.0], speed: 0.35}
+  - {segment: 6, kind: lateral, start: [-1.5, 1.2], end: [-1.5, -1.5], yaw_deg: [0.0, 0.0], speed: -0.08}

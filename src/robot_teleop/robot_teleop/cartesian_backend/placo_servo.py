@@ -33,6 +33,8 @@ from std_msgs.msg import Empty
 from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import ArmReturnHome
+from ibrobot_msgs.msg import SessionLease
+from ibrobot_msgs.srv import StartArmSession
 
 from .base import CartesianBackend
 from .frame_adapter import ToolAngularAdapter
@@ -54,6 +56,9 @@ _MAX_ANGULAR_SPEED_RPS: float = 6.0  # 6.0 rad/s at scale=1.0
 
 
 class PlacoServoBackend(CartesianBackend):
+    # Session endpoints replace start/lease when configured (see __init__).
+    _start_type = Trigger
+    _lease_type = Empty
     """Publish base-frame linear/angular commands to ``so101_placo_servo_node``."""
 
     def __init__(
@@ -71,6 +76,8 @@ class PlacoServoBackend(CartesianBackend):
         stop_srv: str = _DEFAULT_STOP_SRV,
         home_action: str = _DEFAULT_HOME_ACTION,
         command_lease_topic: str = _DEFAULT_COMMAND_LEASE_TOPIC,
+        session_start_srv: str = "",
+        session_lease_topic: str = "",
         input_mode: str = "velocity",
         stale_threshold_s: float = 0.2,
         managed_teleop: bool = False,
@@ -99,10 +106,19 @@ class PlacoServoBackend(CartesianBackend):
         self._linear_pub = node.create_publisher(Vector3Stamped, linear_topic, 10)
         self._angular_pub = node.create_publisher(Vector3Stamped, angular_topic, 10)
         self._pose_pub = node.create_publisher(PoseStamped, pose_topic, 10)
-        self._start_cli = node.create_client(Trigger, start_srv)
+        # Managed sessions use StartArmSession and a stamped SessionLease when the
+        # runtime target names them, so a lease from a released grip cannot keep
+        # the next session alive. Both responses carry success/message.
+        if managed_teleop and session_start_srv:
+            self._start_type = StartArmSession
+            start_srv = session_start_srv
+        self._start_cli = node.create_client(self._start_type, start_srv)
         self._stop_cli = node.create_client(Trigger, stop_srv)
         self._home_client = ActionClient(node, ArmReturnHome, home_action)
-        self._lease_pub = node.create_publisher(Empty, command_lease_topic, 10)
+        if managed_teleop and session_lease_topic:
+            self._lease_type = SessionLease
+            command_lease_topic = session_lease_topic
+        self._lease_pub = node.create_publisher(self._lease_type, command_lease_topic, 10)
         self._requested_enabled = False
         self._active_enabled = False
         self._start_request_inflight = False
@@ -214,7 +230,7 @@ class PlacoServoBackend(CartesianBackend):
             return
         self._cancel_start_retry()
         try:
-            future = self._start_cli.call_async(Trigger.Request())
+            future = self._start_cli.call_async(self._start_type.Request())
         except Exception as exc:  # noqa: BLE001
             self._node.get_logger().error(f"so101_placo_servo_node start request failed: {exc}")
             self._finish_enable(False, f"start request failed: {exc}")
@@ -458,7 +474,11 @@ class PlacoServoBackend(CartesianBackend):
         return result
 
     def keepalive(self) -> None:
-        self._lease_pub.publish(Empty())
+        message = self._lease_type()
+        if hasattr(message, "header"):
+            # The servo drops a lease stamped at or before its session start.
+            message.header.stamp = self._node.get_clock().now().to_msg()
+        self._lease_pub.publish(message)
 
     @property
     def is_enabled(self) -> bool:

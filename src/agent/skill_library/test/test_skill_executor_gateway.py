@@ -69,6 +69,7 @@ def _constructor_overrides(suffix: str, catalog_root, profile_name: str):
         "cmd_pose_topic": f"/{suffix}/cmd_pose",
         "default_skill_timeout_sec": 2.5,
         "ee_pose_topic": f"/{suffix}/ee_pose",
+        "execution_store_path": str(catalog_root / "executions.sqlite3"),
         "gripper_settle_sec": 0.4,
         "joint_state_topic": f"/{suffix}/joint_state",
         "model_idle_timeout_sec": 8.0,
@@ -320,7 +321,13 @@ def gateway_rig(request, tmp_path):
         "finalize_workflow": f"/{suffix}/finalize_workflow",
         "get_execution": f"/{suffix}/get_execution",
         "get_execution_events": f"/{suffix}/get_execution_events",
+        "get_visual_game_result": f"/{suffix}/get_visual_game_result",
         "joint_state": f"/{suffix}/joint_state",
+        "plan": f"/{suffix}/plan",
+        "prepare_plan": f"/{suffix}/prepare_plan",
+        "validate_plan": f"/{suffix}/validate_plan",
+        "confirm_plan": f"/{suffix}/confirm_plan",
+        "execute_plan": f"/{suffix}/execute_plan",
         "navigation": f"/{suffix}/navigation",
         "primitive": f"/{suffix}/primitive",
         "reload": f"/{suffix}/reload",
@@ -389,14 +396,21 @@ def gateway_rig(request, tmp_path):
         "cancel_execution_service": names["cancel_execution"],
         "finalize_workflow_service": names["finalize_workflow"],
         "joint_state_topic": names["joint_state"],
+        "get_visual_game_result_service": names["get_visual_game_result"],
         "ledger_terminal_capacity": 8,
         "gripper_settle_sec": 0.4,
         "model_idle_timeout_sec": 8.0,
         "motion_authorized": True,
         "navigation_action_name": names["navigation"],
+        "prepare_plan_service": names["prepare_plan"],
+        "plan_service": names["plan"],
+        "validate_plan_service": names["validate_plan"],
+        "confirm_plan_service": names["confirm_plan"],
+        "execute_plan_action": names["execute_plan"],
         "named_poses_json": json.dumps({"home": {}}),
         "primitive_action_name": names["primitive"],
         "robot_name": profile_name,
+        "agent_plan_enabled": True,
         "robot_state_freshness_sec": 0.1,
         "rpc_timeout_sec": 0.2,
         "scene_freshness_sec": 0.3,
@@ -543,6 +557,10 @@ def _send_skill(rig, *, task_id: str = "task-1", skill_name: str = "move", schem
     goal.timeout_sec = 0.0
     goal_handle = _future_result(rig.skill_client.send_goal_async(goal))
     assert goal_handle.accepted
+    return _skill_result(rig, goal_handle)
+
+
+def _skill_result(rig, goal_handle):
     return _future_result(goal_handle.get_result_async()).result
 
 
@@ -558,6 +576,127 @@ def _set_root_identity(rig, binding) -> None:
     binding.expected_registry_epoch = status.registry_epoch
     binding.expected_registry_generation = status.registry_generation
     binding.expected_registry_digest = status.registry_digest
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [
+        {
+            "motion_authorized": False,
+            "execution_caller_scopes_json": '["robot_skill_cli", "integration"]',
+            "execution_caller_tokens_json": json.dumps(tokens),
+        }
+        for tokens in (
+            {"integration": "integration-test-token"},
+            {"robot_skill_cli": "", "integration": "integration-test-token"},
+        )
+    ],
+    indirect=True,
+)
+def test_unconfigured_operator_keeps_scope_and_motion_admission_checks(gateway_rig, monkeypatch):
+    monkeypatch.setenv("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", "obsolete-environment-token")
+    node = gateway_rig.executor_node
+    assert node._execution_auth_ok(SimpleNamespace(caller_scope="robot_skill_cli", caller_token=""))
+    assert not node._execution_auth_ok(SimpleNamespace(caller_scope="unknown", caller_token=""))
+    assert not node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token=""))
+    assert node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token="integration-test-token"))
+
+    assert not _get_status(gateway_rig).motion_authorized
+    dispatched = []
+    monkeypatch.setattr(node._primitive_client, "send_goal_async", lambda goal: dispatched.append(goal))
+    result = _send_skill(gateway_rig)
+    assert not result.success
+    assert result.error_code == "MOTION_NOT_AUTHORIZED"
+    assert dispatched == []
+    assert gateway_rig.downstream_goals == []
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [
+        {
+            "_task_executor": True,
+            "execution_caller_scopes_json": '["robot_skill_cli", "integration"]',
+            "execution_caller_tokens_json": json.dumps(
+                {
+                    "robot_skill_cli": "configured-operator-token",
+                    "integration": "integration-test-token",
+                }
+            ),
+        }
+    ],
+    indirect=True,
+)
+def test_configured_operator_token_is_enforced(gateway_rig, monkeypatch):
+    # A stale shell token must not replace or weaken the deployment token.
+    monkeypatch.setenv("IBROBOT_EXECUTION_TOKEN_ROBOT_SKILL_CLI", "obsolete-environment-token")
+    node = gateway_rig.executor_node
+    assert node._execution_caller_tokens["robot_skill_cli"] == "configured-operator-token"
+
+    def authorized(token: str) -> bool:
+        return node._execution_auth_ok(SimpleNamespace(caller_scope="robot_skill_cli", caller_token=token))
+
+    assert authorized("configured-operator-token")
+    assert not authorized("")
+    assert not authorized("obsolete-environment-token")
+    assert not authorized("wrong-token")
+    # Other scopes keep their own configured token independently.
+    assert node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token="integration-test-token"))
+    assert not node._execution_auth_ok(SimpleNamespace(caller_scope="integration", caller_token=""))
+
+    missing_token = _program_goal(gateway_rig, request_id="configured-token-missing")
+    assert missing_token.caller_token == ""
+    denied = _send_program(gateway_rig, missing_token)
+    assert denied.success is False
+    assert denied.state == "FAILED"
+    assert denied.error_code == "EXECUTION_SCOPE_DENIED"
+    assert gateway_rig.downstream_goals == []
+
+    wrong_token = _program_goal(gateway_rig, request_id="configured-token-wrong")
+    wrong_token.caller_token = "wrong-token"
+    denied = _send_program(gateway_rig, wrong_token)
+    assert denied.success is False
+    assert denied.error_code == "EXECUTION_SCOPE_DENIED"
+
+    valid_token = _program_goal(gateway_rig, request_id="configured-token-valid")
+    valid_token.caller_token = "configured-operator-token"
+    accepted = _send_program(gateway_rig, valid_token)
+    assert accepted.success is True
+    assert accepted.state == "SUCCEEDED"
+
+
+@pytest.mark.parametrize(
+    "gateway_rig",
+    [
+        {
+            "motion_authorized": False,
+            "execution_caller_scopes_json": '["robot_skill_cli"]',
+            "execution_caller_tokens_json": json.dumps({"robot_skill_cli": "configured-operator-token"}),
+        }
+    ],
+    indirect=True,
+)
+def test_configured_operator_token_does_not_bypass_motion_admission(gateway_rig, monkeypatch):
+    node = gateway_rig.executor_node
+    assert node._execution_auth_ok(
+        SimpleNamespace(caller_scope="robot_skill_cli", caller_token="configured-operator-token")
+    )
+    assert not _get_status(gateway_rig).motion_authorized
+
+    dispatched = []
+    monkeypatch.setattr(node._primitive_client, "send_goal_async", lambda goal: dispatched.append(goal))
+    result = _send_skill(gateway_rig)
+    assert not result.success
+    assert result.error_code == "MOTION_NOT_AUTHORIZED"
+    assert dispatched == []
+    assert gateway_rig.downstream_goals == []
+
+
+@pytest.mark.parametrize("gateway_rig", [{"execution_caller_scopes_json": '["integration"]'}], indirect=True)
+def test_keyless_operator_still_requires_an_allowed_caller_scope(gateway_rig):
+    assert not gateway_rig.executor_node._execution_auth_ok(
+        SimpleNamespace(caller_scope="robot_skill_cli", caller_token="")
+    )
 
 
 def test_v1_executor_does_not_create_navigation_action_client(gateway_rig):
@@ -1682,6 +1821,7 @@ def test_constructor_declares_catalog_parameters_and_drops_legacy_template_param
         assert node.has_parameter("skill_catalog_source_mode")
         assert node.has_parameter("skill_catalog_source_root")
         assert node.has_parameter("skill_catalog_profile")
+        assert node.get_parameter("execution_store_path").value == str(tmp_path / "executions.sqlite3")
     finally:
         node.destroy_node()
 

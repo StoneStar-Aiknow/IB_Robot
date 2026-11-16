@@ -54,8 +54,9 @@ stop behaviour against the simulator's ros2_control interface: the runtime
 starts a minimal empty world on its own (bring `IBROBOT_GAZEBO_HEADLESS=1`
 for server-only rendering), spawns the SO-101 into it and republishes the
 simulated joint effort as `joint.current`. When generic launch owns the
-world it passes `gazebo_world` and the spawn pose (`spawn_x/y/z/yaw`) and
-the runtime attaches to that world instead of starting one. Every node the
+world it passes the platform-neutral `sim_world` (the gz world name) and the
+spawn pose (`spawn_x/y/z/yaw`), and the runtime attaches to that world
+instead of starting one. Every node the
 runtime starts on this platform runs on simulation time. The Gazebo camera
 poses/FOV are runtime-owned (`simulation.gazebo.transform` per camera in
 the profile); user-saved overrides under
@@ -67,7 +68,9 @@ the profile); user-saved overrides under
 manager, and the runtime starts it alone by default —
 
 ```bash
-# provider alone (robot model only, no scene)
+# provider alone: an empty scene name composes the shared sim_models "empty"
+# scene (ground plane + light) — a robot-only model would render on a black
+# void; only a direct API caller passing scene=None gets the bare robot
 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
 # headless (no Simulate UI): camera rendering falls back to EGL when no
 # display is available, so no xvfb-run wrapper is needed (requires libegl1
@@ -81,11 +84,12 @@ before the model is composed. A venv installed with the LIBERO benchmark
 dependencies (`mujoco<3.9`) cannot run this platform — the same check
 reports it.
 
-When generic launch owns the world it passes the scene by name
-(`mujoco_scene:=<scene>`) plus the spawn pose, and the runtime composes its
-robot MJCF with that scene (e.g.
+When generic launch owns the world it passes the platform-neutral
+`sim_world` (the scene name on MuJoCo) plus the spawn pose, and the runtime
+composes its robot MJCF with that scene (e.g.
 `robot_config:=so101_single_arm_pick_banana use_sim:=true sim_platform:=mujoco`
-for the pick-and-place scene). The MuJoCo camera poses/FOV are runtime-owned
+for the pick-and-place scene). The MuJoCo
+camera poses/FOV are runtime-owned
 too (`simulation.mujoco.transform` per camera; the same user-saved overrides
 apply, converted from the Gazebo convention), the plugin's single camera
 rate comes from `simulation.mujoco.camera_publish_rate` (default: the

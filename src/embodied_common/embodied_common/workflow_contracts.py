@@ -20,6 +20,7 @@ _WORKFLOW_STEP_COMMON_FIELDS = frozenset(
         "motion_distance",
         "arm_side",
         "imitation_duration_sec",
+        "approach",
         "timeout_sec",
     }
 )
@@ -44,6 +45,7 @@ def validate_workflow_steps(steps: Sequence[Any], *, max_steps: int = 16) -> Non
         "place_name",
         "motion_direction",
         "arm_side",
+        "approach",
         "direction",
     }
     number_fields = {"motion_distance", "imitation_duration_sec", "timeout_sec", "distance", "degree", "x", "y", "yaw"}
@@ -86,6 +88,7 @@ class CanonicalWorkflowStep:
     imitation_duration_sec: float = 0.0
     timeout_sec: float = 0.0
     direction: str = ""
+    approach: str = ""
     distance: float = 0.0
     degree: float = 0.0
     x: float | None = None
@@ -99,13 +102,21 @@ class CanonicalWorkflowStep:
             raise TypeError("WorkflowStep.skill_name must be a string")
         if not self.skill_name.strip():
             raise ValueError("WorkflowStep.skill_name must be non-empty")
-        for field_name in ("target_name", "container_name", "place_name", "motion_direction", "arm_side", "direction"):
+        for field_name in (
+            "target_name",
+            "container_name",
+            "place_name",
+            "motion_direction",
+            "arm_side",
+            "direction",
+            "approach",
+        ):
             if not isinstance(getattr(self, field_name), str):
                 raise TypeError(f"WorkflowStep.{field_name} must be a string")
         object.__setattr__(self, "skill_name", self.skill_name.strip())
         for field_name in ("target_name", "container_name", "place_name"):
             object.__setattr__(self, field_name, getattr(self, field_name).strip())
-        for field_name in ("motion_direction", "arm_side", "direction"):
+        for field_name in ("motion_direction", "arm_side", "direction", "approach"):
             object.__setattr__(self, field_name, getattr(self, field_name).strip().lower())
         if self.arm_side and self.arm_side not in {"left", "right", "auto"}:
             raise ValueError("WorkflowStep.arm_side must be left, right, or auto")
@@ -149,6 +160,8 @@ class CanonicalWorkflowStep:
                     "imitation_duration_sec": normalized_imitation_duration,
                 }
             )
+        if self.approach:
+            result["approach"] = self.approach
         if self.schema_version == 2:
             result.update(
                 {
@@ -196,6 +209,7 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
                 ("motion_distance", 0.0),
                 ("arm_side", ""),
                 ("imitation_duration_sec", 0.0),
+                ("approach", ""),
                 ("timeout_sec", 0.0),
                 ("direction", ""),
                 ("distance", 0.0),
@@ -232,6 +246,7 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         arm_side=str(values.get("arm_side", "")),
         imitation_duration_sec=_finite_float(values.get("imitation_duration_sec", 0.0)),
         timeout_sec=_finite_float(values.get("timeout_sec", 0.0)),
+        approach=str(values.get("approach", "")),
         direction=str(values.get("direction", "")) if schema_version == 2 else "",
         distance=_finite_float(values.get("distance", 0.0)) if schema_version == 2 else 0.0,
         degree=_finite_float(values.get("degree", 0.0)) if schema_version == 2 else 0.0,

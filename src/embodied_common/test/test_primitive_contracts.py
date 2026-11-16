@@ -5,6 +5,7 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from embodied_common.primitive_contracts import (
+    GRIPPER_APPROACH_EXTENSION,
     PRIMITIVE_CONTRACT_DIGEST,
     PRIMITIVE_CONTRACT_V1,
     PRIMITIVE_CONTRACT_V2,
@@ -14,6 +15,7 @@ from embodied_common.primitive_contracts import (
     canonical_json,
     primitive_contract_for_version,
     primitive_contract_preimage,
+    primitive_extensions_for_context,
 )
 
 V1_PRIMITIVE_DIGEST = "537210f86c9d8b7fa70f063235e7b9f10226de62c64a4b38376bbe5c53b42700"
@@ -184,3 +186,36 @@ def test_absolute_coordinate_descriptor_accepts_signed_values_and_explicit_zero(
     step = {"primitive_name": "nav_abs_coordinate", "x": 0.0, "y": -2.5, "yaw": -180.0}
 
     assert list(validator.iter_errors(step)) == []
+
+
+def test_gripper_approach_extension_adds_one_primitive_without_touching_the_base_contract():
+    extended = primitive_contract_for_version(1, (GRIPPER_APPROACH_EXTENSION,))
+    assert set(extended.descriptors) - set(PRIMITIVE_CONTRACT_V1.descriptors) == {"set_gripper_approach"}
+    assert extended.digest != PRIMITIVE_CONTRACT_V1.digest
+    assert PRIMITIVE_CONTRACT_V1.digest == V1_PRIMITIVE_DIGEST
+    assert primitive_contract_for_version(1, ()) is PRIMITIVE_CONTRACT_V1
+    assert primitive_contract_for_version(1, [GRIPPER_APPROACH_EXTENSION]) is extended
+    with pytest.raises(ValueError, match="unsupported primitive contract extensions"):
+        primitive_contract_for_version(1, ("teleport",))
+
+
+def test_only_contexts_with_approach_presets_select_the_extension():
+    assert primitive_extensions_for_context({}) == ()
+    assert primitive_extensions_for_context({"gripper_approach": {"axis": "x"}}) == ()
+    presets = {"gripper_approach": {"presets": {"top_down": {"orientation": {"w": 1.0}}}}}
+    assert primitive_extensions_for_context(presets) == (GRIPPER_APPROACH_EXTENSION,)
+
+
+def test_approach_step_names_its_preset_once():
+    schema = _json_value(
+        primitive_contract_for_version(1, (GRIPPER_APPROACH_EXTENSION,))
+        .descriptors["set_gripper_approach"]
+        .parameter_contract
+    )
+    validator = Draft202012Validator(schema)
+    assert validator.is_valid({"primitive_name": "set_gripper_approach", "approach_from_request": True})
+    assert validator.is_valid({"primitive_name": "set_gripper_approach", "approach": "top_down"})
+    assert not validator.is_valid({"primitive_name": "set_gripper_approach"})
+    assert not validator.is_valid(
+        {"primitive_name": "set_gripper_approach", "approach": "top_down", "approach_from_request": True}
+    )

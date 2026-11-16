@@ -85,7 +85,10 @@ def test_visual_game_commands_use_public_gateway_services(capsys, monkeypatch):
         lambda **_kwargs: (context, transport),
     )
     try:
-        assert robot_skill_main(["start-game", "sorting_hat", "--request-id", request_id]) == 0
+        assert (
+            robot_skill_main(["--config-name", "test-fixture", "start-game", "sorting_hat", "--request-id", request_id])
+            == 0
+        )
         started = json.loads(capsys.readouterr().out)
         assert started["ok"] is True
         assert started["command"] == "start-game"
@@ -98,7 +101,7 @@ def test_visual_game_commands_use_public_gateway_services(capsys, monkeypatch):
             "message": "accepted",
         }
 
-        assert robot_skill_main(["game-result", "--request-id", request_id]) == 0
+        assert robot_skill_main(["--config-name", "test-fixture", "game-result", "--request-id", request_id]) == 0
         result = json.loads(capsys.readouterr().out)
         assert result["ok"] is True
         assert result["command"] == "game-result"

@@ -343,6 +343,8 @@ class ModelRequest:
 
     inputs: Mapping[str, object] = field(default_factory=dict)
     metadata: Mapping[str, object] = field(default_factory=dict)
+    # Identity contributes to the request digest, but not the workload bucket.
+    identity_metadata_keys: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         if not isinstance(self.inputs, Mapping):
@@ -351,6 +353,11 @@ class ModelRequest:
             raise TypeError("ModelRequest input names must be non-empty strings")
         object.__setattr__(self, "inputs", MappingProxyType(dict(self.inputs)))
         object.__setattr__(self, "metadata", _freeze_json_mapping(self.metadata, path="metadata"))
+        if isinstance(self.identity_metadata_keys, str) or any(
+            not isinstance(key, str) or not key for key in self.identity_metadata_keys
+        ):
+            raise TypeError("identity metadata keys must be non-empty strings")
+        object.__setattr__(self, "identity_metadata_keys", frozenset(self.identity_metadata_keys))
 
     @property
     def semantic_inputs(self) -> Mapping[str, object]:

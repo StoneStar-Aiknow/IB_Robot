@@ -41,46 +41,7 @@ import yaml
 
 from robot_runtime.capabilities import validate_capability_set
 from robot_runtime.contract import IDLE_MODE, STOP_POLICIES
-
-#: Simulation platforms a runtime profile may declare (runtime-simulation-platform D1).
-#: ``sdk`` is the vendor SDK virtual bus behind the production hardware adapter
-#: (no physics); physical execution is not a simulation platform.
-SIM_PLATFORMS = ("sdk", "gazebo", "mujoco")
-
-#: Platforms that replace the robot with a physics simulator
-#: (so101-mujoco-runtime-platform D1). Every ``== "gazebo"`` test that really
-#: means "a physics simulator provides the clock and the world-side rules"
-#: must test membership here instead; tests about Gazebo specifics (entity
-#: creation, gz bridges) keep the literal platform.
-PHYSICS_SIM_PLATFORMS = ("gazebo", "mujoco")
-
-#: Physics platforms whose sensor injection stands in for a lidar
-#: (lekiwi-gazebo-runtime-platform D14.2): the rendering path consults this
-#: next to the driver check (``LIDAR_SIM_DRIVERS``) before injecting a lidar
-#: sensor, and the lidar-odometry gate reads it as the "the runtime simulates
-#: lidar here" capability — a platform outside it renders no lidar, so the
-#: constant cannot drift from production behaviour.
-LIDAR_SIM_PLATFORMS = ("gazebo", "mujoco")
-
-
-def lidar_driver_simulated(driver: str, sim_platform: str | None) -> bool:
-    """Whether a physics platform's lidar injection stands in for ``driver`` (D5).
-
-    The driver sets are platform-specific (Gazebo simulates every driver in
-    ``robot_runtime.gazebo.LIDAR_SIM_DRIVERS``, MuJoCo only the MID-360 —
-    ``robot_runtime.mujoco.MUJOCO_LIDAR_SIM_DRIVERS``); a driver the selected
-    platform does not stand in for is neither simulated nor advertised there.
-    Imported lazily so the platform modules keep importing this one.
-    """
-    if sim_platform == "gazebo":
-        from robot_runtime.gazebo import LIDAR_SIM_DRIVERS
-
-        return driver in LIDAR_SIM_DRIVERS
-    if sim_platform == "mujoco":
-        from robot_runtime.mujoco import MUJOCO_LIDAR_SIM_DRIVERS
-
-        return driver in MUJOCO_LIDAR_SIM_DRIVERS
-    return False
+from robot_runtime.sim_platforms import SimPlatformError, is_valid_sim_platform_name, validate_embodiment_reference
 
 
 def resolve_sensor_pose(periph: dict, platform: str = "gazebo") -> dict:
@@ -108,26 +69,34 @@ class ProfileError(ValueError):
 
 
 def _validate_sim_selection(data: dict[str, Any], source: str | Path) -> None:
-    """Normalize and validate ``use_sim`` / ``sim_platforms`` / ``sim_platform`` (D1).
+    """Normalize and validate ``use_sim`` / ``sim_platforms`` / ``sim_platform`` (D1/D2).
 
     A profile declares the simulation platforms it supports and a default
     platform. The legacy boolean ``simulated`` key stays an alias of ``use_sim``:
     both present and disagreeing fail naming both values. Without
     ``sim_platforms`` the profile supports ``[sdk]`` (today's behaviour);
     ``sim_platform`` defaults to ``sdk`` and must be declared.
+
+    Declaration is syntax (sim-platform-registry D2): platform names follow
+    the identifier rule only; unknown names are accepted, so a hardware-only
+    host still loads a profile that lists a platform whose plugin is not
+    installed. Registration is checked only when a platform becomes the
+    effective selection.
     """
     sim_platforms = data.get("sim_platforms")
     if sim_platforms is None:
         sim_platforms = ["sdk"]
     elif not isinstance(sim_platforms, list) or not sim_platforms:
         raise ProfileError(
-            f"runtime profile 'sim_platforms' must be a non-empty list from {list(SIM_PLATFORMS)}: {source}"
+            f"runtime profile 'sim_platforms' must be a non-empty list of platform identifiers: {source}"
         )
     else:
         sim_platforms = [str(entry).strip() for entry in sim_platforms]
-        if any(entry not in SIM_PLATFORMS for entry in sim_platforms) or len(set(sim_platforms)) != len(sim_platforms):
+        invalid = [entry for entry in sim_platforms if not is_valid_sim_platform_name(entry)]
+        if invalid or len(set(sim_platforms)) != len(sim_platforms):
             raise ProfileError(
-                f"runtime profile 'sim_platforms' must be unique values from {list(SIM_PLATFORMS)}: {source}"
+                f"runtime profile 'sim_platforms' must be unique identifiers matching "
+                f"^[a-z][a-z0-9_]*$ (got {sim_platforms}): {source}"
             )
     data["sim_platforms"] = sim_platforms
 
@@ -151,8 +120,8 @@ def _validate_sim_selection(data: dict[str, Any], source: str | Path) -> None:
     sim_platform = str(data.get("sim_platform", "") or "").strip()
     if not sim_platform:
         sim_platform = "sdk"
-    if sim_platform not in SIM_PLATFORMS:
-        raise ProfileError(f"runtime profile 'sim_platform' must be one of {list(SIM_PLATFORMS)}: {source}")
+    if not is_valid_sim_platform_name(sim_platform):
+        raise ProfileError(f"runtime profile 'sim_platform' must be an identifier matching ^[a-z][a-z0-9_]*$: {source}")
     if sim_platform not in sim_platforms:
         raise ProfileError(
             f"runtime profile sim_platform {sim_platform!r} is not in the supported platforms {sim_platforms}: {source}"
@@ -243,6 +212,15 @@ def validate_profile(data: dict[str, Any], source: str | Path = "<profile>") -> 
                     )
 
     _validate_sim_selection(data, source)
+
+    # sim-platform-registry D3: a declared embodiment override is checked at
+    # load time for its string form only ('module:attr', never ':attr',
+    # 'module:' or empty) — syntax, not registration, so a hardware-only
+    # host still loads a profile that declares one.
+    try:
+        validate_embodiment_reference(data, source)
+    except SimPlatformError as exc:
+        raise ProfileError(str(exc)) from exc
 
     ros2_control = data.get("ros2_control") or {}
     for key, default in (

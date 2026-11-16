@@ -47,11 +47,8 @@
       ]
     },
     "sim_platform": {
-      "enum": [
-        "sdk",
-        "gazebo",
-        "mujoco"
-      ]
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
     },
     "digest": {
       "type": "string",
@@ -330,6 +327,10 @@
           "enum": [
             "clutch_relative"
           ]
+        },
+        "max_pose_step_m": {
+          "type": "number",
+          "exclusiveMinimum": 0
         }
       },
       "allOf": [

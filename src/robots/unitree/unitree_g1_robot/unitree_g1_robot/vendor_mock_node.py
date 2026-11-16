@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -55,6 +57,11 @@ from unitree_g1_adapter.runtime import UnitreeSdk
 
 from unitree_g1_robot import projection
 from unitree_g1_robot.runtime_node import vendor_dds_binding
+from unitree_g1_robot.teardown import (
+    TEARDOWN_FAILURE_EXIT_CODE,
+    bounded_executor_teardown,
+    teardown_failure_message,
+)
 from unitree_g1_robot.vendor_gateway import (
     press_sensor_state,
     rpc_request_to_dict,
@@ -108,6 +115,21 @@ class UnitreeVendorMock(Node):
 
     def __init__(self, **node_kwargs: Any) -> None:
         super().__init__("unitree_vendor_mock", **node_kwargs)
+        try:
+            self._wire()
+        except BaseException:
+            # Same cleanup contract as the runtime node: close the SDK facade
+            # (its reader threads stop delivering into this node's handlers),
+            # destroy the half-built node, then surface the failure.
+            sdk = getattr(self, "_sdk", None)
+            if sdk is not None:
+                with contextlib.suppress(Exception):
+                    sdk.close()
+            with contextlib.suppress(Exception):
+                self.destroy_node()
+            raise
+
+    def _wire(self) -> None:
         self.declare_parameter("profile", str(_default_profile()))
         with open(Path(str(self.get_parameter("profile").value))) as handle:
             self._vendor: dict[str, Any] = yaml.safe_load(handle)["vendor"]
@@ -504,16 +526,37 @@ def main(argv=None) -> int:
         args=argv,
         signal_handler_options=rclpy.signals.SignalHandlerOptions.ALL,
     )
-    node = UnitreeVendorMock()
+    try:
+        node = UnitreeVendorMock()
+    except Exception as exc:  # noqa: BLE001 - startup must be one clean, bounded, nonzero exit
+        print(f"unitree_vendor_mock: startup failed: {exc}", file=sys.stderr, flush=True)
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 1
     executor = MultiThreadedExecutor()
     executor.add_node(node)
     try:
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
+    except Exception as exc:  # noqa: BLE001 - only the shutdown race reaches this arm
+        if rclpy.ok():
+            raise
+        # SIGTERM's rclpy.shutdown() races the executor's wait-set rebuild:
+        # the RCLError "the given context is not valid" is that race, not a
+        # fault — the context is already down, so take the ordinary teardown
+        # path instead of exiting through a traceback (observed on SIGTERM;
+        # runtime_node.main has the same guard).
+        print(f"unitree_vendor_mock: executor stopped after the shutdown signal: {exc}", file=sys.stderr, flush=True)
     finally:
-        node.close_vendor_tier()
-        node.destroy_node()
+        # Same bounded contract as the runtime: no failed step may be reported
+        # as cleanup. A callback that outlived the wait, a failed channel
+        # close, or a failed node destroy keeps the remaining resources open
+        # and fails the process with a diagnostic naming the step.
+        result = bounded_executor_teardown(executor, node, node.close_vendor_tier)
+        if not result.ok:
+            print(teardown_failure_message("unitree_vendor_mock", result), file=sys.stderr, flush=True)
+            os._exit(TEARDOWN_FAILURE_EXIT_CODE)
         if rclpy.ok():
             rclpy.shutdown()
     return 0

@@ -56,7 +56,7 @@ from std_srvs.srv import SetBool
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode, StopRuntime
 from robot_runtime.profile import load_profile
-from robot_runtime.testing.sim_ground_truth import (
+from robot_runtime_sim.testing.sim_ground_truth import (
     RUN_MARKER_ENV,
     open_ground_truth,
     terminate_marked_processes,
@@ -151,7 +151,7 @@ def _launch(environment: dict, log_path: Path, profile_path: Path):
         "runtime.launch.py",
         f"profile:={profile_path}",
         "sim_platform:=mujoco",
-        f"mujoco_scene:={SCENE}",
+        f"sim_world:={SCENE}",
     ]
     return subprocess.Popen(
         arguments,

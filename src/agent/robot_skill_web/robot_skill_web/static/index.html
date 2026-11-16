@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IB-Robot 技能控制台</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">LOCAL CONTROL</p>
+      <h1>IB-Robot 技能控制台</h1>
+    </div>
+    <div id="session-panel" class="session-panel">
+      <span class="chip">未建立会话 · 刷新页面建立会话</span>
+    </div>
+  </header>
+
+  <div id="notification" class="notice" role="status" aria-live="polite" hidden></div>
+
+  <main id="app" class="app">
+    <p class="lede">正在建立本机会话…</p>
+  </main>
+
+  <template id="workbench-template">
+    <section id="connection" class="panel connection">
+      <div class="connection-header">
+        <h2 id="connection-title">等待会话</h2>
+        <span id="connection-summary" class="connection-summary" hidden></span>
+      </div>
+      <p class="meta">目标由启动时的部署配置绑定，页面不发现、不切换机器人。仅用于本机界面与受信任的 ROS 网络。</p>
+    </section>
+
+    <section class="panel workbench">
+      <div class="panel-title">
+        <h2>技能工作台</h2>
+        <span id="target-chip" class="chip"></span><span id="motion-chip" class="chip"></span>
+        <div class="sidebar-controls" aria-label="执行侧栏控制">
+          <span id="execution-summary" class="chip" role="status" aria-live="polite" hidden>执行：未执行</span>
+          <button id="cancel-collapsed" type="button" class="danger" title="请求取消当前任务，不是硬件急停" disabled hidden>请求取消</button>
+          <button id="toggle-sidebar" type="button" class="ghost" aria-expanded="true" aria-controls="execution-sidebar">收起侧栏</button>
+        </div>
+      </div>
+      <div id="work-layout" class="work-layout">
+        <div class="skills-column">
+          <label for="skill-search">搜索技能</label>
+          <input id="skill-search" type="search" autocomplete="off" placeholder="名称、中文名或厂商动作 ID（如 99）">
+          <div id="skill-list" role="listbox" aria-label="可规划技能" tabindex="0"></div>
+        </div>
+        <div class="editor-column">
+          <section id="skill-detail" class="detail"></section>
+          <form id="parameters-form"></form>
+          <div class="preview-controls">
+            <label for="raw-command">执行说明（自动填写，可修改）</label>
+            <input id="raw-command" autocomplete="off" maxlength="4000" aria-describedby="raw-command-help" placeholder="选择技能后自动填写" required>
+            <p id="raw-command-help" class="meta">记录本次请求的目的，不是动作参数，也不代表运动授权。清空后准备计划时会使用默认说明。</p>
+            <p id="plan-status" class="meta" role="status" aria-live="polite">选择技能后自动准备计划，不会执行动作。</p>
+            <button id="retry-preview" type="button" class="ghost" hidden>重新准备计划</button>
+            <button id="execute" type="button" disabled>执行技能</button>
+          </div>
+        </div>
+
+        <aside id="execution-sidebar" class="panel execution-sidebar" aria-label="执行与观察">
+          <div class="execution-current">
+            <div class="panel-title">
+              <h2>执行与观察</h2>
+              <span id="execution-state" class="chip">未执行</span>
+            </div>
+            <button id="cancel" type="button" class="danger" disabled>请求取消</button>
+            <div id="execution-result" class="result"></div>
+          </div>
+
+          <section class="history" aria-labelledby="history-heading">
+            <div class="history-header">
+              <h3 id="history-heading">历史命令</h3>
+              <button id="refresh-history" type="button" class="ghost">刷新</button>
+            </div>
+            <p id="history-status" class="meta" role="status">暂无历史命令</p>
+            <div id="history-list" class="history-list" aria-label="历史命令"></div>
+            <section id="history-detail" class="history-detail" hidden></section>
+          </section>
+        </aside>
+      </div>
+    </section>
+  </template>
+
+  <footer>
+    <p>启动时绑定部署配置 → 建立本机会话 → 准备并确认计划。会话有效期为 8 小时；过期后刷新页面即可，目标不会改变。会话不会取消或重发已提交任务。取消按钮不是硬件急停。</p>
+    <p id="verification-note">技能就绪状态来自在线技能目录，只表示 Gateway 当前报告该能力就绪，不代表已完成真机验收。真机验证记录见操作归档。</p>
+  </footer>
+  <script src="/app.js"></script>
+</body>
+</html>

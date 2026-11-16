@@ -1,0 +1,40 @@
+schema_version: 1
+name: high_five
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Give a high five with the G1 preset; no automatic recovery.
+  category: social_interaction
+  when_to_use:
+  - celebrate or greet with a high five
+  aliases_zh:
+  - 击掌
+  - 举手击掌
+  aliases_en:
+  - high five
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Run the G1 high-five preset (action 18); no automatic recovery.
+  display_name: 击掌
+  tags:
+  - preset
+  - unitree_action_id_18
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  g1_preset_v1: implementations/g1_preset_v1.yaml

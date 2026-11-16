@@ -417,6 +417,58 @@ def test_phone_public_backend_pose_loss_and_explicit_rearm():
     assert device.servo_client.is_enabled
 
 
+def _with_session_endpoints(item):
+    interfaces = item["runtime"]["interface_description"]["interfaces"]
+    base = dict(interfaces["motion.arm.start"])
+    interfaces["motion.arm.session_start"] = {
+        **base,
+        "message_type": "ibrobot_msgs/srv/StartArmSession",
+        "endpoint": "/motion/arm/session_start",
+    }
+    lease = dict(interfaces["motion.arm.lease"])
+    interfaces["motion.arm.session_lease"] = {
+        **lease,
+        "message_type": "ibrobot_msgs/msg/SessionLease",
+        "endpoint": "/motion/arm/session_lease",
+    }
+    target = item["teleoperation"]["target"]["interfaces"]
+    target["session_start"] = "motion.arm.session_start"
+    target["session_lease"] = "motion.arm.session_lease"
+    return item
+
+
+def test_session_endpoints_are_optional_and_validated_when_named():
+    assert "session_start" not in resolve_public_target(config())["interfaces"]
+    target = resolve_public_target(_with_session_endpoints(config()))
+    assert target["interfaces"]["session_start"]["endpoint"] == "/motion/arm/session_start"
+    assert target["interfaces"]["session_lease"]["endpoint"] == "/motion/arm/session_lease"
+    item = _with_session_endpoints(config())
+    item["runtime"]["interface_description"]["interfaces"]["motion.arm.session_start"]["message_type"] = (
+        "std_srvs/srv/Trigger"
+    )
+    with pytest.raises(ValueError, match="session_start"):
+        resolve_public_target(item)
+
+
+def test_vr_session_lease_is_stamped_for_the_session_fence():
+    from robot_teleop.vr_teleop import VRTeleopNode
+
+    published = []
+    stamp = object()
+
+    class Lease:
+        def __init__(self):
+            self.header = SimpleNamespace(stamp=None)
+
+    node = SimpleNamespace(
+        _lease_type=Lease,
+        _managed_lease_pub=SimpleNamespace(publish=published.append),
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: stamp)),
+    )
+    VRTeleopNode._publish_lease(node)
+    assert published[0].header.stamp is stamp
+
+
 @pytest.mark.parametrize("mode", ["pose", "velocity"])
 def test_vr_managed_modes_release_and_rearm_are_explicit(mode):
     import numpy as np
@@ -448,6 +500,7 @@ def test_vr_managed_modes_release_and_rearm_are_explicit(mode):
         node._so101_started = True
         events.append("start")
 
+    node._publish_lease = lambda: node._managed_lease_pub.publish(None)
     node._stop_so101_servo = stop
     node._recalibrate_so101_baseline = start
     node._control_so101_pose = lambda _ctrl: events.append("pose")
@@ -664,6 +717,22 @@ def test_real_launch_builder_has_no_generic_solver_or_follower_files(monkeypatch
         assert params["so101_gripper_topic"] == "/motion/arm/joints"
         assert params["so101_gripper_closed"] == -0.6
         assert params["so101_gripper_open"] == 1.6
+
+
+@pytest.mark.parametrize("name", ["so101_leader", "xbox_controller", "phone_teleop", "vr_teleop"])
+def test_every_managed_device_binds_the_session_endpoints_the_target_names(monkeypatch, name):
+    from robot_teleop.launch_builders import teleop
+
+    nodes = []
+    monkeypatch.setattr(teleop, "Node", lambda **kwargs: nodes.append(kwargs) or kwargs)
+    teleop.generate_teleop_nodes(_with_session_endpoints(_provider_launch_config(name)))
+    params = next(node["parameters"][0] for node in nodes if node["package"] == "robot_teleop")
+    if name == "vr_teleop":
+        bound = (params["session_start_service"], params["session_lease_topic"])
+    else:
+        backend = json.loads(params["device_config"])["cartesian_backend_config"]
+        bound = (backend["session_start_srv"], backend["session_lease_topic"])
+    assert bound == ("/motion/arm/session_start", "/motion/arm/session_lease")
 
 
 def test_real_runtime_projection_composes_executor_and_all_inputs(monkeypatch):

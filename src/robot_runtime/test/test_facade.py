@@ -17,6 +17,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import GetRuntimeStatus, SetRuntimeMode, StopRuntime
 from robot_runtime import contract as C
 
@@ -37,6 +38,12 @@ class FakeControllerManager(Node):
         self.switch_entered = threading.Event()
         self.switch_release = threading.Event()
         self.switch_release.set()
+        # Readiness-blocking hook: the facade's readiness check calls
+        # list_controllers; holding it models a slow controller manager
+        # under load (the Gazebo blocked-close starvation, e2e/gazebo-154437).
+        self.list_entered = threading.Event()
+        self.list_release = threading.Event()
+        self.list_release.set()
         self.ignore_deactivation = False
         self.create_service(SwitchController, "controller_manager/switch_controller", self._switch, callback_group=cb)
         self.create_service(ListControllers, "controller_manager/list_controllers", self._list, callback_group=cb)
@@ -63,6 +70,10 @@ class FakeControllerManager(Node):
         return response
 
     def _list(self, _request, response):
+        self.list_entered.set()
+        if not self.list_release.wait(5.0):
+            response.ok = False
+            return response
         for name in ("arm_position_controller", "arm_trajectory_controller", *self._extra_controllers):
             state = ControllerState()
             state.name = name
@@ -358,36 +369,69 @@ def test_stop_fences_in_flight_mode_switch(stack, policy):
     assert caller.set_mode("idle").success
 
 
-def test_facade_selection_resolution_follows_parameters():
+def test_heartbeat_keeps_its_period_while_a_readiness_check_blocks(stack):
+    """The runtime-status heartbeat owns its callback group: a readiness
+    check blocked on a slow controller manager (the Gazebo blocked-close
+    starvation, e2e/gazebo-154437) must not delay the heartbeat past the
+    Gateway's freshness budget (skill_executor_node admission, 3.0 s wall)."""
+    cm, _caller = stack
+    receipts: list[float] = []
+    monitor = Node("facade_heartbeat_monitor")
+    monitor.create_subscription(RuntimeStatus, C.STATUS_TOPIC, lambda _msg: receipts.append(time.monotonic()), 10)
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(monitor)
+    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread.start()
+    try:
+        time.sleep(2.5)
+        assert len(receipts) >= 2, receipts
+
+        before = len(receipts)
+        cm.list_release.clear()
+        assert cm.list_entered.wait(timeout=2.0), "the readiness check never called list_controllers"
+        time.sleep(4.0)
+        cm.list_release.set()
+
+        assert len(receipts) - before >= 3, receipts[before:]
+        gaps = [later - earlier for earlier, later in zip(receipts, receipts[1:], strict=False)]
+        assert max(gaps) < 3.0, gaps
+    finally:
+        executor.shutdown(timeout_sec=1.0)
+        monitor.destroy_node()
+
+
+def test_facade_selection_resolution_follows_parameters(monkeypatch):
+    import robot_runtime.sim_platforms as sim_platforms
     from robot_runtime.facade_node import resolve_facade_selection
+    from robot_runtime.sim_platforms import SimPlatform, SimSensorTraits
+
+    # a fake registered platform: the success branches below must not depend
+    # on any real simulator plugin being installed (sim-platform-registry D6)
+    fake = SimPlatform(
+        name="gazebo",
+        package="test",
+        embodiment="robot_runtime.sim_platforms:SDK_PLATFORM",  # never resolved here
+        world=None,
+        scene_task=None,
+        sensor_traits=SimSensorTraits(),
+    )
+    platforms = {fake.name: fake}
+    monkeypatch.setattr(sim_platforms, "discover_sim_platforms", lambda *, entry_points=None: platforms)
 
     profile = {"runtime": {"name": "t", "version": "0"}, "use_sim": False, "sim_platforms": ["sdk", "gazebo"]}
     assert resolve_facade_selection(profile, False, "") == (False, None)
     assert resolve_facade_selection(profile, True, "") == (True, "sdk")
     # an explicit platform wins over the profile default
     assert resolve_facade_selection(profile, True, "gazebo") == (True, "gazebo")
-    with pytest.raises(ValueError, match="unknown sim_platform"):
+    # D2: the effective selection must be registered — 'teleport' is a valid
+    # identifier the registry never heard of, so it fails naming the platform
+    with pytest.raises(ValueError, match="is not installed"):
         resolve_facade_selection(profile, True, "teleport")
+    with pytest.raises(ValueError, match="expected an identifier matching"):
+        resolve_facade_selection(profile, True, "teleport-fast!")
     # physical execution cannot carry a platform
     with pytest.raises(ValueError, match="physical execution cannot select"):
         resolve_facade_selection(profile, False, "sdk")
     # a platform the profile does not declare fails naming the set
     with pytest.raises(ValueError, match="not supported by this runtime profile"):
         resolve_facade_selection({"runtime": {"name": "t"}, "use_sim": True, "sim_platforms": ["sdk"]}, True, "gazebo")
-
-
-def test_facade_identity_check_covers_sim_platform():
-    from robot_runtime.facade_node import check_description_identity
-    from robot_runtime.interface_description import build_description, description_digest
-
-    description = build_description(PROFILE, use_sim=True, sim_platform="sdk")
-    check_description_identity(PROFILE, description, True, "sdk")
-    gazebo = build_description(PROFILE, use_sim=True, sim_platform="gazebo")
-    check_description_identity(PROFILE, gazebo, True, "gazebo")
-    with pytest.raises(ValueError, match="does not match"):
-        check_description_identity(PROFILE, gazebo, True, "sdk")
-    # pre-platform snapshots default from execution and still match the sdk facade
-    legacy = build_description(PROFILE, use_sim=True, sim_platform="sdk")
-    del legacy["sim_platform"]
-    legacy["digest"] = description_digest(legacy)
-    check_description_identity(PROFILE, legacy, True, "sdk")

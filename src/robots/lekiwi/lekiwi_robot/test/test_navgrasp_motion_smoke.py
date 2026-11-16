@@ -45,13 +45,18 @@ from sensor_msgs.msg import CameraInfo, Image, JointState
 
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import ComputeFk, MoveToConfiguration, SetRuntimeMode
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
-from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime.profile import load_profile
+from robot_runtime.sim_platforms import get_sim_platform
+from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
 
 PACKAGE = "lekiwi_robot"
 MODEL_NAME = "lekiwi_robot"
 WORLD_NAME = "empty"
 PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_nav_grasp.yaml"
+#: The fixed first-party physics matrix the smoke test is parametrized over
+#: (openspec sim-platform-registry D2); the capability probe reports an
+#: unregistered platform so the shared require-or-skip rule decides.
+PHYSICS_PLATFORMS = ("gazebo", "mujoco")
 ARM_JOINTS = ["1", "2", "3", "4", "5"]
 #: The stowed pose = hardware.reset_positions (joints 1-5; D4).
 STOWED_TARGET = [0.0, -1.5854, 1.5708, 0.7854, 0.0]
@@ -92,15 +97,19 @@ def _smoke_skip_or_fail(sim_platform: str, reason: str) -> None:
 
 
 def _platform_capabilities_missing(sim_platform: str) -> list[str]:
-    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+    from robot_runtime_sim.testing.sim_ground_truth import UnsupportedGroundTruth
 
     missing = []
     try:
-        from robot_runtime.testing.sim_ground_truth import open_ground_truth
+        from robot_runtime_sim.testing.sim_ground_truth import open_ground_truth
 
         open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
     except UnsupportedGroundTruth as error:
         missing.append(f"ground truth: {error}")
+    try:
+        get_sim_platform(sim_platform)
+    except Exception as error:  # noqa: BLE001  (SimPlatformError: the platform is not installed)
+        missing.append(f"sim platform: {error}")
     supported = [str(entry) for entry in load_profile(PROFILE).get("sim_platforms") or []]
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
@@ -227,7 +236,7 @@ def _launch(sim_platform: str, environment: dict, log_path: Path):
         f"sim_platform:={sim_platform}",
     ]
     if sim_platform == "mujoco":
-        arguments.append(f"mujoco_scene:={WORLD_NAME}")
+        arguments.append(f"sim_world:={WORLD_NAME}")
     return subprocess.Popen(
         arguments, stdout=log_path.open("w"), stderr=subprocess.STDOUT, env=environment, start_new_session=True
     )
@@ -246,7 +255,7 @@ def _terminate(launch) -> None:
             launch.wait(timeout=10)
 
 
-@pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
+@pytest.mark.parametrize("sim_platform", PHYSICS_PLATFORMS)
 def test_navgrasp_motion_smoke_and_wrist_camera(tmp_path, sim_platform):
     missing = _platform_capabilities_missing(sim_platform)
     if missing:
@@ -257,7 +266,7 @@ def test_navgrasp_motion_smoke_and_wrist_camera(tmp_path, sim_platform):
             sim_platform,
             f"nav_grasp motion smoke: platform {sim_platform!r} cannot run: {environment_missing_reason}",
         )
-    from robot_runtime.testing.sim_ground_truth import RUN_MARKER_ENV, terminate_marked_processes
+    from robot_runtime_sim.testing.sim_ground_truth import RUN_MARKER_ENV, terminate_marked_processes
 
     partition = f"navgrasp_smoke_{uuid.uuid4().hex[:8]}"
     environment = dict(os.environ)

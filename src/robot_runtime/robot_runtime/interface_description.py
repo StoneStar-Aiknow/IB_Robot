@@ -22,8 +22,15 @@ import yaml
 from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
-from robot_runtime.gazebo import advertised_camera_frames
-from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS, lidar_driver_simulated
+from robot_runtime.sensor_frames import advertised_camera_frames
+from robot_runtime.sim_platforms import (
+    PERIPHERAL_SIMULATION_RESERVED_KEYS,
+    SimSensorTraits,
+    get_sim_platform,
+    is_physics_selection,
+    is_valid_sim_platform_name,
+    resolve_sim_embodiment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +39,41 @@ class InterfaceDescriptionError(ValueError):
     """A public description violates its schema or semantic contract."""
 
 
+def effective_sensor_traits(
+    profile: dict, profile_path, use_sim: bool, sim_platform: str | None
+) -> SimSensorTraits | None:
+    """The effective sensor traits of the selection (sim-platform-registry D4).
+
+    ``None`` for hardware and ``sdk`` (no registry access — the default
+    surface applies). For a physics selection the embodiment's override when
+    it declares one, else the registered platform's traits. Accesses the
+    registry (and may fail on an unregistered platform) exactly once here,
+    so no per-sensor projection branch needs the platform name.
+    """
+    if not is_physics_selection(use_sim, sim_platform):
+        return None
+    platform = get_sim_platform(str(sim_platform))
+    embodiment = resolve_sim_embodiment(profile, profile_path, platform)
+    override = getattr(embodiment, "sensor_traits", None)
+    return override if override is not None else platform.sensor_traits
+
+
 def description_sim_platform(description: dict) -> str | None:
     """Effective simulation platform of a description, without mutating the document.
 
     The ``sim_platform`` field is optional (schema_version stays 1), so
     snapshots exported before it existed remain valid with their original
     digest: they are read as ``sdk`` when execution is simulated and as no
-    platform when physical. An explicitly present but unknown value fails
-    closed instead of silently defaulting.
+    platform when physical. An explicitly present value is checked against
+    the identifier rule only (sim-platform-registry D2: reading an exported
+    description never needs the plugin) and fails closed instead of silently
+    defaulting.
     """
     sim_platform = description.get("sim_platform")
     if sim_platform is None:
         return "sdk" if description.get("execution") == "simulated" else None
     sim_platform = str(sim_platform)
-    if sim_platform not in SIM_PLATFORMS:
+    if not is_valid_sim_platform_name(sim_platform):
         raise InterfaceDescriptionError(f"interface description sim_platform: unknown value {sim_platform!r}")
     return sim_platform
 
@@ -242,7 +270,7 @@ def _validate_platform_exclusion_flag(entry: dict, key: tuple) -> None:
             "pass a mapping (an exclusion is lifted only by simulation.<platform>.enabled: true)"
         )
     for platform, section in simulation.items():
-        if platform not in PHYSICS_SIM_PLATFORMS:
+        if platform in PERIPHERAL_SIMULATION_RESERVED_KEYS:
             continue
         if not isinstance(section, dict):
             raise InterfaceDescriptionError(
@@ -367,9 +395,10 @@ def _inherit_platform_exclusion_flags(entry: dict, base: dict) -> None:
     if not isinstance(base_simulation, dict):
         return
     inherited: dict[str, dict] = {}
-    for platform in PHYSICS_SIM_PLATFORMS:
-        base_section = base_simulation.get(platform)
-        if not isinstance(base_section, dict) or "enabled" not in base_section:
+    for platform, base_section in base_simulation.items():
+        if platform in PERIPHERAL_SIMULATION_RESERVED_KEYS or not isinstance(base_section, dict):
+            continue
+        if "enabled" not in base_section:
             continue
         override_section = override_simulation.get(platform) if isinstance(override_simulation, dict) else None
         if isinstance(override_section, dict) and "enabled" in override_section:
@@ -387,11 +416,11 @@ def platform_peripherals(peripherals: list | None, sim_platform: str | None) -> 
     A peripheral excluded with ``simulation.<platform>.enabled: false`` is
     neither launched, simulated nor advertised on that platform: every
     physics-platform consumer resolves its inventory through this helper. On
-    hardware and the SDK execution (``sim_platform`` empty or not a physics
-    platform) the key is ignored and the inventory passes through unchanged.
-    One info line is logged per excluded peripheral.
+    hardware and the SDK execution (``sim_platform`` empty or ``sdk``, not
+    is_physics_selection) the key is ignored and the inventory passes
+    through unchanged. One info line is logged per excluded peripheral.
     """
-    if sim_platform not in PHYSICS_SIM_PLATFORMS:
+    if not is_physics_selection(True, sim_platform):
         return list(peripherals or [])
     kept: list[dict] = []
     for entry in peripherals or []:
@@ -452,22 +481,35 @@ def peripheral_interfaces(
     camera_rate_hz: float | None = None,
     imu_rate_hz: float | None = None,
     scan_source_runs: bool = True,
+    traits: SimSensorTraits | None = None,
+    profile: dict | None = None,
 ) -> dict[str, dict]:
     """Project the peripheral surface.
 
-    ``sim_platform`` adjusts streams the platform cannot produce (the gz
-    camera gaps, the lidar wire type) and drops lidars the platform does not
-    stand in for (D5), as well as peripherals excluded on that platform with
-    ``simulation.<platform>.enabled: false`` (D3: neither advertised nor
-    claimed). ``camera_rate_hz``/``imu_rate_hz`` carry the rates the
-    simulators actually produce when they differ from the device defaults.
-    ``scan_source_runs`` says whether the derived scan's source (FAST-LIO's
-    registered body cloud) runs on the selected platform; a physics platform
-    without it advertises no scan (D5).
+    ``traits`` are the selection's effective sensor traits
+    (:func:`effective_sensor_traits`; ``None`` on hardware and ``sdk``) and
+    drive every platform-specific rewrite of the surface — streams the
+    platform cannot produce, forced encodings, dimensions, rates, QoS and
+    the lidar drivers the platform stands in for (D4). The traits' rate
+    callables receive the effective profile — ``profile`` with
+    ``peripherals`` replaced by this projection's merged, platform-filtered
+    inventory — and a callable returning ``None`` applies no override; the
+    explicit ``camera_rate_hz``/``imu_rate_hz`` overrides keep their
+    meaning. ``scan_source_runs`` says whether the derived scan's source
+    (FAST-LIO's registered body cloud) runs on the selected platform (D5).
+    ``sim_platform`` only selects the exclusion filter
+    (``simulation.<platform>.enabled: false``, D3: an excluded peripheral
+    is neither advertised nor claimed).
     """
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
     merged = platform_peripherals(merge_peripherals(peripherals, []), sim_platform)
+    # The rate callables resolve from the effective inventory (D4): the
+    # merged peripherals this projection iterates, platform-excluded entries
+    # removed — the same list every platform consumer resolves, so a callable
+    # reading the camera fps (e.g. the MuJoCo minimum) cannot disagree with
+    # the plugin the platform runs (review round 1).
+    effective_profile = {**(profile or {}), "peripherals": merged}
     for periph in merged:
         name, kind = periph["name"], periph["type"]
         if kind in ("microphone", "speaker"):
@@ -517,16 +559,10 @@ def peripheral_interfaces(
             if driver not in ("opencv", "camera_ros", "realsense"):
                 raise InterfaceDescriptionError(f"camera {name}: unsupported driver {driver!r}")
             streams = camera_streams(periph)
-            if sim_platform == "gazebo":
-                # Streams the gz simulator cannot produce are not advertised on
-                # this platform (runtime-simulation-platform D6): the
-                # rgbd_camera publishes no depth camera_info (its depth image
-                # shares the color intrinsics) and no color-aligned pointcloud.
-                streams = [stream for stream in streams if stream != "pointcloud"]
-            if sim_platform == "mujoco":
-                # The MuJoCo plugin produces no color-aligned pointcloud
-                # (so101-mujoco-runtime-platform D5); depth it does produce
-                # (32FC1, spike T0).
+            if traits is not None and traits.drop_pointcloud:
+                # Streams the simulator cannot produce are not advertised on
+                # this platform (runtime-simulation-platform D6 / the MuJoCo
+                # plugin alike: no color-aligned pointcloud).
                 streams = [stream for stream in streams if stream != "pointcloud"]
             prefix = f"/camera/{name}"
             capability = "perception.camera"
@@ -552,21 +588,18 @@ def peripheral_interfaces(
                     if is_color or aligned
                     else periph.get("depth_height", periph.get("height", 480))
                 )
-                if sim_platform == "mujoco" and not (is_color or aligned):
-                    # the plugin renders one MJCF camera (width x height) for
-                    # every stream (D5): the depth stream dims are the rendered
-                    # camera's dims, never the physical device's
-                    # depth_width/depth_height
+                if traits is not None and not is_color and traits.depth_dims_follow_color:
+                    # the platform renders one camera at the colour
+                    # dimensions for every stream (D8): the depth streams
+                    # advertise what the simulator actually renders, never
+                    # the physical device's depth_* overrides
                     width = periph.get("width", 640)
                     height = periph.get("height", 480)
-                if sim_platform == "gazebo" and not is_color:
-                    # the gz rgbd sensor renders one camera at the colour
-                    # dimensions and rate (D8): the depth/aligned-depth
-                    # streams advertise what the sensor actually renders,
-                    # never the physical device's depth_* overrides (the
-                    # MuJoCo branch above applies the same principle)
-                    width = periph.get("width", 640)
-                    height = periph.get("height", 480)
+                if traits is not None and not is_color and traits.depth_fps_follow_color:
+                    # the platform renders one rate (the colour rate) for
+                    # every non-colour stream, the aligned depth included
+                    # (HEAD's gazebo branch): the depth streams advertise the
+                    # rendered rate, never the device's depth_fps
                     fps = periph.get("fps", 30)
                 else:
                     fps = periph.get("fps", 30) if is_color else periph.get("depth_fps", periph.get("fps", 30))
@@ -586,31 +619,35 @@ def peripheral_interfaces(
                 }.get(wire_format)
                 if wire_format in ("rgb8", "bgr8", "mono8", "16UC1", "32FC1"):
                     encoding = wire_format
-                if sim_platform == "gazebo" and not is_color:
-                    # gz rgbd depth is float32 and ros_gz_bridge maps
-                    # R_FLOAT32 to 32FC1; advertising the physical device's
-                    # encoding (RealSense Z16 -> 16UC1) would mismatch every
-                    # observed depth message in the interface monitor
-                    # (PR !515 P2). The contract on this platform is what the
-                    # simulator actually publishes.
-                    encoding = "32FC1"
-                if sim_platform == "mujoco":
-                    # the plugin always publishes rgb8 color and 32FC1 metre
-                    # depth (spike T0); the contract on this platform is what
-                    # the simulator actually publishes (D5)
-                    encoding = "rgb8" if is_color else "32FC1"
-                if sim_platform == "mujoco" and camera_rate_hz is not None:
-                    # the plugin has one rate for all cameras (D5): every
-                    # stream advertises the effective rate
+                if traits is not None:
+                    # the platform always publishes these encodings; the
+                    # contract on the platform is what the simulator actually
+                    # publishes (gz rgbd depth is float32; the MuJoCo plugin
+                    # publishes rgb8 colour and 32FC1 metre depth, spike T0).
+                    # The depth rule covers every non-colour depth stream,
+                    # the aligned depth included (HEAD's not-is_color branches).
+                    forced = traits.forced_encodings.get(stream)
+                    if forced is None and not is_color:
+                        forced = traits.forced_encodings.get("depth")
+                    if forced is not None:
+                        encoding = forced
+                if traits is not None and traits.camera_rate is not None:
+                    # the platform has one rate for all cameras (D5): every
+                    # stream advertises the effective rate; a callable that
+                    # returns None applies no override (the per-stream fps)
+                    resolved_rate = traits.resolve_camera_rate(effective_profile)
+                    if resolved_rate is not None:
+                        fps = float(resolved_rate)
+                if camera_rate_hz is not None:
                     fps = float(camera_rate_hz)
                 suffix = "" if is_color else ("/aligned_depth_to_color" if aligned else "/depth")
                 endpoint = f"{prefix}{suffix}/{'image_raw' if is_color or aligned else 'image_rect_raw'}"
                 info_topic = f"{prefix}{suffix}/camera_info"
-                if sim_platform == "gazebo" and not is_color:
-                    # gz rgbd_camera has no depth camera_info topic; the depth
-                    # image shares the color intrinsics, so the color info
-                    # interface carries them (D6: unproducible streams are not
-                    # advertised).
+                if traits is not None and not is_color and traits.shared_depth_camera_info:
+                    # the platform's rgbd sensor publishes no depth camera_info
+                    # topic; the depth image shares the colour intrinsics, so
+                    # the colour info interface carries them (D6:
+                    # unproducible streams are not advertised).
                     info_topic = f"{prefix}/camera_info"
                 stream_frame, stream_info_frame = image_frame, info_frame
                 if driver == "realsense":
@@ -645,21 +682,21 @@ def peripheral_interfaces(
                     configured_profile=configured,
                     supported_profiles=supported,
                 )
-                if sim_platform == "mujoco":
-                    # the plugin's camera publishers are reliable (depth 1):
+                if traits is not None and traits.camera_qos_reliable:
+                    # the platform's camera publishers are reliable (depth 1):
                     # large images lose fragments without repair under
-                    # best-effort, so the contract on this platform offers
+                    # best-effort, so the contract on the platform offers
                     # reliable delivery (what the simulator actually publishes)
                     interfaces[key]["qos"]["reliability"] = "reliable"
-                if sim_platform == "gazebo" and not is_color:
-                    # the shared color info interface above already carries the
+                if traits is not None and not is_color and traits.shared_depth_camera_info:
+                    # the shared colour info interface above already carries the
                     # depth intrinsics; a dedicated depth info topic has no
                     # producer on this platform
                     continue
                 interfaces[f"{key}_info"] = _topic(
                     info_topic, "sensor_msgs/msg/CameraInfo", capability, frame_id=stream_info_frame, rate_hz=fps
                 )
-                if sim_platform == "mujoco":
+                if traits is not None and traits.camera_qos_reliable:
                     interfaces[f"{key}_info"]["qos"]["reliability"] = "reliable"
             if "pointcloud" in streams:
                 interfaces[f"camera.{name}.points"] = _topic(
@@ -671,13 +708,20 @@ def peripheral_interfaces(
                 )
         elif kind == "lidar":
             driver = periph.get("driver")
-            simulated_lidar = sim_platform in LIDAR_SIM_PLATFORMS and lidar_driver_simulated(str(driver), sim_platform)
-            # A physics platform that simulates lidar but not THIS driver
-            # neither simulates nor advertises it (D5): same rule as an
-            # unsupported driver, so the declared surface never claims a
-            # stream nothing produces (MuJoCo: MID-360 only).
-            if sim_platform in LIDAR_SIM_PLATFORMS and not simulated_lidar:
+            # A platform that simulates lidar but not THIS driver neither
+            # simulates nor advertises it (D5): same rule as an unsupported
+            # driver, so the declared surface never claims a stream nothing
+            # produces (default traits advertise every declared lidar as
+            # declared; MuJoCo: MID-360 only).
+            if (
+                traits is not None
+                and traits.lidar_sim_drivers is not None
+                and str(driver) not in traits.lidar_sim_drivers
+            ):
                 continue
+            simulated_lidar = (
+                traits is not None and traits.lidar_sim_drivers is not None and str(driver) in traits.lidar_sim_drivers
+            )
             if driver == "livox_mid360":
                 if periph.get("multi_topic", 0):
                     raise InterfaceDescriptionError(f"lidar {name}: multi_topic endpoints require an explicit adapter")
@@ -690,14 +734,14 @@ def peripheral_interfaces(
                 cloud_type = "sensor_msgs/msg/PointCloud2" if simulated_lidar else types[transfer]
                 # The advertised rate is the rate the platform runs: the
                 # composed MJCF honours simulation.mujoco.update_rate over
-                # publish_freq (robot_runtime.mujoco), so the description
+                # publish_freq (robot_runtime_sim.mujoco), so the description
                 # must resolve the same precedence — never claim a rate the
                 # simulation does not produce (review round 1).
                 points_rate_hz = periph.get("publish_freq", 10.0)
-                if sim_platform == "mujoco":
-                    mujoco_section = (periph.get("simulation") or {}).get("mujoco") or {}
-                    if isinstance(mujoco_section, dict) and mujoco_section.get("update_rate") is not None:
-                        points_rate_hz = mujoco_section["update_rate"]
+                if traits is not None and traits.lidar_points_rate is not None:
+                    override = traits.resolve_lidar_points_rate(periph)
+                    if override is not None:
+                        points_rate_hz = override
                 interfaces[f"lidar.{name}.points"] = _topic(
                     periph.get("pointcloud_topic", "/livox/lidar"),
                     cloud_type,
@@ -709,12 +753,24 @@ def peripheral_interfaces(
                 # The integrated IMU's advertised rate is the rate it actually
                 # produces: on MuJoCo the imu_sensor_broadcaster publishes on
                 # the controller-manager clock (D5.3, no second hard-coded 100).
+                # Default traits and platforms without an IMU-rate override
+                # advertise no rate, exactly as before.
+                effective_imu_rate = imu_rate_hz
+                if (
+                    effective_imu_rate is None
+                    and traits is not None
+                    and traits.imu_rate is not None
+                    and str(driver) in traits.integrated_imu_drivers
+                ):
+                    # None from the callable means no override (no rate
+                    # advertised), never float(None)
+                    effective_imu_rate = traits.resolve_imu_rate(effective_profile, merged)
                 interfaces[f"lidar.{name}.imu"] = _topic(
                     periph.get("imu_topic", "/livox/imu"),
                     "sensor_msgs/msg/Imu",
                     "perception.lidar",
                     frame_id=periph.get("frame_id", "livox_frame"),
-                    **({"rate_hz": imu_rate_hz} if imu_rate_hz is not None else {}),
+                    **({"rate_hz": effective_imu_rate} if effective_imu_rate is not None else {}),
                 )
                 interfaces[f"lidar.{name}.points"]["qos"]["reliability"] = "reliable"
                 interfaces[f"lidar.{name}.imu"]["qos"]["reliability"] = "reliable"
@@ -799,6 +855,9 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
         base_frame, tool_frame = frames["base_link"], frames["ee_link"]
     except KeyError as exc:
         raise InterfaceDescriptionError("teleoperation requires model base_link and ee_link frames") from exc
+    step = teleop.get("max_pose_step_m")
+    if step is not None and (type(step) not in (int, float) or not math.isfinite(step) or step <= 0):
+        raise InterfaceDescriptionError("teleoperation.max_pose_step_m must be a finite positive number")
     shared = {
         "target_group": target,
         "joint_names": list(groups[target]),
@@ -814,6 +873,7 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
             "subscribe",
             units={"position": "m", "orientation": "quaternion"},
             pose_reference="clutch_relative",
+            **({} if step is None else {"max_pose_step_m": float(step)}),
             **shared,
         ),
         "motion.arm.linear": _topic(
@@ -845,6 +905,20 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
             command_stale_s=float(stale),
         ),
         "motion.arm.lease": _topic(f"{prefix}/lease", "std_msgs/msg/Empty", "runtime.stop", "subscribe", **shared),
+        "motion.arm.session_lease": _topic(
+            f"{prefix}/session_lease", "ibrobot_msgs/msg/SessionLease", "runtime.stop", "subscribe", **shared
+        ),
+        "motion.arm.reference": _topic(
+            f"{prefix}/reference", "ibrobot_msgs/msg/ArmCommandReference", "runtime.stop", "publish", **shared
+        ),
+        "motion.arm.session_start": {
+            "capability": "runtime.stop",
+            "kind": "service",
+            "direction": "serve",
+            "endpoint": f"{prefix}/session_start",
+            "message_type": "ibrobot_msgs/srv/StartArmSession",
+            **shared,
+        },
         "motion.arm.start": {
             "capability": "runtime.stop",
             "kind": "service",
@@ -872,63 +946,6 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
     }
 
 
-def _mujoco_camera_rate(profile: dict) -> float:
-    """The effective MuJoCo camera rate for the description (lazy import: the
-    rate algorithm lives next to the MuJoCo camera generation, D5)."""
-    from robot_runtime.mujoco import mujoco_camera_publish_rate  # noqa: PLC0415
-
-    return mujoco_camera_publish_rate(profile)
-
-
-def _mujoco_imu_rate(profile: dict, peripherals: list | None) -> float | None:
-    """The rate the simulated IMU produces on MuJoCo (D5.3), when one runs.
-
-    The ``imu_sensor_broadcaster`` publishes on the controller-manager clock,
-    so the produced rate is the effective ``controller_manager.update_rate``
-    of the controllers configuration the embodiment generates from — read
-    from the profile's ``ros2_control.controllers_config`` (the generated
-    file adds the broadcaster entry, never a different rate). Computed only
-    when the EFFECTIVE inventory (the merged profile + deployment fragment,
-    exactly the list the description itself iterates — review round 1)
-    carries a lidar whose integrated IMU the MuJoCo platform simulates; a
-    profile without one needs no rate, and a missing update_rate on a
-    profile that does fails closed: no rate is better than a wrong one.
-    """
-    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS  # noqa: PLC0415
-    from robot_runtime.mujoco import MUJOCO_LIDAR_SIM_DRIVERS  # noqa: PLC0415
-
-    integrated_here = set(MUJOCO_LIDAR_SIM_DRIVERS) & set(LIDAR_INTEGRATED_IMU_DRIVERS)
-    effective = peripherals if peripherals is not None else (profile.get("peripherals") or [])
-    effective = [entry for entry in effective if entry.get("enabled", True)]
-    if not any(
-        periph.get("type") == "lidar" and str(periph.get("driver", "")) in integrated_here for periph in effective
-    ):
-        return None
-    import yaml
-
-    from robot_runtime.path_subst import resolve_path
-
-    config = str(((profile.get("ros2_control") or {}).get("controllers_config") or "").strip())
-    if not config:
-        raise InterfaceDescriptionError(
-            "the MuJoCo IMU rate needs ros2_control.controllers_config in the runtime profile"
-        )
-    path = resolve_path(config)
-    try:
-        with open(path, encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise InterfaceDescriptionError(
-            f"cannot read the controllers configuration for the MuJoCo IMU rate: {exc}"
-        ) from exc
-    rate = ((data.get("controller_manager") or {}).get("ros__parameters") or {}).get("update_rate")
-    if not isinstance(rate, int | float) or rate <= 0:
-        raise InterfaceDescriptionError(
-            f"controller_manager.update_rate missing or invalid in {path}: the MuJoCo IMU rate cannot be advertised"
-        )
-    return float(rate)
-
-
 def build_description(
     profile: dict,
     peripherals: list[dict] | None = None,
@@ -936,6 +953,7 @@ def build_description(
     use_sim: bool | None = None,
     robot_description: str | None = None,
     sim_platform: str | None = None,
+    profile_path=None,
 ) -> dict:
     """Project only public ROS interfaces; do not serialize private configuration.
 
@@ -943,7 +961,10 @@ def build_description(
     execution identity recorded in the description: physical execution carries
     no platform, simulated execution carries the platform it runs on. With
     neither given the profile's declared selection applies; ``use_sim:=false``
-    together with a platform fails naming both.
+    together with a platform fails naming both. A platform name follows the
+    identifier rule (declaration is syntax); a PHYSICS selection must be
+    registered (sim-platform-registry D2), so building a description on a
+    platform whose plugin is not installed fails naming it and the package.
     """
     runtime = profile["runtime"]
     caps = profile["capabilities"]
@@ -957,10 +978,15 @@ def build_description(
         sim_platform = None
     else:
         sim_platform = str(sim_platform or profile.get("sim_platform") or "sdk").strip()
-        if sim_platform not in SIM_PLATFORMS:
+        if not is_valid_sim_platform_name(sim_platform):
             raise InterfaceDescriptionError(
-                f"unknown sim_platform {sim_platform!r}: expected one of {list(SIM_PLATFORMS)}"
+                f"unknown sim_platform {sim_platform!r}: expected an identifier matching ^[a-z][a-z0-9_]*$"
             )
+    # D4: one effective-traits resolution — the embodiment's override when
+    # present, else the registered platform's traits; None on hardware and
+    # sdk (no registry access). A physics selection whose plugin is not
+    # installed fails here, before anything is advertised.
+    traits = effective_sensor_traits(profile, profile_path, use_sim, sim_platform)
     # D3: peripherals excluded on the selected physics platform are neither
     # advertised nor claimed — the description projects the same filtered
     # inventory every platform consumer resolves.
@@ -968,15 +994,15 @@ def build_description(
     interfaces = peripheral_interfaces(
         peripherals,
         sim_platform=sim_platform,
-        camera_rate_hz=(
-            _mujoco_camera_rate({**profile, "peripherals": peripherals}) if sim_platform == "mujoco" else None
-        ),
-        imu_rate_hz=(_mujoco_imu_rate(profile, peripherals) if sim_platform == "mujoco" else None),
+        traits=traits,
+        profile=profile,
         # The derived scan's source (FAST-LIO's registered body cloud) runs
         # on a physics platform only when lidar odometry itself runs there;
         # without it no scan is advertised or published (D5).
         scan_source_runs=(
-            bool((profile.get("fast_lio") or {}).get("enabled")) if sim_platform in PHYSICS_SIM_PLATFORMS else True
+            bool((profile.get("fast_lio") or {}).get("enabled"))
+            if is_physics_selection(use_sim, sim_platform)
+            else True
         ),
     )
     # Audio peripherals derive the interaction.audio_* capability entries. A
@@ -1148,6 +1174,15 @@ def build_description(
     return description
 
 
+def _cli_sim_platform(value: str) -> str:
+    """``--sim_platform`` CLI check: the identifier rule only (D2)."""
+    if not is_valid_sim_platform_name(value):
+        raise argparse.ArgumentTypeError(
+            f"{value!r} is not a simulation platform identifier (expected ^[a-z][a-z0-9_]*$)"
+        )
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Export or validate the public robot interface description")
     source = parser.add_mutually_exclusive_group(required=True)
@@ -1155,7 +1190,11 @@ def main(argv=None):
     source.add_argument("--validate")
     parser.add_argument("--peripherals", default="")
     parser.add_argument("--simulated", choices=("true", "false"))
-    parser.add_argument("--sim_platform", choices=SIM_PLATFORMS)
+    parser.add_argument(
+        "--sim_platform",
+        help="Simulation platform identifier (sdk or a registered physics platform)",
+        type=lambda value: _cli_sim_platform(value),
+    )
     parser.add_argument("--output")
     parser.add_argument("--instance-id")
     args = parser.parse_args(argv)

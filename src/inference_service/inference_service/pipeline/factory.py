@@ -81,6 +81,7 @@ def _new_lerobot_torch_session(
     return LeRobotTorchModelSession(
         context.device,
         priority_scheduling=context.priority_scheduling,
+        managed_execution=context.managed_execution,
     )
 
 

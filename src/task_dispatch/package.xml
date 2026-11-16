@@ -38,6 +38,10 @@
   <!-- The migrated launch-builder tests import robot_config's registry and
        loader (openspec change ``migrate-business-launch-builders``). -->
   <test_depend>robot_config</test_depend>
+  <!-- test_task_executor_runtime_cancel runs a MOVE_TO_POSE step against the direct-control
+       runtime on robot_runtime_sim's CPU toy platform (its test doubles); robot_runtime_sim
+       cannot test task_dispatch itself (robot_config already depends on it: a cycle). -->
+  <test_depend>robot_runtime_sim</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

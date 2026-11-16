@@ -265,7 +265,7 @@ def test_binding_branch_starts_the_world_once_before_the_provider(monkeypatch, t
     assert provider_args["use_sim"] == "true"
     assert provider_args["sim_platform"] == "gazebo"
     assert "simulated" not in provider_args
-    assert provider_args["gazebo_world"] == "demo"
+    assert provider_args["sim_world"] == "demo"
     assert (provider_args["spawn_x"], provider_args["spawn_y"], provider_args["spawn_z"]) == ("0.1", "0.2", "-0.03")
 
 

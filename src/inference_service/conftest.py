@@ -21,6 +21,8 @@ from __future__ import annotations
 import importlib.util
 import pathlib
 
+import pytest
+
 _WORKSPACE_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _ROOT_CONFTEST = _WORKSPACE_ROOT / "conftest.py"
 
@@ -41,3 +43,12 @@ pytest_unconfigure = _root.pytest_unconfigure
 pytest_collection_modifyitems = _root.pytest_collection_modifyitems
 model_bundle_available = _root.model_bundle_available
 repo_asset_available = _root.repo_asset_available
+
+
+@pytest.fixture
+def simulated_runtime_construction():
+    """Opt-in isolation for tests of generic controllers and transport."""
+    from inference_service.runtime_creation import runtime_creation
+
+    with runtime_creation(purpose="simulation") as construction:
+        yield construction

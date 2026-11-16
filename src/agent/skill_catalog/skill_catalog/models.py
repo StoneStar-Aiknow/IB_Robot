@@ -249,6 +249,20 @@ class SkillRobotContext:
     gripper_closed_position: float
     execution_endpoints: Mapping[str, str]
     supported_control_modes: tuple[str, ...] = ()
+    # Optional multi-arm surface (contract v2): skill arm_side -> runtime motion group,
+    # e.g. {"left": "left_arm", "right": "right_arm"}. Empty = one implicit arm, and
+    # arm_side stays rejected. Absent from the registry preimage while empty, so
+    # existing robots keep their schema version and digests.
+    arm_groups: Mapping[str, str] = field(default_factory=dict)
+    # Optional per-robot motion limits enforced by safety_guard, e.g.
+    # {"max_velocity_scaling": 0.6}. Same preimage rule as arm_groups.
+    motion_limits: Mapping[str, float] = field(default_factory=dict)
+    # Optional gripper orientation surface: ``axis`` is the tool frame's approach
+    # axis that rotate_gripper_* turns about (absent = "z", the SO-101 tool
+    # frame), ``presets`` maps approach names to base-frame orientations
+    # ({"orientation": {"x", "y", "z", "w"}}) for set_gripper_approach. Same
+    # preimage rule as arm_groups.
+    gripper_approach: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for field_name in (
@@ -259,6 +273,9 @@ class SkillRobotContext:
             "timeout_policy",
             "relative_motion_direction_mapping",
             "execution_endpoints",
+            "arm_groups",
+            "motion_limits",
+            "gripper_approach",
         ):
             object.__setattr__(self, field_name, deep_freeze(getattr(self, field_name)))
         object.__setattr__(self, "arm_joint_names", tuple(self.arm_joint_names))

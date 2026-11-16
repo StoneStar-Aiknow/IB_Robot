@@ -150,12 +150,21 @@ class OnnxRuntimeModelSession(ModelSession):
                     f"ONNX Runtime artifact {role!r} is unavailable: {path}", code="invalid_artifact"
                 )
             try:
-                session = ort.InferenceSession(str(path), sess_options=sess_options, providers=providers)
+                options = {"enable_fallback": False} if context.managed_execution else {}
+                session = ort.InferenceSession(str(path), sess_options=sess_options, providers=providers, **options)
+                sessions[role] = session
+                if context.managed_execution:
+                    active_providers = session.get_providers()
+                    if not active_providers or active_providers[0] != providers[0]:
+                        raise BackendLoadError(
+                            f"ONNX role {role!r} execution provider initialization fell back to another device",
+                            code="device_unavailable",
+                        )
+                    session.disable_fallback()
             except BackendError:
                 raise
             except Exception as exc:
                 raise BackendLoadError(f"unable to load ONNX graph for role {role!r}: {exc}") from exc
-            sessions[role] = session
             graph_inputs = [item.name for item in session.get_inputs()]
             graph_outputs = [item.name for item in session.get_outputs()]
             bindings = deployment.bindings[role]

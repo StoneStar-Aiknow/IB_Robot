@@ -11,13 +11,28 @@
 #   scripts/verify_runtime_independence.sh core
 #
 # runtime mode: build <robot>_robot in an ISOLATED workspace containing only its
-#   declared dependency closure. The closure is audited against a FIXED
-#   allow-list (runtime members + the contract layer + vendored third-party);
-#   membership is NOT derived from the closure itself. The isolated build uses
-#   the workspace venv and the project's colcon flags (merge-install,
-#   symlink-install, the repo's mixin file) so it matches ./scripts/build.sh.
-#   The runtime is then launched through its own entry in simulated transport
-#   and the capability-scoped conformance suite runs against it.
+#   declared dependency closure. Three closures are distinguished
+#   (sim-platform-registry D10, computed by scripts/runtime_closure.py from the
+#   workspace package.xml files with catkin_pkg):
+#   - the EXECUTION closure (exec_depend/depend/run_depend/build_export_depend,
+#     transitive) is what the FIXED allow-list audits (runtime members + the
+#     contract layer + vendored third-party); membership is NOT derived from the
+#     closure itself, and it must exclude sim_models and robot_runtime_sim;
+#   - the BUILD closure (execution edges + build_depend/buildtool_depend)
+#     populates the isolated workspace, so no simulation package is built or
+#     installed unless a runtime edge pulls it in;
+#   - the TEST closure (build + test_depend) would be used where the gate runs
+#     package tests; this gate runs none (the conformance suite is driven from
+#     outside the isolated workspace), so it is only logged for diagnosis.
+#   The isolated build uses the workspace venv and the project's colcon flags
+#   (merge-install, symlink-install, the repo's mixin file) so it matches
+#   ./scripts/build.sh. Inside the isolated run the gate asserts, BEFORE any
+#   conformance case, that robot_runtime_sim and sim_models are invisible
+#   (no importable module, no ibrobot.sim_platforms entry point, no ament share
+#   directory), so a leak from the full worktree install fails the gate instead
+#   of passing silently. The runtime is then launched through its own entry in
+#   simulated transport and the capability-scoped conformance suite runs
+#   against it.
 #
 # core mode: build the generic IB-Robot packages with every robot runtime,
 #   SDK, driver adapter, motion package, robot suite, robot description and
@@ -49,11 +64,11 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 # never derived from the closure under audit.
 # ---------------------------------------------------------------------------
 CONTRACT_PACKAGES=(ibrobot_msgs robot_runtime)
-# Packages the contract packages themselves depend on. robot_runtime
-# exec_depends sim_models for its MuJoCo scene composition (828762f9), so every
-# runtime closure contains it. Temporary: #191 moves the simulation code out of
-# robot_runtime, after which this entry must be removed.
-CONTRACT_DEPENDENCIES=(sim_models)
+# Packages the contract packages themselves depend on. The simulation code
+# moved to robot_runtime_sim (sim-platform-registry #191): the contract layer
+# depends on no simulator package, so a sim package in an execution closure is
+# a dependency leak and fails the gate (see SIM_EXCLUDED below).
+CONTRACT_DEPENDENCIES=()
 SO101_RUNTIME_MEMBERS=(
   so101_robot so101_sdk so101_hardware so101_description so101_motion so101_suite
   feetech_sdk
@@ -71,8 +86,11 @@ LEKIWI_RUNTIME_MEMBERS=(
   so101_suite
 )
 # The X2 runtime is a bridge onto the vendor MC tier: no SDK, hardware adapter,
-# description or motion package of its own. aimdk_msgs is supplied by the
-# developer's AimDK overlay and is never vendored into this repository.
+# description or motion package of its own. Its in-tree C++ data plane
+# (aimdk_dataplane, launched by runtime.launch.py and exec_depended by
+# aimdk_robot) and its X2-owned interface package (aimdk_interfaces) are
+# runtime members. aimdk_msgs is supplied by the developer's AimDK overlay
+# and is never vendored into this repository.
 AIMDK_RUNTIME_MEMBERS=(aimdk_robot aimdk_dataplane aimdk_interfaces)
 AIMDK_EXTERNAL_PACKAGES=(aimdk_msgs)
 # The G1 runtime is a bridge onto the vendor DDS tier: it owns the official
@@ -87,7 +105,9 @@ UNITREE_RUNTIME_MEMBERS=(
 # Third-party/vendored packages that may appear in a runtime closure without
 # being IB-Robot generic packages (they are not listed by `colcon list` in the
 # main workspace src/ tree anyway; this list documents intent).
-THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs livox_ros_driver2 fast_lio fast_calib)
+# usb_cam joined with so101_robot's exec_depend on the vendored camera driver
+# (same vendored-third-party class as pymoveit2/livox).
+THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs livox_ros_driver2 fast_lio fast_calib usb_cam)
 
 # Generic packages that must build WITHOUT any robot package (core gate).
 CORE_EXCLUDED_SUFFIXES=("_robot" "_sdk" "_hardware" "_motion" "_suite")
@@ -95,7 +115,16 @@ CORE_EXCLUDED_PACKAGES=(
   so101_description moveit lekiwi_description lekiwi_calibration
   livox_ros_driver2 fast_lio fast_calib rosclaw pymoveit2
 )
+# The contract layer is part of the generic core, not a robot package:
+# ibrobot_msgs + robot_runtime (the mock runtime provider IS robot_runtime's
+# reference implementation) and, since #191 moved the sim implementations out
+# of the contract, robot_runtime_sim + sim_models (robot_config's launch
+# builders import robot_runtime_sim at module level, and robot_runtime_sim
+# exec_depends sim_models for its scenes). Without them the core launch only
+# ever worked through the full-worktree install leaking into the run
+# environment — exactly what the scrubbed isolated run exists to catch.
 CORE_BUILD_PACKAGES=(
+  ibrobot_msgs robot_runtime robot_runtime_sim sim_models
   robot_config embodied_bringup manipulation_execution skill_library skill_catalog
   task_dispatch action_dispatch inference_service dataset_tools robot_navigation
   robot_teleop safety_guard embodied_agent embodied_common
@@ -113,6 +142,117 @@ package_dir_for() {
 }
 
 # ---------------------------------------------------------------------------
+# Closures (sim-platform-registry D10): scripts/runtime_closure.py follows one
+# dependency-tag class per kind through the workspace package.xml files
+# (catkin_pkg, the same parser colcon uses). Each kind has exactly one use:
+# execution -> the allow-list audit; build -> the isolated workspace contents;
+# test -> package tests, which this gate does not run (logged for diagnosis).
+# ---------------------------------------------------------------------------
+SIM_EXCLUDED=(sim_models robot_runtime_sim)
+
+runtime_closure() {
+  local kind="$1"; shift
+  local out
+  if ! out="$("$GATE_PYTHON" "$SCRIPT_DIR/runtime_closure.py" --kind "$kind" --base-path "$MAIN_WORKSPACE/src" "$@")"; then
+    log_error "cannot compute the ${kind} closure of $* (runtime_closure.py failed)"
+    exit 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# ---------------------------------------------------------------------------
+# Scrubbed isolated environment: a fresh subshell whose PYTHONPATH /
+# AMENT_PREFIX_PATH / COLCON_PREFIX_PATH / LD_LIBRARY_PATH hold ONLY the gate
+# interpreter's own site-packages (the venv layer the interpreter would see
+# anyway — /opt/ros' ros2 entry points use #!/usr/bin/python3, which does NOT
+# inherit the venv, so the venv's jsonschema must stay reachable through
+# PYTHONPATH exactly as it is in a normal workspace run), /opt/ros, the
+# isolated install prefix and (aimdk) the vendor overlay — never the main
+# worktree's own install/build trees. Without this, the full-worktree paths
+# the gate itself runs under would satisfy every import and the isolation
+# assertions below would test nothing.
+# ---------------------------------------------------------------------------
+GATE_PYTHON_SITE=""
+compute_gate_python_site() {
+  if [[ -z "$GATE_PYTHON_SITE" ]]; then
+    GATE_PYTHON_SITE="$("$GATE_PYTHON" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")"
+  fi
+  return 0
+}
+
+scrub_environment() {
+  unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH LD_LIBRARY_PATH
+  compute_gate_python_site
+  export PYTHONPATH="$GATE_PYTHON_SITE"
+  source /opt/ros/humble/setup.sh
+  # The AimDK vendor overlay (aimdk mode only): the C++ data plane's CMake and
+  # the runtime both need aimdk_msgs from it.
+  if [[ -n "${VENDOR_OVERLAY_SETUP:-}" ]]; then
+    source "$VENDOR_OVERLAY_SETUP"
+  fi
+  return 0
+}
+
+run_in_isolated_env() {
+  local ws="$1"; shift
+  (
+    set +u
+    scrub_environment
+    source "$ws/install/setup.sh"
+    set -u
+    "$@"
+  )
+}
+
+# The in-run isolation assertions (D10): before any conformance case runs, the
+# isolated environment must not see the simulation packages at all — not as an
+# importable module, not as a registered sim platform, not as an ament
+# package. A leak here means the "isolated" run is silently using the full
+# worktree's install and every later pass is void.
+assert_simulation_invisible() {
+  local ws="$1"
+  run_in_isolated_env "$ws" "$GATE_PYTHON" - "$ws" <<'PY'
+import importlib.metadata
+import importlib.util
+import sys
+
+ws = sys.argv[1]
+failures = []
+
+
+def check(condition, message):
+    if not condition:
+        failures.append(message)
+
+
+for module in ("robot_runtime_sim", "sim_models"):
+    check(importlib.util.find_spec(module) is None, f"module {module!r} is importable in the isolated run")
+
+try:
+    entry_points = [ep.name for ep in importlib.metadata.entry_points(group="ibrobot.sim_platforms")]
+except Exception as exc:  # any discovery error is itself a gate failure, reported verbatim
+    entry_points = []
+    failures.append(f"entry point discovery raised {exc!r}")
+check(not entry_points, f"ibrobot.sim_platforms entry points are registered: {entry_points}")
+
+from ament_index_python import get_package_share_directory
+
+for package in ("robot_runtime_sim", "sim_models"):
+    try:
+        share = get_package_share_directory(package)
+    except Exception:
+        continue
+    check(False, f"ament share of {package!r} resolves in the isolated run: {share}")
+
+if failures:
+    for line in failures:
+        print(f"ISOLATION FAILURE: {line}")
+    sys.exit(1)
+print(f"isolation OK: no sim module, no sim platform entry point, no sim share dir visible from {ws}")
+PY
+}
+
+# ---------------------------------------------------------------------------
 # Isolated build environment: /opt/ros + the workspace venv, project colcon
 # flags (mirrors scripts/build.sh: merge-install, symlink-install, repo mixin).
 # ---------------------------------------------------------------------------
@@ -126,7 +266,13 @@ isolated_colcon_build() {
   }
   (
     cd "$ws"
-    set +u; source /opt/ros/humble/setup.sh; set -u
+    set +u
+    # Scrubbed build environment, same as the run below: colcon records every
+    # prefix visible at build time into install/setup.sh's prefix chain, so a
+    # worktree install inherited from the gate's own environment would be
+    # re-sourced by every later "isolated" run and defeat the gate.
+    scrub_environment
+    set -u
     # Same flags as scripts/build.sh (dev mixin): merge + symlink install.
     PYTHONNOUSERSITE=1 "$venv_python" -m colcon build \
       --merge-install --symlink-install \
@@ -183,6 +329,29 @@ runtime_gate() {
         exit 0
       fi
       VENDOR_OVERLAY_SETUP="${AIMDK_OVERLAY_SETUP:-}"
+      if [[ -z "$VENDOR_OVERLAY_SETUP" ]]; then
+        # aimdk_msgs is importable through the environment this gate runs in,
+        # but the isolated build/run below is scrubbed of that environment, so
+        # the overlay must be re-sourced by name. Derive its local_setup.sh
+        # from the ament prefix aimdk_msgs resolves through right now.
+        VENDOR_OVERLAY_SETUP="$(python3 - <<'PY' 2>/dev/null || true
+import os
+
+prefixes = os.environ.get("AMENT_PREFIX_PATH", "").split(os.pathsep)
+for prefix in prefixes:
+    if prefix.endswith("/aimdk_msgs") and os.path.isfile(os.path.join(prefix, "..", "local_setup.sh")):
+        print(os.path.abspath(os.path.join(prefix, "..", "local_setup.sh")))
+        break
+PY
+)"
+        if [[ -n "$VENDOR_OVERLAY_SETUP" ]]; then
+          log_info "aimdk overlay derived from the environment: ${VENDOR_OVERLAY_SETUP}"
+        else
+          log_error "aimdk_msgs is importable but no overlay local_setup.sh was found;"
+          log_error "set AIMDK_OVERLAY_SETUP=<aimdk>/install/local_setup.sh and re-run"
+          exit 1
+        fi
+      fi
       ;;
     unitree_g1_robot)
       members=("${UNITREE_RUNTIME_MEMBERS[@]}")
@@ -201,9 +370,23 @@ runtime_gate() {
 
   log_info "runtime gate: computing dependency closure of ${robot_pkg}"
   local closure
-  closure="$(list_workspace_packages | xargs -I{} true; cd "$MAIN_WORKSPACE" && colcon list --base-paths src --packages-up-to "$robot_pkg" --names-only 2>/dev/null)"
+  closure="$(runtime_closure execution "$robot_pkg")"
   [[ -n "$closure" ]] || { log_error "cannot resolve closure for ${robot_pkg}"; exit 1; }
   grep -Fx "$robot_pkg" <<<"$closure" >/dev/null || { log_error "${robot_pkg} not in its own closure"; exit 1; }
+
+  # The execution closure is a runtime-dependency statement: the simulation
+  # packages must not be reachable through any runtime edge (D10). This is a
+  # separate, harder assertion than the allow-list below — a leak here is a
+  # package.xml bug even when the package would sit in some allow-list.
+  local excluded
+  for excluded in "${SIM_EXCLUDED[@]}"; do
+    if grep -Fx "$excluded" <<<"$closure" >/dev/null; then
+      log_error "execution closure of ${robot_pkg} contains ${excluded}:"
+      log_error "  a runtime edge (exec_depend/depend/run_depend/build_export_depend)"
+      log_error "  reaches a simulation package; that is a dependency leak, not an allow-list matter"
+      exit 1
+    fi
+  done
 
   # Audit against the FIXED allow-list (not the closure itself).
   local offenders=()
@@ -218,14 +401,23 @@ runtime_gate() {
     fi
   done <<<"$closure"
   if [[ ${#offenders[@]} -gt 0 ]]; then
-    log_error "dependency closure of ${robot_pkg} contains non-member workspace packages:"
+    log_error "execution closure of ${robot_pkg} contains non-member workspace packages:"
     printf '  - %s\n' "${offenders[@]}"
     log_error "allowed members: ${allowlist[*]}"
     exit 1
   fi
   log_info "closure audit OK: $(wc -l <<<"$closure") packages, fixed allow-list honored"
 
-  # Isolated workspace.
+  # Isolated workspace: the BUILD closure (execution edges + build edges, no
+  # test edges), so a test_depend on a simulation package never puts it into
+  # the built install. The test closure is logged for diagnosis; the gate runs
+  # no package tests inside this workspace (the conformance suite is driven
+  # from outside, against the launched runtime).
+  local build_closure test_closure
+  build_closure="$(runtime_closure build "$robot_pkg")"
+  test_closure="$(runtime_closure test "$robot_pkg")"
+  log_info "build closure: $(wc -l <<<"$build_closure") packages; test closure (unused, no package tests run here): $(wc -l <<<"$test_closure")"
+
   local tmp
   tmp="$(mktemp -d /tmp/runtime_independence_XXXXXX)"
   mkdir -p "$tmp/src"
@@ -234,12 +426,19 @@ runtime_gate() {
     local dir
     dir="$(package_dir_for "$pkg")" || { log_error "no source dir for $pkg"; exit 1; }
     ln -s "$dir" "$tmp/src/$pkg"
-  done <<<"$closure"
+  done <<<"$build_closure"
   # Pinned repo-level libraries under libs/ (Livox-SDK2 for livox).
   [[ -d "$MAIN_WORKSPACE/libs" ]] && ln -s "$MAIN_WORKSPACE/libs" "$tmp/libs"
 
-  log_info "building isolated workspace: $tmp (${robot_pkg} closure)"
+  log_info "building isolated workspace: $tmp (${robot_pkg} build closure)"
   isolated_colcon_build "$tmp"
+
+  # Before any conformance case: the isolated run must not see the simulation
+  # packages at all (import, entry point, ament share). This is the check that
+  # catches a leak from the full worktree install or a sim package sneaking
+  # into the built workspace.
+  log_info "asserting simulation packages are invisible in the isolated run"
+  assert_simulation_invisible "$tmp"
 
   # Launch the runtime through its own entry and run conformance.
   local profile_path="${profile_dir}/${profile}.yaml"
@@ -253,8 +452,7 @@ runtime_gate() {
   (
     cd "$tmp"
     set +u
-    source /opt/ros/humble/setup.sh
-    [[ -n "${VENDOR_OVERLAY_SETUP:-}" ]] && source "$VENDOR_OVERLAY_SETUP"
+    scrub_environment
     source "$tmp/install/setup.sh"
     set -u
     cd "$MAIN_WORKSPACE"
@@ -276,7 +474,13 @@ core_gate() {
   log_info "core gate: building the generic set with robot packages excluded"
   local ignore_count=0
   local pkg name rel_dir
-  while IFS=$'\t' read -r pkg rel_dir; do
+  # colcon list prints name <TAB> path <TAB> build_type: read the path through
+  # awk -F'\t' (like package_dir_for), because a plain two-variable read lets
+  # rel_dir swallow "path<TAB>build_type" and every symlink below is broken —
+  # colcon then builds zero packages and "succeeds".
+  while IFS= read -r line; do
+    pkg="$(awk -F'\t' '{print $1}' <<<"$line")"
+    rel_dir="$(awk -F'\t' '{print $2}' <<<"$line")"
     name="$pkg"
     local skip=false
     for suffix in "${CORE_EXCLUDED_SUFFIXES[@]}"; do
@@ -293,16 +497,43 @@ core_gate() {
   done < <(cd "$MAIN_WORKSPACE" && colcon list --base-paths src 2>/dev/null)
   log_info "excluded $ignore_count robot-specific packages from the temp workspace"
 
-  isolated_colcon_build "$tmp" --packages-select "${CORE_BUILD_PACKAGES[@]}"
+  # Build selection = the core roots' build closure, minus the excluded set:
+  # a scrubbed build chain-sources every dependency's package.sh, so a
+  # dependency left unbuilt fails the build (or, before the scrub, silently
+  # resolved through the full worktree install — the leak this gate exists to
+  # catch). Derived mechanically from CORE_BUILD_PACKAGES so it cannot drift.
+  local core_select=() core_closure=""
+  core_closure="$(runtime_closure build "${CORE_BUILD_PACKAGES[@]}")"
+  while IFS= read -r pkg; do
+    local skip=false
+    for suffix in "${CORE_EXCLUDED_SUFFIXES[@]}"; do
+      [[ "$pkg" == *"$suffix" ]] && skip=true
+    done
+    for pkg_name in "${CORE_EXCLUDED_PACKAGES[@]}"; do
+      [[ "$pkg" == "$pkg_name" ]] && skip=true
+    done
+    [[ "$skip" == "true" ]] && continue
+    core_select+=("$pkg")
+  done <<<"$core_closure"
+  log_info "core build set: ${core_select[*]}"
+
+  isolated_colcon_build "$tmp" --packages-select "${core_select[@]}"
   log_info "generic build OK without robot packages"
 
   # Contract-chain smoke: mock-runtime provider launch + reconciliation + a
-  # mock motion service call + the stop service.
+  # mock motion service call + the stop service. The run environment is
+  # scrubbed to /opt/ros + this isolated install only, so the contract chain
+  # (which includes the simulation-layer packages robot_config legitimately
+  # exec_depends) is proven from the isolated build, never from the full
+  # worktree install the gate itself runs under.
   log_info "core gate: launching robot.launch.py with the mock runtime provider"
   export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-111}" ROS_LOCALHOST_ONLY=1
   (
     cd "$tmp"
-    set +u; source /opt/ros/humble/setup.sh; source install/setup.sh; set -u
+    set +u
+    scrub_environment
+    source install/setup.sh
+    set -u
     python3 - "$MAIN_WORKSPACE" "$tmp" <<'PY'
 import os
 import subprocess

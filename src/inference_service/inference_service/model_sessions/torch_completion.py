@@ -4,6 +4,7 @@ import logging
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 
+from inference_manifest.runtime_identity import MAX_TORCH_DEVICE_INDEX
 from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError
 from inference_service.unified_runtime import ExecutionFailureFactory, OutcomeEvidence
 from inference_service.unified_runtime.contracts import OutcomeState
@@ -17,10 +18,22 @@ LOGGER = logging.getLogger(__name__)
 RELEASE_DRAIN_ATTEMPTS = 2
 
 
-def resolve_torch_device(torch_module, device_name):
+def resolve_torch_device(torch_module, device_name, *, torch_device_index=None):
     """Freeze implicit accelerator placement while the model is being loaded."""
+    if torch_device_index is not None and (
+        type(torch_device_index) is not int
+        or not 0 <= torch_device_index <= MAX_TORCH_DEVICE_INDEX
+        or device_name not in {"cuda", "npu"}
+    ):
+        raise ValueError("torch_device_index requires an integer in 0..127 and a CUDA/NPU profile")
     if device_name in {"cuda", "npu"}:
-        return torch_module.device(f"{device_name}:{getattr(torch_module, device_name).current_device()}")
+        index = (
+            getattr(torch_module, device_name).current_device() if torch_device_index is None else torch_device_index
+        )
+        device = torch_module.device(f"{device_name}:{index}")
+        if device.index != index:
+            raise ValueError("Torch parsed device index differs from requested placement")
+        return device
     return torch_module.device(device_name)
 
 
@@ -41,7 +54,9 @@ def drain_torch_device(torch_module, device_name, device):
         runtime.synchronize(device)
 
 
-def drain_torch_device_before_release(torch_module, device_name, device, *, failed_attempts: int, owner: str) -> None:
+def drain_torch_device_before_release(
+    torch_module, device_name, device, *, failed_attempts: int, owner: str, managed: bool = False
+) -> None:
     """Wait for device completion before releasing model references.
 
     While ``failed_attempts`` is below ``RELEASE_DRAIN_ATTEMPTS`` a failed drain
@@ -50,8 +65,9 @@ def drain_torch_device_before_release(torch_module, device_name, device, *, fail
     the bound is reached the device is presumed stuck in a sticky error state
     that never completes; the wait is abandoned so the caller can drop the
     references and let close terminate, and the abandoned completion is logged.
+    Managed owners always require completion evidence before releasing ownership.
     """
-    if failed_attempts >= RELEASE_DRAIN_ATTEMPTS:
+    if not managed and failed_attempts >= RELEASE_DRAIN_ATTEMPTS:
         LOGGER.warning(
             "%s abandons the device drain after %d failed attempts; releasing references with device completion unknown",
             owner,

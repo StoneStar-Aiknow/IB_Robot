@@ -38,6 +38,7 @@ direction 订阅同一音频采集 topic（provider 部署绑定 runtime `audio.
   `manipulation_execution/pick_executor_node`。
 - 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为
   ROS 参数传给业务节点。
+- 启动 Gateway 时保留 `robot_skill_cli` 标准操作员作用域；Gateway 将该作用域的令牌固定为空值。
 - 无 `runtime.provider` 的旧式配置里，当 `robot.grasp_execution.ik.worker_count>0` 时，包含
   `grasp_execution.ik.workers_launch` 指定的机器人套件 launch（如
   `$(find so101_motion)/launch/ik_workers.launch.py`），为 Hermes 启动与监督式抓取脚本相同的并行候选
@@ -98,8 +99,9 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 | `config_path` | 空 | 可选的 YAML 绝对路径覆盖 |
 | `control_mode` | 空 | 默认继承所选 robot config/stage 的 `default_control_mode` |
 | `nav_stage` | 空 | 配置声明的工作阶段；导航配置支持 `mapping`/`navigation`，移动抓取统一配置还支持 `grasp` |
-| `use_sim` | `false` | 是否启动仿真路径 |
-| `sim_platform` | 空 | 覆盖 robot YAML `simulation.platform` 的 CLI 透传参数 |
+| `use_sim` | 空 | 留空时推断：配置声明了仿真即仿真，否则硬件；显式 `true`/`false` 覆盖推断；`sim_platform:=X` 单独给出即选择在 X 上仿真 |
+| `sim_platform` | 空 | 覆盖 robot YAML `simulation.platform` 的 CLI 透传参数；单独给出隐含仿真路径 |
+| `runtime_target` | 空 | 声明运行时时钟目标（review r1 item 2；留空由解析结果决定，benchmark 配置为 wall time） |
 | `entry_mode` | 空 | 覆盖 `embodied.entry_mode`（hermes/agent）；agent 模式需 `embodied.agent` 块校验通过 |
 | `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |

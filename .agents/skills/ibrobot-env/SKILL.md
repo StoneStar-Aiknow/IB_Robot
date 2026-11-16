@@ -15,7 +15,7 @@ Since the Bash tool runs in isolated subshells, environment variables set via `s
 
 ## When to Use ibrobot-worktree-env Instead
 
-If the command will run inside a **git worktree** of IB_Robot (not the main checkout), use `ibrobot-worktree-env` instead of this skill. Worktree environments require reusing the main repo's venv while sourcing the worktree's `.shrc_local`; naively running `source .shrc_local` in a worktree produces a mixed environment that silently tests the wrong branch.
+If the command will run inside a **git worktree** of IB_Robot (not the main checkout), use `ibrobot-worktree-env` instead of this skill. Worktree environments require reusing the main repo's venv while sourcing the worktree's `.shrc_local`; select that venv with `IBROBOT_VENV=/path/to/main/IB_Robot/venv` and do **not** hand-assemble `PYTHONPATH`. Without a local venv or the selector, `source .shrc_local` runs on system Python and silently misses venv-only packages (for example `unitree_sdk2py`).
 
 Routing signals that indicate worktree-env:
 - User mentions "worktree", "git worktree", "worktree 环境"
@@ -48,8 +48,8 @@ source .shrc_local && ./scripts/build.sh
 ```
 
 ## Environment Provided by .shrc_local
-- Activates Python virtual environment (`venv`).
-- Sets `PYTHONPATH` including `libs/lerobot/src` and `src` directories.
+- Activates the Python virtual environment: the explicit `IBROBOT_VENV` (worktree shared venv) or `${WORKSPACE}/venv` by default; an invalid `IBROBOT_VENV` fails closed.
+- Sets `PYTHONPATH` including `libs/lerobot/src` and the active venv's `site-packages` (taken from `VIRTUAL_ENV`).
 - Sources ROS 2 Humble setup.
 - Defines common aliases (`cb`, `cbp`, `src`, etc.).
 

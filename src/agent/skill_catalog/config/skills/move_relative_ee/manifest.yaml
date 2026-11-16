@@ -54,11 +54,49 @@ capability:
     - motion_direction
     - motion_distance
   recovery_policy: ask_user
+capability_variants:
+  robodojo_arx_x5_v1:
+    parameters:
+      type: object
+      additionalProperties: false
+      properties:
+        arm_side:
+          type: string
+          enum:
+          - left
+          - right
+          - auto
+        motion_direction:
+          type: string
+          enum:
+          - forward
+          - backward
+          - left
+          - right
+          - up
+          - down
+        motion_distance:
+          type: number
+          exclusiveMinimum: 0
+          unit: meters
+      required:
+      - motion_direction
+      - motion_distance
 implementations:
   lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
   lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
+  robodojo_arx_x5_v1: implementations/robodojo_arx_x5_v1.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
+  robodojo_arx_x5_v1:
+    summary: Translate one arm's end effector by a requested direction and distance (orientation kept).
+    category: translation
+    when_to_use:
+    - approach, descend to or lift an object with the chosen arm
+    - make a small corrective end-effector move
+    motion_scope:
+    - arm
+    intensity: moderate
   lekiwi_handeye_realsense_grasp:
     summary: Translate the end-effector by a requested direction and distance.
     category: translation

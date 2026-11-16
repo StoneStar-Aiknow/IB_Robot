@@ -1,0 +1,39 @@
+# Runtime profile of the CPU toy simulator used by the ROS-level tests (no real platform).
+runtime: {name: toy_sim, version: 0.0.1, type: toy}
+use_sim: false
+joint_state_topic: /joint_states
+joints: [a_j1, a_j2, a_j3, a_j4, a_j5, a_j6, a_grip]
+arm_joints: [a_j1, a_j2, a_j3, a_j4, a_j5, a_j6]
+gripper_joints: [a_grip]
+motion_groups:
+  a:
+    joints: [a_j1, a_j2, a_j3, a_j4, a_j5, a_j6]
+    gripper: a_grip
+    ee_pose_topic: /robot_status/a/ee_pose
+default_group: a
+pose_frame: world
+cameras: [cam]
+camera_topic_prefix: /toy
+modes:
+  initial: idle
+  idle: {controllers: [], transitions: [trajectory]}
+  trajectory: {controllers: [toy], allows_trajectory: true, transitions: [idle]}
+command_channels:
+  - {channel: a_grip_stream, topic: /a_grip_position_controller/commands, joints: [a_grip], modes: []}
+trajectory_actions: [/a_grip_trajectory_controller/follow_joint_trajectory]
+capabilities:
+  joint.state: {joint_count: 7, rate_hz: 20.0}
+  joint.trajectory: {joint_count: 1}
+  gripper.1d: {count: 1}
+  motion.move_to_pose: {groups: [a], default_group: a}
+  perception.camera: {topics: [/toy/cam/image_raw]}
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 1.0, torque_off_bound_s: 1.0}
+sim_platforms: [sdk, toy]
+# Direct-control settings live in the platform section (simulation.<platform>).
+simulation:
+  toy:
+    clock_mode: platform_pull
+    dt_s: 0.04
+    supported_commands: [joint, gripper, pose]
+    ik: platform                # the toy's exact IK (flange xyz = first three joints)
+    motion: {gripper_ticks: 100, settle_ticks: 1, idle_wait_s: 0.01}

@@ -1,0 +1,310 @@
+<?xml version="1.0" ?>
+<!-- nav_grasp_room Gazebo world — generated from nav_grasp_room.world.template
+     (#205 grasp stage D1). nav_room's navigation geometry (the same walls
+     and obstacles, so the same navigation behaviour) plus the mobile-
+     manipulation furniture of layout.yaml: a static grasp table and one
+     dynamic magenta cube. World name "demo" as every shipped scene; the
+     robot spawns at layout.yaml's robot_spawn.
+-->
+<sdf version="1.9">
+  <world name="demo">
+
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin
+      filename="gz-sim-physics-system"
+      name="gz::sim::systems::Physics">
+    </plugin>
+
+    <plugin
+      filename="gz-sim-user-commands-system"
+      name="gz::sim::systems::UserCommands">
+    </plugin>
+
+    <plugin
+      filename="gz-sim-scene-broadcaster-system"
+      name="gz::sim::systems::SceneBroadcaster">
+    </plugin>
+
+    <plugin
+      filename="gz-sim-sensors-system"
+      name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <!-- runtime-generated IMU sensors need the IMU system to publish -->
+    <plugin
+      filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
+    </plugin>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>100 100</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+            <specular>0.8 0.8 0.8 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================= -->
+    <!-- Enclosed room: identical entries to nav_room  -->
+    <!-- (4m x 4m, walls 0.1m thick; the robot spawns  -->
+    <!-- at (-1.5, -1.5))                               -->
+    <!-- ============================================= -->
+
+    <!-- North wall (y = 2) -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 2 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>4.2 0.1 1.0</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>4.2 0.1 1.0</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.5 1</ambient>
+            <diffuse>0.6 0.6 0.6 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- South wall (y = -2) -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -2 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>4.2 0.1 1.0</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>4.2 0.1 1.0</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.5 1</ambient>
+            <diffuse>0.6 0.6 0.6 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- East wall (x = 2) -->
+    <model name="wall_east">
+      <static>true</static>
+      <pose>2 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.1 4.2 1.0</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.1 4.2 1.0</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.5 1</ambient>
+            <diffuse>0.6 0.6 0.6 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- West wall (x = -2) -->
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-2 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.1 4.2 1.0</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.1 4.2 1.0</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.5 1</ambient>
+            <diffuse>0.6 0.6 0.6 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================= -->
+    <!-- Interior obstacles (identical to nav_room)    -->
+    <!-- ============================================= -->
+
+    <!-- Obstacle 1: Box on direct path from start to goal -->
+    <model name="obstacle_box">
+      <static>true</static>
+      <pose>0 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.4 0.4 0.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.4 0.4 0.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.2 0.2 1</ambient>
+            <diffuse>0.9 0.3 0.3 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Obstacle 2: Cylinder near east side -->
+    <model name="obstacle_cylinder">
+      <static>true</static>
+      <pose>1.0 -0.5 0.3 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <cylinder><radius>0.2</radius><length>0.6</length></cylinder>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <cylinder><radius>0.2</radius><length>0.6</length></cylinder>
+          </geometry>
+          <material>
+            <ambient>0.2 0.2 0.8 1</ambient>
+            <diffuse>0.3 0.3 0.9 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ============================================= -->
+    <!-- Mobile-manipulation furniture (D1)           -->
+    <!-- ============================================= -->
+
+    <!-- Grasp table: static slab, top 0.015 m above the floor (lowered
+         2026-11-02, maintainer decision: the validated grasp surface
+         z_base = -0.061), long side facing the west approach; light grey
+         (unsaturated — outside the object's hue band so the colour mask
+         stays scene-unique). -->
+    <model name="table">
+      <static>true</static>
+      <pose>1.2 0.4 0.0075 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.40 0.50 0.015</size></box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>0.8</mu>
+                <mu2>0.8</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.40 0.50 0.015</size></box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Grasp cube: dynamic box (edge 0.03 m, mass 0.05 kg, explicit
+         inertia — I = m a^2 / 6 = 7.5e-6 per axis), surface friction from
+         layout.yaml (mu 1.0), saturated magenta (hue 300 deg; the mask
+         band 270-330 deg, S > 0.5, V > 0.25 — no other scene element falls
+         in it). Spawns 1 cm above the table top (0.015 m) and settles. -->
+    <model name="grasp_object">
+      <pose>1.025 0.4 0.04 0 0 0</pose>
+      <link name="link">
+        <inertial>
+          <mass>0.05</mass>
+          <inertia>
+            <ixx>7.5e-06</ixx>
+            <ixy>0</ixy>
+            <ixz>0</ixz>
+            <iyy>7.5e-06</iyy>
+            <iyz>0</iyz>
+            <izz>7.5e-06</izz>
+          </inertia>
+        </inertial>
+        <collision name="collision">
+          <geometry>
+            <box><size>0.03 0.03 0.03</size></box>
+          </geometry>
+          <surface>
+            <friction>
+              <ode>
+                <mu>1.0</mu>
+                <mu2>1.0</mu2>
+              </ode>
+            </friction>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.03 0.03 0.03</size></box>
+          </geometry>
+          <material>
+            <ambient>0.85 0.1 0.85 1</ambient>
+            <diffuse>0.85 0.1 0.85 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

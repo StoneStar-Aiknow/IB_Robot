@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from threading import RLock
 
 import rclpy
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
@@ -96,7 +97,16 @@ class SafetyGuardNode(Node):
             self._handle_registry_event,
             registry_qos,
         )
-        self.create_timer(self._snapshot_sync_period_sec, self._sync_gateway_status)
+        # A discovery and reconciliation poll, not a timed behaviour: it runs on the steady
+        # clock so it keeps firing when this node runs on a simulated clock that stands
+        # still (a lockstep platform does not advance /clock while the robot is idle). It is
+        # also the only retry when the latched registry event arrives before the snapshot
+        # service is discovered.
+        self._snapshot_sync_timer = self.create_timer(
+            self._snapshot_sync_period_sec,
+            self._sync_gateway_status,
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
+        )
 
         self.create_service(ValidateSkill, self._validate_skill_service, self._handle_validate_skill)
         self.create_service(ValidatePrimitive, self._validate_primitive_service, self._handle_validate_primitive)
@@ -340,6 +350,9 @@ class SafetyGuardNode(Node):
                 yaw=request.yaw if request.has_yaw else None,
                 schema_version=request_schema_version,
                 primitive_descriptors=snapshot.primitive_descriptors,
+                arm_groups=robot_context.get("arm_groups", {}),
+                gripper_approach=robot_context.get("gripper_approach", {}),
+                approach=getattr(request, "approach", ""),
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
@@ -450,6 +463,10 @@ class SafetyGuardNode(Node):
                 request.navigation_value,
                 schema_version=request_schema_version,
                 primitive_descriptors=snapshot.primitive_descriptors,
+                target_group=request.target_group,
+                arm_groups=robot_context.get("arm_groups", {}),
+                motion_limits=robot_context.get("motion_limits", {}),
+                gripper_approach=robot_context.get("gripper_approach", {}),
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")

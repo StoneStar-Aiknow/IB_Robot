@@ -40,8 +40,7 @@ def _render(profile, extra):
         "simulated": "",
         "use_sim": "",
         "sim_platform": "",
-        "gazebo_world": "",
-        "mujoco_scene": "",
+        "sim_world": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.05",
@@ -140,8 +139,8 @@ def test_nav_grasp_gazebo_render_carries_the_arm_and_the_initial_values():
     render contains the whole robot — 9 ros2_control joints with the expected
     interfaces and D4 initial values, the arm chain through arm_root (D8: no
     link named world), the wrist camera, no front camera."""
-    from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     profile = load_profile(GRASP_PROFILE)
     urdf = render_gazebo_description(profile, GRASP_PROFILE, spawn_pose=(0.0, 0.0, 0.05, 0.0))
@@ -252,9 +251,9 @@ def test_physical_and_sdk_renders_carry_no_simulation_content():
 
 
 def test_gazebo_render_carries_the_plugin_and_the_wheel_treatment():
-    from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.peripherals import merge_peripherals
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     profile = load_profile(LIDAR_PROFILE)
     urdf = render_gazebo_description(
@@ -312,7 +311,7 @@ def test_launch_declares_the_gazebo_arguments():
     description = _launch_module().generate_launch_description()
     arguments = [action for action in description.entities if isinstance(action, DeclareLaunchArgument)]
     names = {_text(action._DeclareLaunchArgument__name) for action in arguments}
-    assert {"gazebo_world", "spawn_x", "spawn_y", "spawn_z", "spawn_yaw"} <= names
+    assert {"sim_world", "spawn_x", "spawn_y", "spawn_z", "spawn_yaw"} <= names
     defaults = {
         _text(action._DeclareLaunchArgument__name): _text(action._DeclareLaunchArgument__default_value)
         for action in arguments
@@ -328,7 +327,7 @@ def test_gazebo_launch_threads_world_pose_and_sim_time():
         {
             "use_sim": "true",
             "sim_platform": "gazebo",
-            "gazebo_world": "demo",
+            "sim_world": "demo",
             "spawn_x": "0.5",
             "spawn_y": "-0.25",
             "spawn_z": "0.05",
@@ -429,9 +428,9 @@ def test_rotated_mount_drives_sensor_pose_public_tf_and_extrinsics(tmp_path):
     """A non-default rotated mount (as the application fragment forwards it):
     the simulator sensor sits at the mount, livox_frame has exactly one
     parent (body), and FAST-LIO's extrinsic is the mount's inverse."""
-    from robot_runtime.launch_support import render_gazebo_description
     from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
     from robot_runtime.profile import load_profile
+    from robot_runtime_sim.gazebo_embodiment import render_gazebo_description
 
     translation = [-0.12, 0.05, 0.28]
     rpy = [0.2, -0.15, 1.9]  # non-default rotation
@@ -486,7 +485,7 @@ def test_rotated_mount_drives_sensor_pose_public_tf_and_extrinsics(tmp_path):
     # body, and the FAST-LIO bridge receives the mount's inverse extrinsic
     actions = _render(
         LIDAR_PROFILE,
-        {"use_sim": "true", "sim_platform": "gazebo", "peripherals": str(fragment), "gazebo_world": "demo"},
+        {"use_sim": "true", "sim_platform": "gazebo", "peripherals": str(fragment), "sim_world": "demo"},
     )
     nodes = [a for a in actions if isinstance(a, Node)]
     tf = [node for node in nodes if node._Node__node_executable == "static_transform_publisher"]

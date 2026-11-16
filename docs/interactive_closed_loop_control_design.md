@@ -19,7 +19,7 @@
 ## 2. 状态机
 
 ```text
-IDLE -> DISCOVERED -> PREPARED -> CONFIRMED -> EXECUTING
+IDLE -> CATALOG_LOADED -> PREPARED -> CONFIRMED -> EXECUTING
                        |            |             |
                        +------------+-------------+---- stop intent
                                                     |
@@ -73,7 +73,7 @@ server-owned continuation admission（Gateway 的步内续做准入只在 `Execu
 
 - `continue_workflow(..., resume=True)` 返回 `SKILL_CONTINUATION_UNAVAILABLE`，不规划、不确认、不发 goal；
 - 只有 `GoalStatus=5 + SKILL_CANCELLED + exact identity` 的确定取消允许用户提出独立的新 Workflow；
-- 新 Workflow 重新 discover、重新校验 catalog，并使用新 request/task/plan token；
+- 新 Workflow 重新 load_catalog、重新校验 catalog，并使用新 request/task/plan token；
 - `SUCCEEDED`、`FAILED` 和 `UNKNOWN` 均不授权 continuation。
 
 未来只有在 ROS 层提供 continuation planning/admission 和可验证停止证明后，才可在本客户端实现“跳过完成步骤、
@@ -117,7 +117,7 @@ step count。CLI 只接受与该 tuple 精确匹配的 Action 终态；字段非
 
 `robot-skill-closed-loop` 是 live Gateway 验证入口。它按以下顺序输出：
 
-1. `discover`
+1. `load_catalog`
 2. `prepare`（已 flush）
 3. `auto_confirm`（内部 admission）
 4. feedback 和唯一 `execute_terminal`

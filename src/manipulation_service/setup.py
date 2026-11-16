@@ -21,6 +21,7 @@ setup(
         "console_scripts": [
             "grasp_planner_node = manipulation_service.grasp_planner_node:main",
             "grasp_verifier_node = manipulation_service.grasp_verifier_node:main",
+            "debug_graspgen = manipulation_service.debug_graspgen:main",
         ],
     },
 )

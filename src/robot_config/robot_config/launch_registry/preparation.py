@@ -211,8 +211,16 @@ def _load_config(arguments: Mapping[str, str], loaded_config: Mapping[str, Any] 
     return config
 
 
-def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict[str, Any]) -> dict[str, Any]:
-    """Design phase 0: runtime target, provider, sim platform, backend caps."""
+def resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict[str, Any]) -> dict[str, Any]:
+    """Design phase 0: runtime target, provider, sim platform, backend caps.
+
+    Public so launch entries that must agree with the base launch —
+    embodied_pipeline's R3 clock decision above all — resolve ``use_sim``,
+    ``sim_platform`` and ``node_use_sim_time`` through the SAME rules (empty
+    ``use_sim`` infers the target; a ``sim_platform`` override alone selects
+    simulation; the providerless default platform is ``gazebo``), never a
+    private re-parse of the raw ``use_sim`` argument.
+    """
     use_sim_str = arguments["use_sim"]
     requested_use_sim = None if use_sim_str == "" else parse_bool(use_sim_str, default=False)
     sim_platform_override = arguments["sim_platform"].strip()
@@ -246,6 +254,7 @@ def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict
     from robot_config.launch_builders.runtime import runtime_provider
     from robot_config.launch_builders.sim_backend import get_backend_caps
     from robot_config.utils import provider_sim_platform_error, providerless_sim_platform_error
+    from robot_runtime.sim_platforms import SimPlatformError, get_sim_platform, is_physics_selection
 
     runtime_provider_name = runtime_provider(robot_config)
     sim_platform = str(
@@ -259,11 +268,19 @@ def _resolve_target_and_backend(arguments: Mapping[str, str], robot_config: dict
         platform_error = provider_sim_platform_error(sim_platform, runtime_provider_name)
         if platform_error:
             raise PreparationError(platform_error)
-        if sim_platform in ("gazebo", "mujoco"):
-            # D4 (gazebo) / D1 (mujoco): generic launch owns the world side
-            # only; the provider owns the embodiment. The world provides the
-            # clock, but ros2_control and the entity are the provider's, so
-            # generic never spawns them.
+        if is_physics_selection(use_sim, sim_platform):
+            # sim-platform-registry D2/D5: registration is required only for
+            # an effective selection — the CLI override and the use_sim/target
+            # resolution are final by now, and use_sim is true. A hardware or
+            # sdk launch of a gazebo-default configuration never consults the
+            # registry. Generic launch then owns the world side only; the
+            # provider owns the embodiment. The world provides the clock, but
+            # ros2_control and the entity are the provider's, so generic never
+            # spawns them.
+            try:
+                get_sim_platform(sim_platform)
+            except SimPlatformError as exc:
+                raise PreparationError(str(exc)) from exc
             backend_caps = {"provides_clock": True, "needs_ros2_control": False}
         else:
             backend_caps = {"provides_clock": False, "needs_ros2_control": False}
@@ -611,7 +628,7 @@ def prepare_launch(
     hooks_by_phase = dict(registry.hooks_by_phase())
 
     _run_phase_hooks("load_target", hooks_by_phase["load_target"], robot_config, arguments)
-    target_state = _resolve_target_and_backend(arguments, robot_config)
+    target_state = resolve_target_and_backend(arguments, robot_config)
     hook_target_state = HookTargetState(use_sim=target_state["use_sim"], control_mode="")
 
     _run_phase_hooks("control_mode", hooks_by_phase["control_mode"], robot_config, arguments, hook_target_state)
@@ -660,8 +677,13 @@ def prepare_launch(
     _run_phase_hooks("preflight", hooks_by_phase["preflight"], robot_config, arguments, hook_target_state)
 
     # 13a. binding-target: write back only for the live-binding snapshot.
+    task_dispatch = robot_config.get("task_dispatch")
     live_binding_required = bool(
-        required_interface_ids(robot_config) or (robot_config.get("runtime") or {}).get("require_model")
+        required_interface_ids(robot_config)
+        or (robot_config.get("runtime") or {}).get("require_model")
+        # Multi-group task dispatch without a public model binds its gripper and
+        # motion interfaces from the live description (contract v2).
+        or (isinstance(task_dispatch, dict) and task_dispatch.get("groups"))
     )
     node_use_sim_time = target_state["node_use_sim_time"]
     if live_binding_required:

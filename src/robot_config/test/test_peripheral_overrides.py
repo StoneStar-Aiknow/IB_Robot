@@ -687,6 +687,7 @@ _PROVIDER_PROFILE_DIRS = {
     "lekiwi_robot": "lekiwi",
     "unitree_g1_robot": "unitree",
     "aimdk_robot": "aimdk",
+    "robodojo_robot": "robodojo",
 }
 
 

@@ -185,8 +185,8 @@ class RKNNModelSession(ModelSession):
         context: ExecutionContext,
     ) -> Mapping[str, object]:
         del request
-        context = self._require_context()
-        deployment = context.deployment
+        runtime = self._require_context()
+        deployment = runtime.deployment
         if not isinstance(deployment, CompiledDeployment) or role not in self._sessions:
             if role in self._host_roles:
                 raise BackendInferenceError(

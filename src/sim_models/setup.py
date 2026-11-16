@@ -18,6 +18,12 @@ setup(
         # nav_room scene (lekiwi-gazebo-runtime-platform D8): room-level
         # navigation world + layout; static, no meshes
         ("share/sim_models/scenes/nav_room", glob("scenes/nav_room/*.yaml") + glob("scenes/nav_room/*.template")),
+        # nav_grasp_room scene (#205 grasp stage D1): nav_room's navigation
+        # geometry + the grasp table and cube; static, no meshes
+        (
+            "share/sim_models/scenes/nav_grasp_room",
+            glob("scenes/nav_grasp_room/*.yaml") + glob("scenes/nav_grasp_room/*.template"),
+        ),
         # pick_banana scene: layout + templates (NOT meshes — separate entry below)
         (
             "share/sim_models/scenes/pick_banana",
@@ -55,6 +61,7 @@ setup(
         "console_scripts": [
             "sim_camera_adjuster = sim_models.sim_camera_adjuster:main",
             "pick_banana_task_node = sim_models.tasks.pick_banana:main",
+            "layout_map = sim_models.layout_map:main",
         ],
     },
 )

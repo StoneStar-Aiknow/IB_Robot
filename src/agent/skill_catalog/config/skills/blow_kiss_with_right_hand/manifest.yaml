@@ -1,0 +1,39 @@
+schema_version: 1
+name: blow_kiss_with_right_hand
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Blow a kiss with the right hand using the G1 preset; no automatic recovery.
+  category: social_emotion
+  when_to_use:
+  - show affection with a right-hand kiss
+  aliases_zh:
+  - 右手飞吻
+  aliases_en:
+  - blow kiss with right hand
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Run the G1 right-hand blow-kiss preset (action 13); no automatic recovery.
+  display_name: 右手飞吻
+  tags:
+  - preset
+  - unitree_action_id_13
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  g1_preset_v1: implementations/g1_preset_v1.yaml

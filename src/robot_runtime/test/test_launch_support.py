@@ -5,6 +5,31 @@ import logging
 import pytest
 
 from robot_runtime.launch_support import RuntimeProfileError, resolve_sim_selection
+from robot_runtime.sim_platforms import SimPlatform, SimSensorTraits
+
+
+@pytest.fixture(autouse=True)
+def _fake_first_party_platforms(monkeypatch):
+    """Register fake gazebo/mujoco platforms for every test in this module.
+
+    resolve_sim_selection checks registration for an effective physics
+    selection (sim-platform-registry D2); the fake platforms keep these
+    contract tests independent of any real simulator plugin (D6).
+    """
+    import robot_runtime.sim_platforms as sim_platforms
+
+    platforms = {}
+    for name in ("gazebo", "mujoco"):
+        platform = SimPlatform(
+            name=name,
+            package="test",
+            embodiment="robot_runtime.sim_platforms:SDK_PLATFORM",  # never resolved here
+            world=None,
+            scene_task=None,
+            sensor_traits=SimSensorTraits(),
+        )
+        platforms[name] = platform
+    monkeypatch.setattr(sim_platforms, "discover_sim_platforms", lambda *, entry_points=None: platforms)
 
 
 def _profile(**extra):
@@ -68,9 +93,18 @@ def test_physical_execution_with_platform_fails_naming_both():
         resolve_sim_selection(_profile(sim_platforms=["sdk", "gazebo"]), "false", "gazebo", "")
 
 
-def test_unknown_platform_value_fails():
-    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'teleport'"):
-        resolve_sim_selection(_profile(), "true", "teleport", "")
+def test_malformed_platform_value_fails():
+    # D2: a platform name is an identifier — anything else fails outright
+    with pytest.raises(RuntimeProfileError, match="unknown sim_platform 'teleport-fast!'"):
+        resolve_sim_selection(_profile(), "true", "teleport-fast!", "")
+
+
+def test_unregistered_platform_value_fails_naming_the_package():
+    # D2: an identifier the registry never heard of is valid syntax; it only
+    # needs the plugin once it is the effective selection, and then it fails
+    # naming the platform and the package to install
+    with pytest.raises(RuntimeProfileError, match="simulation platform 'teleport' is not installed"):
+        resolve_sim_selection(_profile(sim_platforms=["sdk", "teleport"]), "true", "teleport", "")
 
 
 def test_unparseable_boolean_values_fail():
@@ -156,6 +190,11 @@ def test_profile_controllers_rejects_a_bad_platform_table():
     from robot_runtime.launch_support import profile_controllers
 
     profile = _mode_profile()
-    profile["modes"]["idle"]["controllers_by_platform"] = {"teleport": ["x"]}
-    with pytest.raises(ValueError, match="not a physics platform"):
+    # D2: the key must be a platform identifier (any registered platform may
+    # override, not a fixed list); a reserved non-platform key is rejected too
+    profile["modes"]["idle"]["controllers_by_platform"] = {"teleport-fast!": ["x"]}
+    with pytest.raises(ValueError, match="not a simulation platform"):
+        profile_controllers(profile, "mujoco")
+    profile["modes"]["idle"]["controllers_by_platform"] = {"embedded_sensor": ["x"]}
+    with pytest.raises(ValueError, match="not a simulation platform"):
         profile_controllers(profile, "mujoco")

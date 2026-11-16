@@ -13,6 +13,8 @@ from .models import RoleRuntimeProfile, _json_safe, _runtime_profiles
 # Bump when the composition payload or its canonical serialization changes.
 # Adapter implementations version their own identifier; this is not their ABI.
 RUNTIME_COMPOSITION_FINGERPRINT_VERSION = 1
+# c10::DeviceIndex is int8_t; negative indices are not explicit placement.
+MAX_TORCH_DEVICE_INDEX = 127
 
 
 class _DeviceKind(str, Enum):
@@ -49,8 +51,8 @@ def _torch(settings: Mapping[str, Any]) -> str:
     device = _DeviceKind(settings.get("device", _DeviceKind.CPU))
     if device in {_DeviceKind.CUDA, _DeviceKind.NPU}:
         index = settings.get("resolved_device_index")
-        if type(index) is not int or index < 0:
-            raise ValueError("Torch accelerator identity requires an explicit resolved torch_device_index")
+        if type(index) is not int or not 0 <= index <= MAX_TORCH_DEVICE_INDEX:
+            raise ValueError("Torch accelerator identity requires an explicit resolved torch_device_index in 0..127")
         return f"{device.value}:{index}"
     return device.value
 
@@ -166,6 +168,11 @@ def runtime_composition_fingerprint(
     ).hexdigest()
 
 
+def is_canonical_device(device: object) -> bool:
+    """Validate directory placement without consulting process environment."""
+    return isinstance(device, str) and _DEVICE_PATTERN.fullmatch(device) is not None
+
+
 def validate_runtime_device_visibility(device: str, target_id: str) -> None:
     """Require unremapped indices and PCI bus ordering in every CUDA host.
 
@@ -173,7 +180,7 @@ def validate_runtime_device_visibility(device: str, target_id: str) -> None:
     same device inventory throughout their lifetime. This checks configuration,
     not SDK state; changing environment after initialization is unsupported.
     """
-    if not isinstance(device, str) or _DEVICE_PATTERN.fullmatch(device) is None:
+    if not is_canonical_device(device):
         raise ValueError(f"runtime target {target_id}: invalid physical device {device!r}")
     variables = {_DeviceKind.CUDA: "CUDA_VISIBLE_DEVICES", _DeviceKind.NPU: "ASCEND_RT_VISIBLE_DEVICES"}
     backend = device.removeprefix("local/").split(":", 1)[0]

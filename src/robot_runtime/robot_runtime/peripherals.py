@@ -42,7 +42,7 @@ from robot_runtime.interface_description import (
     peripheral_interfaces,
 )
 from robot_runtime.path_subst import resolve_path
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS
+from robot_runtime.sim_platforms import SimSensorTraits, is_physics_selection
 
 logger = logging.getLogger("robot_runtime.peripherals")
 
@@ -109,17 +109,27 @@ def load_peripherals_file(path: str) -> dict[str, Any]:
 
 
 def perception_capabilities(
-    peripherals: list[dict[str, Any]] | None, *, sim_platform: str | None = None
+    peripherals: list[dict[str, Any]] | None,
+    *,
+    sim_platform: str | None = None,
+    traits: SimSensorTraits | None = None,
+    profile: dict | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Perception capability specs (RuntimeStatus surface) for a peripheral list.
 
-    ``sim_platform`` filters exactly like the interface description (D5.4):
-    the RuntimeStatus capability surface and the advertised endpoints derive
-    from the same platform-filtered projection, so a lidar the platform does
-    not stand in for is neither advertised nor claimed.
+    ``traits`` are the selection's effective sensor traits
+    (:func:`robot_runtime.interface_description.effective_sensor_traits`;
+    ``None`` on hardware and ``sdk``) and filter exactly like the interface
+    description (D5.4/sim-platform-registry D4): the RuntimeStatus capability
+    surface and the advertised endpoints derive from the same projection, so
+    a lidar the platform does not stand in for is neither advertised nor
+    claimed. ``sim_platform`` only selects the exclusion filter (D3).
+    ``profile`` is the runtime profile the traits' rate callables resolve
+    from (the effective peripheral list is threaded through by the shared
+    :func:`peripheral_interfaces` projection).
     """
     caps: dict[str, dict[str, Any]] = {}
-    for spec in peripheral_interfaces(peripherals, sim_platform=sim_platform).values():
+    for spec in peripheral_interfaces(peripherals, sim_platform=sim_platform, traits=traits, profile=profile).values():
         if not spec["capability"].startswith("perception."):
             continue  # interaction.audio_* entries carry their format via audio_capabilities
         caps.setdefault(spec["capability"], {"topics": []})["topics"].append(spec["endpoint"])
@@ -871,7 +881,7 @@ def fast_lio_nodes(config: dict[str, Any], *, bridge_package: str, use_sim: bool
     """
     if not config.get("enabled", False):
         return []
-    physics = use_sim and sim_platform in PHYSICS_SIM_PLATFORMS
+    physics = is_physics_selection(use_sim, sim_platform)
     if use_sim and not physics:
         return []
     params_file = config.get("params_file", "")

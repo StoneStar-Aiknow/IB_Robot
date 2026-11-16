@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,12 +51,33 @@ from robot_config.placement_execution_config import validate_placement_execution
 from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_config.voice_contract import SPEAKER_EMBEDDING_IDLE_TIMEOUT_SEC, SPEAKER_EMBEDDING_OUTPUT_TOPIC
-from robot_runtime import contract as RUNTIME
 
 from .config_path import resolve_robot_config_path
-from .utils import resolve_calibration_paths_from_config, resolve_ros_path
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_ros_path(path):
+    """Resolve ROS-style path substitutions, importing the shared helper lazily.
+
+    ``robot_config.utils`` imports the joint-conversion contract from
+    ``robot_runtime`` at module scope. Importing it here would make every
+    consumer of this module pull in ``robot_runtime``, which breaks the
+    transport-only projection (:func:`load_transport_robot_config`). Resolve
+    the helper on first use so the strict loaders keep importing it exactly
+    when they run, while transport consumers stay free of the runtime layer.
+    """
+    from robot_config.utils import resolve_ros_path as _resolve_ros_path
+
+    return _resolve_ros_path(path)
+
+
+def resolve_calibration_paths_from_config(robot_config: dict[str, Any]) -> list[str]:
+    """Return resolved calibration paths, importing the shared helper lazily."""
+    from robot_config.utils import resolve_calibration_paths_from_config as _resolve_calibration_paths
+
+    return _resolve_calibration_paths(robot_config)
+
 
 # Controlled vocabularies for the skill `description` contract exposed to Agent callers.
 _VALID_MOTION_SCOPES = {"base", "shoulder", "elbow", "wrist", "gripper", "arm"}
@@ -669,6 +691,11 @@ def robot_supported_control_modes(robot_config: dict[str, Any]) -> tuple[str, ..
 
 def robot_execution_endpoints(robot_config: dict[str, Any]) -> dict[str, Any]:
     """Return the closed endpoint set for the selected robot context schema."""
+    # The endpoint default below is the only reason this module needs the
+    # runtime contract; import it per call so importing ``loader`` for the
+    # transport projection (or config introspection) stays runtime-free.
+    from robot_runtime import contract as RUNTIME
+
     embodied = robot_config.get("embodied", {})
     if not isinstance(embodied, dict):
         embodied = {}
@@ -2092,6 +2119,92 @@ def load_robot_config_dict(
         require_local_model_artifacts=require_local_model_artifacts,
     )
     return robot_config
+
+
+#: ``embodied`` keys that make up the public consumer transport contract.
+#: They are robot_config keys (the neutral ``robot_client.transport`` contract
+#: maps the same set to message types), so they stay literal endpoint strings
+#: and are never resolved through the runtime interface description.
+TRANSPORT_ENDPOINT_KEYS: tuple[str, ...] = (
+    "skill_gateway_status_service",
+    "skill_catalog_snapshot_service",
+    "skill_catalog_reload_service",
+    "validate_skill_service",
+    "skill_action_name",
+    "primitive_action_name",
+    "validate_primitive_service",
+    "plan_service",
+    "prepare_plan_service",
+    "validate_plan_service",
+    "confirm_plan_service",
+    "execute_plan_action",
+    "execute_program_action",
+    "get_execution_service",
+    "get_execution_events_service",
+    "cancel_execution_service",
+    "start_visual_game_service",
+    "get_visual_game_result_service",
+)
+
+
+@dataclass(frozen=True)
+class TransportRobotConfig:
+    """Transport-only projection of one robot configuration.
+
+    This is deliberately **not** a validated robot configuration. It carries
+    the robot name, the public ``embodied`` mapping and the provenance of the
+    file chain, and nothing else. Logical runtime interfaces are not resolved,
+    no local catalog is compiled, no model or vendor artifact is read, and no
+    provider is started. Consumers that need capability metadata (catalog,
+    plan, direct skill execution) must keep using :func:`load_robot_config_dict`
+    or the launch-resolved consumer snapshot.
+    """
+
+    name: str
+    embodied: dict[str, Any]
+    config_path: str
+    config_sources: tuple[str, ...]
+    interfaces_deferred: bool = True
+
+
+def load_transport_robot_config(
+    *,
+    config_name: str | None = None,
+    config_path: str | Path | None = None,
+) -> TransportRobotConfig:
+    """Load the consumer transport projection of a robot configuration.
+
+    Precedence and file normalization are the loader's own: ``config_path`` >
+    ``config_name`` > ``ROBOT_CONFIG`` > ``ROBOT_NAME``, with ``base_config``
+    inheritance, relative-path resolution and the ordered ``_config_sources``
+    chain handled by the same functions :func:`load_robot_config_dict` uses.
+    Only the projection is returned; interface descriptions are never required
+    and are never claimed. This function does not validate the rest of the
+    robot configuration, so it must not be used as a validation substitute.
+    """
+    resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
+    resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(resolved_path)
+    robot_data = _resolve_nav_stage(copy.deepcopy(robot_data), "")
+    name = robot_data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError(f"robot.name must be a non-empty string: {resolved_config_path}")
+    embodied = robot_data.get("embodied")
+    if embodied is None:
+        embodied = {}
+    if not isinstance(embodied, dict):
+        raise ValueError(f"robot.embodied must be a mapping: {resolved_config_path}")
+    for key in TRANSPORT_ENDPOINT_KEYS:
+        if key not in embodied:
+            continue
+        value = embodied[key]
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"embodied.{key} must be a non-empty endpoint string: {resolved_config_path}")
+    return TransportRobotConfig(
+        name=name.strip(),
+        embodied=dict(embodied),
+        config_path=str(resolved_config_path),
+        config_sources=tuple(str(path) for path in config_sources),
+    )
 
 
 def validate_runtime_owned_audio_config(robot_config: dict[str, Any]) -> list[str]:

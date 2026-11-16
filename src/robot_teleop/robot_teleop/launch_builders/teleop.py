@@ -906,6 +906,8 @@ def _generate_public_teleop_nodes(config, use_sim_time: bool = False):
         "stop_srv": endpoints["stop"],
         "home_action": endpoints["home"],
         "command_lease_topic": endpoints["lease"],
+        "session_start_srv": endpoints.get("session_start", ""),
+        "session_lease_topic": endpoints.get("session_lease", ""),
         "runtime_status_topic": config["runtime"]["interface_description"]["interfaces"]["runtime.status"]["endpoint"],
     }
     nodes = []
@@ -933,6 +935,8 @@ def _generate_public_teleop_nodes(config, use_sim_time: bool = False):
                 "so101_gripper_closed": target["closed"],
                 "so101_gripper_open": target["open"],
                 "command_lease_topic": endpoints["lease"],
+                "session_start_service": endpoints.get("session_start", ""),
+                "session_lease_topic": endpoints.get("session_lease", ""),
                 "runtime_status_topic": config["runtime"]["interface_description"]["interfaces"]["runtime.status"][
                     "endpoint"
                 ],

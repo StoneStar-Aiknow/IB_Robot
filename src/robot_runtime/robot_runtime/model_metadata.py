@@ -30,7 +30,7 @@ from robot_runtime.joint_conversion import (
     joint_limits_from_urdf,
     normalize_lerobot_norm_mode,
 )
-from robot_runtime.profile import SIM_PLATFORMS
+from robot_runtime.sim_platforms import is_valid_sim_platform_name
 
 _MODES = (NORM_MODE_DEGREES, NORM_MODE_RANGE, NORM_MODE_NONE)
 _ENTRY_FIELDS = ("min", "max", "span", "offset")
@@ -268,8 +268,10 @@ def build_model_metadata(
     simulated = bool(use_sim)
     if simulated:
         platform = str(sim_platform or "sdk")
-        if platform not in SIM_PLATFORMS:
-            raise ValueError(f"model metadata sim_platform must be one of {list(SIM_PLATFORMS)}, got {platform!r}")
+        if not is_valid_sim_platform_name(platform):
+            raise ValueError(
+                f"model metadata sim_platform must be an identifier matching ^[a-z][a-z0-9_]*$, got {platform!r}"
+            )
     names = [str(name) for name in profile.get("joints", [])]
     base = profile.get("base") or {}
     wheels = [str(name) for name in base.get("wheel_joints", [])]

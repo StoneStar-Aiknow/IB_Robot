@@ -56,6 +56,10 @@ class _FakeModeClient:
 
 
 def _node(*, enabled=True, status=None, required=("joint.trajectory", "gripper.1d")):
+    class _FakeLogger:
+        def warning(self, _message):
+            pass
+
     node = SimpleNamespace(
         _runtime_enabled=enabled,
         _runtime_name="test_runtime",
@@ -71,6 +75,7 @@ def _node(*, enabled=True, status=None, required=("joint.trajectory", "gripper.1
             snapshot=SimpleNamespace(capability_view={"pick_object": {"required_capabilities": list(required)}})
         ),
         get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=100_000_000_000)),
+        get_logger=lambda: _FakeLogger(),
         _wait_for_future=lambda *_args, **_kwargs: True,
     )
     for name in (
@@ -151,6 +156,12 @@ def test_stale_or_future_source_stamp_rejected_despite_fresh_receipt(stamp_sec):
     ready, reason = node._ensure_skill_capabilities("pick_object")
     assert not ready
     assert "stale" in reason
+
+
+def test_a_stamp_one_tick_ahead_of_a_simulated_clock_is_not_from_the_future():
+    # The runtime stamped the status with a tick whose /clock this node has not received yet.
+    node = _node(status=_status(stamp=SimpleNamespace(sec=100, nanosec=40_000_000)))
+    assert node._ensure_skill_capabilities("pick_object") == (True, "")
 
 
 def test_receipt_timeout_rejects_status_even_when_ros_clock_is_paused():

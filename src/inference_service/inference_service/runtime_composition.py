@@ -30,6 +30,7 @@ def require_runtime_dependencies(
     providers: RuntimeProviders | None,
     *,
     owner: str,
+    node=None,
 ) -> tuple[RegistrySet, RuntimeProviders]:
     """Validate explicit dependencies at a construction boundary."""
 
@@ -53,6 +54,8 @@ def require_runtime_dependencies(
             f"{owner} providers must be a RuntimeProviders value",
             code="runtime_providers_invalid",
         )
+    if node is not None and providers.runtime_environment is not None:
+        providers.runtime_environment.configure_from_node(node)
     return registry_set, providers
 
 
@@ -61,6 +64,7 @@ def build_runtime_dependencies(
     *,
     backend_registry: BackendRegistry | None = None,
     providers: RuntimeProviders | None = None,
+    node=None,
 ) -> RuntimeDependencies:
     """Build and freeze one process-local runtime composition.
 
@@ -97,6 +101,7 @@ def build_runtime_dependencies(
             "providers must be a RuntimeProviders value",
             code="runtime_providers_invalid",
         )
+    require_runtime_dependencies(registry_set, providers, owner="runtime composition", node=node)
     return RuntimeDependencies(registry_set, providers)
 
 

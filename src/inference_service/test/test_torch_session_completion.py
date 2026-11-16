@@ -31,6 +31,7 @@ def session_probe(kind, managed, events, fail):
     )
     torch.cuda.current_stream = lambda device: SimpleNamespace(synchronize=lambda: torch.cuda.synchronize(device))
     session = TorchModelSession(lambda _: None) if kind == "tensor" else LeRobotTorchModelSession("cuda")
+    session._managed_execution = managed
     session._torch = torch
     session._device = "cuda:0"
     if kind == "tensor":
@@ -127,6 +128,55 @@ def test_real_session_close_terminates_after_bounded_drain_failures(kind):
     assert session.health().state is BackendState.CLOSED
     assert (session._module if kind == "tensor" else session._policy) is None
     assert events == ["sync"] * RELEASE_DRAIN_ATTEMPTS
+
+
+@pytest.mark.parametrize("kind", ["tensor", "lerobot"])
+def test_managed_session_never_abandons_unknown_device_completion(kind):
+    from inference_service.model_sessions.torch_completion import RELEASE_DRAIN_ATTEMPTS
+
+    events, fail = [], ["sync"]
+    session = session_probe(kind, True, events, fail)
+    native = session._module if kind == "tensor" else session._policy
+    try:
+        for _ in range(RELEASE_DRAIN_ATTEMPTS + 3):
+            with pytest.raises(BackendLifecycleError) as caught:
+                session.close()
+            assert caught.value.close_pending
+            assert session.health().state is not BackendState.CLOSED
+            assert (session._module if kind == "tensor" else session._policy) is native
+    finally:
+        fail[0] = None
+        session.close()
+    assert session.health().state is BackendState.CLOSED
+
+
+@pytest.mark.parametrize("accelerator", ["cuda", "npu"])
+@pytest.mark.parametrize("index", [127, 128, 255, 256])
+def test_explicit_torch_index_never_narrows_to_another_device(accelerator, index):
+    from inference_service.model_sessions.torch_completion import resolve_torch_device
+
+    parsed = []
+
+    def device(name):
+        parsed.append(name)
+        return SimpleNamespace(index=index if index <= 127 else (index + 128) % 256 - 128)
+
+    torch = SimpleNamespace(device=device)
+    if index == 127:
+        assert resolve_torch_device(torch, accelerator, torch_device_index=index).index == index
+        assert parsed == [f"{accelerator}:127"]
+    else:
+        with pytest.raises(ValueError, match="0..127"):
+            resolve_torch_device(torch, accelerator, torch_device_index=index)
+        assert not parsed
+
+
+def test_torch_device_parser_must_preserve_requested_index():
+    from inference_service.model_sessions.torch_completion import resolve_torch_device
+
+    torch = SimpleNamespace(device=lambda _: SimpleNamespace(index=0))
+    with pytest.raises(ValueError, match="differs"):
+        resolve_torch_device(torch, "cuda", torch_device_index=2)
 
 
 @pytest.mark.parametrize("kind", ["tensor", "lerobot"])
@@ -294,7 +344,11 @@ def test_direct_late_result_requires_device_fence(kind, stop, fence_fails):
 
 @pytest.mark.parametrize("kind", ["tensor", "lerobot"])
 @pytest.mark.parametrize("fails", [False, True])
-def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch, kind, fails):
+@pytest.mark.parametrize("explicit_index", [None, 2])
+@pytest.mark.parametrize("accelerator", ["cuda", "npu"])
+def test_loading_pins_cuda_device_for_execution_and_close(
+    tmp_path, monkeypatch, kind, fails, explicit_index, accelerator
+):
     from contextlib import contextmanager
 
     import torch as real_torch
@@ -302,6 +356,7 @@ def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch,
     from inference_manifest import TorchRuntimeProfile
     from inference_service.backends import RuntimeContext
 
+    selected_index = 0 if explicit_index is None else explicit_index
     current, synced, placements = [0], [], []
 
     @contextmanager
@@ -318,7 +373,7 @@ def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch,
         synced.append(current[0] if index is None else index)
 
     torch = SimpleNamespace(
-        device=real_torch.device,
+        device=lambda device: real_torch.device(device.replace("npu", "cuda")),
         inference_mode=nullcontext,
         cuda=SimpleNamespace(
             is_available=lambda: True,
@@ -330,8 +385,13 @@ def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch,
         ),
     )
 
+    torch.npu = torch.cuda
+    torch.npu.get_device_name = lambda index: "Ascend910B"
+    monkeypatch.setitem(__import__("sys").modules, "torch_npu", SimpleNamespace())
+
     class Module:
         def to(self, device):
+            assert current[0] == selected_index
             placements.append(real_torch.device(device))
             return self
 
@@ -339,7 +399,7 @@ def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch,
             return self
 
         def __call__(self, *_args, **_kwargs):
-            assert current[0] == 0
+            assert current[0] == selected_index
             if fails:
                 raise ValueError("inference failed on device zero")
             return {} if kind == "tensor" else np.ones((1, 2), np.float32)
@@ -359,28 +419,40 @@ def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch,
         manifest=SimpleNamespace(model=SimpleNamespace(**vars(identity), inputs=(), outputs=())),
         top_level_identity=identity,
     )
-    context = RuntimeContext(validated, runtime_profile=TorchRuntimeProfile(device="cuda"), managed_execution=True)
+    context = RuntimeContext(
+        validated,
+        runtime_profile=TorchRuntimeProfile(device=accelerator),
+        managed_execution=True,
+        runtime_options={} if explicit_index is None else {"torch_device_index": explicit_index},
+    )
+
+    def load_module(*args, **kwargs):
+        assert current[0] == selected_index
+        return module
+
     if kind == "tensor":
-        session = TorchModelSession(lambda _: module, torch_loader=lambda: torch)
+        session = TorchModelSession(load_module, torch_loader=lambda: torch)
     else:
         (tmp_path / "config.json").write_text("{}")
         (tmp_path / "policy_preprocessor.json").write_text("{}")
         modules = {
             "torch": torch,
+            "torch_npu": SimpleNamespace(),
             "lerobot.configs.policies": SimpleNamespace(
                 PreTrainedConfig=type(
                     "Config", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: SimpleNamespace())}
                 )
             ),
             "lerobot.policies.factory": SimpleNamespace(
-                get_policy_class=lambda _: SimpleNamespace(from_pretrained=lambda *args, **kwargs: module),
+                get_policy_class=lambda _: SimpleNamespace(from_pretrained=load_module),
                 make_pre_post_processors=lambda **kwargs: (lambda x: x, lambda x: x),
             ),
             "torch_models.policy_provider": SimpleNamespace(resolve_policy_provider=lambda *_: None),
         }
         monkeypatch.setattr(LeRobotTorchModelSession, "_import_required", staticmethod(lambda name, _: modules[name]))
-        session = LeRobotTorchModelSession("cuda")
+        session = LeRobotTorchModelSession(accelerator)
     session.load(context)
+    assert synced == [selected_index] and current[0] == 0
     current[0] = 1
     try:
         if fails:
@@ -389,11 +461,11 @@ def test_loading_pins_cuda_device_for_execution_and_close(tmp_path, monkeypatch,
             assert caught.value.outcome_known
         else:
             session.execute(ModelRequest(), ExecutionContext("execute"))
-        assert placements == [real_torch.device("cuda:0")]
-        assert synced == [0] and current[0] == 1
+        assert placements == [real_torch.device(f"cuda:{selected_index}")]
+        assert synced == [selected_index, selected_index] and current[0] == 1
     finally:
         session.close()
-    assert synced == [0, 0]
+    assert synced == [selected_index, selected_index, selected_index]
 
 
 @pytest.mark.parametrize("kind", ["tensor", "lerobot"])
@@ -622,7 +694,7 @@ def test_npu_load_execution_and_close_keep_the_loading_device(tmp_path, monkeypa
     current[0] = 1
     session.execute(ModelRequest(), ExecutionContext("other-thread-device"))
     session.close()
-    assert placements == [0] and waits == [0, 0] and current[0] == 1
+    assert placements == [0] and waits == [0, 0, 0] and current[0] == 1
 
 
 @pytest.mark.parametrize("kind", ["tensor", "lerobot"])

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -45,15 +46,22 @@ class _FakeGraph:
         return list(self.body(feed))
 
 
-def _fake_ort(graphs: dict[str, _FakeGraph]) -> Any:
+def _fake_ort(graphs: dict[str, _FakeGraph], *, actual_provider=None, fail_execution=False) -> Any:
     class _InferenceSession:
-        def __init__(self, path: str, sess_options=None, providers=None) -> None:
+        def __init__(self, path: str, sess_options=None, providers=None, enable_fallback=True) -> None:
             try:
                 self.graph = graphs[path]
             except KeyError as exc:
                 raise RuntimeError(f"model not found: {path}") from exc
             self.sess_options = sess_options
             self.providers = providers
+            self.fallback_enabled = enable_fallback
+
+        def get_providers(self):
+            return [actual_provider] if actual_provider else self.providers
+
+        def disable_fallback(self):
+            self.fallback_enabled = False
 
         def get_inputs(self):
             return [_FakeNode(name) for name in self.graph.inputs]
@@ -62,6 +70,10 @@ def _fake_ort(graphs: dict[str, _FakeGraph]) -> Any:
             return [_FakeNode(name) for name in self.graph.outputs]
 
         def run(self, _output_names, feed):
+            if fail_execution:
+                if not self.fallback_enabled:
+                    raise RuntimeError("execution provider failed")
+                self.providers = ["CPUExecutionProvider"]
             return self.graph.run(feed)
 
     class _OnnxRuntime:
@@ -637,3 +649,52 @@ def test_build_onnx_model_session_selects_state_mode(tmp_path) -> None:
     session = build_onnx_model_session(RuntimeContext(validated))
     assert session.capabilities.stateful is True
     assert session.capabilities.resettable is True
+
+
+@pytest.mark.parametrize("active_provider", ["CPUExecutionProvider", "CUDAExecutionProvider"])
+def test_onnx_session_rejects_load_fallback_and_does_not_retry_execution(tmp_path, active_provider):
+    manifest = _stateless_manifest()
+    manifest["deployments"]["onnx_cpu"]["runtime_profile"]["profile"] = {"provider": "cuda"}
+    context = replace(_context(tmp_path, manifest), managed_execution=True)
+    graph = _FakeGraph(("input",), ("prob",), lambda feed: [np.zeros(1, dtype=np.float32)])
+    ort = _fake_ort(
+        {str(tmp_path / "artifacts/model.onnx"): graph}, actual_provider=active_provider, fail_execution=True
+    )
+    session = OnnxRuntimeModelSession(ort_loader=lambda: ort)
+    try:
+        if active_provider == "CPUExecutionProvider":
+            with pytest.raises(BackendLoadError, match="fell back to another device"):
+                session.load(context)
+        else:
+            session.load(context)
+            from inference_service.backends.errors import BackendInferenceError
+
+            with pytest.raises(BackendInferenceError, match="execution provider failed"):
+                session.execute(
+                    ModelRequest({"host.silero.audio": np.zeros(4, dtype=np.float32)}),
+                    ExecutionContext("provider-failure"),
+                )
+        assert not graph.feeds, "a provider failure must not execute the graph on a fallback device"
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("active_provider", ["CPUExecutionProvider", "CUDAExecutionProvider"])
+def test_direct_onnx_preserves_provider_fallback(tmp_path, active_provider):
+    manifest = _stateless_manifest()
+    manifest["deployments"]["onnx_cpu"]["runtime_profile"]["profile"] = {"provider": "cuda"}
+    context = _context(tmp_path, manifest)
+    graph = _FakeGraph(("input",), ("prob",), lambda feed: [np.ones(1, np.float32)])
+    ort = _fake_ort(
+        {str(tmp_path / "artifacts/model.onnx"): graph}, actual_provider=active_provider, fail_execution=True
+    )
+    session = OnnxRuntimeModelSession(ort_loader=lambda: ort)
+    try:
+        session.load(context)
+        result = session.execute(
+            ModelRequest({"host.silero.audio": np.zeros(4, np.float32)}), ExecutionContext("direct")
+        )
+        assert result["host.silero.prob"].tolist() == [1]
+        assert len(graph.feeds) == 1
+    finally:
+        session.close()

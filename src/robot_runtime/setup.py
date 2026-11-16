@@ -13,7 +13,6 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
-        ("share/" + package_name + "/worlds", glob("worlds/*.sdf")),
     ],
     install_requires=["setuptools", "pyyaml", "jsonschema>=4,<5"],
     # colcon test falls back to unittest (0 tests, false green) without this.
@@ -28,14 +27,11 @@ setup(
             "runtime_facade = robot_runtime.facade_node:main",
             "mock_runtime = robot_runtime.mock_runtime_node:main",
             "wait_for_runtime = robot_runtime.wait_for_runtime:main",
-            "wait_for_clock = robot_runtime.wait_for_clock:main",
-            "joint_current_publisher = robot_runtime.joint_current_publisher:main",
             "topic_relay = robot_runtime.topic_relay:main",
             "synthetic_perception = robot_runtime.synthetic_perception:main",
-            "finite_cloud_filter = robot_runtime.finite_cloud_filter:main",
-            "imu_settle_filter = robot_runtime.imu_settle_filter:main",
-            "odometry_twist_relay = robot_runtime.odometry_twist_relay:main",
             "runtime_interfaces = robot_runtime.interface_description:main",
         ],
+        # The physics platforms (gazebo, mujoco) moved to robot_runtime_sim
+        # (openspec sim-platform-registry D6); this package registers none.
     },
 )
