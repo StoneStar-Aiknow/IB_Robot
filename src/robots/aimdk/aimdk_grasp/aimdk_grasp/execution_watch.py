@@ -248,13 +248,18 @@ class X2TargetWatch:
         on_moved: Callable[[str], None] | None = None,
         source_clock: Callable[[], float] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        side: str = "left",
     ):
-        """``on_moved(reason)`` is told once the target has moved (the grasp head publishes it at once)."""
+        """``on_moved(reason)`` is told once the target has moved (the grasp head publishes it at once).
+
+        ``side`` is the moving arm: its spheres (from ``spheres``) are left out of the compared pixels.
+        """
         if mode not in WATCH_MODES:
             raise ValueError(f"watch mode must be one of {WATCH_MODES}")
         self.capture_state, self.spheres, self.mode, self.imu = capture_state, spheres, mode, imu
         self.period_s, self.crop_margin_px, self.config = period_s, crop_margin_px, config
         self.timeouts, self.on_moved, self.source_clock, self.clock = timeouts, on_moved, source_clock, clock
+        self.side = side
         self._watcher: ExecutionWatcher | None = None
         self._armed = False
         self._phase, self._moved, self._error, self._fault = "", None, None, None
@@ -302,6 +307,7 @@ class X2TargetWatch:
                 on_moved=self._on_moved if stop else None,
                 source_clock=self.source_clock,
                 max_image_age_s=self.timeouts.image_age_s,
+                side=self.side,
             ).start()
         except Exception as exc:  # noqa: BLE001 - reported; stop refuses to execute without the watch
             self._watcher, self._error = None, f"not started: {type(exc).__name__}: {exc}"

@@ -61,7 +61,7 @@ def no_watcher_left_running(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def one_moving_sphere(monkeypatch):
-    monkeypatch.setattr("aimdk_grasp.target_watch.moving_sphere_indices", lambda: np.array([0]))
+    monkeypatch.setattr("aimdk_grasp.target_watch.moving_sphere_indices", lambda side="left": np.array([0]))
 
 
 def planned(image=STILL):

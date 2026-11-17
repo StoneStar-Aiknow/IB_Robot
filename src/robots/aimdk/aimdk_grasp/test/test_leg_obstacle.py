@@ -39,3 +39,19 @@ def test_the_obstacle_is_read_only_and_in_the_torso_frame():
     assert obstacle["pose"] == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     assert not obstacle["vertices"].flags.writeable and not obstacle["faces"].flags.writeable
     assert obstacle["vertices"].shape[1] == 3 and obstacle["faces"].size % 3 == 0
+
+
+def test_the_right_arm_keeps_away_from_the_mirrored_right_leg():
+    import numpy as np
+
+    left, right = leg_obstacle(), leg_obstacle(config_directory("right"))
+    data = json.loads((config_directory("right") / FILENAME).read_text(encoding="utf-8"))
+    assert "mirrored" in data and set(data["source"]["meshes"]) == set(
+        json.loads((config_directory() / FILENAME).read_text(encoding="utf-8"))["source"]["meshes"]
+    )
+    # Same pelvis, the leg on the other side: the leg reaches as far right as the left one reaches left
+    # (up to the standing waist roll and yaw, about 1 cm at the knee).
+    assert right["vertices"][:, 1].min() == pytest.approx(-left["vertices"][:, 1].max(), abs=0.01)
+    assert right["vertices"][:, 1].max() < left["vertices"][:, 1].max() - 0.1
+    assert right["faces"].size == left["faces"].size
+    np.testing.assert_allclose(right["vertices"][:, 2].min(), left["vertices"][:, 2].min(), atol=0.01)

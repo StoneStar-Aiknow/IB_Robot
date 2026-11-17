@@ -1,4 +1,4 @@
-"""Build the X2 left-arm grasp planning model from the official X2 description.
+"""Build the X2 grasp planning model of one arm from the official X2 description.
 
 The model combines two official AgiBot URDFs from ``aimdk_description``:
 
@@ -49,7 +49,7 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIAS_SIGNS
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIAS_SIGNS, check_side
 
 BODY_URDF = "urdf/x2_ultra.urdf"
 HAND_URDF = "urdf/x2_ultra_omnihand_v1.4.0.urdf"
@@ -217,6 +217,62 @@ def _hand(
     return links, joints
 
 
+def _mirror_hand(links: list[ET.Element], joints: list[ET.Element]) -> tuple[list[ET.Element], list[ET.Element]]:
+    """The aliased left hand mirrored onto ``right_wrist_roll_link``, as the right hand.
+
+    The X2's right arm mirrors the left one about the torso's sagittal plane,
+    and the right OmniHand mirrors the left one. Every link frame is mirrored
+    by a reflection ``K`` of its own: ``y`` for the wrist and the fingers (the
+    official right hand's convention), ``x`` for ``R_palm``. With ``x`` the
+    mirrored palm tool frame keeps the gripper description's ``base_rotation``
+    valid: a grasp frame ``G = P inv(B)`` then mirrors to ``M G diag(1, -1, 1)``,
+    a symmetry of the GraspGen-X sweep volumes, so the right hand uses the left
+    description unchanged. ``y`` would tilt the grasp frame instead.
+
+    A joint origin ``T`` from parent ``p`` to child ``c`` becomes
+    ``K_p T K_c``; a revolute axis ``a`` becomes ``-K_c a`` with the same angle,
+    so the aliases keep their values and limits: a right-hand alias position is
+    the native right-hand position (the left alias of the same physical shape).
+    Geometry keeps the left meshes, reflected by a mesh scale; inertia follows.
+    """
+    flip_y, flip_x = np.diag([1.0, -1.0, 1.0, 1.0]), np.diag([-1.0, 1.0, 1.0, 1.0])
+
+    def reflection(link: str) -> np.ndarray:
+        return flip_x if link == "R_palm" else flip_y
+
+    links, joints = copy.deepcopy(links), copy.deepcopy(joints)
+    for joint in joints:
+        parent, child = joint.find("parent"), joint.find("child")
+        if parent.get("link") == "left_wrist_roll_link":
+            parent.set("link", "right_wrist_roll_link")
+        elif not parent.get("link").startswith("R_"):
+            raise ValueError(f"hand joint {joint.get('name')} hangs off {parent.get('link')}")
+        k_parent, k_child = reflection(parent.get("link")), reflection(child.get("link"))
+        _set_origin(joint, k_parent @ _origin_matrix(joint) @ k_child)
+        axis = joint.find("axis")
+        if axis is not None:
+            mirrored = -(k_child[:3, :3] @ np.array([float(value) for value in axis.get("xyz").split()]))
+            axis.set("xyz", " ".join(repr(float(value) + 0.0) for value in mirrored))
+    for link in links:
+        k_link = reflection(link.get("name"))
+        for element in [*link.findall("visual"), *link.findall("collision")]:
+            _set_origin(element, k_link @ _origin_matrix(element) @ flip_y)
+            mesh = element.find("geometry/mesh")
+            if mesh is not None:
+                scale = [float(value) for value in (mesh.get("scale") or "1 1 1").split()]
+                mesh.set("scale", " ".join(repr(value + 0.0) for value in (scale[0], -scale[1], scale[2])))
+        inertial = link.find("inertial")
+        if inertial is not None:
+            _set_origin(inertial, k_link @ _origin_matrix(inertial) @ flip_y)
+            inertia = inertial.find("inertia")
+            if inertia is not None:
+                # The y reflection of the principal frame flips the products that involve y.
+                for name in ("ixy", "iyz"):
+                    if inertia.get(name) is not None:
+                        inertia.set(name, repr(-float(inertia.get(name)) + 0.0))
+    return links, joints
+
+
 def _mount_on_wrist(joints: list[ET.Element], link: str, palm: np.ndarray, wrist_from_link: np.ndarray) -> None:
     """Place ``link`` at ``wrist_from_link`` (joints at zero) by moving the joint that attaches its chain to the palm.
 
@@ -246,8 +302,14 @@ def build_planning_model(
     arm_limits: Mapping[str, tuple[float, float]],
     thumb_mount: str = "legacy",
     palm_mount: str = "legacy",
+    side: str = "left",
 ) -> ET.ElementTree:
     """The planning URDF; ``arm_limits`` narrows joint ranges, never widens them.
+
+    ``side`` names the arm that plans and the hand mounted as the ``R_*``
+    aliases: the left OmniHand as described above, or for ``"right"`` its
+    mirror image on the right wrist (:func:`_mirror_hand`). The other wrist
+    carries no hand in either model.
 
     The deployed limits are the robot configuration's ``arm_limits``
     (:func:`aimdk_grasp.robot_model.left_arm_limits`); an empty mapping keeps the
@@ -256,12 +318,15 @@ def build_planning_model(
     ``description`` defaults to the installed ``aimdk_description`` share; mesh
     paths in the result are absolute paths into it.
     """
+    side = check_side(side)
     description = Path(description) if description is not None else description_share()
     robot = _body(description)
     hand = ET.parse(description / HAND_URDF).getroot()
     _mount_omnihand_wrists(robot, hand, description)
     links, joints = _hand(hand, description, thumb_mount, palm_mount)
-    robot.set("name", "x2_ultra_left_omnihand")
+    if side == "right":
+        links, joints = _mirror_hand(links, joints)
+    robot.set("name", f"x2_ultra_{side}_omnihand")
     for element in (*links, *joints):
         robot.append(element)
     for name, (lower, upper) in arm_limits.items():

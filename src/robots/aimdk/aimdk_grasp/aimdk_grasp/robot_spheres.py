@@ -2,8 +2,10 @@
 
 The spheres are the planner's own cover (``robot_model.collision_robot_config``),
 placed by a level-batched forward kinematics of the generated planning model.
-They feed the scene's self filter and the planner's start state; the left arm's
-reach bounds crop the scene and prefilter grasp candidates. Collision checking
+They feed the scene's self filter and the planner's start state; the planning
+arm's reach bounds crop the scene and prefilter grasp candidates. A model plans
+the arm its configuration names (``robot_model.model_side``); the other arm and
+the head are locked. Collision checking
 itself is cuRobo's, on the GPU.
 """
 
@@ -17,30 +19,41 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from aimdk_grasp.hand import HandMapping
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HEAD, LEFT_ARM, RIGHT_ARM
-from aimdk_grasp.robot_model import collision_robot_config, planning_model
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HEAD, arm_joints, check_side, other_side
+from aimdk_grasp.robot_model import collision_robot_config, config_directory, model_side, planning_model
 
 _EYE3 = np.eye(3)
-_reach_bounds = None
+_reach_bounds: dict[str, tuple] = {}
 _reach_lock = RLock()
 
 
-def left_reach_bounds():
-    """Cached torso-frame (center, arm radius, palm radius); see left_arm_reach/left_palm_reach."""
-    global _reach_bounds
+def reach_bounds(side: str):
+    """Cached torso-frame (center, arm radius, palm radius) of ``side``'s planning model; see arm_reach/palm_reach."""
     with _reach_lock:
-        if _reach_bounds is None:
-            model = RobotSphereModel()
-            center, arm = model.left_arm_reach()
-            _reach_bounds = center, arm, model.left_palm_reach()[1]
-        return _reach_bounds
+        if check_side(side) not in _reach_bounds:
+            model = RobotSphereModel(directory=config_directory(side))
+            center, arm = model.arm_reach()
+            _reach_bounds[side] = center, arm, model.palm_reach()[1]
+        return _reach_bounds[side]
+
+
+def left_reach_bounds():
+    return reach_bounds("left")
 
 
 class RobotSphereModel:
-    """``mapping`` supplies the hand limits; by default the planning model's."""
+    """``mapping`` supplies the hand limits; by default the planning model's.
+
+    ``directory`` selects the planning model (default: the left arm's); its
+    side is the moving arm, whose hand ``mapping`` must describe.
+    """
 
     def __init__(self, mapping: HandMapping | None = None, directory: Path | None = None):
-        self.mapping = HandMapping(planning_model(directory)) if mapping is None else mapping
+        self.side = model_side(directory)
+        self.arm, self.other_arm = arm_joints(self.side), arm_joints(other_side(self.side))
+        self.mapping = HandMapping(planning_model(directory), side=self.side) if mapping is None else mapping
+        if self.mapping.side != self.side:
+            raise ValueError(f"a {self.mapping.side} hand mapping cannot drive the {self.side} planning model")
         kin = collision_robot_config(directory)["robot_cfg"]["kinematics"]
         self.base = kin["base_link"]
         self.links = kin["collision_link_names"]
@@ -116,10 +129,10 @@ class RobotSphereModel:
         self.fk_skew = np.stack([joint["skew"] for joint in self.joints])
         self.fk_square = np.stack([joint["square"] for joint in self.joints])
         # Joint angle = input[:, fk_source] * fk_scale + fk_offset over the
-        # columns LEFT_ARM + RIGHT_ARM + HEAD + hand alias names; fixed joints
-        # read column 0 scaled by zero.
+        # columns planning arm + other arm + HEAD + hand alias names; fixed
+        # joints read column 0 scaled by zero.
         alias_names = list(HAND_ALIASES) + list(DIP_FOLLOWERS)
-        self.fk_inputs = list(LEFT_ARM) + list(RIGHT_ARM) + list(HEAD) + alias_names
+        self.fk_inputs = list(self.arm) + list(self.other_arm) + list(HEAD) + alias_names
         self.fk_alias_names = alias_names
         column = {name: index for index, name in enumerate(self.fk_inputs)}
         source, scale, offset = {}, {}, {}
@@ -146,14 +159,24 @@ class RobotSphereModel:
         self.sphere_link_index = np.array([self.link_indices[link] for link in self.sphere_links])
 
     def left_arm_reach(self):
-        """Torso-frame (center, radius) bounding every left-arm/hand sphere at any joint state.
+        if self.side != "left":
+            raise ValueError("left_arm_reach of a right planning model")
+        return self.arm_reach()
 
-        Center is the first left-arm joint origin; joints upstream of it are fixed
+    def left_palm_reach(self):
+        if self.side != "left":
+            raise ValueError("left_palm_reach of a right planning model")
+        return self.palm_reach()
+
+    def arm_reach(self):
+        """Torso-frame (center, radius) bounding every planning-arm/hand sphere at any joint state.
+
+        Center is the first planning-arm joint origin; joints upstream of it are fixed
         in this torso-rooted model. By the triangle inequality a link origin lies
         within the summed joint-offset lengths from it, so radius is an upper
         bound (not a sample maximum) including sphere offsets, radii and buffer.
         """
-        center, bounds = self._left_arm_link_bounds()
+        center, bounds = self._arm_link_bounds()
         moving = [index for index, link in enumerate(self.sphere_links) if link in bounds]
         radius = max(
             bounds[self.sphere_links[index]] + np.linalg.norm(self.local[index, :3]) + self.local[index, 3]
@@ -161,19 +184,19 @@ class RobotSphereModel:
         )
         return center.copy(), float(radius)
 
-    def left_palm_reach(self):
+    def palm_reach(self):
         """Torso-frame (center, radius) bounding the R_palm origin at any joint state.
 
-        Same triangle-inequality bound as left_arm_reach, for the palm frame
+        Same triangle-inequality bound as arm_reach, for the palm frame
         that grasp goals are expressed in. A goal outside it has no IK solution.
         """
-        center, bounds = self._left_arm_link_bounds()
+        center, bounds = self._arm_link_bounds()
         return center, float(bounds["R_palm"])
 
-    def _left_arm_link_bounds(self):
+    def _arm_link_bounds(self):
         """Shoulder center and, per moving link, a bound on its origin's distance from it."""
         joints = {joint["child"]: joint for joint in self.joints}
-        shoulder = next(joint for joint in self.joints if joint["name"] == LEFT_ARM[0])
+        shoulder = next(joint for joint in self.joints if joint["name"] == self.arm[0])
         transform, link = np.eye(4), shoulder["parent"]
         while link != self.base:
             joint = joints[link]
@@ -196,25 +219,25 @@ class RobotSphereModel:
                     pending.append(child)
         return center.copy(), bounds
 
-    def spheres(self, feedback, positions, *, right=None, head=None, hand=None):
-        """Torso-frame spheres ``(N, S, 4)`` for N left-arm states, and whether each
+    def spheres(self, feedback, positions, *, other=None, head=None, hand=None):
+        """Torso-frame spheres ``(N, S, 4)`` for N planning-arm states, and whether each
         state is inside every joint's limits.
 
-        The right arm and head come from ``feedback`` unless given (per state or
-        shared); the hand from ``feedback.left_hand`` unless ``hand`` gives a native
+        The other arm and head come from ``feedback`` unless given (per state or
+        shared); the hand from ``feedback.hand(side)`` unless ``hand`` gives a native
         (10,) pose or one per state. ``last_link_frames`` keeps the link frames.
         """
         q = np.asarray(positions, dtype=float)
         if q.ndim != 2 or q.shape[1] != 7 or not len(q) or not np.isfinite(q).all():
-            raise ValueError("Finite Nx7 left-arm positions required")
+            raise ValueError(f"Finite Nx7 {self.side}-arm positions required")
         body_columns = [q]
         for names, vector in (
-            (RIGHT_ARM, feedback.vector(RIGHT_ARM) if right is None else right),
+            (self.other_arm, feedback.vector(self.other_arm) if other is None else other),
             (HEAD, feedback.vector(HEAD) if head is None else head),
         ):
             vector = np.asarray(vector, float)
             if vector.shape not in ((len(names),), (len(q), len(names))) or not np.isfinite(vector).all():
-                raise ValueError("Invalid right-arm/head state")
+                raise ValueError("Invalid other-arm/head state")
             if vector.ndim == 1:
                 vector = np.broadcast_to(vector, (len(q), len(names)))
             else:
@@ -222,7 +245,7 @@ class RobotSphereModel:
             body_columns.append(vector)
         n = len(q)
         if hand is None:
-            hand = feedback.left_hand
+            hand = feedback.hand(self.side)
         hand = np.asarray(hand, float)
         if hand.ndim == 1:
             alias = self.mapping.kinematic_alias(hand)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -150,3 +151,37 @@ def test_an_arm_stream_without_both_arms_is_refused(gravity):
 
     with pytest.raises(ValueError, match="does not carry"):
         x2_arm_executor(Partial(), gravity=gravity)
+
+
+def test_the_right_arm_streams_with_its_own_gravity_limits_and_mirrored_home():
+    from aimdk_grasp.arm_stream import home_command
+    from aimdk_grasp.joints import ARM_MIRROR_SIGNS
+    from aimdk_grasp.robot_model import config_directory
+
+    left, right = ArmGravity.load(), ArmGravity.load(side="right")
+    assert (right.side, right.joints, right.kp) == ("right", RIGHT_ARM, left.kp)
+    # The right chain is the official description's, like the left one's.
+    robot = ET.parse(description_share() / BODY_URDF).getroot()
+    for link, name in zip(right.chain, RIGHT_ARM, strict=True):
+        joint = robot.find(f"joint[@name='{name}']")
+        np.testing.assert_allclose(np.fromstring(joint.find("origin").get("xyz"), sep=" "), link["xyz"])
+    # Mirror poses sag as mirror images, up to the left fit's torso roll and the description's asymmetry.
+    positions = np.linspace(START, APPROACH, 10)
+    np.testing.assert_allclose(
+        right.sags(positions * ARM_MIRROR_SIGNS), left.sags(positions) * ARM_MIRROR_SIGNS, atol=0.01
+    )
+    config = x2_stream_config(side="right")
+    assert config.limits == {name: arm_limits(config_directory("right"))[name] for name in RIGHT_ARM}
+    assert config.locked_joints == LEFT_ARM + HEAD
+    assert config.home_command == home_command("right")
+    np.testing.assert_allclose(
+        [home_command("right")[name] for name in RIGHT_ARM], [HOME_COMMAND[n] for n in LEFT_ARM] * ARM_MIRROR_SIGNS
+    )
+    assert home_command("left") == HOME_COMMAND
+    with pytest.raises(ValueError, match="seven right arm joints"):
+        GravityShaper(right).raise_for(LEFT_ARM, positions)
+    io = SimpleNamespace(channel_joints=LEFT_ARM + RIGHT_ARM)
+    with pytest.raises(ValueError, match="left arm gravity model cannot shape the right"):
+        x2_arm_executor(io, gravity=left, side="right")
+    worst = require_executable({"approach": positions * ARM_MIRROR_SIGNS}, arm_limits(config_directory("right")), right)
+    assert 0 < worst < MAX_SAG_RAD

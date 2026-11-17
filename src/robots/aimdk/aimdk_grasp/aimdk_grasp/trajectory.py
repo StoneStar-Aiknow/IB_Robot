@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .joints import LEFT_ARM
+from .joints import LEFT_ARM, RIGHT_ARM
 
 
 @dataclass(frozen=True)
@@ -16,8 +16,12 @@ class TimedTrajectory:
     def __post_init__(self):
         times = np.array(self.times, dtype=np.float64, copy=True)
         positions = np.array(self.positions, dtype=np.float64, copy=True)
-        if times.ndim != 1 or tuple(self.joint_names) != LEFT_ARM or positions.shape != (len(times), 7):
-            raise ValueError("Trajectory must command only the seven left arm joints")
+        if (
+            times.ndim != 1
+            or tuple(self.joint_names) not in (LEFT_ARM, RIGHT_ARM)
+            or positions.shape != (len(times), 7)
+        ):
+            raise ValueError("Trajectory must command only the seven joints of one arm")
         if len(times) < 2 or times[0] != 0 or np.any(np.diff(times) <= 0):
             raise ValueError("Times must start at zero and strictly increase")
         if not np.isfinite(times).all() or not np.isfinite(positions).all():
@@ -74,7 +78,9 @@ class TimedTrajectory:
         return TimedTrajectory(self.times[-1] - self.times[::-1], self.positions[::-1], self.joint_names)
 
     @classmethod
-    def from_curobo(cls, result, interpolation_dt, *, locked_positions=None):
+    def from_curobo(cls, result, interpolation_dt, *, locked_positions=None, arm=LEFT_ARM):
+        """The planned ``arm`` (seven joints) of a cuRobo result; every other joint must stay at its lock."""
+        arm = tuple(arm)
         if (
             result is None
             or result.success is None
@@ -86,17 +92,17 @@ class TimedTrajectory:
         plan = result.get_interpolated_plan()
         names = tuple(plan.joint_names)
         locked_positions = {} if locked_positions is None else locked_positions
-        if len(set(names)) != len(names) or not set(LEFT_ARM) <= set(names):
+        if len(set(names)) != len(names) or not set(arm) <= set(names):
             raise ValueError("Unexpected cuRobo planned joints")
         q = plan.position.detach().cpu().numpy()
         while q.ndim > 2 and q.shape[0] == 1:
             q = q[0]
         if q.ndim != 2 or q.shape[1] != len(names) or not np.isfinite(q).all():
             raise ValueError("Invalid cuRobo trajectory dimensions or values")
-        for name in set(names) - set(LEFT_ARM):
+        for name in set(names) - set(arm):
             if name not in locked_positions or not np.allclose(
                 q[:, names.index(name)], locked_positions[name], atol=1e-6, rtol=0
             ):
                 raise ValueError(f"Unexpected motion or unknown locked joint: {name}")
-        q = q[:, [names.index(n) for n in LEFT_ARM]]
-        return cls(np.arange(len(q)) * interpolation_dt, q)
+        q = q[:, [names.index(n) for n in arm]]
+        return cls(np.arange(len(q)) * interpolation_dt, q, arm)

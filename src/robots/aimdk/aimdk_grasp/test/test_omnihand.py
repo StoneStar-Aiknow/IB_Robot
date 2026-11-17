@@ -10,15 +10,17 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from aimdk_grasp.hand import HandMapping
-from aimdk_grasp.joints import LEFT_HAND
+from aimdk_grasp.joints import HAND_SIGNS, LEFT_HAND
 from aimdk_grasp.omnihand import (
     CONTACT_LAG_RAD,
     FINGERS,
     GRIP_LOST_S,
     HAND_HZ,
+    IDLE_DUMMY,
     RIGHT_DUMMY,
     OmniHandEffector,
     left_touch_levels,
+    touch_levels,
 )
 from aimdk_grasp.robot_model import planning_model
 from test_hand import PRESETS, RELEASE
@@ -290,3 +292,73 @@ def test_touch_readings_older_than_a_frame_or_two_are_not_contact():
     assert io.touch() == {"thumb": 120.0}
     clock[0] += TOUCH_MAX_AGE_S + 0.01
     assert io.touch() is None
+
+
+class RightSimHand(SimHand):
+    """The same simulated hand in the right slots of the 20-value stream."""
+
+    def feedback(self):
+        received_at = self.feedback_received_at - (1.0 if self.stale else 0.0)
+        return JointSample(received_at, dict(zip(self.channel_joints[len(LEFT_HAND) :], self.measured, strict=True)))
+
+    def publish(self, positions):
+        assert len(positions) == 20 and tuple(positions[:10]) == IDLE_DUMMY
+        self.published.append(np.array(positions[10:]))
+        self.command = np.array(positions[10:])
+
+
+@pytest.fixture(scope="module")
+def right_mapping():
+    from aimdk_grasp.robot_model import config_directory
+
+    return HandMapping(planning_model(config_directory("right")), PRESETS, side="right")
+
+
+def test_the_right_hand_opens_and_grips_in_its_own_slots(right_mapping):
+    hand = RightSimHand(np.asarray(RELEASE) * HAND_SIGNS)
+    effector = OmniHandEffector(hand, right_mapping)
+    assert act(effector, EffectorAction.PRESHAPE).succeeded
+    np.testing.assert_allclose(hand.measured, right_mapping.preset("open"), atol=0.025)
+    close, open_hand = right_mapping.preset("close"), right_mapping.preset("open")
+    for finger in ("thumb", "ring"):
+        flex = FINGERS[finger][1]
+        hand.block(finger, open_hand[flex] + 0.5 * (close[flex] - open_hand[flex]))
+    outcome = act(effector, EffectorAction.CLOSE)
+    assert outcome.succeeded and outcome.held is True
+    assert {"thumb", "ring"} <= set(outcome.report["contacts"])
+    assert effector.holding() == ""
+
+
+def test_the_right_hand_state_is_read_from_its_half_of_the_runtime_view(right_mapping):
+    description = build_description(load_profile(os.fspath(PROFILE)), use_sim=True)
+    interfaces = description["interfaces"]
+    stream_names = tuple(interfaces["joint.hand_stream"]["joint_names"])
+    state_names = tuple(interfaces["joint.hand_state"]["joint_names"])
+    binding = bind_stream(
+        description,
+        stream="joint.hand_stream",
+        feedback=["joint.hand_state"],
+        feedback_names=dict(zip(stream_names, state_names, strict=True)),
+    )
+    stream = RosStreamIO.__new__(RosStreamIO)
+    stream.binding = binding
+    stream._subscriptions = SimpleNamespace(drain=lambda: None)
+    stream._lock = threading.Lock()
+    right = np.asarray(RELEASE) * HAND_SIGNS
+    stream._views = {"joint.hand_state": (10.0, dict(zip(state_names, [*RELEASE, *right], strict=True)))}
+
+    hand = RightSimHand(right)
+    hand.channel_joints = stream_names
+    hand.feedback = stream.feedback
+    np.testing.assert_allclose(OmniHandEffector(hand, right_mapping)._measured(), right)
+
+
+def test_touch_levels_are_read_per_pad_of_either_hand():
+    from std_msgs.msg import Float64MultiArray, MultiArrayDimension
+
+    message = Float64MultiArray()
+    for label, values in (("left_thumb", [5]), ("right_thumb", [99, 98]), ("right_little_finger", [0, 31])):
+        message.layout.dim.append(MultiArrayDimension(label=label, size=len(values)))
+        message.data.extend(float(value) for value in values)
+    assert touch_levels(message, "right") == {"thumb": 99.0, "little_finger": 31.0}
+    assert touch_levels(message, "left") == left_touch_levels(message) == {"thumb": 5.0}
