@@ -248,7 +248,8 @@ class Status:
             public_arm_count=int(data.get("public_arm_count", 0)),
             public_arm_age_s=None if data.get("public_arm_age_s") is None else float(data["public_arm_age_s"]),
             arm_owner=None if data.get("arm_owner") is None else int(data["arm_owner"]),
-            cbf=dict(data.get("cbf") or {}),
+            # A malformed cbf section is read as no report; the rest of the status still counts.
+            cbf=dict(data["cbf"]) if isinstance(data.get("cbf"), dict) else {},
         )
 
 

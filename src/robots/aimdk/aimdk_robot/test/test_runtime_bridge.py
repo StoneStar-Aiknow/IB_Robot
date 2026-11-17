@@ -2609,6 +2609,47 @@ def test_an_enforcing_cbf_on_other_hands_refuses_mirroring_before_it_starts(monk
         harness.shutdown()
 
 
+def test_a_refusal_lasts_only_while_the_hands_do_not_match(monkeypatch):
+    """The right hand comes back after a refusal: the next request starts mirroring."""
+    decode = dataplane.Status.decode
+
+    def with_report(text):
+        status = decode(text)
+        # As an enforcing data plane would report it: the match follows the reported types.
+        report = {
+            "enabled": True,
+            "mode": "enforce",
+            "mirror_mode": "policy_stream",
+            "mapping_available": True,
+            "hands_installed": [True, True],
+            "hand_configuration_matches": status.hand_types == [1, 1],
+        }
+        return replace(status, cbf=report)
+
+    monkeypatch.setattr(dataplane.Status, "decode", staticmethod(with_report))
+    harness = Harness(
+        profile=OMNIHAND_PROFILE,
+        hand_type="dexterous",
+        right_hand_type="none",
+        initial_action="UPPERBODY_REMOTE_SPLIT",
+    )
+    try:
+        harness.wait_active()
+        refused = harness.set_mode("policy_stream")
+        assert not refused.success
+        assert "right hand expected 1 (nimble_hands), platform reports 0 (none)" in refused.message
+        harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="dexterous")])
+        harness.wait_for(
+            lambda: harness.runtime._dataplane.cbf.get("hand_configuration_matches"),
+            "the data plane to report matching hands",
+        )
+        response = harness.set_mode("policy_stream")
+        assert response.success, response.message
+        assert harness.status().active_mode == "policy_stream"
+    finally:
+        harness.shutdown()
+
+
 def test_a_view_fed_by_stamped_and_unstamped_groups_still_publishes():
     """A view carries the oldest stamp among its groups, whether the platform stamped them or not.
 

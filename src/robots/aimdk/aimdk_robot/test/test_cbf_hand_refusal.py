@@ -100,3 +100,13 @@ def test_status_carries_the_cbf_report():
     assert dataplane.cbf_hand_refusal(status.cbf, MIRROR, status.hand_types)
     # Control: a status without a cbf section decodes to an empty report.
     assert dataplane.Status.decode(json.dumps({"at": 1.0})).cbf == {}
+
+
+def test_a_malformed_cbf_section_does_not_drop_the_status():
+    for cbf in ("enforce", 5, [["mode", "enforce"]], [1, 2]):
+        status = dataplane.Status.decode(json.dumps({"at": 1.0, "control_seq": 7, "hand_types": [1, 0], "cbf": cbf}))
+        assert status.cbf == {}, cbf
+        assert (status.control_seq, status.hand_types) == (7, [1, 0])
+    # Control: a well-formed section in the same status is kept.
+    status = dataplane.Status.decode(json.dumps({"at": 1.0, "control_seq": 7, "cbf": report()}))
+    assert status.cbf == report()

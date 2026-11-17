@@ -561,8 +561,10 @@ private:
     } else {
       ++log_no_distance_frames_;
     }
+    publish(decision.output);
     // Start, end and every second of a period published without verification.
     // Observation only: a long release is a CBF criterion to fix, not to act on.
+    // Logged after the command is out, so the WARN never delays it.
     if (d.releasing != was_releasing || (d.releasing && release_at - last_release_log_s_ >= 1.0)) {
       RCLCPP_WARN(
         get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu reason=%s",
@@ -571,7 +573,6 @@ private:
         d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released), d.reason.c_str());
       last_release_log_s_ = release_at;
     }
-    publish(decision.output);
     core_.remember_arm_output(decision.output);
     cbf_->committed(decision, monotonic_s());
     const double ended = monotonic_s();
