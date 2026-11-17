@@ -6,7 +6,8 @@ right's in ``RIGHT_HAND`` order). The grasping hand (its :class:`HandMapping`'s
 side) takes its ten slots; the other hand holds its fresh measured pose from
 the first command until the goal finishes. Missing or non-finite feedback of
 that hand refuses further output; its drift from the recorded pose is only
-reported (``report["preserved_hand"]["max_drift_rad"]``). The
+reported (``report["preserved_hand"]["max_drift_rad"]``). A hand that is not installed is not
+preserved: its slots carry ``joints.ABSENT_HAND_COMMAND``. The
 last command is kept alive between actions, so the hand holds its target while
 the arm moves; after a goal the stream is released and the platform keeps the
 last hand target.
@@ -33,7 +34,7 @@ from manipulation_execution.pick.pipeline.streaming import JointSample, received
 from manipulation_execution.shared.contracts import EffectorAction, EffectorOutcome, Flag
 
 from .hand import OPEN_HAND_TOLERANCE_RAD, HandMapping
-from .joints import HAND_PARTS, check_side, other_side
+from .joints import ABSENT_HAND_COMMAND, HAND_PARTS, check_side, other_side
 
 HAND_HZ = 50.0
 HAND_STEP_RAD = 0.01
@@ -117,6 +118,9 @@ class OmniHandEffector:
     io: HandIO
     mapping: HandMapping
     feedback_max_age_s: float = 0.1
+    #: The other hand is not installed (``backend_options.installed_hands``): its
+    #: slots carry ``ABSENT_HAND_COMMAND`` and its feedback is never read.
+    absent_other: bool = False
     command: np.ndarray | None = None
     report: dict = field(default_factory=dict)
     #: The last close's grip while it is held: contact fingers, frozen command, closing direction.
@@ -300,19 +304,26 @@ class OmniHandEffector:
         preserved_side = other_side(self.mapping.side)
         other_offset = HAND_OFFSETS[preserved_side]
         other_joints = self.io.channel_joints[other_offset : other_offset + len(HAND_PARTS)]
-        try:
-            other = np.asarray([sample.positions[name] for name in other_joints], dtype=float)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise _Failed(f"invalid preserved hand feedback: {exc}") from None
-        if other.shape != (len(HAND_PARTS),) or not np.isfinite(other).all():
-            raise _Failed("ten finite preserved hand positions required")
-        if self._preserved_hand is None:
-            self._preserved_hand = other.copy()
-            self.report["preserved_hand"] = dict(side=preserved_side, positions=other.tolist(), max_drift_rad=0.0)
-        # Drift is recorded, not refused: the other hand does not gate this one.
-        preserved = self.report["preserved_hand"]
-        drift = float(np.max(np.abs(other - self._preserved_hand)))
-        preserved["max_drift_rad"] = max(preserved["max_drift_rad"], drift)
+        if self.absent_other:
+            # Not installed: nothing to measure or preserve, and whatever the HAL
+            # reports for it (it reports both hands) does not gate this hand.
+            if self._preserved_hand is None:
+                self._preserved_hand = np.array(ABSENT_HAND_COMMAND)
+                self.report["preserved_hand"] = dict(side=preserved_side, installed=False)
+        else:
+            try:
+                other = np.asarray([sample.positions[name] for name in other_joints], dtype=float)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise _Failed(f"invalid preserved hand feedback: {exc}") from None
+            if other.shape != (len(HAND_PARTS),) or not np.isfinite(other).all():
+                raise _Failed("ten finite preserved hand positions required")
+            if self._preserved_hand is None:
+                self._preserved_hand = other.copy()
+                self.report["preserved_hand"] = dict(side=preserved_side, positions=other.tolist(), max_drift_rad=0.0)
+            # Drift is recorded, not refused: the other hand does not gate this one.
+            preserved = self.report["preserved_hand"]
+            drift = float(np.max(np.abs(other - self._preserved_hand)))
+            preserved["max_drift_rad"] = max(preserved["max_drift_rad"], drift)
         if self.mapping.side == "left":
             self.io.publish([*hand.tolist(), *self._preserved_hand.tolist()])
         else:

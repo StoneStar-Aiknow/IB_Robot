@@ -96,6 +96,12 @@ def other_side(side: str) -> str:
     return "right" if check_side(side) == "left" else "left"
 
 
+#: Zero placeholders for an explicitly absent hand in the fixed 20-value
+#: command stream. These slots never stand in for measured feedback.
+ABSENT_HAND_COMMAND = np.zeros(len(HAND_PARTS))
+ABSENT_HAND_COMMAND.setflags(write=False)
+
+
 def swap_side_name(name: str) -> str:
     """``left_*`` <-> ``right_*``; other names unchanged."""
     if name.startswith("left_"):

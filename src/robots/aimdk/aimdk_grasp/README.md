@@ -42,6 +42,46 @@ HAL leaves `meas_stamp` zero), so joint states and images are compared within on
 clock domain, as in the standalone pipeline; the nearest sample is at most 10 ms
 from the image.
 
+### Removed hands
+
+Declare the mounted hands explicitly in `grasp_execution.backend_options` on
+both the pipeline host and the grasp-head host. For a robot with only the right
+OmniHand mounted:
+
+```yaml
+grasp_execution:
+  backend_options:
+    installed_hands: [right]
+    arm_side: right
+```
+
+The default is `[left, right]`. A single mounted hand requires its own explicit
+`arm_side`; `auto` requires both hands, and an `arm_side` naming a hand that is
+not installed is a configuration error.
+
+Feedback must contain every joint of each declared hand. Missing or partial
+feedback for a declared hand is refused. The vendor HAL reports both hands
+whether or not one is mounted, so whatever it reports for a hand declared
+absent is ignored and never gates the other hand. A runtime `none` report is
+never used to infer physical removal. The fixed 20-value stream keeps ten zero placeholders for an
+absent hand; these are output slots, never invented measurements or a substitute
+for feedback.
+
+When neither hand is mounted, disable `grasp_execution.enabled`. The mounting
+parser accepts `installed_hands: []`, and `FeedbackHistory(required_hands=())`
+subscribes only to body/head feedback and runtime health. Enabling grasp
+execution with no installed hands is an explicit configuration error.
+
+The runtime's transport-health checks still apply. If the vendor publishes no
+hand-state messages at all, the handless deployment's runtime profile must also
+set `vendor.feedback.required_groups: [arm]`. Keep the arm/head fault checks and
+the normal `[arm, hand]` freshness requirement whenever a hand is mounted. An
+empty hand-joint view and a failed runtime transport are separate conditions.
+
+Changing these settings requires matching configuration on both hosts and a
+restart of the affected nodes. Mock checks do not establish hardware approval
+for a new right-hand grasp deployment.
+
 ## Planning model
 
 `aimdk_grasp.planning_model.build_planning_model()` generates the planning URDF

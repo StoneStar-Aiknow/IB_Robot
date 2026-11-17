@@ -49,6 +49,23 @@ def test_options_default_to_the_x2_deployment_and_refuse_what_they_do_not_know()
         _options({"backend_options": {"arm_side": "both"}})
 
 
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_grasp_side_must_have_an_explicitly_installed_hand(side):
+    options = {"installed_hands": [side], "arm_side": side}
+    assert _options({"backend_options": options})["installed_hands"] == [side]
+    for arm_side in ("auto", "right" if side == "left" else "left"):
+        with pytest.raises(ValueError, match="arm_side"):
+            _options({"backend_options": {**options, "arm_side": arm_side}})
+    with pytest.raises(ValueError, match="at least one installed hand"):
+        _options({"backend_options": {"installed_hands": []}})
+
+
+@pytest.mark.parametrize("value", ["right", None, ["left", "left"], ["other"]])
+def test_mounting_configuration_cannot_be_mistyped_or_duplicated(value):
+    with pytest.raises(ValueError, match="installed_hands"):
+        _options({"backend_options": {"installed_hands": value}})
+
+
 def test_the_x2_backends_refuse_a_configuration_that_names_no_model_deployment():
     """The shared aimdk_x2_grasp names none; only a host deployment (CUDA or 310P) does."""
     from aimdk_grasp.backend import x2_robot
