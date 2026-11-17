@@ -371,9 +371,12 @@ say (`execution_watch.WatchState`) decides what `watch: stop` does:
 |---|---|---|
 | stable | the newest fresh frame reads the target where it was planned | go on |
 | moved | the votes decided the target moved | halt, retrace, plan again (`TARGET_MOVED`) |
-| unknown | frames arrive but do not decide (the hand covers the target) | go on for `watch_unknown_timeout_s`, then stop in place (`WATCH_FAILED`) |
+| unknown | frames arrive but do not decide (the hand covers the target) | go on for `watch_unknown_timeout_s` (`watch_occluded_timeout_s` in the `grasp` step while the newest frame is undecided only because the arm covers the target), then stop in place (`WATCH_FAILED`) |
 | unavailable | not started, stopped, or no fresh frame for `watch_frame_timeout_s` | refuse to start; mid-way stop in place (`WATCH_FAILED`) |
 | waiting / ended | before the approach / from the close on, or `watch: off` | nothing is judged |
+
+A frame votes moved only when both its measured depth and its RGB changed over
+their limits; depth alone misreads next to the closing hand.
 
 A failed watch is not a move: nothing says where the target is, so the arm is
 held where it halted and nothing is retraced, replanned or released. When the

@@ -120,6 +120,7 @@ def test_the_shared_grasp_names_no_models_and_runs_the_pipeline_beside_them_with
     assert options["head"]["cpu_isolation"] == {"node": "4-7", "others": "1-3"}
     assert options["watch"] == "stop" and options["head"]["status_timeout_s"] == 1.0
     assert (options["watch_frame_timeout_s"], options["watch_unknown_timeout_s"]) == (1.0, 4.0)
+    assert options["watch_occluded_timeout_s"] == 8.0
     assert grasp["pipeline"]["release_after_success"] is True
 
 

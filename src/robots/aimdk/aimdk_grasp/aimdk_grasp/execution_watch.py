@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import enum
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -104,11 +105,19 @@ class WatchTimeouts:
       no IMU orientation) stayed undecided for 9.4 s.
     - ``image_age_s``: an image older than this when the watch takes it is not
       fresh. Ages were 0.17 s (p50), 0.24 s (p99), 0.34 s at most.
+    - ``occluded_s``: replaces ``unknown_s`` in the grasp segment while the
+      newest frame is undecided only because the arm covers the target
+      (:func:`covered_by_the_arm`); never shorter than ``unknown_s``. The
+      second X2 (2026-11-10, 19 armed watches) hid the target 3.1-3.9 s in 8
+      runs that went on to hold it, and 3 more were stopped at 4.0-4.1 s, so
+      how long the cover lasts there is not known yet; a target taken away
+      meanwhile is still found by the grip check after the close.
     """
 
     frame_s: float = 1.0
     unknown_s: float = 4.0
     image_age_s: float = 0.5
+    occluded_s: float = 8.0
 
     def __post_init__(self):
         for name, value in vars(self).items():
@@ -128,12 +137,35 @@ class WatchStatus:
     reason: str = ""
 
 
+#: The segment in which the hand is meant to cover the target on its way to it.
+OCCLUDING_PHASE = "grasp"
+_COVERED = re.compile(r"target \d+% visible")
+
+
+def covered_reason(visible_fraction: float) -> str:
+    """Why a frame is undecided when too little of the target is left once the robot's pixels are taken out."""
+    return f"target {visible_fraction:.0%} visible"
+
+
+def covered_by_the_arm(reason: str) -> bool:
+    """Whether ``reason`` (a WatchStatus's, also as received from the head) is the arm covering the target."""
+    return _COVERED.fullmatch(reason or "") is not None
+
+
+def unknown_limit(status: WatchStatus, timeouts: WatchTimeouts) -> float:
+    """How long ``status`` may stay undecided."""
+    if status.phase == OCCLUDING_PHASE and covered_by_the_arm(status.reason):
+        return max(timeouts.unknown_s, timeouts.occluded_s)
+    return timeouts.unknown_s
+
+
 def watch_failure(status: WatchStatus, timeouts: WatchTimeouts) -> str | None:
     """Why a watch in ``status`` no longer vouches for the target, or None while it does (or need not)."""
     if status.state is WatchState.UNAVAILABLE:
         return f"watch unavailable: {status.reason}"
-    if status.state is WatchState.UNKNOWN and status.unknown_s > timeouts.unknown_s:
-        return f"target not observable for {status.unknown_s:.1f} s (over {timeouts.unknown_s:g} s): {status.reason}"
+    limit = unknown_limit(status, timeouts)
+    if status.state is WatchState.UNKNOWN and status.unknown_s > limit:
+        return f"target not observable for {status.unknown_s:.1f} s (over {limit:g} s): {status.reason}"
     return None
 
 
@@ -388,7 +420,7 @@ class X2TargetWatch:
         if record.get("vote") == "moved":
             return "a frame voted moved"
         if "visible_fraction" in record:
-            return f"target {record['visible_fraction']:.0%} visible"
+            return covered_reason(record["visible_fraction"])
         return "no frame compared yet"
 
     def moved(self) -> str | None:
