@@ -49,7 +49,7 @@
    2. 全局停止：`StopRuntime` 或切到 idle 模式。
 6. 已交给平台的一拍不能撤回，取消从下一拍生效。
 7. 一次运动按请求速度需要的拍数超过 `max_motion_ticks` 时直接拒绝（REJECTED，不推进任何拍），不压缩轨迹，所以不会比请求的速度快。
-8. 客户端启动前清除 ROS 与 venv 环境变量（`run_eval_client.sh` 白名单重启），避免 3.10 包进入 conda 解释器。
+8. 客户端启动前清除父 shell 的 ROS 与 venv 环境变量（`run_eval_client.sh` 白名单重启）。下游会再次激活 Conda；激活钩子、环境配置和 `.pth` 仍可能引入其他路径。激活前的 `print-env` 不能证明最终 Isaac 解释器已隔离，检查方法见[操作手册第 4 节](../src/robots/robodojo/robodojo_robot/README.md#4-检查仿真侧环境)。
 9. 运行时回答 reset 后，客户端把 RoboDojo ws 客户端的重连预算收紧到 30 s（`IBROBOT_RUNTIME_RECONNECT_S`，在白名单里，可从启动环境传入；只改本次会话的配置对象，不改 RoboDojo 仓）。
 10. 客户端向运行时的调用被拒绝或断联时，客户端立即停止调用 `take_action`，写 `interrupted` 工件（无判分），把该局标为 unstable，RoboDojo 不计分也不保留视频。
 11. 局结束前，客户端上传最后一拍后的观测，所以会话结束事件的 `ticks` 等于平台的 `take_action_cnt`（另记 `platform_ticks`）。
@@ -91,20 +91,16 @@
 
 ## 6. 运行方法
 
-```bash
-export ROBODOJO_ROOT=<RoboDojo checkout>
-./scripts/build.sh --agent
-./scripts/build.sh --packages-select task_dispatch robot_runtime_sim robodojo_robot agent_eval agent_eval_robodojo
-# 运行时单独冒烟（另一个终端运行 RoboDojo 客户端）
-ros2 launch robodojo_robot runtime.launch.py profile:=arx_x5_dual
-TASK=general_pickup EVAL_NUM=1 bash install/share/robodojo_robot/robodojo_client/run_eval_client.sh
-python3 src/robot_runtime_sim/scripts/direct_control_smoke.py --group right_arm --out smoke.json --finish
-# 完整 Agent 评测（模型地址与密钥变量名用 --override 在运行时提供）
-ros2 run agent_eval run_suite --suite robodojo_general_pickup_smoke --out runs \
-  --override embodied.agent.planner.base_url=<endpoint> --override embodied.agent.planner.api_key_env=<VAR>
-```
+安装、资产下载、构建和操作步骤只维护在 [RoboDojo 首次使用手册](../src/robots/robodojo/robodojo_robot/README.md)。
+先阅读依赖与许可，再选择无模型运行时冒烟或 Agent 单局评测。
+手册分别说明 ROS/Conda 环境、三个手动终端、端口与 ROS 域、结果判读、停止和排障。
+不要把架构说明当成安装完成的证明。
 
-`robodojo_general_pickup_e2` 套件用 MR !551 E2 的 3 个布局（9001、9002、9012）各 10 局和同样的六个抓取技能。它的 25/30 不能作为这里的参照：那时的驱动还逐步给 Agent 写执行反馈、复核 DONE。每次运行的目录里有 `report.json`、`canonical/`（`run_manifest.json`、`episodes.jsonl`、`summary.json`）、每局记录、各进程日志、派生的 robot_config 和 profile 副本。
+`robodojo_general_pickup_smoke` 使用 `9001` 布局集合的 1 局。
+`robodojo_general_pickup_e2` 使用 `9001`、`9002`、`9012` 三个集合，各 10 局。
+仓库不提供这些集合的分发或生成步骤，也未证明上游标准资产包含它们；缺失时停止评测。
+每次 suite 输出包括 `report.json`、`canonical/`、逐局记录、进程日志、派生 robot_config 和 runtime profile 副本。
+原生视频和桥接工件的准确路径见报告，不靠目录时间推测。
 
 ## 7. 限制
 

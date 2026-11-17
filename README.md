@@ -6,6 +6,8 @@ IB-Robot 贯通遥操作、数据采集、模型训练、边端协同推理、�
 
 **[用户指导文档](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)** · **[机器人配置](src/robot_config/README.md)** · **[推理运行时](src/inference_service/README.md)** · **[Agent 技能入口](src/agent/robot_skill_cli/README.md)** · **[开发与测试](docs/testing.md)**
 
+**可选：[RoboDojo 首次使用手册](src/robots/robodojo/robodojo_robot/README.md)** — 外部仿真环境与资产准备、无模型运行时冒烟、Agent 单局评测。普通 IB-Robot 用户无需下载 RoboDojo 资产；项目 setup 不会代装该仿真环境。
+
 ## 项目能力
 
 | 方向 | 核心能力 |
