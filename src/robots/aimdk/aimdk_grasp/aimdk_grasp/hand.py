@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_PARTS, check_side, hand_alias_signs
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_PARTS, check_side, hand_alias_signs, hand_joints
 
 #: How far (rad) a measured joint may be from the open preset and still count
 #: as open: before planning a grasp, after opening and on release.
@@ -22,6 +22,39 @@ THUMB_ABAD_OPEN_TOLERANCE_RAD = 0.1
 OPEN_TOLERANCES_RAD = np.full(len(HAND_PARTS), OPEN_HAND_TOLERANCE_RAD)
 OPEN_TOLERANCES_RAD[HAND_PARTS.index("thumb_abad")] = THUMB_ABAD_OPEN_TOLERANCE_RAD
 OPEN_TOLERANCES_RAD.setflags(write=False)
+
+
+#: Round-off allowed past a native URDF limit; not a feedback tolerance.
+LIMIT_SLACK_RAD = 1e-6
+
+
+class HandLimitError(ValueError):
+    """Native hand positions beyond the planning model's limits, and by how much.
+
+    The message keeps the "<Side> hand exceeds native URDF limits" prefix and
+    adds every offending joint and the complete vector, so a refusal can be
+    told apart (real overtravel, boundary jitter, mapping or model mismatch)
+    from the log alone. ``violations`` holds ``(joint, index, value, lower,
+    upper, excess)`` per offending joint, ``excess`` > 0 in rad.
+    """
+
+    def __init__(self, side: str, native: np.ndarray, lower: np.ndarray, upper: np.ndarray):
+        joints = hand_joints(side)
+        self.side = side
+        self.native = np.array(native, dtype=np.float64)
+        self.violations = tuple(
+            (joints[i], i, float(q), float(lo), float(hi), float(max(lo - q, q - hi)))
+            for i, (q, lo, hi) in enumerate(zip(self.native, lower, upper, strict=True))
+            if q < lo - LIMIT_SLACK_RAD or q > hi + LIMIT_SLACK_RAD
+        )
+        detail = "; ".join(
+            f"{name}[{i}]={q:.6f} outside [{lo:.6f}, {hi:.6f}] by {excess:.6f} rad"
+            for name, i, q, lo, hi, excess in self.violations
+        )
+        vector = ", ".join(f"{q:.6f}" for q in self.native)
+        super().__init__(
+            f"{side.capitalize()} hand exceeds native URDF limits: {detail}; native ({', '.join(joints)}) = [{vector}]"
+        )
 
 
 def is_open(native, open_pose) -> bool:
@@ -98,8 +131,8 @@ class HandMapping:
         q = np.asarray(native, dtype=np.float64)
         if q.shape != (10,) or not np.isfinite(q).all():
             raise ValueError(f"Exactly ten finite active {self.side} joints required")
-        if np.any(q < self.lower - 1e-6) or np.any(q > self.upper + 1e-6):
-            raise ValueError(f"{self.side.capitalize()} hand exceeds native URDF limits")
+        if np.any(q < self.lower - LIMIT_SLACK_RAD) or np.any(q > self.upper + LIMIT_SLACK_RAD):
+            raise HandLimitError(self.side, q, self.lower, self.upper)
         return q
 
     def to_native(self, alias: Mapping[str, float]) -> np.ndarray:

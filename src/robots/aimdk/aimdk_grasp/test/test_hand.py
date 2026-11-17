@@ -7,8 +7,8 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
-from aimdk_grasp.hand import HandMapping, hand_links, load_gripper_presets
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES
+from aimdk_grasp.hand import HandLimitError, HandMapping, hand_links, load_gripper_presets
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, hand_joints
 from aimdk_grasp.planning_model import HAND_URDF, description_share
 from aimdk_grasp.robot_model import planning_model
 
@@ -118,3 +118,29 @@ def test_the_right_hand_is_mounted_natively_with_the_same_alias_presets():
             right.require_open(short)
     with pytest.raises(ValueError, match="side must be"):
         HandMapping(planning_model(), PRESETS, side="middle")
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_limit_refusal_names_each_joint_its_excess_and_the_vector(side):
+    from aimdk_grasp.robot_model import config_directory
+
+    mapping = HandMapping(planning_model(config_directory(side)), PRESETS, side=side)
+    q = mapping.preset("open").copy()
+    q[0] = mapping.lower[0] - 2e-6
+    q[3] = mapping.upper[3] + 0.01
+    with pytest.raises(HandLimitError) as exc:
+        mapping.check(q)
+    joints = hand_joints(side)
+    assert [(v[0], v[1]) for v in exc.value.violations] == [(joints[0], 0), (joints[3], 3)]
+    assert [v[5] for v in exc.value.violations] == pytest.approx([2e-6, 0.01], abs=1e-9)
+    message = str(exc.value)
+    assert message.startswith(f"{side.capitalize()} hand exceeds native URDF limits: {joints[0]}[0]=")
+    assert ", ".join(joints) in message and f"{q[3]:.6f}" in message
+    assert isinstance(exc.value, ValueError)  # existing ValueError handlers keep working
+
+
+def test_limit_slack_is_round_off_only():
+    mapping = HandMapping(planning_model(), PRESETS)
+    q = mapping.preset("open").copy()
+    q[0] = mapping.lower[0] - 0.5e-6
+    mapping.check(q)
