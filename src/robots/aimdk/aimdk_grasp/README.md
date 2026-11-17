@@ -260,10 +260,15 @@ command is kept alive between actions, so the hand holds its target while the
 arm moves; after a goal the stream is released and the platform keeps it.
 
 Preshape and release open along a straight line, 0.01 rad per 50 Hz frame, and
-wait up to 3 s for the fingers; a hand left more than 0.1 rad short of open is
-blocked. The close moves each finger on its own and freezes it at its first
-contact, a fingertip pad reading 30 or more or the flex joint 0.15 rad behind
-its command; the thumb and one more finger in contact is a grip. The hand's
+wait up to 3 s for the fingers. A hand still more than 0.1 rad short that holds
+nothing tries once more from its measured pose with the thumb cleared
+(`thumb_clear`: the thumb straightens out of the fingers' way, the fingers open,
+then the thumb comes in); a gripping hand only ever opens along the straight
+line. Still more than 0.1 rad short, the hand is blocked. Open means every joint
+within 0.025 rad of the open preset, the thumb abduction within 0.1 rad.
+
+The close moves each finger on its own and freezes it at its first contact, a
+fingertip pad reading 30 or more or the flex joint 0.15 rad behind its command; the thumb and one more finger in contact is a grip. The hand's
 fault codes are not used and the runtime does not publish them: a finger
 pressing an object reports one for as long as it grips. Open and close shapes
 come from the GraspGenX gripper description.

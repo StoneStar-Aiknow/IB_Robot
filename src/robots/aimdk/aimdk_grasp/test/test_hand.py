@@ -110,5 +110,11 @@ def test_the_right_hand_is_mounted_natively_with_the_same_alias_presets():
     short[1] = open_pose[1] + 0.12 * inward
     with pytest.raises(RuntimeError, match="Initial right hand is not open"):
         right.require_open(short)
+    # Every other joint keeps the 0.025 rad bound.
+    for joint in (0, 2, 4):
+        short = open_pose.copy()
+        short[joint] += 0.03 if open_pose[joint] + 0.03 <= right.upper[joint] else -0.03
+        with pytest.raises(RuntimeError, match="Initial right hand is not open"):
+            right.require_open(short)
     with pytest.raises(ValueError, match="side must be"):
         HandMapping(planning_model(), PRESETS, side="middle")
