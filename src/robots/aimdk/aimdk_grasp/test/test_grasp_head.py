@@ -145,8 +145,7 @@ def head(monkeypatch):
     monkeypatch.setattr(grasp_head, "x2_robot", lambda config: robot)
     monkeypatch.setattr(grasp_head, "head_parts", lambda node, robot, description, closers, on_moved: parts)
     monkeypatch.setattr(grasp_head, "check_initial_hand", lambda hand, admitted: None)
-    monkeypatch.setattr(grasp_head, "measured_spheres", lambda model, feedback: "measured spheres")
-    monkeypatch.setattr(grasp_head, "prepare_scene", lambda depth, *a, **k: ("prepared", k["robot_spheres_torso"]))
+    monkeypatch.setattr(grasp_head, "prepare_capture_scene", lambda observation, model, config: ("prepared", model))
     unsupported = threading.Event()
 
     def complete(prepared, mask, *, lazy_validation):
@@ -209,7 +208,7 @@ def test_captures_wait_for_the_warmup_and_start_their_scene(head):
     assert response.success and response.capture_id and response.rgb.header.frame_id == "optical"
     np.testing.assert_allclose(wire.decode_depth(response.depth), 0.8)
     assert parts.imu.events[-1] == ("pause_after", response.stamp_ns)
-    assert node._capture(response.capture_id).prepared.result(5.0) == ("prepared", "measured spheres")
+    assert node._capture(response.capture_id).prepared.result(5.0) == ("prepared", "spheres")
     node._ready.clear()
     refused = call(node._on_capture, CaptureGraspObservation, timeout_s=1.0)
     assert (refused.success, refused.error_code) == (False, NOT_READY)
