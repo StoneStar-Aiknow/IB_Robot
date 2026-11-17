@@ -239,7 +239,11 @@ non-verdict reason for a whole run against the same run without it.
 The status splits a tick's cost: `max_elapsed_us` (`max_filter_us` in the INFO
 line) is the filter, `max_after_check_us` is the part after the node's deadline check
 (publication, commit). An overrun there cannot be caused by the filter and
-holds no frame. All `max_*` values are maxima since start.
+holds no frame. All `max_*` values are maxima since start. The INFO line also
+prints `min_distance_m`, the smallest output distance among the frames verified
+since the previous line (`na` if none), with `distance_frames` and
+`no_distance_frames`; a held or released frame has no distance of its own and
+is only counted. Logging only.
 
 The status also reports `hand_configuration_matches`: the platform's hand types
 and hand state are the ones `hands_installed` describes. When CBF enforces,

@@ -19,6 +19,7 @@
 #include <chrono>
 #include <csignal>
 #include <cmath>
+#include <cstdio>
 #include <map>
 #include <limits>
 #include <memory>
@@ -552,6 +553,14 @@ private:
     const double release_at = monotonic_s();
     decision = cbf_->release_if_stuck(decision, snapshot, release_at);
     const auto & d = cbf_->diagnostics();
+    // For the INFO line only: the closest verified output since it last printed.
+    // A held or released frame has no distance of its own.
+    if (d.distance_valid) {
+      log_min_distance_m_ = std::min(log_min_distance_m_, d.minimum_distance_m);
+      ++log_distance_frames_;
+    } else {
+      ++log_no_distance_frames_;
+    }
     // Start, end and every second of a period published without verification.
     // Observation only: a long release is a CBF criterion to fix, not to act on.
     if (d.releasing != was_releasing || (d.releasing && release_at - last_release_log_s_ >= 1.0)) {
@@ -704,21 +713,35 @@ private:
           }
         }
       }
-      RCLCPP_INFO_THROTTLE(
-        get_logger(), *get_clock(), 2000,
-        "CBF status: mode=%s mirror_active=%s calls=%llu published=%llu geometry_modified=%llu "
-        "held=%llu withheld=%llu released=%llu thumb_feedback_frames=%llu "
-        "recovery_verified=%s hand_held=%s "
-        "budget_us=%.0f hand_us=%.0f verify_us=%.0f project_us=%.0f reuses=%llu "
-        "max_tick_us=%.0f max_filter_us=%.0f max_after_check_us=%.0f reason=%s",
-        cbf_->config().enforce ? "enforce" : "shadow", d.active ? "true" : "false",
-        static_cast<unsigned long long>(d.calls), static_cast<unsigned long long>(d.published),
-        static_cast<unsigned long long>(d.geometry_modified), static_cast<unsigned long long>(d.held),
-        static_cast<unsigned long long>(d.withheld), static_cast<unsigned long long>(d.released),
-        static_cast<unsigned long long>(d.thumb_feedback_frames), d.recovery_verified ? "true" : "false",
-        d.hand_held ? "true" : "false", d.available_budget_us, d.hand_check_us,
-        d.verification_us, d.projection_us, static_cast<unsigned long long>(d.verification_reuses),
-        d.max_tick_us, d.max_elapsed_us, d.max_after_check_us, d.reason.c_str());
+      // Every 2 s; the distance figures cover the frames since the previous line.
+      if (now_s - last_status_log_s_ >= 2.0) {
+        char min_distance[32] = "na";
+        if (log_distance_frames_ > 0) {
+          std::snprintf(min_distance, sizeof(min_distance), "%.4f", log_min_distance_m_);
+        }
+        RCLCPP_INFO(
+          get_logger(),
+          "CBF status: mode=%s mirror_active=%s calls=%llu published=%llu geometry_modified=%llu "
+          "held=%llu withheld=%llu released=%llu thumb_feedback_frames=%llu "
+          "recovery_verified=%s hand_held=%s "
+          "budget_us=%.0f hand_us=%.0f verify_us=%.0f project_us=%.0f reuses=%llu "
+          "max_tick_us=%.0f max_filter_us=%.0f max_after_check_us=%.0f "
+          "min_distance_m=%s distance_frames=%llu no_distance_frames=%llu reason=%s",
+          cbf_->config().enforce ? "enforce" : "shadow", d.active ? "true" : "false",
+          static_cast<unsigned long long>(d.calls), static_cast<unsigned long long>(d.published),
+          static_cast<unsigned long long>(d.geometry_modified), static_cast<unsigned long long>(d.held),
+          static_cast<unsigned long long>(d.withheld), static_cast<unsigned long long>(d.released),
+          static_cast<unsigned long long>(d.thumb_feedback_frames), d.recovery_verified ? "true" : "false",
+          d.hand_held ? "true" : "false", d.available_budget_us, d.hand_check_us,
+          d.verification_us, d.projection_us, static_cast<unsigned long long>(d.verification_reuses),
+          d.max_tick_us, d.max_elapsed_us, d.max_after_check_us, min_distance,
+          static_cast<unsigned long long>(log_distance_frames_),
+          static_cast<unsigned long long>(log_no_distance_frames_), d.reason.c_str());
+        last_status_log_s_ = now_s;
+        log_min_distance_m_ = std::numeric_limits<double>::infinity();
+        log_distance_frames_ = 0;
+        log_no_distance_frames_ = 0;
+      }
       if (d.last_thumb_feedback_event && d.last_thumb_feedback_event->event != logged_thumb_event_ &&
         (logged_thumb_event_ == 0 || now_s - last_thumb_event_log_s_ >= 2.0))
       {
@@ -831,6 +854,10 @@ private:
   uint64_t logged_thumb_event_ = 0;
   double last_thumb_event_log_s_ = 0.0;
   double last_release_log_s_ = 0.0;
+  double last_status_log_s_ = -std::numeric_limits<double>::infinity();
+  double log_min_distance_m_ = std::numeric_limits<double>::infinity();
+  uint64_t log_distance_frames_ = 0;
+  uint64_t log_no_distance_frames_ = 0;
   std::vector<rclcpp::CallbackGroup::SharedPtr> intake_groups_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   std::vector<std::pair<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr, std::vector<std::string>>> views_;
