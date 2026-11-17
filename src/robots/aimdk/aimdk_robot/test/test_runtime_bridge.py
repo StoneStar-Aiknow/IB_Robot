@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -2569,6 +2570,41 @@ def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
         assert not response.success
         assert "hand type mismatch" in response.message
         assert harness.status().lifecycle == "ACTIVE"
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize(("matches", "right_hand_type"), [(False, "none"), (True, "dexterous")])
+def test_an_enforcing_cbf_on_other_hands_refuses_mirroring_before_it_starts(monkeypatch, matches, right_hand_type):
+    """A right hand that dropped out (reports 0) under an enforcing CBF; the control has both hands."""
+    report = {
+        "enabled": True,
+        "mode": "enforce",
+        "mirror_mode": "policy_stream",
+        "mapping_available": True,
+        "hands_installed": [True, True],
+        "hand_configuration_matches": matches,
+    }
+    decode = dataplane.Status.decode
+    # The data plane under test runs no CBF; its status carries the report one enforcing it would.
+    monkeypatch.setattr(dataplane.Status, "decode", staticmethod(lambda text: replace(decode(text), cbf=report)))
+    harness = Harness(
+        profile=OMNIHAND_PROFILE,
+        hand_type="dexterous",
+        right_hand_type=right_hand_type,
+        initial_action="UPPERBODY_REMOTE_SPLIT",
+    )
+    try:
+        harness.wait_active()
+        response = harness.set_mode("policy_stream")
+        if matches:
+            assert response.success, response.message
+            assert harness.status().active_mode == "policy_stream"
+        else:
+            assert not response.success
+            assert "right hand expected 1 (nimble_hands), platform reports 0 (none)" in response.message
+            assert harness.status().active_mode != "policy_stream"
+            assert harness.status().lifecycle == "ACTIVE"
     finally:
         harness.shutdown()
 

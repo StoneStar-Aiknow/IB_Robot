@@ -275,7 +275,9 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     std::chrono::duration<double, std::micro>(config_.deadline_us));
   const auto deadline = snapshot.publication_deadline ?
     std::min(configured_deadline, *snapshot.publication_deadline) : configured_deadline;
+  int kernel_calls = 0;
   const auto remaining = [&]() {
+      if (kernel_call_limit_ >= 0 && kernel_calls >= kernel_call_limit_) {return 0.0;}
       return std::chrono::duration<double, std::micro>(deadline - Clock::now()).count();
     };
   if (snapshot.epoch != epoch_) {
@@ -467,6 +469,7 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       cfg.allow_airwall_recovery = true;
       const auto result = thumb_only ? x2::cbf::verify_thumb_target_with_arm_held(input, cfg) :
         (verify_only ? x2::cbf::verify_arm_target(input, cfg) : x2::cbf::filter_arm_target(input, cfg));
+      ++kernel_calls;
       const double cost = elapsed(call_start);
       if (thumb_only) {diagnostics_.hand_check_us += cost;}
       else if (verify_only) {diagnostics_.verification_us += cost;}
@@ -784,10 +787,12 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   return out;
 }
 
-void CbfSafety::tick_finished(double elapsed_us)
+void CbfSafety::tick_finished(double elapsed_us, double after_check_us)
 {
   diagnostics_.tick_us = elapsed_us;
   diagnostics_.max_tick_us = std::max(diagnostics_.max_tick_us, elapsed_us);
+  diagnostics_.after_check_us = after_check_us;
+  diagnostics_.max_after_check_us = std::max(diagnostics_.max_after_check_us, after_check_us);
   if (elapsed_us > config_.deadline_us) {++diagnostics_.publish_overruns;}
 }
 

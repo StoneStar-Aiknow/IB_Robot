@@ -141,6 +141,10 @@ struct CbfDiagnostics
   double max_elapsed_us = 0.0;
   double tick_us = 0.0;
   double max_tick_us = 0.0;
+  // The part of a tick after the node's deadline check (publication, commit):
+  // an overrun here cannot be caused by the filter and does not hold a frame.
+  double after_check_us = 0.0;
+  double max_after_check_us = 0.0;
   double available_budget_us = 0.0;
   double hand_check_us = 0.0;
   double verification_us = 0.0;
@@ -185,9 +189,11 @@ public:
   CbfDecision feedback_fallback(const CbfDecision & decision, const std::string & reason);
   // Last step before publication. Never applied to a collision refusal.
   CbfDecision release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now);
-  void tick_finished(double elapsed_us);
+  void tick_finished(double elapsed_us, double after_check_us = 0.0);
   void discarded();
   void inactive(uint64_t epoch);
+  // Tests only: after this many kernel calls in a frame its budget reads as spent.
+  void limit_kernel_calls_for_test(int calls) {kernel_call_limit_ = calls;}
 
 private:
   CbfDecision cached_fallback(const CbfDecision & decision, const std::string & reason);
@@ -198,6 +204,7 @@ private:
   double last_published_ = 0.0;
   bool invalid_input_episode_ = false;
   std::optional<double> stuck_since_;
+  int kernel_call_limit_ = -1;
 };
 
 }  // namespace aimdk_dataplane

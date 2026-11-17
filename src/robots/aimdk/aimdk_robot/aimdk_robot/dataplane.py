@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from aimdk_robot import projection
+from aimdk_robot import vendor_gateway as vg
 
 CONTROL_TOPIC = "/aimdk_runtime/dataplane/control"
 STATUS_TOPIC = "/aimdk_runtime/dataplane/status"
@@ -224,6 +225,8 @@ class Status:
     public_arm_age_s: float | None = None
     #: The arm owner the data plane applied; a claim it refused stays ``None``.
     arm_owner: int | None = None
+    #: The data plane's CBF report; empty when it runs no CBF.
+    cbf: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def decode(cls, text: str) -> Status:
@@ -245,7 +248,35 @@ class Status:
             public_arm_count=int(data.get("public_arm_count", 0)),
             public_arm_age_s=None if data.get("public_arm_age_s") is None else float(data["public_arm_age_s"]),
             arm_owner=None if data.get("arm_owner") is None else int(data["arm_owner"]),
+            cbf=dict(data.get("cbf") or {}),
         )
+
+
+def cbf_hand_refusal(cbf: dict[str, Any], mode: str, reported: list[int]) -> str:
+    """Why an enforcing CBF cannot protect ``mode`` on the hands the platform reports, or "".
+
+    Its collision geometry and thumb mapping are built for the hands it was
+    configured with. Mirroring on other hands it could only hold the arm, so
+    the mode it protects is refused before it starts. A CBF that is off or
+    only observing, and every other mode, are left as they were.
+    """
+    if cbf.get("mode") != "enforce" or mode != cbf.get("mirror_mode"):
+        return ""
+    if cbf.get("mapping_available") is False:
+        return "CBF enforce has no thumb mapping (cbf_safety.thumb_mapping)"
+    if cbf.get("hand_configuration_matches") is not False:
+        return ""
+    installed = list(cbf.get("hands_installed") or [])
+    sides = []
+    for side, name in enumerate(("left", "right")):
+        # The data plane accepts exactly the OmniHand type on an installed side and none elsewhere.
+        expected = vg.HAND_TYPE_NIMBLE if side < len(installed) and installed[side] else vg.HAND_TYPE_NONE
+        actual = reported[side] if side < len(reported) else None
+        if actual != expected:
+            seen = "nothing" if actual is None else f"{actual} ({vg.hand_type_name(actual)})"
+            sides.append(f"{name} hand expected {expected} ({vg.hand_type_name(expected)}), platform reports {seen}")
+    detail = "; ".join(sides) or "the hand state lists a hand on a side configured without one"
+    return f"CBF enforce hand mismatch: {detail}"
 
 
 def start_process(profile: dict[str, Any]) -> subprocess.Popen:

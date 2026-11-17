@@ -471,12 +471,7 @@ private:
     snapshot.epoch = core_.safety_epoch();
     snapshot.named_arm_cache = core_.candidate_arm_is_named();
     snapshot.source_ready = source_ready;
-    const auto hands_match = [this]() {
-        const auto & installed = cbf_->config().hands_installed;
-        return hand_ && cbf_->config().matches_hand_types(core_.hand_types()) &&
-          (installed[0] || hand_->left_hands.empty()) && (installed[1] || hand_->right_hands.empty());
-      };
-    snapshot.hand_configuration_matches = hands_match();
+    snapshot.hand_configuration_matches = cbf_hands_match();
     static const std::array<std::string, 4> all_thumb_names{
       "L_thumb_roll_joint", "L_thumb_abad_joint", "R_thumb_roll_joint", "R_thumb_abad_joint"};
     std::vector<std::string> thumb_order;
@@ -538,7 +533,7 @@ private:
       flush_notes();
       return;
     }
-    if (cbf_->config().enforce && !hands_match()) {
+    if (cbf_->config().enforce && !cbf_hands_match()) {
       decision = cbf_->feedback_fallback(decision, "hand_configuration_mismatch");
     } else if (cbf_->config().enforce && !core_.mirror_candidate(cbf_->config().mirror_mode, finished)) {
       decision = cbf_->feedback_fallback(decision, "mirror_input_stale");
@@ -554,20 +549,34 @@ private:
     }
     const bool was_releasing = cbf_->diagnostics().releasing;
     const double previous_stuck_s = cbf_->diagnostics().stuck_s;
-    decision = cbf_->release_if_stuck(decision, snapshot, monotonic_s());
+    const double release_at = monotonic_s();
+    decision = cbf_->release_if_stuck(decision, snapshot, release_at);
     const auto & d = cbf_->diagnostics();
-    if (d.releasing != was_releasing) {
-      // Start and end of each period published without verification.
+    // Start, end and every second of a period published without verification.
+    // Observation only: a long release is a CBF criterion to fix, not to act on.
+    if (d.releasing != was_releasing || (d.releasing && release_at - last_release_log_s_ >= 1.0)) {
       RCLCPP_WARN(
         get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu reason=%s",
-        d.releasing ? "start" : "end", static_cast<unsigned long long>(d.release_episodes),
+        d.releasing != was_releasing ? (d.releasing ? "start" : "end") : "ongoing",
+        static_cast<unsigned long long>(d.release_episodes),
         d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released), d.reason.c_str());
+      last_release_log_s_ = release_at;
     }
     publish(decision.output);
     core_.remember_arm_output(decision.output);
     cbf_->committed(decision, monotonic_s());
-    cbf_->tick_finished((monotonic_s() - now_s) * 1e6);
+    const double ended = monotonic_s();
+    cbf_->tick_finished((ended - now_s) * 1e6, (ended - finished) * 1e6);
     flush_notes();
+  }
+
+  // The hands the platform reports are the ones the CBF geometry was built for.
+  // The runtime reads this from the status and refuses to start mirroring otherwise.
+  bool cbf_hands_match() const
+  {
+    const auto & installed = cbf_->config().hands_installed;
+    return hand_ && cbf_->config().matches_hand_types(core_.hand_types()) &&
+           (installed[0] || hand_->left_hands.empty()) && (installed[1] || hand_->right_hands.empty());
   }
 
   void publish(const Output & output)
@@ -648,9 +657,11 @@ private:
       const auto & d = cbf_->diagnostics();
       status["cbf"] = {
         {"enabled", true}, {"mode", cbf_->config().enforce ? "enforce" : "shadow"},
+        {"mirror_mode", cbf_->config().mirror_mode},
         {"mapping_verified", cbf_->config().mapping_verified}, {"mirror_active", d.active},
         {"mapping_available", cbf_->config().mapping_available},
         {"hands_installed", cbf_->config().hands_installed},
+        {"hand_configuration_matches", cbf_hands_match()},
         {"check_arm_feedback_goal_range", cbf_->config().check_arm_feedback_goal_range},
         {"arm_age_s", std::isfinite(d.arm_age_s) && d.arm_age_s >= 0.0 ? nlohmann::json(d.arm_age_s) : nlohmann::json(nullptr)},
         {"thumb_age_s", std::isfinite(d.thumb_age_s) && d.thumb_age_s >= 0.0 ? nlohmann::json(d.thumb_age_s) : nlohmann::json(nullptr)},
@@ -660,6 +671,7 @@ private:
         {"recovery_verified", d.recovery_verified}, {"hand_held", d.hand_held},
         {"deadlines", d.deadlines}, {"reason", d.reason},
         {"node_deadlines", d.node_deadlines}, {"tick_us", d.tick_us}, {"max_tick_us", d.max_tick_us},
+        {"max_after_check_us", d.max_after_check_us},
         {"publish_overruns", d.publish_overruns},
         {"available_budget_us", d.available_budget_us},
         {"hand_check_us", d.hand_check_us}, {"verification_us", d.verification_us},
@@ -698,7 +710,7 @@ private:
         "held=%llu withheld=%llu released=%llu thumb_feedback_frames=%llu "
         "recovery_verified=%s hand_held=%s "
         "budget_us=%.0f hand_us=%.0f verify_us=%.0f project_us=%.0f reuses=%llu "
-        "max_tick_us=%.0f reason=%s",
+        "max_tick_us=%.0f max_filter_us=%.0f max_after_check_us=%.0f reason=%s",
         cbf_->config().enforce ? "enforce" : "shadow", d.active ? "true" : "false",
         static_cast<unsigned long long>(d.calls), static_cast<unsigned long long>(d.published),
         static_cast<unsigned long long>(d.geometry_modified), static_cast<unsigned long long>(d.held),
@@ -706,7 +718,7 @@ private:
         static_cast<unsigned long long>(d.thumb_feedback_frames), d.recovery_verified ? "true" : "false",
         d.hand_held ? "true" : "false", d.available_budget_us, d.hand_check_us,
         d.verification_us, d.projection_us, static_cast<unsigned long long>(d.verification_reuses),
-        d.max_tick_us, d.reason.c_str());
+        d.max_tick_us, d.max_elapsed_us, d.max_after_check_us, d.reason.c_str());
       if (d.last_thumb_feedback_event && d.last_thumb_feedback_event->event != logged_thumb_event_ &&
         (logged_thumb_event_ == 0 || now_s - last_thumb_event_log_s_ >= 2.0))
       {
@@ -818,6 +830,7 @@ private:
   double last_input_fault_log_s_ = 0.0;
   uint64_t logged_thumb_event_ = 0;
   double last_thumb_event_log_s_ = 0.0;
+  double last_release_log_s_ = 0.0;
   std::vector<rclcpp::CallbackGroup::SharedPtr> intake_groups_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   std::vector<std::pair<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr, std::vector<std::string>>> views_;

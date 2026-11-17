@@ -1510,12 +1510,17 @@ class AimdkRuntimeNode(Node):
         declared = "claw" if self._hand_type == "claw" else "dexterous"
         with self._lock:
             reported = list(self._dataplane.hand_types)
+            cbf = dict(self._dataplane.cbf)
         if {vg.hand_type_family(value) for value in reported} - {None, declared}:
             names = [vg.hand_type_name(value) for value in reported]
             return (
                 f"hand type mismatch: profile declares {declared!r}, platform reports {names}; "
                 f"its upper-body commands in {mode!r} would be dropped"
             )
+        refusal = dataplane.cbf_hand_refusal(cbf, mode, reported)
+        if refusal:
+            self.get_logger().warning(f"refusing {mode!r} before it starts: {refusal}")
+            return f"{refusal}; {mode!r} refused before it starts"
         return ""
 
     def publish_safe_command(self, *, wait_s: float = 0.2) -> bool:

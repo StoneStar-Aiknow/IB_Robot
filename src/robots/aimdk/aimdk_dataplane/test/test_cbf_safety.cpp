@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -27,6 +28,7 @@ namespace
 {
 
 using aimdk_dataplane::CbfDecision;
+using aimdk_dataplane::CbfDiagnostics;
 using aimdk_dataplane::CbfSafety;
 using aimdk_dataplane::CbfSafetyConfig;
 using aimdk_dataplane::CbfSnapshot;
@@ -1947,5 +1949,156 @@ TEST(CbfSafety, ABlockedArmNeverTurnsMoveAwayOrStillRequestsIntoAHold)
         safety.committed(decision, now);
       }
     }
+  }
+}
+
+// Every reason a frame can go unverified other than a collision verdict, held
+// for the whole run. The same moving request is sent with and without it: the
+// control is accepted from the first frame, the fault is held for at most the
+// release time and then followed. Thumb readings never hold a frame at all.
+struct PersistentFault
+{
+  const char * name;
+  bool holds;
+  const char * reason;  // The hold's reason; nullptr when the frame never reached the end of the filter.
+  std::function<void(CbfSnapshot &, CbfSafety &)> input = nullptr;
+  // The node's checks after the filter, as dataplane_node.cpp applies them.
+  std::function<CbfDecision(CbfSafety &, const CbfDecision &)> node = nullptr;
+  std::function<void(json &)> configure = nullptr;
+  std::function<void(const CbfDiagnostics &)> while_held = nullptr;
+};
+
+void expect_follows(const PersistentFault & fault, bool faulty)
+{
+  auto value = urdf_fixture_json();
+  if (faulty && fault.configure) {fault.configure(value);}
+  CbfSafety safety(fixture_config(value));
+  const auto & config = safety.config();
+  const auto standing = urdf_snapshot();
+  const auto seed = safety.filter(standing, 1.0);
+  if (seed.accept_new) {safety.committed(seed, 1.0);}
+  ASSERT_EQ(seed.accept_new, !(faulty && fault.configure));
+
+  auto goal = standing;
+  goal.requested.arm[0] = std::min(config.upper[0], goal.requested.arm[0] + 0.1);
+  goal.requested.hand[5] = 0.4;
+  Output previous = standing.requested;
+  int held = 0;
+  for (int frame = 0; frame < 50; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.02 + config.period_s * frame;
+    auto snapshot = goal;
+    // A new thumb target every frame, so the thumb ordering check runs every frame.
+    snapshot.requested.hand[0] += frame % 2 == 0 ? 0.05 : -0.05;
+    snapshot.arm->position = previous.arm;  // The robot follows what was published.
+    safety.limit_kernel_calls_for_test(-1);
+    if (faulty && fault.input) {fault.input(snapshot, safety);}
+    auto decision = safety.filter(snapshot, now);
+    if (faulty && fault.node) {decision = fault.node(safety, decision);}
+    decision = safety.release_if_stuck(decision, snapshot, now);
+    EXPECT_FALSE(decision.collision_refusal) << safety.diagnostics().reason;
+    if (faulty && fault.holds && now - 1.02 + 1e-9 < config.hold_release_after_s) {
+      EXPECT_FALSE(decision.accept_new) << safety.diagnostics().reason;
+      if (fault.reason) {EXPECT_EQ(safety.diagnostics().reason, fault.reason);}
+      if (fault.while_held) {fault.while_held(safety.diagnostics());}
+      ++held;
+    } else {
+      ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+      EXPECT_EQ(decision.released, faulty && fault.holds) << safety.diagnostics().reason;
+      ASSERT_EQ(decision.output.kind, Output::Kind::kUpperBody);
+      for (std::size_t joint = 0; joint < 14; ++joint) {
+        SCOPED_TRACE(joint);
+        EXPECT_LE(std::abs(decision.output.arm[joint] - previous.arm[joint]),
+          config.velocity[joint] * config.period_s + 1e-9);
+      }
+      EXPECT_DOUBLE_EQ(decision.output.hand[5], 0.4);
+      previous = decision.output;
+    }
+    safety.committed(decision, now);
+  }
+  EXPECT_EQ(held, faulty && fault.holds ? 10 : 0);
+  // The filter may stop short of a request near a constraint; a release publishes it.
+  EXPECT_GT(previous.arm[0], standing.requested.arm[0] + 0.08);
+  if (faulty && fault.holds) {EXPECT_DOUBLE_EQ(previous.arm[0], goal.requested.arm[0]);}
+}
+
+std::vector<PersistentFault> persistent_faults()
+{
+  const auto deadline_fallback = [](CbfSafety & safety, const CbfDecision & decision) {
+      return safety.deadline_fallback(decision);
+    };
+  const auto publication = [](const char * reason) {
+      return [reason](CbfSafety & safety, const CbfDecision & decision) {
+               return safety.feedback_fallback(decision, reason);
+             };
+    };
+  const auto thumb_axis_band = [](const CbfSafety & safety, int axis) {
+      return safety.config().thumb_model_limits[axis];
+    };
+  return {
+    {"arm_feedback_stale", true, "feedback_unavailable", [](CbfSnapshot & s, CbfSafety & safety) {
+        s.arm->age_s = safety.config().feedback_max_age_s + 0.001;
+      }},
+    {"arm_feedback_missing", true, "feedback_unavailable", [](CbfSnapshot & s, CbfSafety &) {s.arm.reset();}},
+    {"budget_spent_before_the_kernel", true, "deadline", [](CbfSnapshot & s, CbfSafety &) {
+        s.publication_deadline = std::chrono::steady_clock::now();
+      }},
+    {"budget_spent_after_the_thumb_check", true, "deadline", [](CbfSnapshot &, CbfSafety & safety) {
+        safety.limit_kernel_calls_for_test(1);
+      }, nullptr, nullptr, [](const CbfDiagnostics & d) {
+        EXPECT_GT(d.hand_check_us, 0.0);
+        EXPECT_DOUBLE_EQ(d.verification_us, 0.0);
+      }},
+    {"budget_spent_after_the_nominal_check", true, "deadline", [](CbfSnapshot &, CbfSafety & safety) {
+        safety.limit_kernel_calls_for_test(2);
+      }, nullptr, nullptr, [](const CbfDiagnostics & d) {
+        EXPECT_GT(d.hand_check_us, 0.0);
+        EXPECT_GT(d.verification_us, 0.0);
+      }},
+    {"node_deadline", true, "node_deadline", nullptr, deadline_fallback},
+    {"publication_snapshot_feedback_expired", true, "publication_snapshot_feedback_expired", nullptr, publication("snapshot_feedback_expired")},
+    {"mirror_input_stale", true, "mirror_input_stale", [](CbfSnapshot & s, CbfSafety &) {s.source_ready = false;}},
+    {"publication_mirror_input_stale", true, "publication_mirror_input_stale", nullptr, publication("mirror_input_stale")},
+    {"hand_configuration_mismatch", true, "hand_configuration_mismatch", [](CbfSnapshot & s, CbfSafety &) {
+        s.hand_configuration_matches = false;
+      }},
+    {"publication_hand_configuration_mismatch", true,
+      "publication_hand_configuration_mismatch", nullptr, publication("hand_configuration_mismatch")},
+    {"mixed_named_arm", true, "mixed_named_arm", [](CbfSnapshot & s, CbfSafety &) {s.named_arm_cache = true;}},
+    {"mapping_required", true, "mapping_required", nullptr, nullptr, [](json & value) {value.erase("thumb_mapping");}},
+    // dataplane_node.cpp's catch: the frame carries only its epoch.
+    {"filter_exception", true, nullptr, nullptr, [](CbfSafety &, const CbfDecision & decision) {
+        CbfDecision failed;
+        failed.epoch = decision.epoch;
+        return failed;
+      }},
+    {"unknown_reason", true, "publication_a_reason_added_later", nullptr, publication("a_reason_added_later")},
+    {"thumb_out_of_range", false, nullptr, [thumb_axis_band](CbfSnapshot & s, CbfSafety & safety) {
+        s.thumb->position[0] = thumb_axis_band(safety, 0)[1] + 0.35;
+        s.thumb->position[3] = thumb_axis_band(safety, 3)[0] - 0.35;
+      }},
+    {"thumb_saturated", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {
+        std::fill(s.thumb->position.begin(), s.thumb->position.end(), 1.74);
+      }},
+    {"thumb_nan", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {
+        s.thumb->position[1] = std::numeric_limits<double>::quiet_NaN();
+      }},
+    {"thumb_faulted", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {s.thumb_faulted = true;}},
+    {"thumb_missing", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {s.thumb.reset();}},
+    {"thumb_stale", false, nullptr, [](CbfSnapshot & s, CbfSafety & safety) {
+        s.thumb->age_s = safety.config().feedback_max_age_s + 0.001;
+      }},
+  };
+}
+
+TEST(CbfSafety, EveryPersistentNonCollisionReasonIsFollowedAfterTheReleaseTime)
+{
+  for (const auto & fault : persistent_faults()) {
+    SCOPED_TRACE(fault.name);
+    {
+      SCOPED_TRACE("control");
+      expect_follows(fault, false);
+    }
+    expect_follows(fault, true);
   }
 }

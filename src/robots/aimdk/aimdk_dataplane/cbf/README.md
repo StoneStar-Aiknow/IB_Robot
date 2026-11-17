@@ -227,10 +227,28 @@ invalid input, publication recheck, authorization) lasts at most
 `hold_release_after_s` (default 0.2 s). Then `release_if_stuck()` publishes the
 request clamped to the application joint limits and stepped at the configured
 velocity from the last published arm, else the measured arm, as if the filter
-were disabled. `CBF_RELEASE start|end` marks each episode. A request with no
+were disabled. `CBF_RELEASE start|end` marks each episode and `ongoing` repeats
+at most once a second while it lasts; the log only observes, it never changes
+a decision. A request with no
 complete upper-body command keeps the hold. A collision verdict (the kernel
 rejected every candidate on geometry) is never released; at 50 Hz a request
 that moves away or holds still is accepted in the next frame.
+`EveryPersistentNonCollisionReasonIsFollowedAfterTheReleaseTime` runs each
+non-verdict reason for a whole run against the same run without it.
+
+The status splits a tick's cost: `max_elapsed_us` (`max_filter_us` in the INFO
+line) is the filter, `max_after_check_us` is the part after the node's deadline check
+(publication, commit). An overrun there cannot be caused by the filter and
+holds no frame. All `max_*` values are maxima since start.
+
+The status also reports `hand_configuration_matches`: the platform's hand types
+and hand state are the ones `hands_installed` describes. When CBF enforces,
+the runtime refuses to enter `mirror_mode` if that is false or no thumb mapping
+is configured, naming the side and the expected and reported type. CBF off or
+shadow refuses nothing. A mismatch that appears mid-run is a non-verdict hold
+and is released after `hold_release_after_s`. `mixed_named_arm` only occurs
+mid-run (a named motion still owns the arm cache at the hand-over) and is
+released the same way.
 
 ## Invalid input diagnostics
 
