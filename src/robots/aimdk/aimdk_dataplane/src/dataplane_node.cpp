@@ -282,6 +282,13 @@ private:
     }
     const int64_t stamp = stamp_ns(message->header);
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::string faulted;
+    for (const auto & [name, code] : codes) {
+      if (code != 0) {faulted += " " + name + "=" + std::to_string(code);}
+    }
+    if (!faulted.empty()) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "HAND_FAULT%s", faulted.c_str());
+    }
     note_intake("hand", stamp);
     core_.on_hand_state(
       {message->left_hand_type.value, message->right_hand_type.value}, std::move(entries), std::move(measured),
@@ -489,39 +496,51 @@ private:
       };
     snapshot.arm = state(kVendorArmOrder, now_s);
     snapshot.thumb = state(thumb_order, now_s);
+    if (hand_) {
+      // A faulted hand's positions are not measurements; the filter substitutes them.
+      for (const auto * hands : {&hand_->left_hands, &hand_->right_hands}) {
+        for (const auto & hand : *hands) {
+          if (hand.faultcode != 0 &&
+            std::find(thumb_order.begin(), thumb_order.end(), hand.name) != thumb_order.end())
+          {
+            snapshot.thumb_faulted = true;
+          }
+        }
+      }
+    }
     lock.unlock();  // Vendor feedback intake continues on its existing threads.
     CbfDecision decision;
     try {
       decision = cbf_->filter(snapshot, now_s);
     } catch (const std::exception & error) {
       RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "CBF rejected frame: %s", error.what());
+      decision.epoch = snapshot.epoch;
       if (!cbf_->config().enforce) {decision.output = snapshot.requested;}
     }
     lock.lock();
     double finished = monotonic_s();
     std::string latest_feedback_problem;
     if (cbf_->config().enforce) {
-      // Recheck data validity after callbacks ran during the solve. An ordinary
+      // Recheck arm data validity after callbacks ran during the solve. An ordinary
       // new sample is allowed; a new NaN, missing joint or stale stamp is not.
       CbfSnapshot latest;
       latest.arm = state(kVendorArmOrder, finished);
-      latest.thumb = state(thumb_order, finished);
       latest_feedback_problem = cbf_->config().feedback_error(latest);
       finished = monotonic_s();
     }
-    const double oldest_age = snapshot.arm && snapshot.thumb ?
-      std::max(snapshot.arm->age_s, snapshot.thumb->age_s) + finished - now_s :
+    const double oldest_age = snapshot.arm ? snapshot.arm->age_s + finished - now_s :
       std::numeric_limits<double>::infinity();
     if (core_.safety_epoch() != snapshot.epoch ||
-      !core_.mirror_context(cbf_->config().mirror_mode, finished) ||
-      (cbf_->config().enforce && !hands_match()))
+      !core_.mirror_context(cbf_->config().mirror_mode, finished))
     {
       cbf_->discarded();
       cbf_->tick_finished((finished - now_s) * 1e6);
       flush_notes();
       return;
     }
-    if (cbf_->config().enforce && !core_.mirror_candidate(cbf_->config().mirror_mode, finished)) {
+    if (cbf_->config().enforce && !hands_match()) {
+      decision = cbf_->feedback_fallback(decision, "hand_configuration_mismatch");
+    } else if (cbf_->config().enforce && !core_.mirror_candidate(cbf_->config().mirror_mode, finished)) {
       decision = cbf_->feedback_fallback(decision, "mirror_input_stale");
     } else if (cbf_->config().enforce &&
       (!latest_feedback_problem.empty() || oldest_age > cbf_->config().feedback_max_age_s))
@@ -532,6 +551,17 @@ private:
       (finished - now_s) * 1e6 >= cbf_->config().deadline_us - cbf_->config().guard_us)
     {
       decision = cbf_->deadline_fallback(decision);
+    }
+    const bool was_releasing = cbf_->diagnostics().releasing;
+    const double previous_stuck_s = cbf_->diagnostics().stuck_s;
+    decision = cbf_->release_if_stuck(decision, snapshot, monotonic_s());
+    const auto & d = cbf_->diagnostics();
+    if (d.releasing != was_releasing) {
+      // Start and end of each period published without verification.
+      RCLCPP_WARN(
+        get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu reason=%s",
+        d.releasing ? "start" : "end", static_cast<unsigned long long>(d.release_episodes),
+        d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released), d.reason.c_str());
     }
     publish(decision.output);
     core_.remember_arm_output(decision.output);
@@ -641,6 +671,13 @@ private:
         {"minimum_distance_m", d.distance_valid ? nlohmann::json(d.minimum_distance_m) : nlohmann::json(nullptr)}
       };
       status["cbf"]["invalid_input_frames"] = d.invalid_input_frames;
+      status["cbf"]["thumb_feedback_frames"] = d.thumb_feedback_frames;
+      status["cbf"]["thumb_feedback_issue"] = d.thumb_feedback_issue;
+      status["cbf"]["released"] = d.released;
+      status["cbf"]["release_episodes"] = d.release_episodes;
+      status["cbf"]["releasing"] = d.releasing;
+      status["cbf"]["stuck_s"] = d.stuck_s;
+      status["cbf"]["hold_release_after_s"] = cbf_->config().hold_release_after_s;
       if (d.last_input_fault) {
         status["cbf"]["last_input_fault_event"] = d.last_input_fault->event;
         status["cbf"]["last_input_fault_issue"] = d.last_input_fault->issue;
@@ -658,16 +695,38 @@ private:
       RCLCPP_INFO_THROTTLE(
         get_logger(), *get_clock(), 2000,
         "CBF status: mode=%s mirror_active=%s calls=%llu published=%llu geometry_modified=%llu "
-        "held=%llu withheld=%llu recovery_verified=%s hand_held=%s "
+        "held=%llu withheld=%llu released=%llu thumb_feedback_frames=%llu "
+        "recovery_verified=%s hand_held=%s "
         "budget_us=%.0f hand_us=%.0f verify_us=%.0f project_us=%.0f reuses=%llu "
         "max_tick_us=%.0f reason=%s",
         cbf_->config().enforce ? "enforce" : "shadow", d.active ? "true" : "false",
         static_cast<unsigned long long>(d.calls), static_cast<unsigned long long>(d.published),
         static_cast<unsigned long long>(d.geometry_modified), static_cast<unsigned long long>(d.held),
-        static_cast<unsigned long long>(d.withheld), d.recovery_verified ? "true" : "false",
+        static_cast<unsigned long long>(d.withheld), static_cast<unsigned long long>(d.released),
+        static_cast<unsigned long long>(d.thumb_feedback_frames), d.recovery_verified ? "true" : "false",
         d.hand_held ? "true" : "false", d.available_budget_us, d.hand_check_us,
         d.verification_us, d.projection_us, static_cast<unsigned long long>(d.verification_reuses),
         d.max_tick_us, d.reason.c_str());
+      if (d.last_thumb_feedback_event && d.last_thumb_feedback_event->event != logged_thumb_event_ &&
+        (logged_thumb_event_ == 0 || now_s - last_thumb_event_log_s_ >= 2.0))
+      {
+        // Advisory: the frame went ahead with a clamped or substituted reading.
+        static constexpr std::array<const char *, 4> names{
+          "L_thumb_roll", "L_thumb_abad", "R_thumb_roll", "R_thumb_abad"};
+        const auto & event = *d.last_thumb_feedback_event;
+        const auto number = [](double value) {
+            return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
+          };
+        const nlohmann::json detail = {
+          {"event", event.event}, {"at_monotonic_s", number(event.at_s)}, {"issue", event.issue},
+          {"joint", event.axis >= 0 && event.axis < 4 ? nlohmann::json(names[event.axis]) : nlohmann::json(nullptr)},
+          {"value", number(event.value)}, {"lower", number(event.lower)}, {"upper", number(event.upper)},
+          {"frames", d.thumb_feedback_frames}, {"angle_units", "native rad"}
+        };
+        RCLCPP_WARN(get_logger(), "CBF_THUMB_FEEDBACK %s", detail.dump().c_str());
+        logged_thumb_event_ = event.event;
+        last_thumb_event_log_s_ = now_s;
+      }
       if (d.last_input_fault && d.last_input_fault->event != logged_input_fault_event_ &&
         (logged_input_fault_event_ == 0 || now_s - last_input_fault_log_s_ >= 2.0))
       {
@@ -757,6 +816,8 @@ private:
   std::optional<CbfSafety> cbf_;
   uint64_t logged_input_fault_event_ = 0;
   double last_input_fault_log_s_ = 0.0;
+  uint64_t logged_thumb_event_ = 0;
+  double last_thumb_event_log_s_ = 0.0;
   std::vector<rclcpp::CallbackGroup::SharedPtr> intake_groups_;
   std::vector<rclcpp::SubscriptionBase::SharedPtr> subscriptions_;
   std::vector<std::pair<rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr, std::vector<std::string>>> views_;

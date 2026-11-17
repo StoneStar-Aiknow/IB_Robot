@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -56,6 +57,41 @@ bool same_arm(const std::array<double, 14> & a, const std::vector<double> & b)
   }
   return true;
 }
+
+// Native interval that maps into the model band through scale and offset.
+std::array<double, 2> native_band(const std::array<double, 2> & band, double scale, double offset)
+{
+  const double a = (band[0] - offset) / scale;
+  const double b = (band[1] - offset) / scale;
+  return {std::min(a, b), std::max(a, b)};
+}
+
+// What the hand can be commanded to: its native range, else the model range.
+std::array<double, 2> thumb_command_band(const CbfSafetyConfig & config, size_t axis)
+{
+  const auto model = native_band(config.thumb_model_limits[axis], config.command_scale[axis],
+      config.command_offset[axis]);
+  if (!config.native_limits_available) {return model;}
+  return {std::max(model[0], config.native_lower[axis]), std::min(model[1], config.native_upper[axis])};
+}
+
+// An unreachable thumb angle is limited like any other joint, never refused.
+void clamp_thumb_command(const CbfSafetyConfig & config, Output & command)
+{
+  for (size_t axis = 0; axis < kHandSlots.size(); ++axis) {
+    if (!config.hands_installed[axis / 2]) {continue;}
+    const auto band = thumb_command_band(config, axis);
+    auto & value = command.hand[kHandSlots[axis]];
+    value = std::clamp(value, band[0], band[1]);
+  }
+}
+
+bool complete_upper_body(const Output & command)
+{
+  return command.kind == Output::Kind::kUpperBody && command.arm.size() == 14 &&
+         command.hand_sub_mode == kHandSubModeDexterousJoint && command.hand.size() == 20 &&
+         finite(command.arm) && finite(command.hand);
+}
 }  // namespace
 
 CbfSafetyConfig CbfSafetyConfig::from_json(const std::string & text, double rate_hz)
@@ -74,13 +110,15 @@ CbfSafetyConfig CbfSafetyConfig::from_json(const std::string & text, double rate
   out.state_skew_max_s = value.value("state_skew_max_s", out.state_skew_max_s);
   out.feedback_limit_tolerance_rad = value.value("feedback_limit_tolerance_rad", 0.0);
   out.check_arm_feedback_goal_range = value.value("check_arm_feedback_goal_range", true);
+  out.hold_release_after_s = value.value("hold_release_after_s", out.hold_release_after_s);
   if ((mode != "shadow" && mode != "enforce") || out.mirror_mode.empty() ||
     !std::isfinite(rate_hz) || rate_hz <= 0.0 || !std::isfinite(out.deadline_us) ||
     !std::isfinite(out.guard_us) || out.deadline_us <= 0.0 || out.guard_us < 0.0 ||
     out.guard_us >= out.deadline_us || !std::isfinite(out.feedback_max_age_s) || out.feedback_max_age_s <= 0.0 ||
     !std::isfinite(out.state_skew_max_s) || out.state_skew_max_s < 0.0 ||
     !std::isfinite(out.feedback_limit_tolerance_rad) || out.feedback_limit_tolerance_rad < 0.0 ||
-    out.feedback_limit_tolerance_rad > 0.1)
+    out.feedback_limit_tolerance_rad > 0.1 || !std::isfinite(out.hold_release_after_s) ||
+    out.hold_release_after_s < 0.0 || out.hold_release_after_s > 1.0)
   {
     throw std::invalid_argument("invalid CBF mode, period or budget");
   }
@@ -198,28 +236,14 @@ bool CbfSafetyConfig::matches_hand_types(const std::vector<int> & types) const
 
 std::string CbfSafetyConfig::feedback_error(const CbfSnapshot & snapshot) const
 {
-  const size_t count = 2 * static_cast<size_t>(hands_installed[0]) +
-    2 * static_cast<size_t>(hands_installed[1]);
-  if (!snapshot.arm || !snapshot.thumb || snapshot.arm->position.size() != 14 ||
-    snapshot.thumb->position.size() != count || !finite(snapshot.arm->position) || !finite(snapshot.thumb->position) ||
-    !std::isfinite(snapshot.arm->age_s) || !std::isfinite(snapshot.thumb->age_s) ||
-    snapshot.arm->age_s < 0.0 || snapshot.thumb->age_s < 0.0 ||
-    snapshot.arm->age_s > feedback_max_age_s || snapshot.thumb->age_s > feedback_max_age_s)
+  // Only the arm gates a frame. OmniHand thumb readings carry errors far larger
+  // than any useful admission band, and refusing a frame cannot move the thumb
+  // back, so filter() clamps or replaces them instead of holding.
+  if (!snapshot.arm || snapshot.arm->position.size() != 14 || !finite(snapshot.arm->position) ||
+    !std::isfinite(snapshot.arm->age_s) || snapshot.arm->age_s < 0.0 ||
+    snapshot.arm->age_s > feedback_max_age_s)
   {
     return "feedback_unavailable";
-  }
-  if (std::abs(snapshot.arm->age_s - snapshot.thumb->age_s) > state_skew_max_s) {return "feedback_skew";}
-  if (native_limits_available) {
-    size_t axis = 0;
-    for (size_t j = 0; j < 4; ++j) {
-      if (!hands_installed[j / 2]) {continue;}
-      const double measured = snapshot.thumb->position[axis++];
-      if (measured < native_lower[j] - feedback_limit_tolerance_rad - 1e-9 ||
-        measured > native_upper[j] + feedback_limit_tolerance_rad + 1e-9)
-      {
-        return "native_feedback_out_of_range";
-      }
-    }
   }
   return {};
 }
@@ -234,9 +258,14 @@ void CbfSafety::inactive(uint64_t epoch)
     accepted_.reset();
     epoch_ = epoch;
   }
+  stuck_since_.reset();
   diagnostics_.active = false;
   diagnostics_.recovery_verified = false;
   diagnostics_.hand_held = false;
+  diagnostics_.releasing = false;
+  diagnostics_.stuck_s = 0.0;
+  diagnostics_.thumb_feedback_issue.clear();
+  diagnostics_.reason = "inactive";
 }
 
 CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
@@ -252,8 +281,11 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   if (snapshot.epoch != epoch_) {
     accepted_.reset();
     invalid_input_episode_ = false;
+    stuck_since_.reset();
     epoch_ = snapshot.epoch;
   }
+  const auto previous_thumb_issue = std::move(diagnostics_.thumb_feedback_issue);
+  diagnostics_.thumb_feedback_issue.clear();
   ++diagnostics_.calls;
   diagnostics_.active = true;
   diagnostics_.distance_valid = false;
@@ -301,13 +333,14 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     }
     decision.prepared_hold.sequence = snapshot.requested.sequence;
   }
-  const auto fallback = [&](const std::string & reason) {
+  const auto fallback = [&](const std::string & reason, bool collision = false) {
       decision.output = decision.prepared_hold;
       decision.accept_new = false;
       decision.modified = false;
       decision.geometry_modified = false;
       decision.recovery_verified = false;
       decision.hand_held = false;
+      decision.collision_refusal = collision;
       diagnostics_.distance_valid = false;
       return finish(reason);
     };
@@ -318,20 +351,63 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     ++diagnostics_.deadlines;
     return fallback("deadline");
   }
-  bool command_valid = snapshot.requested.kind == Output::Kind::kUpperBody &&
-    snapshot.requested.arm.size() == 14 && snapshot.requested.hand_sub_mode == kHandSubModeDexterousJoint &&
-    snapshot.requested.hand.size() == 20 && finite(snapshot.requested.arm) && finite(snapshot.requested.hand);
+  const bool command_valid = complete_upper_body(snapshot.requested);
   const auto feedback_problem = config_.feedback_error(snapshot);
   if (!feedback_problem.empty()) {return fallback(feedback_problem);}
-  if (config_.native_limits_available) {
+  if (!command_valid) {
+    return fallback(snapshot.requested.kind == Output::Kind::kNone ? "candidate_unavailable" : "invalid_command");
+  }
+  Output command = snapshot.requested;
+  clamp_thumb_command(config_, command);
+  // Thumb readings never gate a frame: no admission band covers OmniHand
+  // tracking error, and a held frame cannot move the thumb back. Geometry uses
+  // the reading clamped into the model range; a missing, stale, nonfinite or
+  // faulted reading is replaced by the last published (else requested) command.
+  std::array<double, 4> thumb_current{};
+  CbfThumbFeedbackEvent thumb_event;
+  {
+    const size_t installed = 2 * static_cast<size_t>(config_.hands_installed[0]) +
+      2 * static_cast<size_t>(config_.hands_installed[1]);
+    const bool present = snapshot.thumb && snapshot.thumb->position.size() == installed;
+    const bool fresh = present && std::isfinite(snapshot.thumb->age_s) && snapshot.thumb->age_s >= 0.0 &&
+      snapshot.thumb->age_s <= config_.feedback_max_age_s;
+    const char * blanket = !present ? "unavailable" : (!fresh ? "stale" :
+      (snapshot.thumb_faulted ? "faulted" : nullptr));
+    const auto & substitute = accepted_ ? accepted_->hand : command.hand;
+    size_t feedback_axis = 0;
     for (size_t j = 0; j < 4; ++j) {
       if (!config_.hands_installed[j / 2]) {continue;}
-      if (command_valid && (snapshot.requested.hand[kHandSlots[j]] < config_.native_lower[j] - 1e-9 ||
-        snapshot.requested.hand[kHandSlots[j]] > config_.native_upper[j] + 1e-9))
-      {
-        command_valid = false;
+      const auto & band = config_.thumb_model_limits[j];
+      const double raw = present ? snapshot.thumb->position[feedback_axis] :
+        std::numeric_limits<double>::quiet_NaN();
+      ++feedback_axis;
+      double value = config_.feedback_scale[j] * raw + config_.feedback_offset[j];
+      const char * issue = blanket;
+      if (!issue && !std::isfinite(value)) {issue = "unavailable";}
+      if (!issue && (value < band[0] || value > band[1])) {issue = "out_of_range";}
+      if (blanket || !std::isfinite(value)) {
+        value = config_.command_scale[j] * substitute[kHandSlots[j]] + config_.command_offset[j];
+      }
+      thumb_current[j] = std::clamp(value, band[0], band[1]);
+      if (issue && thumb_event.issue.empty()) {
+        const auto native = native_band(band, config_.feedback_scale[j], config_.feedback_offset[j]);
+        thumb_event.issue = issue;
+        thumb_event.axis = static_cast<int>(j);
+        thumb_event.value = raw;
+        thumb_event.lower = native[0];
+        thumb_event.upper = native[1];
       }
     }
+  }
+  if (!thumb_event.issue.empty()) {
+    ++diagnostics_.thumb_feedback_frames;
+    const auto & last = diagnostics_.last_thumb_feedback_event;
+    if (previous_thumb_issue.empty() || !last || last->issue != thumb_event.issue || last->axis != thumb_event.axis) {
+      thumb_event.event = last ? last->event + 1 : 1;
+      thumb_event.at_s = now;
+      diagnostics_.last_thumb_feedback_event = thumb_event;
+    }
+    diagnostics_.thumb_feedback_issue = thumb_event.issue;
   }
   std::array<std::array<double, 2>, 14> command_box;
   for (size_t j = 0; j < command_box.size(); ++j) {
@@ -357,7 +433,6 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
         band[1] += config_.feedback_limit_tolerance_rad;
       }
       input.hands_installed = config_.hands_installed;
-      size_t feedback_axis = 0;
       for (size_t j = 0; j < 4; ++j) {
         if (!config_.hands_installed[j / 2]) {
           input.thumb_joint_limits_urdf[j] = x2::cbf::kRigidThumbLimits[j];
@@ -365,20 +440,14 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
         }
         input.q_thumb_urdf[kModelSlots[j]] =
           config_.command_scale[j] * target.hand[kHandSlots[j]] + config_.command_offset[j];
-        input.q_thumb_current_urdf[kModelSlots[j]] =
-          config_.feedback_scale[j] * snapshot.thumb->position[feedback_axis++] + config_.feedback_offset[j];
+        input.q_thumb_current_urdf[kModelSlots[j]] = thumb_current[j];
       }
+      // Already clamped into these bounds above.
       input.current_thumb_joint_limits_urdf = input.thumb_joint_limits_urdf;
-      for (size_t j = 0; j < 4; ++j) {
-        if (!config_.hands_installed[j / 2]) {continue;}
-        const double allowance = std::abs(config_.feedback_scale[j]) * config_.feedback_limit_tolerance_rad;
-        (*input.current_thumb_joint_limits_urdf)[j][0] -= allowance;
-        (*input.current_thumb_joint_limits_urdf)[j][1] += allowance;
-      }
       return input;
     };
-  if (command_valid) {
-    const auto preview = input_for(snapshot.requested);
+  {
+    const auto preview = input_for(command);
     for (size_t j = 0; j < 4; ++j) {
       diagnostics_.thumb_current_urdf[j] = preview.q_thumb_current_urdf[kModelSlots[j]];
       diagnostics_.thumb_target_urdf[j] = preview.q_thumb_urdf[kModelSlots[j]];
@@ -429,12 +498,12 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
           fault.thumb_target_urdf = input.q_thumb_urdf;
           fault.thumb_limits_urdf = input.thumb_joint_limits_urdf;
           fault.thumb_current_limits_urdf = *input.current_thumb_joint_limits_urdf;
-          fault.thumb_native_current = snapshot.thumb->position;
+          fault.thumb_native_current = snapshot.thumb ? snapshot.thumb->position : std::vector<double>{};
           for (size_t axis = 0; axis < kHandSlots.size(); ++axis) {
             fault.thumb_native_target[axis] = target.hand[kHandSlots[axis]];
           }
           fault.arm_age_s = snapshot.arm->age_s;
-          fault.thumb_age_s = snapshot.thumb->age_s;
+          fault.thumb_age_s = snapshot.thumb ? snapshot.thumb->age_s : -1.0;
           diagnostics_.last_input_fault = std::move(fault);
           invalid_input_episode_ = true;
         }
@@ -442,14 +511,11 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       return result;
     };
 
-  if (!command_valid) {
-    return fallback(snapshot.requested.kind == Output::Kind::kNone ? "candidate_unavailable" : "invalid_command");
-  }
   if (remaining() <= config_.guard_us) {
     ++diagnostics_.deadlines;
     return fallback("deadline");
   }
-  Output target = snapshot.requested;
+  Output target = command;
   bool hand_held = false;
   bool new_thumb_target = false;
   if (config_.enforce && accepted_) {
@@ -592,9 +658,13 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       hand_held = true;
       continue;
     }
-    return fallback(x2::cbf::filter_status_name(result.status));
+    // Only this exit is a collision verdict: the kernel judged every candidate
+    // unsafe. Invalid data and an exhausted budget are not verdicts.
+    return fallback(x2::cbf::filter_status_name(result.status),
+             result.status != x2::cbf::FilterStatus::InvalidInputFallback &&
+             result.status != x2::cbf::FilterStatus::DeadlineFallback);
   }
-  return fallback("candidate_path_rejected");
+  return fallback("candidate_path_rejected", true);
 }
 
 void CbfSafety::committed(const CbfDecision & decision, double now)
@@ -612,6 +682,7 @@ void CbfSafety::committed(const CbfDecision & decision, double now)
     if (decision.accept_new) {
       accepted_ = decision.output;
       ++diagnostics_.accepted;
+      if (decision.released) {++diagnostics_.released;}
       if (decision.modified) {++diagnostics_.modified;}
       if (decision.geometry_modified) {++diagnostics_.geometry_modified;}
     } else {
@@ -644,6 +715,7 @@ CbfDecision CbfSafety::cached_fallback(const CbfDecision & decision, const std::
 {
   CbfDecision held;
   held.epoch = decision.epoch;
+  held.collision_refusal = decision.collision_refusal;
   // A decision prepared before an ownership/epoch exit cannot revive history.
   if (diagnostics_.active && decision.epoch == epoch_ && accepted_ &&
     decision.prepared_hold.kind == Output::Kind::kUpperBody &&
@@ -659,6 +731,57 @@ CbfDecision CbfSafety::cached_fallback(const CbfDecision & decision, const std::
   diagnostics_.recovery_verified = false;
   diagnostics_.hand_held = false;
   return held;
+}
+
+CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now)
+{
+  const auto settle = [&]() {
+      stuck_since_.reset();
+      diagnostics_.releasing = false;
+      diagnostics_.stuck_s = 0.0;
+      return decision;
+    };
+  if (!config_.enforce || !diagnostics_.active || decision.epoch != epoch_ ||
+    decision.accept_new || decision.collision_refusal)
+  {
+    return settle();
+  }
+  const auto & requested = snapshot.requested;
+  if (!stuck_since_) {stuck_since_ = now;}
+  diagnostics_.stuck_s = std::max(0.0, now - *stuck_since_);
+  if (diagnostics_.stuck_s + 1e-9 < config_.hold_release_after_s || !complete_upper_body(requested)) {
+    diagnostics_.releasing = false;
+    return decision;
+  }
+  // Nothing judged this request unsafe; it only went unverified. Publish it as
+  // the filter-disabled path would, within the same joint and velocity limits,
+  // stepping from the committed arm, else from the measured one.
+  CbfDecision out;
+  out.epoch = decision.epoch;
+  out.output = requested;
+  clamp_thumb_command(config_, out.output);
+  const bool measured = snapshot.arm && snapshot.arm->position.size() == 14 && finite(snapshot.arm->position);
+  const double dt = accepted_ ? std::min(config_.period_s, std::max(0.0, now - last_published_)) : config_.period_s;
+  for (size_t j = 0; j < 14; ++j) {
+    double value = std::clamp(out.output.arm[j], config_.lower[j], config_.upper[j]);
+    if (accepted_ || measured) {
+      const double reference = accepted_ ? accepted_->arm[j] : snapshot.arm->position[j];
+      const double step = config_.velocity[j] * dt;
+      value = std::clamp(value, reference - step, reference + step);
+    }
+    out.output.arm[j] = value;
+  }
+  out.accept_new = true;
+  out.released = true;
+  out.modified = out.output.arm != requested.arm || out.output.hand != requested.hand;
+  out.prepared_hold = decision.prepared_hold;
+  if (!diagnostics_.releasing) {++diagnostics_.release_episodes;}
+  diagnostics_.releasing = true;
+  diagnostics_.reason = "released/" + diagnostics_.reason;
+  diagnostics_.distance_valid = false;
+  diagnostics_.recovery_verified = false;
+  diagnostics_.hand_held = false;
+  return out;
 }
 
 void CbfSafety::tick_finished(double elapsed_us)

@@ -64,8 +64,10 @@ arm/hand command while reporting `thumb_current_urdf` and `thumb_target_urdf`
 with an `unverified_mapping/` reason. Enforce uses the supplied conversion and
 retains the same unverified diagnostic prefix. Calibration provenance is not
 a second motion admission gate; absent mapping arrays still produce
-`mapping_required`. Feedback validity and all geometric acceptance flags remain
-mandatory, and a rejected hand target cannot accompany the new arm target.
+`mapping_required`. Arm feedback validity and all geometric acceptance flags
+remain mandatory, and a rejected hand target cannot accompany the new arm
+target. Thumb feedback is advisory in the runtime adapter; see "Runtime thumb
+feedback and hold release" below.
 Inverse-mapping the old safe URDF baseline provides a native fixture; it does
 not establish a verified SDK pose or authorize real motion.
 
@@ -183,8 +185,9 @@ explicitly configure installed hardware and reject incompatible reported types.
 The adaptation touches `kinematics.hpp`, `safety_filter.hpp`, `kinematics.cpp`,
 `distance_gradient.cpp` and `safety_filter.cpp`. Tests retain both-hand defaults
 and cover exclusion of an absent right hand while left-hand and arm collisions
-remain detectable. Runtime feedback is required only for installed hands; no
-missing native angle is filled in as measured zero.
+remain detectable. Thumb feedback is read only for installed hands; a missing
+native angle is never filled in as measured zero (the adapter substitutes the
+last published command, see below).
 
 ## Native observations versus commanded joint bounds
 
@@ -201,6 +204,33 @@ The captured right-shoulder frame had feedback 0.052634239196777344 rad versus
 the operator upper bound 0.05236 rad; the actual provider bound is 0.061 rad.
 Regression fixtures replay that exact arm/thumb input and preserve strict
 default-domain rejection and rejection of illegal command targets.
+
+## Runtime thumb feedback and hold release
+
+These rules live in the dataplane adapter (`src/cbf_safety.cpp`,
+`src/dataplane_node.cpp`); the kernel files are unchanged.
+
+Thumb feedback never refuses a frame. OmniHand tracking error can exceed any
+narrow admission band, and a held frame cannot move the thumb back into it, so
+a strict check deadlocks (field freeze 2026-11-17). For FK the adapter clamps
+each reading into `thumb_model_limits`; a missing, stale, nonfinite or faulted
+reading (nonzero hand `faultcode`) is replaced by the last published thumb
+command, else the requested one. Each such frame increments
+`thumb_feedback_frames`; the first frame of a new issue is logged once as
+`CBF_THUMB_FEEDBACK` with the raw native value and native bounds.
+
+A thumb command outside what the hand can reach is clamped into the native
+range intersected with the inverse-mapped model range, never refused.
+
+A hold that is not a collision verdict (arm feedback, deadline or node budget,
+invalid input, publication recheck, authorization) lasts at most
+`hold_release_after_s` (default 0.2 s). Then `release_if_stuck()` publishes the
+request clamped to the application joint limits and stepped at the configured
+velocity from the last published arm, else the measured arm, as if the filter
+were disabled. `CBF_RELEASE start|end` marks each episode. A request with no
+complete upper-body command keeps the hold. A collision verdict (the kernel
+rejected every candidate on geometry) is never released; at 50 Hz a request
+that moves away or holds still is accepted in the next frame.
 
 ## Invalid input diagnostics
 

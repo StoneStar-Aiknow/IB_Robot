@@ -207,7 +207,7 @@ TEST(CbfSafety, AnUncommittedDecisionCannotEstablishAFallback)
   const auto unpublished = safety.filter(snapshot, 1.0);
   ASSERT_TRUE(unpublished.accept_new);
   // No committed() call: this frame has not been published.
-  snapshot.requested.hand[0] = x2::cbf::kRigidThumbLimits[0][1] + 0.01;
+  snapshot.requested.hand[0] = std::numeric_limits<double>::quiet_NaN();
   const auto rejected = safety.filter(snapshot, 1.02);
 
   EXPECT_FALSE(rejected.accept_new);
@@ -216,7 +216,7 @@ TEST(CbfSafety, AnUncommittedDecisionCannotEstablishAFallback)
   EXPECT_EQ(safety.diagnostics().published, 0u);
 }
 
-TEST(CbfSafety, InvalidThumbAndNanNominalHoldTheCommittedArmAndHandTogether)
+TEST(CbfSafety, NanHandAndNanNominalHoldTheCommittedArmAndHandTogether)
 {
   CbfSafety safety(fixture_config());
   const auto initial = safety.filter(urdf_snapshot(), 1.0);
@@ -228,9 +228,10 @@ TEST(CbfSafety, InvalidThumbAndNanNominalHoldTheCommittedArmAndHandTogether)
     auto snapshot = urdf_snapshot();
     ++snapshot.requested.sequence;
     if (invalid_case == 0) {
-      // Existing phase-C shoulder request plus the original invalid-thumb case.
+      // Existing phase-C shoulder request plus a nonfinite thumb command. An
+      // out-of-range one is clamped instead (UnreachableThumbTargetsAreClamped...).
       snapshot.requested.arm[0] += 0.04;
-      snapshot.requested.hand[0] = x2::cbf::kRigidThumbLimits[0][1] + 0.01;
+      snapshot.requested.hand[0] = std::numeric_limits<double>::quiet_NaN();
     } else {
       snapshot.requested.arm[3] = std::numeric_limits<double>::quiet_NaN();
     }
@@ -283,26 +284,30 @@ TEST(CbfSafety, ShadowPreservesBothProjectedAndInvalidRequestsExactly)
   EXPECT_EQ(safety.diagnostics().published, 0u);
 }
 
-TEST(CbfSafety, StaleArmOrThumbFeedbackKeepsTheCommittedPairWithoutAcceptingNewTargets)
+TEST(CbfSafety, StaleArmFeedbackHoldsTheCommittedPairButStaleThumbFeedbackDoesNot)
 {
   CbfSafety safety(fixture_config());
   const auto initial = safety.filter(urdf_snapshot(), 1.0);
   ASSERT_TRUE(initial.accept_new);
   safety.committed(initial, 1.0);
 
-  for (int stale_group = 0; stale_group < 2; ++stale_group) {
-    SCOPED_TRACE(stale_group);
-    auto snapshot = urdf_snapshot();
-    auto & feedback = stale_group == 0 ? snapshot.arm : snapshot.thumb;
-    feedback->age_s = safety.config().feedback_max_age_s + 0.001;
-    const auto decision = safety.filter(snapshot, 1.02);
-    expect_held_pair(decision, initial.output);
-    EXPECT_EQ(safety.diagnostics().reason, "feedback_unavailable");
-  }
+  auto snapshot = urdf_snapshot();
+  snapshot.arm->age_s = safety.config().feedback_max_age_s + 0.001;
+  const auto held = safety.filter(snapshot, 1.02);
+  expect_held_pair(held, initial.output);
+  EXPECT_FALSE(held.collision_refusal);
+  EXPECT_EQ(safety.diagnostics().reason, "feedback_unavailable");
+
+  snapshot = urdf_snapshot();
+  snapshot.thumb->age_s = safety.config().feedback_max_age_s + 0.001;
+  const auto moved_on = safety.filter(snapshot, 1.02);
+  ASSERT_TRUE(moved_on.accept_new) << safety.diagnostics().reason;
+  EXPECT_EQ(moved_on.output.hand, snapshot.requested.hand);
+  EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, "stale");
   EXPECT_EQ(safety.diagnostics().published, 1u);
 }
 
-TEST(CbfSafety, FreshFeedbackWithExcessiveArmThumbSkewIsRejected)
+TEST(CbfSafety, ArmThumbSkewWithinTheFeedbackAgeDoesNotRejectAFrame)
 {
   CbfSafety safety(fixture_config());
   auto snapshot = urdf_snapshot();
@@ -313,10 +318,11 @@ TEST(CbfSafety, FreshFeedbackWithExcessiveArmThumbSkewIsRejected)
   ASSERT_LT(snapshot.thumb->age_s, safety.config().feedback_max_age_s);
   ASSERT_GT(std::abs(snapshot.arm->age_s - snapshot.thumb->age_s), safety.config().state_skew_max_s);
 
-  const auto rejected = safety.filter(snapshot, 1.0);
-  EXPECT_FALSE(rejected.accept_new);
-  EXPECT_EQ(rejected.output.kind, Output::Kind::kNone);
-  EXPECT_EQ(safety.diagnostics().reason, "feedback_skew");
+  // Thumb samples are advisory; a fresh-enough one is used as is.
+  const auto accepted = safety.filter(snapshot, 1.0);
+  EXPECT_TRUE(accepted.accept_new) << safety.diagnostics().reason;
+  EXPECT_EQ(safety.diagnostics().reason, "verified_nominal_path");
+  EXPECT_TRUE(safety.diagnostics().thumb_feedback_issue.empty());
 }
 
 TEST(CbfSafety, ANewEpochCannotReuseThePreviousCommittedPair)
@@ -328,7 +334,7 @@ TEST(CbfSafety, ANewEpochCannotReuseThePreviousCommittedPair)
 
   auto snapshot = urdf_snapshot();
   snapshot.epoch = 2;
-  snapshot.requested.hand[0] = x2::cbf::kRigidThumbLimits[0][1] + 0.01;
+  snapshot.requested.hand[0] = std::numeric_limits<double>::quiet_NaN();
   const auto rejected = safety.filter(snapshot, 1.02);
   EXPECT_FALSE(rejected.accept_new);
   EXPECT_EQ(rejected.output.kind, Output::Kind::kNone);
@@ -518,7 +524,7 @@ TEST(CbfSafety, UnverifiedNativeMappingReportsShadowAnglesAndEnforcesGeometry)
   }
 }
 
-TEST(CbfSafety, LeftCandidateAcceptsSafeCompactFeedbackAndHoldsTheCommittedPairForAnInvalidTarget)
+TEST(CbfSafety, LeftCandidateAcceptsSafeCompactFeedbackAndClampsAnUnreachableThumbTarget)
 {
   CbfSafety safety(fixture_config(historical_left_candidate_fixture_json()));
   ASSERT_TRUE(safety.config().enforce);
@@ -543,47 +549,78 @@ TEST(CbfSafety, LeftCandidateAcceptsSafeCompactFeedbackAndHoldsTheCommittedPairF
   EXPECT_EQ(safety.diagnostics().published, 1u);
   EXPECT_FALSE(safety.config().mapping_verified);
 
-  auto invalid_target = snapshot;
-  invalid_target.requested.arm[0] += 0.04;
-  invalid_target.requested.hand[0] = safety.config().native_upper[0] + 0.01;
-  const auto held = safety.filter(invalid_target, 1.02);
-  expect_held_pair(held, decision.output);
-  EXPECT_EQ(safety.diagnostics().reason, "unverified_mapping/invalid_command");
-  ASSERT_EQ(held.output.kind, Output::Kind::kUpperBody);
-  safety.committed(held, 1.02);
-  EXPECT_EQ(safety.diagnostics().accepted, 1u);
-  EXPECT_EQ(safety.diagnostics().held, 1u);
+  // The hand cannot reach past its native range; the command is clamped there.
+  auto unreachable = snapshot;
+  unreachable.requested.hand[0] = safety.config().native_upper[0] + 0.01;
+  const auto clamped = safety.filter(unreachable, 1.02);
+  ASSERT_TRUE(clamped.accept_new) << safety.diagnostics().reason;
+  EXPECT_TRUE(clamped.modified);
+  EXPECT_DOUBLE_EQ(clamped.output.hand[0], safety.config().native_upper[0]);
+  EXPECT_EQ(clamped.output.arm, unreachable.requested.arm);
+  for (std::size_t slot = 1; slot < 20; ++slot) {
+    EXPECT_EQ(clamped.output.hand[slot], unreachable.requested.hand[slot]) << slot;
+  }
+  safety.committed(clamped, 1.02);
+  EXPECT_EQ(safety.diagnostics().accepted, 2u);
+  EXPECT_EQ(safety.diagnostics().held, 0u);
   EXPECT_EQ(safety.diagnostics().published, 2u);
   EXPECT_FALSE(safety.config().mapping_verified);
 }
 
-TEST(CbfSafety, LeftCandidateHoldsTheCommittedPairForOutOfRangeNanAndStaleFeedback)
+TEST(CbfSafety, LeftCandidateFollowsThroughOutOfRangeNanAndStaleThumbFeedback)
 {
+  // 11-17 field freeze: one thumb root read past the native range, the held
+  // frame froze the thumb, and the reading never came back. Thumb feedback
+  // now only feeds FK, clamped or replaced by the last published command.
   CbfSafety safety(fixture_config(historical_left_candidate_fixture_json()));
   const auto first = safety.filter(historical_left_native_snapshot(), 1.0);
   ASSERT_TRUE(first.accept_new);
   safety.committed(first, 1.0);
+  const double raw = safety.config().native_lower[0] - 0.35;  // About 20 degrees out.
   for (int invalid_case = 0; invalid_case < 3; ++invalid_case) {
     SCOPED_TRACE(invalid_case);
     auto snapshot = historical_left_native_snapshot();
-    const char * reason;
+    const char * issue;
     if (invalid_case == 0) {
-      snapshot.thumb->position[0] = safety.config().native_lower[0] - 0.01;
-      reason = "unverified_mapping/native_feedback_out_of_range";
+      snapshot.thumb->position[0] = raw;
+      issue = "out_of_range";
     } else if (invalid_case == 1) {
       snapshot.thumb->position[0] = std::numeric_limits<double>::quiet_NaN();
-      reason = "unverified_mapping/feedback_unavailable";
+      issue = "unavailable";
     } else {
       snapshot.thumb->age_s = safety.config().feedback_max_age_s + 0.001;
-      reason = "unverified_mapping/feedback_unavailable";
+      issue = "stale";
     }
-    const auto rejected = safety.filter(snapshot, 1.02 + 0.02 * invalid_case);
-    expect_held_pair(rejected, first.output);
-    EXPECT_EQ(safety.diagnostics().reason, reason);
-    EXPECT_FALSE(safety.config().mapping_verified);
+    const double now = 1.02 + 0.02 * invalid_case;
+    const auto decision = safety.filter(snapshot, now);
+    ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+    EXPECT_EQ(decision.output.arm, snapshot.requested.arm);
+    EXPECT_EQ(decision.output.hand, snapshot.requested.hand);
+    EXPECT_EQ(safety.diagnostics().reason.find("unverified_mapping/"), 0u);
+    EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, issue);
+    ASSERT_TRUE(safety.diagnostics().last_thumb_feedback_event.has_value());
+    const auto & event = *safety.diagnostics().last_thumb_feedback_event;
+    EXPECT_EQ(event.issue, issue);
+    EXPECT_EQ(event.event, static_cast<uint64_t>(invalid_case + 1));
+    EXPECT_DOUBLE_EQ(event.at_s, now);
+    if (invalid_case == 0) {
+      EXPECT_EQ(event.axis, 0);
+      EXPECT_DOUBLE_EQ(event.value, raw);
+      EXPECT_NEAR(event.lower, safety.config().native_lower[0], 1e-12);
+      EXPECT_NEAR(event.upper, safety.config().native_upper[0], 1e-12);
+    }
+    safety.committed(decision, now);
   }
-  EXPECT_EQ(safety.diagnostics().accepted, 1u);
-  EXPECT_EQ(safety.diagnostics().published, 1u);
+  EXPECT_EQ(safety.diagnostics().thumb_feedback_frames, 3u);
+  EXPECT_EQ(safety.diagnostics().accepted, 4u);
+  EXPECT_EQ(safety.diagnostics().published, 4u);
+  EXPECT_EQ(safety.diagnostics().held, 0u);
+
+  // A valid reading clears the issue; the event stays for the log.
+  const auto recovered = safety.filter(historical_left_native_snapshot(), 1.1);
+  ASSERT_TRUE(recovered.accept_new);
+  EXPECT_TRUE(safety.diagnostics().thumb_feedback_issue.empty());
+  EXPECT_EQ(safety.diagnostics().last_thumb_feedback_event->event, 3u);
 }
 
 TEST(CbfSafety, ExplicitLeftHandOnlyUsesTwoMeasuredRootsAndPreservesHand20)
@@ -610,18 +647,20 @@ TEST(CbfSafety, ExplicitLeftHandOnlyUsesTwoMeasuredRootsAndPreservesHand20)
   safety.committed(decision, 1.0);
   snapshot.thumb->position.pop_back();
   const auto lost_left = safety.filter(snapshot, 1.02);
-  expect_held_pair(lost_left, decision.output);
-  EXPECT_EQ(safety.diagnostics().reason, "feedback_unavailable");
+  ASSERT_TRUE(lost_left.accept_new) << safety.diagnostics().reason;
+  EXPECT_EQ(lost_left.output.hand, snapshot.requested.hand);
+  EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, "unavailable");
 }
 
 TEST(CbfSafety, AnInstalledHandCannotSilentlyDisappearOrChangeHardware)
 {
+  // Missing thumb roots no longer refuse a frame; the hardware check below does.
   CbfSafety both(fixture_config());
   auto snapshot = urdf_snapshot();
   snapshot.thumb->position.resize(2);
   const auto missing = both.filter(snapshot, 1.0);
-  EXPECT_EQ(missing.output.kind, Output::Kind::kNone);
-  EXPECT_EQ(both.diagnostics().reason, "feedback_unavailable");
+  ASSERT_TRUE(missing.accept_new) << both.diagnostics().reason;
+  EXPECT_EQ(both.diagnostics().thumb_feedback_issue, "unavailable");
 
   auto value = urdf_fixture_json();
   value["hands_installed"] = {true, false};
@@ -648,7 +687,7 @@ TEST(CbfSafety, InstalledHandConfigurationRequiresExplicitBooleans)
       R"({"enabled":false,"hands_installed":"unused"})", 50.0).enabled);
 }
 
-TEST(CbfSafety, PublicationFeedbackGateRejectsNewInvalidSamplesButAcceptsNormalUpdates)
+TEST(CbfSafety, PublicationFeedbackGateChecksTheArmOnly)
 {
   auto value = urdf_fixture_json();
   value["hands_installed"] = {true, false};
@@ -659,8 +698,15 @@ TEST(CbfSafety, PublicationFeedbackGateRejectsNewInvalidSamplesButAcceptsNormalU
   latest.arm->position[0] += 0.001;
   EXPECT_TRUE(config.feedback_error(latest).empty());
   latest.thumb->position[0] = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_EQ(config.feedback_error(latest), "feedback_unavailable");
+  EXPECT_TRUE(config.feedback_error(latest).empty());
   latest.thumb.reset();
+  EXPECT_TRUE(config.feedback_error(latest).empty());
+  latest.arm->position[3] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_EQ(config.feedback_error(latest), "feedback_unavailable");
+  latest.arm->position[3] = 0.0;
+  latest.arm->age_s = config.feedback_max_age_s + 0.001;
+  EXPECT_EQ(config.feedback_error(latest), "feedback_unavailable");
+  latest.arm.reset();
   EXPECT_EQ(config.feedback_error(latest), "feedback_unavailable");
 }
 
@@ -866,52 +912,42 @@ TEST(CbfSafety, FeedbackTolerancePreservesAllCommandBoundsAndVelocity)
   EXPECT_FALSE(observation_allowance.mapping_verified);
 }
 
-TEST(CbfSafety, ThumbFeedbackAllowanceDoesNotRelaxTargetLimitsOrAcceptExcessiveFeedback)
+TEST(CbfSafety, ThumbFeedbackBeyondTheModelRangeIsClampedForGeometryWithoutRelaxingTargets)
 {
   auto value = historical_left_candidate_fixture_json();
-  CbfSafety strict(fixture_config(value));
-  constexpr double one_degree = 0.017453292519943295;
-  value["feedback_limit_tolerance_rad"] = one_degree;
-  CbfSafety observation_allowance(fixture_config(value));
-  const double native_upper = strict.config().native_upper[0];
-  auto within_allowance = historical_left_native_snapshot();
-  ASSERT_EQ(within_allowance.thumb->position.size(), 2u);
-  within_allowance.thumb->position[0] = native_upper + 0.0006;
-  EXPECT_EQ(strict.config().feedback_error(within_allowance), "native_feedback_out_of_range");
-  const auto strict_rejection = strict.filter(within_allowance, 1.0);
-  EXPECT_FALSE(strict_rejection.accept_new);
-  EXPECT_EQ(strict_rejection.output.kind, Output::Kind::kNone);
-  EXPECT_TRUE(observation_allowance.config().feedback_error(within_allowance).empty());
+  CbfSafety safety(fixture_config(value));
+  const auto & config = safety.config();
+  const double native_upper = config.native_upper[0];
+  const auto & band = config.thumb_model_limits[0];
+  // native_upper maps to the model lower bound (scale -1). Readings a hair and
+  // about 20 degrees past it both drive FK from the bound itself.
+  for (double excess : {0.0006, 0.35}) {
+    SCOPED_TRACE(excess);
+    auto beyond = historical_left_native_snapshot();
+    ASSERT_EQ(beyond.thumb->position.size(), 2u);
+    beyond.thumb->position[0] = native_upper + excess;
+    EXPECT_TRUE(config.feedback_error(beyond).empty());
+    const auto decision = safety.filter(beyond, 1.0);
+    EXPECT_EQ(safety.diagnostics().invalid_input_frames, 0u);
+    EXPECT_EQ(safety.diagnostics().reason.find("INVALID_INPUT_FALLBACK"), std::string::npos);
+    EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, "out_of_range");
+    ASSERT_TRUE(safety.diagnostics().thumb_angles_valid);
+    const double raw_model_current = config.feedback_scale[0] * beyond.thumb->position[0] + config.feedback_offset[0];
+    ASSERT_LT(raw_model_current, band[0]);
+    EXPECT_DOUBLE_EQ(safety.diagnostics().thumb_current_urdf[0], band[0]);
+    EXPECT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+  }
 
-  const auto numerical = observation_allowance.filter(within_allowance, 1.0);
-  (void)numerical;  // Geometry may reject; an observation allowance is not a collision-safety pass.
-  EXPECT_EQ(observation_allowance.diagnostics().invalid_input_frames, 0u);
-  EXPECT_EQ(observation_allowance.diagnostics().reason.find("INVALID_INPUT_FALLBACK"), std::string::npos);
-  EXPECT_NE(observation_allowance.diagnostics().reason, "unverified_mapping/native_feedback_out_of_range");
-  ASSERT_TRUE(observation_allowance.diagnostics().thumb_angles_valid);
-  const double raw_model_current = observation_allowance.config().feedback_scale[0] *
-    within_allowance.thumb->position[0] + observation_allowance.config().feedback_offset[0];
-  ASSERT_LT(raw_model_current, observation_allowance.config().thumb_model_limits[0][0]);
-  EXPECT_DOUBLE_EQ(observation_allowance.diagnostics().thumb_current_urdf[0], raw_model_current);
-
-  auto beyond_allowance = within_allowance;
-  beyond_allowance.thumb->position[0] = native_upper + one_degree + 0.0006;
-  EXPECT_EQ(observation_allowance.config().feedback_error(beyond_allowance), "native_feedback_out_of_range");
-  const auto feedback_rejection = observation_allowance.filter(beyond_allowance, 1.02);
-  EXPECT_FALSE(feedback_rejection.accept_new);
-  EXPECT_EQ(feedback_rejection.output.kind, Output::Kind::kNone);
-  EXPECT_EQ(observation_allowance.diagnostics().reason, "unverified_mapping/native_feedback_out_of_range");
-
-  // No result above was committed: a target outside the unchanged command
-  // range cannot authorize a new frame or invent a fallback pair.
-  auto invalid_target = historical_left_native_snapshot();
-  invalid_target.requested.hand[0] = native_upper + 0.0006;
-  ASSERT_TRUE(observation_allowance.config().feedback_error(invalid_target).empty());
-  const auto target_rejection = observation_allowance.filter(invalid_target, 1.04);
-  EXPECT_FALSE(target_rejection.accept_new);
-  EXPECT_EQ(target_rejection.output.kind, Output::Kind::kNone);
-  EXPECT_EQ(observation_allowance.diagnostics().reason, "unverified_mapping/invalid_command");
-  EXPECT_FALSE(observation_allowance.config().mapping_verified);
+  // Target bounds stay strict: a command past native_upper is clamped onto it
+  // (into the model range), never handed to the kernel beyond it.
+  auto unreachable = historical_left_native_snapshot();
+  unreachable.requested.hand[0] = native_upper + 0.35;
+  const auto clamped = safety.filter(unreachable, 1.04);
+  ASSERT_TRUE(clamped.accept_new) << safety.diagnostics().reason;
+  EXPECT_DOUBLE_EQ(clamped.output.hand[0], native_upper);
+  EXPECT_GE(safety.diagnostics().thumb_target_urdf[0], band[0] - 1e-12);
+  EXPECT_LE(safety.diagnostics().thumb_target_urdf[0], band[1] + 1e-12);
+  EXPECT_FALSE(config.mapping_verified);
 }
 
 namespace
@@ -1024,15 +1060,14 @@ x2::cbf::SafetyFilterInput freeze091650_input(const CbfSnapshot & snapshot, cons
   input.thumb_joint_limits_urdf = config.thumb_model_limits;
   input.thumb_joint_limits_urdf[2] = x2::cbf::kRigidThumbLimits[2];
   input.thumb_joint_limits_urdf[3] = x2::cbf::kRigidThumbLimits[3];
+  // Production clamps the reading into the model range; no thumb allowance.
   input.current_thumb_joint_limits_urdf = input.thumb_joint_limits_urdf;
   for (std::size_t axis = 0; axis < 2; ++axis) {
     const auto slot = x2::cbf::kRigidThumbIndices[axis];
-    input.q_thumb_current_urdf[slot] = config.feedback_scale[axis] * snapshot.thumb->position[axis] +
-      config.feedback_offset[axis];
+    input.q_thumb_current_urdf[slot] = std::clamp(
+      config.feedback_scale[axis] * snapshot.thumb->position[axis] + config.feedback_offset[axis],
+      config.thumb_model_limits[axis][0], config.thumb_model_limits[axis][1]);
     input.q_thumb_urdf[slot] = config.command_scale[axis] * snapshot.requested.hand[axis] + config.command_offset[axis];
-    const double allowance = std::abs(config.feedback_scale[axis]) * config.feedback_limit_tolerance_rad;
-    (*input.current_thumb_joint_limits_urdf)[axis][0] -= allowance;
-    (*input.current_thumb_joint_limits_urdf)[axis][1] += allowance;
   }
   return input;
 }
@@ -1224,7 +1259,7 @@ TEST(CbfSafety, AirwallFeedbackFailuresAndNodeDeadlinesKeepPublishingThenResumeI
     } else if (frame % 4 == 2) {
       bad.arm->position[0] = std::numeric_limits<double>::quiet_NaN();
     } else {
-      bad.thumb->age_s = config.state_skew_max_s + 0.001;
+      bad.arm.reset();  // Thumb feedback no longer gates a frame.
     }
     const double now = 1.02 + config.period_s * frame;
     const auto decision = safety.filter(bad, now);
@@ -1261,7 +1296,7 @@ TEST(CbfSafety, AirwallFeedbackFailuresAndNodeDeadlinesKeepPublishingThenResumeI
   safety.inactive(fresh.epoch);  // An explicit ownership exit invalidates even a prepared hold.
   EXPECT_EQ(safety.deadline_fallback(last_hold).output.kind, Output::Kind::kNone);
   ++fresh.epoch;
-  fresh.thumb.reset();
+  fresh.arm.reset();
   const auto new_epoch = safety.filter(fresh, 1.22);
   EXPECT_EQ(new_epoch.output.kind, Output::Kind::kNone);
   EXPECT_EQ(safety.feedback_fallback(last_hold, "feedback_unavailable").output.kind, Output::Kind::kNone);
@@ -1424,7 +1459,7 @@ TEST(CbfSafety, FasterHandFeedbackWaitsForLaggingArmWithdrawalThenReleasesTheWho
 
     const double now = 1.02 + config.period_s * frame;
     auto supplied = observed;
-    if (frame == 1) {supplied.thumb->age_s = config.feedback_max_age_s + 0.001;}
+    if (frame == 1) {supplied.arm->age_s = config.feedback_max_age_s + 0.001;}
     auto decision = safety.filter(supplied, now);
     if (frame == 2) {decision = safety.deadline_fallback(decision);}
     ASSERT_EQ(decision.output.kind, Output::Kind::kUpperBody) << safety.diagnostics().reason;
@@ -1662,4 +1697,255 @@ TEST(CbfSafety, ProjectedRecoveryReusesItsKernelProofForTheUnchangedActualSnapsh
   safety.committed(projected, 1.02);
   EXPECT_EQ(safety.diagnostics().accepted, 2u);
   EXPECT_EQ(safety.diagnostics().withheld, 0u);
+}
+
+TEST(CbfSafety, HoldReleaseConfigurationIsBounded)
+{
+  EXPECT_DOUBLE_EQ(fixture_config().hold_release_after_s, 0.2);
+  auto value = urdf_fixture_json();
+  value["hold_release_after_s"] = 0.5;
+  EXPECT_DOUBLE_EQ(fixture_config(value).hold_release_after_s, 0.5);
+  for (double invalid : {-0.01, 1.01}) {
+    value["hold_release_after_s"] = invalid;
+    EXPECT_THROW(fixture_config(value), std::invalid_argument);
+  }
+}
+
+TEST(CbfSafety, FaultedOrMissingThumbFeedbackUsesTheLastPublishedCommandInTheSameFrame)
+{
+  CbfSafety safety(fixture_config());
+  const auto & band = safety.config().thumb_model_limits;
+  // Before any publication the requested command stands in for the reading.
+  auto first = urdf_snapshot();
+  first.thumb.reset();
+  first.requested.hand[0] = 0.5 * (band[0][0] + band[0][1]);
+  const auto seed = safety.filter(first, 1.0);
+  ASSERT_TRUE(seed.accept_new) << safety.diagnostics().reason;
+  EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, "unavailable");
+  EXPECT_DOUBLE_EQ(safety.diagnostics().thumb_current_urdf[0], first.requested.hand[0]);
+  safety.committed(seed, 1.0);
+
+  for (int faulted_case = 0; faulted_case < 2; ++faulted_case) {
+    SCOPED_TRACE(faulted_case);
+    auto snapshot = urdf_snapshot();
+    if (faulted_case == 0) {
+      snapshot.thumb_faulted = true;
+      snapshot.thumb->position[0] = 5.0;  // A faulted hand's reading is not used even clamped.
+    } else {
+      snapshot.thumb.reset();
+    }
+    const auto decision = safety.filter(snapshot, 1.02 + 0.02 * faulted_case);
+    ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+    EXPECT_EQ(decision.output.hand, snapshot.requested.hand);
+    EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, faulted_case == 0 ? "faulted" : "unavailable");
+    EXPECT_DOUBLE_EQ(safety.diagnostics().thumb_current_urdf[0], seed.output.hand[0]);
+    safety.committed(decision, 1.02 + 0.02 * faulted_case);
+  }
+  EXPECT_EQ(safety.diagnostics().held, 0u);
+}
+
+TEST(CbfSafety, UnreachableThumbTargetsAreClampedIntoTheModelRangeWithoutNativeLimits)
+{
+  CbfSafety safety(fixture_config());
+  ASSERT_FALSE(safety.config().native_limits_available);
+  const auto & band = safety.config().thumb_model_limits;
+  auto snapshot = urdf_snapshot();
+  snapshot.requested.hand[0] = band[0][1] + 0.35;
+  snapshot.requested.hand[11] = band[3][0] - 0.35;
+  const auto decision = safety.filter(snapshot, 1.0);
+  ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+  EXPECT_TRUE(decision.modified);
+  EXPECT_DOUBLE_EQ(decision.output.hand[0], band[0][1]);
+  EXPECT_DOUBLE_EQ(decision.output.hand[11], band[3][0]);
+  EXPECT_EQ(decision.output.arm, snapshot.requested.arm);
+}
+
+TEST(CbfSafety, NonCollisionHoldsReleaseAfterTheConfiguredTimeWithinJointAndVelocityLimits)
+{
+  CbfSafety safety(fixture_config());
+  const auto & config = safety.config();
+  const auto seed = safety.filter(urdf_snapshot(), 1.0);
+  ASSERT_TRUE(seed.accept_new);
+  safety.committed(seed, 1.0);
+
+  auto goal = urdf_snapshot();
+  goal.requested.arm[0] = std::min(config.upper[0], goal.requested.arm[0] + 0.3);
+  goal.requested.arm[3] = config.lower[3] - 1.0;  // Past the joint limit: published clamped.
+  goal.requested.hand[0] = config.thumb_model_limits[0][1] + 0.2;
+  goal.requested.hand[5] = 0.4;
+  Output previous = seed.output;
+  int held_frames = 0;
+  int released_frames = 0;
+  double first_release = -1.0;
+  for (int frame = 0; frame < 50; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.02 + config.period_s * frame;
+    // Every non-verdict hold kind counts toward the same episode.
+    auto snapshot = goal;
+    CbfDecision decision;
+    if (frame % 3 == 0) {
+      snapshot.arm->age_s = config.feedback_max_age_s + 0.001;
+      decision = safety.filter(snapshot, now);
+    } else if (frame % 3 == 1) {
+      decision = safety.deadline_fallback(safety.filter(snapshot, now));
+    } else {
+      decision = safety.feedback_fallback(safety.filter(snapshot, now), "feedback_unavailable");
+    }
+    ASSERT_FALSE(decision.accept_new);
+    ASSERT_FALSE(decision.collision_refusal);
+    decision = safety.release_if_stuck(decision, snapshot, now);
+    ASSERT_EQ(decision.output.kind, Output::Kind::kUpperBody);
+    if (now - 1.02 + 1e-9 < config.hold_release_after_s) {
+      expect_held_pair(decision, seed.output);
+      EXPECT_FALSE(safety.diagnostics().releasing);
+      ++held_frames;
+    } else {
+      ASSERT_TRUE(decision.accept_new);
+      EXPECT_TRUE(decision.released);
+      EXPECT_TRUE(safety.diagnostics().releasing);
+      EXPECT_EQ(safety.diagnostics().reason.find("released/"), 0u) << safety.diagnostics().reason;
+      if (first_release < 0.0) {first_release = now;}
+      for (std::size_t joint = 0; joint < 14; ++joint) {
+        SCOPED_TRACE(joint);
+        EXPECT_GE(decision.output.arm[joint], config.lower[joint] - 1e-12);
+        EXPECT_LE(decision.output.arm[joint], config.upper[joint] + 1e-12);
+        EXPECT_LE(std::abs(decision.output.arm[joint] - previous.arm[joint]),
+          config.velocity[joint] * config.period_s + 1e-9);
+      }
+      EXPECT_DOUBLE_EQ(decision.output.hand[0], config.thumb_model_limits[0][1]);
+      EXPECT_DOUBLE_EQ(decision.output.hand[5], 0.4);
+      ++released_frames;
+    }
+    safety.committed(decision, now);
+    previous = decision.output;
+  }
+  EXPECT_NEAR(first_release, 1.22, 1e-9);
+  EXPECT_EQ(held_frames, 10);
+  EXPECT_EQ(released_frames, 40);
+  EXPECT_EQ(safety.diagnostics().release_episodes, 1u);
+  EXPECT_EQ(safety.diagnostics().released, 40u);
+  // The release walked the arm to the reachable goal.
+  EXPECT_DOUBLE_EQ(previous.arm[0], goal.requested.arm[0]);
+  EXPECT_DOUBLE_EQ(previous.arm[3], config.lower[3]);
+
+  // A verified frame ends the episode; a new hold starts a new 0.2 s count.
+  auto valid = urdf_snapshot();
+  valid.arm->position = previous.arm;
+  valid.requested.arm = previous.arm;
+  auto verified = safety.release_if_stuck(safety.filter(valid, 2.02), valid, 2.02);
+  ASSERT_TRUE(verified.accept_new) << safety.diagnostics().reason;
+  EXPECT_FALSE(verified.released);
+  EXPECT_FALSE(safety.diagnostics().releasing);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+  safety.committed(verified, 2.02);
+  valid.arm->age_s = config.feedback_max_age_s + 0.001;
+  EXPECT_FALSE(safety.release_if_stuck(safety.filter(valid, 2.04), valid, 2.04).accept_new);
+  EXPECT_TRUE(safety.release_if_stuck(safety.filter(valid, 2.24), valid, 2.24).released);
+  EXPECT_EQ(safety.diagnostics().release_episodes, 2u);
+
+  safety.inactive(valid.epoch);
+  EXPECT_EQ(safety.diagnostics().reason, "inactive");
+  EXPECT_FALSE(safety.diagnostics().releasing);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+}
+
+TEST(CbfSafety, ReleaseWithoutAPublishedFrameStepsFromTheMeasuredArm)
+{
+  CbfSafety safety(fixture_config());
+  const auto & config = safety.config();
+  auto snapshot = urdf_snapshot();
+  snapshot.requested.arm[0] = std::min(config.upper[0], snapshot.arm->position[0] + 0.3);
+  snapshot.publication_deadline = std::chrono::steady_clock::now();  // Every frame misses its budget.
+  auto decision = safety.release_if_stuck(safety.filter(snapshot, 1.0), snapshot, 1.0);
+  EXPECT_EQ(decision.output.kind, Output::Kind::kNone);
+  EXPECT_FALSE(decision.collision_refusal);
+  decision = safety.release_if_stuck(safety.filter(snapshot, 1.2), snapshot, 1.2);
+  ASSERT_TRUE(decision.released) << safety.diagnostics().reason;
+  ASSERT_EQ(decision.output.kind, Output::Kind::kUpperBody);
+  EXPECT_NEAR(decision.output.arm[0], snapshot.arm->position[0] + config.velocity[0] * config.period_s, 1e-12);
+  EXPECT_EQ(decision.output.hand, snapshot.requested.hand);
+
+  // Nothing complete to publish: an invalid command keeps the hold however long.
+  snapshot.requested.hand[3] = std::numeric_limits<double>::quiet_NaN();
+  for (double now : {1.4, 1.6, 2.0}) {
+    EXPECT_FALSE(safety.release_if_stuck(safety.filter(snapshot, now), snapshot, now).accept_new);
+  }
+}
+
+TEST(CbfSafety, ACollisionVerdictIsNeverReleasedAndTheNextMoveAwayFrameIsAccepted)
+{
+  const auto config = fixture_config(freeze091650_config());
+  const auto frozen = freeze094711_snapshot(config);
+  CbfSafety safety(config);
+  const auto seed = safety.filter(frozen, 1.0);
+  ASSERT_TRUE(seed.accept_new) << safety.diagnostics().reason;
+  safety.committed(seed, 1.0);
+
+  // A non-verdict hold starts the release clock ...
+  auto stale = frozen;
+  stale.arm->age_s = config.feedback_max_age_s + 0.001;
+  EXPECT_FALSE(safety.release_if_stuck(safety.filter(stale, 1.0), stale, 1.0).accept_new);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+
+  // ... and a verdict resets it. The measured elbow has left the committed one
+  // inside the wall; at the instant of the last publication the command box has
+  // zero width, so the only candidate is a path back into the wall. Offline this
+  // is the reproducible verdict; the release clock is advanced independently.
+  auto lagging = frozen;
+  lagging.arm->position[3] += 0.05;
+  for (double release_clock : {1.1, 1.5, 3.0}) {
+    SCOPED_TRACE(release_clock);
+    const auto verdict = safety.filter(lagging, 1.0);
+    ASSERT_TRUE(verdict.collision_refusal) << safety.diagnostics().reason;
+    ASSERT_FALSE(verdict.accept_new);
+    const auto kept = safety.release_if_stuck(verdict, lagging, release_clock);
+    EXPECT_FALSE(kept.accept_new);
+    EXPECT_FALSE(kept.released);
+    expect_held_pair(kept, seed.output);
+    EXPECT_FALSE(safety.diagnostics().releasing);
+    EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+    // The node's late recheck keeps the verdict flag on the cached hold.
+    EXPECT_TRUE(safety.deadline_fallback(verdict).collision_refusal);
+  }
+  safety.committed(seed, 1.0);
+
+  // One frame later the operator moves away and the frame is accepted.
+  auto away = lagging;
+  away.requested.arm[3] = lagging.arm->position[3] + 0.02;
+  const auto moved = safety.release_if_stuck(safety.filter(away, 1.02), away, 1.02);
+  ASSERT_TRUE(moved.accept_new) << safety.diagnostics().reason;
+  EXPECT_FALSE(moved.released);
+  EXPECT_GT(moved.output.arm[3], seed.output.arm[3] + 1e-6);
+  auto path = away;
+  path.requested = moved.output;
+  const auto verified = freeze091650_path(path, config, true);
+  EXPECT_TRUE(verified.nonlinear_verified);
+}
+
+TEST(CbfSafety, ABlockedArmNeverTurnsMoveAwayOrStillRequestsIntoAHold)
+{
+  // The robot does not follow the published command (blocked or lagging) while
+  // the operator keeps moving. At 50 Hz none of these frames may hold.
+  const auto config = fixture_config(freeze091650_config());
+  const auto frozen = freeze094711_snapshot(config);
+  for (double offset : {-0.05, 0.0, 0.05, 0.2}) {
+    for (double direction : {0.0, 0.01}) {
+      SCOPED_TRACE(offset);
+      SCOPED_TRACE(direction);
+      CbfSafety safety(config);
+      const auto seed = safety.filter(frozen, 1.0);
+      ASSERT_TRUE(seed.accept_new);
+      safety.committed(seed, 1.0);
+      auto snapshot = frozen;
+      snapshot.arm->position[3] += offset;
+      for (int frame = 0; frame < 40; ++frame) {
+        const double now = 1.02 + config.period_s * frame;
+        snapshot.requested.arm[3] = std::min(config.upper[3], frozen.requested.arm[3] + direction * (frame + 1));
+        const auto decision = safety.release_if_stuck(safety.filter(snapshot, now), snapshot, now);
+        ASSERT_TRUE(decision.accept_new) << frame << " " << safety.diagnostics().reason;
+        EXPECT_FALSE(decision.released);
+        safety.committed(decision, now);
+      }
+    }
+  }
 }

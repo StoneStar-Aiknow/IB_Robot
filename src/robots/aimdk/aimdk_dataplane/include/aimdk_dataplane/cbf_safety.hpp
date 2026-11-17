@@ -29,6 +29,10 @@ struct CbfSafetyConfig
   // Sensor/tracking allowance only. Never added to command or clearance limits.
   double feedback_limit_tolerance_rad = 0.0;
   bool check_arm_feedback_goal_range = true;
+  // A refusal that is not a collision verdict (data, budget, authorization) may
+  // hold the committed pair only this long; then the request is published within
+  // the original joint and velocity limits, as if the filter were disabled.
+  double hold_release_after_s = 0.2;
   double period_s = 0.02;
   bool mapping_verified = false;
   bool mapping_available = false;
@@ -60,6 +64,7 @@ struct CbfSnapshot
   bool hand_configuration_matches = true;
   std::optional<Measured> arm;
   std::optional<Measured> thumb;  // Installed sides only: L roll/abad then R roll/abad, native radians.
+  bool thumb_faulted = false;  // An installed thumb root reported a nonzero hand faultcode.
   // Shared with the publishing tick. Numerical callers may omit this and use
   // the configured relative budget; wall-clock/ROS time must never be used here.
   std::optional<std::chrono::steady_clock::time_point> publication_deadline;
@@ -74,7 +79,23 @@ struct CbfDecision
   bool geometry_modified = false;
   bool recovery_verified = false;
   bool hand_held = false;
+  // The kernel judged the request unsafe. Only these holds persist; a target
+  // that does not approach a collision is never refused this way.
+  bool collision_refusal = false;
+  bool released = false;  // Published by release_if_stuck, not verified by the filter.
   Output prepared_hold;
+};
+
+// Thumb feedback is advisory: its first problem in an episode, for logging only.
+struct CbfThumbFeedbackEvent
+{
+  uint64_t event = 0;
+  double at_s = 0.0;
+  std::string issue;  // out_of_range, unavailable, stale, faulted
+  int axis = -1;  // 0..3 = L roll, L abad, R roll, R abad
+  double value = 0.0;  // native radians as reported
+  double lower = 0.0;
+  double upper = 0.0;
 };
 
 struct CbfInputFault
@@ -141,6 +162,13 @@ struct CbfDiagnostics
   std::array<double, 4> thumb_target_urdf{};
   uint64_t invalid_input_frames = 0;
   std::optional<CbfInputFault> last_input_fault;
+  uint64_t thumb_feedback_frames = 0;  // Frames that clamped or replaced the thumb reading.
+  std::string thumb_feedback_issue;  // This frame's issue, empty when the reading was used as is.
+  std::optional<CbfThumbFeedbackEvent> last_thumb_feedback_event;
+  uint64_t released = 0;
+  uint64_t release_episodes = 0;
+  bool releasing = false;
+  double stuck_s = 0.0;  // Length of the current non-collision hold.
   std::string reason = "inactive";
 };
 
@@ -155,6 +183,8 @@ public:
   void committed(const CbfDecision & decision, double now);
   CbfDecision deadline_fallback(const CbfDecision & decision);
   CbfDecision feedback_fallback(const CbfDecision & decision, const std::string & reason);
+  // Last step before publication. Never applied to a collision refusal.
+  CbfDecision release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now);
   void tick_finished(double elapsed_us);
   void discarded();
   void inactive(uint64_t epoch);
@@ -167,6 +197,7 @@ private:
   std::optional<Output> accepted_;
   double last_published_ = 0.0;
   bool invalid_input_episode_ = false;
+  std::optional<double> stuck_since_;
 };
 
 }  // namespace aimdk_dataplane

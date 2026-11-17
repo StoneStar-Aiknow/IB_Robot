@@ -400,6 +400,12 @@ robot:
     feedback_limit_tolerance_rad: 0.017453292519943295
     # Encoder feedback is raw geometry, not a goal to be admitted by travel limits.
     check_arm_feedback_goal_range: false
+    # feat/x2-cbf-dual
+    # A hold that is not a collision verdict (feedback, budget, authorization)
+    # lasts at most this long; then the request goes out within joint and
+    # velocity limits. Thumb feedback no longer holds a frame at all.
+    hold_release_after_s: 0.2
+    # /feat/x2-cbf-dual
     thumb_mapping:
       # Historical candidate only. The operator requested a live trial before calibration.
       verified: false
