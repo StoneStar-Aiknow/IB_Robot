@@ -238,8 +238,13 @@ bool CbfSafetyConfig::matches_hand_types(const std::vector<int> & types) const
   if (types.size() != 2) {return false;}
   for (size_t side = 0; side < hands_installed.size(); ++side) {
     // This geometry and mapping are for the OmniHand reported as SDK type 1.
-    // A dropout or a newly attached hand must never remove collision pairs.
-    if (types[side] != (hands_installed[side] ? 1 : 0)) {return false;}
+    // An installed side reported as type 0 is an empty flange (a hand not yet
+    // fitted, or a dropout): its geometry stays in, checked as a phantom hand at
+    // the commanded thumb angles, which only adds collision pairs. The reverse is
+    // refused: a hand on a side configured without one (or any other hand type)
+    // has no collision body here, so it would move unchecked.
+    const bool accepted = hands_installed[side] ? (types[side] == 1 || types[side] == 0) : types[side] == 0;
+    if (!accepted) {return false;}
   }
   return true;
 }
@@ -377,6 +382,9 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   // tracking error, and a held frame cannot move the thumb back. Geometry uses
   // the reading clamped into the model range; a missing, stale, nonfinite or
   // faulted reading is replaced by the last published (else requested) command.
+  // Each side is judged on its own: one side's missing or faulted thumb never
+  // replaces the other side's reading. A side reported as an empty flange is a
+  // phantom hand: always the command, and not counted as a feedback problem.
   std::array<double, 4> thumb_current{};
   CbfThumbFeedbackEvent thumb_event;
   {
@@ -385,21 +393,24 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     const bool present = snapshot.thumb && snapshot.thumb->position.size() == installed;
     const bool fresh = present && std::isfinite(snapshot.thumb->age_s) && snapshot.thumb->age_s >= 0.0 &&
       snapshot.thumb->age_s <= config_.feedback_max_age_s;
-    const char * blanket = !present ? "unavailable" : (!fresh ? "stale" :
-      (snapshot.thumb_faulted ? "faulted" : nullptr));
+    const char * whole = !present ? "unavailable" : (!fresh ? "stale" : nullptr);
     const auto & substitute = accepted_ ? accepted_->hand : command.hand;
     size_t feedback_axis = 0;
     for (size_t j = 0; j < 4; ++j) {
-      if (!config_.hands_installed[j / 2]) {continue;}
+      const size_t side = j / 2;
+      if (!config_.hands_installed[side]) {continue;}
       const auto & band = config_.thumb_model_limits[j];
       const double raw = present ? snapshot.thumb->position[feedback_axis] :
         std::numeric_limits<double>::quiet_NaN();
       ++feedback_axis;
+      const bool phantom = snapshot.hand_reported_absent[side];
+      const char * blanket = phantom ? nullptr : (whole ? whole :
+        (snapshot.thumb_faulted[side] ? "faulted" : nullptr));
       double value = config_.feedback_scale[j] * raw + config_.feedback_offset[j];
       const char * issue = blanket;
-      if (!issue && !std::isfinite(value)) {issue = "unavailable";}
-      if (!issue && (value < band[0] || value > band[1])) {issue = "out_of_range";}
-      if (blanket || !std::isfinite(value)) {
+      if (!phantom && !issue && !std::isfinite(value)) {issue = "unavailable";}
+      if (!phantom && !issue && (value < band[0] || value > band[1])) {issue = "out_of_range";}
+      if (phantom || blanket || !std::isfinite(value)) {
         value = config_.command_scale[j] * substitute[kHandSlots[j]] + config_.command_offset[j];
       }
       thumb_current[j] = std::clamp(value, band[0], band[1]);

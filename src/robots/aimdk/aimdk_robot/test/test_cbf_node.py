@@ -1,8 +1,10 @@
 """The data plane node with an enforcing CBF, against the vendor mock: what it reports and logs.
 
 The filter's decisions are covered by aimdk_dataplane's C++ tests. These cover
-the node around it: the status fields the runtime reads, the INFO line, and the
-CBF_RELEASE log when the right hand drops out mid-mirror and comes back.
+the node around it: the status fields the runtime reads, the INFO line, the
+CBF_RELEASE log when the right hand is swapped for one the geometry was not
+built for mid-mirror and comes back, and an empty right flange checked as a
+phantom hand instead of released.
 """
 
 from __future__ import annotations
@@ -61,8 +63,10 @@ class Logged:
 
 
 @pytest.fixture
-def node(monkeypatch):
+def node(monkeypatch, request):
     logged = Logged()
+    # Indirect parametrization overrides keys of the CBF section.
+    cbf_config = {**CBF, **getattr(request, "param", {})}
 
     def start_process(profile):
         executable = Path(get_package_prefix("aimdk_dataplane")) / "lib" / "aimdk_dataplane" / "aimdk_dataplane"
@@ -72,7 +76,7 @@ def node(monkeypatch):
                     "aimdk_dataplane": {
                         "ros__parameters": {
                             "plan_json": json.dumps(dataplane.plan(profile)),
-                            "cbf_safety_json": json.dumps(CBF),
+                            "cbf_safety_json": json.dumps(cbf_config),
                         }
                     }
                 },
@@ -95,11 +99,11 @@ def node(monkeypatch):
         harness.shutdown()
 
 
-def stream(harness, stop: threading.Event) -> threading.Thread:
-    """The arm target a mirror session would send, at 50 Hz until ``stop``."""
-    publisher = harness.node.create_publisher(Float64MultiArray, "/aimdk/arm/commands", 10)
+def stream(harness, stop: threading.Event, topic="/aimdk/arm/commands", data=None) -> threading.Thread:
+    """The arm (or other) target a mirror session would send, at 50 Hz until ``stop``."""
+    publisher = harness.node.create_publisher(Float64MultiArray, topic, 10)
     command = Float64MultiArray()
-    command.data = [0.0] * 14
+    command.data = [0.0] * 14 if data is None else [float(value) for value in data]
 
     def run():
         while not stop.is_set():
@@ -115,7 +119,7 @@ def fields(line: str) -> dict[str, str]:
     return dict(re.findall(r"(\w+)=(\S+)", line))
 
 
-def test_a_hand_dropping_out_mid_mirror_is_released_logged_and_recovers(node):
+def test_a_hand_swapped_mid_mirror_is_released_logged_and_recovers(node):
     harness, logged = node
     harness.wait_active()
     cbf = harness.wait_for(lambda: harness.runtime._dataplane.cbf or None, "a status with the CBF report")
@@ -139,8 +143,9 @@ def test_a_hand_dropping_out_mid_mirror_is_released_logged_and_recovers(node):
         float(verified["min_distance_m"])
         assert not logged.matching("CBF_RELEASE")
 
-        # The right hand drops out: a non-verdict hold, released after hold_release_after_s, logged each second.
-        harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="none")])
+        # The right hand is swapped for one the geometry was not built for: a
+        # non-verdict hold, released after hold_release_after_s, logged each second.
+        harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="lite_s")])
         start = harness.wait_for(lambda: logged.matching("CBF_RELEASE start"), "the release to start", timeout_s=5.0)[0]
         assert float(fields(start)["held_s"]) >= 0.2
         harness.wait_for(lambda: len(logged.matching("CBF_RELEASE ongoing")) >= 2, "ongoing lines", timeout_s=5.0)
@@ -164,3 +169,96 @@ def test_a_hand_dropping_out_mid_mirror_is_released_logged_and_recovers(node):
     finally:
         stop.set()
         thread.join(timeout=1.0)
+
+
+def cbf_report(harness, predicate, what):
+    """The data plane's CBF report once ``predicate`` holds; a timeout names the last report."""
+    try:
+        return harness.wait_for(
+            lambda: (lambda cbf: cbf if cbf and predicate(cbf) else None)(harness.runtime._dataplane.cbf), what
+        )
+    except AssertionError as error:
+        raise AssertionError(f"{error}; last CBF report: {harness.runtime._dataplane.cbf}") from None
+
+
+def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
+    """Two hands configured, the right flange empty: mirroring runs on the left hand's reading."""
+    harness, logged = node
+    harness.wait_active()
+    harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="none")])
+    cbf = cbf_report(harness, lambda cbf: cbf.get("phantom_hands") == [False, True], "the right hand as a phantom")
+    assert cbf["hands_installed"] == [True, True]
+    assert cbf["hand_configuration_matches"] is True
+
+    response = harness.set_mode("policy_stream")
+    assert response.success, response.message
+    stop = threading.Event()
+    thread = stream(harness, stop)
+    try:
+        verified = harness.wait_for(
+            lambda: [
+                f
+                for f in map(fields, logged.matching("CBF status:"))
+                if f["mirror_active"] == "true" and f["min_distance_m"] != "na"
+            ],
+            "an INFO line with a distance",
+        )[-1]
+        assert int(verified["distance_frames"]) > 0
+        feedback_frames = harness.runtime._dataplane.cbf["thumb_feedback_frames"]
+
+        # Well past hold_release_after_s: nothing was held for the empty flange,
+        # and the missing right thumb is no feedback problem.
+        time.sleep(1.5)
+        cbf = harness.runtime._dataplane.cbf
+        assert cbf["hand_configuration_matches"] is True
+        assert cbf["released"] == 0 and cbf["release_episodes"] == 0
+        assert cbf["thumb_feedback_frames"] == feedback_frames
+        assert cbf["thumb_feedback_issue"] == ""
+        assert not logged.matching("CBF_RELEASE")
+        assert harness.status().active_mode == "policy_stream"
+
+        # A left thumb reading inside the model band is used as it is; the
+        # phantom right thumb is the command. The mock stops echoing commands
+        # so the reading differs from the command (its arm stops following too,
+        # so this part checks no releases).
+        harness.mock.set_parameters([rclpy.parameter.Parameter("follow_commands", value=False)])
+        with harness.mock._lock:
+            harness.mock._positions["L_thumb_roll_joint"] = 0.5
+            harness.mock._positions["L_thumb_abad_joint"] = -0.6
+        hand = [0.0] * 20
+        hand[0], hand[1], hand[10], hand[11] = 0.9, -0.2, 0.3, -0.4
+        stream(harness, stop, "/aimdk/hand/joint_commands", hand)
+        # The phantom thumb is the last published command, so the frame the
+        # new command arrives on still carries the previous one: wait for both.
+        cbf = cbf_report(
+            harness,
+            lambda cbf: cbf.get("thumb_target_urdf")
+            and cbf["thumb_target_urdf"] == pytest.approx([0.9, -0.2, 0.3, -0.4], abs=1e-9)
+            and cbf["thumb_current_urdf"] == pytest.approx([0.5, -0.6, 0.3, -0.4], abs=1e-9),
+            "the left thumb reading and the right command in the CBF report",
+        )
+        assert cbf["thumb_feedback_issue"] == ""
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+
+@pytest.mark.parametrize("node", [{"hands_installed": [True, False]}], indirect=True)
+def test_a_right_hand_on_a_left_only_configuration_is_refused(node):
+    """The reverse of an empty flange: a hand where the geometry has no collision body."""
+    harness, _logged = node
+    harness.wait_active()
+    cbf = cbf_report(harness, lambda cbf: "hand_configuration_matches" in cbf, "a status with the CBF report")
+    assert cbf["hands_installed"] == [True, False]
+    assert cbf["hand_configuration_matches"] is False
+    assert cbf["phantom_hands"] == [False, False]
+    refused = harness.set_mode("policy_stream")
+    assert not refused.success
+    assert "right hand expected 0 (none), platform reports 1 (nimble_hands)" in refused.message
+    assert harness.status().active_mode != "policy_stream"
+
+    # Control: the right side reports none.
+    harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="none")])
+    cbf_report(harness, lambda cbf: cbf.get("hand_configuration_matches") is True, "matching hands")
+    response = harness.set_mode("policy_stream")
+    assert response.success, response.message

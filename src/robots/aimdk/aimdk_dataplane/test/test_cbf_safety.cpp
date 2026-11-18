@@ -21,6 +21,7 @@
 
 #include "aimdk_dataplane/cbf_safety.hpp"
 #include "cbf/generated_constants.hpp"
+#include "cbf/kinematics.hpp"
 #include "cbf/rigid_thumb.hpp"
 #include "cbf/safety_filter.hpp"
 #include "nlohmann/json.hpp"
@@ -632,7 +633,8 @@ TEST(CbfSafety, ExplicitLeftHandOnlyUsesTwoMeasuredRootsAndPreservesHand20)
   value["hands_installed"] = {true, false};
   const auto config = fixture_config(value);
   EXPECT_TRUE(config.matches_hand_types({1, 0}));
-  EXPECT_FALSE(config.matches_hand_types({0, 0}));
+  // Left installed but reported as none: an empty flange, checked as a phantom hand.
+  EXPECT_TRUE(config.matches_hand_types({0, 0}));
   EXPECT_FALSE(config.matches_hand_types({1, 1}));
   EXPECT_FALSE(config.matches_hand_types({1, 2}));
   EXPECT_FALSE(config.matches_hand_types({1}));
@@ -1750,7 +1752,7 @@ TEST(CbfSafety, FaultedOrMissingThumbFeedbackUsesTheLastPublishedCommandInTheSam
     SCOPED_TRACE(faulted_case);
     auto snapshot = urdf_snapshot();
     if (faulted_case == 0) {
-      snapshot.thumb_faulted = true;
+      snapshot.thumb_faulted = {true, true};  // Both hands faulted: every reading is replaced.
       snapshot.thumb->position[0] = 5.0;  // A faulted hand's reading is not used even clamped.
     } else {
       snapshot.thumb.reset();
@@ -2226,7 +2228,7 @@ std::vector<PersistentFault> persistent_faults()
     {"thumb_nan", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {
         s.thumb->position[1] = std::numeric_limits<double>::quiet_NaN();
       }},
-    {"thumb_faulted", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {s.thumb_faulted = true;}},
+    {"thumb_faulted", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {s.thumb_faulted = {true, true};}},
     {"thumb_missing", false, nullptr, [](CbfSnapshot & s, CbfSafety &) {s.thumb.reset();}},
     {"thumb_stale", false, nullptr, [](CbfSnapshot & s, CbfSafety & safety) {
         s.thumb->age_s = safety.config().feedback_max_age_s + 0.001;
@@ -2402,4 +2404,300 @@ TEST(CbfSafety, WithTwoHandsAFirstFrameThumbVerdictNoLongerPublishesNothingForev
   EXPECT_EQ(released_frames + verified_frames, 125);
   EXPECT_GT(released_frames, 0);
   EXPECT_EQ(safety.diagnostics().collision_release_episodes, 1u);
+}
+
+// --- Two hands configured, one of them possibly an empty flange ---------------
+
+TEST(CbfSafety, AnInstalledSideReportedAsNoHandIsAPhantomHandNotAMismatch)
+{
+  const auto both = fixture_config();
+  ASSERT_TRUE(both.hands_installed[0] && both.hands_installed[1]);
+  // Type 0 on an installed side is an empty flange (the hand is not fitted yet).
+  EXPECT_TRUE(both.matches_hand_types({1, 1}));
+  EXPECT_TRUE(both.matches_hand_types({1, 0}));
+  EXPECT_TRUE(both.matches_hand_types({0, 1}));
+  EXPECT_TRUE(both.matches_hand_types({0, 0}));
+}
+
+TEST(CbfSafety, AHandTheGeometryWasNotBuiltForIsStillAMismatch)
+{
+  // Any hand other than the OmniHand (type 1) has no collision body here.
+  const auto both = fixture_config();
+  for (int other : {2, 3, 4, 5, 0xFF, -1}) {
+    SCOPED_TRACE(other);
+    EXPECT_FALSE(both.matches_hand_types({1, other}));
+    EXPECT_FALSE(both.matches_hand_types({other, 1}));
+    EXPECT_FALSE(both.matches_hand_types({0, other}));
+  }
+  EXPECT_FALSE(both.matches_hand_types({1}));
+  EXPECT_FALSE(both.matches_hand_types({1, 1, 1}));
+  EXPECT_FALSE(both.matches_hand_types({}));
+  // Control: the same calls with the OmniHand on both sides match.
+  EXPECT_TRUE(both.matches_hand_types({1, 1}));
+}
+
+TEST(CbfSafety, AHandOnASideConfiguredWithoutOneIsStillAMismatch)
+{
+  // The reverse of the phantom hand: the platform reports a hand where the
+  // configuration has no collision body, so that hand would move unchecked.
+  auto value = urdf_fixture_json();
+  value["hands_installed"] = {true, false};
+  const auto left_only = fixture_config(value);
+  EXPECT_FALSE(left_only.matches_hand_types({1, 1}));
+  EXPECT_FALSE(left_only.matches_hand_types({0, 1}));
+  EXPECT_FALSE(left_only.matches_hand_types({1, 2}));
+  // Control: none on that side matches.
+  EXPECT_TRUE(left_only.matches_hand_types({1, 0}));
+  value["hands_installed"] = {false, true};
+  const auto right_only = fixture_config(value);
+  EXPECT_FALSE(right_only.matches_hand_types({1, 1}));
+  EXPECT_FALSE(right_only.matches_hand_types({1, 0}));
+  EXPECT_TRUE(right_only.matches_hand_types({0, 1}));
+  EXPECT_TRUE(right_only.matches_hand_types({0, 0}));
+}
+
+namespace
+{
+
+// Two hands configured; every thumb reading inside the model band and off the command.
+CbfSnapshot two_hand_readings(const CbfSafetyConfig & config)
+{
+  auto snapshot = urdf_snapshot();
+  constexpr std::array<std::size_t, 4> slots{0, 1, 10, 11};
+  for (std::size_t axis = 0; axis < 4; ++axis) {
+    const auto & band = config.thumb_model_limits[axis];
+    const double command = snapshot.requested.hand[slots[axis]];
+    // A quarter of the way to the farther bound: inside the band, never the command.
+    const double bound = band[1] - command > command - band[0] ? band[1] : band[0];
+    snapshot.thumb->position[axis] = command + 0.25 * (bound - command);
+  }
+  return snapshot;
+}
+
+}  // namespace
+
+TEST(CbfSafety, APhantomRightThumbIsTheCommandAndNoFeedbackProblem)
+{
+  const auto config = fixture_config();
+  CbfSafety safety(config);
+  auto snapshot = two_hand_readings(config);
+  constexpr std::array<std::size_t, 4> slots{0, 1, 10, 11};
+  snapshot.hand_reported_absent = {false, true};
+  // An empty flange has no readings; any that arrive are not this hand's.
+  snapshot.thumb->position[2] = std::numeric_limits<double>::quiet_NaN();
+  snapshot.thumb->position[3] = 5.0;
+  for (int frame = 0; frame < 3; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.0 + 0.02 * frame;
+    const auto decision = safety.filter(snapshot, now);
+    ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+    const auto & d = safety.diagnostics();
+    for (std::size_t axis = 0; axis < 2; ++axis) {
+      EXPECT_DOUBLE_EQ(d.thumb_current_urdf[axis], snapshot.thumb->position[axis]) << axis;
+      ASSERT_NE(snapshot.thumb->position[axis], snapshot.requested.hand[slots[axis]]);
+    }
+    for (std::size_t axis = 2; axis < 4; ++axis) {
+      EXPECT_DOUBLE_EQ(d.thumb_current_urdf[axis], snapshot.requested.hand[slots[axis]]) << axis;
+    }
+    EXPECT_TRUE(d.thumb_feedback_issue.empty()) << d.thumb_feedback_issue;
+    EXPECT_EQ(d.thumb_feedback_frames, 0u);
+    EXPECT_FALSE(d.last_thumb_feedback_event.has_value());
+    safety.committed(decision, now);
+  }
+  // Control: the same readings on a hand the platform reports are used, and flagged.
+  CbfSafety reported(config);
+  snapshot.hand_reported_absent = {false, false};
+  const auto decision = reported.filter(snapshot, 1.0);
+  ASSERT_TRUE(decision.accept_new) << reported.diagnostics().reason;
+  EXPECT_EQ(reported.diagnostics().thumb_feedback_issue, "unavailable");
+  EXPECT_EQ(reported.diagnostics().last_thumb_feedback_event->axis, 2);
+  EXPECT_EQ(reported.diagnostics().thumb_feedback_frames, 1u);
+}
+
+TEST(CbfSafety, AFaultedThumbReplacesOnlyItsOwnSide)
+{
+  const auto config = fixture_config();
+  constexpr std::array<std::size_t, 4> slots{0, 1, 10, 11};
+  for (std::size_t faulted : {0u, 1u}) {
+    SCOPED_TRACE(faulted);
+    CbfSafety safety(config);
+    auto snapshot = two_hand_readings(config);
+    snapshot.thumb_faulted[faulted] = true;
+    const auto decision = safety.filter(snapshot, 1.0);
+    ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+    const auto & d = safety.diagnostics();
+    for (std::size_t axis = 0; axis < 4; ++axis) {
+      SCOPED_TRACE(axis);
+      const double expected = axis / 2 == faulted ? snapshot.requested.hand[slots[axis]] : snapshot.thumb->position[axis];
+      EXPECT_DOUBLE_EQ(d.thumb_current_urdf[axis], expected);
+    }
+    EXPECT_EQ(d.thumb_feedback_issue, "faulted");
+    ASSERT_TRUE(d.last_thumb_feedback_event.has_value());
+    EXPECT_EQ(d.last_thumb_feedback_event->axis, static_cast<int>(2 * faulted));
+  }
+}
+
+TEST(CbfSafety, AMissingSideLeavesTheOtherSidesReadingInUse)
+{
+  // The node fills a side without readings with NaN; the other side still counts.
+  const auto config = fixture_config();
+  constexpr std::array<std::size_t, 4> slots{0, 1, 10, 11};
+  for (std::size_t missing : {0u, 1u}) {
+    SCOPED_TRACE(missing);
+    CbfSafety safety(config);
+    auto snapshot = two_hand_readings(config);
+    snapshot.thumb->position[2 * missing] = std::numeric_limits<double>::quiet_NaN();
+    snapshot.thumb->position[2 * missing + 1] = std::numeric_limits<double>::quiet_NaN();
+    const auto decision = safety.filter(snapshot, 1.0);
+    ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+    for (std::size_t axis = 0; axis < 4; ++axis) {
+      SCOPED_TRACE(axis);
+      const double expected = axis / 2 == missing ? snapshot.requested.hand[slots[axis]] : snapshot.thumb->position[axis];
+      EXPECT_DOUBLE_EQ(safety.diagnostics().thumb_current_urdf[axis], expected);
+    }
+    EXPECT_EQ(safety.diagnostics().thumb_feedback_issue, "unavailable");
+  }
+}
+
+namespace
+{
+
+// Everything a left-only frame decides and counts, timing excluded.
+std::string decision_record(const CbfDecision & decision, const CbfDiagnostics & d)
+{
+  std::string out;
+  const auto add = [&out](double value) {
+      char text[40];
+      std::snprintf(text, sizeof(text), "%a,", value);
+      out += text;
+    };
+  out += std::to_string(static_cast<int>(decision.output.kind)) + ":" + std::to_string(decision.accept_new) +
+    std::to_string(decision.modified) + std::to_string(decision.geometry_modified) +
+    std::to_string(decision.recovery_verified) + std::to_string(decision.hand_held) +
+    std::to_string(decision.collision_refusal) + std::to_string(decision.released) + ":";
+  for (double v : decision.output.arm) {add(v);}
+  for (double v : decision.output.hand) {add(v);}
+  out += "|" + d.reason + "|" + d.thumb_feedback_issue + "|";
+  for (auto v : {d.calls, d.accepted, d.published, d.modified, d.geometry_modified, d.held, d.withheld,
+      d.deadlines, d.invalid_input_frames, d.thumb_feedback_frames, d.released, d.release_episodes,
+      d.collision_release_episodes, d.hand_budget_holds})
+  {
+    out += std::to_string(v) + ",";
+  }
+  for (double v : d.thumb_current_urdf) {add(v);}
+  for (double v : d.thumb_target_urdf) {add(v);}
+  add(d.distance_valid ? d.minimum_distance_m : -99.0);
+  if (d.last_thumb_feedback_event) {
+    out += d.last_thumb_feedback_event->issue + std::to_string(d.last_thumb_feedback_event->axis) +
+      std::to_string(d.last_thumb_feedback_event->event);
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST(CbfSafety, RightSideFlagsCannotReachALeftOnlyConfiguration)
+{
+  // Left-only control for the per-side flags: on a side configured without a
+  // hand they are inert, so the left-only behaviour is the one of e965d015.
+  const auto config = fixture_config(historical_left_candidate_fixture_json());
+  CbfSafety plain(config);
+  CbfSafety flagged(config);
+  auto base = historical_left_native_snapshot();
+  for (int frame = 0; frame < 12; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.0 + 0.02 * frame;
+    auto snapshot = base;
+    snapshot.requested.arm[0] += 0.01 * frame;
+    if (frame == 4) {snapshot.thumb_faulted[0] = true;}
+    if (frame == 6) {snapshot.thumb->position[1] = std::numeric_limits<double>::quiet_NaN();}
+    if (frame == 8) {snapshot.thumb.reset();}
+    auto with_right = snapshot;
+    with_right.thumb_faulted[1] = true;
+    with_right.hand_reported_absent[1] = true;
+    const auto a = plain.filter(snapshot, now);
+    const auto b = flagged.filter(with_right, now);
+    EXPECT_EQ(decision_record(a, plain.diagnostics()), decision_record(b, flagged.diagnostics()));
+    plain.committed(a, now);
+    flagged.committed(b, now);
+  }
+  EXPECT_GT(plain.diagnostics().thumb_feedback_frames, 0u);
+}
+
+TEST(CbfSafety, APhantomRightHandKeepsItsCollisionPairsInTheDecision)
+{
+  // Found offline (random right-arm poses, seed 3, trial 197): from natural
+  // standing, a straight reach that only the right thumb's collision body
+  // stops. Its path is clear for the arms and the left hand.
+  const auto & standing = x2::cbf::generated::kNaturalStanding;
+  std::array<double, 14> reach{};
+  std::copy_n(standing.begin(), 7, reach.begin());
+  const std::array<double, 7> right{
+    0.66750223117580409, -0.35727957073251027, 0.49318808792707802, -1.1582442514935436,
+    0.64058981282216676, -0.1618123346891257, -0.13997082739639233};
+  std::copy(right.begin(), right.end(), reach.begin() + 7);
+  const auto right_hand_pair = [](std::size_t index) {
+      const auto pair = x2::cbf::kPrimitivePairs[index];
+      const auto hand = [](x2::cbf::PrimitiveId id) {
+          return id == x2::cbf::PrimitiveId::RightPalm || id == x2::cbf::PrimitiveId::RightThumb;
+        };
+      return hand(pair.first) || hand(pair.second);
+    };
+  const auto distances = [](const std::array<double, 14> & arm, std::array<bool, 2> hands) {
+      x2::cbf::KinematicsInput input;
+      input.q_arm = arm;
+      input.q_thumb_urdf = x2::cbf::kRigidThumbBaselineUrdf;  // The commanded thumbs below.
+      input.thumb_pose_valid = true;
+      input.hands_installed = hands;
+      return x2::cbf::evaluate_proxy_distances(input);
+    };
+  {
+    const auto with_right = distances(reach, {true, true});
+    ASSERT_LT(with_right.minimum_distance, -0.01);
+    ASSERT_TRUE(right_hand_pair(with_right.minimum_pair_index));
+    ASSERT_GT(distances(reach, {true, false}).minimum_distance, 0.0);
+  }
+  const auto walk = [&](const CbfSafetyConfig & config, bool phantom_right, double & worst_right_pair) {
+      CbfSafety safety(config);
+      auto snapshot = urdf_snapshot();
+      snapshot.requested.arm.assign(reach.begin(), reach.end());
+      if (phantom_right) {
+        snapshot.hand_reported_absent = {false, true};
+        snapshot.thumb->position[2] = snapshot.thumb->position[3] = std::numeric_limits<double>::quiet_NaN();
+      } else {
+        snapshot.thumb->position.resize(2);
+      }
+      std::array<double, 14> arm{};
+      std::copy_n(standing.begin(), 14, arm.begin());
+      worst_right_pair = std::numeric_limits<double>::infinity();
+      for (int frame = 0; frame < 90; ++frame) {
+        const double now = 1.0 + 0.02 * frame;
+        snapshot.arm->position.assign(arm.begin(), arm.end());  // The arm tracks exactly.
+        auto decision = safety.filter(snapshot, now);
+        decision = safety.release_if_stuck(decision, snapshot, now);
+        EXPECT_FALSE(decision.released) << frame << " " << safety.diagnostics().reason;
+        safety.committed(decision, now);
+        if (decision.output.kind != Output::Kind::kUpperBody) {continue;}
+        std::copy_n(decision.output.arm.begin(), 14, arm.begin());
+        const auto report = distances(arm, {true, true});
+        for (std::size_t index = 0; index < report.distances.size(); ++index) {
+          if (right_hand_pair(index)) {
+            worst_right_pair = std::min(worst_right_pair, report.distances[index].signed_distance);
+          }
+        }
+      }
+      double error = 0.0;
+      for (std::size_t j = 0; j < 14; ++j) {error = std::max(error, std::abs(arm[j] - reach[j]));}
+      return error;
+    };
+  auto value = urdf_fixture_json();
+  value["hands_installed"] = {true, false};
+  double left_only_worst = 0.0;
+  // Control: without the right hand's geometry the reach is published as requested.
+  EXPECT_LT(walk(fixture_config(value), false, left_only_worst), 1e-9);
+  EXPECT_LT(left_only_worst, 0.0);
+  // Two hands configured, the right one an empty flange: stopped short, never inside.
+  double phantom_worst = 0.0;
+  EXPECT_GT(walk(fixture_config(), true, phantom_worst), 0.05);
+  EXPECT_GE(phantom_worst, 0.0);
 }

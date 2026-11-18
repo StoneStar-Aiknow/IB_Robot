@@ -40,15 +40,21 @@ does not block a configured candidate conversion in enforce mode. There is no
 separate trial-authorization switch. Commands and actual feedback may need
 different mappings. Using a candidate does not establish physical calibration.
 
-`hands_installed: [true, false]` is the user-confirmed physical setup: two arms
-and a left OmniHand, with no right hand. This setting is explicit and defaults
-to both hands for existing callers. Only installed hands provide measured
-roll/abad feedback. The original hand20 command layout stays unchanged.
-Pairs containing an absent palm or thumb are excluded; all body and upper-arm/
-forearm pairs remain active, with the same frozen dimensions and transforms.
-Reported SDK types must match the configuration (OmniHand type 1, absent type 0).
-A lost installed-hand state, unexpected hardware type, or newly attached hand
-cannot silently disable collision checks. Recalibrate before changing hardware.
+`hands_installed` is explicit and defaults to both hands for existing callers;
+the X2 deployments configure `[true, true]`, the target hardware. An installed
+side the platform reports as no hand (type 0) is an empty flange: it is checked
+as a phantom hand, with its full palm and thumb geometry and its thumb taken as
+the command, so the same configuration and code run before and after the hand
+is fitted. A phantom hand only adds collision pairs. Only installed sides
+provide measured roll/abad feedback. The original hand20 command layout stays
+unchanged. Pairs containing a palm or thumb on a side configured `false` are
+excluded; all body and upper-arm/forearm pairs remain active, with the same
+frozen dimensions and transforms.
+The reverse is still a mismatch: a hand reported on a side configured `false`
+has no collision body there, and any type other than the OmniHand (1) or none
+(0) is not the hand the geometry was built for. A newly attached hand or an
+unexpected hardware type therefore cannot silently disable collision checks.
+Recalibrate before changing hardware.
 Absent-side diagnostic angles are null, never invented measurements. This v0.5
 adapter requires at least one installed OmniHand.
 

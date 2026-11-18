@@ -37,9 +37,10 @@ robot:
       - left
       arm_side: left
   cbf_safety:
+    # 右手未装就是空法兰，CBF 按幻影手算，与装上后同一份配置。
     hands_installed:
     - true
-    - false
+    - true
   runtime:
     instance_id: x2_robot_03
 ```
