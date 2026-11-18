@@ -501,6 +501,7 @@ def test_a_data_plane_restart_mid_playback_goes_back_to_the_mirror():
     assert rig.blender.phase is Phase.C and exit_reason(rig) == "port_lost"
     assert 0.3 <= rig.now - restarted <= 0.3 + 0.1 + 2 * TICK
     assert not rig.client.busy  # no keepalive to a port that forgot the segment
+    assert rig.sent("release")[-1]["seg_id"] == seg_id and rig.sent("release")[-1]["fast"]
     assert rig.sent("keepalive")[keepalives:] and rig.sent("keepalive")[-1]["seg_id"] == seg_id
     sent = len(rig.messages)
     rig.port = {"state": "IDLE", "seg_id": None}
@@ -543,7 +544,7 @@ def test_a_playback_never_outlasts_t_in_hold_max_and_t_out():
     assert rig.now - started == pytest.approx(1.0 + 4.0 + 1.0 + 1.0, abs=2 * TICK)  # + play_margin_s
     assert rig.sent("release")[-1]["fast"]
     assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
-    assert exit_reason(rig) == "done_timeout"
+    assert exit_reason(rig) == "play_timeout"  # what the log says, not done_timeout
     rig.run(0.5 + TICK)
     assert not rig.client.busy  # wound down although the port still says ENTER_B
     assert rig.run(3.0, lambda: rig.blender.phase is Phase.IDLE) and rig.last_sent.arm == MIRROR
@@ -560,6 +561,7 @@ def test_a_port_restart_while_waiting_for_done_is_a_lost_port():
     rig.port = {"state": "IDLE", "seg_id": None}
     assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
     assert exit_reason(rig) == "port_lost" and rig.now - waited < 0.4 and not rig.client.busy
+    assert rig.sent("release")[-1]["fast"]
 
 
 def test_the_data_planes_own_exit_is_waited_for():

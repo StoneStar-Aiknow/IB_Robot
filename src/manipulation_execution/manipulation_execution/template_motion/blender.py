@@ -537,8 +537,7 @@ class Blender:
             self._client.release(self._seg_id, fast=True)
             return self._to_wait_done(now, "status_stale", segment.t_out_stop)
         if self._port_lost(status):
-            self._client.abandon()
-            return self._to_c(now, "port_lost", m, arm, 1.0)
+            return self._lose_port(now, m, arm)
         if now > self._play_deadline:
             self._client.release(self._seg_id, fast=True)
             return self._to_wait_done(now, "play_timeout", segment.t_out_stop)
@@ -575,14 +574,23 @@ class Blender:
             reason = self._wait_reason if status.state == "DONE" else f"{status.state.lower()}:{status.reason}"
             return self._to_c(now, reason, m, arm, 1.0)
         elif self._port_lost(status):
-            self._client.abandon()
-            return self._to_c(now, "port_lost", m, arm, 1.0)
+            return self._lose_port(now, m, arm)
         if now >= self._deadline:
             # The port never said it finished: one more fast release, and the keepalive ends soon after,
             # so the data plane's own keepalive timeout stops it (a port that plays on is never kept alive).
             self._client.wind_down(now, config.wind_down_s)
-            return self._to_c(now, "status_stale" if stale else "done_timeout", m, arm, 1.0)
+            if stale:
+                reason = "status_stale"
+            else:
+                reason = "play_timeout" if self._wait_reason == "play_timeout" else "done_timeout"
+            return self._to_c(now, reason, m, arm, 1.0)
         return arm
+
+    def _lose_port(self, now: float, m: tuple[float, ...], arm: tuple[float, ...]) -> tuple[float, ...]:
+        # One fast release costs nothing: a port that still has the segment after all lets it go at once.
+        self._client.release(self._seg_id, fast=True)
+        self._client.abandon()
+        return self._to_c(now, "port_lost", m, arm, 1.0)
 
     # -- C ------------------------------------------------------------------------
 
