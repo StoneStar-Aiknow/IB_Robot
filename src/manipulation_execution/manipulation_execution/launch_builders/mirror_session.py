@@ -93,6 +93,11 @@ per MIRRORING round, sent to the upper PC) after the voice node, wired in
 ``launch_builders.mirror_photo``. Like the voice it is an extra: any error
 while working it out is a WARNING and the mirror starts without photos.
 Without a ``photo`` block the actions are exactly what they were.
+
+``motion_template_config`` (feat/x2-motion-template, X2 #3) is the path of
+the ``motion_template`` yaml (``$(find …)`` allowed), passed to the session
+node as is; the node reads it, and its ``enabled: false`` keeps templates
+off. Left out, the parameters are exactly what they were.
 """
 
 import json
@@ -130,6 +135,7 @@ _KEYS = frozenset(
         "operator",
         "voice",
         "photo",
+        "motion_template_config",
     }
 )
 _BUSINESS_KEYS = frozenset({"hooks", "cover_judge", "config"})
@@ -497,6 +503,9 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
     preset_motion = motion_parameters(robot_config, resolve_ros_path)
     if preset_motion is not None:
         parameters["preset_motion_json"] = json.dumps(preset_motion, sort_keys=True)
+    template_config = _string(config, "motion_template_config", "mirror_session")
+    if template_config:
+        parameters["motion_template_config"] = str(resolve_ros_path(template_config))
     session = Node(
         package="manipulation_execution",
         executable="mirror_session_node",

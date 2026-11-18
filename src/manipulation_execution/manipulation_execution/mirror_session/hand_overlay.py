@@ -10,7 +10,9 @@ Per tick:
 * goal: the retarget node's hand values (``observe_follow``, fresh within
   ``FOLLOW_FRESH_S``) while ``following`` (MIRRORING/running), else neutral
   (fingers at 0.33 of the fist, thumb at 0.123). A hand whose perception
-  stopped is already sent to neutral by hand_core upstream;
+  stopped is already sent to neutral by hand_core upstream. A ``target``
+  (a template's hand pose, ``template_motion``) replaces either goal, also
+  while the hand feedback is lost (the data plane plays from it);
 * rate: B2, full open<->fist travel in 1.0 s (fingers) / 0.6 s (thumb);
 * limits: the real-robot hand ranges of ``hand_limits.py``, right thumb roll
   at most ``RIGHT_ROLL_MAX``.
@@ -84,6 +86,21 @@ def _ten(values) -> np.ndarray | None:
     return array if array.shape == (10,) and np.all(np.isfinite(array)) else None
 
 
+def _twenty(values) -> np.ndarray | None:
+    try:
+        array = np.asarray(values, dtype=np.float64).copy()
+    except (TypeError, ValueError):
+        return None
+    return array if array.shape == (HAND_COUNT,) and np.all(np.isfinite(array)) else None
+
+
+def travel_time_s(start: Sequence[float], goal: Sequence[float]) -> float:
+    """How long the B2 rate takes from ``start`` to ``goal`` (the slowest channel)."""
+    full = np.where(_THUMB, FULL_TRAVEL_S_THUMB, FULL_TRAVEL_S)
+    delta = np.abs(np.asarray(goal, dtype=np.float64) - np.asarray(start, dtype=np.float64))
+    return float(np.max(delta / _TRAVEL * full))
+
+
 class HandOverlay:
     def __init__(self, rate_hz: float, neutral: Sequence[float] | None = None):
         self._step = np.where(_THUMB, _TRAVEL / FULL_TRAVEL_S_THUMB, _TRAVEL / FULL_TRAVEL_S) / float(rate_hz)
@@ -152,7 +169,7 @@ class HandOverlay:
             self._last_apply = now
             self._unjam = [False, False]
 
-    def apply(self, following: bool, now: float) -> tuple[float, ...]:
+    def apply(self, following: bool, now: float, target: Sequence[float] | None = None) -> tuple[float, ...]:
         with self._lock:
             if self._prev is None or now - self._last_apply > RESTART_GAP_S:
                 self._start(now)
@@ -176,6 +193,11 @@ class HandOverlay:
             live = live and not self._state_lost
             goal = (self._follow if live else self._neutral).copy()
             self.counts["following"] += int(live)
+            template = None if target is None else _twenty(target)
+            if template is not None:
+                goal = template
+                # Added on first use: with templates off the status stays the baseline's.
+                self.counts["template"] = self.counts.get("template", 0) + 1
             for side in (0, 1):
                 if not self._unjam[side]:
                     continue

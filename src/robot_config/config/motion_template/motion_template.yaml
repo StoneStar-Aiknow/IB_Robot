@@ -1,0 +1,51 @@
+# X2 #3 template motions in the mirror (manipulation_execution.template_motion).
+#
+# Off by default: with enabled: false (or mirror_session.motion_template_config
+# left out) nothing of it is built and the mirror is the baseline. Each
+# template also has its own switch. Needs the mock window pipeline, the hand
+# overlay, publish_enabled and the data plane's playback port; a config that
+# cannot be used is logged and the mirror runs without templates.
+#
+# segments.json is written by scripts/x2_motion_template/make_segments.py from
+# the pose panel's files; the data plane reads the same file. name@50 / name@75
+# are T moved half / three quarters of the way from P, for a first try.
+motion_template:
+  enabled: false
+  segments_file: segments.json
+  label_topic: /preset_motions/state
+  play_topic: /mirror_session/template_play
+  status_topic: /aimdk_dataplane/template_status
+  dataplane_status_topic: /aimdk_runtime/dataplane/status
+  label_stale_s: 0.5          # a label older than this is inactive
+  keepalive_period_s: 0.02    # at most 0.05; the port times out after 0.15 s
+  keepalive_give_up_s: 10.0   # no port status this long: stop the keepalive
+  blend:
+    port_fresh_s: 0.5         # start only with a port status this recent and idle
+    cbf_fresh_s: 0.5          # and a data plane status this recent, CBF not holding or releasing
+    a_min_s: 0.6              # A (mirror -> P): at least this long
+    a_peak_speed: 1.5         # rad/s, the farthest joint's peak speed in A; no upper bound on A's length
+    a_hand_margin_s: 0.1      # the hand reaches hand_P at least this long before the arm reaches P
+    a_timeout_margin_s: 0.3   # A not at P this long after it should be: back to the mirror
+    arrive_fraction: 0.5      # "at P": within this share of the segment's start tolerances
+    ack_timeout_s: 0.2        # no answer from the port this long after start: release, back to the mirror
+    status_stale_s: 0.5       # no port status this long while playing: release fast
+    port_lost_s: 0.3          # only other segments' statuses (or IDLE, a restarted port) this long: back to the mirror
+    play_margin_s: 1.0        # a playback ends at the latest t_in + hold_max_s + t_out + this after its start
+    done_margin_s: 0.3        # an exit not DONE this long after its t_out: back to the mirror anyway
+    min_hold_s: 0.8           # a lost label releases only after this long at T
+    c_duration_s: 0.8         # C (P -> mirror)
+    c_peak_speed: 1.5         # rad/s, C lasts longer when the mirror is far
+    c_peak_accel: 6.0         # rad/s2, and when it has to turn round (leaving A half way)
+    c_min_s: 0.3
+    cooldown_s: 1.0           # mirror only, this long after C
+    wrap_done_margin_s: 0.2   # a stop during a playback waits t_out_stop plus this for the port
+    wrap_return_max_s: 2.0    # then returns to the reset pose in at most this
+    wrap_reserve_s: 0.3       # and ends this far inside the wrap-up budget
+    wrap_min_s: 0.3
+    wind_down_s: 0.5          # a segment given up (an error, WAIT_DONE ran out): released fast, kept alive this long
+    require_person_frame: true  # center_fallback PEAR frames never enter a template
+  templates:
+    overhead_heart: {enabled: false, segments: [overhead_heart]}
+    heart: {enabled: false, segments: [heart]}
+    holy: {enabled: false, segments: [holy]}
+    xsign: {enabled: false, segments: [xsign_left_front, xsign_right_front]}  # the closer P wins
