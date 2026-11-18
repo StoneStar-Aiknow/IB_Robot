@@ -136,6 +136,41 @@ def test_remote_watch_follows_the_planned_arm_and_disarms_the_previous_arm():
     assert calls == [("left", "disarm"), ("right", "arm"), ("right", "disarm"), ("left", "arm")]
 
 
+def test_after_an_arm_switch_the_pipeline_drives_the_new_arms_watch(monkeypatch):
+    """GraspPipeline looks watch.phase up before arming; the phases must still reach the
+    arm the plan chose, or its watch never leaves WAITING and a moved target is not halted."""
+    import manipulation_execution.pick.pipeline.pipeline as pipeline_module
+
+    events = []
+
+    def watch(side):
+        return SimpleNamespace(
+            arm=lambda *args: None,
+            disarm=lambda: {"side": side},
+            phase=lambda name, event: events.append((side, name, event)),
+        )
+
+    class Sequence:
+        def __init__(self, backends, *, home_tolerance_rad, on_phase):
+            self.on_phase = on_phase
+
+        def run(self, plan, **kwargs):
+            self.on_phase("approach", "start", {})
+            return SimpleNamespace(
+                held=False, held_confidence=0.0, at_rest=True, released_after_success=False, phases=[], retreated=True
+            )
+
+    monkeypatch.setattr(pipeline_module, "GraspSequence", Sequence)
+    pipeline = object.__new__(GraspPipeline)
+    pipeline._backends = SimpleNamespace(watch=ArmWatch({side: watch(side) for side in ("left", "right")}))
+    pipeline._config = SimpleNamespace(home_tolerance_rad=0.0)
+    outcome = SimpleNamespace(report={})
+    for side in ("right", "left"):  # the watch starts on the left arm
+        pipeline._execute(None, None, plan(side), 0.0, lambda: False, lambda *args: None, False, outcome)
+    assert events == [("right", "approach", "start"), ("left", "approach", "start")]
+    assert outcome.report["watch"] == [{"side": "right"}, {"side": "left"}]
+
+
 @pytest.mark.parametrize("running", [True, False])
 def test_switching_arms_keeps_the_shared_imu_as_the_plan_left_it(running):
     class Imu:

@@ -24,6 +24,7 @@ constants.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -359,6 +360,8 @@ class RosHandIO:
     """``HandIO`` over the runtime's hand stream, hand state and touch array, bound by interface ID.
 
     Like the stream's, the touch array is taken when read. Call :meth:`close` before ``node`` is destroyed.
+    :meth:`for_side` gives the other hand a view over the same stream and touch subscription, so automatic
+    arm selection reads them once rather than once per hand.
     """
 
     def __init__(self, node, description: Mapping, side: str = "left"):
@@ -383,8 +386,8 @@ class RosHandIO:
         )
         self._stream = RosStreamIO(node, binding)
         self.channel_joints = self._stream.channel_joints
-        self._touch: dict[str, float] | None = None
-        self._touch_received = float("-inf")
+        # Shared with every for_side view; the side is applied when read.
+        self._touch_latest = {"message": None, "received": float("-inf")}
         self._touch_subscriptions = OnDemandSubscriptions(node.context, f"{node.get_name()}_touch")
         touch = interfaces.get("touch.hands")
         if touch is not None:
@@ -397,14 +400,22 @@ class RosHandIO:
             )
 
     def _on_touch(self, message, received: float | None) -> None:
-        self._touch, self._touch_received = touch_levels(message, self.side), received_at_or_stale(received)
+        self._touch_latest.update(message=message, received=received_at_or_stale(received))
+
+    def for_side(self, side: str) -> RosHandIO:
+        """This IO for ``side``'s hand, over the same stream and touch subscription; close only the original."""
+        view = copy.copy(self)
+        view.side = check_side(side)
+        view.close = lambda: None
+        return view
 
     def touch(self) -> Mapping[str, float] | None:
         """The newest touch levels, or None when none is fresh: an old grip's readings are not contact now."""
         self._touch_subscriptions.drain()
-        if self.monotonic() - self._touch_received > TOUCH_MAX_AGE_S:
+        latest = self._touch_latest
+        if latest["message"] is None or self.monotonic() - latest["received"] > TOUCH_MAX_AGE_S:
             return None
-        return self._touch
+        return touch_levels(latest["message"], self.side)
 
     def close(self) -> None:
         self._touch_subscriptions.close()

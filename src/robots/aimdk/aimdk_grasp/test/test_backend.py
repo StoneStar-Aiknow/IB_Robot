@@ -212,3 +212,45 @@ def test_arm_side_right_switches_every_part_to_the_right_arm_and_hand():
     # One gripper description serves both hands: the same alias presets, the right hand's native values.
     for name in ("open", "close"):
         assert right.hand.presets[name] == left.hand.presets[name]
+
+
+def test_automatic_arm_selection_reads_the_runtime_streams_once_for_both_arms(monkeypatch):
+    """Two sets would double the DDS readers of the runtime's arm and hand state on the robot host."""
+    import aimdk_grasp.arm_stream
+    import aimdk_grasp.backend as backend
+    import aimdk_grasp.omnihand
+
+    opened, executors, effectors = [], {}, {}
+
+    class Hand:
+        def __init__(self, side):
+            self.side = side
+
+        def for_side(self, side):
+            return Hand(side)
+
+    def runtime_streams(node, description, closers, side):
+        opened.append(side)
+        return "arm stream", Hand(side)
+
+    monkeypatch.setattr(backend, "runtime_streams", runtime_streams)
+    monkeypatch.setattr(
+        backend,
+        "robot_for_side",
+        lambda robot, side: SimpleNamespace(side=side, gravity=None, limits=None, hand=None, options=robot.options),
+    )
+    monkeypatch.setattr(
+        aimdk_grasp.arm_stream,
+        "x2_arm_executor",
+        lambda io, *, gravity, limits, side: executors.setdefault(side, io),
+    )
+    monkeypatch.setattr(
+        aimdk_grasp.omnihand,
+        "OmniHandEffector",
+        lambda io, hand, *, absent_other: effectors.setdefault(io.side, io),
+    )
+    robot = SimpleNamespace(options={"installed_hands": ["left", "right"]})
+    backend.automatic_execution(None, robot, {}, [], SimpleNamespace(plan=lambda *args, **kwargs: None))
+    assert len(opened) == 1
+    assert executors == {"left": "arm stream", "right": "arm stream"}
+    assert {side: io.side for side, io in effectors.items()} == {"left": "left", "right": "right"}

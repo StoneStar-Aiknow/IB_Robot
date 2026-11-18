@@ -285,13 +285,22 @@ def test_touch_levels_are_read_per_left_pad():
 def test_touch_readings_older_than_a_frame_or_two_are_not_contact():
     """When the touch stream stops, the last grip's levels must not read as contact on the next close."""
     from aimdk_grasp.omnihand import TOUCH_MAX_AGE_S, RosHandIO
+    from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 
     clock = [100.0]
     io = RosHandIO.__new__(RosHandIO)
     io._touch_subscriptions = SimpleNamespace(drain=lambda: 0)
     io._stream = SimpleNamespace(monotonic=lambda: clock[0])
-    io._touch, io._touch_received = {"thumb": 120.0}, 100.0
-    assert io.touch() == {"thumb": 120.0}
+    io.side = "left"
+    io._touch_latest = {"message": None, "received": float("-inf")}
+    assert io.touch() is None  # nothing received yet
+    message = Float64MultiArray()
+    for label, values in (("left_thumb", [120.0]), ("right_thumb", [7.0])):
+        message.layout.dim.append(MultiArrayDimension(label=label, size=len(values)))
+        message.data.extend(values)
+    io._on_touch(message, 100.0)
+    # One touch subscription serves both hands: each view reads its own pads.
+    assert io.touch() == {"thumb": 120.0} and io.for_side("right").touch() == {"thumb": 7.0}
     clock[0] += TOUCH_MAX_AGE_S + 0.01
     assert io.touch() is None
 

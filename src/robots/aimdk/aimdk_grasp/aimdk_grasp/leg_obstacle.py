@@ -135,7 +135,7 @@ def build_leg_obstacle(description: Path, side: str = "left") -> dict:
     }
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=2)  # one obstacle per arm: automatic arm selection alternates them
 def _load(path: str) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if data["frame"] != "torso_link":

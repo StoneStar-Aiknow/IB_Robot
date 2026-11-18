@@ -371,12 +371,11 @@ def head_parts(node, robot: X2Robot, description: Mapping[str, Any], closers: li
     return parts
 
 
-def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: list):
-    """The ``robot.side`` arm's streaming executor and that side's OmniHand effector over the runtime's streams."""
+def runtime_streams(node, description: Mapping[str, Any], closers: list, side: str):
+    """The runtime's arm stream and ``side``'s view of its hand stream; their close is appended to ``closers``."""
     from manipulation_execution.pick.pipeline.ros_stream import RosStreamIO, bind_stream
 
-    from .arm_stream import x2_arm_executor
-    from .omnihand import OmniHandEffector, RosHandIO
+    from .omnihand import RosHandIO
 
     arm = RosStreamIO(
         node,
@@ -388,8 +387,21 @@ def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: 
         ),
     )
     closers.append(arm.close)
-    hand_io = RosHandIO(node, description, robot.side)
+    hand_io = RosHandIO(node, description, side)
     closers.append(hand_io.close)
+    return arm, hand_io
+
+
+def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: list, *, streams=None):
+    """The ``robot.side`` arm's streaming executor and that side's OmniHand effector over the runtime's streams.
+
+    ``streams`` is an ``(arm, hand)`` pair from :func:`runtime_streams` to share; by default this side opens its own.
+    """
+    from .arm_stream import x2_arm_executor
+    from .omnihand import OmniHandEffector
+
+    arm, hand_io = streams or runtime_streams(node, description, closers, robot.side)
+    hand_io = hand_io.for_side(robot.side)
     executor = x2_arm_executor(arm, gravity=robot.gravity, limits=robot.limits, side=robot.side)
     # The other hand is held where it is measured; one that is not installed is not read at all.
     absent_other = other_side(robot.side) not in installed_hands(robot.options)
@@ -399,7 +411,13 @@ def arm_and_hand(node, robot: X2Robot, description: Mapping[str, Any], closers: 
 def automatic_execution(node, robot, description, closers, planner):
     from .dual_arm import ExecutionSelection, SelectedPart, SelectingPlanner
 
-    pairs = {side: arm_and_hand(node, robot_for_side(robot, side), description, closers) for side in ("left", "right")}
+    # One arm stream and one hand stream for both arms: only the selected arm drives them,
+    # and a second set would double the DDS readers of the runtime's state topics.
+    streams = runtime_streams(node, description, closers, "left")
+    pairs = {
+        side: arm_and_hand(node, robot_for_side(robot, side), description, closers, streams=streams)
+        for side in ("left", "right")
+    }
     selection = ExecutionSelection()
     return (
         SelectingPlanner(planner, selection),

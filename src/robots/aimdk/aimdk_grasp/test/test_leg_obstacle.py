@@ -55,3 +55,5 @@ def test_the_right_arm_keeps_away_from_the_mirrored_right_leg():
     assert right["vertices"][:, 1].max() < left["vertices"][:, 1].max() - 0.1
     assert right["faces"].size == left["faces"].size
     np.testing.assert_allclose(right["vertices"][:, 2].min(), left["vertices"][:, 2].min(), atol=0.01)
+    # Both arms' obstacles stay loaded: alternating arms does not re-read and re-hash the description.
+    assert leg_obstacle() is left and leg_obstacle(config_directory("right")) is right

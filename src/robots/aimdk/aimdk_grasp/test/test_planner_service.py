@@ -1210,7 +1210,9 @@ def test_a_recorded_plan_call_keeps_its_inputs_built_fine_scene_and_outcome(monk
     assert planned["options"] == {"snapshot_now": 6.5} and 29 < planned["budget_s"] <= 30
     assert planned["estimate"].validation_scene == fine and planned["estimate"].received_at == 5.0
     assert np.array_equal(planned["camera_from_grasps"], grasps) and planned["feedback"] == {"locked": 0}
-    assert planned["service"] == dict(planning_profile="default", approach_seed_policy="clear_path", max_goalset=100)
+    assert planned["service"] == dict(
+        side="left", planning_profile="default", approach_seed_policy="clear_path", max_goalset=100
+    )
     assert not refused["outcome"]["success"] and "three-segment" in refused["outcome"]["error"]
     assert refused["budget_s"] is None and refused["outcome"]["wall_s"] >= 0
     assert fine_builds == [True]

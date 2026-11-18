@@ -169,6 +169,13 @@ class ArmWatch:
         self.active = side
         return self.watches[side].arm(observation, proposals, plan)
 
+    def phase(self, name, event):
+        # Defined, not forwarded by __getattr__: the pipeline looks the method up
+        # once, before arm() switches sides, and calls it for the whole execution.
+        phase = getattr(self.watches[self.active], "phase", None)
+        if phase is not None:
+            phase(name, event)
+
     def __getattr__(self, name):
         return getattr(self.watches[self.active], name)
 

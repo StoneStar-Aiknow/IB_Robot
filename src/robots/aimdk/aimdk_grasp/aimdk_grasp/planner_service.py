@@ -250,6 +250,7 @@ class GraspPlanningService:
             options={key: value for key, value in options.items() if key not in ("deadline", "checkpoint")},
             budget_s=None if deadline is None else deadline - time.perf_counter(),
             service=dict(
+                side=self.side,
                 planning_profile=self.planning_profile,
                 approach_seed_policy=self.approach_seed_policy,
                 max_goalset=self._options["max_goalset"],
