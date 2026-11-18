@@ -94,6 +94,11 @@ bool complete_upper_body(const Output & command)
 }
 }  // namespace
 
+std::array<double, 2> cbf_thumb_command_band(const CbfSafetyConfig & config, size_t axis)
+{
+  return thumb_command_band(config, axis);
+}
+
 CbfSafetyConfig CbfSafetyConfig::from_json(const std::string & text, double rate_hz)
 {
   CbfSafetyConfig out;
@@ -814,6 +819,28 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   diagnostics_.recovery_verified = false;
   diagnostics_.hand_held = false;
   return out;
+}
+
+void CbfSafety::played(const Output & output, uint64_t epoch, double now)
+{
+  ++diagnostics_.played;
+  // A frame of another epoch, or one played while mirroring is not active, is
+  // only counted: it neither becomes the pair a hold repeats nor ends a hold.
+  if (epoch != epoch_ || !diagnostics_.active) {
+    return;
+  }
+  if (config_.enforce && output.kind == Output::Kind::kUpperBody) {
+    accepted_ = output;
+    last_published_ = now;
+  }
+  stuck_since_.reset();
+  diagnostics_.releasing = false;
+  diagnostics_.stuck_collision = false;
+  diagnostics_.stuck_s = 0.0;
+  diagnostics_.hand_held = false;
+  diagnostics_.recovery_verified = false;
+  diagnostics_.distance_valid = false;
+  diagnostics_.reason = "played";
 }
 
 void CbfSafety::tick_finished(double elapsed_us, double after_check_us)

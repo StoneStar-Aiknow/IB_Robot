@@ -472,6 +472,10 @@ def test_cbf_feature_profile_enforces_with_explicit_candidate_mapping():
         "deadline_guard_us": 500,
         "feedback_limit_tolerance_rad": 0.017453292519943295,
         "check_arm_feedback_goal_range": False,
+        "hold_release_after_s": 0.2,
+        "collision_release_after_s": 2.0,
+        "collision_release_without_history_s": 0.5,
+        "collision_release_speed_scale": 0.3,
         "thumb_mapping": {
             "verified": False,
             "command_scale": [-1.0, 1.0, 1.0, -1.0],
@@ -576,6 +580,128 @@ def test_cbf_limits_use_profile_arm_order_and_preserve_raw_bands(cbf_provider_co
     scaled = json.loads(_include_arguments(cbf_provider_config, use_sim=False)["cbf_safety_json"])
     assert scaled["arm_velocity_limits"] == [0.125 * (index + 1) for index in range(14)]
     assert mock["arm_velocity_limits"][joints[0]] == 1.0
+
+
+@pytest.mark.parametrize("enabled", [None, False])
+def test_template_play_default_and_off_keep_include_arguments_identical(cbf_provider_config, enabled):
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    cbf_provider_config["template_play"] = {
+        **({"enabled": enabled} if enabled is not None else {}),
+        "segments_file": "/does/not/exist/but_disabled.json",
+    }
+    assert _include_arguments(cbf_provider_config, use_sim=False) == baseline
+    assert "template_play_json" not in baseline
+
+
+def test_template_play_enabled_passes_one_json_argument_with_an_absolute_file(cbf_provider_config, tmp_path):
+    segments = tmp_path / "segments.json"
+    segments.write_text("{}", encoding="utf-8")
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    cbf_provider_config["template_play"] = {"enabled": True, "segments_file": str(segments)}
+    arguments = _include_arguments(cbf_provider_config, use_sim=False)
+    payload = json.loads(arguments.pop("template_play_json"))
+    assert arguments == baseline, "the CBF and every other include argument must remain identical"
+    assert payload == {"enabled": True, "segments_file": str(segments.resolve())}
+
+
+@pytest.fixture
+def template_warnings(monkeypatch):
+    import robot_config.launch_builders.runtime as runtime_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(runtime_module.logger, "warning", warnings.append)
+    return warnings
+
+
+@pytest.mark.parametrize("template_play", [[], "on", {"enabled": "true", "segments_file": "/x.json"}])
+def test_template_play_that_cannot_be_read_stays_off_and_never_stops_the_launch(
+    cbf_provider_config, template_warnings, template_play
+):
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    cbf_provider_config["template_play"] = template_play
+    assert _include_arguments(cbf_provider_config, use_sim=False) == baseline
+    assert len(template_warnings) == 1 and "template playback stays off" in template_warnings[0]
+
+
+def test_template_play_on_another_provider_stays_off_and_never_stops_the_launch(
+    cbf_provider_config, template_warnings, tmp_path
+):
+    segments = tmp_path / "segments.json"
+    segments.write_text("{}", encoding="utf-8")
+    cbf_provider_config["runtime"]["provider"] = "so101_robot"
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    cbf_provider_config["template_play"] = {"enabled": True, "segments_file": str(segments)}
+    assert _include_arguments(cbf_provider_config, use_sim=False) == baseline
+    assert len(template_warnings) == 1 and "runtime.provider=aimdk_robot" in template_warnings[0]
+
+
+def test_template_play_without_the_cbf_still_reaches_the_data_plane_which_refuses(
+    cbf_provider_config, template_warnings, tmp_path
+):
+    # The summit profile inherits voice_mirror_all with the CBF off: enabling a
+    # template there must not stop the launch. The data plane answers disabled.
+    segments = tmp_path / "segments.json"
+    segments.write_text("{}", encoding="utf-8")
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    cbf_provider_config["template_play"] = {"enabled": True, "segments_file": str(segments)}
+    arguments = _include_arguments(cbf_provider_config, use_sim=False)
+    payload = json.loads(arguments.pop("template_play_json"))
+    assert arguments == baseline and "cbf_safety_json" not in arguments
+    assert payload == {"enabled": True, "segments_file": str(segments.resolve())}
+    assert len(template_warnings) == 1 and "cbf_safety.enabled" in template_warnings[0]
+
+
+@pytest.mark.parametrize(
+    ("segments_file", "expected"),
+    [
+        (None, ""),
+        (" ", ""),
+        (7, ""),
+        ("relative.json", ""),
+        ("{missing}", "{missing}"),
+    ],
+)
+def test_template_play_without_a_readable_file_still_reaches_the_data_plane_which_refuses(
+    cbf_provider_config, template_warnings, tmp_path, segments_file, expected
+):
+    missing = str(tmp_path / "missing.json")
+    cbf_provider_config["cbf_safety"] = {"enabled": True}
+    baseline = _include_arguments(cbf_provider_config, use_sim=False)
+    cbf_provider_config["template_play"] = {
+        "enabled": True,
+        **({} if segments_file is None else {"segments_file": segments_file}),
+    }
+    if isinstance(segments_file, str):
+        cbf_provider_config["template_play"]["segments_file"] = segments_file.format(missing=missing)
+    arguments = _include_arguments(cbf_provider_config, use_sim=False)
+    payload = json.loads(arguments.pop("template_play_json"))
+    assert arguments == baseline
+    # Never a relative path: the data plane would read it against its own working directory.
+    assert payload == {"enabled": True, "segments_file": expected.format(missing=missing)}
+    assert len(template_warnings) == 1 and "refuses every start" in template_warnings[0]
+
+
+@pytest.mark.parametrize("config_path", sorted(ROBOTS.glob("*.yaml")), ids=lambda path: path.stem)
+def test_template_play_is_off_in_every_shipped_robot_profile(config_path):
+    from robot_config.launch_builders.runtime import _template_play_json
+    from robot_config.loader import _load_robot_section
+
+    # Inherited sections included: grasp and summit inherit voice_mirror_all.
+    _, config = _load_robot_section(config_path)
+    assert _template_play_json(config) == "", f"{config_path.name} unexpectedly enables the template port"
+
+
+def test_template_play_feature_profile_names_the_motion_template_segments():
+    import yaml
+
+    config = yaml.safe_load((ROBOTS / "aimdk_x2_voice_mirror_all.yaml").read_text(encoding="utf-8"))["robot"]
+    assert config["template_play"] == {
+        "enabled": False,
+        "segments_file": "$(find robot_config)/config/motion_template/segments.json",
+    }
 
 
 def test_hardware_and_sdk_pass_use_sim_and_platform_without_the_alias():

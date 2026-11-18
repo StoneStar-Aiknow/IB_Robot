@@ -423,6 +423,16 @@ robot:
       native_upper: [0.03, 1.64, 0.87, 0.05]
   # /feat/x2-cbf-safety
 
+  # feat/x2-cbf-dual: template playback port
+  # The data plane plays whitelisted contact segments itself (P -> T -> P) within
+  # the CBF's limits; the mirror session only starts, keeps alive and releases.
+  # Without cbf_safety or the file every start is refused; the launch never fails
+  # on this block. Off: no topic, the data plane is the e965d015 one.
+  template_play:
+    enabled: false
+    segments_file: $(find robot_config)/config/motion_template/segments.json
+  # /feat/x2-cbf-dual
+
   # feat/x2-internvl-voice
   # The mirror speaks prerecorded clips only: transitions, standby words and a
   # line matched to what InternVL sees. Never synthesis. Remove this block (or

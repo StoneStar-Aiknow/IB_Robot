@@ -236,6 +236,46 @@ def _cbf_safety_json(robot_config: dict[str, Any]) -> str:
     return json.dumps(payload, allow_nan=False)
 
 
+def _template_play_json(robot_config: dict[str, Any]) -> str:
+    """Optional X2 template playback port of the data plane; off unless enabled.
+
+    A template is an extra and never stops a launch: a block that cannot be read
+    is logged and left off. Enabled, the data plane gets the port even when it
+    can only refuse (no CBF: disabled, no file: no_whitelist), so a mirror
+    session's start is answered rather than left waiting.
+    """
+    config = robot_config.get("template_play")
+    if config is None:
+        return ""
+    if not isinstance(config, dict) or not isinstance(config.get("enabled", False), bool):
+        logger.warning("robot.template_play must be a mapping with a boolean enabled flag; template playback stays off")
+        return ""
+    if not config.get("enabled", False):
+        return ""
+    if runtime_provider(robot_config) != "aimdk_robot":
+        logger.warning("robot.template_play needs runtime.provider=aimdk_robot; template playback stays off")
+        return ""
+    if not _cbf_safety_json(robot_config):
+        # Every played point is bounded by the CBF's limits; without it every start is refused.
+        logger.warning("robot.template_play without robot.cbf_safety.enabled: the data plane refuses every start")
+    value = config.get("segments_file")
+    path = ""
+    if isinstance(value, str) and value.strip():
+        from robot_config.utils import resolve_ros_path
+
+        resolved = Path(str(resolve_ros_path(value)))
+        # Never a relative path: the data plane would read it against its own working directory.
+        path = str(resolved.resolve()) if resolved.is_absolute() else ""
+        if not resolved.is_absolute() or not resolved.is_file():
+            logger.warning(
+                f"robot.template_play.segments_file {value!r} is not an existing absolute file: "
+                "the data plane refuses every start"
+            )
+    else:
+        logger.warning("robot.template_play.segments_file is missing: the data plane refuses every start")
+    return json.dumps({"enabled": True, "segments_file": path}, sort_keys=True, allow_nan=False)
+
+
 def generate_runtime_provider_actions(
     robot_config: dict[str, Any],
     *,
@@ -292,6 +332,9 @@ def generate_runtime_provider_actions(
     cbf_safety_json = _cbf_safety_json(robot_config)
     if cbf_safety_json:
         include_arguments["cbf_safety_json"] = cbf_safety_json
+    template_play_json = _template_play_json(robot_config)
+    if template_play_json:
+        include_arguments["template_play_json"] = template_play_json
     if use_sim:
         include_arguments["sim_platform"] = str(sim_platform).lower()
     platform = str(sim_platform).lower() if use_sim else ""
