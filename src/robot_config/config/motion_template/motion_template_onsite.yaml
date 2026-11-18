@@ -1,0 +1,17 @@
+# X2 #3 on site: every template on. Only used when the robot yaml points
+# mirror_session.motion_template_config here (with template_play, the gesture
+# model and preset_motions.gesture switched on, motion_enabled kept false; see
+# motion-template-integ-yaml). The blend settings are the code defaults, the
+# same as in motion_template.yaml. Must sit next to segments.json.
+motion_template:
+  enabled: true
+  segments_file: segments.json
+  label_topic: /preset_motions/state
+  play_topic: /mirror_session/template_play
+  status_topic: /aimdk_dataplane/template_status
+  dataplane_status_topic: /aimdk_runtime/dataplane/status
+  templates:
+    overhead_heart: {enabled: true, segments: [overhead_heart]}
+    heart: {enabled: true, segments: [heart]}
+    holy: {enabled: true, segments: [holy]}
+    xsign: {enabled: true, segments: [xsign_left_front, xsign_right_front]}
