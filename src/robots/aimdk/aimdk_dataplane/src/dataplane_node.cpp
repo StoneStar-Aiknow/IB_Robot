@@ -550,6 +550,7 @@ private:
     }
     const bool was_releasing = cbf_->diagnostics().releasing;
     const double previous_stuck_s = cbf_->diagnostics().stuck_s;
+    const bool was_collision = cbf_->diagnostics().stuck_collision;
     const double release_at = monotonic_s();
     decision = cbf_->release_if_stuck(decision, snapshot, release_at);
     const auto & d = cbf_->diagnostics();
@@ -567,10 +568,11 @@ private:
     // Logged after the command is out, so the WARN never delays it.
     if (d.releasing != was_releasing || (d.releasing && release_at - last_release_log_s_ >= 1.0)) {
       RCLCPP_WARN(
-        get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu reason=%s",
+        get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu collision=%d reason=%s",
         d.releasing != was_releasing ? (d.releasing ? "start" : "end") : "ongoing",
         static_cast<unsigned long long>(d.release_episodes),
-        d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released), d.reason.c_str());
+        d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released),
+        d.releasing ? d.stuck_collision : was_collision, d.reason.c_str());
       last_release_log_s_ = release_at;
     }
     core_.remember_arm_output(decision.output);
@@ -697,9 +699,14 @@ private:
       status["cbf"]["thumb_feedback_issue"] = d.thumb_feedback_issue;
       status["cbf"]["released"] = d.released;
       status["cbf"]["release_episodes"] = d.release_episodes;
+      status["cbf"]["collision_release_episodes"] = d.collision_release_episodes;
       status["cbf"]["releasing"] = d.releasing;
+      status["cbf"]["stuck_collision"] = d.stuck_collision;
       status["cbf"]["stuck_s"] = d.stuck_s;
       status["cbf"]["hold_release_after_s"] = cbf_->config().hold_release_after_s;
+      status["cbf"]["collision_release_after_s"] = cbf_->config().collision_release_after_s;
+      status["cbf"]["collision_release_without_history_s"] = cbf_->config().collision_release_without_history_s;
+      status["cbf"]["collision_release_speed_scale"] = cbf_->config().collision_release_speed_scale;
       if (d.last_input_fault) {
         status["cbf"]["last_input_fault_event"] = d.last_input_fault->event;
         status["cbf"]["last_input_fault_issue"] = d.last_input_fault->issue;

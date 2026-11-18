@@ -231,8 +231,17 @@ were disabled. `CBF_RELEASE start|end` marks each episode and `ongoing` repeats
 at most once a second while it lasts; the log only observes, it never changes
 a decision. A request with no
 complete upper-body command keeps the hold. A collision verdict (the kernel
-rejected every candidate on geometry) is never released; at 50 Hz a request
-that moves away or holds still is accepted in the next frame.
+rejected every candidate on geometry) holds longer: at 50 Hz a request that
+moves away or holds still is accepted in the next frame, and a hold that saw a
+verdict is released after `collision_release_after_s` (default 2.0 s) when it
+began on a published pair, or after `collision_release_without_history_s`
+(default 0.5 s) when nothing had been published in the epoch yet (that hold
+publishes nothing). One clock covers the whole hold, and once any frame of it
+was a verdict the collision time applies to all of it. Such a release steps
+the arm at `collision_release_speed_scale` (default 0.3) of the velocity limit;
+the hand is published as requested. A release that has begun lasts until a
+verified frame. `CBF_RELEASE` prints `collision=1` for these, and the status
+counts them in `collision_release_episodes`.
 `EveryPersistentNonCollisionReasonIsFollowedAfterTheReleaseTime` runs each
 non-verdict reason for a whole run against the same run without it.
 

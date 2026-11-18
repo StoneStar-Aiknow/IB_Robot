@@ -33,6 +33,14 @@ struct CbfSafetyConfig
   // hold the committed pair only this long; then the request is published within
   // the original joint and velocity limits, as if the filter were disabled.
   double hold_release_after_s = 0.2;
+  // A hold that saw a collision verdict is released too, later and slower: after
+  // collision_release_after_s when it began on a published pair (the arm waits at
+  // the boundary and a move-away is accepted at once), after
+  // collision_release_without_history_s when nothing had been published yet (the
+  // hold publishes nothing). The arm step is scaled by collision_release_speed_scale.
+  double collision_release_after_s = 2.0;
+  double collision_release_without_history_s = 0.5;
+  double collision_release_speed_scale = 0.3;
   double period_s = 0.02;
   bool mapping_verified = false;
   bool mapping_available = false;
@@ -79,8 +87,9 @@ struct CbfDecision
   bool geometry_modified = false;
   bool recovery_verified = false;
   bool hand_held = false;
-  // The kernel judged the request unsafe. Only these holds persist; a target
-  // that does not approach a collision is never refused this way.
+  // The kernel judged the request unsafe. These holds are released later and
+  // slower than others; a target that does not approach a collision is never
+  // refused this way.
   bool collision_refusal = false;
   bool released = false;  // Published by release_if_stuck, not verified by the filter.
   Output prepared_hold;
@@ -171,8 +180,10 @@ struct CbfDiagnostics
   std::optional<CbfThumbFeedbackEvent> last_thumb_feedback_event;
   uint64_t released = 0;
   uint64_t release_episodes = 0;
+  uint64_t collision_release_episodes = 0;  // Episodes that released after a collision verdict.
   bool releasing = false;
-  double stuck_s = 0.0;  // Length of the current non-collision hold.
+  bool stuck_collision = false;  // The current hold has seen a collision verdict.
+  double stuck_s = 0.0;  // Length of the current hold.
   std::string reason = "inactive";
 };
 
@@ -187,7 +198,7 @@ public:
   void committed(const CbfDecision & decision, double now);
   CbfDecision deadline_fallback(const CbfDecision & decision);
   CbfDecision feedback_fallback(const CbfDecision & decision, const std::string & reason);
-  // Last step before publication. Never applied to a collision refusal.
+  // Last step before publication. Every hold ends: see the release times in the config.
   CbfDecision release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now);
   void tick_finished(double elapsed_us, double after_check_us = 0.0);
   void discarded();
@@ -204,6 +215,8 @@ private:
   double last_published_ = 0.0;
   bool invalid_input_episode_ = false;
   std::optional<double> stuck_since_;
+  bool stuck_with_history_ = false;  // The hold began on a published pair.
+  bool stuck_released_ = false;  // The hold has begun to release.
   int kernel_call_limit_ = -1;
 };
 

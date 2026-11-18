@@ -16,6 +16,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "aimdk_dataplane/cbf_safety.hpp"
@@ -1703,13 +1704,31 @@ TEST(CbfSafety, ProjectedRecoveryReusesItsKernelProofForTheUnchangedActualSnapsh
 
 TEST(CbfSafety, HoldReleaseConfigurationIsBounded)
 {
-  EXPECT_DOUBLE_EQ(fixture_config().hold_release_after_s, 0.2);
-  auto value = urdf_fixture_json();
-  value["hold_release_after_s"] = 0.5;
-  EXPECT_DOUBLE_EQ(fixture_config(value).hold_release_after_s, 0.5);
-  for (double invalid : {-0.01, 1.01}) {
-    value["hold_release_after_s"] = invalid;
-    EXPECT_THROW(fixture_config(value), std::invalid_argument);
+  const auto defaults = fixture_config();
+  EXPECT_DOUBLE_EQ(defaults.hold_release_after_s, 0.2);
+  EXPECT_DOUBLE_EQ(defaults.collision_release_after_s, 2.0);
+  EXPECT_DOUBLE_EQ(defaults.collision_release_without_history_s, 0.5);
+  EXPECT_DOUBLE_EQ(defaults.collision_release_speed_scale, 0.3);
+  const std::vector<std::tuple<std::string, double, std::vector<double>>> fields{
+    {"hold_release_after_s", 0.5, {-0.01, 1.01}},
+    {"collision_release_after_s", 3.0, {-0.01, 10.01}},
+    {"collision_release_without_history_s", 1.0, {-0.01, 5.01}},
+    {"collision_release_speed_scale", 1.0, {0.0, -0.1, 1.01}},
+  };
+  for (const auto & [field, valid, invalids] : fields) {
+    SCOPED_TRACE(field);
+    auto value = urdf_fixture_json();
+    value[field] = valid;
+    const auto config = fixture_config(value);
+    const double read = field == "hold_release_after_s" ? config.hold_release_after_s :
+      field == "collision_release_after_s" ? config.collision_release_after_s :
+      field == "collision_release_without_history_s" ? config.collision_release_without_history_s :
+      config.collision_release_speed_scale;
+    EXPECT_DOUBLE_EQ(read, valid);
+    for (double invalid : invalids) {
+      value[field] = invalid;
+      EXPECT_THROW(fixture_config(value), std::invalid_argument) << invalid;
+    }
   }
 }
 
@@ -1874,9 +1893,11 @@ TEST(CbfSafety, ReleaseWithoutAPublishedFrameStepsFromTheMeasuredArm)
   }
 }
 
-TEST(CbfSafety, ACollisionVerdictIsNeverReleasedAndTheNextMoveAwayFrameIsAccepted)
+TEST(CbfSafety, ACollisionVerdictHoldsAtTheBoundaryForItsOwnTimeThenReleasesSlowly)
 {
   const auto config = fixture_config(freeze091650_config());
+  ASSERT_DOUBLE_EQ(config.collision_release_after_s, 2.0);
+  ASSERT_DOUBLE_EQ(config.collision_release_speed_scale, 0.3);
   const auto frozen = freeze094711_snapshot(config);
   CbfSafety safety(config);
   const auto seed = safety.filter(frozen, 1.0);
@@ -1888,40 +1909,162 @@ TEST(CbfSafety, ACollisionVerdictIsNeverReleasedAndTheNextMoveAwayFrameIsAccepte
   stale.arm->age_s = config.feedback_max_age_s + 0.001;
   EXPECT_FALSE(safety.release_if_stuck(safety.filter(stale, 1.0), stale, 1.0).accept_new);
   EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+  EXPECT_FALSE(safety.diagnostics().stuck_collision);
 
-  // ... and a verdict resets it. The measured elbow has left the committed one
-  // inside the wall; at the instant of the last publication the command box has
-  // zero width, so the only candidate is a path back into the wall. Offline this
-  // is the reproducible verdict; the release clock is advanced independently.
+  // ... and a verdict joins it, so the whole hold now waits the collision time.
+  // The measured elbow has left the committed one inside the wall; at the
+  // instant of the last publication the command box has zero width, so the only
+  // candidate is a path back into the wall. Offline this is the reproducible
+  // verdict; the release clock is advanced independently.
   auto lagging = frozen;
   lagging.arm->position[3] += 0.05;
-  for (double release_clock : {1.1, 1.5, 3.0}) {
+  for (double release_clock : {1.1, 1.25, 1.5, 2.99}) {
     SCOPED_TRACE(release_clock);
     const auto verdict = safety.filter(lagging, 1.0);
     ASSERT_TRUE(verdict.collision_refusal) << safety.diagnostics().reason;
     ASSERT_FALSE(verdict.accept_new);
     const auto kept = safety.release_if_stuck(verdict, lagging, release_clock);
-    EXPECT_FALSE(kept.accept_new);
     EXPECT_FALSE(kept.released);
     expect_held_pair(kept, seed.output);
     EXPECT_FALSE(safety.diagnostics().releasing);
-    EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+    EXPECT_TRUE(safety.diagnostics().stuck_collision);
+    EXPECT_NEAR(safety.diagnostics().stuck_s, release_clock - 1.0, 1e-9);
     // The node's late recheck keeps the verdict flag on the cached hold.
     EXPECT_TRUE(safety.deadline_fallback(verdict).collision_refusal);
+    // A non-verdict frame amid the verdicts cannot cut the hold to 0.2 s.
+    const auto amid = safety.release_if_stuck(safety.filter(stale, 1.0), stale, release_clock);
+    EXPECT_FALSE(amid.released);
+    expect_held_pair(amid, seed.output);
   }
+  EXPECT_EQ(safety.diagnostics().release_episodes, 0u);
+
+  // At 2 s the request goes out, the arm at 0.3x the velocity step.
+  const auto verdict = safety.filter(lagging, 1.0);
+  ASSERT_TRUE(verdict.collision_refusal);
+  const auto released = safety.release_if_stuck(verdict, lagging, 3.0);
+  ASSERT_TRUE(released.accept_new);
+  ASSERT_TRUE(released.released);
+  EXPECT_TRUE(safety.diagnostics().releasing);
+  EXPECT_EQ(safety.diagnostics().release_episodes, 1u);
+  EXPECT_EQ(safety.diagnostics().collision_release_episodes, 1u);
+  for (std::size_t joint = 0; joint < 14; ++joint) {
+    SCOPED_TRACE(joint);
+    EXPECT_LE(std::abs(released.output.arm[joint] - seed.output.arm[joint]),
+      0.3 * config.velocity[joint] * config.period_s + 1e-12);
+  }
+  EXPECT_EQ(released.output.hand, lagging.requested.hand);
   safety.committed(seed, 1.0);
 
   // One frame later the operator moves away and the frame is accepted.
   auto away = lagging;
   away.requested.arm[3] = lagging.arm->position[3] + 0.02;
-  const auto moved = safety.release_if_stuck(safety.filter(away, 1.02), away, 1.02);
+  const auto moved = safety.release_if_stuck(safety.filter(away, 1.02), away, 3.02);
   ASSERT_TRUE(moved.accept_new) << safety.diagnostics().reason;
   EXPECT_FALSE(moved.released);
+  EXPECT_FALSE(safety.diagnostics().releasing);
+  EXPECT_FALSE(safety.diagnostics().stuck_collision);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
   EXPECT_GT(moved.output.arm[3], seed.output.arm[3] + 1e-6);
   auto path = away;
   path.requested = moved.output;
   const auto verified = freeze091650_path(path, config, true);
   EXPECT_TRUE(verified.nonlinear_verified);
+}
+
+TEST(CbfSafety, AReleaseUnderWayIsNotStoppedByAVerdictOnlySlowedDown)
+{
+  const auto config = fixture_config(freeze091650_config());
+  const auto frozen = freeze094711_snapshot(config);
+  CbfSafety safety(config);
+  const auto seed = safety.filter(frozen, 1.0);
+  ASSERT_TRUE(seed.accept_new) << safety.diagnostics().reason;
+  safety.committed(seed, 1.0);
+  auto stale = frozen;
+  stale.arm->age_s = config.feedback_max_age_s + 0.001;
+  stale.requested.arm[3] -= 0.1;
+  EXPECT_FALSE(safety.release_if_stuck(safety.filter(stale, 1.0), stale, 1.0).accept_new);
+  const auto plain = safety.release_if_stuck(safety.filter(stale, 1.0), stale, 1.2);
+  ASSERT_TRUE(plain.released);
+  EXPECT_FALSE(safety.diagnostics().stuck_collision);
+  EXPECT_NEAR(std::abs(plain.output.arm[3] - seed.output.arm[3]), config.velocity[3] * config.period_s, 1e-12);
+
+  // The same release, not committed, meets the 094711 verdict on the next frame.
+  auto lagging = frozen;
+  lagging.arm->position[3] += 0.05;
+  const auto verdict = safety.filter(lagging, 1.0);
+  ASSERT_TRUE(verdict.collision_refusal) << safety.diagnostics().reason;
+  const auto slowed = safety.release_if_stuck(verdict, lagging, 1.22);
+  ASSERT_TRUE(slowed.released);
+  EXPECT_TRUE(safety.diagnostics().releasing);
+  EXPECT_TRUE(safety.diagnostics().stuck_collision);
+  for (std::size_t joint = 0; joint < 14; ++joint) {
+    SCOPED_TRACE(joint);
+    EXPECT_LE(std::abs(slowed.output.arm[joint] - seed.output.arm[joint]),
+      0.3 * config.velocity[joint] * config.period_s + 1e-12);
+  }
+  EXPECT_EQ(safety.diagnostics().release_episodes, 1u);
+  EXPECT_EQ(safety.diagnostics().collision_release_episodes, 0u);  // It began as a plain release.
+}
+
+TEST(CbfSafety, AVerdictBeforeAnythingWasPublishedIsReleasedAfterHalfASecondAndKeepsGoing)
+{
+  const auto config = fixture_config(freeze091650_config());
+  ASSERT_DOUBLE_EQ(config.collision_release_without_history_s, 0.5);
+  // A fresh epoch: nothing published yet, so a verdict has no pair to hold and
+  // publishes nothing, frame after frame. Measured elbow 0.15 rad lower than
+  // the 094711 snapshot, request 0.1 rad further down: the thumb sweep from the
+  // reading to the request is rejected on the first frame.
+  auto start = freeze094711_snapshot(config);
+  start.arm->position[3] -= 0.15;
+  start.requested.arm = start.arm->position;
+  start.requested.arm[3] -= 0.1;
+  CbfSafety safety(config);
+  Output previous;
+  int empty_frames = 0;
+  int released_frames = 0;
+  for (int frame = 0; frame < 60; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.0 + config.period_s * frame;
+    const auto decision = safety.filter(start, now);
+    if (frame == 0) {
+      ASSERT_TRUE(decision.collision_refusal) << safety.diagnostics().reason;
+      ASSERT_EQ(decision.output.kind, Output::Kind::kNone);
+    }
+    const auto out = safety.release_if_stuck(decision, start, now);
+    if (now - 1.0 + 1e-9 < 0.5) {
+      EXPECT_EQ(out.output.kind, Output::Kind::kNone);
+      EXPECT_FALSE(safety.diagnostics().releasing);
+      ++empty_frames;
+    } else {
+      // Once begun, the release goes on through the verdicts that follow.
+      ASSERT_TRUE(out.released) << safety.diagnostics().reason;
+      ASSERT_EQ(out.output.kind, Output::Kind::kUpperBody);
+      const auto & from = released_frames == 0 ? start.arm->position : previous.arm;
+      for (std::size_t joint = 0; joint < 14; ++joint) {
+        SCOPED_TRACE(joint);
+        EXPECT_LE(std::abs(out.output.arm[joint] - from[joint]),
+          0.3 * config.velocity[joint] * config.period_s + 1e-12);
+      }
+      ++released_frames;
+    }
+    safety.committed(out, now);
+    if (out.output.kind == Output::Kind::kUpperBody) {previous = out.output;}
+  }
+  EXPECT_EQ(empty_frames, 25);
+  EXPECT_EQ(released_frames, 35);
+  EXPECT_EQ(safety.diagnostics().release_episodes, 1u);
+  EXPECT_EQ(safety.diagnostics().collision_release_episodes, 1u);
+  // The slowed release reached the requested elbow.
+  EXPECT_NEAR(previous.arm[3], start.requested.arm[3], 1e-9);
+
+  // A new epoch starts a new count: nothing published in it yet.
+  auto next = start;
+  next.epoch = start.epoch + 1;
+  EXPECT_EQ(safety.release_if_stuck(safety.filter(next, 3.0), next, 3.0).output.kind, Output::Kind::kNone);
+  EXPECT_FALSE(safety.diagnostics().releasing);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+  EXPECT_EQ(safety.release_if_stuck(safety.filter(next, 3.48), next, 3.48).output.kind, Output::Kind::kNone);
+  EXPECT_TRUE(safety.release_if_stuck(safety.filter(next, 3.5), next, 3.5).released);
 }
 
 TEST(CbfSafety, ABlockedArmNeverTurnsMoveAwayOrStillRequestsIntoAHold)
@@ -2101,4 +2244,162 @@ TEST(CbfSafety, EveryPersistentNonCollisionReasonIsFollowedAfterTheReleaseTime)
     }
     expect_follows(fault, true);
   }
+}
+
+namespace
+{
+
+struct NoStallStats
+{
+  int frames = 0;
+  int verdicts = 0;
+  int collision_releases = 0;
+  int releases = 0;
+  double longest_unpublished_s = 0.0;  // Longest run of frames that accepted no new pair.
+};
+
+// Random reaching motions, including the arms across and the hands together,
+// with the robot following what was published. No hold may outlast the longest
+// configured release time by more than a frame.
+NoStallStats run_random_reaching(const CbfSafetyConfig & config, CbfSnapshot snapshot, unsigned seed, int frames)
+{
+  CbfSafety safety(config);
+  std::srand(seed);
+  const auto uniform = [](double lo, double hi) {return lo + (hi - lo) * (std::rand() / (RAND_MAX + 1.0));};
+  NoStallStats stats;
+  std::array<double, 14> goal{};
+  std::array<double, 4> thumb_goal{};
+  for (std::size_t j = 0; j < 14; ++j) {goal[j] = snapshot.requested.arm[j];}
+  double stuck_since = -1.0;
+  constexpr std::array<std::size_t, 4> slots{0, 1, 10, 11};
+  for (int frame = 0; frame < frames; ++frame) {
+    const double now = 1.0 + config.period_s * frame;
+    if (frame % 40 == 0) {
+      for (std::size_t j = 0; j < 14; ++j) {goal[j] = uniform(config.lower[j], config.upper[j]);}
+    }
+    if (frame % 7 == 0) {
+      for (std::size_t a = 0; a < 4; ++a) {
+        thumb_goal[a] = uniform(config.thumb_model_limits[a][0], config.thumb_model_limits[a][1]);
+      }
+    }
+    // The operator moves fast: 0.1 rad a frame towards the goal, well past the arm step.
+    for (std::size_t j = 0; j < 14; ++j) {
+      const double delta = std::clamp(goal[j] - snapshot.requested.arm[j], -0.1, 0.1);
+      snapshot.requested.arm[j] += delta;
+    }
+    for (std::size_t a = 0; a < 4; ++a) {
+      snapshot.requested.hand[slots[a]] = (thumb_goal[a] - config.command_offset[a]) / config.command_scale[a];
+    }
+    auto decision = safety.filter(snapshot, now);
+    if (decision.collision_refusal) {++stats.verdicts;}
+    if (frame % 17 == 0) {decision = safety.deadline_fallback(decision);}
+    const bool was_releasing = safety.diagnostics().releasing;
+    decision = safety.release_if_stuck(decision, snapshot, now);
+    if (safety.diagnostics().releasing && !was_releasing) {
+      ++stats.releases;
+      if (safety.diagnostics().stuck_collision) {++stats.collision_releases;}
+    }
+    safety.committed(decision, now);
+    if (decision.accept_new) {
+      stuck_since = -1.0;
+    } else {
+      if (stuck_since < 0.0) {stuck_since = now;}
+      stats.longest_unpublished_s = std::max(stats.longest_unpublished_s, now - stuck_since);
+    }
+    // The robot lags: each frame it covers half the way to the published arm.
+    if (decision.output.kind == Output::Kind::kUpperBody) {
+      for (std::size_t j = 0; j < 14; ++j) {
+        snapshot.arm->position[j] += 0.5 * (decision.output.arm[j] - snapshot.arm->position[j]);
+      }
+      for (std::size_t a = 0; a < snapshot.thumb->position.size(); ++a) {
+        auto & thumb = snapshot.thumb->position[a];
+        thumb += 0.5 * (decision.output.hand[slots[a]] - thumb);
+      }
+    }
+    ++stats.frames;
+  }
+  return stats;
+}
+
+}  // namespace
+
+TEST(CbfSafety, RandomReachingWithOneOrTwoHandsNeverHoldsLongerThanTheReleaseTime)
+{
+  struct Case {const char * name; CbfSafetyConfig config; CbfSnapshot start;};
+  const auto left = fixture_config(freeze091650_config());
+  const std::vector<Case> cases{
+    {"two hands", fixture_config(), urdf_snapshot()},
+    {"left hand", left, freeze094711_snapshot(left)},
+  };
+  for (const auto & item : cases) {
+    SCOPED_TRACE(item.name);
+    int verdicts = 0;
+    int collision_releases = 0;
+    for (unsigned seed = 1; seed <= 10; ++seed) {
+      SCOPED_TRACE(seed);
+      const auto stats = run_random_reaching(item.config, item.start, seed, 1500);
+      std::printf("%s seed=%u frames=%d verdicts=%d releases=%d collision_releases=%d longest_unpublished_s=%.3f\n",
+        item.name, seed, stats.frames, stats.verdicts, stats.releases, stats.collision_releases,
+        stats.longest_unpublished_s);
+      EXPECT_LE(stats.longest_unpublished_s, item.config.collision_release_after_s + 1e-9);
+      verdicts += stats.verdicts;
+      collision_releases += stats.collision_releases;
+    }
+    // The random motions must actually reach collision verdicts, or this proves nothing.
+    EXPECT_GT(verdicts, 0);
+  }
+}
+
+TEST(CbfSafety, WithTwoHandsAFirstFrameThumbVerdictNoLongerPublishesNothingForever)
+{
+  // Two installed hands, a random arm pose and thumb request (probe seed 11,
+  // trial 5): the first frame of the epoch rejects the thumb sweep from the
+  // reading. Nothing has been published, so the hold publishes nothing.
+  const auto config = fixture_config();
+  ASSERT_TRUE(config.hands_installed[0] && config.hands_installed[1]);
+  auto snapshot = urdf_snapshot();
+  const std::array<double, 14> arm{
+    0.97098955171977375, 0.0015500553156590283, -1.0116668777822755, -0.86858823246654793,
+    2.2962224066114643, -0.012511402474913114, -0.21896841497806308, -2.8793513228937471,
+    -1.3056623927009205, -0.70820119348490729, -1.2248622998793119, -0.56394577834023996,
+    -0.40764830845765165, -0.19043920759682131};
+  const std::array<double, 4> thumb{0.26006678639704239, -0.0635755207687001, 0.34644515390078245, -0.97902161376583652};
+  constexpr std::array<std::size_t, 4> slots{0, 1, 10, 11};
+  for (std::size_t j = 0; j < 14; ++j) {snapshot.arm->position[j] = snapshot.requested.arm[j] = arm[j];}
+  for (std::size_t a = 0; a < 4; ++a) {snapshot.requested.hand[slots[a]] = thumb[a];}
+  CbfSafety safety(config);
+  int empty_frames = 0;
+  int released_frames = 0;
+  int verified_frames = 0;
+  for (int frame = 0; frame < 150; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.0 + config.period_s * frame;
+    const auto decision = safety.filter(snapshot, now);
+    if (frame == 0) {
+      ASSERT_TRUE(decision.collision_refusal) << safety.diagnostics().reason;
+      ASSERT_EQ(decision.output.kind, Output::Kind::kNone);
+    }
+    const auto out = safety.release_if_stuck(decision, snapshot, now);
+    safety.committed(out, now);
+    if (now - 1.0 + 1e-9 < 0.5) {
+      EXPECT_EQ(out.output.kind, Output::Kind::kNone);
+      ++empty_frames;
+      continue;
+    }
+    // From 0.5 s every frame publishes a complete pair.
+    ASSERT_EQ(out.output.kind, Output::Kind::kUpperBody) << safety.diagnostics().reason;
+    out.released ? ++released_frames : ++verified_frames;
+    // The robot covers half the way to what was published.
+    for (std::size_t j = 0; j < 14; ++j) {
+      snapshot.arm->position[j] += 0.5 * (out.output.arm[j] - snapshot.arm->position[j]);
+    }
+    for (std::size_t a = 0; a < 4; ++a) {
+      snapshot.thumb->position[a] += 0.5 * (out.output.hand[slots[a]] - snapshot.thumb->position[a]);
+    }
+  }
+  std::printf("two-hand first frame: empty=%d released=%d verified=%d\n", empty_frames, released_frames, verified_frames);
+  EXPECT_EQ(empty_frames, 25);
+  EXPECT_EQ(released_frames + verified_frames, 125);
+  EXPECT_GT(released_frames, 0);
+  EXPECT_EQ(safety.diagnostics().collision_release_episodes, 1u);
 }

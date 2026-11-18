@@ -111,6 +111,11 @@ CbfSafetyConfig CbfSafetyConfig::from_json(const std::string & text, double rate
   out.feedback_limit_tolerance_rad = value.value("feedback_limit_tolerance_rad", 0.0);
   out.check_arm_feedback_goal_range = value.value("check_arm_feedback_goal_range", true);
   out.hold_release_after_s = value.value("hold_release_after_s", out.hold_release_after_s);
+  out.collision_release_after_s = value.value("collision_release_after_s", out.collision_release_after_s);
+  out.collision_release_without_history_s =
+    value.value("collision_release_without_history_s", out.collision_release_without_history_s);
+  out.collision_release_speed_scale =
+    value.value("collision_release_speed_scale", out.collision_release_speed_scale);
   if ((mode != "shadow" && mode != "enforce") || out.mirror_mode.empty() ||
     !std::isfinite(rate_hz) || rate_hz <= 0.0 || !std::isfinite(out.deadline_us) ||
     !std::isfinite(out.guard_us) || out.deadline_us <= 0.0 || out.guard_us < 0.0 ||
@@ -118,7 +123,12 @@ CbfSafetyConfig CbfSafetyConfig::from_json(const std::string & text, double rate
     !std::isfinite(out.state_skew_max_s) || out.state_skew_max_s < 0.0 ||
     !std::isfinite(out.feedback_limit_tolerance_rad) || out.feedback_limit_tolerance_rad < 0.0 ||
     out.feedback_limit_tolerance_rad > 0.1 || !std::isfinite(out.hold_release_after_s) ||
-    out.hold_release_after_s < 0.0 || out.hold_release_after_s > 1.0)
+    out.hold_release_after_s < 0.0 || out.hold_release_after_s > 1.0 ||
+    !std::isfinite(out.collision_release_after_s) || out.collision_release_after_s < 0.0 ||
+    out.collision_release_after_s > 10.0 || !std::isfinite(out.collision_release_without_history_s) ||
+    out.collision_release_without_history_s < 0.0 || out.collision_release_without_history_s > 5.0 ||
+    !std::isfinite(out.collision_release_speed_scale) || out.collision_release_speed_scale <= 0.0 ||
+    out.collision_release_speed_scale > 1.0)
   {
     throw std::invalid_argument("invalid CBF mode, period or budget");
   }
@@ -259,6 +269,7 @@ void CbfSafety::inactive(uint64_t epoch)
     epoch_ = epoch;
   }
   stuck_since_.reset();
+  diagnostics_.stuck_collision = false;
   diagnostics_.active = false;
   diagnostics_.recovery_verified = false;
   diagnostics_.hand_held = false;
@@ -284,6 +295,7 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     accepted_.reset();
     invalid_input_episode_ = false;
     stuck_since_.reset();
+    diagnostics_.stuck_collision = false;
     epoch_ = snapshot.epoch;
   }
   const auto previous_thumb_issue = std::move(diagnostics_.thumb_feedback_issue);
@@ -741,24 +753,37 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   const auto settle = [&]() {
       stuck_since_.reset();
       diagnostics_.releasing = false;
+      diagnostics_.stuck_collision = false;
       diagnostics_.stuck_s = 0.0;
       return decision;
     };
-  if (!config_.enforce || !diagnostics_.active || decision.epoch != epoch_ ||
-    decision.accept_new || decision.collision_refusal)
-  {
+  if (!config_.enforce || !diagnostics_.active || decision.epoch != epoch_ || decision.accept_new) {
     return settle();
   }
   const auto & requested = snapshot.requested;
-  if (!stuck_since_) {stuck_since_ = now;}
+  if (!stuck_since_) {
+    stuck_since_ = now;
+    stuck_with_history_ = accepted_.has_value();
+    stuck_released_ = false;
+  }
+  // One clock per hold. Once a verdict is seen the whole hold uses the collision
+  // time, so a deadline frame amid verdicts cannot cut it short.
+  const bool collision = diagnostics_.stuck_collision || decision.collision_refusal;
+  diagnostics_.stuck_collision = collision;
   diagnostics_.stuck_s = std::max(0.0, now - *stuck_since_);
-  if (diagnostics_.stuck_s + 1e-9 < config_.hold_release_after_s || !complete_upper_body(requested)) {
+  const double release_after = !collision ? config_.hold_release_after_s :
+    stuck_with_history_ ? config_.collision_release_after_s : config_.collision_release_without_history_s;
+  // A release that has begun goes on until a verified frame, so it never stops
+  // again halfway; a verdict arriving during it only slows it down.
+  if ((!stuck_released_ && diagnostics_.stuck_s + 1e-9 < release_after) ||
+    !complete_upper_body(requested))
+  {
     diagnostics_.releasing = false;
     return decision;
   }
-  // Nothing judged this request unsafe; it only went unverified. Publish it as
-  // the filter-disabled path would, within the same joint and velocity limits,
-  // stepping from the committed arm, else from the measured one.
+  // Publish the request as the filter-disabled path would, within the same
+  // joint limits, stepping from the committed arm, else from the measured one.
+  // After a verdict the step is slower: the request may press into contact.
   CbfDecision out;
   out.epoch = decision.epoch;
   out.output = requested;
@@ -769,7 +794,7 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
     double value = std::clamp(out.output.arm[j], config_.lower[j], config_.upper[j]);
     if (accepted_ || measured) {
       const double reference = accepted_ ? accepted_->arm[j] : snapshot.arm->position[j];
-      const double step = config_.velocity[j] * dt;
+      const double step = config_.velocity[j] * dt * (collision ? config_.collision_release_speed_scale : 1.0);
       value = std::clamp(value, reference - step, reference + step);
     }
     out.output.arm[j] = value;
@@ -778,7 +803,11 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   out.released = true;
   out.modified = out.output.arm != requested.arm || out.output.hand != requested.hand;
   out.prepared_hold = decision.prepared_hold;
-  if (!diagnostics_.releasing) {++diagnostics_.release_episodes;}
+  if (!diagnostics_.releasing) {
+    ++diagnostics_.release_episodes;
+    if (collision) {++diagnostics_.collision_release_episodes;}
+  }
+  stuck_released_ = true;
   diagnostics_.releasing = true;
   diagnostics_.reason = "released/" + diagnostics_.reason;
   diagnostics_.distance_valid = false;
