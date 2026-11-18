@@ -181,13 +181,18 @@ intermediate path samples and exact verifier all honor the same selection.
 Excluded distance entries use a finite sentinel and never compete for the
 minimum; they are excluded pairs, not measurements. The real integration must
 explicitly configure installed hardware and reject incompatible reported types.
+The dataplane adapter checks an installed side the platform reports as no hand
+(an empty flange) as a phantom hand: its pairs stay in, so the selection is
+never narrowed by a missing hand. A hand reported on a side configured absent,
+or a type other than the OmniHand, is rejected as a mismatch.
 
 The adaptation touches `kinematics.hpp`, `safety_filter.hpp`, `kinematics.cpp`,
 `distance_gradient.cpp` and `safety_filter.cpp`. Tests retain both-hand defaults
 and cover exclusion of an absent right hand while left-hand and arm collisions
 remain detectable. Thumb feedback is read only for installed hands; a missing
 native angle is never filled in as measured zero (the adapter substitutes the
-last published command, see below).
+last published command, see below; a phantom hand's thumb is a configured
+compact pose).
 
 ## Native observations versus commanded joint bounds
 
@@ -215,9 +220,15 @@ narrow admission band, and a held frame cannot move the thumb back into it, so
 a strict check deadlocks (field freeze 2026-11-17). For FK the adapter clamps
 each reading into `thumb_model_limits`; a missing, stale, nonfinite or faulted
 reading (nonzero hand `faultcode`) is replaced by the last published thumb
-command, else the requested one. Each such frame increments
-`thumb_feedback_frames`; the first frame of a new issue is logged once as
-`CBF_THUMB_FEEDBACK` with the raw native value and native bounds.
+command, else the requested one. Each side is judged on its own: a side
+without readings or with a faulted hand is replaced, the other side's reading
+stays in use. Each such frame increments `thumb_feedback_frames`; the first
+frame of a new issue is logged once as `CBF_THUMB_FEEDBACK` with the raw native
+value and native bounds. A phantom hand's thumb (an installed side reported as
+no hand) is the configured compact pose `phantom_thumb_native`, as its
+current angle, its target and its published command, and is not a feedback
+issue: it never follows the request, so it never starts a gesture ordering
+check or makes the whole-gesture deferral hold the other hand's gesture.
 
 A thumb command outside what the hand can reach is clamped into the native
 range intersected with the inverse-mapped model range, never refused.
@@ -255,7 +266,10 @@ since the previous line (`na` if none), with `distance_frames` and
 is only counted. Logging only.
 
 The status also reports `hand_configuration_matches`: the platform's hand types
-and hand state are the ones `hands_installed` describes. When CBF enforces,
+and hand state are the ones `hands_installed` describes, where an installed
+side reported as no hand counts as a match (a phantom hand, listed in
+`phantom_hands`); a hand on a side configured absent, or another hand type, does
+not. When CBF enforces,
 the runtime refuses to enter `mirror_mode` if that is false or no thumb mapping
 is configured, naming the side and the expected and reported type. CBF off or
 shadow refuses nothing. A mismatch that appears mid-run is a non-verdict hold

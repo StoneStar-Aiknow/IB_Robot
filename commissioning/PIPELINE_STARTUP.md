@@ -37,9 +37,10 @@ robot:
       - left
       arm_side: left
   cbf_safety:
+    # 右手未装就是空法兰，CBF 按幻影手算，与装上后同一份配置。
     hands_installed:
     - true
-    - false
+    - true
   runtime:
     instance_id: x2_robot_03
 ```
@@ -52,6 +53,25 @@ commissioning/fixed_poses_voice_mirror_grasp.json
 
 安装手配置变更后必须重新生成匹配的姿态库。
 禁止手动修改姿态库摘要来跳过校验。
+
+### 部署顺序：`hands_installed` 与数据面一起发布
+
+`cbf_safety.hands_installed: [true, true]` 只能配支持幻影手的 aimdk_dataplane
+（feat/x2-cbf-twohands 起）。e965d015 及更早的数据面不认空法兰：平台报
+`{1, 0}`（左手装、右侧空）时判为手配置不匹配（`hand_configuration_matches=false`），
+enforce 下 runtime 拒绝进入 mirror_mode，照镜子起不来。
+
+- 发布：数据面先于或同时于新 yaml 上板，不能只换 yaml。
+- 回退：先回 yaml 到 `[true, false]`，再回数据面。旧 yaml 配新数据面可用，
+  但只在平台报 `{1, 0}` 时与 e965d015 的输出相同。左手掉线报 `{0, 0}` 时两者不同：
+  e965d015 判手配置不匹配（`hand_configuration_matches=false`），整机 hold
+  （照镜子没开时 runtime 不进 mirror_mode；开着时按不匹配 hold，超过
+  `hold_release_after_s` 后照原有规则放行、打 `CBF_RELEASE`）；45635b17 起
+  新数据面把左手当幻影手，继续照镜子，并打 `CBF_HAND_ABSENT side=left start`。
+- 现场核对：数据面日志 `CBF_HAND_ABSENT side=right start` 表示右侧按幻影手算，
+  空法兰时正常。出现 `side=left start` 说明左手报了 type 0（如掉线），左手正被
+  当作幻影手检查，应停下查左手；恢复时打 `side=left end`。status 的
+  `cbf.phantom_hands` 给出同样的状态。
 
 ## 启动完整 pipeline
 

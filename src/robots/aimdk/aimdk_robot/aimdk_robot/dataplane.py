@@ -260,6 +260,11 @@ def cbf_hand_refusal(cbf: dict[str, Any], mode: str, reported: list[int]) -> str
     configured with. Mirroring on other hands it could only hold the arm, so
     the mode it protects is refused before it starts. A CBF that is off or
     only observing, and every other mode, are left as they were.
+
+    The verdict is the data plane's. An installed side the platform reports as
+    none is an empty flange: the data plane checks it as a phantom hand and
+    does not report a mismatch, so it is not refused. The reverse is: a hand on
+    a side configured without one has no collision body there.
     """
     if cbf.get("mode") != "enforce" or mode != cbf.get("mirror_mode"):
         return ""
@@ -270,13 +275,24 @@ def cbf_hand_refusal(cbf: dict[str, Any], mode: str, reported: list[int]) -> str
     installed = list(cbf.get("hands_installed") or [])
     sides = []
     for side, name in enumerate(("left", "right")):
-        # The data plane accepts exactly the OmniHand type on an installed side and none elsewhere.
-        expected = vg.HAND_TYPE_NIMBLE if side < len(installed) and installed[side] else vg.HAND_TYPE_NONE
         actual = reported[side] if side < len(reported) else None
-        if actual != expected:
-            seen = "nothing" if actual is None else f"{actual} ({vg.hand_type_name(actual)})"
-            sides.append(f"{name} hand expected {expected} ({vg.hand_type_name(expected)}), platform reports {seen}")
-    detail = "; ".join(sides) or "the hand state lists a hand on a side configured without one"
+        seen = "nothing" if actual is None else f"{actual} ({vg.hand_type_name(actual)})"
+        if side < len(installed) and installed[side]:
+            # The OmniHand the geometry is built for, or an empty flange checked as a phantom hand.
+            if actual not in (vg.HAND_TYPE_NIMBLE, vg.HAND_TYPE_NONE):
+                sides.append(
+                    f"{name} hand expected {vg.HAND_TYPE_NIMBLE} ({vg.hand_type_name(vg.HAND_TYPE_NIMBLE)}) "
+                    f"or {vg.HAND_TYPE_NONE} ({vg.hand_type_name(vg.HAND_TYPE_NONE)}, an empty flange), "
+                    f"platform reports {seen}"
+                )
+        elif actual != vg.HAND_TYPE_NONE:
+            sides.append(
+                f"{name} hand expected {vg.HAND_TYPE_NONE} ({vg.hand_type_name(vg.HAND_TYPE_NONE)}), "
+                f"platform reports {seen}: cbf_safety.hands_installed has no collision body on that side"
+            )
+    detail = "; ".join(sides) or (
+        "the hand state lists a hand on a side configured without one (or the data plane predates empty-flange sides)"
+    )
     return f"CBF enforce hand mismatch: {detail}"
 
 

@@ -377,6 +377,38 @@ private:
       codes, stamp, monotonic_s());
     hand_ = message;
     hand_fresh_ = true;
+    note_phantom_transitions();
+  }
+
+  // An installed side reported as no hand is checked as a phantom hand. That is
+  // right for an empty flange but also hides a real hand that dropped out, so
+  // it is logged to be visible in the field: the start at once, the end only
+  // once the hand has been reported for kPhantomEndAfterS without a break, so
+  // a type flickering between 0 and 1 logs one episode, not every flip.
+  void note_phantom_transitions()
+  {
+    if (!cbf_) {return;}
+    static constexpr double kPhantomEndAfterS = 0.5;
+    static const std::array<const char *, 2> side_names{"left", "right"};
+    const auto phantom = phantom_hands();
+    const double now = monotonic_s();
+    for (size_t side = 0; side < phantom.size(); ++side) {
+      if (phantom[side]) {
+        present_since_[side].reset();
+        if (!phantom_logged_[side]) {
+          phantom_logged_[side] = true;
+          RCLCPP_WARN(get_logger(), "CBF_HAND_ABSENT side=%s start: installed hand reported as type 0, "
+            "checked as a phantom hand", side_names[side]);
+        }
+      } else if (phantom_logged_[side]) {
+        if (!present_since_[side]) {present_since_[side] = now;}
+        if (now - *present_since_[side] >= kPhantomEndAfterS) {
+          phantom_logged_[side] = false;
+          present_since_[side].reset();
+          RCLCPP_INFO(get_logger(), "CBF_HAND_ABSENT side=%s end", side_names[side]);
+        }
+      }
+    }
   }
 
   // What the motion-control unit is driving the arm to. A message with a
@@ -576,11 +608,6 @@ private:
     snapshot.hand_configuration_matches = cbf_hands_match();
     static const std::array<std::string, 4> all_thumb_names{
       "L_thumb_roll_joint", "L_thumb_abad_joint", "R_thumb_roll_joint", "R_thumb_abad_joint"};
-    std::vector<std::string> thumb_order;
-    thumb_order.reserve(4);
-    for (size_t axis = 0; axis < all_thumb_names.size(); ++axis) {
-      if (cbf_->config().hands_installed[axis / 2]) {thumb_order.push_back(all_thumb_names[axis]);}
-    }
     const auto state = [&](const std::vector<std::string> & order, double at) {
         auto measured = core_.measured_with_age(order, at);
         const auto view = core_.view(order, at);
@@ -592,15 +619,37 @@ private:
         return measured;
       };
     snapshot.arm = state(kVendorArmOrder, now_s);
-    snapshot.thumb = state(thumb_order, now_s);
+    snapshot.hand_reported_absent = phantom_hands();
+    {
+      // Each installed side is read on its own, so a side without readings (an
+      // empty flange, a dropout) leaves the other side's readings in use. Its
+      // entries are NaN; no readings on any installed side is no thumb at all.
+      Measured thumb;
+      bool any = false;
+      for (size_t side = 0; side < 2; ++side) {
+        if (!cbf_->config().hands_installed[side]) {continue;}
+        const auto reading = snapshot.hand_reported_absent[side] ? std::nullopt :
+          state({all_thumb_names[2 * side], all_thumb_names[2 * side + 1]}, now_s);
+        for (size_t axis = 0; axis < 2; ++axis) {
+          thumb.position.push_back(reading ? reading->position[axis] : std::numeric_limits<double>::quiet_NaN());
+        }
+        if (reading) {
+          thumb.age_s = any ? std::max(thumb.age_s, reading->age_s) : reading->age_s;
+          any = true;
+        }
+      }
+      if (any) {snapshot.thumb = std::move(thumb);}
+    }
     if (hand_) {
-      // A faulted hand's positions are not measurements; the filter substitutes them.
+      // A faulted hand's positions are not measurements; the filter substitutes
+      // that side's thumb only.
       for (const auto * hands : {&hand_->left_hands, &hand_->right_hands}) {
         for (const auto & hand : *hands) {
-          if (hand.faultcode != 0 &&
-            std::find(thumb_order.begin(), thumb_order.end(), hand.name) != thumb_order.end())
-          {
-            snapshot.thumb_faulted = true;
+          if (hand.faultcode == 0) {continue;}
+          for (size_t axis = 0; axis < all_thumb_names.size(); ++axis) {
+            if (cbf_->config().hands_installed[axis / 2] && hand.name == all_thumb_names[axis]) {
+              snapshot.thumb_faulted[axis / 2] = true;
+            }
           }
         }
       }
@@ -754,11 +803,24 @@ private:
 
   // The hands the platform reports are the ones the CBF geometry was built for.
   // The runtime reads this from the status and refuses to start mirroring otherwise.
+  // An installed side may report no hand (an empty flange, checked as a phantom
+  // hand); a hand on a side configured without one never matches.
   bool cbf_hands_match() const
   {
     const auto & installed = cbf_->config().hands_installed;
     return hand_ && cbf_->config().matches_hand_types(core_.hand_types()) &&
            (installed[0] || hand_->left_hands.empty()) && (installed[1] || hand_->right_hands.empty());
+  }
+
+  // Installed sides the platform reports as type 0, checked as phantom hands.
+  std::array<bool, 2> phantom_hands() const
+  {
+    std::array<bool, 2> phantom{};
+    const auto & types = core_.hand_types();
+    for (size_t side = 0; side < phantom.size() && side < types.size(); ++side) {
+      phantom[side] = cbf_->config().hands_installed[side] && types[side] == 0;
+    }
+    return phantom;
   }
 
   void publish(const Output & output)
@@ -844,6 +906,7 @@ private:
         {"mapping_available", cbf_->config().mapping_available},
         {"hands_installed", cbf_->config().hands_installed},
         {"hand_configuration_matches", cbf_hands_match()},
+        {"phantom_hands", phantom_hands()},
         {"check_arm_feedback_goal_range", cbf_->config().check_arm_feedback_goal_range},
         {"arm_age_s", std::isfinite(d.arm_age_s) && d.arm_age_s >= 0.0 ? nlohmann::json(d.arm_age_s) : nlohmann::json(nullptr)},
         {"thumb_age_s", std::isfinite(d.thumb_age_s) && d.thumb_age_s >= 0.0 ? nlohmann::json(d.thumb_age_s) : nlohmann::json(nullptr)},
@@ -1055,6 +1118,8 @@ private:
   rclcpp::TimerBase::SharedPtr touch_timer_;
   rclcpp::TimerBase::SharedPtr echo_timer_;
   HandStateArray::ConstSharedPtr hand_;
+  std::array<bool, 2> phantom_logged_{};
+  std::array<std::optional<double>, 2> present_since_{};
   bool hand_fresh_ = false;
   std::unique_ptr<ibrobot_msgs::msg::JointCommandState> echo_;
   std::vector<std::string> pending_rejections_;

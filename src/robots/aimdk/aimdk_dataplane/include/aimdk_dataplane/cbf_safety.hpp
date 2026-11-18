@@ -45,7 +45,10 @@ struct CbfSafetyConfig
   bool mapping_verified = false;
   bool mapping_available = false;
   bool native_limits_available = false;
-  std::array<bool, 2> hands_installed{true, true};  // Explicit hardware, never inferred from missing feedback.
+  // Hands whose collision geometry is checked. Explicit, never inferred from
+  // missing feedback. An installed side may be an empty flange (platform type 0):
+  // checked as a phantom hand. A hand on a side configured without one is a mismatch.
+  std::array<bool, 2> hands_installed{true, true};
   std::array<double, 4> native_lower{};
   std::array<double, 4> native_upper{};
   std::array<std::array<double, 2>, 4> thumb_model_limits{};
@@ -53,6 +56,15 @@ struct CbfSafetyConfig
   std::array<double, 4> command_offset{};
   std::array<double, 4> feedback_scale{1.0, 1.0, 1.0, 1.0};
   std::array<double, 4> feedback_offset{};
+  // Native command angles (L roll, L abad, R roll, R abad) of a phantom hand's
+  // thumb, used as its target, its current angle and its published command.
+  // Default: the most tucked-in pose in the command band, model roll at its
+  // upper and abad at its lower end; with the rigid model band and an identity
+  // mapping that is the value below. FK over arm poses whose palm is near the
+  // body or the other arm found it farthest from them of the band ends and
+  // the baseline. cbf_safety_json may set phantom_thumb_native: [[L roll,
+  // L abad], [R roll, R abad]] inside the command band.
+  std::array<double, 4> phantom_thumb_native{1.27409035, -1.6424, 0.69813170, -1.464235482612666};
   std::array<double, 14> lower{};
   std::array<double, 14> upper{};
   std::array<double, 14> velocity{};
@@ -75,8 +87,16 @@ struct CbfSnapshot
   bool source_ready = true;
   bool hand_configuration_matches = true;
   std::optional<Measured> arm;
-  std::optional<Measured> thumb;  // Installed sides only: L roll/abad then R roll/abad, native radians.
-  bool thumb_faulted = false;  // An installed thumb root reported a nonzero hand faultcode.
+  // Installed sides only: L roll/abad then R roll/abad, native radians. A side
+  // without readings is NaN there; the other side's readings are still used.
+  std::optional<Measured> thumb;
+  // Per side, left/right: that side's thumb roots reported a nonzero hand
+  // faultcode. Only that side is replaced by the command.
+  std::array<bool, 2> thumb_faulted{};
+  // Per side: configured as installed while the platform reports no hand (SDK
+  // type 0), i.e. an empty flange. Its geometry is still checked, as a phantom
+  // hand with its thumb at phantom_thumb_native; this is no feedback problem.
+  std::array<bool, 2> hand_reported_absent{};
   // Shared with the publishing tick. Numerical callers may omit this and use
   // the configured relative budget; wall-clock/ROS time must never be used here.
   std::optional<std::chrono::steady_clock::time_point> publication_deadline;

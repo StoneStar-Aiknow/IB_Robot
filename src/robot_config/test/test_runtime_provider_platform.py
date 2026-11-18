@@ -467,7 +467,7 @@ def test_cbf_feature_profile_enforces_with_explicit_candidate_mapping():
     assert config["cbf_safety"] == {
         "enabled": True,
         "mode": "enforce",
-        "hands_installed": [True, False],
+        "hands_installed": [True, True],
         "deadline_us": 10000,
         "deadline_guard_us": 500,
         "feedback_limit_tolerance_rad": 0.017453292519943295,
