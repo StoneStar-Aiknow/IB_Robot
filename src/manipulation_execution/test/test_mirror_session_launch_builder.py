@@ -343,6 +343,63 @@ class TestVoiceNode:
         assert len(actions) == 2  # the session node and its release handler
 
 
+class TestPresetGesture:
+    """The hand gesture part of ``preset_motions`` is an extra: a bad gesture
+    subsection, or gesture with motion output, is a WARNING and a matcher
+    without gestures; any other preset error still fails the launch."""
+
+    def config_with_preset(self, **preset):
+        config = _config()
+        config["motion_imitation_stream"] = {
+            "enabled": True,
+            "frame_topic": "/stream/pear",
+            "status_topic": "/stream/status",
+            "actor_state_topic": "/stream/actor",
+            "frame_source": {"interface": "camera.head.color_compressed", "decoder": "mock_cpu"},
+            "yolox_detect_service": "/perception/yolox",
+            "pear_parameters_service": "/perception/pear",
+        }
+        config["preset_motions"] = {"enabled": True, **preset}
+        return config
+
+    def matcher_parameters(self, config):
+        (matcher,) = [
+            node
+            for node in generate_mirror_session_nodes(config)
+            if isinstance(node, Node) and node._Node__node_executable == "preset_motion_matcher_node"
+        ]
+        return _node_parameters(matcher)
+
+    @pytest.fixture
+    def warnings(self, monkeypatch):
+        from manipulation_execution.launch_builders import mirror_session
+
+        lines = []
+        monkeypatch.setattr(mirror_session.logger, "warning", lines.append)
+        return lines
+
+    @pytest.mark.parametrize("gesture", [{"enabled": False, "window": 0.6}, {"enabled": True, "min_score": 1.5}])
+    def test_a_gesture_problem_still_launches_the_matcher_without_gestures(self, gesture, warnings):
+        # (gesture with motion_enabled: test_preset_motion_config; motion here would need certified assets)
+        parameters = self.matcher_parameters(self.config_with_preset(gesture=gesture))
+
+        assert parameters["pear_frame_topic"] == "/stream/pear"
+        assert not {k for k in parameters if k.startswith("gesture")}
+        assert len(warnings) == 1 and warnings[0].endswith("gesture off")
+
+    def test_a_good_gesture_section_reaches_the_matcher(self, warnings):
+        parameters = self.matcher_parameters(self.config_with_preset(gesture={"enabled": True, "min_frames": 5}))
+
+        assert parameters["gesture_enabled"] is True and json.loads(parameters["gesture_vote_json"]) == {
+            "min_frames": 5
+        }
+        assert warnings == []
+
+    def test_other_preset_errors_still_fail_the_launch(self, warnings):
+        with pytest.raises(ValueError, match="documented keys"):
+            generate_mirror_session_nodes(self.config_with_preset(unknown=1, gesture={"enabled": True}))
+
+
 class TestGenerateNodesValidation:
     """The builder's config checks, migrated verbatim: each failure names
     the offending key instead of starting a half-wired node."""

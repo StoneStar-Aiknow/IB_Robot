@@ -16,9 +16,8 @@ from rclpy.parameter import Parameter
 from std_msgs.msg import String
 
 from manipulation_execution import preset_motion_matcher_node as module
-from manipulation_execution.preset_motions.matcher import MatchResult
 from manipulation_execution.preset_motions.match_signal import _POSE_REASONS, TEMPLATE_NAMES, decode_match_state
-
+from manipulation_execution.preset_motions.matcher import MatchResult
 
 
 class Recorder:
@@ -52,9 +51,7 @@ def make():
     nodes = []
 
     def _make(**params):
-        node = module.PresetMotionMatcherNode(
-            parameter_overrides=[Parameter(k, value=v) for k, v in params.items()]
-        )
+        node = module.PresetMotionMatcherNode(parameter_overrides=[Parameter(k, value=v) for k, v in params.items()])
         nodes.append(node)
         clock = Clock()
         node._times = lambda: (clock.ros, clock.mono)
@@ -181,7 +178,12 @@ def test_time_exit_on_the_tick(make):
     node._tick()
     first, second = by_template(node._match_state_pub.take())["holy"]
     assert not first["active"] and first["reason"] == "pose_exited"
-    assert not second["active"] and second["reason"] == "confirming"  # old votes, no fresh run: no re-entry
+    assert not second["active"] and second["reason"] == "pose_not_matched"  # its votes left the window
+    for _ in range(3):
+        gesture(node)
+    assert not by_template(node._match_state_pub.take())["holy"][-1]["active"]  # 3 fresh runs are not 4
+    gesture(node)
+    assert by_template(node._match_state_pub.take())["holy"][-1]["active"]
 
 
 def test_other_actor_and_actor_change(make):
@@ -263,11 +265,22 @@ def test_overhead_heart_beats_the_hand_heart(make):
     assert not heart["active"] and heart["reason"] == "confirming" and heart["input_valid"]
 
 
-def test_bad_vote_parameters_fail_the_node(make):
-    with pytest.raises((TypeError, ValueError)):
-        make(gesture_enabled=True, gesture_vote_json=json.dumps({"window": 1.0}))
-    with pytest.raises(ValueError):
-        make(gesture_enabled=True, gesture_vote_json=json.dumps({"min_frames": 0}))
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"gesture_vote_json": json.dumps({"window": 1.0})},
+        {"gesture_vote_json": json.dumps({"min_frames": 0})},
+        {"gesture_vote_json": "not json"},
+        {"gesture_topic": "relative/topic"},
+    ],
+)
+def test_bad_gesture_parameters_turn_only_the_gesture_off(make, params):
+    node = make(gesture_enabled=True, **params)
+    assert node._gesture is None and node.count_subscribers("/hri/hand/gesture") == 0
+    session(node)
+    actor(node)
+    node._tick()
+    assert {m["template_name"] for m in node._match_state_pub.take()} == {"overhead_heart"}
 
 
 def test_status_has_a_gesture_section_only_when_on(make):

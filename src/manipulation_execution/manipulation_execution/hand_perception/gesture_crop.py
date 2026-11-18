@@ -14,7 +14,8 @@ order) decide whether the gesture model runs on that frame and on which square:
 - no hand: no run.
 
 A square under ``min_side_px`` is skipped (the person is too far for 320 px to
-show anything). All runs together are at most ``max_rate_hz``, by camera stamp.
+show anything); one over the image's long edge is cut to it, about the same
+centre (only a landmark glitch gets there; it bounds the copy). All runs together are at most ``max_rate_hz``, by camera stamp.
 Palm = max(|wrist -> middle MCP|, 1.25 x |index MCP -> pinky MCP|) in pixels, the
 larger hand's when there are two; it sizes the one-hand square only.
 
@@ -31,7 +32,7 @@ import numpy as np
 
 WRIST, INDEX_MCP, MIDDLE_MCP, PINKY_MCP = 0, 5, 9, 17
 PAD_VALUE = 114
-MAX_SIDE_PX = 4096  # a square this big would only be a landmark glitch; bounds the copy
+MAX_SIDE_PX = 4096  # without the image size: a square this big would only be a landmark glitch
 # Camera stamps come in 33 ms steps at 30 fps; a period of exactly two frames
 # (66.7 ms at 15 Hz) must not lose to a fraction of a millisecond of jitter.
 RATE_SLACK_NS = 5_000_000
@@ -99,8 +100,10 @@ def _square(cx: float, cy: float, side: float) -> tuple[int, int, int]:
     return int(round(cx - s / 2.0)), int(round(cy - s / 2.0)), s
 
 
-def plan_crop(lms, person_box, cfg: CropConfig) -> CropPlan:
-    """The square to run on for this frame's hands (source pixels), or why not."""
+def plan_crop(lms, person_box, cfg: CropConfig, image_hw=None) -> CropPlan:
+    """The square to run on for this frame's hands (source pixels), or why not.
+
+    ``image_hw`` (height, width): the side is at most the longer of the two."""
     hands = valid_hands(lms)[:2]
     if not hands:
         return CropPlan(False, "hands")
@@ -125,6 +128,8 @@ def plan_crop(lms, person_box, cfg: CropConfig) -> CropPlan:
     x0, y0, s = _square(float(cx), float(cy), side)
     if not math.isfinite(side) or side < cfg.min_side_px:
         return CropPlan(False, "small", mode, x0, y0, s, box_h, ratio, palm)
+    if image_hw is not None and s > max(image_hw):
+        x0, y0, s = _square(float(cx), float(cy), float(max(image_hw)))
     if s > MAX_SIDE_PX:
         return CropPlan(False, "large", mode, x0, y0, s, box_h, ratio, palm)
     return CropPlan(True, "", mode, x0, y0, s, box_h, ratio, palm)

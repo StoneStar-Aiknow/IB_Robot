@@ -40,16 +40,16 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String
 
 from ibrobot_msgs.msg import HandFrame, HandObservation, PearFrame
 
-from .hand_perception import dump, gesture_crop, gesture_runner, npu_hands
+from .hand_perception import dump, npu_hands
 from .perception_pause_follower import PausableSubscription
 
 SIDES = ("left", "right")
@@ -90,7 +90,8 @@ PARAMS = {
     "dump_dir": "",
     "dump_crops": False,
     "dump_crop_every": 2,
-    # two-hand gesture om (hand_perception/gesture_runner.py); off unless enabled AND a model path is set
+    # two-hand gesture om (hand_perception/gesture_runner.py); off unless enabled AND a model path is set.
+    # Declared untyped and checked in _gesture_runner: a wrong one turns the gesture off, never the node.
     "gesture_enabled": False,
     "gesture_model_path": "",  # the cut-head om (never *_e2e.om); relative: under $WORKSPACE
     "gesture_topic": "/hri/hand/gesture",
@@ -157,7 +158,11 @@ class Stats:
 class HandPerceptionNode(Node):
     def __init__(self, parameter_overrides=None):
         super().__init__("hand_perception", parameter_overrides=parameter_overrides)
-        p = {k: self.declare_parameter(k, v).value for k, v in PARAMS.items()}
+        untyped = ParameterDescriptor(dynamic_typing=True)
+        p = {
+            k: self.declare_parameter(k, v, untyped if k.startswith("gesture_") else ParameterDescriptor()).value
+            for k, v in PARAMS.items()
+        }
         p["calib_path"] = p["calib_path"] or str(npu_hands.extern_path(p["extern_dir"], npu_hands.CALIB_MEDIAPIPE_JSON))
         self.p = p
         self.keypoints = npu_hands.load_extern(p["extern_dir"], npu_hands.KEYPOINTS_PY)
@@ -192,7 +197,7 @@ class HandPerceptionNode(Node):
 
         self.pub = self.create_publisher(HandFrame, p["frame_topic"], FRAME_QOS)
         self._gesture = self.gesture_pub = None
-        if p["gesture_enabled"] and str(p["gesture_model_path"]).strip():
+        if p["gesture_enabled"] is not False:
             self._gesture = self._gesture_runner(p)
         self.create_subscription(PearFrame, p["pear_frame_topic"], self._on_pear, qos_profile_sensor_data)
         self.camera = PausableSubscription(
@@ -213,42 +218,60 @@ class HandPerceptionNode(Node):
         self.get_logger().info(f"{self.backend.description} ready")
 
     def _gesture_runner(self, p):
-        """The gesture runner and its publisher, or None (one INFO line) when it may not run."""
+        """The gesture runner and its publisher, or None (one INFO line, none for an empty path) when it may not run."""
         log = self.get_logger().info
-        if p["backend"] != GESTURE_BACKEND and not p["gesture_allow_mixed_backend"]:
+        try:
+            return self._try_gesture_runner(p, log)
+        except Exception as e:  # noqa: BLE001  a gesture parameter never stops the hands
+            self.gesture_pub = None
+            log(f"gesture model off: {type(e).__name__}: {e}")
+            return None
+
+    def _try_gesture_runner(self, p, log):
+        from std_msgs.msg import String
+
+        from .hand_perception import gesture_crop, gesture_runner
+
+        if p["gesture_enabled"] is not True:
+            raise ValueError(f"gesture_enabled must be a boolean, got {p['gesture_enabled']!r}")
+        path = p["gesture_model_path"]
+        if not isinstance(path, str):
+            raise ValueError(f"gesture_model_path must be a string, got {path!r}")
+        if not path.strip():
+            return None
+        if p["backend"] != GESTURE_BACKEND and p["gesture_allow_mixed_backend"] is not True:
             log(
                 f"gesture model off: hands backend is {p['backend']}, the gesture om needs {GESTURE_BACKEND}; "
                 "set gesture_allow_mixed_backend to run both"
             )
             return None
-        try:
-            crop = gesture_crop.CropConfig(
-                far_ratio=p["gesture_far_ratio"],
-                k=p["gesture_k"],
-                one_hand_palms=p["gesture_one_hand_palms"],
-                min_side_px=p["gesture_min_side_px"],
-                max_rate_hz=p["gesture_max_rate_hz"],
-                one_hand_max_rate_hz=p["gesture_one_hand_max_rate_hz"],
-            )
-            cfg = gesture_runner.RunnerConfig(
-                conf=p["gesture_conf"],
-                slow_ms=p["gesture_slow_ms"],
-                slow_limit=p["gesture_slow_limit"],
-                fail_limit=p["gesture_fail_limit"],
-                log_period_s=p["gesture_log_period_s"],
-            )
-        except (TypeError, ValueError) as e:
-            log(f"gesture model off: {e}")
-            return None
-        self.gesture_pub = self.create_publisher(String, p["gesture_topic"], GESTURE_QOS)
-        return gesture_runner.GestureRunner(
+        crop = gesture_crop.CropConfig(
+            far_ratio=p["gesture_far_ratio"],
+            k=p["gesture_k"],
+            one_hand_palms=p["gesture_one_hand_palms"],
+            min_side_px=p["gesture_min_side_px"],
+            max_rate_hz=p["gesture_max_rate_hz"],
+            one_hand_max_rate_hz=p["gesture_one_hand_max_rate_hz"],
+        )
+        cfg = gesture_runner.RunnerConfig(
+            conf=p["gesture_conf"],
+            slow_ms=p["gesture_slow_ms"],
+            slow_limit=p["gesture_slow_limit"],
+            fail_limit=p["gesture_fail_limit"],
+            log_period_s=p["gesture_log_period_s"],
+        )
+        if not isinstance(p["gesture_topic"], str):
+            raise ValueError(f"gesture_topic must be a string, got {p['gesture_topic']!r}")
+        runner = gesture_runner.GestureRunner(
             crop,
             cfg,
-            model_path=p["gesture_model_path"],
+            model_path=path,
             device=int(p["device"]),
             publish=lambda text: self.gesture_pub.publish(String(data=text)),
             log=log,
         )
+        self.gesture_pub = self.create_publisher(String, p["gesture_topic"], GESTURE_QOS)  # last: may refuse the name
+        return runner
 
     # -- callbacks (executor thread) ----------------------------------------
     def _on_pear(self, msg: PearFrame):

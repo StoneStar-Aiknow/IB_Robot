@@ -277,11 +277,34 @@ def test_mixed_backend_is_off_unless_allowed(env):
     assert len(gestures(node)) == 1
 
 
-def test_bad_gesture_parameter_is_off_not_a_crash(env):
-    node = env.make(gesture_enabled=True, gesture_model_path=env.model, gesture_k=-1.0)
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"gesture_k": -1.0},
+        {"gesture_k": "big"},
+        {"gesture_slow_limit": 3.5},
+        {"gesture_slow_ms": "fast"},
+        {"gesture_enabled": "true"},
+        {"gesture_enabled": 1},
+        {"gesture_model_path": 5},
+        {"gesture_topic": "bad topic"},
+        {"gesture_topic": 7},
+    ],
+)
+@pytest.mark.parametrize("enabled", [True, False])
+def test_bad_gesture_parameter_is_off_not_a_crash(env, params, enabled):
+    params = {"gesture_enabled": enabled, "gesture_model_path": env.model, **params}
+    node = env.make(**params)  # wrong types too: the gesture_* parameters are declared untyped
     assert node._gesture is None and node.gesture_pub is None
+    assert node.count_publishers("/hri/hand/gesture") == 0
     run_frames(node, 2)
-    assert len(node.pub.msgs) == 2
+    assert len(node.pub.msgs) == 2 and Session.instances == []
+
+
+def test_a_number_given_as_an_integer_is_fine(env):
+    node = env.make(gesture_enabled=True, gesture_model_path=env.model, gesture_slow_ms=20, gesture_k=2)
+    run_frames(node, 1)
+    assert len(gestures(node)) == 1
 
 
 def test_load_failure_turns_it_off_and_hands_go_on(env, monkeypatch):
@@ -363,13 +386,14 @@ def _find(tree, key):
 
 
 def test_deployed_yaml_has_the_gesture_off_with_node_types():
-    import yaml
     from pathlib import Path
+
+    import yaml
 
     path = Path(__file__).resolve().parents[2] / "robot_config/config/robots/aimdk_x2_voice_mirror_all.yaml"
     (params,) = list(_find(yaml.safe_load(path.read_text()), "gesture_model_path"))
     gesture = {k: v for k, v in params.items() if k.startswith("gesture_")}
     assert gesture == {k: v for k, v in module.PARAMS.items() if k.startswith("gesture_")}
-    for k, v in gesture.items():  # a ROS parameter keeps the declared type: 1 for 1.0 would be refused
+    for k, v in gesture.items():  # declared untyped, so a wrong type is only gesture off: keep them right
         assert type(v) is type(module.PARAMS[k]), k
     assert params["gesture_enabled"] is False and params["gesture_model_path"] == ""

@@ -517,6 +517,8 @@ robot:
       topic: /hri/hand/gesture
       window_s: 0.6
       min_frames: 4
+      min_frames_one_hand: 3   # one-hand runs come <= 5 Hz: 3 fit the window even with 15% jitter
       min_score: 0.5
       exit_s: 0.3
+      exit_s_one_hand: 0.5     # exit_s after a one-hand run (2.5 periods at 5 Hz)
   # /feat/x2-preset-motions

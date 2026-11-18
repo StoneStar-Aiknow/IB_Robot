@@ -77,8 +77,12 @@ class PresetMotionMatcherNode(Node):
         self._epoch = 0
         self._gesture = None
         if self.get_parameter("gesture_enabled").value is True:
-            vote = VoteConfig(**json.loads(self.get_parameter("gesture_vote_json").value))
-            self._gesture = GestureFusion(vote, actor_max_age_s=self._matcher.config.actor_max_age_s)
+            try:
+                vote = VoteConfig(**json.loads(self.get_parameter("gesture_vote_json").value))
+                self._topic("gesture_topic")
+                self._gesture = GestureFusion(vote, actor_max_age_s=self._matcher.config.actor_max_age_s)
+            except Exception as exc:  # noqa: BLE001  the gestures are an extra: overhead_heart runs without them
+                self.get_logger().warning(f"hand gestures: {type(exc).__name__}: {exc}; gesture off")
         group = MutuallyExclusiveCallbackGroup()
         self._events_pub = self.create_publisher(String, self._topic("match_topic"), 10)
         self._status_pub = self.create_publisher(String, self._topic("status_topic"), 10)
@@ -91,7 +95,13 @@ class PresetMotionMatcherNode(Node):
         )
         self.create_subscription(String, self._topic("session_state_topic"), self._state, 10, callback_group=group)
         if self._gesture is not None:
-            self.create_subscription(String, self._topic("gesture_topic"), self._gesture_msg, 10, callback_group=group)
+            try:
+                self.create_subscription(
+                    String, self._topic("gesture_topic"), self._gesture_msg, 10, callback_group=group
+                )
+            except Exception as exc:  # noqa: BLE001
+                self.get_logger().warning(f"hand gestures: {type(exc).__name__}: {exc}; gesture off")
+                self._gesture = None
         self.create_timer(0.05, self._tick, callback_group=group)
         self.create_timer(1.0, self._status, callback_group=group)
         self.get_logger().info("overhead-heart observer enabled; robot motion output remains disabled")

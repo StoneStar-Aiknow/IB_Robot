@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 from collections.abc import Mapping
 from pathlib import Path
@@ -31,7 +32,16 @@ _KEYS = {
     "gesture",
 }
 # preset_motions.gesture: the hand gesture vote (gesture_vote.VoteConfig fields besides enabled/topic)
-_GESTURE_VOTE = {"window_s", "min_frames", "min_score", "exit_s", "max_source_age_s", "future_tolerance_s"}
+_GESTURE_VOTE = {
+    "window_s",
+    "min_frames",
+    "min_frames_one_hand",
+    "min_score",
+    "exit_s",
+    "exit_s_one_hand",
+    "max_source_age_s",
+    "future_tolerance_s",
+}
 _TIMING = {
     "enter_confirm_s",
     "exit_confirm_s",
@@ -100,15 +110,37 @@ def gesture_settings(value):
     for key, number in vote.items():
         if type(number) not in (int, float) or not math.isfinite(number) or number <= 0:
             raise ValueError(f"preset_motions.gesture.{key} must be finite and positive")
-    if "min_frames" in vote and type(vote["min_frames"]) is not int:
-        raise ValueError("preset_motions.gesture.min_frames must be an integer")
+    for key in ("min_frames", "min_frames_one_hand"):
+        if key in vote and type(vote[key]) is not int:
+            raise ValueError(f"preset_motions.gesture.{key} must be an integer")
     if "min_score" in vote and vote["min_score"] > 1:
         raise ValueError("preset_motions.gesture.min_score must be at most 1")
     return enabled, topic(value.get("topic", GESTURE_TOPIC), "gesture topic"), vote
 
 
-def launch_parameters(robot_config, stream):
-    """Return observer parameters, or None for the unchanged disabled baseline."""
+def _gesture_or_off(section, warn):
+    """``gesture_settings`` of the section, or None after one ``warn`` line: a gesture problem never fails the launch."""
+    try:
+        gesture = gesture_settings(section["gesture"])
+    except Exception as exc:  # noqa: BLE001  the gestures are an extra
+        warn(f"preset_motions.gesture: {type(exc).__name__}: {exc}; gesture off")
+        return None
+    if gesture[0] and section.get("motion_enabled", False):
+        # mirror_session's preset consumer reads overhead_heart only; the gesture
+        # templates on the same topic would read to it as invalid input.
+        warn("preset_motions.gesture cannot be enabled together with motion_enabled; gesture off")
+        return None
+    return gesture
+
+
+def launch_parameters(robot_config, stream, warn=None):
+    """Return observer parameters, or None for the unchanged disabled baseline.
+
+    A bad ``gesture`` subsection, or gesture together with ``motion_enabled``,
+    only turns the gesture off (one ``warn`` line, default: this module's logger);
+    the observer then gets the parameters it gets without the subsection. Every
+    other error still raises.
+    """
     section = robot_config.get("preset_motions")
     if section is None:
         return None
@@ -121,11 +153,8 @@ def launch_parameters(robot_config, stream):
         return None
     if section.get("motion_enabled", False) and (not section.get("template_file") or not section.get("geometry_file")):
         raise ValueError("preset_motions motion output requires a validated template and geometry artifact")
-    gesture = gesture_settings(section["gesture"]) if "gesture" in section else None
-    if gesture is not None and gesture[0] and section.get("motion_enabled", False):
-        # mirror_session's preset consumer reads overhead_heart only; the gesture
-        # templates on the same topic would read to it as invalid input.
-        raise ValueError("preset_motions.gesture cannot be enabled together with motion_enabled")
+    warn = warn or logging.getLogger(__name__).warning
+    gesture = _gesture_or_off(section, warn) if "gesture" in section else None
     parameters = {
         "pear_frame_topic": topic(stream.get("frame_topic", ""), "PEAR frame topic"),
         "actor_state_topic": topic(stream.get("actor_state_topic", ""), "actor state topic"),

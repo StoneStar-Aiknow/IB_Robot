@@ -95,6 +95,18 @@ def test_absurd_square_is_skipped():
     assert not plan.run and plan.reason == "large"
 
 
+def test_square_is_cut_to_the_image_long_edge_about_its_centre():
+    garbage = [hand(5000, -3000, size=2000.0), hand(5200, -2900, size=2000.0)]  # far off the image, huge
+    plan = gc.plan_crop(garbage, (0, 0, 10, 100000), CFG, (480, 640))
+    assert plan.run and plan.side == 640
+    cx, cy = plan.x0 + plan.side / 2, plan.y0 + plan.side / 2
+    lo, hi = np.concatenate(garbage).min(axis=0), np.concatenate(garbage).max(axis=0)
+    assert (cx, cy) == pytest.approx((lo + hi) / 2, abs=1.0)
+    assert gc.extract_square(np.zeros((480, 640, 3), np.uint8), plan.x0, plan.y0, plan.side).nbytes == 640 * 640 * 3
+    fits = gc.plan_crop([hand(300, 300)], BOX, CFG, (480, 640))  # under the long edge: as without the size
+    assert fits.roi == gc.plan_crop([hand(300, 300)], BOX, CFG).roi == (220, 220, 380, 380)
+
+
 def test_thresholds_are_parameters():
     cfg = gc.CropConfig(far_ratio=0.3, k=2.0, one_hand_palms=2.0, min_side_px=100.0)
     assert gc.plan_crop([hand(200, 300), hand(600, 300)], BOX, cfg).reason == "far"

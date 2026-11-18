@@ -25,6 +25,7 @@ is ever written or logged; the log line is numbers only.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import time
@@ -122,10 +123,8 @@ class GestureRunner:
         om, self.om = self.om, None
         self.enabled = False
         if om is not None:
-            try:
+            with contextlib.suppress(Exception):
                 om.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     def _disable(self, reason: str, detail: str) -> None:
         self.disabled_reason = reason
@@ -143,10 +142,8 @@ class GestureRunner:
             self._failed(e)
             return None
         finally:
-            try:
+            with contextlib.suppress(Exception):  # a log line must not reach the hands
                 self._maybe_log()
-            except Exception:  # noqa: BLE001  a log line must not reach the hands
-                pass
 
     def _step(self, stamp_ns, actor_id, img, box, lms, busy):
         if busy:
@@ -156,7 +153,7 @@ class GestureRunner:
             self._skips["actor"] += 1
             return None
         t0 = time.perf_counter()
-        plan = gc.plan_crop(lms, box, self.crop)
+        plan = gc.plan_crop(lms, box, self.crop, img.shape[:2])
         if not plan.run:
             self._skips[plan.reason] += 1
             if plan.reason in ("far", "small"):

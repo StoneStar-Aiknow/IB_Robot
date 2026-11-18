@@ -9,10 +9,14 @@ each with the camera stamp, the PearFrame actor, the best class and its score.
 - The window is the last ``window_s`` of camera time (by ``stamp_ns``), and of
   receive time: a stream that stops ages out instead of freezing the vote.
 - A class becomes active when it has at least ``min_frames`` runs in the window
+  (or ``min_frames_one_hand`` one-hand runs, ``"crop": "one"``: those come at
+  most 5 Hz, so a 0.6 s window holds only 3 of them once there is any jitter)
   AND more than half of the window's runs.
-- An active class goes inactive when no run of it has come for ``exit_s``, by
-  receive time (the node's tick) or by camera time (newer runs of something
-  else), or on an actor change / reset.
+- An active class goes inactive when no run of it has come for ``exit_s``
+  (``exit_s_one_hand`` when its last run was a one-hand run), by receive time
+  (the node's tick) or by camera time (newer runs of something else), or on an
+  actor change / reset. Its runs then leave the window, so entering again takes
+  fresh runs (after a short dropout the old ones would re-enter it at once).
 - A camera stamp going backwards resets the vote; a repeated stamp is ignored;
   a run older than the ``barrier`` (set on a session change) or staler than
   ``max_source_age_s`` against ROS time never counts.
@@ -39,8 +43,10 @@ _CLASSES = frozenset((*GESTURES, NONE))
 class VoteConfig:
     window_s: float = 0.6
     min_frames: int = 4
+    min_frames_one_hand: int = 3  # one-hand runs (<= 5 Hz) that are enough on their own
     min_score: float = 0.5
     exit_s: float = 0.3
+    exit_s_one_hand: float = 0.5  # exit_s after a one-hand run: 2.5 periods at 5 Hz, as 0.3 s is at 15 Hz
     max_source_age_s: float = 0.8
     future_tolerance_s: float = 0.1
 
@@ -49,8 +55,9 @@ class VoteConfig:
             v = getattr(self, f.name)
             if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v) or v <= 0:
                 raise ValueError(f"gesture vote {f.name} must be a finite positive number, got {v!r}")
-        if not isinstance(self.min_frames, int):
-            raise ValueError(f"gesture vote min_frames must be an integer, got {self.min_frames!r}")
+        for name in ("min_frames", "min_frames_one_hand"):
+            if not isinstance(getattr(self, name), int):
+                raise ValueError(f"gesture vote {name} must be an integer, got {getattr(self, name)!r}")
         if self.min_score > 1:
             raise ValueError(f"gesture vote min_score must be at most 1, got {self.min_score!r}")
 
@@ -93,10 +100,10 @@ class GestureVote:
         self.actor_id: int | None = None
         self.barrier_ns = -1
         self.last_reason = ""  # why the last observe did not count, for the status line
-        self._frames: collections.deque = collections.deque()  # (stamp_ns, cls, mono_s)
+        self._frames: collections.deque = collections.deque()  # (stamp_ns, cls, mono_s, one_hand)
         self._last_stamp: int | None = None
         self._active = dict.fromkeys(GESTURES, False)
-        self._last_pos: dict[str, tuple[int, float] | None] = dict.fromkeys(GESTURES)  # (stamp_ns, mono_s)
+        self._last_pos: dict[str, tuple[int, float, bool] | None] = dict.fromkeys(GESTURES)  # (stamp, mono, one)
         self._pending_exit: set[str] = set()
 
     def reset(self, *, barrier: bool = False) -> None:
@@ -140,9 +147,10 @@ class GestureVote:
                 self.reset()
         self._last_stamp = stamp
         counted = cls if cls != NONE and score >= cfg.min_score else NONE
-        self._frames.append((stamp, counted, now_mono_s))
+        one = message.get("crop") == "one"
+        self._frames.append((stamp, counted, now_mono_s, one))
         if counted != NONE:
-            self._last_pos[counted] = (stamp, now_mono_s)
+            self._last_pos[counted] = (stamp, now_mono_s, one)
         self.last_reason = ""
         return True
 
@@ -150,7 +158,6 @@ class GestureVote:
         """The state of each gesture now (receive time = the caller's monotonic clock)."""
         cfg = self.config
         window_ns = int(cfg.window_s * 1e9)
-        exit_ns = int(cfg.exit_s * 1e9)
         frames = self._frames
         if self._last_stamp is not None:
             while frames and frames[0][0] < self._last_stamp - window_ns:
@@ -158,24 +165,30 @@ class GestureVote:
         while frames and now_mono_s - frames[0][2] > cfg.window_s:
             frames.popleft()
         runs = len(frames)
-        counts = collections.Counter(c for _, c, _ in frames)
+        counts = collections.Counter(c for _, c, _, _ in frames)
+        one_hand = collections.Counter(c for _, c, _, one in frames if one)
         out = {}
         for name in GESTURES:
             votes = counts[name]
             was = self._active[name]
             entered = exited = False
             pos = self._last_pos[name]
+            exit_s = cfg.exit_s_one_hand if pos is not None and pos[2] else cfg.exit_s
             # A run of this class within exit_s, by both clocks: keeps it active, and is needed to
             # enter (else the window's older votes would re-enter it right after a time exit).
             fresh = (
                 pos is not None
-                and now_mono_s - pos[1] <= cfg.exit_s
-                and (self._last_stamp is None or self._last_stamp - pos[0] <= exit_ns)
+                and now_mono_s - pos[1] <= exit_s
+                and (self._last_stamp is None or self._last_stamp - pos[0] <= int(exit_s * 1e9))
             )
+            enough = votes >= cfg.min_frames or one_hand[name] >= cfg.min_frames_one_hand
             if was and not fresh:
                 self._active[name] = False
                 exited = True
-            elif not was and fresh and votes >= cfg.min_frames and 2 * votes > runs:
+                # Its runs leave the window: entering again takes min_frames fresh runs.
+                self._frames = collections.deque(f for f in self._frames if f[1] != name)
+                votes, runs = 0, len(self._frames)
+            elif not was and fresh and enough and 2 * votes > runs:
                 self._active[name] = entered = True
             if name in self._pending_exit and not self._active[name]:
                 exited = True

@@ -12,9 +12,9 @@ T0 = 100_000_000_000  # camera stamp, ns (100 s)
 ROS0 = 100.0
 
 
-def msg(stamp, cls="holy", score=0.9, actor=3):
+def msg(stamp, cls="holy", score=0.9, actor=3, crop="both"):
     return {"schema": gv.SCHEMA, "stamp_ns": stamp, "actor_id": actor, "cls": cls, "score": score,
-            "crop": "both", "roi": [0, 0, 64, 64], "infer_ms": 5.0}  # fmt: skip
+            "crop": crop, "roi": [0, 0, 64, 64], "infer_ms": 5.0}  # fmt: skip
 
 
 class Feed:
@@ -28,18 +28,26 @@ class Feed:
     def mono(self, stamp=None):
         return ((self.stamp if stamp is None else stamp) - T0) / 1e9
 
-    def run(self, cls="holy", score=0.9, actor=3, step_ms=66):
+    def run(self, cls="holy", score=0.9, actor=3, step_ms=66, crop="both"):
         ok = self.vote.observe(
-            msg(self.stamp, cls, score, actor), now_ros_s=ROS0 + self.mono(), now_mono_s=self.mono()
+            msg(self.stamp, cls, score, actor, crop), now_ros_s=ROS0 + self.mono(), now_mono_s=self.mono()
         )
         state = self.vote.update(now_mono_s=self.mono())
-        self.stamp += step_ms * MS
+        self.stamp += int(step_ms * MS)
         return ok, state
+
+    def ticks(self, until_stamp):
+        """The node's 50 ms state ticks (receive time) up to just before ``until_stamp``; the states."""
+        out, t = [], self.mono(self.stamp - 1)
+        while t + 0.05 < self.mono(until_stamp):
+            t += 0.05
+            out.append(self.vote.update(now_mono_s=t))
+        return out
 
 
 def test_four_runs_in_the_window_enter():
     f = Feed()
-    for i in range(3):
+    for _ in range(3):
         _, s = f.run()
         assert not s["holy"].active and s["holy"].reason == "confirming"
     _, s = f.run()
@@ -83,7 +91,7 @@ def test_exit_after_0_3_s_without_a_run_by_tick_time():
     s = f.vote.update(now_mono_s=last + 0.31)
     assert not s["holy"].active and s["holy"].exited and s["holy"].reason == "pose_exited"
     s = f.vote.update(now_mono_s=last + 0.32)
-    assert s["holy"].reason == "confirming" and not s["holy"].exited  # older votes alone do not re-enter
+    assert s["holy"].reason == "pose_not_matched" and not s["holy"].exited  # its runs left the window
     s = f.vote.update(now_mono_s=last + 0.35)
     assert not s["holy"].active
 
@@ -186,9 +194,97 @@ def test_numbers_are_parameters():
     assert s["holy"].active
 
 
+def test_reentry_after_a_short_dropout_takes_min_frames_fresh_runs():
+    f = Feed()
+    for _ in range(8):
+        f.run(cls="heart")  # 15 Hz heart: active
+    assert f.vote.update(now_mono_s=f.mono(f.stamp - 66 * MS))["heart"].active
+    resume = f.stamp - 66 * MS + 350 * MS  # a 0.35 s gap, ticks in between
+    gap = f.ticks(resume)
+    assert [s["heart"].exited for s in gap].count(True) == 1 and not gap[-1]["heart"].active
+    f.stamp = resume
+    states = [f.run(cls="heart")[1]["heart"] for _ in range(4)]
+    # the old window's votes (the last 0.25 s before the gap) no longer count: 4 fresh runs to enter
+    assert [s.active for s in states] == [False, False, False, True]
+    assert [s.entered for s in states] == [False, False, False, True]
+    assert states[0].votes == 1 and states[0].reason == "confirming"
+
+
+def test_an_exit_only_clears_that_class():
+    f = Feed()
+    for _ in range(5):
+        f.run(cls="holy")
+    for _ in range(3):
+        f.run(cls="xsign", step_ms=110)
+    _, s = f.run(cls="xsign")  # holy last seen 330+ ms ago: exits; the xsign runs stay and now hold the majority
+    assert s["holy"].exited and s["holy"].votes == 0
+    assert s["xsign"].votes == 4 and s["xsign"].active
+
+
+def _jitter(base_ms, n, spread=0.15, seed=7):
+    import random
+
+    rng = random.Random(seed)
+    return [base_ms * (1 + rng.uniform(-spread, spread)) for _ in range(n)]
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_two_hands_at_15_hz_with_jitter_enter_within_the_window(seed):
+    f = Feed()
+    t0 = f.stamp
+    for step in _jitter(66.7, 20, seed=seed):
+        stamp = f.stamp
+        _, s = f.run(cls="heart", step_ms=step)
+        if s["heart"].entered:
+            break
+    assert s["heart"].entered and stamp - t0 <= 0.6e9
+
+
+@pytest.mark.parametrize("seed", range(5))
+@pytest.mark.parametrize("spread", [0.10, 0.15])
+def test_one_hand_at_5_hz_with_jitter_enters_and_holds(seed, spread):
+    f = Feed()
+    t0, entered_at, held = f.stamp, None, []
+    for step in _jitter(200.0, 15, spread=spread, seed=seed):  # 3 s of one-hand heart runs
+        stamp = f.stamp
+        _, s = f.run(cls="heart", step_ms=step, crop="one")
+        if entered_at is None and s["heart"].entered:
+            entered_at = stamp
+        ticks = f.ticks(f.stamp)
+        if entered_at is not None:
+            held += [s["heart"].active] + [t["heart"].active for t in ticks]
+    assert entered_at is not None and entered_at - t0 <= 0.6e9  # the 3rd run
+    assert all(held)  # no exit between one-hand runs 170-230 ms apart
+
+
+def test_one_hand_runs_exit_after_exit_s_one_hand():
+    f = Feed()
+    for _ in range(4):
+        f.run(cls="heart", step_ms=200, crop="one")
+    last = f.mono(f.stamp - 200 * MS)
+    assert f.vote.update(now_mono_s=last + 0.45)["heart"].active  # past exit_s 0.3, within 0.5
+    assert not f.vote.update(now_mono_s=last + 0.51)["heart"].active
+
+
+def test_one_hand_entry_needs_its_own_count():
+    f = Feed(gv.GestureVote(gv.VoteConfig(min_frames_one_hand=4)))
+    for _ in range(6):
+        _, s = f.run(cls="heart", step_ms=230, crop="one")  # 3 runs fit the 0.6 s window
+        assert not s["heart"].active
+    f = Feed()
+    for _ in range(2):
+        f.run(cls="heart", crop="one")
+    _, s = f.run(cls="heart")  # 2 one-hand + 1 two-hand: neither count is reached
+    assert not s["heart"].active
+    _, s = f.run(cls="heart")  # 4 runs in all
+    assert s["heart"].active
+
+
 @pytest.mark.parametrize(
-    "kw", [dict(window_s=0), dict(min_frames=2.5), dict(min_score=1.5), dict(exit_s=float("nan")), dict(exit_s=True)]
-)
+    "kw",
+    [dict(window_s=0), dict(min_frames=2.5), dict(min_frames_one_hand=3.0), dict(min_score=1.5),
+     dict(exit_s=float("nan")), dict(exit_s=True), dict(exit_s_one_hand=0)],
+)  # fmt: skip
 def test_vote_config_is_checked(kw):
     with pytest.raises(ValueError):
         gv.VoteConfig(**kw)

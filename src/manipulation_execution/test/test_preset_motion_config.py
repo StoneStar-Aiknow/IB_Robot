@@ -159,28 +159,67 @@ def test_gesture_vote_json_builds_the_vote_config():
     assert VoteConfig(**vote) == VoteConfig(min_score=0.6, max_source_age_s=0.5)
 
 
-@pytest.mark.parametrize(
-    "gesture",
-    [
-        True,
-        {"enabled": "yes"},
-        {"window": 0.6},
-        {"window_s": 0},
-        {"window_s": float("inf")},
-        {"exit_s": True},
-        {"min_frames": 2.5},
-        {"min_score": 1.5},
-        {"topic": ""},
-        {"topic": 5},
-    ],
-)
-def test_bad_gesture_section_is_rejected(gesture):
-    with pytest.raises(ValueError):
-        launch_parameters({"preset_motions": {"enabled": True, "gesture": gesture}}, STREAM)
+BAD_GESTURE = [
+    True,
+    {"enabled": "yes"},
+    {"window": 0.6},
+    {"window_s": 0},
+    {"window_s": float("inf")},
+    {"exit_s": True},
+    {"min_frames": 2.5},
+    {"min_frames_one_hand": 2.5},
+    {"min_score": 1.5},
+    {"topic": ""},
+    {"topic": 5},
+]
 
 
-def test_gesture_cannot_run_with_motion_output():
+@pytest.mark.parametrize("gesture", BAD_GESTURE)
+@pytest.mark.parametrize("enabled", [True, False])
+def test_bad_gesture_section_warns_and_turns_only_the_gesture_off(gesture, enabled):
+    if isinstance(gesture, dict) and "enabled" not in gesture:
+        gesture = {**gesture, "enabled": enabled}
+    warnings = []
+    result = launch_parameters({"preset_motions": {"enabled": True, "gesture": gesture}}, STREAM, warnings.append)
+    assert result == launch_parameters({"preset_motions": {"enabled": True}}, STREAM)  # as without the section
+    assert len(warnings) == 1 and warnings[0].startswith("preset_motions.gesture") and "gesture off" in warnings[0]
+
+
+def test_gesture_warning_goes_to_the_module_logger_by_default(monkeypatch):
+    import logging
+
+    lines = []
+    monkeypatch.setattr(logging.getLogger(launch_parameters.__module__), "warning", lines.append)
+    launch_parameters({"preset_motions": {"enabled": True, "gesture": {"window": 0.6}}}, STREAM)
+    assert len(lines) == 1 and "gesture off" in lines[0]
+
+
+def test_gesture_with_motion_output_warns_and_turns_only_the_gesture_off():
     section = {"enabled": True, "motion_enabled": True, "template_file": "t", "geometry_file": "g",
                "gesture": {"enabled": True}}  # fmt: skip
-    with pytest.raises(ValueError, match="gesture"):
-        launch_parameters({"preset_motions": section}, STREAM)
+    warnings = []
+    result = launch_parameters({"preset_motions": section}, STREAM, warnings.append)
+    assert not {k for k in result if k.startswith("gesture")}
+    assert len(warnings) == 1 and "motion_enabled" in warnings[0] and "gesture off" in warnings[0]
+    assert section["motion_enabled"] is True  # never touched
+    off = {**section, "gesture": {"enabled": False}}
+    assert launch_parameters({"preset_motions": off}, STREAM, warnings.append)["gesture_enabled"] is False
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"enabled": True, "unknown": 1},
+        {"enabled": "true"},
+        {"enabled": True, "motion_enabled": "no"},
+        {"enabled": True, "motion_enabled": True},
+        {"enabled": True, "matcher": {"unknown": 1}},
+        {"enabled": True, "match_topic": "relative"},
+    ],
+)
+@pytest.mark.parametrize("gesture", [{"enabled": True}, {"window": 0.6}])
+def test_errors_outside_the_gesture_section_still_raise(section, gesture):
+    warnings = []
+    with pytest.raises(ValueError):
+        launch_parameters({"preset_motions": {**section, "gesture": gesture}}, STREAM, warnings.append)
