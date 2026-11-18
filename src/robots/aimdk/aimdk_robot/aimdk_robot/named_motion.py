@@ -321,12 +321,14 @@ class NamedMotionServer:
         start = self._node.measured_arm_positions()
         if start is None:
             return self._fail_trajectory(goal_handle, result, "no fresh arm measurement to start the motion from")
+        # Start from what the platform is driving: see arm_takeover_start.
+        origin = self._node.arm_takeover_start(start)
         goal = goal_handle.request.trajectory
         times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in goal.points]
         try:
             plan = traj.planned_trajectory(
                 "trajectory",
-                start,
+                origin,
                 list(goal.joint_names),
                 times,
                 [list(p.positions) for p in goal.points],
@@ -349,7 +351,16 @@ class NamedMotionServer:
 
         try:
             ok, _code, message = self._run_trajectory(
-                "trajectory", mode, "", "", goal_handle, generation, epoch, recorded=plan, on_progress=on_progress
+                "trajectory",
+                mode,
+                "",
+                "",
+                goal_handle,
+                generation,
+                epoch,
+                recorded=plan,
+                origin=origin,
+                on_progress=on_progress,
             )
         except _Superseded as superseded:
             return self._fail_trajectory(goal_handle, result, superseded.message)
@@ -640,6 +651,7 @@ class NamedMotionServer:
         epoch: int,
         *,
         recorded: traj.ArmTrajectory | None = None,
+        origin: list[float] | None = None,
         on_progress=None,
     ) -> tuple[bool, int, str]:
         """Replay a trajectory on the arm channel, easing in from the measured pose.
@@ -695,7 +707,9 @@ class NamedMotionServer:
         if goal_handle.is_cancel_requested:
             raise self._cancel_replay(name, mode, recorded, offset, epoch)
         first = recorded.sample(offset)
-        ease = traj.blend_duration(start, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
+        # Where the command eases from: the measured pose unless the caller knows the platform's target.
+        ease_from = start if origin is None else origin
+        ease = traj.blend_duration(ease_from, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
         total = ease + recorded.duration - offset
         period = 1.0 / self._rate_hz
         self._take_over(name, generation)
@@ -726,7 +740,7 @@ class NamedMotionServer:
                     # target sent one tracking lag ago is the one being realized.
                     self._node.command_arm(sent[0][1] if sent else start, owner=generation, epoch=epoch)
                     raise self._cancel_replay(name, mode, recorded, reached, epoch)
-                point = traj.blend(start, first, t / ease) if t < ease else recorded.sample(reached)
+                point = traj.blend(ease_from, first, t / ease) if t < ease else recorded.sample(reached)
                 sent.append((t, point))
                 while len(sent) > 1 and sent[1][0] <= t - self._hold_lag_s:
                     sent.popleft()
