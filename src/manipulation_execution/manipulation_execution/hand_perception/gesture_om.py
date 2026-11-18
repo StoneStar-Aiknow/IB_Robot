@@ -110,6 +110,9 @@ class GestureOm:
         if not self.path.is_file():
             raise FileNotFoundError(f"gesture model {self.path} missing")
         self.session = _open_session(int(device), str(self.path))
+        # The first run sets the NPU up and can take far longer than the watchdog allows; do it here,
+        # while loading (not watched), so it never turns the gesture off. A failure fails the load.
+        self.infer(np.zeros((1, 3, INPUT_SIZE, INPUT_SIZE), np.float32))
 
     def infer(self, x: np.ndarray) -> np.ndarray:
         out = self.session.infer([x], mode="static")

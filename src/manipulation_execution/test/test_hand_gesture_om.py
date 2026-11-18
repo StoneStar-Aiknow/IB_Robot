@@ -105,9 +105,10 @@ def test_om_session_on_ais_bench_static(fake_ais_bench, tmp_path):
     path.write_bytes(b"om")
     om = go.GestureOm(path, device=1)
     assert om.session.device == 1 and om.session.path == str(path)
+    assert len(om.session.fed) == 1  # the warm-up run, while loading (not under the watchdog)
     x = np.zeros((1, 3, 320, 320), np.float32)
     assert om.infer(x).shape == go.OUTPUT_SHAPE
-    assert om.session.fed[0][1] == "static"
+    assert [mode for _, mode in om.session.fed] == ["static", "static"]
     session = om.session
     om.close()
     om.close()
@@ -142,3 +143,11 @@ def test_wrong_shape_or_nan_output_raises(fake_ais_bench, tmp_path, monkeypatch,
     monkeypatch.setattr(_Session, "out", out)
     with pytest.raises(go.BadOutput):
         go.GestureOm(path).infer(np.zeros((1, 3, 320, 320), np.float32))
+
+
+def test_a_failing_warm_up_run_fails_the_load(fake_ais_bench, tmp_path, monkeypatch):
+    path = tmp_path / "g.om"
+    path.write_bytes(b"om")
+    monkeypatch.setattr(_Session, "raises", RuntimeError("acl"))
+    with pytest.raises(RuntimeError):
+        go.GestureOm(path)

@@ -82,11 +82,14 @@ class Session:
     def __init__(self, device, path):
         if Session.open_error:
             raise Session.open_error
-        self.device, self.path, self.calls, self.freed = device, path, 0, False
+        self.device, self.path, self.calls, self.freed, self.warmed = device, path, 0, False, False
         self.thread = threading.current_thread().name
         Session.instances.append(self)
 
     def infer(self, feeds, mode=None):
+        if not self.warmed:  # GestureOm's warm-up run while loading: not one of the runs the tests count
+            self.warmed = True
+            return [np.zeros(gesture_om.OUTPUT_SHAPE, np.float32)]
         self.calls += 1
         if Session.delay_s:
             time.sleep(Session.delay_s)
