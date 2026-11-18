@@ -38,6 +38,7 @@ moved the arm since; otherwise it plays from the start and says why.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import uuid
@@ -111,6 +112,23 @@ class _Checkpoint:
     stamp: float
 
 
+def _unsupported_trajectory_request(request) -> str:
+    """Why a FollowJointTrajectory goal asks for what this runtime does not do, or "".
+
+    Refused rather than ignored: a scheduled start, a path tolerance or a
+    velocity/acceleration goal tolerance would each be a promise the replay
+    does not keep. Position goal tolerances and goal_time_tolerance are kept.
+    """
+    stamp = request.trajectory.header.stamp
+    if stamp.sec or stamp.nanosec:
+        return "trajectory.header.stamp must be zero: a scheduled start is not supported"
+    if any(t.position > 0.0 or t.velocity > 0.0 or t.acceleration > 0.0 for t in request.path_tolerance):
+        return "path_tolerance is not supported: the arm trails its command by the platform's tracking lag"
+    if any(t.velocity > 0.0 or t.acceleration > 0.0 for t in request.goal_tolerance):
+        return "goal_tolerance supports positions only, not velocities or accelerations"
+    return ""
+
+
 class NamedMotionServer:
     """Serve ExecuteNamedMotion from the profile's motion tables."""
 
@@ -151,6 +169,16 @@ class NamedMotionServer:
         # target sent this long ago: the target the arm is realizing now,
         # including the error the platform needs to hold it against gravity.
         self._hold_lag_s = float(config.get("trajectory_hold_lag_s", 0.05))
+        # joint.trajectory success: when the goal sets no tolerance, each goal joint must end
+        # within the larger of these of its final target (trajectory.goal_tolerances), within
+        # trajectory_goal_settle_s unless the goal's goal_time_tolerance says otherwise. Coarse
+        # on purpose: it catches a joint that stopped short, not a pose held against gravity.
+        self._goal_tolerance_rad = float(config.get("trajectory_goal_tolerance_rad", 0.2))
+        self._goal_tolerance_ratio = float(config.get("trajectory_goal_tolerance_ratio", 0.5))
+        self._goal_settle_s = float(config.get("trajectory_goal_settle_s", 2.0))
+        # ... and each goal joint commanded at least this far must itself have followed
+        # (trajectory_follow_min_ratio of its travel): a stuck-joint check, not a precision one.
+        self._follow_joint_min_rad = float(config.get("trajectory_follow_joint_min_rad", 0.1))
         self._rate_hz = float((vendor.get("command") or {}).get("rate_hz", 50.0))
         profile_dir = Path(str(node.get_parameter("profile").value)).parent
         max_speed = float(config.get("trajectory_max_speed_radps", 3.0))
@@ -323,12 +351,16 @@ class NamedMotionServer:
             return self._fail_trajectory(
                 goal_handle, result, f"mode {mode!r} does not replay trajectories; use {self._planned_trajectory_modes}"
             )
+        request = goal_handle.request
+        refusal = _unsupported_trajectory_request(request)
+        if refusal:
+            return self._fail_trajectory(goal_handle, result, refusal)
         start = self._node.measured_arm_positions()
         if start is None:
             return self._fail_trajectory(goal_handle, result, "no fresh arm measurement to start the motion from")
         # Start from what the platform is driving: see arm_takeover_start.
         origin = self._node.arm_takeover_start(start)
-        goal = goal_handle.request.trajectory
+        goal = request.trajectory
         times = [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in goal.points]
         try:
             plan = traj.planned_trajectory(
@@ -340,9 +372,21 @@ class NamedMotionServer:
                 limits=self._arm_limits,
                 max_speed_radps=self._max_speed,
                 rate_hz=self._rate_hz,
+                measured=start,
+            )
+            final = plan.positions[-1]
+            tolerances = traj.goal_tolerances(
+                list(goal.joint_names),
+                {str(t.name): float(t.position) for t in request.goal_tolerance},
+                origin,
+                final,
+                default_rad=self._goal_tolerance_rad,
+                default_ratio=self._goal_tolerance_ratio,
             )
         except traj.TrajectoryError as exc:
             return self._fail_trajectory(goal_handle, result, str(exc))
+        settle = request.goal_time_tolerance.sec + request.goal_time_tolerance.nanosec * 1e-9
+        settle_s = settle if settle > 0.0 else self._goal_settle_s
         with self._lock:
             self._generation += 1
             generation = self._generation
@@ -354,6 +398,7 @@ class NamedMotionServer:
             feedback.desired.positions = [float(v) for v in point]
             goal_handle.publish_feedback(feedback)
 
+        arrival = {"tolerances": tolerances, "settle_s": settle_s}
         try:
             ok, _code, message = self._run_trajectory(
                 "trajectory",
@@ -366,6 +411,7 @@ class NamedMotionServer:
                 recorded=plan,
                 origin=origin,
                 on_progress=on_progress,
+                arrival=arrival,
             )
         except _Superseded as superseded:
             return self._fail_trajectory(goal_handle, result, superseded.message)
@@ -381,6 +427,14 @@ class NamedMotionServer:
         if not ok:
             result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
             result.error_string = message
+            goal_handle.abort()
+            return result
+        errors = arrival["errors"]
+        report = ", ".join(f"{joint} {error:.3f} (allowed {tolerances[joint]:.3f})" for joint, error in errors.items())
+        message = f"{message}; final error: {report or 'not checked'}"
+        if not arrival["arrived"]:
+            result.error_code = FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED
+            result.error_string = f"not at the final target within {settle_s:.1f}s; {message}"
             goal_handle.abort()
             return result
         goal_handle.succeed()
@@ -658,11 +712,15 @@ class NamedMotionServer:
         recorded: traj.ArmTrajectory | None = None,
         origin: list[float] | None = None,
         on_progress=None,
+        arrival: dict | None = None,
     ) -> tuple[bool, int, str]:
         """Replay a trajectory on the arm channel, easing in from the measured pose.
 
         ``recorded`` defaults to the profile's recording for ``name``; a
-        ``joint.trajectory`` goal passes its own validated plan instead.
+        ``joint.trajectory`` goal passes its own validated plan instead, and
+        ``arrival`` (``tolerances`` and ``settle_s``): the arm is kept until
+        those joints settle at the final target, and ``arrived`` and ``errors``
+        are filled in.
         """
         planned = recorded is not None
         recorded = recorded or self._trajectories.get(name)
@@ -714,7 +772,11 @@ class NamedMotionServer:
         first = recorded.sample(offset)
         # Where the command eases from: the measured pose unless the caller knows the platform's target.
         ease_from = start if origin is None else origin
-        ease = traj.blend_duration(ease_from, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
+        if planned and max(abs(a - b) for a, b in zip(ease_from, first, strict=True)) == 0.0:
+            # A planned trajectory starts where the command does: nothing to ease.
+            ease = 0.0
+        else:
+            ease = traj.blend_duration(ease_from, first, speed_radps=self._blend_speed, minimum_s=self._blend_min_s)
         total = ease + recorded.duration - offset
         period = 1.0 / self._rate_hz
         self._take_over(name, generation)
@@ -738,12 +800,7 @@ class NamedMotionServer:
                     raise _Superseded(ExecuteNamedMotion.Result.CANCELLED, f"runtime left {mode!r} during {name}")
                 reached = offset + max(0.0, t - ease)
                 if goal_handle.is_cancel_requested:
-                    # Hold where the arm is. Not at the last target: the arm
-                    # trails it and would carry on. Not by commanding the
-                    # measured pose either: the platform holds a pose only with
-                    # an error against gravity, so the arm would sag by it. The
-                    # target sent one tracking lag ago is the one being realized.
-                    self._node.command_arm(sent[0][1] if sent else start, owner=generation, epoch=epoch)
+                    self._hold_on_cancel(sent, ease_from, generation, epoch, period)
                     raise self._cancel_replay(name, mode, recorded, reached, epoch)
                 point = traj.blend(ease_from, first, t / ease) if t < ease else recorded.sample(reached)
                 sent.append((t, point))
@@ -757,43 +814,129 @@ class NamedMotionServer:
                         f"runtime stopped admitting arm commands during {name}",
                     )
                 measured = self._node.measured_arm_positions() or start
-                for k, (origin, target, actual) in enumerate(zip(start, point, measured, strict=True)):
-                    commanded_peak[k] = max(commanded_peak[k], abs(target - origin))
-                    measured_peak[k] = max(measured_peak[k], abs(actual - origin))
+                # Commanded travel from where the command started, measured
+                # travel from where the arm was: under load the two differ by
+                # the sag, which neither the command nor the arm travels.
+                for k, (eased, measured_start, target, actual) in enumerate(
+                    zip(ease_from, start, point, measured, strict=True)
+                ):
+                    commanded_peak[k] = max(commanded_peak[k], abs(target - eased))
+                    measured_peak[k] = max(measured_peak[k], abs(actual - measured_start))
                 if t >= total:
                     break
                 if tick % int(self._rate_hz) == 0:
                     on_progress(min(reached / recorded.duration, 1.0), point)
                 tick += 1
                 time.sleep(max(0.0, started + tick * period - time.monotonic()))
-            self._confirm_final_target(point, generation, epoch, period)
+            plan_ended = time.monotonic()
+            confirmed = self._confirm_final_target(
+                point,
+                generation,
+                epoch,
+                period,
+                cancelled=lambda: goal_handle.is_cancel_requested,
+                deadline=None if arrival is None else plan_ended + arrival["settle_s"],
+            )
+            if confirmed is None:  # cancelled while the final target was being confirmed
+                self._hold_on_cancel(sent, ease_from, generation, epoch, period)
+                raise self._cancel_replay(name, mode, recorded, reached, epoch)
+            if arrival is not None:
+                # Settle with the arm still owned: released, the public arm
+                # stream could override the final target, and a cancel could
+                # not hold. The confirmation above spends the same budget.
+                deadline = plan_ended + arrival["settle_s"]
+                final = point
+                while True:
+                    measured = self._node.measured_arm_positions()
+                    if measured is not None:
+                        for k, (measured_start, actual) in enumerate(zip(start, measured, strict=True)):
+                            measured_peak[k] = max(measured_peak[k], abs(actual - measured_start))
+                        arrival["errors"] = {
+                            joint: abs(measured[k] - final[k])
+                            for joint in arrival["tolerances"]
+                            for k in (projection.VENDOR_ARM_ORDER.index(joint),)
+                        }
+                    errors = arrival.setdefault("errors", {})
+                    arrival["arrived"] = measured is not None and all(
+                        errors[joint] <= tolerance for joint, tolerance in arrival["tolerances"].items()
+                    )
+                    if arrival["arrived"] or time.monotonic() >= deadline:
+                        break
+                    if goal_handle.is_cancel_requested:
+                        self._hold_on_cancel(sent, ease_from, generation, epoch, period)
+                        raise self._cancel_replay(name, mode, recorded, reached, epoch)
+                    self._still_current(generation, epoch)
+                    if self._node.current_mode() != mode:
+                        raise _Superseded(ExecuteNamedMotion.Result.CANCELLED, f"runtime left {mode!r} during {name}")
+                    self._node.command_arm(final, owner=generation, epoch=epoch)
+                    time.sleep(period)
         finally:
             self._node.release_arm(generation)
-        joint = max(range(len(start)), key=commanded_peak.__getitem__)
-        if (
-            commanded_peak[joint] >= FOLLOW_CHECK_MIN_RAD
-            and measured_peak[joint] < self._follow_min_ratio * commanded_peak[joint]
-        ):
-            return (
-                False,
-                ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
-                f"platform did not follow {name}: {projection.VENDOR_ARM_ORDER[joint]} was commanded "
-                f"{commanded_peak[joint]:.2f} rad and moved {measured_peak[joint]:.2f} rad",
-            )
-        return True, ExecuteNamedMotion.Result.NONE, f"replayed {name} in {mode} ({total:.1f}s){resume_note}"
+        # The platform must have followed: the most-moving joint, and for a
+        # planned goal also every checked joint commanded far enough to tell a
+        # stuck joint from noise. Measured travel is from where the arm was, so
+        # a pose held against gravity (a steady offset) does not count against it.
+        joints = [max(range(len(start)), key=commanded_peak.__getitem__)]
+        if arrival is not None:
+            joints += [
+                projection.VENDOR_ARM_ORDER.index(name_)
+                for name_ in arrival["tolerances"]
+                if commanded_peak[projection.VENDOR_ARM_ORDER.index(name_)] >= self._follow_joint_min_rad
+            ]
+        for joint in joints:
+            if (
+                commanded_peak[joint] >= FOLLOW_CHECK_MIN_RAD
+                and measured_peak[joint] < self._follow_min_ratio * commanded_peak[joint]
+            ):
+                return (
+                    False,
+                    ExecuteNamedMotion.Result.REJECTED_BY_PLATFORM,
+                    f"platform did not follow {name}: {projection.VENDOR_ARM_ORDER[joint]} was commanded "
+                    f"{commanded_peak[joint]:.2f} rad and moved {measured_peak[joint]:.2f} rad",
+                )
+        # Without an echo there is nothing to confirm with; with one, say so when it never came.
+        echoed = getattr(self._node, "has_arm_command_echo", False)
+        unconfirmed = "" if confirmed or not echoed else "; the platform did not confirm the final target"
+        return (
+            True,
+            ExecuteNamedMotion.Result.NONE,
+            f"replayed {name} in {mode} ({total:.1f}s){resume_note}{unconfirmed}",
+        )
 
-    def _confirm_final_target(self, point: list[float], generation: int, epoch: int, period: float) -> bool:
+    def _hold_on_cancel(self, sent, ease_from, generation: int, epoch: int, period: float) -> None:
+        """Hold where the arm is, and make sure the hold arrives before the release.
+
+        Not at the last target: the arm trails it and would carry on. Not by
+        commanding the measured pose either: the platform holds a pose only
+        with an error against gravity, so the arm would sag by it. The target
+        sent one tracking lag ago is the one being realized; before the first
+        tick, the target the command starts from. A stop or a later goal that
+        owns the arm by now needs no hold.
+        """
+        hold = sent[0][1] if sent else ease_from
+        self._node.command_arm(hold, owner=generation, epoch=epoch)
+        with contextlib.suppress(_Superseded):
+            self._confirm_final_target(hold, generation, epoch, period)
+
+    def _confirm_final_target(
+        self, point: list[float], generation: int, epoch: int, period: float, *, cancelled=None, deadline=None
+    ) -> bool | None:
         """Keep sending the final target until the data plane echoes it, then let the arm go.
 
         The data plane takes an arm target only while this motion owns the arm,
         and the release travels on another topic: released first, the final
         target would be dropped and the platform would hold the one before it.
         Waits at most ``FINAL_TARGET_CONFIRM_S``; a profile without the echo
-        gets the target once more. True when the echo confirmed it.
+        gets the target once more. True when the echo confirmed it; None as
+        soon as ``cancelled()`` says the goal was cancelled meanwhile. An
+        earlier ``deadline`` (a goal's arrival budget) shortens the wait.
         """
         echoed = getattr(self._node, "has_arm_command_echo", False)
-        deadline = time.monotonic() + FINAL_TARGET_CONFIRM_S
+        limit = time.monotonic() + FINAL_TARGET_CONFIRM_S
+        deadline = limit if deadline is None else min(limit, deadline)
         while True:
+            if cancelled is not None and cancelled():
+                return None
             echo = self._node.commanded_arm() if echoed else None
             if (
                 echo is not None

@@ -3055,7 +3055,7 @@ def test_the_views_keep_their_rate_under_a_burst_of_platform_state():
 _TRAJECTORY_ACTION = "/arm_trajectory_controller/follow_joint_trajectory"
 
 
-def _trajectory_goal(harness, joints, positions, seconds: float):
+def _trajectory_goal(harness, joints, positions, seconds: float, configure=None):
     from control_msgs.action import FollowJointTrajectory
     from rclpy.action import ActionClient
     from trajectory_msgs.msg import JointTrajectoryPoint
@@ -3063,6 +3063,8 @@ def _trajectory_goal(harness, joints, positions, seconds: float):
     client = ActionClient(harness.node, FollowJointTrajectory, _TRAJECTORY_ACTION)
     assert client.wait_for_server(timeout_sec=TIMEOUT_S)
     goal = FollowJointTrajectory.Goal()
+    if configure is not None:
+        configure(goal)
     goal.trajectory.joint_names = list(joints)
     point = JointTrajectoryPoint()
     point.positions = [float(p) for p in positions]
@@ -3224,6 +3226,255 @@ def test_a_planned_motion_takes_over_from_the_platforms_target(tmp_path):
         harness.shutdown()
 
 
+def test_a_planned_motion_under_load_sag_is_judged_on_the_joints_it_moves(tmp_path):
+    """Under load the shoulder settles 0.15 rad below the target the command starts from.
+
+    The follow check used to count that sag as commanded travel the arm never made, so a
+    goal moving only the elbow was refused as "platform did not follow" the shoulder.
+    """
+    from control_msgs.action import FollowJointTrajectory
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        measured = harness.runtime.measured_arm_positions
+
+        def sagging():
+            positions = measured()
+            if positions is not None:
+                positions = list(positions)
+                positions[_RIGHT_PITCH] -= 0.15
+            return positions
+
+        harness.runtime.measured_arm_positions = sagging
+        harness.runtime.arm_takeover_start = lambda start: [
+            v + 0.15 if k == _RIGHT_PITCH else v for k, v in enumerate(start)
+        ]
+        handle = _trajectory_goal(harness, ["right_elbow_joint"], [-0.1], 1.0)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle)
+        assert result.result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, result.result.error_string
+        # Starting where the command already is, the plan has nothing to ease in: 1.0 s, not 1.5 s.
+        assert "(1.0s)" in result.result.error_string
+    finally:
+        harness.shutdown()
+
+
+def test_a_cancel_before_the_first_tick_holds_the_platforms_target(tmp_path):
+    """A cancel that arrives while the arm is being claimed must not command the sagged measured pose."""
+    import threading
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        origin = [0.12] * len(projection.VENDOR_ARM_ORDER)  # the mock arm itself is at zero
+        harness.runtime.arm_takeover_start = lambda measured: list(origin)
+        claim, claiming, resume = harness.runtime.claim_arm, threading.Event(), threading.Event()
+
+        def slow_claim(owner):
+            claiming.set()
+            resume.wait(TIMEOUT_S)
+            return claim(owner)
+
+        harness.runtime.claim_arm = slow_claim
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.5], 1.0)
+        assert handle.accepted
+        harness.wait_for(claiming.is_set, "the motion to claim the arm")
+        cancel = handle.cancel_goal_async()
+        harness.wait_for(cancel.done, "the cancel response")
+        resume.set()
+        _trajectory_result(harness, handle)
+        harness.wait_for(
+            lambda: (
+                harness.mock.last_upper_body is not None
+                and harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(0.12, abs=1e-6)
+            ),
+            "the hold at the platform's target on the vendor wire",
+        )
+    finally:
+        harness.shutdown()
+
+
+@pytest.mark.parametrize("exempt", [False, True])
+def test_a_joint_that_stops_short_fails_the_goal_unless_the_caller_exempts_it(tmp_path, exempt):
+    """The replay's own check passes at 0.3 of the travel; the goal must still not report arrival."""
+    from control_msgs.action import FollowJointTrajectory
+    from control_msgs.msg import JointTolerance
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        measured = harness.runtime.measured_arm_positions
+
+        def stuck():  # the shoulder stops at -0.31 of a commanded -1.0
+            positions = measured()
+            if positions is not None:
+                positions = list(positions)
+                positions[_RIGHT_PITCH] = max(positions[_RIGHT_PITCH], -0.31)
+            return positions
+
+        harness.runtime.measured_arm_positions = stuck
+
+        def configure(goal):
+            goal.goal_time_tolerance.nanosec = 300_000_000
+            if exempt:
+                goal.goal_tolerance = [JointTolerance(name="right_shoulder_pitch_joint", position=-1.0)]
+
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-1.0], 1.0, configure)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle).result
+        if exempt:
+            assert result.error_code == FollowJointTrajectory.Result.SUCCESSFUL, result.error_string
+            assert "final error: not checked" in result.error_string
+        else:
+            assert result.error_code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED, result.error_string
+            assert "right_shoulder_pitch_joint 0.690 (allowed 0.500)" in result.error_string
+    finally:
+        harness.shutdown()
+
+
+def _clamped_measurement(harness, clamp):
+    """Make the runtime measure the arm through ``clamp(positions) -> positions``."""
+    measured = harness.runtime.measured_arm_positions
+
+    def through():
+        positions = measured()
+        return None if positions is None else clamp(list(positions))
+
+    harness.runtime.measured_arm_positions = through
+
+
+def test_a_participating_joint_that_never_moved_fails_a_default_goal(tmp_path):
+    """Review: 0.25 + 0.15 rad asked, 0.10 + 0 moved; both end 0.15 rad off, under the coarse floor."""
+    from control_msgs.action import FollowJointTrajectory
+
+    elbow = projection.VENDOR_ARM_ORDER.index("right_elbow_joint")
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+
+        def stuck(positions):
+            positions[_RIGHT_PITCH] = max(positions[_RIGHT_PITCH], -0.10)
+            positions[elbow] = 0.0
+            return positions
+
+        _clamped_measurement(harness, stuck)
+
+        def configure(goal):
+            goal.goal_time_tolerance.nanosec = 300_000_000
+
+        joints = ["right_shoulder_pitch_joint", "right_elbow_joint"]
+        handle = _trajectory_goal(harness, joints, [-0.25, -0.15], 1.0, configure)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle).result
+        assert result.error_code == FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED, result.error_string
+        assert "right_elbow_joint was commanded 0.15 rad and moved 0.00 rad" in result.error_string
+    finally:
+        harness.shutdown()
+
+
+def test_the_arm_is_kept_while_it_settles_and_a_cancel_then_holds(tmp_path):
+    """Review: released before the arrival wait, the public stream could take over and a cancel did not hold."""
+    from action_msgs.msg import GoalStatus
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+
+        def trailing(positions):  # the shoulder trails at -0.35 of -0.5
+            positions[_RIGHT_PITCH] = max(positions[_RIGHT_PITCH], -0.35)
+            return positions
+
+        _clamped_measurement(harness, trailing)
+
+        def configure(goal):
+            goal.goal_time_tolerance.sec = 5
+            goal.goal_tolerance = [JointTolerance(name="right_shoulder_pitch_joint", position=0.05)]
+
+        from control_msgs.msg import JointTolerance
+
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.5], 0.5, configure)
+        assert handle.accepted
+        harness.wait_for(
+            lambda: (
+                harness.mock.last_upper_body is not None
+                and harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH] == pytest.approx(-0.5, abs=1e-6)
+            ),
+            "the final target on the vendor wire",
+        )
+        time.sleep(0.5)  # into the arrival wait
+        assert harness.runtime._arm_owner is not None, "the arm was released before it settled"
+        cancel = handle.cancel_goal_async()
+        harness.wait_for(cancel.done, "the cancel response")
+        assert _trajectory_result(harness, handle).status == GoalStatus.STATUS_CANCELED
+        assert harness.runtime._arm_owner is None
+        held = harness.mock.last_upper_body.arm_pos[_RIGHT_PITCH]
+        assert held == pytest.approx(-0.5, abs=0.02)
+    finally:
+        harness.shutdown()
+
+
+def test_the_echo_wait_spends_the_goal_time_tolerance(tmp_path):
+    """Review: with 0.1 s allowed, an arm settling 0.3 s after the plan ended passed after a 0.25 s echo wait."""
+    from control_msgs.action import FollowJointTrajectory
+    from control_msgs.msg import JointTolerance
+
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        harness.runtime.commanded_arm = lambda: None  # the echo never confirms
+        ended = []
+        command = harness.runtime.command_arm
+
+        def noting_the_final_target(positions, **kwargs):
+            if not ended and abs(positions[_RIGHT_PITCH] + 0.5) < 1e-9:
+                ended.append(time.monotonic())  # the plan's last target leaves now
+            return command(positions, **kwargs)
+
+        harness.runtime.command_arm = noting_the_final_target
+
+        def late(positions):  # the shoulder settles 0.3 s after the plan ended
+            if not ended or time.monotonic() < ended[0] + 0.3:
+                positions[_RIGHT_PITCH] = max(positions[_RIGHT_PITCH], -0.4)
+            return positions
+
+        _clamped_measurement(harness, late)
+
+        def configure(goal):
+            goal.goal_time_tolerance.nanosec = 100_000_000
+            goal.goal_tolerance = [JointTolerance(name="right_shoulder_pitch_joint", position=0.05)]
+
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.5], 0.5, configure)
+        assert handle.accepted
+        result = _trajectory_result(harness, handle).result
+        assert result.error_code == FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED, result.error_string
+    finally:
+        harness.shutdown()
+
+
+def test_a_cancel_while_the_final_target_is_confirmed_holds_and_ends_cancelled(tmp_path, monkeypatch):
+    import aimdk_robot.named_motion as named_motion
+    from action_msgs.msg import GoalStatus
+
+    monkeypatch.setattr(named_motion, "FINAL_TARGET_CONFIRM_S", 5.0)
+    harness = _replay_harness(tmp_path, duration_s=1.0)
+    try:
+        import threading
+
+        confirming, cancelled = threading.Event(), threading.Event()
+        echo = harness.runtime.commanded_arm
+
+        def delayed_echo():  # no echo until the cancel is in, so the window stays open
+            confirming.set()
+            return echo() if cancelled.is_set() else None
+
+        harness.runtime.commanded_arm = delayed_echo
+        handle = _trajectory_goal(harness, ["right_shoulder_pitch_joint"], [-0.3], 0.5)
+        assert handle.accepted
+        harness.wait_for(confirming.is_set, "the final-target confirmation")
+        cancel = handle.cancel_goal_async()
+        harness.wait_for(cancel.done, "the cancel response")
+        cancelled.set()
+        # Ignoring the cancel, the echoed final target would end the goal SUCCEEDED.
+        assert _trajectory_result(harness, handle).status == GoalStatus.STATUS_CANCELED
+    finally:
+        harness.shutdown()
+
+
 def _echo(positions):
     from types import SimpleNamespace
 
@@ -3302,3 +3553,26 @@ def test_an_unconfirmed_final_target_gives_up_at_the_deadline():
     assert not NamedMotionServer._confirm_final_target(server, final, 1, 0, 0.01)
     assert FINAL_TARGET_CONFIRM_S <= clock.monotonic() - began < FINAL_TARGET_CONFIRM_S + 0.2
     assert sent and all(point == final for point in sent)
+
+
+@pytest.mark.parametrize(
+    "field,reason",
+    [("stamp", "scheduled start"), ("path", "path_tolerance"), ("velocity", "positions only")],
+)
+def test_a_trajectory_request_this_runtime_would_not_honour_is_refused(field, reason):
+    from aimdk_robot.named_motion import _unsupported_trajectory_request
+    from control_msgs.action import FollowJointTrajectory
+    from control_msgs.msg import JointTolerance
+
+    goal = FollowJointTrajectory.Goal()
+    assert _unsupported_trajectory_request(goal) == ""
+    goal.goal_tolerance = [JointTolerance(name="right_elbow_joint", position=0.05)]  # positions are kept
+    goal.path_tolerance = [JointTolerance(name="right_elbow_joint", position=-1.0)]  # "not checked" is fine
+    assert _unsupported_trajectory_request(goal) == ""
+    if field == "stamp":
+        goal.trajectory.header.stamp.sec = 5
+    elif field == "path":
+        goal.path_tolerance = [JointTolerance(name="right_elbow_joint", position=0.1)]
+    else:
+        goal.goal_tolerance = [JointTolerance(name="right_elbow_joint", velocity=0.1)]
+    assert reason in _unsupported_trajectory_request(goal)
