@@ -37,10 +37,11 @@ robot:
       - left
       arm_side: left
   cbf_safety:
-    # 右手未装就是空法兰，CBF 按幻影手算，与装上后同一份配置。
+    # 与实物一致：只装左手。数据面也认 [true, true] 配空法兰（见下节），
+    # 改成 [true, true] 前先在 .5 实测 CBF 耗时。
     hands_installed:
     - true
-    - true
+    - false
   runtime:
     instance_id: x2_robot_03
 ```
@@ -55,6 +56,10 @@ commissioning/fixed_poses_voice_mirror_grasp.json
 禁止手动修改姿态库摘要来跳过校验。
 
 ### 部署顺序：`hands_installed` 与数据面一起发布
+
+出厂 yaml 仍是 `[true, false]`，与只装左手的实物一致。下面是改成
+`[true, true]`（右手空法兰或已装）时的要求；改之前先在 .5 实测 CBF 耗时
+（x86 上两手比单手 p99 约高 3 倍）。
 
 `cbf_safety.hands_installed: [true, true]` 只能配支持幻影手的 aimdk_dataplane
 （feat/x2-cbf-twohands 起）。e965d015 及更早的数据面不认空法兰：平台报

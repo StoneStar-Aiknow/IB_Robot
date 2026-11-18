@@ -663,11 +663,9 @@ robot:
     enabled: true
   cbf_safety:
     enabled: false
-    # As in the base: an unfitted right hand is an empty flange, checked as a
-    # phantom hand. grasp_execution.installed_hands is the grasp's own setting.
     hands_installed:
     - true
-    - true
+    - false
   internvl_voice:
     enabled: true
   preset_motions:

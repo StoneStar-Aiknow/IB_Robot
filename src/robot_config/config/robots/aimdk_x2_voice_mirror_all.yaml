@@ -392,11 +392,11 @@ robot:
   cbf_safety:
     enabled: true
     mode: enforce
-    # Two OmniHands are the target hardware. A side the platform reports as no
-    # hand (the right one, until it is fitted) is an empty flange: checked as a
-    # phantom hand, its commands simply go nowhere. A hand on a side configured
-    # false, or another hand type, is still a mismatch.
-    hands_installed: [true, true]
+    # User-confirmed hardware: left OmniHand only; both arms remain protected.
+    # The data plane also takes [true, true] with the right flange empty (a
+    # phantom hand, commissioning/PIPELINE_STARTUP.md); kept at the fitted hands
+    # until its cost is measured on the board.
+    hands_installed: [true, false]
     deadline_us: 10000
     deadline_guard_us: 500
     # Observation-only allowance (1 degree); outgoing limits and raw FK are unchanged.
