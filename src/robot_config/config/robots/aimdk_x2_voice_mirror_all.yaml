@@ -314,6 +314,26 @@ robot:
             # In-process inference_service; the node's default stays ais_bench
             # for the older flat model directories.
             backend: inference_service
+            # Two-hand gesture om (heart / holy / xsign -> /hri/hand/gesture), run after
+            # each HandFrame on the same frame. Off: nothing is loaded or run. To try it,
+            # set the cut-head om (never *_e2e.om; relative to $WORKSPACE) and enable;
+            # with backend inference_service also gesture_allow_mixed_backend (untested
+            # mix of the two runtimes in one thread) or the om stays off.
+            gesture_enabled: false
+            gesture_model_path: ""
+            gesture_topic: /hri/hand/gesture
+            gesture_allow_mixed_backend: false
+            gesture_conf: 0.25
+            gesture_far_ratio: 0.6          # two hands further apart than this x person box height: no run
+            gesture_k: 1.5                  # two-hand square = union of the hands' points x k
+            gesture_one_hand_palms: 4.0     # one-hand square side in palms
+            gesture_min_side_px: 64.0
+            gesture_max_rate_hz: 15.0
+            gesture_one_hand_max_rate_hz: 5.0
+            gesture_slow_ms: 20.0           # this slow gesture_slow_limit times in a row: off
+            gesture_slow_limit: 3
+            gesture_fail_limit: 5           # failed runs in a row: off
+            gesture_log_period_s: 1.0
     # The standing-zone selector: only the person whose feet are inside the floor
     # quad is mirrored. The zone is the 2026-10-28 field calibration; the camera
     # rides the head and the robot stands still, so it holds on any X2 standing

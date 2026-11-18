@@ -21,6 +21,12 @@ Per frame:
 
 The hand pipeline and keypoint helper modules ship with this package; a
 non-empty ``extern_dir`` loads them from there instead (see npu_hands.load_extern).
+
+Optional, off by default: ``gesture_enabled`` with a non-empty
+``gesture_model_path`` also runs the two-hand gesture om (heart / holy / xsign)
+in the same worker, after each HandFrame is published, on the frame and hands it
+already has, and sends ``x2_hand_gesture/v1`` JSON on ``gesture_topic`` (see
+hand_perception/gesture_runner.py). Off, nothing of it is built or run.
 """
 
 from __future__ import annotations
@@ -39,10 +45,11 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
 
 from ibrobot_msgs.msg import HandFrame, HandObservation, PearFrame
 
-from .hand_perception import dump, npu_hands
+from .hand_perception import dump, gesture_crop, gesture_runner, npu_hands
 from .perception_pause_follower import PausableSubscription
 
 SIDES = ("left", "right")
@@ -58,6 +65,12 @@ FRAME_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
     history=HistoryPolicy.KEEP_LAST,
     depth=30,
+)
+GESTURE_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=DurabilityPolicy.VOLATILE,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10,
 )
 PARAMS = {
     "camera_topic": "/aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed",
@@ -77,7 +90,26 @@ PARAMS = {
     "dump_dir": "",
     "dump_crops": False,
     "dump_crop_every": 2,
+    # two-hand gesture om (hand_perception/gesture_runner.py); off unless enabled AND a model path is set
+    "gesture_enabled": False,
+    "gesture_model_path": "",  # the cut-head om (never *_e2e.om); relative: under $WORKSPACE
+    "gesture_topic": "/hri/hand/gesture",
+    # The om runs on ais_bench. With the hands on another backend (inference_service)
+    # both would share one thread's ACL state; untested, so off unless allowed here.
+    "gesture_allow_mixed_backend": False,
+    "gesture_conf": 0.25,
+    "gesture_far_ratio": 0.6,
+    "gesture_k": 1.5,
+    "gesture_one_hand_palms": 4.0,
+    "gesture_min_side_px": 64.0,
+    "gesture_max_rate_hz": 15.0,
+    "gesture_one_hand_max_rate_hz": 5.0,
+    "gesture_slow_ms": 20.0,
+    "gesture_slow_limit": 3,
+    "gesture_fail_limit": 5,
+    "gesture_log_period_s": 1.0,
 }
+GESTURE_BACKEND = "ais_bench"
 
 
 def stamp_ns(header) -> int:
@@ -147,6 +179,7 @@ class HandPerceptionNode(Node):
         self._init_error = None
         self._boxes = collections.deque(maxlen=64)
         self._boxes_lock = threading.Lock()
+        self._box_actor = None  # actor_id of the PearFrame the last _person_box picked
         self._prev_stamp = None
         self.dropped = self.resets = self.frame_count = 0
         self.labels = {s: ("", 0.0) for s in SIDES}
@@ -158,6 +191,9 @@ class HandPerceptionNode(Node):
             self.get_logger().info(f"debug record -> {self.dump.dir} (crops={self.dump.crops})")
 
         self.pub = self.create_publisher(HandFrame, p["frame_topic"], FRAME_QOS)
+        self._gesture = self.gesture_pub = None
+        if p["gesture_enabled"] and str(p["gesture_model_path"]).strip():
+            self._gesture = self._gesture_runner(p)
         self.create_subscription(PearFrame, p["pear_frame_topic"], self._on_pear, qos_profile_sensor_data)
         self.camera = PausableSubscription(
             self, CompressedImage, p["camera_topic"], self._on_image, CAMERA_QOS, on_change=self._on_camera_paused
@@ -176,9 +212,53 @@ class HandPerceptionNode(Node):
             raise RuntimeError(f"NPU backend failed: {self._init_error}")
         self.get_logger().info(f"{self.backend.description} ready")
 
+    def _gesture_runner(self, p):
+        """The gesture runner and its publisher, or None (one INFO line) when it may not run."""
+        log = self.get_logger().info
+        if p["backend"] != GESTURE_BACKEND and not p["gesture_allow_mixed_backend"]:
+            log(
+                f"gesture model off: hands backend is {p['backend']}, the gesture om needs {GESTURE_BACKEND}; "
+                "set gesture_allow_mixed_backend to run both"
+            )
+            return None
+        try:
+            crop = gesture_crop.CropConfig(
+                far_ratio=p["gesture_far_ratio"],
+                k=p["gesture_k"],
+                one_hand_palms=p["gesture_one_hand_palms"],
+                min_side_px=p["gesture_min_side_px"],
+                max_rate_hz=p["gesture_max_rate_hz"],
+                one_hand_max_rate_hz=p["gesture_one_hand_max_rate_hz"],
+            )
+            cfg = gesture_runner.RunnerConfig(
+                conf=p["gesture_conf"],
+                slow_ms=p["gesture_slow_ms"],
+                slow_limit=p["gesture_slow_limit"],
+                fail_limit=p["gesture_fail_limit"],
+                log_period_s=p["gesture_log_period_s"],
+            )
+        except (TypeError, ValueError) as e:
+            log(f"gesture model off: {e}")
+            return None
+        self.gesture_pub = self.create_publisher(String, p["gesture_topic"], GESTURE_QOS)
+        return gesture_runner.GestureRunner(
+            crop,
+            cfg,
+            model_path=p["gesture_model_path"],
+            device=int(p["device"]),
+            publish=lambda text: self.gesture_pub.publish(String(data=text)),
+            log=log,
+        )
+
     # -- callbacks (executor thread) ----------------------------------------
     def _on_pear(self, msg: PearFrame):
-        box = (stamp_ns(msg.header), np.asarray(msg.bbox, dtype=np.float64), msg.source, float(msg.confidence))
+        box = (
+            stamp_ns(msg.header),
+            np.asarray(msg.bbox, dtype=np.float64),
+            msg.source,
+            float(msg.confidence),
+            int(msg.actor_id),
+        )
         with self._boxes_lock:
             self._boxes.append(box)
 
@@ -213,6 +293,8 @@ class HandPerceptionNode(Node):
             self._ready.set()
             return
         self._ready.set()
+        if self._gesture is not None and not self._gesture.load():
+            self._gesture = None
         try:
             while not self._stopping.is_set():
                 if not self._has_frame.wait(0.5):
@@ -230,14 +312,17 @@ class HandPerceptionNode(Node):
                 if not rclpy.ok():
                     break
         finally:
+            if self._gesture is not None:
+                self._gesture.close()
             self.backend.close()
 
     def _person_box(self, stamp: int):
         with self._boxes_lock:
             older = [b for b in self._boxes if b[0] <= stamp]
         if not older:
+            self._box_actor = None
             return None, None, False
-        ts, box, source, conf = max(older, key=lambda b: b[0])
+        ts, box, source, conf, self._box_actor = max(older, key=lambda b: b[0])
         age = stamp - ts
         valid = (
             source == "yolox"
@@ -301,6 +386,23 @@ class HandPerceptionNode(Node):
             )
         self.frame_count += 1
         self._account(out, valid, (time.time_ns() - stamp) / 1e6)
+        if self._gesture is not None and img is not None:
+            self._gesture_step(stamp, img, box, hands)
+
+    def _gesture_step(self, stamp: int, img, box, hands):
+        """The gesture model on this frame, after its HandFrame is out. Never raises."""
+        g = self._gesture
+        try:
+            with self._slot_lock:
+                busy = self._slot is not None  # a newer frame waits: the hands go first
+            lms = [hands[s]["lm"] for s in SIDES if hands[s] is not None]
+            g.step(stamp, self._box_actor, img, box, lms, busy)
+            if not g.enabled:
+                self._gesture = None
+        except Exception as e:  # noqa: BLE001
+            self._gesture = None
+            g.close()
+            self.get_logger().info(f"gesture model off: {type(e).__name__}: {e}; hands unaffected")
 
     def _hands(self, img, box):
         """Upper-body crop -> NPU -> {side: hand or None}, number of hands found."""
