@@ -11,8 +11,8 @@ Per tick:
   ``FOLLOW_FRESH_S``) while ``following`` (MIRRORING/running), else neutral
   (fingers at 0.33 of the fist, thumb at 0.123). A hand whose perception
   stopped is already sent to neutral by hand_core upstream. A ``target``
-  (a template's hand pose, ``template_motion``) replaces either goal,
-  except while the hand feedback is lost;
+  (a template's hand pose, ``template_motion``) replaces either goal, also
+  while the hand feedback is lost (the data plane plays from it);
 * rate: B2, full open<->fist travel in 1.0 s (fingers) / 0.6 s (thumb);
 * limits: the real-robot hand ranges of ``hand_limits.py``, right thumb roll
   at most ``RIGHT_ROLL_MAX``.
@@ -119,15 +119,7 @@ class HandOverlay:
         self._unjam = [False, False]
         self._state_lost = False
         self._fresh_since: float | None = None
-        self.counts = {
-            "starts": 0,
-            "unjams": 0,
-            "held_state": 0,
-            "lost_state": 0,
-            "clamped": 0,
-            "following": 0,
-            "template": 0,
-        }
+        self.counts = {"starts": 0, "unjams": 0, "held_state": 0, "lost_state": 0, "clamped": 0, "following": 0}
         self.start_source = ""
 
     # -- inputs (subscription callbacks) ----------------------------------------
@@ -201,10 +193,11 @@ class HandOverlay:
             live = live and not self._state_lost
             goal = (self._follow if live else self._neutral).copy()
             self.counts["following"] += int(live)
-            template = _twenty(target) if target is not None and not self._state_lost else None
+            template = None if target is None else _twenty(target)
             if template is not None:
                 goal = template
-                self.counts["template"] += 1
+                # Added on first use: with templates off the status stays the baseline's.
+                self.counts["template"] = self.counts.get("template", 0) + 1
             for side in (0, 1):
                 if not self._unjam[side]:
                     continue

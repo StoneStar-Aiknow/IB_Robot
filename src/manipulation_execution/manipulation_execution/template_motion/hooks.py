@@ -63,7 +63,7 @@ class TemplateBlendHooks(SessionHooks):
         self.errors += 1
         try:
             self._log_error(f"template {where} failed, templates off for this round: {exc!r}")
-            self._blender.disable_round(type(exc).__name__)
+            self._blender.disable_round(type(exc).__name__, self._clock())
         except Exception:
             pass
 

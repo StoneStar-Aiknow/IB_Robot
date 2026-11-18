@@ -169,7 +169,8 @@ class PlayClient:
         self._next_id = int(first_seg_id) % (1 << 31)
         self._seg_id: int | None = None  # keepalive owner; None: nothing to keep alive
         self._last_keepalive = -math.inf
-        self._since = -math.inf  # start, or the newest status, whichever is later
+        self._since = -math.inf  # start, or the segment's newest status, whichever is later
+        self._linger_until = math.inf  # wind_down: the keepalive ends here at the latest
         self.sent = {"start": 0, "keepalive": 0, "release": 0}
         self.publish_errors = 0
 
@@ -193,6 +194,7 @@ class PlayClient:
                 raise RuntimeError(f"segment {self._seg_id} is still playing")
             seg_id, self._next_id = self._next_id, (self._next_id + 1) % (1 << 31)
             self._seg_id, self._last_keepalive, self._since = seg_id, now, now
+            self._linger_until = math.inf
             self._send({"op": "start", "seg": seg, "seg_id": seg_id})
             return seg_id
 
@@ -205,18 +207,27 @@ class PlayClient:
         with self._lock:
             self._seg_id = None
 
+    def wind_down(self, now: float, linger_s: float) -> None:
+        """Release the segment fast and keep it alive ``linger_s`` at most, until its terminal status."""
+        with self._lock:
+            if self._seg_id is None:
+                return
+            self._send({"op": "release", "seg_id": self._seg_id, "fast": True})
+            self._linger_until = min(self._linger_until, now + linger_s)
+
     def pump(self, now: float) -> None:
         """Node tick: the keepalive, until a terminal status for the segment."""
         status = self._monitor.latest()
         with self._lock:
             if self._seg_id is None:
                 return
-            if status is not None and status.received_at > self._since:
+            # Only the segment's own statuses count: a restarted port's IDLE never keeps it alive.
+            if status is not None and status.received_at > self._since and status.seg_id == self._seg_id:
                 self._since = status.received_at
-                if status.seg_id == self._seg_id and status.state in TERMINAL:
+                if status.state in TERMINAL:
                     self._seg_id = None
                     return
-            if now - self._since > self._give_up_s:
+            if now - self._since > self._give_up_s or now >= self._linger_until:
                 self._seg_id = None
                 return
             if now - self._last_keepalive >= self._period - KEEPALIVE_SLACK_S:

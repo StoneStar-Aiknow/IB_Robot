@@ -470,24 +470,96 @@ def test_a_silent_port_while_playing_releases_fast_and_ends_on_the_deadline():
     assert rig.sent("release")[-1] == {"op": "release", "seg_id": seg_id, "fast": True, "schema": "x2_template_play/v1"}
     waited = rig.now
     assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
-    assert exit_reason(rig) == "done_timeout"
+    assert exit_reason(rig) == "status_stale"  # what the log says, not done_timeout
     assert rig.now - waited == pytest.approx(0.5 + 0.3, abs=2 * TICK)  # t_out_stop + done_margin_s
-    assert rig.client.busy  # the keepalive goes on until the port says so (or give_up_s)
+    assert rig.client.busy and rig.sent("release")[-1]["fast"]  # one more fast release
+    rig.run(0.5 + TICK)  # wind_down_s: then the keepalive ends, the port's own timeout stops it
+    assert not rig.client.busy
+    sent = len(rig.sent("keepalive"))
     assert rig.run(3.0, lambda: rig.blender.phase is Phase.IDLE)
+    assert len(rig.sent("keepalive")) == sent
     del rig.active["heart"]
     rig.step()
     rig.active["heart"] = 7
     rig.port = {"state": "IDLE"}
-    rig.run(0.2)
-    assert rig.blender.phase is Phase.IDLE  # never a start while the client is busy
-    rig.publish_port(state="STOPPED", seg_id=seg_id, reason="released")
     rig.step()
-    rig.port = {"state": "IDLE"}
+    assert rig.blender.phase is Phase.A  # nothing stuck: the next activation plays
+
+
+def test_a_data_plane_restart_mid_playback_goes_back_to_the_mirror():
+    rig = Rig()
+    seg_id = to_playing(rig)
+    keepalives = len(rig.sent("keepalive"))
+    restarted = rig.now
+    rig.port = None  # the restarted port: IDLE, no segment, every 100 ms (the label stays active)
+    for k in range(60):
+        if k % 5 == 0:
+            rig.publish_port(state="IDLE", seg_id=None)
+        rig.step()
+        if rig.blender.phase is Phase.C:
+            break
+    assert rig.blender.phase is Phase.C and exit_reason(rig) == "port_lost"
+    assert 0.3 <= rig.now - restarted <= 0.3 + 0.1 + 2 * TICK
+    assert not rig.client.busy  # no keepalive to a port that forgot the segment
+    assert rig.sent("keepalive")[keepalives:] and rig.sent("keepalive")[-1]["seg_id"] == seg_id
+    sent = len(rig.messages)
+    rig.port = {"state": "IDLE", "seg_id": None}
+    assert rig.run(3.0, lambda: rig.blender.phase is Phase.IDLE)
+    assert len(rig.messages) == sent and rig.last_sent.arm == MIRROR
+    assert max_step(rig.out) <= 0.03
+    assert "total=" in rig.logs[-1] and "reason=port_lost" in rig.logs[-1]
     del rig.active["heart"]
     rig.step()
     rig.active["heart"] = 7
     rig.step()
-    assert not rig.client.busy and rig.blender.phase is Phase.A
+    assert rig.blender.phase is Phase.A  # the next activation plays
+
+
+def test_one_refusal_of_another_start_mid_playback_is_not_a_lost_port():
+    rig = Rig()
+    seg_id = to_playing(rig, state="HOLD")
+    ours = rig.port
+    rig.publish_port(state="REJECTED", seg_id=seg_id + 100, seg="holy", reason="busy")
+    rig.step()
+    rig.port = ours
+    rig.run(1.0)
+    assert rig.blender.phase is Phase.PLAYING and rig.client.busy
+
+
+def test_another_segments_playback_is_a_lost_port():
+    rig = Rig()
+    seg_id = to_playing(rig)
+    rig.port = {"state": "HOLD", "seg_id": seg_id + 1, "seg": "holy"}
+    assert rig.run(0.5, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "port_lost"
+
+
+def test_a_playback_never_outlasts_t_in_hold_max_and_t_out():
+    rig = Rig()
+    seg_id = to_wait_ack(rig)
+    started = rig.now
+    rig.port = {"state": "ENTER_B", "seg_id": seg_id, "seg": "heart", "P_actual": list(P_HEART)}
+    assert rig.run(9.0, lambda: rig.blender.phase is Phase.WAIT_DONE)  # the port plays ENTER_B for ever
+    assert rig.now - started == pytest.approx(1.0 + 4.0 + 1.0 + 1.0, abs=2 * TICK)  # + play_margin_s
+    assert rig.sent("release")[-1]["fast"]
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "done_timeout"
+    rig.run(0.5 + TICK)
+    assert not rig.client.busy  # wound down although the port still says ENTER_B
+    assert rig.run(3.0, lambda: rig.blender.phase is Phase.IDLE) and rig.last_sent.arm == MIRROR
+
+
+def test_a_port_restart_while_waiting_for_done_is_a_lost_port():
+    rig = Rig()
+    to_playing(rig, state="HOLD")
+    rig.run(0.9)
+    del rig.active["heart"]
+    rig.step()
+    assert rig.blender.phase is Phase.WAIT_DONE
+    waited = rig.now
+    rig.port = {"state": "IDLE", "seg_id": None}
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "port_lost" and rig.now - waited < 0.4 and not rig.client.busy
 
 
 def test_the_data_planes_own_exit_is_waited_for():
@@ -598,15 +670,40 @@ def test_the_approach_wrap_up_is_never_the_blenders():
     assert wrap_until_done(rig, purpose=WrapUpPurpose.APPROACH)[0] is None
 
 
-def test_disable_round_stops_the_keepalive_and_entries():
+def test_disable_round_releases_fast_and_the_client_alone_keeps_it_alive_a_while():
     rig = Rig()
-    to_playing(rig)
-    rig.blender.disable_round("ValueError")
-    assert not rig.client.busy and rig.blender.phase is Phase.IDLE
-    assert rig.blender.exits == {"error": 1}
+    seg_id = to_playing(rig)
+    rig.blender.disable_round("ValueError", rig.now)
+    assert rig.blender.phase is Phase.IDLE and rig.blender.exits == {"error": 1}
+    assert rig.sent("release")[-1] == {"op": "release", "seg_id": seg_id, "fast": True, "schema": "x2_template_play/v1"}
+    line = rig.logs[-1]
+    assert line.startswith("template exit heart seg=heart phase=PLAYING reason=error:ValueError d=0.600")
+    assert " total=" in line
+    keepalives = len(rig.sent("keepalive"))
+    assert rig.client.busy
+    rig.run(0.9)  # the port still plays (ENTER_B): kept alive, no new entry
+    assert len(rig.sent("keepalive")) >= keepalives + 40 and rig.client.busy and rig.blender.entries == 1
+    rig.run(0.2)  # t_out_stop 0.5 + wind_down_s 0.5
+    assert not rig.client.busy
     sent = len(rig.messages)
     rig.run(0.5)
     assert len(rig.messages) == sent and rig.blender.entries == 1
+
+
+def test_after_an_error_the_keepalive_ends_on_the_terminal_status():
+    rig = Rig()
+    seg_id = to_playing(rig)
+    rig.blender.disable_round("ValueError", rig.now)
+    rig.run(0.2)
+    rig.publish_port(state="DONE", seg_id=seg_id, seg="heart", reason="released")
+    rig.step()
+    assert not rig.client.busy
+
+
+def test_disable_round_outside_a_playback_logs_nothing_and_sends_nothing():
+    rig = Rig()
+    rig.blender.disable_round("ValueError", rig.now)
+    assert rig.messages == [] and rig.logs == [] and rig.blender.exits == {}
 
 
 # -- config -----------------------------------------------------------------------------
@@ -699,7 +796,8 @@ def test_a_blender_error_never_reaches_the_session():
     assert hooks.retarget(rig.inputs()) is raw
     assert hooks.errors == 1 and rig.blender.snapshot()["round_disabled"]
     assert rig.blender.exits == {"error": 1}
-    assert "templates off for this round" in rig.logs[-1]
+    assert "templates off for this round" in rig.logs[-2]
+    assert rig.logs[-1].startswith("template exit heart seg=heart phase=A reason=error:ZeroDivisionError d=0.600")
     rig.blender.wrap = broken
     context = WrapUpContext(WrapUpPurpose.STOP, None, None, RESET, 0.0, 2.5)
     assert hooks.wrap_up(context) == WrapUpStep(RESET, True)

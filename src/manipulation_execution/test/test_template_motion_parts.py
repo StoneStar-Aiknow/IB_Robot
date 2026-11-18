@@ -216,6 +216,33 @@ def test_the_keepalive_gives_up_without_any_status_and_abandon_stops_it():
     assert not c.client.busy
 
 
+def test_only_the_segments_own_statuses_keep_the_keepalive_from_giving_up():
+    c = Client(give_up_s=1.0)
+    c.client.start("heart", 0.0)
+    for k in range(1, 60):  # a restarted port: IDLE without a segment, every 100 ms
+        if k % 5 == 0:
+            c.port.observe(status(state="IDLE", seg_id=None), k * 0.02)
+        c.client.pump(k * 0.02)
+    assert not c.client.busy
+
+
+def test_wind_down_releases_fast_and_ends_the_keepalive_in_time():
+    c = Client()
+    seg_id = c.client.start("heart", 0.0)
+    c.client.wind_down(0.1, 0.5)
+    assert c.ops("release") == [{"op": "release", "seg_id": seg_id, "fast": True, "schema": "x2_template_play/v1"}]
+    now = 0.1
+    while now < 0.58:
+        now += 0.02
+        c.port.observe(status(state="EXIT_B", seg_id=seg_id), now)  # the port plays on
+        c.client.pump(now)
+        assert c.client.busy
+    c.client.pump(0.62)
+    assert not c.client.busy
+    c.client.wind_down(0.7, 0.5)  # nothing kept alive: nothing sent
+    assert len(c.ops("release")) == 1
+
+
 def test_a_failing_publisher_is_counted_not_raised():
     port = PortMonitor()
 
@@ -326,6 +353,8 @@ def test_make_segments_reproduces_the_shipped_whitelist(tmp_path):
 
 def test_a_template_target_replaces_the_mirror_and_neutral_goals():
     overlay = HandOverlay(50.0, neutral=list(HAND_NEUTRAL))
+    overlay.apply(False, 0.0)
+    assert "template" not in overlay.counts  # templates off: the status is the baseline's
     goal = list((HAND_LOW + HAND_HIGH) / 2.0)
     out = None
     for k in range(200):
@@ -334,6 +363,17 @@ def test_a_template_target_replaces_the_mirror_and_neutral_goals():
     assert overlay.counts["template"] == 200
     out = overlay.apply(False, 4.0, target=[0.0] * 19)  # malformed: ignored, neutral again
     assert overlay.counts["template"] == 200
+
+
+def test_a_template_target_holds_also_while_the_hand_feedback_is_lost():
+    overlay = HandOverlay(50.0, neutral=list(HAND_NEUTRAL))
+    goal = list((HAND_LOW + HAND_HIGH) / 2.0)
+    overlay.observe_state([0.1] * 10, [0.1] * 10, 0.0)
+    out = None
+    for k in range(300):  # the state stops after t = 0
+        out = overlay.apply(True, k * 0.02, target=goal)
+    assert overlay.snapshot(6.0)["state_lost"]
+    assert out == pytest.approx(goal)  # not drifting to neutral
 
 
 def test_travel_time_is_the_slowest_channel():

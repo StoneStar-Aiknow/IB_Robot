@@ -23,9 +23,12 @@ One template per label activation, from the mirror and back to it::
   did when it was left).
 
 Nothing here waits without a deadline: A has ``T_A + a_timeout_margin_s``,
-WAIT_ACK ``ack_timeout_s``, the playback a stale-status check and the data
-plane's own hold_max_s, WAIT_DONE ``t_out + done_margin_s``. Every exit goes
-through C back to the mirror, and every exit is logged with its reason.
+WAIT_ACK ``ack_timeout_s``, the playback ``t_in + hold_max_s + t_out +
+play_margin_s`` from its start, a stale-status check and a port-lost check
+(fresh statuses that are not this segment's for ``port_lost_s``: the data
+plane restarted, or plays something else), WAIT_DONE ``t_out +
+done_margin_s``. Every exit goes through C back to the mirror, and every exit
+is logged with its reason and the time since the template was entered.
 """
 
 from __future__ import annotations
@@ -71,6 +74,8 @@ class BlendConfig:
     arrive_fraction: float = 0.5  # of start_tol_rad / hand_start_tol, so the port's gate passes
     ack_timeout_s: float = 0.2
     status_stale_s: float = 0.5  # no port status this long while playing: release fast
+    port_lost_s: float = 0.3  # only other segments' statuses (or IDLE) this long while playing: the port lost it
+    play_margin_s: float = 1.0  # the playback ends at the latest t_in + hold_max_s + t_out + this after its start
     done_margin_s: float = 0.3  # WAIT_DONE ends this long after the exit should have finished
     min_hold_s: float = 0.8  # a lost label releases only after this long in HOLD
     c_duration_s: float = 0.8  # C from beta = 1
@@ -82,6 +87,7 @@ class BlendConfig:
     wrap_return_max_s: float = 2.0
     wrap_reserve_s: float = 0.3  # the return ends this far inside the wrap-up budget
     wrap_min_s: float = 0.3
+    wind_down_s: float = 0.5  # keepalive this long after giving a segment up (+ t_out_stop on errors)
     require_person_frame: bool = True
 
     @classmethod
@@ -201,6 +207,7 @@ class Blender:
         self.played = 0
         self._last_exit = ""
         self._hand_out: tuple[float, ...] | None = None
+        self._snap: dict = {}
         self.begin_round()
 
     # -- round --------------------------------------------------------------------
@@ -211,6 +218,7 @@ class Blender:
         self._port_suspect = False
         self._pear_source: str | None = None  # of the newest PEAR frame this round
         self._clear()
+        self._refresh_snapshot()
 
     def _clear(self) -> None:
         self._label: Label | None = None
@@ -218,6 +226,10 @@ class Blender:
         self._segment: Segment | None = None
         self._seg_id: int | None = None
         self._since = 0.0  # when the current phase began
+        self._entered_at: float | None = None
+        self._play_deadline = math.inf
+        self._foreign_since: float | None = None  # newest statuses not this segment's, since
+        self._seen_serial = 0
         self._t_a = 0.0
         self._entry_d = 0.0
         self._entry_dist = 0.0
@@ -237,6 +249,12 @@ class Blender:
 
     def end_round(self, now: float) -> None:
         """The session's round ends (wrap-up next, or WAIT). A playback is released fast."""
+        try:
+            self._end_round(now)
+        finally:
+            self._refresh_snapshot()
+
+    def _end_round(self, now: float) -> None:
         if self._phase in (Phase.WAIT_ACK, Phase.PLAYING, Phase.WAIT_DONE):
             if self._seg_id is not None:
                 self._client.release(self._seg_id, fast=True)
@@ -250,14 +268,27 @@ class Blender:
             self._phase = Phase.IDLE
             self._clear()
 
-    def disable_round(self, reason: str) -> None:
-        """After an error: nothing more this round; the keepalive stops, the data plane exits on its own."""
-        self._client.abandon()
+    def disable_round(self, reason: str, now: float) -> None:
+        """After an error: nothing more this round, back to the mirror at once.
+
+        A playback is released fast and kept alive for ``t_out_stop +
+        wind_down_s`` by the port client alone (it does not need the
+        blender), so the data plane plays back to P instead of timing out.
+        """
+        try:
+            linger = (self._segment.t_out_stop if self._segment is not None else 0.6) + self._config.wind_down_s
+            self._client.wind_down(now, linger)
+        except Exception:
+            self._client.abandon()
         if self._phase not in (Phase.IDLE, Phase.COOLDOWN):
-            self._count_exit(f"error:{reason}")
+            try:
+                self._exit_log(f"error:{reason}", now)
+            except Exception:
+                self._count_exit(f"error:{reason}")
         self._round_disabled = True
         self._phase = Phase.IDLE
         self._clear()
+        self._refresh_snapshot()
 
     # -- per tick -----------------------------------------------------------------
 
@@ -288,6 +319,12 @@ class Blender:
 
         ``mirror`` is the newest mirror command (14), ``inputs`` the session's.
         """
+        try:
+            return self._step(now, inputs, mirror)
+        finally:
+            self._refresh_snapshot()
+
+    def _step(self, now: float, inputs, mirror: Sequence[float] | None) -> tuple[float, ...] | None:
         m = _arm(mirror)
         frames = getattr(getattr(inputs, "window", None), "frames", ())
         if frames:  # the window holds only the frames since the previous tick
@@ -368,7 +405,7 @@ class Blender:
         self._t_a = max(
             MIN_JERK_PEAK * self._entry_dist / config.a_peak_speed, hand + config.a_hand_margin_s, config.a_min_s
         )
-        self._phase, self._since = Phase.A, now
+        self._phase, self._since, self._entered_at = Phase.A, now, now
         self._hand_target = segment.hand_P
         self.entries += 1
         self._log(
@@ -404,7 +441,8 @@ class Blender:
             except RuntimeError:
                 return self._to_c(now, "port_busy", m, segment.P, 1.0)
             status = self._port.latest()
-            self._status_serial = 0 if status is None else status.serial
+            self._status_serial = self._seen_serial = 0 if status is None else status.serial
+            self._play_deadline = now + segment.t_in + segment.hold_max_s + segment.t_out + config.play_margin_s
             self._phase, self._since = Phase.WAIT_ACK, now
             return segment.P
         return self._blend_a(now, m)
@@ -474,6 +512,22 @@ class Blender:
             return self._to_c(now, "no_ack", m, self._segment.P, 1.0)
         return self._segment.P
 
+    def _port_lost(self, status) -> bool:
+        """Fresh statuses, none this segment's, for ``port_lost_s``: the data plane no longer plays it.
+
+        One other segment's status (a refusal of someone else's start) is not
+        enough: the port's next periodic status is ours again.
+        """
+        if status is None or status.serial <= self._seen_serial:
+            return False
+        self._seen_serial = status.serial
+        if status.seg_id == self._seg_id:
+            self._foreign_since = None
+            return False
+        if self._foreign_since is None:
+            self._foreign_since = status.received_at
+        return status.received_at - self._foreign_since >= self._config.port_lost_s
+
     def _tick_playing(self, now: float, inputs, m: tuple[float, ...]) -> tuple[float, ...]:
         config, segment = self._config, self._segment
         status = self._port.latest()
@@ -482,6 +536,12 @@ class Blender:
         if status is None or now - status.received_at > config.status_stale_s:
             self._client.release(self._seg_id, fast=True)
             return self._to_wait_done(now, "status_stale", segment.t_out_stop)
+        if self._port_lost(status):
+            self._client.abandon()
+            return self._to_c(now, "port_lost", m, arm, 1.0)
+        if now > self._play_deadline:
+            self._client.release(self._seg_id, fast=True)
+            return self._to_wait_done(now, "play_timeout", segment.t_out_stop)
         if status.seg_id == self._seg_id:
             if status.state in TERMINAL:
                 return self._to_c(now, f"{status.state.lower()}:{status.reason}", m, arm, 1.0)
@@ -508,13 +568,20 @@ class Blender:
         status = self._port.latest()
         arm = self._status_arm()
         self._hand_target = self._status_hand()
-        if status is None or now - status.received_at > config.status_stale_s:
+        stale = status is None or now - status.received_at > config.status_stale_s
+        if stale:
             self._deadline = min(self._deadline, now + segment.t_out_stop + config.done_margin_s)
         elif status.seg_id == self._seg_id and status.state in TERMINAL:
             reason = self._wait_reason if status.state == "DONE" else f"{status.state.lower()}:{status.reason}"
             return self._to_c(now, reason, m, arm, 1.0)
+        elif self._port_lost(status):
+            self._client.abandon()
+            return self._to_c(now, "port_lost", m, arm, 1.0)
         if now >= self._deadline:
-            return self._to_c(now, "done_timeout", m, arm, 1.0)
+            # The port never said it finished: one more fast release, and the keepalive ends soon after,
+            # so the data plane's own keepalive timeout stops it (a port that plays on is never kept alive).
+            self._client.wind_down(now, config.wind_down_s)
+            return self._to_c(now, "status_stale" if stale else "done_timeout", m, arm, 1.0)
         return arm
 
     # -- C ------------------------------------------------------------------------
@@ -570,6 +637,12 @@ class Blender:
         quintic from P_actual to the reset pose within what is left of the budget.
         ``hold_arm_command(arm)`` builds the ``UpperBodyCommand``.
         """
+        try:
+            return self._wrap(context, hold_arm_command)
+        finally:
+            self._refresh_snapshot()
+
+    def _wrap(self, context, hold_arm_command) -> object | None:
         from manipulation_execution.mirror_session.hooks import WrapUpPurpose, WrapUpStep
 
         if self._phase is not Phase.STOP_WAIT or context.purpose == WrapUpPurpose.APPROACH:
@@ -614,11 +687,13 @@ class Blender:
         self._log(
             f"template exit {name} seg={seg} phase={self._phase.value} reason={reason} "
             f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f} "
-            f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f}"
+            f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f} "
+            f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f}"
         )
 
-    def snapshot(self) -> dict:
-        return {
+    def _refresh_snapshot(self) -> None:
+        # One assignment: the status timer reads it from another thread without the session lock.
+        self._snap = {
             "phase": self._phase.value,
             "template": None if self._label is None else self._label.template,
             "segment": None if self._segment is None else self._segment.name,
@@ -630,3 +705,6 @@ class Blender:
             "round_disabled": self._round_disabled,
             "port_suspect": self._port_suspect,
         }
+
+    def snapshot(self) -> dict:
+        return dict(self._snap)

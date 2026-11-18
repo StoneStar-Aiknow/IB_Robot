@@ -29,6 +29,8 @@ motion_template:
     arrive_fraction: 0.5      # "at P": within this share of the segment's start tolerances
     ack_timeout_s: 0.2        # no answer from the port this long after start: release, back to the mirror
     status_stale_s: 0.5       # no port status this long while playing: release fast
+    port_lost_s: 0.3          # only other segments' statuses (or IDLE, a restarted port) this long: back to the mirror
+    play_margin_s: 1.0        # a playback ends at the latest t_in + hold_max_s + t_out + this after its start
     done_margin_s: 0.3        # an exit not DONE this long after its t_out: back to the mirror anyway
     min_hold_s: 0.8           # a lost label releases only after this long at T
     c_duration_s: 0.8         # C (P -> mirror)
@@ -40,6 +42,7 @@ motion_template:
     wrap_return_max_s: 2.0    # then returns to the reset pose in at most this
     wrap_reserve_s: 0.3       # and ends this far inside the wrap-up budget
     wrap_min_s: 0.3
+    wind_down_s: 0.5          # a segment given up (an error, WAIT_DONE ran out): released fast, kept alive this long
     require_person_frame: true  # center_fallback PEAR frames never enter a template
   templates:
     overhead_heart: {enabled: false, segments: [overhead_heart]}
