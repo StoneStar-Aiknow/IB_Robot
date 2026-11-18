@@ -1397,12 +1397,17 @@ def _offsets(receive_s, offset_s):
     return [(int(r * 1e9), int(o * 1e9)) for r, o in zip(receive_s, offset_s, strict=True)]
 
 
+def _ticks(start_s, count, period_s=0.02):
+    return [start_s + i * period_s for i in range(count)]
+
+
 def test_header_offset_shared_clock_domain_cancels():
     """Simulation: every header is sim time, so all streams share one large offset -> no warning."""
+    receive = _ticks(0, 10)
     warnings = _header_offset_warnings(
         header_offsets_ns={
-            "observation.images.top": _offsets([0, 1, 2], [5, 5, 5]),
-            "observation.state": _offsets([0, 1, 2], [5, 5, 5]),
+            "observation.images.top": _offsets(receive, [5] * 10),
+            "observation.state": _offsets(receive, [5] * 10),
         },
         image_keys=["observation.images.top"],
         external_video_keys=[],
@@ -1417,8 +1422,8 @@ def test_header_offset_drifting_clock_with_late_camera_does_not_warn():
 
     Whole-stream medians would differ by 500 ms; pairing by receive time must not.
     """
-    state_receive = [0, 1, 2, 3, 4]
-    camera_receive = [2, 3, 4]
+    state_receive = _ticks(0, 250)
+    camera_receive = _ticks(2.005, 100, period_s=0.033)
     warnings = _header_offset_warnings(
         header_offsets_ns={
             "observation.images.top": _offsets(camera_receive, [10 + 0.5 * r for r in camera_receive]),
@@ -1432,12 +1437,53 @@ def test_header_offset_drifting_clock_with_late_camera_does_not_warn():
     assert warnings == []
 
 
-def test_header_offset_checks_each_camera_separately():
+def test_header_offset_sparse_reference_on_drifting_clock_is_unchecked(capsys):
+    """Review of !601: header = receive / 2 everywhere, reference samples 4 s apart.
+
+    Pairing each image with a far-away reference would report the clock drift as +500 ms.
+    """
+    reference_receive = [100, 104]
+    image_receive = [101, 102, 103]
     warnings = _header_offset_warnings(
         header_offsets_ns={
-            "observation.images.top": _offsets([0, 1, 2], [0.4, 0.4, 0.4]),
-            "observation.images.wrist": _offsets([0, 1, 2], [0.001, 0.001, 0.001]),
-            "observation.state": _offsets([0, 1, 2], [0.001, 0.001, 0.001]),
+            "observation.images.top": _offsets(image_receive, [r / 2 for r in image_receive]),
+            "observation.state": _offsets(reference_receive, [r / 2 for r in reference_receive]),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=["observation.images.top"],
+        warn_ms=200,
+    )
+    assert warnings == []
+    assert "unchecked for observation.images.top: 0 image samples have a non-image header sample within 50 ms" in (
+        capsys.readouterr().out
+    )
+
+
+def test_header_offset_ignores_pairs_across_a_reference_gap():
+    """A 2 s gap in the reference stream on a drifting clock: only close pairs are judged."""
+    reference_receive = _ticks(0, 50) + _ticks(3, 50)
+    image_receive = _ticks(0.005, 120, period_s=0.033)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(image_receive, [0.5 * r for r in image_receive]),
+            "observation.state": _offsets(reference_receive, [0.5 * r for r in reference_receive]),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    assert warnings == []
+
+
+def test_header_offset_checks_each_camera_separately():
+    receive = _ticks(0, 10)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(receive, [0.4] * 10),
+            "observation.images.wrist": _offsets(receive, [0.001] * 10),
+            "observation.state": _offsets(receive, [0.001] * 10),
         },
         image_keys=["observation.images.top", "observation.images.wrist"],
         external_video_keys=[],
@@ -1451,10 +1497,11 @@ def test_header_offset_checks_each_camera_separately():
 
 
 def test_header_offset_warns_when_header_is_late():
+    receive = _ticks(0, 10)
     warnings = _header_offset_warnings(
         header_offsets_ns={
-            "observation.images.top": _offsets([0, 1], [-0.25, -0.25]),
-            "observation.state": _offsets([0.5], [0.0]),
+            "observation.images.top": _offsets([r + 0.01 for r in receive], [-0.25] * 10),
+            "observation.state": _offsets(receive, [0.0] * 10),
         },
         image_keys=["observation.images.top"],
         external_video_keys=[],
@@ -1463,6 +1510,23 @@ def test_header_offset_warns_when_header_is_late():
     )
     assert len(warnings) == 1
     assert "by -250 ms" in warnings[0]
+
+
+def test_header_offset_extreme_stamps_do_not_wrap(capsys):
+    """Review of !601: int64 distance between INT64_MAX and -1 wrapped and passed the 50 ms bound."""
+    big = np.iinfo(np.int64).max
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": [(big - i, 400_000_000) for i in range(5)],
+            "observation.state": [(-1, 0)],
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    assert warnings == []
+    assert "0 image samples have a non-image header sample within 50 ms" in capsys.readouterr().out
 
 
 def test_header_offset_reports_unchecked_streams(capsys):

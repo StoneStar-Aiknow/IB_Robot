@@ -564,6 +564,10 @@ def _selected_indices_for_ticks(
 
 
 TIMESTAMP_SOURCES = ("contract", "receive", "header")
+# Header-offset diagnostic: an image sample is only compared with a reference sample received at
+# most this far away, and a stream needs this many such pairs before it is judged.
+_HEADER_PAIR_MAX_GAP_NS = 50_000_000
+_HEADER_PAIR_MIN_COUNT = 5
 _TIMESTAMP_SOURCE_ALIASES = {"bag": "receive"}
 
 
@@ -596,11 +600,14 @@ def _header_offset_warnings(
     """Print per-stream ``receive - header`` offsets and return warnings for skewed image streams.
 
     ``header_offsets_ns`` maps a stream key to ``(receive_ns, receive_ns - header_ns)`` samples.
-    Each image sample is paired with the non-image header sample nearest in receive time, and the
-    median of the paired differences is the image stream's skew. Pairing by receive time cancels a
-    clock domain shared by all streams even when it drifts against wall time (for example sim time
-    running slower than real time); an image driver whose header clock is shifted (#246) does not
-    cancel. The skew still includes normal transport latency, so this is a diagnostic only.
+    Each image sample is paired with the non-image header sample nearest in receive time; pairs more
+    than ``_HEADER_PAIR_MAX_GAP_NS`` apart are dropped, and the median of the remaining paired
+    differences is the image stream's skew. Close pairing cancels a clock domain shared by all
+    streams even when it drifts against wall time (for example sim time running slower than real
+    time) up to drift rate x gap (for 10x sim time and a 30 ms gap that is still 270 ms, so a large
+    time warp can warn); an image driver whose header clock is shifted (#246) does not
+    cancel. Streams with fewer than ``_HEADER_PAIR_MIN_COUNT`` valid pairs are reported unchecked.
+    The skew still includes normal transport latency, so this is a diagnostic only.
     """
     if warn_ms <= 0:
         return []
@@ -633,8 +640,23 @@ def _header_offset_warnings(
         index = np.searchsorted(ref[:, 0], receive_ns)
         left = np.clip(index - 1, 0, len(ref) - 1)
         right = np.clip(index, 0, len(ref) - 1)
-        nearest = np.where(np.abs(ref[left, 0] - receive_ns) <= np.abs(ref[right, 0] - receive_ns), left, right)
-        skew_ms = float(np.median(offset_ns - ref[nearest, 1])) / 1e6
+        # Differences in float64: int64 subtraction can wrap for out-of-range stamps, and
+        # float64 keeps sub-microsecond resolution at epoch scale, far below the ms bounds.
+        ref_receive, image_receive = ref[:, 0].astype(np.float64), receive_ns.astype(np.float64)
+        left_gap = np.abs(ref_receive[left] - image_receive)
+        right_gap = np.abs(ref_receive[right] - image_receive)
+        nearest = np.where(left_gap <= right_gap, left, right)
+        valid = np.minimum(left_gap, right_gap) <= _HEADER_PAIR_MAX_GAP_NS
+        if int(valid.sum()) < _HEADER_PAIR_MIN_COUNT:
+            print(
+                f"[bag_to_lerobot] header offset unchecked for {key}: {int(valid.sum())} image samples have a "
+                f"non-image header sample within {_HEADER_PAIR_MAX_GAP_NS / 1e6:g} ms "
+                f"(need {_HEADER_PAIR_MIN_COUNT})"
+            )
+            continue
+        skew_ms = (
+            float(np.median(offset_ns[valid].astype(np.float64) - ref[nearest[valid], 1].astype(np.float64))) / 1e6
+        )
         if abs(skew_ms) <= warn_ms:
             continue
         usage = "used for alignment" if key in aligned else "not used for alignment"
