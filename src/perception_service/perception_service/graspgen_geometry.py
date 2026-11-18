@@ -79,10 +79,9 @@ def remove_point_cloud_outliers(
     """Keep the points whose mean L1 distance to their k nearest others is below threshold.
 
     The sampler's own rule, without its all-pairs distance matrix: exact L1
-    neighbours come from a KD tree and only their distances are computed, in
-    float32 like the sampler. An X2 bottle mask is ~27k points, which the
-    all-pairs form took ~40 s per request to filter on the model host.
-    The point's own row is excluded, duplicates of it are not.
+    neighbours and their distances both come from one KD tree query. An X2 bottle
+    mask is ~27k points, which the all-pairs form took ~40 s per request to filter
+    on the model host. The point's own row is excluded, duplicates of it are not.
     """
     values = np.ascontiguousarray(points, dtype=np.float32)
     if values.ndim != 2 or values.shape[1] != 3:
@@ -95,8 +94,15 @@ def remove_point_cloud_outliers(
     from scipy.spatial import cKDTree
 
     # k + 1 so the k nearest others are there whether or not the row itself is.
-    _, indices = cKDTree(values).query(values, k=k + 1, p=1, workers=-1)
-    distance = np.sum(np.abs(values[:, None, :] - values[indices]), axis=-1, dtype=np.float32)
+    # The query already computed these L1 distances, so take them instead of
+    # rebuilding them from the neighbour rows: that recompute materialises an
+    # [N, k + 1, 3] intermediate and is about half of this function's cost
+    # (90 -> 38 ms for a 14k-point X2 object cloud on the 310P). scipy sums in
+    # float64 where the recompute summed in float32; over 42 X2 object clouds
+    # (418780 points) the two means differ by at most 1.9e-9 m against a 1.4 cm
+    # threshold, and no point changes side.
+    distance, indices = cKDTree(values).query(values, k=k + 1, p=1, workers=-1)
+    distance = distance.astype(np.float32)
     distance[indices == np.arange(len(values))[:, None]] = np.float32(np.inf)
     distance.sort(axis=1)
     keep = np.mean(distance[:, :k], axis=1, dtype=np.float32) < np.float32(threshold)
