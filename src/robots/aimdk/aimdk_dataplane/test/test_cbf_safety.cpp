@@ -10,6 +10,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -2476,7 +2477,9 @@ CbfSnapshot two_hand_readings(const CbfSafetyConfig & config)
 
 }  // namespace
 
-TEST(CbfSafety, APhantomRightThumbIsTheCommandAndNoFeedbackProblem)
+// The request does not change here, so the published phantom thumb is the
+// request on every frame; a changing request is held (see below).
+TEST(CbfSafety, APhantomRightThumbIsThePublishedCommandAndNoFeedbackProblem)
 {
   const auto config = fixture_config();
   CbfSafety safety(config);
@@ -2700,4 +2703,225 @@ TEST(CbfSafety, APhantomRightHandKeepsItsCollisionPairsInTheDecision)
   double phantom_worst = 0.0;
   EXPECT_GT(walk(fixture_config(), true, phantom_worst), 0.05);
   EXPECT_GE(phantom_worst, 0.0);
+}
+
+namespace
+{
+
+bool right_hand_pair(std::size_t index)
+{
+  const auto pair = x2::cbf::kPrimitivePairs[index];
+  const auto hand = [](x2::cbf::PrimitiveId id) {
+      return id == x2::cbf::PrimitiveId::RightPalm || id == x2::cbf::PrimitiveId::RightThumb;
+    };
+  return hand(pair.first) || hand(pair.second);
+}
+
+// The closest pair involving the right palm or thumb, with both hands in the geometry.
+double right_hand_distance(const std::vector<double> & arm, const std::array<double, 6> & thumbs)
+{
+  x2::cbf::KinematicsInput input;
+  std::copy_n(arm.begin(), 14, input.q_arm.begin());
+  input.q_thumb_urdf = thumbs;
+  input.thumb_pose_valid = true;
+  input.hands_installed = {true, true};
+  const auto report = x2::cbf::evaluate_proxy_distances(input);
+  double out = std::numeric_limits<double>::infinity();
+  for (std::size_t index = 0; index < report.distances.size(); ++index) {
+    if (right_hand_pair(index)) {out = std::min(out, report.distances[index].signed_distance);}
+  }
+  return out;
+}
+
+}  // namespace
+
+TEST(CbfSafety, APhantomThumbCommandNeverHoldsTheRealHandsGesture)
+{
+  // Found offline (random right-arm poses, seed 3, trial 270): with the left arm
+  // standing, a right thumb angle that puts the right thumb into the body while
+  // the baseline thumbs are clear. The left thumb changes gesture in the same frame.
+  const auto & standing = x2::cbf::generated::kNaturalStanding;
+  std::vector<double> arm(standing.begin(), standing.end());
+  const std::array<double, 7> right{
+    1.2195245293972587, -0.35745308639855455, 0.77877897171611288, -1.3525817857779296,
+    -1.474963573344094, -0.19896486789711637, -0.4473240963224453};
+  std::copy(right.begin(), right.end(), arm.begin() + 7);
+  const std::array<double, 2> right_thumb{0.44924661356620199, 0.0078834578599495941};
+  const std::array<double, 2> left_gesture{0.66863211354711227, -0.35277882194107857};
+  {
+    auto thumbs = x2::cbf::kRigidThumbBaselineUrdf;
+    ASSERT_GT(right_hand_distance(arm, thumbs), 0.0);
+    thumbs[3] = right_thumb[0];
+    thumbs[4] = right_thumb[1];
+    ASSERT_LT(right_hand_distance(arm, thumbs), -0.02);
+  }
+  const auto config = fixture_config();
+  // Frame 0 publishes both baseline thumbs; frame 1 asks for the left gesture,
+  // and the right thumb either stays or moves into the body.
+  const auto second_frame = [&](bool phantom_right, bool move_right) {
+      CbfSafety safety(config);
+      auto snapshot = urdf_snapshot();
+      snapshot.requested.arm = arm;
+      snapshot.arm = Measured{arm, 0.0};
+      if (phantom_right) {
+        snapshot.hand_reported_absent = {false, true};
+        snapshot.thumb->position[2] = snapshot.thumb->position[3] = std::numeric_limits<double>::quiet_NaN();
+      }
+      const auto first = safety.filter(snapshot, 1.0);
+      EXPECT_TRUE(first.accept_new) << safety.diagnostics().reason;
+      safety.committed(first, 1.0);
+      snapshot.requested.sequence = 8;
+      snapshot.requested.hand[0] = left_gesture[0];
+      snapshot.requested.hand[1] = left_gesture[1];
+      if (move_right) {
+        snapshot.requested.hand[10] = right_thumb[0];
+        snapshot.requested.hand[11] = right_thumb[1];
+      }
+      return std::make_pair(safety.filter(snapshot, 1.02), first.output);
+    };
+  // Control: on a reported right hand that thumb angle is real, and holds the whole gesture.
+  {
+    const auto [held, first] = second_frame(false, true);
+    ASSERT_TRUE(held.accept_new);
+    EXPECT_TRUE(held.hand_held);
+    EXPECT_EQ(held.output.hand, first.hand);
+    const auto [still, unused] = second_frame(false, false);
+    ASSERT_TRUE(still.accept_new);
+    EXPECT_FALSE(still.hand_held);
+    EXPECT_EQ(still.output.hand[0], left_gesture[0]);
+  }
+  // A phantom right thumb stays where it was published: the left gesture passes
+  // in that frame, bit for bit as when the right thumb command does not change.
+  const auto [moved, first] = second_frame(true, true);
+  const auto [still, unused] = second_frame(true, false);
+  ASSERT_TRUE(moved.accept_new);
+  EXPECT_FALSE(moved.hand_held);
+  EXPECT_EQ(moved.output.hand[0], left_gesture[0]);
+  EXPECT_EQ(moved.output.hand[1], left_gesture[1]);
+  EXPECT_EQ(moved.output.hand[10], first.hand[10]);
+  EXPECT_EQ(moved.output.hand[11], first.hand[11]);
+  EXPECT_EQ(moved.output.arm, still.output.arm);
+  EXPECT_EQ(moved.output.hand, still.output.hand);
+  EXPECT_EQ(moved.recovery_verified, still.recovery_verified);
+  EXPECT_EQ(moved.geometry_modified, still.geometry_modified);
+}
+
+TEST(CbfSafety, APhantomRightHandChangesTheLeftHandAndArmsOnlyWhereItsGeometryIsNear)
+{
+  // Two hands configured with the right one an empty flange, against the
+  // left-only configuration with the platform reporting {1, 0}. The latter is
+  // the e965d015 behaviour: an offline driver linking both builds printed every
+  // decision of 600 frames bit for bit identical (RightSideFlags... above keeps
+  // the per-side flags out of it in this suite).
+  //
+  // Same requests, right thumb command unchanged. The two can only differ
+  // where the phantom right palm or thumb is in the geometry: a pair involving
+  // it within the activation distance (0.08 m, plus 0.02 m for the path
+  // between the checked poses) of the body, the thighs or the left arm. Far
+  // from them the outputs are bit for bit the same. Near them the phantom hand
+  // may stop or bend the arm the left-only filter lets through; that is what
+  // an empty flange costs (geometry_modified 389 against 1107 frames in the
+  // 3000-frame timing input), and the reason the reverse is unsafe.
+  //
+  // After a frame that differs the two robots are put back together (a new
+  // epoch, both at the phantom run's arm), so every compared frame starts from
+  // the same state.
+  auto left_value = urdf_fixture_json();
+  left_value["hands_installed"] = {true, false};
+  const auto left_config = fixture_config(left_value);
+  const auto phantom_config = fixture_config();
+  ASSERT_TRUE(left_config.matches_hand_types({1, 0}));
+  ASSERT_TRUE(phantom_config.matches_hand_types({1, 0}));
+  CbfSafety left_only(left_config);
+  CbfSafety phantom(phantom_config);
+  const auto & standing = x2::cbf::generated::kNaturalStanding;
+  const std::array<double, 7> reach{
+    0.66750223117580409, -0.35727957073251027, 0.49318808792707802, -1.1582442514935436,
+    0.64058981282216676, -0.1618123346891257, -0.13997082739639233};
+  std::uint64_t state = 88172645463325252ull;
+  const auto uniform = [&state](double lo, double hi) {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      return lo + (hi - lo) * static_cast<double>(state >> 11) * (1.0 / 9007199254740992.0);
+    };
+  const double activation = x2::cbf::SafetyFilterConfig{}.activation_distance_m;
+  auto snapshot = urdf_snapshot();
+  std::vector<double> requested(standing.begin(), standing.end());
+  std::vector<double> goal = requested, measured = requested;
+  std::array<double, 2> left_thumb_goal{snapshot.requested.hand[0], snapshot.requested.hand[1]};
+  std::array<double, 2> left_thumb{left_thumb_goal};
+  std::uint64_t epoch = 1;
+  int same_far = 0, same_near = 0, differed = 0;
+  double farthest_difference = -std::numeric_limits<double>::infinity();
+  for (int frame = 0; frame < 1500; ++frame) {
+    SCOPED_TRACE(frame);
+    const double now = 1.0 + 0.02 * frame;
+    if (frame % 40 == 0) {
+      if (frame < 500) {  // Left arm reaching anywhere, right arm standing.
+        for (std::size_t j = 0; j < 7; ++j) {goal[j] = uniform(left_config.lower[j], left_config.upper[j]);}
+        std::copy_n(standing.begin() + 7, 7, goal.begin() + 7);
+      } else if (frame < 1000) {  // Right arm towards the reach only its hand stops.
+        std::copy_n(standing.begin(), 7, goal.begin());
+        for (std::size_t j = 0; j < 7; ++j) {goal[7 + j] = reach[j] + uniform(-0.2, 0.2);}
+      } else {  // Both arms reaching anywhere.
+        for (std::size_t j = 0; j < 14; ++j) {goal[j] = uniform(left_config.lower[j], left_config.upper[j]);}
+      }
+    }
+    if (frame % 7 == 0) {
+      for (std::size_t a = 0; a < 2; ++a) {
+        left_thumb_goal[a] = uniform(left_config.thumb_model_limits[a][0], left_config.thumb_model_limits[a][1]);
+      }
+    }
+    for (std::size_t j = 0; j < 14; ++j) {requested[j] += std::clamp(goal[j] - requested[j], -0.1, 0.1);}
+    snapshot.epoch = epoch;
+    snapshot.requested.sequence = static_cast<std::uint32_t>(frame + 10);
+    snapshot.requested.arm = requested;
+    snapshot.requested.hand[0] = left_thumb_goal[0];
+    snapshot.requested.hand[1] = left_thumb_goal[1];
+    snapshot.arm = Measured{measured, 0.0};
+    auto left_snapshot = snapshot;
+    left_snapshot.thumb->position = {left_thumb[0], left_thumb[1]};
+    auto phantom_snapshot = snapshot;
+    phantom_snapshot.thumb->position = {left_thumb[0], left_thumb[1],
+      std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::quiet_NaN()};
+    phantom_snapshot.hand_reported_absent = {false, true};
+    const auto a = left_only.filter(left_snapshot, now);
+    const auto b = phantom.filter(phantom_snapshot, now);
+    left_only.committed(a, now);
+    phantom.committed(b, now);
+    const auto left_hand = [](const CbfDecision & d) {
+        const auto & hand = d.output.hand;  // Empty when nothing is published.
+        return std::vector<double>(hand.begin(), hand.begin() + std::min<std::size_t>(10, hand.size()));
+      };
+    const bool same = a.accept_new == b.accept_new && a.output.kind == b.output.kind &&
+      a.output.arm == b.output.arm && left_hand(a) == left_hand(b);
+    auto thumbs = x2::cbf::kRigidThumbBaselineUrdf;
+    thumbs[0] = snapshot.requested.hand[0];
+    thumbs[1] = snapshot.requested.hand[1];
+    double near = right_hand_distance(measured, thumbs);
+    near = std::min(near, right_hand_distance(requested, thumbs));
+    for (const auto * d : {&a, &b}) {
+      if (d->output.kind == Output::Kind::kUpperBody) {near = std::min(near, right_hand_distance(d->output.arm, thumbs));}
+    }
+    const bool is_near = near < activation + 0.02;
+    if (same) {
+      (is_near ? same_near : same_far) += 1;
+    } else {
+      ++differed;
+      farthest_difference = std::max(farthest_difference, near);
+      EXPECT_TRUE(is_near) << "outputs differ with the phantom hand " << near << " m away";
+    }
+    const auto & lead = same ? a : b;
+    if (lead.output.kind == Output::Kind::kUpperBody) {
+      for (std::size_t j = 0; j < 14; ++j) {measured[j] += 0.5 * (lead.output.arm[j] - measured[j]);}
+      for (std::size_t k = 0; k < 2; ++k) {left_thumb[k] += 0.5 * (lead.output.hand[k] - left_thumb[k]);}
+    }
+    if (!same) {++epoch;}  // Both start the next frame from the same state again.
+  }
+  std::printf("same_far=%d same_near=%d differed=%d farthest_difference_m=%.4f\n", same_far, same_near, differed,
+    farthest_difference);
+  // The input must reach both cases, or this proves nothing.
+  EXPECT_GT(same_far, 100);
+  EXPECT_GT(differed, 10);
 }

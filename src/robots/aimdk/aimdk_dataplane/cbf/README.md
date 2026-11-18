@@ -224,7 +224,10 @@ without readings or with a faulted hand is replaced, the other side's reading
 stays in use. Each such frame increments `thumb_feedback_frames`; the first
 frame of a new issue is logged once as `CBF_THUMB_FEEDBACK` with the raw native
 value and native bounds. A phantom hand's thumb (an installed side reported as
-no hand) is always the command and is not a feedback issue.
+no hand) is held where it was last published (the request on the first frame
+of an epoch), as both its current and its target angle, and is not a feedback
+issue: it never moves in the geometry, so it never starts a gesture ordering
+check or makes the whole-gesture deferral hold the other hand's gesture.
 
 A thumb command outside what the hand can reach is clamped into the native
 range intersected with the inverse-mapped model range, never refused.

@@ -4,7 +4,7 @@ The filter's decisions are covered by aimdk_dataplane's C++ tests. These cover
 the node around it: the status fields the runtime reads, the INFO line, the
 CBF_RELEASE log when the right hand is swapped for one the geometry was not
 built for mid-mirror and comes back, and an empty right flange checked as a
-phantom hand instead of released.
+phantom hand instead of released, its thumb held and its start and end logged.
 """
 
 from __future__ import annotations
@@ -166,6 +166,8 @@ def test_a_hand_swapped_mid_mirror_is_released_logged_and_recovers(node):
             "a distance after the release",
         )
         assert len(logged.matching("CBF_RELEASE start")) == 1
+        # Another hand type is no empty flange.
+        assert not logged.matching("CBF_HAND_ABSENT")
     finally:
         stop.set()
         thread.join(timeout=1.0)
@@ -189,6 +191,9 @@ def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
     cbf = cbf_report(harness, lambda cbf: cbf.get("phantom_hands") == [False, True], "the right hand as a phantom")
     assert cbf["hands_installed"] == [True, True]
     assert cbf["hand_configuration_matches"] is True
+    # Logged once when it starts, so a real hand that drops out shows in the field.
+    harness.wait_for(lambda: logged.matching("CBF_HAND_ABSENT side=right start"), "the phantom start line")
+    assert not logged.matching("CBF_HAND_ABSENT side=left")
 
     response = harness.set_mode("policy_stream")
     assert response.success, response.message
@@ -218,9 +223,13 @@ def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
         assert harness.status().active_mode == "policy_stream"
 
         # A left thumb reading inside the model band is used as it is; the
-        # phantom right thumb is the command. The mock stops echoing commands
-        # so the reading differs from the command (its arm stops following too,
-        # so this part checks no releases).
+        # phantom right thumb stays where it was published, as its target and
+        # its current angle, whatever the right command. The mock stops echoing
+        # commands so the reading differs from the command (its arm stops
+        # following too, so this part checks no releases: a later release
+        # publishes the request as it is, and the phantom thumb with it).
+        held = cbf["thumb_target_urdf"][2:]
+        assert held != pytest.approx([0.3, -0.4], abs=1e-9)
         harness.mock.set_parameters([rclpy.parameter.Parameter("follow_commands", value=False)])
         with harness.mock._lock:
             harness.mock._positions["L_thumb_roll_joint"] = 0.5
@@ -228,19 +237,28 @@ def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
         hand = [0.0] * 20
         hand[0], hand[1], hand[10], hand[11] = 0.9, -0.2, 0.3, -0.4
         stream(harness, stop, "/aimdk/hand/joint_commands", hand)
-        # The phantom thumb is the last published command, so the frame the
-        # new command arrives on still carries the previous one: wait for both.
         cbf = cbf_report(
             harness,
             lambda cbf: cbf.get("thumb_target_urdf")
-            and cbf["thumb_target_urdf"] == pytest.approx([0.9, -0.2, 0.3, -0.4], abs=1e-9)
-            and cbf["thumb_current_urdf"] == pytest.approx([0.5, -0.6, 0.3, -0.4], abs=1e-9),
-            "the left thumb reading and the right command in the CBF report",
+            and cbf["thumb_target_urdf"][:2] == pytest.approx([0.9, -0.2], abs=1e-9)
+            and cbf["thumb_current_urdf"][:2] == pytest.approx([0.5, -0.6], abs=1e-9),
+            "the left thumb command and reading in the CBF report",
         )
+        assert cbf["released"] == 0, "a release would publish the right command as it is"
+        assert cbf["thumb_target_urdf"][2:] == pytest.approx(held, abs=1e-9)
+        assert cbf["thumb_current_urdf"][2:] == pytest.approx(held, abs=1e-9)
         assert cbf["thumb_feedback_issue"] == ""
     finally:
         stop.set()
         thread.join(timeout=1.0)
+
+    # The hand is fitted: the phantom ends, logged once, and the start was logged once.
+    harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="dexterous")])
+    cbf_report(harness, lambda cbf: cbf.get("phantom_hands") == [False, False], "no phantom hand")
+    harness.wait_for(lambda: logged.matching("CBF_HAND_ABSENT side=right end"), "the phantom end line")
+    assert len(logged.matching("CBF_HAND_ABSENT side=right start")) == 1
+    assert len(logged.matching("CBF_HAND_ABSENT side=right end")) == 1
+    assert not logged.matching("CBF_HAND_ABSENT side=left")
 
 
 @pytest.mark.parametrize("node", [{"hands_installed": [True, False]}], indirect=True)

@@ -296,6 +296,27 @@ private:
       codes, stamp, monotonic_s());
     hand_ = message;
     hand_fresh_ = true;
+    note_phantom_transitions();
+  }
+
+  // An installed side reported as no hand is checked as a phantom hand. That is
+  // right for an empty flange but also hides a real hand that dropped out, so
+  // each change is logged once to be visible in the field.
+  void note_phantom_transitions()
+  {
+    if (!cbf_) {return;}
+    static const std::array<const char *, 2> side_names{"left", "right"};
+    const auto phantom = phantom_hands();
+    for (size_t side = 0; side < phantom.size(); ++side) {
+      if (phantom[side] == phantom_logged_[side]) {continue;}
+      phantom_logged_[side] = phantom[side];
+      if (phantom[side]) {
+        RCLCPP_WARN(get_logger(), "CBF_HAND_ABSENT side=%s start: installed hand reported as type 0, "
+          "checked as a phantom hand", side_names[side]);
+      } else {
+        RCLCPP_INFO(get_logger(), "CBF_HAND_ABSENT side=%s end", side_names[side]);
+      }
+    }
   }
 
   // What the motion-control unit is driving the arm to. A message with a
@@ -610,7 +631,7 @@ private:
            (installed[0] || hand_->left_hands.empty()) && (installed[1] || hand_->right_hands.empty());
   }
 
-  // Installed sides the platform reports as type 0: their thumbs are the command.
+  // Installed sides the platform reports as type 0, checked as phantom hands.
   std::array<bool, 2> phantom_hands() const
   {
     std::array<bool, 2> phantom{};
@@ -911,6 +932,7 @@ private:
   rclcpp::TimerBase::SharedPtr touch_timer_;
   rclcpp::TimerBase::SharedPtr echo_timer_;
   HandStateArray::ConstSharedPtr hand_;
+  std::array<bool, 2> phantom_logged_{};
   bool hand_fresh_ = false;
   std::unique_ptr<ibrobot_msgs::msg::JointCommandState> echo_;
   std::vector<std::string> pending_rejections_;

@@ -239,10 +239,11 @@ bool CbfSafetyConfig::matches_hand_types(const std::vector<int> & types) const
   for (size_t side = 0; side < hands_installed.size(); ++side) {
     // This geometry and mapping are for the OmniHand reported as SDK type 1.
     // An installed side reported as type 0 is an empty flange (a hand not yet
-    // fitted, or a dropout): its geometry stays in, checked as a phantom hand at
-    // the commanded thumb angles, which only adds collision pairs. The reverse is
-    // refused: a hand on a side configured without one (or any other hand type)
-    // has no collision body here, so it would move unchecked.
+    // fitted, or a dropout): its geometry stays in, checked as a phantom hand
+    // with its thumb held where it was published, which only adds collision
+    // pairs. The reverse is refused: a hand on a side configured without one
+    // (or any other hand type) has no collision body here, so it would move
+    // unchecked.
     const bool accepted = hands_installed[side] ? (types[side] == 1 || types[side] == 0) : types[side] == 0;
     if (!accepted) {return false;}
   }
@@ -378,13 +379,24 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   }
   Output command = snapshot.requested;
   clamp_thumb_command(config_, command);
+  // A phantom hand's thumb stays where it was last published (the request on
+  // the first frame of an epoch), the same angles its current pose uses below.
+  // It never moves in the geometry, so it can neither start a gesture ordering
+  // check nor make the whole-gesture deferral hold the real hand's gesture.
+  if (accepted_) {
+    for (size_t axis = 0; axis < kHandSlots.size(); ++axis) {
+      if (config_.hands_installed[axis / 2] && snapshot.hand_reported_absent[axis / 2]) {
+        command.hand[kHandSlots[axis]] = accepted_->hand[kHandSlots[axis]];
+      }
+    }
+  }
   // Thumb readings never gate a frame: no admission band covers OmniHand
   // tracking error, and a held frame cannot move the thumb back. Geometry uses
   // the reading clamped into the model range; a missing, stale, nonfinite or
   // faulted reading is replaced by the last published (else requested) command.
   // Each side is judged on its own: one side's missing or faulted thumb never
   // replaces the other side's reading. A side reported as an empty flange is a
-  // phantom hand: always the command, and not counted as a feedback problem.
+  // phantom hand: always the held command above, and not counted as a feedback problem.
   std::array<double, 4> thumb_current{};
   CbfThumbFeedbackEvent thumb_event;
   {

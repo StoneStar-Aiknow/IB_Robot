@@ -43,9 +43,14 @@ different mappings. Using a candidate does not establish physical calibration.
 `hands_installed` is explicit and defaults to both hands for existing callers;
 the X2 deployments configure `[true, true]`, the target hardware. An installed
 side the platform reports as no hand (type 0) is an empty flange: it is checked
-as a phantom hand, with its full palm and thumb geometry and its thumb taken as
-the command, so the same configuration and code run before and after the hand
-is fitted. A phantom hand only adds collision pairs. Only installed sides
+as a phantom hand, with its full palm and thumb geometry and its thumb held
+where it was last published (the request on the first frame of an epoch), so
+the same configuration and code run before and after the hand is fitted. The
+phantom thumb never moves, so its commands can never hold the real hand's
+gesture. A phantom hand only adds collision pairs. The data plane logs
+`CBF_HAND_ABSENT side=<left|right> start` when an installed side starts being
+reported as no hand and `... end` when it stops, so a real hand that drops out
+and is checked as a phantom is visible in the field. Only installed sides
 provide measured roll/abad feedback. The original hand20 command layout stays
 unchanged. Pairs containing a palm or thumb on a side configured `false` are
 excluded; all body and upper-arm/forearm pairs remain active, with the same

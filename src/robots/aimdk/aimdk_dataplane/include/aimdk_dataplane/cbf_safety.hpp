@@ -82,7 +82,7 @@ struct CbfSnapshot
   std::array<bool, 2> thumb_faulted{};
   // Per side: configured as installed while the platform reports no hand (SDK
   // type 0), i.e. an empty flange. Its geometry is still checked, as a phantom
-  // hand at the commanded thumb angles; this is no feedback problem.
+  // hand with its thumb where it was last published; this is no feedback problem.
   std::array<bool, 2> hand_reported_absent{};
   // Shared with the publishing tick. Numerical callers may omit this and use
   // the configured relative budget; wall-clock/ROS time must never be used here.
