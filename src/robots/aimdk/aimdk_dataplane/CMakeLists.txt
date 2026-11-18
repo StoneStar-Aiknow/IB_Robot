@@ -23,7 +23,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(x2_cbf_core PRIVATE -O3)
 endif()
 
-add_library(aimdk_dataplane_core STATIC src/projection.cpp src/core.cpp src/cbf_safety.cpp)
+add_library(aimdk_dataplane_core STATIC src/projection.cpp src/core.cpp src/cbf_safety.cpp
+  src/template_play.cpp)
 target_include_directories(aimdk_dataplane_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
@@ -63,6 +64,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_cbf_kernel x2_cbf_core)
   ament_add_gtest(test_cbf_safety test/test_cbf_safety.cpp)
   target_link_libraries(test_cbf_safety aimdk_dataplane_core)
+  ament_add_gtest(test_template_play test/test_template_play.cpp)
+  target_link_libraries(test_template_play aimdk_dataplane_core)
 endif()
 
 ament_package()

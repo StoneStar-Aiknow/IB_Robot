@@ -2403,3 +2403,76 @@ TEST(CbfSafety, WithTwoHandsAFirstFrameThumbVerdictNoLongerPublishesNothingForev
   EXPECT_GT(released_frames, 0);
   EXPECT_EQ(safety.diagnostics().collision_release_episodes, 1u);
 }
+
+TEST(CbfSafety, APlayedFrameBecomesTheCommittedPairOfItsEpochOnly)
+{
+  CbfSafety safety(fixture_config());
+  const auto initial = safety.filter(urdf_snapshot(), 1.0);
+  ASSERT_TRUE(initial.accept_new);
+  safety.committed(initial, 1.0);
+  auto played = initial.output;
+  played.arm[0] += 0.01;
+  played.hand[5] = 0.3;
+
+  // Another epoch is counted but cannot become the pair a hold repeats.
+  safety.played(played, 2, 1.02);
+  EXPECT_EQ(safety.diagnostics().played, 1u);
+  EXPECT_EQ(safety.diagnostics().reason, "played");
+  auto stale = urdf_snapshot();
+  stale.arm->age_s = safety.config().feedback_max_age_s + 0.001;
+  expect_held_pair(safety.filter(stale, 1.04), initial.output);
+
+  safety.played(played, 1, 1.06);
+  EXPECT_EQ(safety.diagnostics().played, 2u);
+  EXPECT_FALSE(safety.diagnostics().distance_valid);
+  EXPECT_FALSE(safety.diagnostics().recovery_verified);
+  EXPECT_FALSE(safety.diagnostics().hand_held);
+  expect_held_pair(safety.filter(stale, 1.08), played);
+  // Played frames are not filter publications.
+  EXPECT_EQ(safety.diagnostics().published, 1u);
+  EXPECT_EQ(safety.diagnostics().accepted, 1u);
+}
+
+TEST(CbfSafety, APlayedFrameEndsAHoldSoTheNextHoldStartsItsOwnClock)
+{
+  CbfSafety safety(fixture_config());
+  const auto initial = safety.filter(urdf_snapshot(), 1.0);
+  ASSERT_TRUE(initial.accept_new);
+  safety.committed(initial, 1.0);
+  auto stale = urdf_snapshot();
+  stale.arm->age_s = safety.config().feedback_max_age_s + 0.001;
+  auto held = safety.release_if_stuck(safety.filter(stale, 1.02), stale, 1.02);
+  safety.committed(held, 1.02);
+  held = safety.release_if_stuck(safety.filter(stale, 1.12), stale, 1.12);
+  safety.committed(held, 1.12);
+  EXPECT_NEAR(safety.diagnostics().stuck_s, 0.1, 1e-9);
+
+  safety.played(initial.output, 1, 1.14);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);
+  EXPECT_FALSE(safety.diagnostics().releasing);
+  EXPECT_FALSE(safety.diagnostics().stuck_collision);
+
+  // Without the reset the hold would be 0.23 s old here and released.
+  held = safety.release_if_stuck(safety.filter(stale, 1.16), stale, 1.16);
+  safety.committed(held, 1.16);
+  const auto later = safety.release_if_stuck(safety.filter(stale, 1.25), stale, 1.25);
+  EXPECT_FALSE(later.released);
+  EXPECT_NEAR(safety.diagnostics().stuck_s, 0.09, 1e-9);
+  EXPECT_TRUE(safety.release_if_stuck(safety.filter(stale, 1.37), stale, 1.37).released);
+}
+
+TEST(CbfSafety, ShadowCountsPlayedFramesWithoutKeepingThem)
+{
+  auto value = urdf_fixture_json();
+  value["mode"] = "shadow";
+  CbfSafety safety(fixture_config(value));
+  auto snapshot = urdf_snapshot();
+  const auto first = safety.filter(snapshot, 1.0);
+  safety.committed(first, 1.0);
+  auto played = first.output;
+  played.arm[0] += 0.01;
+  safety.played(played, 1, 1.02);
+  EXPECT_EQ(safety.diagnostics().played, 1u);
+  // Shadow publishes the request as is, before and after.
+  expect_original_output(safety.filter(snapshot, 1.04).output, snapshot.requested);
+}

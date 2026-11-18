@@ -63,6 +63,10 @@ struct CbfSafetyConfig
   std::string feedback_error(const CbfSnapshot & snapshot) const;
 };
 
+// What a thumb axis (0..3 = L roll, L abad, R roll, R abad) can be commanded to,
+// in command values: its native range, else the model range.
+std::array<double, 2> cbf_thumb_command_band(const CbfSafetyConfig & config, size_t axis);
+
 struct CbfSnapshot
 {
   Output requested;
@@ -179,6 +183,7 @@ struct CbfDiagnostics
   std::string thumb_feedback_issue;  // This frame's issue, empty when the reading was used as is.
   std::optional<CbfThumbFeedbackEvent> last_thumb_feedback_event;
   uint64_t released = 0;
+  uint64_t played = 0;  // Frames published by the template player, not by the filter.
   uint64_t release_episodes = 0;
   uint64_t collision_release_episodes = 0;  // Episodes that released after a collision verdict.
   bool releasing = false;
@@ -200,6 +205,10 @@ public:
   CbfDecision feedback_fallback(const CbfDecision & decision, const std::string & reason);
   // Last step before publication. Every hold ends: see the release times in the config.
   CbfDecision release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now);
+  // A frame the template player published instead of the filter. Under enforce it
+  // becomes the committed pair of the same epoch, so the filter resumes from where
+  // the arm is; it is never verified and ends any hold.
+  void played(const Output & output, uint64_t epoch, double now);
   void tick_finished(double elapsed_us, double after_check_us = 0.0);
   void discarded();
   void inactive(uint64_t epoch);
