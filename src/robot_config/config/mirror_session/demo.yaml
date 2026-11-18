@@ -17,4 +17,9 @@
 session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0}
 timing:      {start_confirm_s: 1.5, cancel_confirm_s: 2.0}
 cover_judge: {percentile: 95, max_value: 45}
-operator:    {max_session_s: 100.0, leave_stop_min_round_s: 10.0}
+# feat/x2-actor-harden
+# leave_stop_min_round_s 0: a round the person walked out of goes back to STANDBY, not WAIT
+# (zll 11-18). 10.0 is the old value. max_session_s stays 100: visual_interaction's
+# max_per_round auto reads it (100 s = 40 lines).
+operator:    {max_session_s: 100.0, leave_stop_min_round_s: 0}
+# /feat/x2-actor-harden

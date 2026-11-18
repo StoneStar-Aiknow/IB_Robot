@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from manipulation_execution.mirror_operator.config import OperatorConfig
 from manipulation_execution.mirror_operator.core import TIMEOUT_RETRY_S, Operator
 from manipulation_execution.mirror_operator.judge import CoverJudge
+from manipulation_execution.mirror_session.business import load_business_config
 
 MIN_ROUND = 10.0
 SESSION_LIMIT = 60.0
@@ -224,3 +227,30 @@ def test_send_disabled_records_once():
     assert calls.stops == []
     assert operator.status()["session_timeout"]["last"]["result"] == "not_sent"
     assert sum("leave stop (attempt" in message for _, message in logs) == 1
+
+
+# feat/x2-actor-harden
+SHIPPED_DEMO = Path(__file__).resolve().parents[2] / "robot_config" / "config" / "mirror_session" / "demo.yaml"
+
+
+def test_the_shipped_demo_config_has_the_leave_stop_off_and_keeps_the_session_limit():
+    # zll 11-18: a round the person walked out of goes back to STANDBY; max_session_s stays
+    # 100 because visual_interaction's max_per_round auto reads it.
+    config = OperatorConfig.from_mapping(load_business_config(str(SHIPPED_DEMO)).operator)
+    assert config.leave_stop_min_round_s == 0.0
+    assert config.max_session_s == 100.0
+
+
+def test_with_the_shipped_config_a_long_round_the_person_left_waits_for_the_session_limit():
+    config = OperatorConfig.from_mapping(load_business_config(str(SHIPPED_DEMO)).operator)
+    operator, clock, calls, _ = make(config.leave_stop_min_round_s, config.max_session_s)
+    start_round(operator, clock)
+    play(operator, clock, 30.0, "no_actor")
+    run(operator, clock, 50.0, cancelled("no_actor")[2])
+    assert calls.stops == []
+    run(operator, clock, 10.0, cancelled("no_actor")[2])  # past 100 s since WAIT
+    assert len(calls.stops) == 1
+    assert operator.status()["session_timeout"]["cause"] != "leave"
+
+
+# /feat/x2-actor-harden
