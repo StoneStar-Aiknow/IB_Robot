@@ -117,3 +117,61 @@ def blend(start: Sequence[float], goal: Sequence[float], ratio: float) -> list[f
     ratio = min(max(ratio, 0.0), 1.0)
     weight = 0.5 - 0.5 * math.cos(math.pi * ratio)
     return [a + (b - a) * weight for a, b in zip(start, goal, strict=True)]
+
+
+def planned_trajectory(
+    name: str,
+    start: Sequence[float],
+    joint_names: Sequence[str],
+    times: Sequence[float],
+    points: Sequence[Sequence[float]],
+    *,
+    limits: dict[str, tuple[float, float]],
+    max_speed_radps: float,
+    rate_hz: float,
+) -> ArmTrajectory:
+    """A caller-computed arm trajectory, from the measured ``start``, ready to replay.
+
+    ``joint_names`` may be any subset of the arm joints; the others hold
+    ``start``. Waypoints are joined by a cosine ease (zero velocity at each
+    waypoint, the same profile the replay uses to ease in), sampled at
+    ``rate_hz``. A goal is refused rather than repaired: an unknown or repeated
+    joint, a non-finite value, time not moving forward, a target outside
+    ``limits`` or a step faster than ``max_speed_radps`` would each execute a
+    motion the caller did not plan.
+    """
+    names = [str(joint) for joint in joint_names]
+    unknown = sorted(set(names) - set(VENDOR_ARM_ORDER))
+    if not names or unknown or len(set(names)) != len(names):
+        raise TrajectoryError(f"joint_names must be distinct arm joints; unknown {unknown}" if unknown else
+                              "joint_names must be distinct and non-empty")  # fmt: skip
+    if not points or len(points) != len(times):
+        raise TrajectoryError("needs at least one point and one time per point")
+    if times[0] <= 0.0 or any(b <= a for a, b in zip(times, times[1:], strict=False)):
+        raise TrajectoryError("time_from_start must be positive and strictly increasing")
+    index = {joint: i for i, joint in enumerate(names)}
+    knots = [tuple(float(v) for v in start)]
+    for row in points:
+        if len(row) != len(names) or not all(math.isfinite(float(v)) for v in row):
+            raise TrajectoryError(f"every point needs {len(names)} finite positions")
+        for joint, value in zip(names, row, strict=True):
+            low, high = limits[joint]
+            if not low <= float(value) <= high:
+                raise TrajectoryError(f"{joint} target {float(value):.3f} outside [{low:.3f}, {high:.3f}]")
+        knots.append(tuple(float(row[index[j]]) if j in index else knots[0][k] for k, j in enumerate(VENDOR_ARM_ORDER)))
+    knot_times = [0.0, *(float(t) for t in times)]
+    sample_times, samples = [0.0], [knots[0]]
+    for k in range(1, len(knots)):
+        t0, t1 = knot_times[k - 1], knot_times[k]
+        steps = max(1, math.ceil((t1 - t0) * rate_hz))
+        for i in range(1, steps + 1):
+            sample_times.append(t0 + (t1 - t0) * i / steps)
+            samples.append(tuple(blend(knots[k - 1], knots[k], i / steps)))
+    for k in range(1, len(samples)):
+        dt = sample_times[k] - sample_times[k - 1]
+        step = max(abs(b - a) for a, b in zip(samples[k - 1], samples[k], strict=True))
+        if step / dt > max_speed_radps:
+            raise TrajectoryError(
+                f"{step / dt:.2f} rad/s at t={sample_times[k]:.2f}s exceeds the {max_speed_radps} rad/s limit"
+            )
+    return ArmTrajectory(name=name, target="both", times=tuple(sample_times), positions=tuple(samples))
