@@ -132,3 +132,55 @@ def test_motion_requires_unchanged_clearance_and_a_certified_stop_bridge(tmp_pat
     record["motion_enabled"] = True
     template.write_text(yaml.safe_dump(record))
     assert motion_parameters(settings)["motion_name"] == "overhead_heart"
+
+
+# -- preset_motions.gesture (the hand gesture templates heart / holy / xsign) ------------------
+
+
+def test_no_gesture_section_leaves_the_observer_parameters_as_they_were():
+    result = launch_parameters({"preset_motions": {"enabled": True}}, STREAM)
+    assert not {k for k in result if k.startswith("gesture")}
+
+
+def test_gesture_section_becomes_three_parameters():
+    section = {"enabled": True, "gesture": {"enabled": True, "window_s": 0.6, "min_frames": 4, "exit_s": 0.3}}
+    result = launch_parameters({"preset_motions": section}, STREAM)
+    assert result["gesture_enabled"] is True and result["gesture_topic"] == "/hri/hand/gesture"
+    assert json.loads(result["gesture_vote_json"]) == {"window_s": 0.6, "min_frames": 4, "exit_s": 0.3}
+    off = launch_parameters({"preset_motions": {"enabled": True, "gesture": {"topic": "/g"}}}, STREAM)
+    assert off["gesture_enabled"] is False and off["gesture_topic"] == "/g" and off["gesture_vote_json"] == "{}"
+
+
+def test_gesture_vote_json_builds_the_vote_config():
+    from manipulation_execution.preset_motions.gesture_vote import VoteConfig
+
+    section = {"enabled": True, "gesture": {"enabled": True, "min_score": 0.6, "max_source_age_s": 0.5}}
+    vote = json.loads(launch_parameters({"preset_motions": section}, STREAM)["gesture_vote_json"])
+    assert VoteConfig(**vote) == VoteConfig(min_score=0.6, max_source_age_s=0.5)
+
+
+@pytest.mark.parametrize(
+    "gesture",
+    [
+        True,
+        {"enabled": "yes"},
+        {"window": 0.6},
+        {"window_s": 0},
+        {"window_s": float("inf")},
+        {"exit_s": True},
+        {"min_frames": 2.5},
+        {"min_score": 1.5},
+        {"topic": ""},
+        {"topic": 5},
+    ],
+)
+def test_bad_gesture_section_is_rejected(gesture):
+    with pytest.raises(ValueError):
+        launch_parameters({"preset_motions": {"enabled": True, "gesture": gesture}}, STREAM)
+
+
+def test_gesture_cannot_run_with_motion_output():
+    section = {"enabled": True, "motion_enabled": True, "template_file": "t", "geometry_file": "g",
+               "gesture": {"enabled": True}}  # fmt: skip
+    with pytest.raises(ValueError, match="gesture"):
+        launch_parameters({"preset_motions": section}, STREAM)

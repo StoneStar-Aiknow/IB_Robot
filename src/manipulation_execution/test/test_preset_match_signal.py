@@ -167,3 +167,38 @@ def test_round_barrier_is_strictly_newer_and_rejects_stale_human_exit():
 def test_input_invalid_cannot_be_relabelled_as_a_valid_geometry_exit():
     signal = decode(message(active=False, input_valid=False, reason="pose_exited"))
     assert signal == MatchSignal(False, False, None, "input_invalid")
+
+
+# -- the gesture templates (heart / holy / xsign) on the same topic ------------------------------
+from manipulation_execution.preset_motions.match_signal import TEMPLATE_NAMES  # noqa: E402
+
+
+def test_template_names():
+    assert TEMPLATE_NAMES == ("overhead_heart", "heart", "holy", "xsign")
+
+
+@pytest.mark.parametrize("name", ["heart", "holy", "xsign"])
+def test_default_reads_overhead_heart_only_so_old_consumers_never_see_a_gesture(name):
+    assert decode(message(template_name=name)) == MatchSignal(False, False, None, "template_invalid")
+
+
+@pytest.mark.parametrize("name", TEMPLATE_NAMES)
+def test_gesture_templates_are_read_when_asked_with_the_same_checks(name):
+    got = decode(message(template_name=name), templates=TEMPLATE_NAMES)
+    assert got == MatchSignal(True, True, 7, "holding") and got.template_name == name
+    assert decode(message(template_name=name, actor_id=4), templates=TEMPLATE_NAMES).reason == "actor_mismatch"
+    assert decode(message(template_name=name, reason="awaiting_pose"), templates=TEMPLATE_NAMES).reason == (
+        "reason_invalid"
+    )
+
+
+def test_a_subset_of_templates_and_bad_template_lists():
+    assert decode(message(template_name="holy"), templates=("heart",)).reason == "template_invalid"
+    assert decode(message(template_name="holy"), templates=("holy",)).valid
+    for bad in ((), ("wave",), "holy", None):
+        assert decode(templates=bad) == MatchSignal(False, False, None, "templates_invalid")
+
+
+def test_template_name_is_not_part_of_equality():
+    assert decode().template_name == "overhead_heart"
+    assert decode() == MatchSignal(True, True, 7, "holding")

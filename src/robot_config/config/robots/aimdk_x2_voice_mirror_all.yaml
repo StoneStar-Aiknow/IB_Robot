@@ -509,4 +509,14 @@ robot:
       enter_confirm_s: 0.5
       exit_confirm_s: 0.4
       min_enter_frames: 3
+    # Hand gesture templates heart / holy / xsign on /preset_motions/state, voted
+    # from hands.perception's gesture model (/hri/hand/gesture). Off: it needs
+    # hands.perception.parameters.gesture_enabled and a consumer that reads them.
+    gesture:
+      enabled: false
+      topic: /hri/hand/gesture
+      window_s: 0.6
+      min_frames: 4
+      min_score: 0.5
+      exit_s: 0.3
   # /feat/x2-preset-motions

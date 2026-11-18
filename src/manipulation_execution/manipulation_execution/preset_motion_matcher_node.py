@@ -2,6 +2,14 @@
 
 This node has no actuator publisher or runtime action client. An accepted
 match is a perception event, not a claim that a robot motion was executed.
+
+With ``gesture_enabled`` it also reads the hand gesture stream
+(``gesture_topic``, x2_hand_gesture/v1 from hand_perception_node) and puts three
+more templates on ``match_state_topic``: ``heart``, ``holy``, ``xsign``
+(preset_motions/gesture_vote.py). Each state publish then sends four messages,
+``overhead_heart`` first, exactly as without the gesture input; at most one of
+the four is active. Without ``gesture_enabled`` nothing changes: no gesture
+subscription, ``overhead_heart`` only.
 """
 
 from __future__ import annotations
@@ -19,6 +27,7 @@ from std_msgs.msg import String
 from ibrobot_msgs.msg import ActorState, PearFrame
 from manipulation_execution.preset_motions import HeartBounds, HeartRuleConfig, MatcherConfig, PoseMatcher
 from manipulation_execution.preset_motions.config import (
+    GESTURE_TOPIC,
     MATCH_STATE_TOPIC,
     MATCH_TOPIC,
     STATE_TOPIC,
@@ -27,6 +36,7 @@ from manipulation_execution.preset_motions.config import (
     topic,
 )
 from manipulation_execution.preset_motions.events import match_event, match_state
+from manipulation_execution.preset_motions.gesture_vote import GestureFusion, VoteConfig
 from manipulation_execution.preset_motions.session_gate import SessionGate
 
 
@@ -40,8 +50,8 @@ def make_config(value):
 
 
 class PresetMotionMatcherNode(Node):
-    def __init__(self):
-        super().__init__("preset_motion_matcher")
+    def __init__(self, parameter_overrides=None):
+        super().__init__("preset_motion_matcher", parameter_overrides=parameter_overrides)
         defaults = {
             "pear_frame_topic": "/motion_imitation_stream/pear_frame",
             "actor_state_topic": "/motion_imitation_stream/actor_state",
@@ -51,6 +61,9 @@ class PresetMotionMatcherNode(Node):
             "match_state_topic": MATCH_STATE_TOPIC,
             "matcher_json": "{}",
             "motion_enabled": False,
+            "gesture_enabled": False,
+            "gesture_topic": GESTURE_TOPIC,
+            "gesture_vote_json": "{}",  # gesture_vote.VoteConfig fields
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
@@ -61,6 +74,11 @@ class PresetMotionMatcherNode(Node):
         self._result = None
         self._events = 0
         self._session_active = False
+        self._epoch = 0
+        self._gesture = None
+        if self.get_parameter("gesture_enabled").value is True:
+            vote = VoteConfig(**json.loads(self.get_parameter("gesture_vote_json").value))
+            self._gesture = GestureFusion(vote, actor_max_age_s=self._matcher.config.actor_max_age_s)
         group = MutuallyExclusiveCallbackGroup()
         self._events_pub = self.create_publisher(String, self._topic("match_topic"), 10)
         self._status_pub = self.create_publisher(String, self._topic("status_topic"), 10)
@@ -72,9 +90,15 @@ class PresetMotionMatcherNode(Node):
             ActorState, self._topic("actor_state_topic"), self._actor, qos_profile_sensor_data, callback_group=group
         )
         self.create_subscription(String, self._topic("session_state_topic"), self._state, 10, callback_group=group)
+        if self._gesture is not None:
+            self.create_subscription(String, self._topic("gesture_topic"), self._gesture_msg, 10, callback_group=group)
         self.create_timer(0.05, self._tick, callback_group=group)
         self.create_timer(1.0, self._status, callback_group=group)
         self.get_logger().info("overhead-heart observer enabled; robot motion output remains disabled")
+        if self._gesture is not None:
+            self.get_logger().info(
+                f"hand gestures heart/holy/xsign from {self._topic('gesture_topic')}: {self._gesture.vote.config}"
+            )
 
     def _topic(self, name):
         return topic(self.get_parameter(name).value, name)
@@ -84,7 +108,9 @@ class PresetMotionMatcherNode(Node):
 
     def _permit(self, ros, mono):
         epoch, active = self._gate.permit(now_ros_s=ros, now_mono_s=mono)
-        self._session_active = active
+        self._session_active, self._epoch = active, epoch
+        if self._gesture is not None:
+            self._gesture.set_session(epoch, active)
         self._accept(self._matcher.set_session(epoch=epoch, active=active))
         self._accept(self._matcher.tick(now_ros_s=ros, now_mono_s=mono))
 
@@ -106,6 +132,8 @@ class PresetMotionMatcherNode(Node):
         ros, mono = self._times()
         self._permit(ros, mono)
         self._matcher.observe_actor(message, now_mono_s=mono)
+        if self._gesture is not None:
+            self._gesture.observe_actor(message, now_mono_s=mono)
         self._accept(self._matcher.tick(now_ros_s=ros, now_mono_s=mono))
         self._publish_match_state()
 
@@ -113,6 +141,12 @@ class PresetMotionMatcherNode(Node):
         ros, mono = self._times()
         self._permit(ros, mono)
         self._accept(self._matcher.observe_pear(message, now_ros_s=ros, now_mono_s=mono))
+        self._publish_match_state()
+
+    def _gesture_msg(self, message):
+        ros, mono = self._times()
+        self._permit(ros, mono)
+        self._gesture.observe(message.data, now_ros_s=ros, now_mono_s=mono)
         self._publish_match_state()
 
     def _tick(self):
@@ -124,6 +158,20 @@ class PresetMotionMatcherNode(Node):
         if self._result is not None:
             payload = match_state(self._result, self.get_clock().now().nanoseconds, session_active=self._session_active)
             self._match_state_pub.publish(String(data=json.dumps(payload, sort_keys=True, allow_nan=False)))
+            if self._gesture is not None:
+                self._publish_gestures()
+
+    def _publish_gestures(self):
+        now_ns = self.get_clock().now().nanoseconds
+        results = self._gesture.results(
+            overhead_active=self._result.active is True,
+            session_active=self._session_active,
+            epoch=self._epoch,
+            now_mono_s=self._times()[1],
+        )
+        for result in results:
+            payload = match_state(result, now_ns, session_active=self._session_active)
+            self._match_state_pub.publish(String(data=json.dumps(payload, sort_keys=True, allow_nan=False)))
 
     def _status(self):
         result = asdict(self._result) if self._result is not None else {}
@@ -133,6 +181,15 @@ class PresetMotionMatcherNode(Node):
             motion_enabled=False,
             motion_state="disabled_pending_validated_template_and_handoff",
         )
+        if self._gesture is not None:
+            g = self._gesture
+            result["gesture"] = {
+                "latched": g.latch.latched,
+                "actor_id": g.vote.actor_id,
+                "counted": g.counted,
+                "ignored": g.ignored,
+                "last_ignored": g.vote.last_reason,
+            }
         self._status_pub.publish(String(data=json.dumps(result, sort_keys=True, allow_nan=False)))
 
 

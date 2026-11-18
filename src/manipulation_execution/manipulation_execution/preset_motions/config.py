@@ -17,6 +17,7 @@ MATCH_TOPIC = "/preset_motions/matched"
 STATUS_TOPIC = "/preset_motions/status"
 STATE_TOPIC = "/mirror_session/state"
 MATCH_STATE_TOPIC = "/preset_motions/state"
+GESTURE_TOPIC = "/hri/hand/gesture"
 _KEYS = {
     "enabled",
     "motion_enabled",
@@ -27,7 +28,10 @@ _KEYS = {
     "motion_name",
     "template_file",
     "geometry_file",
+    "gesture",
 }
+# preset_motions.gesture: the hand gesture vote (gesture_vote.VoteConfig fields besides enabled/topic)
+_GESTURE_VOTE = {"window_s", "min_frames", "min_score", "exit_s", "max_source_age_s", "future_tolerance_s"}
 _TIMING = {
     "enter_confirm_s",
     "exit_confirm_s",
@@ -82,6 +86,27 @@ def matcher_settings(value):
     return result
 
 
+def gesture_settings(value):
+    """(enabled, topic, vote numbers) of ``preset_motions.gesture``."""
+    if not isinstance(value, Mapping):
+        raise ValueError("preset_motions.gesture must be a mapping")
+    unknown = set(value) - (_GESTURE_VOTE | {"enabled", "topic"})
+    if unknown:
+        raise ValueError(f"preset_motions.gesture has unknown keys {sorted(unknown)}")
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("preset_motions.gesture.enabled must be a boolean")
+    vote = {key: value[key] for key in _GESTURE_VOTE & value.keys()}
+    for key, number in vote.items():
+        if type(number) not in (int, float) or not math.isfinite(number) or number <= 0:
+            raise ValueError(f"preset_motions.gesture.{key} must be finite and positive")
+    if "min_frames" in vote and type(vote["min_frames"]) is not int:
+        raise ValueError("preset_motions.gesture.min_frames must be an integer")
+    if "min_score" in vote and vote["min_score"] > 1:
+        raise ValueError("preset_motions.gesture.min_score must be at most 1")
+    return enabled, topic(value.get("topic", GESTURE_TOPIC), "gesture topic"), vote
+
+
 def launch_parameters(robot_config, stream):
     """Return observer parameters, or None for the unchanged disabled baseline."""
     section = robot_config.get("preset_motions")
@@ -96,7 +121,12 @@ def launch_parameters(robot_config, stream):
         return None
     if section.get("motion_enabled", False) and (not section.get("template_file") or not section.get("geometry_file")):
         raise ValueError("preset_motions motion output requires a validated template and geometry artifact")
-    return {
+    gesture = gesture_settings(section["gesture"]) if "gesture" in section else None
+    if gesture is not None and gesture[0] and section.get("motion_enabled", False):
+        # mirror_session's preset consumer reads overhead_heart only; the gesture
+        # templates on the same topic would read to it as invalid input.
+        raise ValueError("preset_motions.gesture cannot be enabled together with motion_enabled")
+    parameters = {
         "pear_frame_topic": topic(stream.get("frame_topic", ""), "PEAR frame topic"),
         "actor_state_topic": topic(stream.get("actor_state_topic", ""), "actor state topic"),
         "session_state_topic": STATE_TOPIC,
@@ -106,6 +136,12 @@ def launch_parameters(robot_config, stream):
         "matcher_json": json.dumps(matcher_settings(section.get("matcher", {})), sort_keys=True),
         "motion_enabled": False,
     }
+    if gesture is not None:
+        enabled, gesture_topic, vote = gesture
+        parameters.update(
+            gesture_enabled=enabled, gesture_topic=gesture_topic, gesture_vote_json=json.dumps(vote, sort_keys=True)
+        )
+    return parameters
 
 
 def motion_parameters(robot_config, resolver=lambda value: value):
