@@ -36,11 +36,16 @@ def recorded_calls(paths: list[Path]) -> list[Path]:
     return files
 
 
-def with_leg_boxes(estimate, shrink_m: float):
-    """The estimate with the pelvis and left leg as boxes in its coarse scene only (scene_estimation.leg_boxes)."""
-    from aimdk_grasp.scene_estimation import leg_boxes
+def with_leg_boxes(estimate, shrink_m: float, side: str = "left"):
+    """The estimate with the pelvis and ``side``'s leg as boxes in its coarse scene only (scene_estimation.leg_boxes).
 
-    scene = dict(estimate.scene, cuboid={**estimate.scene["cuboid"], **leg_boxes(shrink_m)})
+    Boxes the recording already carries for that leg are replaced, so ``shrink_m`` is the one in effect.
+    """
+    from aimdk_grasp.scene_estimation import leg_boxes, leg_obstacle_name
+
+    prefix = f"{leg_obstacle_name(side)}_"
+    cuboids = {name: box for name, box in estimate.scene["cuboid"].items() if not name.startswith(prefix)}
+    scene = dict(estimate.scene, cuboid={**cuboids, **leg_boxes(shrink_m, side)})
     return replace(estimate, scene=scene)
 
 
@@ -101,7 +106,7 @@ def replay(files, service, *, leg_shrink_m=None, budget_s=None, repeats=1):
             clock += 100.0
             feedback, estimate, options = shifted(recorded, offset)
             if leg_shrink_m is not None:
-                estimate = with_leg_boxes(estimate, leg_shrink_m)
+                estimate = with_leg_boxes(estimate, leg_shrink_m, side)
             budget = budget_s if budget_s is not None else recorded["budget_s"]
             rebuilt = arm_service._planner is None or not arm_service._planner.locked_joints_match(feedback)
             row = dict(call=path.name, repeat=repeat, live=recorded["outcome"], rebuilt=rebuilt, budget_s=budget)
