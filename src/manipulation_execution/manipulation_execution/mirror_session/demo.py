@@ -20,6 +20,13 @@ class replaces it. It answers four things itself and passes everything else to
 
 * ``cooldown_over``: ``cooldown_s`` has passed.
 
+``cancel_on_actor_loss: false`` (default true: the rules above) keeps a round
+going while the person is lost: ``no_actor`` and ``too_far`` no longer cancel,
+``no_pose`` counts PEAR frames of any source (the stream goes on with
+``center_fallback`` frames while nobody is locked), and ``stale`` also covers
+an ``ActorState`` never received. A round then ends on its own only when the
+stream stops. ``start_criteria`` is unchanged.
+
 The confirm times (``timing`` section) are the core's, not applied here.
 
 The PEAR window only holds the frames since the previous tick, so the newest
@@ -50,23 +57,30 @@ DEMO_SESSION_DEFAULTS = {
     "min_box_height_px": 0.0,
     "cooldown_s": 2.0,
 }
+DEMO_SESSION_SWITCHES = {"cancel_on_actor_loss": True}
 POSE_SOURCE = "yolox"
 
 
-def _settings(config: Mapping[str, Any] | None) -> dict[str, float]:
+def _settings(config: Mapping[str, Any] | None) -> dict[str, float | bool]:
     if config is None:
         config = {}
     if not isinstance(config, Mapping):
         raise ValueError("the demo session config must be a mapping")
-    unknown = sorted(set(config) - set(DEMO_SESSION_DEFAULTS))
+    known = set(DEMO_SESSION_DEFAULTS) | set(DEMO_SESSION_SWITCHES)
+    unknown = sorted(set(config) - known)
     if unknown:
-        raise ValueError(f"the demo session config has unknown keys {unknown}; known: {sorted(DEMO_SESSION_DEFAULTS)}")
-    settings = {}
+        raise ValueError(f"the demo session config has unknown keys {unknown}; known: {sorted(known)}")
+    settings: dict[str, float | bool] = {}
     for name, default in DEMO_SESSION_DEFAULTS.items():
         value = config.get(name, default)
         if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value) or value < 0:
             raise ValueError(f"session.{name} must be a finite number, not negative")
         settings[name] = float(value)
+    for name, default in DEMO_SESSION_SWITCHES.items():
+        value = config.get(name, default)
+        if not isinstance(value, bool):
+            raise ValueError(f"session.{name} must be true or false")
+        settings[name] = value
     return settings
 
 
@@ -90,10 +104,12 @@ class DemoHooks(SessionHooks):
         self._pear_max_age_s = settings["pear_max_age_s"]
         self._min_box_height_px = settings["min_box_height_px"]
         self._cooldown_s = settings["cooldown_s"]
+        self._cancel_on_actor_loss = settings["cancel_on_actor_loss"]
         self._context = context
         self._inner = inner
         self._clock = clock
         self._pose_at: float | None = None
+        self._frame_at: float | None = None  # newest PEAR frame of any source
         self._box_height = math.nan
         self.cancel_reason = ""
 
@@ -103,6 +119,7 @@ class DemoHooks(SessionHooks):
 
     def _observe(self, inputs: SessionInputs) -> None:
         for frame in inputs.window.frames:
+            self._frame_at = self._clock()
             if getattr(frame, "source", None) == POSE_SOURCE:
                 self._pose_at = self._clock()
                 self._box_height = _box_height(frame)
@@ -120,13 +137,25 @@ class DemoHooks(SessionHooks):
             return "too_far"
         return ""
 
+    def _stream_failed_rule(self, inputs: SessionInputs) -> str:
+        """With ``cancel_on_actor_loss`` off: only a stopped stream fails, or ``""``."""
+        actor = inputs.actor
+        if actor is None or actor.age_s > self._actor_max_age_s:
+            return "stale"
+        if self._frame_at is None or self._clock() - self._frame_at > self._pear_max_age_s:
+            return "no_pose"
+        return ""
+
     def start_criteria(self, inputs: SessionInputs) -> bool:
         self._observe(inputs)
         return self._failed_rule(inputs) == ""
 
     def cancel_criteria(self, inputs: SessionInputs, round_elapsed_s: float) -> bool:
         self._observe(inputs)
-        self.cancel_reason = self._failed_rule(inputs)
+        if self._cancel_on_actor_loss:
+            self.cancel_reason = self._failed_rule(inputs)
+        else:
+            self.cancel_reason = self._stream_failed_rule(inputs)
         return self.cancel_reason != ""
 
     def cooldown_over(self, elapsed_s: float) -> bool:

@@ -14,7 +14,13 @@
 #              leave_stop_min_round_s: a round that ran this long and was cancelled because the
 #              person left (no_actor / too_far) stops the session once back in STANDBY, instead
 #              of waiting there for max_session_s; a shorter round stays in STANDBY. 0 = off.
-session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0}
+# feat/x2-actor-harden
+# cancel_on_actor_loss false: once MIRRORING, a lost person (no_actor / too_far) does not end the
+# round; it ends at max_session_s, on a long cover or a stop, or when the stream stops (stale /
+# no_pose, PEAR frames of any source). zll 11-18. Unset or true = the old rules.
+session:     {actor_max_age_s: 1.0, pear_max_age_s: 1.0, min_box_height_px: 0, cooldown_s: 2.0,
+              cancel_on_actor_loss: false}
+# /feat/x2-actor-harden
 timing:      {start_confirm_s: 1.5, cancel_confirm_s: 2.0}
 cover_judge: {percentile: 95, max_value: 45}
 # feat/x2-actor-harden
