@@ -84,7 +84,7 @@ TemplateSegment parse_segment(const std::string & name, const json & value, cons
   out.hand_start_tol = number_field(value, "hand_start_tol");
   within("t_in", out.t_in, kMinBlendS, kMaxBlendS, false);
   within("t_out", out.t_out, kMinBlendS, kMaxBlendS, false);
-  within("t_out_stop", out.t_out_stop, 0.0, kMaxStopS, true);
+  within("t_out_stop", out.t_out_stop, kMinBlendS, kMaxStopS, false);
   within("hold_max_s", out.hold_max_s, 0.0, kMaxHoldS, true);
   if (out.start_tol_rad <= 0.0) {throw std::invalid_argument("start_tol_rad must be positive");}
   if (out.hand_start_tol <= 0.0) {throw std::invalid_argument("hand_start_tol must be positive");}
@@ -230,6 +230,10 @@ void TemplatePlayer::on_message(const std::string & text, double now)
   }
   switch (command->op) {
     case TemplateCommand::Op::kStart:
+      // A start nobody kept alive is not waited for: the session has long taken it as refused.
+      if (pending_ && now - pending_->received > kKeepaliveTimeoutS) {
+        reject_pending("stale_start");
+      }
       if (playing() || pending_) {
         refuse(command->seg_id, command->segment, "busy");
       } else if (!limits_) {
@@ -273,6 +277,10 @@ bool TemplatePlayer::evaluate_start(const CbfDecision & decision, uint64_t epoch
   if (!pending_) {return false;}
   const auto pending = *pending_;
   pending_.reset();
+  if (now - pending.received > kKeepaliveTimeoutS) {
+    refuse(pending.seg_id, pending.segment, "stale_start");
+    return false;
+  }
   const auto found = whitelist_.segments.find(pending.segment);
   if (!limits_) {
     refuse(pending.seg_id, pending.segment, "disabled");
@@ -480,7 +488,8 @@ void TemplatePlayer::refuse(uint64_t seg_id, const std::string & segment, const 
 {
   ++counters_.rejected;
   outbox_.push_back(Refusal{seg_id, segment, reason});
-  if (playing() || pending_) {return;}
+  // Nor does it replace a transition not yet published (a DONE, a STOPPED).
+  if (playing() || pending_ || (changed_ && state_ != TemplateState::kRejected)) {return;}
   seg_id_ = seg_id;
   segment_name_ = segment;
   segment_ = nullptr;

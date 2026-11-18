@@ -93,6 +93,9 @@ public:
   // ``limits`` is the CBF's configuration; without it every start is refused
   // as disabled. ``whitelist_loaded`` is false when the file could not be read.
   TemplatePlayer(std::optional<CbfSafetyConfig> limits, TemplateWhitelist whitelist, bool whitelist_loaded);
+  // segment_ points into the player's own whitelist.
+  TemplatePlayer(const TemplatePlayer &) = delete;
+  TemplatePlayer & operator=(const TemplatePlayer &) = delete;
 
   // A message from the mirror session; counted and dropped if malformed.
   void on_message(const std::string & text, double now);
@@ -104,7 +107,8 @@ public:
 
   // The tick's CBF path decided ``decision`` and is about to publish it: admit
   // or refuse a pending start against it. True when admitted; the decision is
-  // published unchanged either way and playing starts on the next tick.
+  // published unchanged either way and playing starts on the next tick. A start
+  // not kept alive for kKeepaliveTimeoutS is refused as stale_start.
   bool evaluate_start(const CbfDecision & decision, uint64_t epoch, bool enforce, double now);
   // Refuse a pending start on a tick that published nothing the gate can judge.
   void reject_pending(const std::string & reason);

@@ -207,7 +207,8 @@ public:
   CbfDecision release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now);
   // A frame the template player published instead of the filter. Under enforce it
   // becomes the committed pair of the same epoch, so the filter resumes from where
-  // the arm is; it is never verified and ends any hold.
+  // the arm is; it is never verified and ends any hold. A frame of another epoch,
+  // or one played while mirroring is not active, is only counted.
   void played(const Output & output, uint64_t epoch, double now);
   void tick_finished(double elapsed_us, double after_check_us = 0.0);
   void discarded();

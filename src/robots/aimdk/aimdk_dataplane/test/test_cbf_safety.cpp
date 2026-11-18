@@ -2417,7 +2417,7 @@ TEST(CbfSafety, APlayedFrameBecomesTheCommittedPairOfItsEpochOnly)
   // Another epoch is counted but cannot become the pair a hold repeats.
   safety.played(played, 2, 1.02);
   EXPECT_EQ(safety.diagnostics().played, 1u);
-  EXPECT_EQ(safety.diagnostics().reason, "played");
+  EXPECT_NE(safety.diagnostics().reason, "played");
   auto stale = urdf_snapshot();
   stale.arm->age_s = safety.config().feedback_max_age_s + 0.001;
   expect_held_pair(safety.filter(stale, 1.04), initial.output);
@@ -2446,6 +2446,11 @@ TEST(CbfSafety, APlayedFrameEndsAHoldSoTheNextHoldStartsItsOwnClock)
   held = safety.release_if_stuck(safety.filter(stale, 1.12), stale, 1.12);
   safety.committed(held, 1.12);
   EXPECT_NEAR(safety.diagnostics().stuck_s, 0.1, 1e-9);
+
+  // A frame of another epoch leaves the hold and its clock alone.
+  safety.played(initial.output, 2, 1.13);
+  EXPECT_NEAR(safety.diagnostics().stuck_s, 0.1, 1e-9);
+  EXPECT_EQ(safety.diagnostics().played, 1u);
 
   safety.played(initial.output, 1, 1.14);
   EXPECT_DOUBLE_EQ(safety.diagnostics().stuck_s, 0.0);

@@ -247,8 +247,9 @@ TEST(TemplateWhitelist, EachRuleRejectsOnlyItsSegment)
     {"t_in", 0.29, "t_in = 0.29 outside [0.3, 2]"},
     {"t_in", 2.01, "t_in = 2.01 outside [0.3, 2]"},
     {"t_out", 0.29, "t_out = 0.29 outside"},
-    {"t_out_stop", 0.0, "t_out_stop = 0 outside (0, 0.6]"},
-    {"t_out_stop", 0.61, "t_out_stop = 0.61 outside (0, 0.6]"},
+    {"t_out_stop", 0.0, "t_out_stop = 0 outside [0.3, 0.6]"},
+    {"t_out_stop", 0.29, "t_out_stop = 0.29 outside [0.3, 0.6]"},
+    {"t_out_stop", 0.61, "t_out_stop = 0.61 outside [0.3, 0.6]"},
     {"hold_max_s", 0.0, "hold_max_s = 0 outside (0, 10]"},
     {"hold_max_s", 10.01, "hold_max_s = 10.01 outside (0, 10]"},
     {"start_tol_rad", 0.0, "start_tol_rad must be positive"},
@@ -288,18 +289,15 @@ TEST(TemplateWhitelist, EachOfTheThreeDurationsMustKeepTheQuinticWithinTheSpeedL
 {
   const auto config = limits();
   ASSERT_DOUBLE_EQ(config.velocity[3], 2.0);
-  // 1.875 * 0.25 / t: 0.234 s is the shortest time this move allows.
+  // Each duration at its shortest, 0.3 s, with a move that needs 0.309 s.
   for (const char * key : {"t_in", "t_out", "t_out_stop"}) {
     auto bad = segment_json();
-    bad[key] = std::string(key) == "t_out_stop" ? 0.2 : 0.3;
-    if (std::string(key) != "t_out_stop") {
-      auto far = target_arm();
-      far[3] = start_arm()[3] + 0.33;  // 1.875 * 0.33 / 0.3 = 2.06 rad/s
-      bad["T"] = far;
-      bad["t_in"] = 2.0;
-      bad["t_out"] = 2.0;
-      bad[key] = 0.3;
-    }
+    auto far = target_arm();
+    far[3] = start_arm()[3] + 0.33;  // 1.875 * 0.33 / 0.3 = 2.06 rad/s
+    bad["T"] = far;
+    bad["t_in"] = 2.0;
+    bad["t_out"] = 2.0;
+    bad[key] = 0.3;
     const auto reason = only_rejection(with_good(bad));
     EXPECT_NE(reason.find(std::string("over ") + key), std::string::npos) << reason;
     EXPECT_NE(reason.find("above the CBF velocity limit 2"), std::string::npos) << reason;
@@ -647,6 +645,60 @@ TEST(TemplatePlayer, StartsThatCannotBeJudgedAreRefusedWithTheirReason)
   rig.player.reject_pending("not_admitted");
   EXPECT_EQ(rig.last_status()["reason"], "not_admitted");
   EXPECT_EQ(rig.player.counters().rejected, 3u);
+}
+
+TEST(TemplatePlayer, AStartNotKeptAliveIsRefusedAsStaleAndNeverLocksThePort)
+{
+  // Judged late: the session took it as refused long ago, so it must not play.
+  Rig rig;
+  rig.start(1);
+  rig.now += TemplatePlayer::kKeepaliveTimeoutS + 0.01;
+  EXPECT_FALSE(rig.player.evaluate_start(published(), 1, true, rig.now));
+  auto status = rig.last_status();
+  EXPECT_EQ(status["state"], "REJECTED");
+  EXPECT_EQ(status["reason"], "stale_start");
+  EXPECT_EQ(status["seg_id"], 1);
+
+  // Never judged: the next start refuses it and is not busy.
+  rig.start(2);
+  rig.now += TemplatePlayer::kKeepaliveTimeoutS + 0.01;
+  rig.start(3);
+  const auto messages = rig.player.take_status(rig.now);
+  ASSERT_FALSE(messages.empty());
+  status = json::parse(messages.front());
+  EXPECT_EQ(status["seg_id"], 2);
+  EXPECT_EQ(status["reason"], "stale_start");
+  for (const auto & text : messages) {EXPECT_NE(json::parse(text)["reason"], "busy");}
+  EXPECT_TRUE(rig.player.evaluate_start(published(), 1, true, rig.now));
+
+  // A start kept alive waits as long as its keepalives come.
+  Rig kept;
+  kept.start(4);
+  for (int i = 0; i < 4; ++i) {
+    kept.now += 0.1;
+    kept.keepalive(4);
+  }
+  EXPECT_TRUE(kept.player.evaluate_start(published(), 1, true, kept.now));
+}
+
+TEST(TemplatePlayer, ARefusalDoesNotHideADoneNotYetPublished)
+{
+  Rig rig;
+  ASSERT_TRUE(rig.admit(7));
+  rig.run_while(TemplateState::kEnterB, 7);
+  rig.release(7, true);
+  rig.run_while(TemplateState::kHold, 7);
+  rig.run_while(TemplateState::kExitB, 7);
+  ASSERT_EQ(rig.player.state(), TemplateState::kDone);
+  // A start refused on the spot before the DONE went out.
+  rig.start(8, "heart");
+  const auto messages = rig.player.take_status(rig.now);
+  ASSERT_EQ(messages.size(), 2u);
+  EXPECT_EQ(json::parse(messages.front())["reason"], "unknown_segment");
+  const auto done = json::parse(messages.back());
+  EXPECT_EQ(done["state"], "DONE");
+  EXPECT_EQ(done["seg_id"], 7);
+  EXPECT_EQ(rig.player.state(), TemplateState::kDone);
 }
 
 TEST(TemplatePlayer, TheGateRefusesEachUnsuitablePublishedDecision)

@@ -823,11 +823,16 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
 
 void CbfSafety::played(const Output & output, uint64_t epoch, double now)
 {
-  if (config_.enforce && epoch == epoch_ && diagnostics_.active && output.kind == Output::Kind::kUpperBody) {
+  ++diagnostics_.played;
+  // A frame of another epoch, or one played while mirroring is not active, is
+  // only counted: it neither becomes the pair a hold repeats nor ends a hold.
+  if (epoch != epoch_ || !diagnostics_.active) {
+    return;
+  }
+  if (config_.enforce && output.kind == Output::Kind::kUpperBody) {
     accepted_ = output;
     last_published_ = now;
   }
-  ++diagnostics_.played;
   stuck_since_.reset();
   diagnostics_.releasing = false;
   diagnostics_.stuck_collision = false;
