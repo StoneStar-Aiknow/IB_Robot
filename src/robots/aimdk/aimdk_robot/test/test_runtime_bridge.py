@@ -2574,20 +2574,58 @@ def test_a_hand_mismatch_refuses_only_the_mode_that_carries_the_hands():
         harness.shutdown()
 
 
-@pytest.mark.parametrize(("matches", "right_hand_type"), [(False, "none"), (True, "dexterous")])
-def test_an_enforcing_cbf_on_other_hands_refuses_mirroring_before_it_starts(monkeypatch, matches, right_hand_type):
-    """A right hand that dropped out (reports 0) under an enforcing CBF; the control has both hands."""
-    report = {
+def _enforcing_report(hands_installed, hand_types):
+    """The CBF section an enforcing data plane would report for ``hand_types``.
+
+    As the data plane decides it: an installed side takes the OmniHand (1) or
+    an empty flange (0, a phantom hand); a side configured without a hand
+    takes only 0.
+    """
+    matches = len(hand_types) == 2 and all(
+        value in (1, 0) if installed else value == 0
+        for installed, value in zip(hands_installed, hand_types, strict=True)
+    )
+    return {
         "enabled": True,
         "mode": "enforce",
         "mirror_mode": "policy_stream",
         "mapping_available": True,
-        "hands_installed": [True, True],
+        "hands_installed": list(hands_installed),
         "hand_configuration_matches": matches,
     }
+
+
+@pytest.mark.parametrize(
+    ("hands_installed", "right_hand_type", "refusal"),
+    [
+        # Two hands configured, the right flange empty: checked as a phantom hand, not refused.
+        ([True, True], "none", ""),
+        # Control: both hands fitted.
+        ([True, True], "dexterous", ""),
+        # A hand the geometry was not built for.
+        (
+            [True, True],
+            "lite_s",
+            "right hand expected 1 (nimble_hands) or 0 (none, an empty flange), platform reports 4 (lite_s_hands)",
+        ),
+        # A hand on a side configured without one: no collision body there.
+        ([True, False], "dexterous", "right hand expected 0 (none), platform reports 1 (nimble_hands)"),
+        # Control: that side reports none.
+        ([True, False], "none", ""),
+    ],
+)
+def test_an_enforcing_cbf_on_other_hands_refuses_mirroring_before_it_starts(
+    monkeypatch, hands_installed, right_hand_type, refusal
+):
+    """Mirroring under an enforcing CBF starts on the hands it was built for, an empty flange included."""
     decode = dataplane.Status.decode
-    # The data plane under test runs no CBF; its status carries the report one enforcing it would.
-    monkeypatch.setattr(dataplane.Status, "decode", staticmethod(lambda text: replace(decode(text), cbf=report)))
+
+    def with_report(text):
+        status = decode(text)
+        # The data plane under test runs no CBF; its status carries the report one enforcing it would.
+        return replace(status, cbf=_enforcing_report(hands_installed, status.hand_types))
+
+    monkeypatch.setattr(dataplane.Status, "decode", staticmethod(with_report))
     harness = Harness(
         profile=OMNIHAND_PROFILE,
         hand_type="dexterous",
@@ -2596,13 +2634,14 @@ def test_an_enforcing_cbf_on_other_hands_refuses_mirroring_before_it_starts(monk
     )
     try:
         harness.wait_active()
+        harness.wait_for(lambda: len(harness.runtime._dataplane.hand_types) == 2, "the reported hand types")
         response = harness.set_mode("policy_stream")
-        if matches:
+        if not refusal:
             assert response.success, response.message
             assert harness.status().active_mode == "policy_stream"
         else:
             assert not response.success
-            assert "right hand expected 1 (nimble_hands), platform reports 0 (none)" in response.message
+            assert refusal in response.message
             assert harness.status().active_mode != "policy_stream"
             assert harness.status().lifecycle == "ACTIVE"
     finally:
@@ -2610,34 +2649,29 @@ def test_an_enforcing_cbf_on_other_hands_refuses_mirroring_before_it_starts(monk
 
 
 def test_a_refusal_lasts_only_while_the_hands_do_not_match(monkeypatch):
-    """The right hand comes back after a refusal: the next request starts mirroring."""
+    """The right hand is swapped for the OmniHand after a refusal: the next request starts mirroring."""
     decode = dataplane.Status.decode
 
     def with_report(text):
         status = decode(text)
         # As an enforcing data plane would report it: the match follows the reported types.
-        report = {
-            "enabled": True,
-            "mode": "enforce",
-            "mirror_mode": "policy_stream",
-            "mapping_available": True,
-            "hands_installed": [True, True],
-            "hand_configuration_matches": status.hand_types == [1, 1],
-        }
-        return replace(status, cbf=report)
+        return replace(status, cbf=_enforcing_report([True, True], status.hand_types))
 
     monkeypatch.setattr(dataplane.Status, "decode", staticmethod(with_report))
     harness = Harness(
         profile=OMNIHAND_PROFILE,
         hand_type="dexterous",
-        right_hand_type="none",
+        right_hand_type="lite_s",
         initial_action="UPPERBODY_REMOTE_SPLIT",
     )
     try:
         harness.wait_active()
+        harness.wait_for(lambda: len(harness.runtime._dataplane.hand_types) == 2, "the reported hand types")
         refused = harness.set_mode("policy_stream")
         assert not refused.success
-        assert "right hand expected 1 (nimble_hands), platform reports 0 (none)" in refused.message
+        assert (
+            "right hand expected 1 (nimble_hands) or 0 (none, an empty flange), platform reports 4" in refused.message
+        )
         harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="dexterous")])
         harness.wait_for(
             lambda: harness.runtime._dataplane.cbf.get("hand_configuration_matches"),

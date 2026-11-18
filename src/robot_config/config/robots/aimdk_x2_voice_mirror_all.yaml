@@ -415,6 +415,9 @@ robot:
     enabled: true
     mode: enforce
     # User-confirmed hardware: left OmniHand only; both arms remain protected.
+    # The data plane also takes [true, true] with the right flange empty (a
+    # phantom hand, commissioning/PIPELINE_STARTUP.md); kept at the fitted hands
+    # until its cost is measured on the board.
     hands_installed: [true, false]
     deadline_us: 10000
     deadline_guard_us: 500
