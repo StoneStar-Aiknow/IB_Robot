@@ -173,6 +173,9 @@ class GestureRunner:
                 job = self.take(0.5)
                 if job is not None:
                     self.run(job)
+        except BaseException as e:  # noqa: BLE001  never left ON with no thread behind it
+            with contextlib.suppress(Exception):
+                self._off("thread", f"the gesture thread ended ({type(e).__name__}: {e})")
         finally:
             self._close()
 

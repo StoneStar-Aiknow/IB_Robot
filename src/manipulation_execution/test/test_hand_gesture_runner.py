@@ -396,3 +396,16 @@ def test_the_watchdog_turns_a_hung_run_off_and_leaves_it():
     om.release.set()  # it comes back late: nothing goes out, the om is freed
     r.thread.join(WAIT_S)
     assert not r.thread.is_alive() and not sent and om.closed and om.calls == 1
+
+
+def test_a_gesture_thread_that_dies_turns_the_gesture_off():
+    r, om, sent, logs = runner()
+
+    def broken(_timeout):
+        raise RuntimeError("boom")
+
+    r.take = broken
+    r.start()
+    assert wait_for(lambda: r.off) and r.disabled_reason == "thread"
+    assert wait_for(lambda: om.closed) and not r.post(0, 1, IMG, BOX, TWO, False)
+    assert any("gesture thread ended (RuntimeError: boom)" in line for line in logs)
