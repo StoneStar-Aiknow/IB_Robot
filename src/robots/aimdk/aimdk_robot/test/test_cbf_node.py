@@ -150,7 +150,11 @@ def test_a_hand_dropping_out_mid_mirror_is_released_logged_and_recovers(node):
         )[-1]
         assert int(released["no_distance_frames"]) > 0
 
-        assert harness.runtime._dataplane.cbf["hand_configuration_matches"] is False
+        # Wait for it: a status that has not reported the CBF yet reads as an empty section.
+        harness.wait_for(
+            lambda: harness.runtime._dataplane.cbf.get("hand_configuration_matches") is False,
+            "a status reporting the mismatch",
+        )
         # The hand returns: the episode ends and verified frames carry distances again.
         harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="dexterous")])
         end = harness.wait_for(lambda: logged.matching("CBF_RELEASE end"), "the release to end", timeout_s=5.0)[0]

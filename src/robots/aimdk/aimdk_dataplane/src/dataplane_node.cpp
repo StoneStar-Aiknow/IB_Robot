@@ -20,10 +20,13 @@
 #include <csignal>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -31,6 +34,7 @@
 
 #include "aimdk_dataplane/core.hpp"
 #include "aimdk_dataplane/cbf_safety.hpp"
+#include "aimdk_dataplane/template_play.hpp"
 #include "cbf/proxy_model.hpp"
 #include "aimdk_msgs/msg/hand_state_array.hpp"
 #include "aimdk_msgs/msg/joint_command_array.hpp"
@@ -121,6 +125,7 @@ public:
         }
       }
     }
+    setup_template_play(declare_parameter<std::string>("template_play_json", ""));
     // Each vendor input is taken on a thread of its own (see intake_groups): the
     // 500 Hz groups alone are more than one rclcpp thread keeps up with on the
     // loaded 310P.
@@ -215,6 +220,74 @@ public:
   const std::vector<rclcpp::CallbackGroup::SharedPtr> & intake_groups() const {return intake_groups_;}
 
 private:
+  // The template playback port (template_play.hpp), off unless the parameter
+  // enables it: off, there is no player, no subscription and no status topic.
+  void setup_template_play(const std::string & text)
+  {
+    if (text.empty()) {
+      return;
+    }
+    nlohmann::json settings;
+    try {
+      settings = nlohmann::json::parse(text);
+    } catch (const std::exception & error) {
+      RCLCPP_ERROR(get_logger(), "template playback stays off, template_play_json is malformed: %s", error.what());
+      return;
+    }
+    const auto enabled = settings.is_object() ? settings.find("enabled") : settings.end();
+    if (!settings.is_object() || enabled == settings.end() || !enabled->is_boolean() || !enabled->get<bool>()) {
+      return;
+    }
+    // Any setting of the wrong type leaves the port off; it never stops the node.
+    try {
+      const auto path = settings.value("segments_file", std::string());
+      TemplateWhitelist whitelist;
+      bool loaded = false;
+      if (cbf_) {
+        try {
+          std::ifstream file(path);
+          if (!file) {
+            throw std::runtime_error("cannot read " + path);
+          }
+          std::stringstream contents;
+          contents << file.rdbuf();
+          whitelist = TemplateWhitelist::from_json(contents.str(), cbf_->config());
+          loaded = true;
+        } catch (const std::exception & error) {
+          RCLCPP_ERROR(get_logger(), "template whitelist not loaded, every start is refused: %s", error.what());
+        }
+        for (const auto & rejected : whitelist.rejected) {
+          RCLCPP_WARN(get_logger(), "template segment left out: %s", rejected.c_str());
+        }
+      } else {
+        RCLCPP_WARN(get_logger(), "template playback enabled without the CBF: every start is refused as disabled");
+      }
+      const auto status_topic = settings.value("status_topic", std::string("/aimdk_dataplane/template_status"));
+      const auto command_topic = settings.value("command_topic", std::string("/mirror_session/template_play"));
+      player_.emplace(
+        cbf_ ? std::optional<CbfSafetyConfig>(cbf_->config()) : std::nullopt, std::move(whitelist), loaded);
+      template_status_pub_ = create_publisher<std_msgs::msg::String>(status_topic, rclcpp::QoS(10).reliable());
+      subscriptions_.push_back(
+        create_subscription<std_msgs::msg::String>(
+          command_topic, rclcpp::QoS(10).reliable(),
+          [this](std_msgs::msg::String::ConstSharedPtr message) {
+            std::lock_guard<std::recursive_mutex> lock(mutex_);
+            try {
+              player_->on_message(message->data, monotonic_s());
+            } catch (const std::exception & error) {
+              RCLCPP_ERROR(get_logger(), "template command dropped: %s", error.what());
+            }
+          }));
+      RCLCPP_INFO(
+        get_logger(), "template playback enabled: %zu segment(s) from %s", player_->whitelist().segments.size(),
+        path.c_str());
+    } catch (const std::exception & error) {
+      player_.reset();
+      template_status_pub_.reset();
+      RCLCPP_ERROR(get_logger(), "template playback stays off: %s", error.what());
+    }
+  }
+
   rclcpp::SubscriptionOptions intake_options()
   {
     intake_groups_.push_back(create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive, false));
@@ -348,6 +421,10 @@ private:
     if (cbf_ && old_epoch != core_.safety_epoch()) {
       cbf_->inactive(core_.safety_epoch());
     }
+    if (player_ && old_epoch != core_.safety_epoch()) {
+      player_->stop("epoch_changed");
+      player_->reject_pending("not_admitted");
+    }
     if (safe_due) {
       publish_safe_command();
     }
@@ -440,6 +517,15 @@ private:
 
   void publish_commands()
   {
+    command_tick();
+    if (player_) {
+      std::lock_guard<std::recursive_mutex> lock(mutex_);
+      publish_template_status(monotonic_s());
+    }
+  }
+
+  void command_tick()
+  {
     std::unique_lock<std::recursive_mutex> lock(mutex_);
     const auto tick_started = std::chrono::steady_clock::now();
     const double now_s = std::chrono::duration<double>(tick_started.time_since_epoch()).count();
@@ -449,7 +535,11 @@ private:
     const bool mirror_context = cbf_ && core_.mirror_context(cbf_->config().mirror_mode, now_s);
     const bool source_ready = cbf_ && core_.mirror_candidate(cbf_->config().mirror_mode, now_s);
     const bool named_only = core_.candidate_arm_is_named() && !source_ready;
+    if (player_ && player_->playing() && play_template(now_s, mirror_context, named_only)) {
+      return;
+    }
     if (!cbf_ || !mirror_context || named_only) {
+      if (player_) {player_->reject_pending(cbf_ ? "not_admitted" : "disabled");}
       if (cbf_) {cbf_->inactive(core_.safety_epoch());}
       publish(core_.tick(now_s));
       flush_notes();
@@ -466,6 +556,7 @@ private:
     if (snapshot.requested.kind != Output::Kind::kUpperBody &&
       (!cbf_->config().enforce || snapshot.requested.kind != Output::Kind::kNone))
     {
+      if (player_) {player_->reject_pending("not_upper_body");}
       flush_notes();
       return;
     }
@@ -530,6 +621,7 @@ private:
       !core_.mirror_context(cbf_->config().mirror_mode, finished))
     {
       cbf_->discarded();
+      if (player_) {player_->reject_pending("not_admitted");}
       cbf_->tick_finished((finished - now_s) * 1e6);
       flush_notes();
       return;
@@ -577,9 +669,75 @@ private:
     }
     core_.remember_arm_output(decision.output);
     cbf_->committed(decision, monotonic_s());
+    if (player_ && player_->start_pending()) {
+      // Judged on what was just published; admitted, it plays from the next tick.
+      try {
+        player_->evaluate_start(decision, core_.safety_epoch(), cbf_->config().enforce, now_s);
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(get_logger(), "template start not judged: %s", error.what());
+        player_->reject_pending("internal_error");
+      }
+    }
     const double ended = monotonic_s();
     cbf_->tick_finished((ended - now_s) * 1e6, (ended - finished) * 1e6);
     flush_notes();
+  }
+
+  // One tick of a playing template segment, in place of the CBF path. False when
+  // the player stopped instead (a runtime-level exit here, or an internal one in
+  // step): the tick then goes on down the ordinary path, so the stream never pauses.
+  bool play_template(double now_s, bool mirror_context, bool named_only)
+  {
+    const char * stop = nullptr;
+    if (core_.control_lapsed(now_s)) {
+      stop = "control_lapsed";
+    } else if (!cbf_ || !mirror_context) {
+      stop = "revoked";
+    } else if (named_only) {
+      stop = "named_arm";
+    } else if (core_.safety_epoch() != player_->epoch()) {
+      stop = "epoch_changed";
+    }
+    Output output;
+    if (!stop) {
+      try {
+        output = player_->step(core_.tick(now_s, false), now_s);
+      } catch (const std::exception & error) {
+        RCLCPP_ERROR(get_logger(), "template playback failed: %s", error.what());
+        stop = "internal_error";
+      }
+    }
+    if (stop) {
+      player_->stop(stop);
+    }
+    if (output.kind != Output::Kind::kUpperBody) {
+      return false;
+    }
+    publish(output);
+    cbf_->played(output, player_->epoch(), now_s);
+    core_.remember_arm_output(output);
+    cbf_->tick_finished((monotonic_s() - now_s) * 1e6);
+    flush_notes();
+    return true;
+  }
+
+  void publish_template_status(double now_s)
+  {
+    const auto messages = player_->take_status(now_s);
+    for (const auto & text : messages) {
+      std_msgs::msg::String message;
+      message.data = text;
+      template_status_pub_->publish(message);
+    }
+    // Every transition and refusal once in the log; the periodic repeats are not.
+    const auto & counters = player_->counters();
+    if (!messages.empty() &&
+      (player_->state() != logged_template_state_ || counters.rejected != logged_template_rejected_))
+    {
+      RCLCPP_INFO(get_logger(), "TEMPLATE %s", messages.back().c_str());
+      logged_template_state_ = player_->state();
+      logged_template_rejected_ = counters.rejected;
+    }
   }
 
   // The hands the platform reports are the ones the CBF geometry was built for.
@@ -698,6 +856,7 @@ private:
       status["cbf"]["thumb_feedback_frames"] = d.thumb_feedback_frames;
       status["cbf"]["thumb_feedback_issue"] = d.thumb_feedback_issue;
       status["cbf"]["released"] = d.released;
+      if (player_) {status["cbf"]["played"] = d.played;}
       status["cbf"]["release_episodes"] = d.release_episodes;
       status["cbf"]["collision_release_episodes"] = d.collision_release_episodes;
       status["cbf"]["releasing"] = d.releasing;
@@ -857,6 +1016,10 @@ private:
   std::recursive_mutex mutex_;
   Core core_;
   std::optional<CbfSafety> cbf_;
+  std::optional<TemplatePlayer> player_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr template_status_pub_;
+  TemplateState logged_template_state_ = TemplateState::kIdle;
+  uint64_t logged_template_rejected_ = 0;
   uint64_t logged_input_fault_event_ = 0;
   double last_input_fault_log_s_ = 0.0;
   uint64_t logged_thumb_event_ = 0;

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 
+import launch.logging
 from aimdk_robot import dataplane
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction, TimerAction
@@ -70,6 +71,7 @@ def _launch_setup(context, *_args, **_kwargs):
     instance_id = LaunchConfiguration("instance_id").perform(context).strip()
     initial_mode = LaunchConfiguration("initial_mode").perform(context).strip()
     cbf_safety_json = LaunchConfiguration("cbf_safety_json", default="").perform(context).strip()
+    template_play_json = LaunchConfiguration("template_play_json", default="").perform(context).strip()
 
     def runtime_node(description_json: str = "") -> Node:
         return Node(
@@ -138,6 +140,18 @@ def _launch_setup(context, *_args, **_kwargs):
                 cbf_config["arm_feedback_lower_limits"] = lower
                 cbf_config["arm_feedback_upper_limits"] = upper
             data_plane_parameters["cbf_safety_json"] = json.dumps(cbf_config, allow_nan=False)
+    if template_play_json:
+        # A template is an extra: an argument that cannot be read leaves it off, never the launch.
+        try:
+            template_config = json.loads(template_play_json)
+        except ValueError:
+            template_config = None
+        if not isinstance(template_config, dict) or not isinstance(template_config.get("enabled", False), bool):
+            launch.logging.get_logger("aimdk_robot.runtime").warning(
+                "template_play_json must contain a mapping with a boolean enabled flag; template playback stays off"
+            )
+        elif template_config.get("enabled", False):
+            data_plane_parameters["template_play_json"] = json.dumps(template_config, allow_nan=False)
     data_plane = Node(
         package="aimdk_dataplane",
         executable="aimdk_dataplane",
@@ -220,6 +234,11 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "cbf_safety_json", default_value="", description="Optional CBF configuration for aimdk_dataplane only"
+            ),
+            DeclareLaunchArgument(
+                "template_play_json",
+                default_value="",
+                description="Optional template playback port for aimdk_dataplane only (needs the CBF)",
             ),
             DeclareLaunchArgument(
                 "cancel_return_motions",

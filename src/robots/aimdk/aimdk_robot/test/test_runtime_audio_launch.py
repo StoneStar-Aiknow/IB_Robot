@@ -138,7 +138,7 @@ def test_launch_declares_the_peripherals_argument():
     assert "peripherals" in names
 
 
-def _cbf_render(simulated, cbf_json=None, *, profile=_PROFILE):
+def _cbf_render(simulated, cbf_json=None, *, profile=_PROFILE, template_json=None):
     context = launch.LaunchContext()
     context.launch_configurations.update(
         {
@@ -153,6 +153,8 @@ def _cbf_render(simulated, cbf_json=None, *, profile=_PROFILE):
     )
     if cbf_json is not None:
         context.launch_configurations["cbf_safety_json"] = cbf_json
+    if template_json is not None:
+        context.launch_configurations["template_play_json"] = template_json
     from launch_ros.utilities import evaluate_parameters
 
     return {
@@ -206,6 +208,40 @@ def test_cbf_launch_argument_has_an_empty_default():
         action
         for action in _runtime_launch_module().generate_launch_description().entities
         if isinstance(action, DeclareLaunchArgument) and action.name == "cbf_safety_json"
+    ]
+    assert len(declarations) == 1
+    assert launch.utilities.perform_substitutions(launch.LaunchContext(), declarations[0].default_value) == ""
+
+
+@pytest.mark.parametrize("simulated", ["false", "true"])
+@pytest.mark.parametrize("template_json", ["", '{"enabled":false,"segments_file":"/missing"}', "{}"])
+def test_template_play_off_matches_direct_launch_default_node_parameters(simulated, template_json):
+    baseline = _cbf_render(simulated)
+    assert _cbf_render(simulated, template_json=template_json) == baseline
+    assert all("template_play_json" not in group for groups in baseline.values() for group in groups)
+
+
+@pytest.mark.parametrize("simulated", ["false", "true"])
+def test_template_play_enabled_changes_only_the_dataplane_parameter(simulated):
+    original = {"enabled": True, "segments_file": "/abs/segments.json"}
+    baseline = _cbf_render(simulated)
+    enabled = _cbf_render(simulated, template_json=json.dumps(original))
+    assert json.loads(enabled["aimdk_dataplane"][0].pop("template_play_json")) == original
+    assert enabled == baseline, "plan_json, aimdk_runtime and all other node parameters must remain identical"
+
+
+@pytest.mark.parametrize("template_json", ["[]", '{"enabled":"true"}', "{not json"])
+def test_template_play_malformed_argument_stays_off_and_never_stops_the_launch(template_json):
+    assert _cbf_render("false", template_json=template_json) == _cbf_render("false")
+
+
+def test_template_play_launch_argument_has_an_empty_default():
+    from launch.actions import DeclareLaunchArgument
+
+    declarations = [
+        action
+        for action in _runtime_launch_module().generate_launch_description().entities
+        if isinstance(action, DeclareLaunchArgument) and action.name == "template_play_json"
     ]
     assert len(declarations) == 1
     assert launch.utilities.perform_substitutions(launch.LaunchContext(), declarations[0].default_value) == ""
