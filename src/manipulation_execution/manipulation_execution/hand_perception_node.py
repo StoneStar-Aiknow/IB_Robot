@@ -24,8 +24,10 @@ non-empty ``extern_dir`` loads them from there instead (see npu_hands.load_exter
 
 Optional, off by default: ``gesture_enabled`` with a non-empty
 ``gesture_model_path`` also runs the two-hand gesture om (heart / holy / xsign)
-in the same worker, after each HandFrame is published, on the frame and hands it
-already has, and sends ``x2_hand_gesture/v1`` JSON on ``gesture_topic`` (see
+on its own daemon thread: after each HandFrame is published the worker crops the
+square from the frame and hands it already has and leaves it in a one-slot
+mailbox, without waiting; the gesture thread loads the om, runs it and sends
+``x2_hand_gesture/v1`` JSON on ``gesture_topic`` (see
 hand_perception/gesture_runner.py). Off, nothing of it is built or run.
 """
 
@@ -95,8 +97,8 @@ PARAMS = {
     "gesture_enabled": False,
     "gesture_model_path": "",  # the cut-head om (never *_e2e.om); relative: under $WORKSPACE
     "gesture_topic": "/hri/hand/gesture",
-    # The om runs on ais_bench. With the hands on another backend (inference_service)
-    # both would share one thread's ACL state; untested, so off unless allowed here.
+    # The om runs on ais_bench, in its own thread. With the hands on another backend
+    # (inference_service) the process holds both runtimes; untested, so off unless allowed here.
     "gesture_allow_mixed_backend": False,
     "gesture_conf": 0.25,
     "gesture_far_ratio": 0.6,
@@ -106,8 +108,10 @@ PARAMS = {
     "gesture_max_rate_hz": 15.0,
     "gesture_one_hand_max_rate_hz": 5.0,
     "gesture_slow_ms": 20.0,
+    "gesture_slow_window": 10,  # gesture_slow_limit of the last this many runs over gesture_slow_ms: off
     "gesture_slow_limit": 3,
-    "gesture_fail_limit": 5,
+    "gesture_fail_limit": 5,  # failed runs in a row: off
+    "gesture_watchdog_ms": 200.0,  # one run not back after this: off (its thread is left behind)
     "gesture_log_period_s": 1.0,
 }
 GESTURE_BACKEND = "ais_bench"
@@ -256,8 +260,10 @@ class HandPerceptionNode(Node):
         cfg = gesture_runner.RunnerConfig(
             conf=p["gesture_conf"],
             slow_ms=p["gesture_slow_ms"],
+            slow_window=p["gesture_slow_window"],
             slow_limit=p["gesture_slow_limit"],
             fail_limit=p["gesture_fail_limit"],
+            watchdog_ms=p["gesture_watchdog_ms"],
             log_period_s=p["gesture_log_period_s"],
         )
         if not isinstance(p["gesture_topic"], str):
@@ -316,8 +322,8 @@ class HandPerceptionNode(Node):
             self._ready.set()
             return
         self._ready.set()
-        if self._gesture is not None and not self._gesture.load():
-            self._gesture = None
+        if self._gesture is not None:
+            self._gesture.start()  # the om loads on the gesture thread; frames before that just skip it
         try:
             while not self._stopping.is_set():
                 if not self._has_frame.wait(0.5):
@@ -336,7 +342,7 @@ class HandPerceptionNode(Node):
                     break
         finally:
             if self._gesture is not None:
-                self._gesture.close()
+                self._gesture.stop()
             self.backend.close()
 
     def _person_box(self, stamp: int):
@@ -413,18 +419,18 @@ class HandPerceptionNode(Node):
             self._gesture_step(stamp, img, box, hands)
 
     def _gesture_step(self, stamp: int, img, box, hands):
-        """The gesture model on this frame, after its HandFrame is out. Never raises."""
+        """This frame's square to the gesture thread, after its HandFrame is out. Never waits or raises."""
         g = self._gesture
         try:
             with self._slot_lock:
                 busy = self._slot is not None  # a newer frame waits: the hands go first
             lms = [hands[s]["lm"] for s in SIDES if hands[s] is not None]
-            g.step(stamp, self._box_actor, img, box, lms, busy)
-            if not g.enabled:
+            g.post(stamp, self._box_actor, img, box, lms, busy)
+            if g.off:
                 self._gesture = None
         except Exception as e:  # noqa: BLE001
             self._gesture = None
-            g.close()
+            g.stop(timeout=0.0)
             self.get_logger().info(f"gesture model off: {type(e).__name__}: {e}; hands unaffected")
 
     def _hands(self, img, box):

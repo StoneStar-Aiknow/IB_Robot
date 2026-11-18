@@ -1,8 +1,10 @@
 """hand_perception_node with the gesture model: off is the baseline, on runs after the HandFrame, faults stay silent.
 
-Real rclpy and the node's real worker thread; the hand NPU pipeline and the
-gesture om session are fakes. Publishers are swapped for recorders so a test
-sees exactly what the worker sent, in order.
+Real rclpy, the node's real worker thread and the real gesture thread; the hand
+NPU pipeline and the gesture om session are fakes. Publishers are swapped for
+recorders so a test sees exactly what each thread sent. ``feed`` waits for the
+gesture run a frame posted (bounded), so the runs are not replaced by the next
+frame unless a test wants that.
 """
 
 import json
@@ -23,6 +25,7 @@ from manipulation_execution import hand_perception_node as module
 from manipulation_execution.hand_perception import gesture_om
 
 MS = 1_000_000
+WAIT_S = 3.0  # upper bound for any wait on a thread; the tests pass in far less
 W, H = 640, 480
 BOX = (150.0, 20.0, 490.0, 470.0)  # 450 px high
 JPEG = cv2.imencode(".jpg", np.full((H, W, 3), 90, np.uint8))[1].tobytes()
@@ -73,6 +76,8 @@ class Session:
     open_error = None
     infer_error = None
     delay_s = 0.0
+    block = None  # an Event: infer waits on it (bounded); entered is set once it does
+    entered = None
 
     def __init__(self, device, path):
         if Session.open_error:
@@ -85,6 +90,9 @@ class Session:
         self.calls += 1
         if Session.delay_s:
             time.sleep(Session.delay_s)
+        if Session.block is not None:
+            Session.entered.set()
+            assert Session.block.wait(WAIT_S), "test never released the session"
         if Session.infer_error:
             raise Session.infer_error
         y = np.zeros(gesture_om.OUTPUT_SHAPE, np.float32)
@@ -130,6 +138,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(Session, "open_error", None)
     monkeypatch.setattr(Session, "infer_error", None)
     monkeypatch.setattr(Session, "delay_s", 0.0)
+    monkeypatch.setattr(Session, "block", None)
+    monkeypatch.setattr(Session, "entered", threading.Event())
     monkeypatch.setattr(gesture_om, "_open_session", lambda device, path: Session(device, path))
     model = tmp_path / "yolov10n_gestures_320_cut_v1.om"
     model.write_bytes(b"om")
@@ -144,8 +154,25 @@ def env(monkeypatch, tmp_path):
         nodes.append(node)
         node.wait_ready(5.0)
         node.pub = Recorder()
-        if node.gesture_pub is not None:
+        node.posted, node.ran = 0, threading.Semaphore(0)
+        g = node._gesture
+        if g is not None:
             node.gesture_pub = Recorder()
+            assert wait_for(lambda: g.state != "loading"), "the gesture thread did not load"
+            post, run = g.post, g.run
+
+            def posted(*args):
+                ok = post(*args)
+                node.posted += ok
+                return ok
+
+            def ran(job):
+                try:
+                    return run(job)
+                finally:
+                    node.ran.release()
+
+            g.post, g.run = posted, ran
         done = threading.Semaphore(0)
         process = node._process
 
@@ -180,17 +207,28 @@ def pear(stamp, actor_id=7):
     return msg
 
 
-def feed(node, stamp, actor_id=7, n=1):
+def wait_for(pred, timeout=WAIT_S):
+    deadline = time.monotonic() + timeout
+    while not pred():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.002)
+    return True
+
+
+def feed(node, stamp, actor_id=7, n=1, wait_gesture=True):
     node._on_pear(pear(stamp, actor_id))
     node._on_image(image(stamp))
     for _ in range(n):
         assert node.processed.acquire(timeout=5.0), "the worker did not process the frame"
+    posted, node.posted = node.posted, 0
+    for _ in range(posted if wait_gesture else 0):
+        assert node.ran.acquire(timeout=WAIT_S), "the gesture thread did not run the posted frame"
 
 
-def run_frames(node, count, step_ms=100):
-    base = 1_000_000_000_000
+def run_frames(node, count, step_ms=100, base=1_000_000_000_000, wait_gesture=True):
     for i in range(count):
-        feed(node, base + i * step_ms * MS)
+        feed(node, base + i * step_ms * MS, wait_gesture=wait_gesture)
     return base
 
 
@@ -242,7 +280,7 @@ def test_on_runs_after_the_hand_frame_and_sends_v1(env):
     base = run_frames(node, 2)
     assert order == ["hand", "gesture", "hand", "gesture"]
     (session,) = Session.instances
-    assert session.thread == "hand-npu" and session.path == env.model
+    assert session.thread == "hand-gesture" and session.path == env.model
     g = gestures(node)[0]
     assert g["schema"] == "x2_hand_gesture/v1" and g["stamp_ns"] == base and g["actor_id"] == 7
     assert g["cls"] == "holy" and g["score"] == pytest.approx(0.85) and g["crop"] == "both"
@@ -327,7 +365,7 @@ def test_inference_errors_five_in_a_row_turn_it_off_and_hands_go_on(env, monkeyp
     node = env.make(gesture_enabled=True, gesture_model_path=env.model)
     run_frames(node, 8)
     (session,) = Session.instances
-    assert session.calls == 5 and session.freed
+    assert session.calls == 5 and wait_for(lambda: session.freed)
     assert node._gesture is None and len(node.pub.msgs) == 8 and gestures(node) == []
     assert [m.frame_id for m in node.pub.msgs] == list(range(8))
 
@@ -336,8 +374,51 @@ def test_three_slow_runs_turn_it_off_and_hands_go_on(env, monkeypatch):
     monkeypatch.setattr(Session, "delay_s", 0.025)
     node = env.make(gesture_enabled=True, gesture_model_path=env.model)
     run_frames(node, 6)
-    assert Session.instances[0].calls == 3 and Session.instances[0].freed
+    assert Session.instances[0].calls == 3 and wait_for(lambda: Session.instances[0].freed)
     assert node._gesture is None and len(node.pub.msgs) == 6 and len(gestures(node)) == 3
+
+
+def test_slow_runs_spread_over_the_window_turn_it_off(env, monkeypatch):
+    node = env.make(gesture_enabled=True, gesture_model_path=env.model)
+    for i in range(5):  # slow, fast, slow, fast, slow: 3 of the last 5
+        monkeypatch.setattr(Session, "delay_s", 0.025 if i % 2 == 0 else 0.0)
+        feed(node, 1_000_000_000_000 + i * 100 * MS)
+    run_frames(node, 2, base=1_000_600_000_000)
+    assert node._gesture is None and len(gestures(node)) == 5 and len(node.pub.msgs) == 7
+
+
+def test_hand_frames_keep_flowing_while_the_gesture_run_is_blocked(env, monkeypatch):
+    monkeypatch.setattr(Session, "block", threading.Event())
+    node = env.make(gesture_enabled=True, gesture_model_path=env.model, gesture_watchdog_ms=5000.0)
+    try:
+        feed(node, 1_000_000_000_000, wait_gesture=False)
+        assert Session.entered.wait(WAIT_S)
+        t0 = time.perf_counter()
+        run_frames(node, 10, base=1_000_100_000_000, wait_gesture=False)
+        per_frame = (time.perf_counter() - t0) / 10
+        assert len(node.pub.msgs) == 11 and Session.instances[0].calls == 1 and gestures(node) == []
+        assert per_frame < 0.1, per_frame  # JPEG decode + fake hands + a crop copy; nothing waits on the om
+        assert node._gesture is not None and node._gesture.enabled
+    finally:
+        Session.block.set()
+    assert wait_for(lambda: len(gestures(node)) == 2)  # the blocked run, then the latest posted frame
+    assert gestures(node)[-1]["stamp_ns"] == 1_000_100_000_000 + 9 * 100 * MS
+
+
+def test_the_watchdog_turns_a_hung_run_off_and_hands_go_on(env, monkeypatch):
+    monkeypatch.setattr(Session, "block", threading.Event())
+    node = env.make(gesture_enabled=True, gesture_model_path=env.model, gesture_watchdog_ms=50.0)
+    try:
+        feed(node, 1_000_000_000_000, wait_gesture=False)
+        assert Session.entered.wait(WAIT_S)
+        time.sleep(0.08)  # the run is now past the 50 ms watchdog
+        run_frames(node, 5, base=1_000_100_000_000, wait_gesture=False)
+        assert node._gesture is None and len(node.pub.msgs) == 6
+        assert [m.frame_id for m in node.pub.msgs] == list(range(6))
+    finally:
+        Session.block.set()
+    assert wait_for(lambda: Session.instances[0].freed)  # it came back late: freed, nothing sent
+    assert gestures(node) == [] and Session.instances[0].calls == 1
 
 
 def test_a_raising_runner_is_dropped_silently(env):
@@ -346,7 +427,7 @@ def test_a_raising_runner_is_dropped_silently(env):
     def boom(*_a, **_k):
         raise RuntimeError("bug")
 
-    node._gesture.step = boom
+    node._gesture.post = boom
     run_frames(node, 3)
     assert node._gesture is None and len(node.pub.msgs) == 3
 
