@@ -101,8 +101,15 @@ def _judge(monkeypatch, segments: Path) -> tuple[list[int], list[str]]:
     try:
         assert done.wait(timeout=20.0), "\n".join(lines[-20:])
     finally:
+        # The line comes from the constructor; a SIGTERM before executor.spin()
+        # starts can be cancelled into nothing and the node spins on. Only the
+        # setup is judged here, so it is killed then.
         process.terminate()
-        process.wait(timeout=10.0)
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5.0)
     loaded = [re.search(r"template playback enabled: (\d+) segment", line) for line in lines]
     refused = [line for line in lines if "template segment left out" in line or "template whitelist" in line]
     return [int(match.group(1)) for match in loaded if match], refused

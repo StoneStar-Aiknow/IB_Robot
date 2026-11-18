@@ -234,8 +234,16 @@ private:
       RCLCPP_ERROR(get_logger(), "template playback stays off, template_play_json is malformed: %s", error.what());
       return;
     }
-    const auto enabled = settings.is_object() ? settings.find("enabled") : settings.end();
-    if (!settings.is_object() || enabled == settings.end() || !enabled->is_boolean() || !enabled->get<bool>()) {
+    if (!settings.is_object()) {
+      RCLCPP_ERROR(get_logger(), "template playback stays off, template_play_json is not an object");
+      return;
+    }
+    const auto enabled = settings.find("enabled");
+    if (enabled != settings.end() && !enabled->is_boolean()) {
+      RCLCPP_ERROR(get_logger(), "template playback stays off, enabled is not true or false");
+      return;
+    }
+    if (enabled == settings.end() || !enabled->get<bool>()) {
       return;
     }
     // Any setting of the wrong type leaves the port off; it never stops the node.
@@ -529,13 +537,15 @@ private:
     std::unique_lock<std::recursive_mutex> lock(mutex_);
     const auto tick_started = std::chrono::steady_clock::now();
     const double now_s = std::chrono::duration<double>(tick_started.time_since_epoch()).count();
-    if (core_.control_lapsed(now_s)) {
+    // Read once: the check latches the lapse and clears, so a second read sees no lapse.
+    const bool lapsed = core_.control_lapsed(now_s);
+    if (lapsed) {
       publish_safe_command();
     }
     const bool mirror_context = cbf_ && core_.mirror_context(cbf_->config().mirror_mode, now_s);
     const bool source_ready = cbf_ && core_.mirror_candidate(cbf_->config().mirror_mode, now_s);
     const bool named_only = core_.candidate_arm_is_named() && !source_ready;
-    if (player_ && player_->playing() && play_template(now_s, mirror_context, named_only)) {
+    if (player_ && player_->playing() && play_template(now_s, lapsed, mirror_context, named_only)) {
       return;
     }
     if (!cbf_ || !mirror_context || named_only) {
@@ -686,14 +696,16 @@ private:
   // One tick of a playing template segment, in place of the CBF path. False when
   // the player stopped instead (a runtime-level exit here, or an internal one in
   // step): the tick then goes on down the ordinary path, so the stream never pauses.
-  bool play_template(double now_s, bool mirror_context, bool named_only)
+  bool play_template(double now_s, bool lapsed, bool mirror_context, bool named_only)
   {
     const char * stop = nullptr;
-    if (core_.control_lapsed(now_s)) {
+    if (lapsed) {
       stop = "control_lapsed";
     } else if (!cbf_ || !mirror_context) {
       stop = "revoked";
     } else if (named_only) {
+      // This and the epoch check are normally met first by on_control, which
+      // stops the player before the tick; kept so the tick never plays past them.
       stop = "named_arm";
     } else if (core_.safety_epoch() != player_->epoch()) {
       stop = "epoch_changed";
