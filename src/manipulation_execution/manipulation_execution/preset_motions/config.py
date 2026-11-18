@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 from collections.abc import Mapping
 from pathlib import Path
@@ -17,6 +18,7 @@ MATCH_TOPIC = "/preset_motions/matched"
 STATUS_TOPIC = "/preset_motions/status"
 STATE_TOPIC = "/mirror_session/state"
 MATCH_STATE_TOPIC = "/preset_motions/state"
+GESTURE_TOPIC = "/hri/hand/gesture"
 _KEYS = {
     "enabled",
     "motion_enabled",
@@ -27,6 +29,18 @@ _KEYS = {
     "motion_name",
     "template_file",
     "geometry_file",
+    "gesture",
+}
+# preset_motions.gesture: the hand gesture vote (gesture_vote.VoteConfig fields besides enabled/topic)
+_GESTURE_VOTE = {
+    "window_s",
+    "min_frames",
+    "min_frames_one_hand",
+    "min_score",
+    "exit_s",
+    "exit_s_one_hand",
+    "max_source_age_s",
+    "future_tolerance_s",
 }
 _TIMING = {
     "enter_confirm_s",
@@ -82,8 +96,51 @@ def matcher_settings(value):
     return result
 
 
-def launch_parameters(robot_config, stream):
-    """Return observer parameters, or None for the unchanged disabled baseline."""
+def gesture_settings(value):
+    """(enabled, topic, vote numbers) of ``preset_motions.gesture``."""
+    if not isinstance(value, Mapping):
+        raise ValueError("preset_motions.gesture must be a mapping")
+    unknown = set(value) - (_GESTURE_VOTE | {"enabled", "topic"})
+    if unknown:
+        raise ValueError(f"preset_motions.gesture has unknown keys {sorted(unknown)}")
+    enabled = value.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ValueError("preset_motions.gesture.enabled must be a boolean")
+    vote = {key: value[key] for key in _GESTURE_VOTE & value.keys()}
+    for key, number in vote.items():
+        if type(number) not in (int, float) or not math.isfinite(number) or number <= 0:
+            raise ValueError(f"preset_motions.gesture.{key} must be finite and positive")
+    for key in ("min_frames", "min_frames_one_hand"):
+        if key in vote and type(vote[key]) is not int:
+            raise ValueError(f"preset_motions.gesture.{key} must be an integer")
+    if "min_score" in vote and vote["min_score"] > 1:
+        raise ValueError("preset_motions.gesture.min_score must be at most 1")
+    return enabled, topic(value.get("topic", GESTURE_TOPIC), "gesture topic"), vote
+
+
+def _gesture_or_off(section, warn):
+    """``gesture_settings`` of the section, or None after one ``warn`` line: a gesture problem never fails the launch."""
+    try:
+        gesture = gesture_settings(section["gesture"])
+    except Exception as exc:  # noqa: BLE001  the gestures are an extra
+        warn(f"preset_motions.gesture: {type(exc).__name__}: {exc}; gesture off")
+        return None
+    if gesture[0] and section.get("motion_enabled", False):
+        # mirror_session's preset consumer reads overhead_heart only; the gesture
+        # templates on the same topic would read to it as invalid input.
+        warn("preset_motions.gesture cannot be enabled together with motion_enabled; gesture off")
+        return None
+    return gesture
+
+
+def launch_parameters(robot_config, stream, warn=None):
+    """Return observer parameters, or None for the unchanged disabled baseline.
+
+    A bad ``gesture`` subsection, or gesture together with ``motion_enabled``,
+    only turns the gesture off (one ``warn`` line, default: this module's logger);
+    the observer then gets the parameters it gets without the subsection. Every
+    other error still raises.
+    """
     section = robot_config.get("preset_motions")
     if section is None:
         return None
@@ -96,7 +153,9 @@ def launch_parameters(robot_config, stream):
         return None
     if section.get("motion_enabled", False) and (not section.get("template_file") or not section.get("geometry_file")):
         raise ValueError("preset_motions motion output requires a validated template and geometry artifact")
-    return {
+    warn = warn or logging.getLogger(__name__).warning
+    gesture = _gesture_or_off(section, warn) if "gesture" in section else None
+    parameters = {
         "pear_frame_topic": topic(stream.get("frame_topic", ""), "PEAR frame topic"),
         "actor_state_topic": topic(stream.get("actor_state_topic", ""), "actor state topic"),
         "session_state_topic": STATE_TOPIC,
@@ -106,6 +165,12 @@ def launch_parameters(robot_config, stream):
         "matcher_json": json.dumps(matcher_settings(section.get("matcher", {})), sort_keys=True),
         "motion_enabled": False,
     }
+    if gesture is not None:
+        enabled, gesture_topic, vote = gesture
+        parameters.update(
+            gesture_enabled=enabled, gesture_topic=gesture_topic, gesture_vote_json=json.dumps(vote, sort_keys=True)
+        )
+    return parameters
 
 
 def motion_parameters(robot_config, resolver=lambda value: value):

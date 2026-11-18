@@ -549,7 +549,8 @@ def generate_mirror_session_nodes(robot_config: dict) -> list:
         )
     from manipulation_execution.preset_motions.config import launch_parameters
 
-    preset = launch_parameters(robot_config, stream)
+    # Only the gesture part is an extra here (it warns and turns itself off); the rest still fails the launch.
+    preset = launch_parameters(robot_config, stream, logger.warning)
     if preset is not None:
         actions.append(
             Node(

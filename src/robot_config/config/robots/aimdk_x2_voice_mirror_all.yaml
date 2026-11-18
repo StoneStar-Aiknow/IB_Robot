@@ -314,6 +314,28 @@ robot:
             # In-process inference_service; the node's default stays ais_bench
             # for the older flat model directories.
             backend: inference_service
+            # Two-hand gesture om (heart / holy / xsign -> /hri/hand/gesture) on its own
+            # thread, fed each HandFrame's frame without waiting. Off: nothing is loaded or
+            # run. To try it, set the cut-head om (never *_e2e.om; relative to $WORKSPACE)
+            # and enable; with backend inference_service also gesture_allow_mixed_backend
+            # (untested: the two runtimes in two threads of one process) or the om stays off.
+            gesture_enabled: false
+            gesture_model_path: ""
+            gesture_topic: /hri/hand/gesture
+            gesture_allow_mixed_backend: false
+            gesture_conf: 0.25
+            gesture_far_ratio: 0.6          # two hands further apart than this x person box height: no run
+            gesture_k: 1.5                  # two-hand square = union of the hands' points x k
+            gesture_one_hand_palms: 4.0     # one-hand square side in palms
+            gesture_min_side_px: 64.0
+            gesture_max_rate_hz: 15.0
+            gesture_one_hand_max_rate_hz: 5.0
+            gesture_slow_ms: 20.0           # gesture_slow_limit of the last gesture_slow_window runs this slow: off
+            gesture_slow_window: 10
+            gesture_slow_limit: 3
+            gesture_fail_limit: 5           # failed runs in a row: off
+            gesture_watchdog_ms: 200.0      # one run not back after this: off (the hands never wait on it)
+            gesture_log_period_s: 1.0
     # The standing-zone selector: only the person whose feet are inside the floor
     # quad is mirrored. The zone is the 2026-10-28 field calibration; the camera
     # rides the head and the robot stands still, so it holds on any X2 standing
@@ -499,4 +521,16 @@ robot:
       enter_confirm_s: 0.5
       exit_confirm_s: 0.4
       min_enter_frames: 3
+    # Hand gesture templates heart / holy / xsign on /preset_motions/state, voted
+    # from hands.perception's gesture model (/hri/hand/gesture). Off: it needs
+    # hands.perception.parameters.gesture_enabled and a consumer that reads them.
+    gesture:
+      enabled: false
+      topic: /hri/hand/gesture
+      window_s: 0.6
+      min_frames: 4
+      min_frames_one_hand: 3   # one-hand runs come <= 5 Hz: 3 fit the window even with 15% jitter
+      min_score: 0.5
+      exit_s: 0.3
+      exit_s_one_hand: 0.5     # exit_s after a one-hand run (2.5 periods at 5 Hz)
   # /feat/x2-preset-motions
