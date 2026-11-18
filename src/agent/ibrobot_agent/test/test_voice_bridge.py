@@ -2200,6 +2200,99 @@ def test_mirror_start_terminal_before_holding_heartbeat_never_admits_question():
     assert _of(core.on_heard("点点头", 1), PublishRequest)
 
 
+def _end_mirror_start(core, result):
+    """Accepted mirror_start whose terminal is ``result``, without a holding heartbeat in between."""
+    _mirror_state(core, 0)
+    core.on_heard("照镜子", 0.1)
+    presentation = {"steps": [{"skill_name": "mirror_start"}], "execution_mode": ASYNC_PRESENTATION_MODE}
+    detail = {"presentation": presentation, "presentation_digest": presentation_digest(presentation)}
+    core.on_event(_event("voice-0", "presentation", "MAY_EXECUTE", detail=detail), 0.2)
+    return core.on_event(_event("voice-0", "terminal", result), 0.3)
+
+
+_START_END_SPEECH = {
+    "FAILED": ["执行失败，请查看执行记录或联系操作员。"],
+    "CANCELLED": ["已停止。"],
+    "UNKNOWN": ["执行结果未知，请操作员确认机器人状态。"],
+}
+
+
+@pytest.mark.parametrize("result", ["FAILED", "CANCELLED", "UNKNOWN"])
+def test_unsuccessful_mirror_start_releases_on_wait_sent_after_its_terminal(result):
+    core = _core(mirror_session_enabled=True)
+    ended = _end_mirror_start(core, result)
+    assert [action.text for action in _of(ended, Speak)] == _START_END_SPEECH[result]
+    assert core._mirror_start_request_id == "voice-0"
+    released = core.on_mirror_state(
+        {"state": "WAIT", "holding": False, "releasing": False, "stamp": 2_000_000_000.4},
+        0.4,
+        source_now=2_000_000_000.4,
+    )
+    assert released == []
+    assert core._mirror_start_request_id == ""
+    command = core.on_heard("点点头", 0.5)
+    if result == "UNKNOWN":
+        # An unknown start result still has no safe terminal; that hold is not the mirror's.
+        assert not _of(command, PublishRequest) and not _of(command, Speak)
+        assert any("no safe terminal" in action.message for action in _of(command, Log))
+    else:
+        assert _of(command, PublishRequest)[0].payload["text"] == "点点头"
+        assert not _of(command, Speak)
+
+
+def test_failed_mirror_start_holds_until_a_fresh_unheld_wait_after_the_terminal():
+    core = _core(mirror_session_enabled=True)
+    _end_mirror_start(core, "FAILED")
+    # The cached WAIT predates the terminal: it cannot show the start has let go.
+    assert not _of(core.on_heard("点点头", 0.35), PublishRequest)
+    _mirror_state(core, 0.4, holding=True)
+    assert not _of(core.on_heard("点点头", 0.45), PublishRequest)
+    _mirror_state(core, 0.5, releasing=True)
+    assert not _of(core.on_heard("点点头", 0.55), PublishRequest)
+    assert core._mirror_start_request_id == "voice-0"
+
+
+@pytest.mark.parametrize("delta", [0.0, -0.1])
+def test_failed_mirror_start_ignores_wait_not_newer_than_the_terminal(delta):
+    core = _core(mirror_session_enabled=True)
+    _end_mirror_start(core, "FAILED")
+    _mirror_state(core, 0.4, stamp=2_000_000_000.0 + delta, source_now=2_000_000_000.4)
+    assert not _of(core.on_heard("点点头", 0.5), PublishRequest)
+    assert core._mirror_start_request_id == "voice-0"
+    _mirror_state(core, 0.6)
+    assert _of(core.on_heard("点点头", 0.7), PublishRequest)
+
+
+def test_new_mirror_start_forgets_the_previous_failed_start():
+    core = _core(mirror_session_enabled=True)
+    _end_mirror_start(core, "FAILED")
+    stop = _of(core.on_heard("不玩了", 0.35), PublishRequest)[0].payload
+    core.on_event(_event(stop["request_id"], "terminal", "SUCCEEDED"), 0.4)
+    assert core._mirror_start_request_id == ""
+    # The cached WAIT is still fresh, so the next start is admitted before any new heartbeat.
+    assert _of(core.on_heard("照镜子", 0.45), PublishRequest)
+    presentation = {"steps": [{"skill_name": "mirror_start"}], "execution_mode": ASYNC_PRESENTATION_MODE}
+    detail = {"presentation": presentation, "presentation_digest": presentation_digest(presentation)}
+    core.on_event(_event("voice-2", "presentation", "MAY_EXECUTE", detail=detail), 0.5)
+    # An early WAIT of the new start is not the old start's release.
+    _mirror_state(core, 0.6)
+    assert core._mirror_start_request_id == "voice-2"
+    core.on_event(_event("voice-2", "terminal", "SUCCEEDED"), 0.7)
+    assert not _of(core.on_heard("点点头", 0.8), PublishRequest)
+
+
+def test_successful_mirror_start_still_needs_holding_before_wait():
+    core = _core(mirror_session_enabled=True)
+    _end_mirror_start(core, "SUCCEEDED")
+    _mirror_state(core, 0.4)
+    assert not _of(core.on_heard("点点头", 0.5), PublishRequest)
+    assert core._mirror_start_request_id == "voice-0"
+    _mirror_state(core, 0.6, "MIRRORING", holding=True)
+    _mirror_state(core, 0.7)
+    assert _of(core.on_heard("点点头", 0.8), PublishRequest)
+    assert core._mirror_start_request_id == ""
+
+
 @pytest.mark.parametrize(
     "state,holding,releasing",
     [("STANDBY", True, False), ("WAIT", True, False), ("WAIT", False, True), ("MIRRORING", True, False)],

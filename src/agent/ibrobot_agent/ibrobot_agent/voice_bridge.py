@@ -574,6 +574,9 @@ class VoiceBridgeCore:
         self._mirror_state: dict[str, Any] | None = None
         self._mirror_start_request_id = ""
         self._mirror_seen_holding = False
+        #: Newest valid heartbeat stamp (source clock), and its value when the start ended unsuccessfully.
+        self._mirror_newest_stamp = float("-inf")
+        self._mirror_start_ended_stamp: float | None = None
         self._mirror_stop_request_id = ""
         self._mirror_busy_spoken = False
         self._mirror_stop_pending = False
@@ -666,6 +669,20 @@ class VoiceBridgeCore:
         self._mirror_state = {**payload, "expires_at": now + MIRROR_SESSION.STATE_STALE_SEC - age} if valid else None
         if valid and payload["holding"]:
             self._mirror_seen_holding = True
+        if valid:
+            stamp = float(stamp)
+            ended = self._mirror_start_ended_stamp
+            if (
+                ended is not None
+                and stamp > ended
+                and payload["state"] == MIRROR_SESSION.STATE_WAIT
+                and not payload["holding"]
+                and not payload["releasing"]
+            ):
+                # Sent after the failed start's terminal: that start never took the session.
+                self._mirror_start_request_id = ""
+                self._mirror_start_ended_stamp = None
+            self._mirror_newest_stamp = max(self._mirror_newest_stamp, stamp)
         if self._mirror_idle(now):
             self._mirror_busy_spoken = False
         return []
@@ -754,6 +771,9 @@ class VoiceBridgeCore:
                 self._mirror_interrupted_id = ""
         elif request_id == self._mirror_start_request_id and payload.get("accepted") is False:
             self._mirror_start_request_id = ""
+        elif request_id == self._mirror_start_request_id and payload.get("state") != "SUCCEEDED":
+            # The cached WAIT may predate this terminal; release on a newer one (``on_mirror_state``).
+            self._mirror_start_ended_stamp = self._mirror_newest_stamp
 
     def note_speech(self, text: str, now: float, *, finished: bool = False, gate_epoch: int | None = None) -> None:
         self._recent_speech.append((_normalize(text), now))
@@ -1799,6 +1819,7 @@ class VoiceBridgeCore:
             self._mirror_start_request_id = request_id
             self._mirror_owned_requests.add(request_id)
             self._mirror_seen_holding = False
+            self._mirror_start_ended_stamp = None
             self._mirror_busy_spoken = False
         gift_owned = self._gift.register(request_id, self._state.session_id, steps)
         if any(
