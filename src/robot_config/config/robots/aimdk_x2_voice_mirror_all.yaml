@@ -319,10 +319,10 @@ robot:
             # run. To try it, set the cut-head om (never *_e2e.om; relative to $WORKSPACE)
             # and enable; with backend inference_service also gesture_allow_mixed_backend
             # (untested: the two runtimes in two threads of one process) or the om stays off.
-            gesture_enabled: false
-            gesture_model_path: ""
+            gesture_enabled: true
+            gesture_model_path: /root/x2-feat-motion-template-hand/yolov10n_gestures_320_cut_v1.om
             gesture_topic: /hri/hand/gesture
-            gesture_allow_mixed_backend: false
+            gesture_allow_mixed_backend: true
             gesture_conf: 0.25
             gesture_far_ratio: 0.6          # two hands further apart than this x person box height: no run
             gesture_k: 1.5                  # two-hand square = union of the hands' points x k
@@ -350,6 +350,7 @@ robot:
   mirror_session:
     enabled: true
     publish_enabled: true
+    motion_template_config: $(find robot_config)/config/motion_template/motion_template_onsite.yaml
     # The mirror speaks again (2026-10-23 evening, on request): the four phrases
     # (starting / ready / mirroring / goodbye) go through the same ZipVoice the
     # agent uses. Each phrase costs ~2 s of NPU inference, so the opening seconds
@@ -454,7 +455,7 @@ robot:
   # Without cbf_safety or the file every start is refused; the launch never fails
   # on this block. Off: no topic, the data plane is the e965d015 one.
   template_play:
-    enabled: false
+    enabled: true
     segments_file: $(find robot_config)/config/motion_template/segments.json
   # /feat/x2-cbf-dual
 
@@ -528,7 +529,7 @@ robot:
     # from hands.perception's gesture model (/hri/hand/gesture). Off: it needs
     # hands.perception.parameters.gesture_enabled and a consumer that reads them.
     gesture:
-      enabled: false
+      enabled: true
       topic: /hri/hand/gesture
       window_s: 0.6
       min_frames: 4
