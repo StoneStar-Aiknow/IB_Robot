@@ -44,6 +44,12 @@ Parameters (one parameter file serves the node and the release script):
                               command the gate sends gets its hand half from
                               ``mirror_session.hand_overlay`` (follow while
                               mirroring, neutral otherwise); empty: unchanged
+``motion_template_config``    path of the ``motion_template`` yaml
+                              (``template_motion.config``); empty or
+                              ``enabled: false``: nothing of it is built. Needs
+                              the mock window pipeline, the hand overlay and
+                              ``publish_enabled``; a config that cannot be
+                              used is logged and templates stay off
 ``hand_state_topic`` /        vendor hand feedback and MC's hand command, by
 ``hand_command_topic``        topic and type name (``*_type``), for the
                               overlay's start, unjam and staleness; empty:
@@ -244,6 +250,7 @@ SESSION_PARAMETERS = {
     "hand_command_topic": "",
     "hand_command_type": "aimdk_msgs/msg/HandCommandArray",
     "preset_motion_json": "",
+    "motion_template_config": "",
 }
 
 
@@ -464,6 +471,9 @@ class MirrorSessionNode(Node):
         self._latency = LatencyMeter()
         self._hands = self._hand_overlay(rate)
         self._hands_last: tuple[float, ...] | None = None
+        self._template = self._template_hooks(hooks)
+        if self._template is not None:
+            hooks = self._template
         if self._preset is not None and (self._hands is None or self._mock is None):
             raise ValueError("named preset requires the live arm preview and both-hand follow target")
         session_options = {"hooks": hooks, "cover": cover}
@@ -555,6 +565,87 @@ class MirrorSessionNode(Node):
                 "commands go to ~/arm_command_preview and ~/hand_command_preview only"
             )
 
+    def _template_hooks(self, hooks):
+        """The session hooks wrapped with the template blender, or None (off, or a config that cannot be used)."""
+        self._template_client = self._template_labels = None
+        path = _string(self, "motion_template_config")
+        if not path:
+            return None
+        logger = self.get_logger()
+        try:
+            from manipulation_execution.mirror_session.hand_overlay import HAND_HIGH, HAND_LOW, travel_time_s
+            from manipulation_execution.template_motion.blender import Blender
+            from manipulation_execution.template_motion.config import load_config
+            from manipulation_execution.template_motion.hooks import TemplateBlendHooks
+            from manipulation_execution.template_motion.labels import LabelBook
+            from manipulation_execution.template_motion.port import CbfMonitor, PlayClient, PortMonitor
+
+            setup = load_config(path, hand_limits=(HAND_LOW, HAND_HIGH))
+            if setup is None:
+                logger.info(f"motion templates off ({path}: enabled false)")
+                return None
+            for note in setup.notes:
+                logger.warning(f"motion templates: {note}")
+            lacking = [
+                name
+                for name, present in (
+                    ("mock_preview_topic", self._mock is not None),
+                    ("hand_follow_topic", self._hands is not None),
+                    ("publish_enabled", self._publish_enabled),
+                    ("no preset_motion_json", self._preset is None),
+                )
+                if not present
+            ]
+            if lacking:
+                raise ValueError(f"motion templates need {', '.join(lacking)}")
+            if not setup.templates:
+                logger.warning("motion templates: no template enabled; off")
+                return None
+            labels = LabelBook(setup.templates, setup.label_stale_s)
+            port, cbf = PortMonitor(), CbfMonitor()
+            publisher = self.create_publisher(String, setup.play_topic, 10)
+            client = PlayClient(
+                lambda data: publisher.publish(String(data=data)),
+                port,
+                setup.keepalive_period_s,
+                setup.keepalive_give_up_s,
+                first_seg_id=int(time.time() * 1000.0),  # a new process never reuses a recent seg_id
+            )
+            blender = Blender(
+                setup.blend,
+                setup.segments,
+                setup.templates,
+                labels,
+                port,
+                cbf,
+                client,
+                lambda text: logger.info(text),
+                hand_travel_s=travel_time_s,
+            )
+            wrapped = TemplateBlendHooks(hooks, blender, lambda text: logger.error(text))
+        except Exception as exc:  # a template is a nice-to-have: the mirror starts without it
+            logger.error(f"motion templates off: {exc!r}")
+            return None
+        group = MutuallyExclusiveCallbackGroup()
+        for topic, observe in (
+            (setup.label_topic, labels.observe),
+            (setup.status_topic, port.observe),
+            (setup.dataplane_status_topic, cbf.observe),
+        ):
+            self.create_subscription(
+                String,
+                topic,
+                lambda msg, observe=observe: observe(msg.data, time.monotonic()),
+                10,
+                callback_group=group,
+            )
+        self._template_client, self._template_labels = client, labels
+        logger.info(
+            f"motion templates on: {', '.join(f'{k}={list(v)}' for k, v in setup.templates.items())}; "
+            f"labels {setup.label_topic}, port {setup.play_topic} / {setup.status_topic}"
+        )
+        return wrapped
+
     def _hand_overlay(self, rate: float) -> HandOverlay | None:
         follow = _optional_topic(self, "hand_follow_topic")
         if not follow:
@@ -621,12 +712,15 @@ class MirrorSessionNode(Node):
             self._hands_last = tuple(command.hand)
         elif self._hands is not None:
             following = self.session.state == SessionState.MIRRORING and self.session.phase == Phase.RUNNING
+            template = None if self._template is None else self._template.hand_target(time.monotonic())
             try:
-                self._hands_last = self._hands.apply(following, self._clock_s())
+                self._hands_last = self._hands.apply(following, self._clock_s(), template)
             except Exception as exc:  # a hand fault never reaches the gate: the hands hold their last values
                 self.get_logger().error(f"hand overlay failed: {exc!r}", throttle_duration_sec=1.0)
             if self._hands_last is not None:
                 command = dataclasses.replace(command, hand=self._hands_last)
+            if self._template is not None:
+                self._template.observe_hand_output(self._hands_last)
         arm, hand = Float64MultiArray(data=list(command.arm)), Float64MultiArray(data=list(command.hand))
         if self._publish_enabled:
             self._arm_publisher.publish(arm)
@@ -744,6 +838,12 @@ class MirrorSessionNode(Node):
     def _tick(self) -> None:
         released_before = self.session.last_release
         self.session.tick(dataclasses.replace(self._inputs.take(), publish_enabled=self._publish_enabled))
+        client = getattr(self, "_template_client", None)  # tests drive _tick on a bare namespace
+        if client is not None:
+            try:
+                client.pump(time.monotonic())
+            except Exception as exc:
+                self.get_logger().error(f"template keepalive failed: {exc!r}", throttle_duration_sec=1.0)
         outcome = self.session.last_release
         if outcome is not released_before and outcome is not None:
             # Releases started here (cover, hook error, runtime fault) log nowhere else.
@@ -803,6 +903,12 @@ class MirrorSessionNode(Node):
             status["mock_playback"] = self._mock.snapshot()
         if self._hands is not None:
             status["hands"] = self._hands.snapshot(self._clock_s())
+        if self._template is not None:
+            status["motion_template"] = {
+                **self._template.snapshot(),
+                "labels": self._template_labels.snapshot(time.monotonic()),
+                "play": self._template_client.snapshot(),
+            }
         self._status_publisher.publish(String(data=json.dumps(status, sort_keys=True)))
 
     def release_on_exit(self, spin_once) -> None:
