@@ -36,11 +36,13 @@ Runtime ownership (``runtime`` module):
   gate is the only caller of ``publish``. Every send re-checks it under the
   same lock revocation takes, so nothing is sent after a revocation.
 * Revocation (another mode, stop latch, fault, status older than 2 s) closes
-  the gate and enters WAIT at once: no wrap-up and no idle request. Recovery
-  is an explicit ``start``, never automatic.
+  the gate and enters WAIT at once: no wrap-up. Recovery is an explicit
+  ``start``, never automatic. A fault or a lost status is also released to
+  idle, on the next tick and once per WAIT (``runtime.releases_on_problem``);
+  another mode or a stop latch is not.
 * Every exit back to idle calls ``runtime.release_to_idle`` and only after the
-  gate is closed: ``stop``, the cover path, startup and shutdown here, and the
-  launch exit script in the node module.
+  gate is closed: ``stop``, the cover path, a runtime fault, startup and
+  shutdown here, and the launch exit script in the node module.
 * ``stop`` reports success only when the runtime was observed back in idle.
   Wrap-up plus release fit in ``stop_timeout_s``; the wrap-up is cut at
   ``stop_timeout_s - RELEASE_RESERVE_S``. The Gateway checks at startup that
@@ -83,6 +85,7 @@ from manipulation_execution.mirror_session.runtime import (
     WaitReason,
     assess,
     release_to_idle,
+    releases_on_problem,
     takeover_refusal,
 )
 
@@ -236,6 +239,8 @@ class MirrorSession:
         self._generation = 0
         self._wait_epoch = 0
         self._stop_waiters = 0
+        # The runtime took the mode away with a fault or went silent: the next tick releases.
+        self._fault_release_due = False
         self._last_status: RuntimeObservation | None = None
         self._last_valid_at: float | None = None
         self._measured_arm: tuple[float, ...] | None = None
@@ -339,9 +344,19 @@ class MirrorSession:
         if not self._holding:
             return
         if problem is not None:
-            self._enter_wait_locked(*problem)
+            self._runtime_problem_locked(*problem, observation)
         elif observation.active_mode != self._config.policy_mode:
             self._enter_wait_locked(WaitReason.REVOKED, f"runtime switched to {observation.active_mode!r}")
+
+    def _runtime_problem_locked(self, reason: WaitReason, detail: str, observation) -> None:
+        """WAIT; a fault or a lost status is released to idle by the next tick.
+
+        Not here: a status callback must not block on the release. A stop that
+        waits releases itself.
+        """
+        self._enter_wait_locked(reason, detail)
+        if self._stop_waiters == 0 and releases_on_problem(reason, observation):
+            self._fault_release_due = True
 
     # ------------------------------------------------------------------
     # ~/set_session and the operator touch
@@ -382,6 +397,7 @@ class MirrorSession:
                 self.detail = f"start refused: {refusal}"
                 return False, refusal
             self._holding = True
+            self._fault_release_due = False
             self._preset_hold_required = self._preset_hold_sent = False
             self._preset_failure = ""
             self._preset_suspended = self._preset_had_owner = self._preset_stop_without_wrap = False
@@ -479,6 +495,7 @@ class MirrorSession:
     def _release(self) -> ReleaseOutcome:
         with self._release_lock:
             with self._lock:
+                self._fault_release_due = False  # any release answers a pending fault release
                 # Every caller closes the gate first, then drops the session lock.
                 # A start that takes over in that gap holds the mode now, and
                 # idle is not requested from under a holder.
@@ -533,18 +550,25 @@ class MirrorSession:
                 release = self._tick_locked(self._clock(), inputs)
             except _HookError as error:
                 release = self._hook_failed_locked(error)
+            fault_release, epoch = release and self._fault_release_due, self._wait_epoch
         if release:
-            self._release()
+            outcome = self._release()
+            if fault_release:
+                with self._lock:
+                    if self.state == SessionState.WAIT and self._wait_epoch == epoch:
+                        self.detail += f"; fault release: {outcome.message}"
 
     def _tick_locked(self, now: float, inputs: SessionInputs) -> bool:
         """One step; True when the caller must release (an internal stop nobody waits on)."""
-        if self.state == SessionState.WAIT and self._preset_hold_required and not self._preset_hold_sent:
+        if self.state == SessionState.WAIT and (
+            self._fault_release_due or (self._preset_hold_required and not self._preset_hold_sent)
+        ):
             return True
         if self._holding:
             age = None if self._last_valid_at is None else now - self._last_valid_at
             if age is None or age > self._config.status_max_age_s:
-                self._enter_wait_locked(WaitReason.RUNTIME_LOST, "no fresh runtime status")
-                return self._preset_hold_required and self._stop_waiters == 0
+                self._runtime_problem_locked(WaitReason.RUNTIME_LOST, "no fresh runtime status", self._last_status)
+                return self._fault_release_due or (self._preset_hold_required and self._stop_waiters == 0)
         if self.state == SessionState.STANDBY:
             return self._tick_standby_locked(now, inputs)
         if self.state == SessionState.MIRRORING:

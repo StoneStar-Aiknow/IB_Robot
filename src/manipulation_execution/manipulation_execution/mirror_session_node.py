@@ -742,7 +742,15 @@ class MirrorSessionNode(Node):
             self.session.observe_arm_position([positions[name] for name in self._arm_joints])
 
     def _tick(self) -> None:
+        released_before = self.session.last_release
         self.session.tick(dataclasses.replace(self._inputs.take(), publish_enabled=self._publish_enabled))
+        outcome = self.session.last_release
+        if outcome is not released_before and outcome is not None:
+            # Releases started here (cover, hook error, runtime fault) log nowhere else.
+            reason = self.session.wait_reason
+            self.get_logger().info(
+                f"release ({'none' if reason is None else reason.value}): idle={outcome.idle} {outcome.message}"
+            )
         transitions = self.session.drain_transitions()
         for record in transitions:
             if getattr(self, "_preset", None) is not None:

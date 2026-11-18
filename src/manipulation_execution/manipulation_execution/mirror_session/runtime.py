@@ -15,8 +15,12 @@ mirror needs:
   over one. Every exit path calls :func:`release_to_idle`; none sends idle any
   other way.
 
-Revocation (another mode, stop latch, fault, stale status) is never answered
-with a request: the caller closes its output and waits for an explicit start.
+Revocation by another mode or a stop latch is never answered with a request:
+the caller closes its output and waits for an explicit start. A fault or a
+lost status is answered with the same release (zll 11-18: whatever goes wrong
+outside, the robot goes back to idle instead of staying where the fault caught
+it), except the faults in :data:`NOT_OURS_FAULTS`, where the robot is in
+someone else's hands.
 """
 
 from __future__ import annotations
@@ -99,6 +103,30 @@ def assess(
         detail = "; ".join(observation.faults) or "no detail"
         return WaitReason.FAULT, f"runtime {observation.lifecycle}: {detail}"
     return None
+
+
+# Fault texts (aimdk runtime_node ``_set_fault`` "arbitration" and "system")
+# that mean the robot is someone else's: a higher-priority source holds the
+# command arbitration, our input source is not registered, or the platform is
+# in EStop / OTA / Poweroff / Reboot / Develop_MC. Asking for idle then could
+# fight that owner. ``RuntimeStatus.faults`` carries only text, hence substrings.
+NOT_OURS_FAULTS = (
+    "command arbitration held by",
+    "vendor input source registration failed",
+    "platform system mode",
+)
+
+
+def releases_on_problem(reason: WaitReason, observation: RuntimeObservation | None) -> bool:
+    """Whether a holder that lost the mode to ``reason`` releases to idle itself.
+
+    Only a fault or a lost status, and not when a fault says the robot is held
+    by someone else. ``release_to_idle`` still decides from a fresh status.
+    """
+    if reason not in (WaitReason.FAULT, WaitReason.RUNTIME_LOST):
+        return False
+    faults = () if observation is None else observation.faults
+    return not any(marker in fault for fault in faults for marker in NOT_OURS_FAULTS)
 
 
 def takeover_refusal(
