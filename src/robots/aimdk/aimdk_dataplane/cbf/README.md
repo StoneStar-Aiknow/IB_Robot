@@ -191,7 +191,8 @@ The adaptation touches `kinematics.hpp`, `safety_filter.hpp`, `kinematics.cpp`,
 and cover exclusion of an absent right hand while left-hand and arm collisions
 remain detectable. Thumb feedback is read only for installed hands; a missing
 native angle is never filled in as measured zero (the adapter substitutes the
-last published command, see below).
+last published command, see below; a phantom hand's thumb is a configured
+compact pose).
 
 ## Native observations versus commanded joint bounds
 
@@ -224,9 +225,9 @@ without readings or with a faulted hand is replaced, the other side's reading
 stays in use. Each such frame increments `thumb_feedback_frames`; the first
 frame of a new issue is logged once as `CBF_THUMB_FEEDBACK` with the raw native
 value and native bounds. A phantom hand's thumb (an installed side reported as
-no hand) is held where it was last published (the request on the first frame
-of an epoch), as both its current and its target angle, and is not a feedback
-issue: it never moves in the geometry, so it never starts a gesture ordering
+no hand) is the configured compact pose `phantom_thumb_native`, as its
+current angle, its target and its published command, and is not a feedback
+issue: it never follows the request, so it never starts a gesture ordering
 check or makes the whole-gesture deferral hold the other hand's gesture.
 
 A thumb command outside what the hand can reach is clamped into the native

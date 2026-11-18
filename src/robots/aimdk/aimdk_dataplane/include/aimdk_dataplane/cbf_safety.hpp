@@ -56,6 +56,15 @@ struct CbfSafetyConfig
   std::array<double, 4> command_offset{};
   std::array<double, 4> feedback_scale{1.0, 1.0, 1.0, 1.0};
   std::array<double, 4> feedback_offset{};
+  // Native command angles (L roll, L abad, R roll, R abad) of a phantom hand's
+  // thumb, used as its target, its current angle and its published command.
+  // Default: the most tucked-in pose in the command band, model roll at its
+  // upper and abad at its lower end; with the rigid model band and an identity
+  // mapping that is the value below. FK over arm poses whose palm is near the
+  // body or the other arm found it farthest from them of the band ends and
+  // the baseline. cbf_safety_json may set phantom_thumb_native: [[L roll,
+  // L abad], [R roll, R abad]] inside the command band.
+  std::array<double, 4> phantom_thumb_native{1.27409035, -1.6424, 0.69813170, -1.464235482612666};
   std::array<double, 14> lower{};
   std::array<double, 14> upper{};
   std::array<double, 14> velocity{};
@@ -82,7 +91,7 @@ struct CbfSnapshot
   std::array<bool, 2> thumb_faulted{};
   // Per side: configured as installed while the platform reports no hand (SDK
   // type 0), i.e. an empty flange. Its geometry is still checked, as a phantom
-  // hand with its thumb where it was last published; this is no feedback problem.
+  // hand with its thumb at phantom_thumb_native; this is no feedback problem.
   std::array<bool, 2> hand_reported_absent{};
   // Shared with the publishing tick. Numerical callers may omit this and use
   // the configured relative budget; wall-clock/ROS time must never be used here.

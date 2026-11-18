@@ -4,7 +4,8 @@ The filter's decisions are covered by aimdk_dataplane's C++ tests. These cover
 the node around it: the status fields the runtime reads, the INFO line, the
 CBF_RELEASE log when the right hand is swapped for one the geometry was not
 built for mid-mirror and comes back, and an empty right flange checked as a
-phantom hand instead of released, its thumb held and its start and end logged.
+phantom hand instead of released, its thumb at the compact pose and its start
+and end logged once even when its type flickers.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from aimdk_robot import dataplane
 from test_runtime_bridge import OMNIHAND_PROFILE, Harness, ros_context  # noqa: F401  (the module's ROS context)
 
 # The candidate mapping is an identity here; the mock's geometry is not the robot's.
+# A phantom right thumb's default pose with it: model roll upper, abad lower end.
+COMPACT_RIGHT_THUMB = [0.69813170, -1.464235482612666]
 CBF = {
     "enabled": True,
     "mode": "enforce",
@@ -223,13 +226,12 @@ def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
         assert harness.status().active_mode == "policy_stream"
 
         # A left thumb reading inside the model band is used as it is; the
-        # phantom right thumb stays where it was published, as its target and
-        # its current angle, whatever the right command. The mock stops echoing
-        # commands so the reading differs from the command (its arm stops
-        # following too, so this part checks no releases: a later release
-        # publishes the request as it is, and the phantom thumb with it).
-        held = cbf["thumb_target_urdf"][2:]
-        assert held != pytest.approx([0.3, -0.4], abs=1e-9)
+        # phantom right thumb is the compact pose, as its target, its current
+        # angle and what is published, whatever the right command. The mock
+        # stops echoing commands so the reading differs from the command.
+        assert cbf["thumb_target_urdf"][2:] == pytest.approx(COMPACT_RIGHT_THUMB, abs=1e-9)
+        assert cbf["thumb_current_urdf"][2:] == pytest.approx(COMPACT_RIGHT_THUMB, abs=1e-9)
+        assert list(harness.mock.last_upper_body.hand_pos)[10:12] == pytest.approx(COMPACT_RIGHT_THUMB, abs=1e-6)
         harness.mock.set_parameters([rclpy.parameter.Parameter("follow_commands", value=False)])
         with harness.mock._lock:
             harness.mock._positions["L_thumb_roll_joint"] = 0.5
@@ -244,13 +246,30 @@ def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
             and cbf["thumb_current_urdf"][:2] == pytest.approx([0.5, -0.6], abs=1e-9),
             "the left thumb command and reading in the CBF report",
         )
-        assert cbf["released"] == 0, "a release would publish the right command as it is"
-        assert cbf["thumb_target_urdf"][2:] == pytest.approx(held, abs=1e-9)
-        assert cbf["thumb_current_urdf"][2:] == pytest.approx(held, abs=1e-9)
+        assert cbf["released"] == 0
+        assert cbf["thumb_target_urdf"][2:] == pytest.approx(COMPACT_RIGHT_THUMB, abs=1e-9)
+        assert cbf["thumb_current_urdf"][2:] == pytest.approx(COMPACT_RIGHT_THUMB, abs=1e-9)
         assert cbf["thumb_feedback_issue"] == ""
+        hand_pos = harness.wait_for(
+            lambda: (lambda pos: pos if pos[:2] == pytest.approx([0.9, -0.2], abs=1e-6) else None)(
+                list(harness.mock.last_upper_body.hand_pos)
+            ),
+            "the left thumb command published",
+        )
+        assert hand_pos[10:12] == pytest.approx(COMPACT_RIGHT_THUMB, abs=1e-6)
     finally:
         stop.set()
         thread.join(timeout=1.0)
+
+    # A type flickering between 0 and 1 (each state 0.2 s, the hand state at
+    # 50 Hz) stays one episode: no end until reported for 0.5 s, no new start.
+    for _ in range(3):
+        harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="dexterous")])
+        time.sleep(0.2)
+        harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="none")])
+        time.sleep(0.2)
+    assert len(logged.matching("CBF_HAND_ABSENT side=right start")) == 1
+    assert not logged.matching("CBF_HAND_ABSENT side=right end")
 
     # The hand is fitted: the phantom ends, logged once, and the start was logged once.
     harness.mock.set_parameters([rclpy.parameter.Parameter("right_hand_type", value="dexterous")])

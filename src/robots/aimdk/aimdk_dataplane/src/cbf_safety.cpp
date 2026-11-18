@@ -86,6 +86,45 @@ void clamp_thumb_command(const CbfSafetyConfig & config, Output & command)
   }
 }
 
+// The most tucked-in thumb in the command band: model roll at its upper end,
+// abad at its lower end (away from the torso, the thighs and the other arm).
+std::array<double, 4> compact_thumb_native(const CbfSafetyConfig & config)
+{
+  std::array<double, 4> out{};
+  for (size_t axis = 0; axis < out.size(); ++axis) {
+    const auto band = thumb_command_band(config, axis);
+    const bool model_upper = axis % 2 == 0;
+    out[axis] = (config.command_scale[axis] > 0.0) == model_upper ? band[1] : band[0];
+  }
+  return out;
+}
+
+// An empty flange's thumb never follows the request.
+void place_phantom_thumbs(
+  const CbfSafetyConfig & config, const std::array<bool, 2> & absent, Output & command)
+{
+  for (size_t axis = 0; axis < kHandSlots.size(); ++axis) {
+    if (config.hands_installed[axis / 2] && absent[axis / 2]) {
+      command.hand[kHandSlots[axis]] = config.phantom_thumb_native[axis];
+    }
+  }
+}
+
+// Hand commands equal apart from the phantom thumbs, which never follow the request.
+bool same_real_hand(
+  const CbfSafetyConfig & config, const std::array<bool, 2> & absent,
+  const std::vector<double> & a, const std::vector<double> & b)
+{
+  if (a.size() != b.size()) {return false;}
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (a[i] == b[i]) {continue;}
+    const size_t side = i < 10 ? 0 : 1;
+    const bool phantom_thumb = (i % 10) < 2 && a.size() == 20 && config.hands_installed[side] && absent[side];
+    if (!phantom_thumb) {return false;}
+  }
+  return true;
+}
+
 bool complete_upper_body(const Output & command)
 {
   return command.kind == Output::Kind::kUpperBody && command.arm.size() == 14 &&
@@ -230,6 +269,25 @@ CbfSafetyConfig CbfSafetyConfig::from_json(const std::string & text, double rate
       }
     }
   }
+  out.phantom_thumb_native = compact_thumb_native(out);
+  if (value.contains("phantom_thumb_native")) {
+    const auto & sides = value.at("phantom_thumb_native");
+    if (!sides.is_array() || sides.size() != 2) {
+      throw std::invalid_argument("CBF phantom_thumb_native must be [[L roll, L abad], [R roll, R abad]]");
+    }
+    for (size_t axis = 0; axis < 4; ++axis) {
+      const auto & side = sides[axis / 2];
+      if (!side.is_array() || side.size() != 2 || !side[axis % 2].is_number()) {
+        throw std::invalid_argument("CBF phantom_thumb_native must be [[L roll, L abad], [R roll, R abad]]");
+      }
+      const double angle = side[axis % 2].get<double>();
+      const auto band = thumb_command_band(out, axis);
+      if (!std::isfinite(angle) || angle < band[0] || angle > band[1]) {
+        throw std::invalid_argument("CBF phantom_thumb_native outside the thumb command band");
+      }
+      out.phantom_thumb_native[axis] = angle;
+    }
+  }
   return out;
 }
 
@@ -240,7 +298,7 @@ bool CbfSafetyConfig::matches_hand_types(const std::vector<int> & types) const
     // This geometry and mapping are for the OmniHand reported as SDK type 1.
     // An installed side reported as type 0 is an empty flange (a hand not yet
     // fitted, or a dropout): its geometry stays in, checked as a phantom hand
-    // with its thumb held where it was published, which only adds collision
+    // with its thumb at phantom_thumb_native, which only adds collision
     // pairs. The reverse is refused: a hand on a side configured without one
     // (or any other hand type) has no collision body here, so it would move
     // unchecked.
@@ -379,24 +437,20 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   }
   Output command = snapshot.requested;
   clamp_thumb_command(config_, command);
-  // A phantom hand's thumb stays where it was last published (the request on
-  // the first frame of an epoch), the same angles its current pose uses below.
-  // It never moves in the geometry, so it can neither start a gesture ordering
-  // check nor make the whole-gesture deferral hold the real hand's gesture.
-  if (accepted_) {
-    for (size_t axis = 0; axis < kHandSlots.size(); ++axis) {
-      if (config_.hands_installed[axis / 2] && snapshot.hand_reported_absent[axis / 2]) {
-        command.hand[kHandSlots[axis]] = accepted_->hand[kHandSlots[axis]];
-      }
-    }
-  }
+  // A phantom hand's thumb is always the configured compact pose, never the
+  // request (an open thumb would stand in the arm's way all epoch), and the
+  // same angles its current pose uses below. It does not follow the request,
+  // so it can neither start a gesture ordering check nor make the
+  // whole-gesture deferral hold the real hand's gesture.
+  const auto & absent = snapshot.hand_reported_absent;
+  place_phantom_thumbs(config_, absent, command);
   // Thumb readings never gate a frame: no admission band covers OmniHand
   // tracking error, and a held frame cannot move the thumb back. Geometry uses
   // the reading clamped into the model range; a missing, stale, nonfinite or
   // faulted reading is replaced by the last published (else requested) command.
   // Each side is judged on its own: one side's missing or faulted thumb never
   // replaces the other side's reading. A side reported as an empty flange is a
-  // phantom hand: always the held command above, and not counted as a feedback problem.
+  // phantom hand: always phantom_thumb_native, and not counted as a feedback problem.
   std::array<double, 4> thumb_current{};
   CbfThumbFeedbackEvent thumb_event;
   {
@@ -422,7 +476,9 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       const char * issue = blanket;
       if (!phantom && !issue && !std::isfinite(value)) {issue = "unavailable";}
       if (!phantom && !issue && (value < band[0] || value > band[1])) {issue = "out_of_range";}
-      if (phantom || blanket || !std::isfinite(value)) {
+      if (phantom) {
+        value = config_.command_scale[j] * config_.phantom_thumb_native[j] + config_.command_offset[j];
+      } else if (blanket || !std::isfinite(value)) {
         value = config_.command_scale[j] * substitute[kHandSlots[j]] + config_.command_offset[j];
       }
       thumb_current[j] = std::clamp(value, band[0], band[1]);
@@ -558,7 +614,9 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   bool new_thumb_target = false;
   if (config_.enforce && accepted_) {
     for (size_t axis = 0; axis < kHandSlots.size(); ++axis) {
-      if (config_.hands_installed[axis / 2] && target.hand[kHandSlots[axis]] != accepted_->hand[kHandSlots[axis]]) {
+      if (config_.hands_installed[axis / 2] && !absent[axis / 2] &&
+        target.hand[kHandSlots[axis]] != accepted_->hand[kHandSlots[axis]])
+      {
         new_thumb_target = true;
       }
     }
@@ -579,11 +637,13 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     if (hand_first.deadline_missed) {
       ++diagnostics_.hand_budget_holds;
       target.hand = accepted_->hand;
+      place_phantom_thumbs(config_, absent, target);
       hand_held = true;
     } else if (hand_first.status == x2::cbf::FilterStatus::InvalidInputFallback) {
       return fallback(x2::cbf::filter_status_name(hand_first.status));
     } else if (!hand_first.thumb_target_accepted || !hand_first.nonlinear_verified) {
       target.hand = accepted_->hand;
+      place_phantom_thumbs(config_, absent, target);
       hand_held = true;
     }
   }
@@ -675,7 +735,7 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
         decision.accept_new = true;
         decision.hand_held = hand_held;
         decision.modified = decision.output.arm != snapshot.requested.arm ||
-          decision.output.hand != snapshot.requested.hand;
+          !same_real_hand(config_, absent, decision.output.hand, snapshot.requested.hand);
         decision.geometry_modified = hand_held || !same_arm(result.q_safe, bounded_arm);
         decision.recovery_verified = verified.recovery_verified;
         diagnostics_.minimum_distance_m = verified.output_min_distance_m;
@@ -690,9 +750,10 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     // failures retain the full old pair and never authorize an arm-only retry.
     if (attempt == 0 && config_.enforce && accepted_ &&
       result.status != x2::cbf::FilterStatus::InvalidInputFallback &&
-      target.hand != accepted_->hand && remaining() > config_.guard_us)
+      !same_real_hand(config_, absent, target.hand, accepted_->hand) && remaining() > config_.guard_us)
     {
       target.hand = accepted_->hand;
+      place_phantom_thumbs(config_, absent, target);
       hand_held = true;
       continue;
     }
@@ -811,6 +872,7 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   out.epoch = decision.epoch;
   out.output = requested;
   clamp_thumb_command(config_, out.output);
+  place_phantom_thumbs(config_, snapshot.hand_reported_absent, out.output);
   const bool measured = snapshot.arm && snapshot.arm->position.size() == 14 && finite(snapshot.arm->position);
   const double dt = accepted_ ? std::min(config_.period_s, std::max(0.0, now - last_published_)) : config_.period_s;
   for (size_t j = 0; j < 14; ++j) {
@@ -824,7 +886,8 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   }
   out.accept_new = true;
   out.released = true;
-  out.modified = out.output.arm != requested.arm || out.output.hand != requested.hand;
+  out.modified = out.output.arm != requested.arm ||
+    !same_real_hand(config_, snapshot.hand_reported_absent, out.output.hand, requested.hand);
   out.prepared_hold = decision.prepared_hold;
   if (!diagnostics_.releasing) {
     ++diagnostics_.release_episodes;

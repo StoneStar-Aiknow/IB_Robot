@@ -43,14 +43,28 @@ different mappings. Using a candidate does not establish physical calibration.
 `hands_installed` is explicit and defaults to both hands for existing callers;
 the X2 deployments configure `[true, true]`, the target hardware. An installed
 side the platform reports as no hand (type 0) is an empty flange: it is checked
-as a phantom hand, with its full palm and thumb geometry and its thumb held
-where it was last published (the request on the first frame of an epoch), so
-the same configuration and code run before and after the hand is fitted. The
-phantom thumb never moves, so its commands can never hold the real hand's
-gesture. A phantom hand only adds collision pairs. The data plane logs
+as a phantom hand, with its full palm and thumb geometry and its thumb at
+`phantom_thumb_native`, so the same configuration and code run before and
+after the hand is fitted. That pose is the thumb's target, its current angle
+and its published command, whatever the request: an open thumb taken from the
+request would stand in the arm's way for the whole epoch. The default is the
+most tucked-in pose in the command band (model roll at its upper end, abad at
+its lower end), which FK over arm poses with the palm near the body or the
+other arm found farthest from them on a grid across the band, its ends and the
+baseline included (with the deployed candidate mapping: native `[-1.117,
+-0.05]` and `[0.87, 0.05]`, URDF roll 1.117 / 0.294, abad -1.6924). It is
+the best on average, not everywhere: with the hand hanging down beside its own
+thigh, an open abad can clear the thigh where this pose does not.
+`cbf_safety_json` may set `phantom_thumb_native: [[L roll, L abad], [R roll,
+R abad]]` (native radians, inside the command band). The phantom thumb never
+follows the request, so its commands can never hold the real hand's gesture
+and do not count as `modified`. When the hand is fitted (type 0 to 1) a new
+thumb command goes through the usual gesture ordering check. A phantom hand
+only adds collision pairs. The data plane logs
 `CBF_HAND_ABSENT side=<left|right> start` when an installed side starts being
-reported as no hand and `... end` when it stops, so a real hand that drops out
-and is checked as a phantom is visible in the field. Only installed sides
+reported as no hand and `... end` once it has been reported as a hand again for
+0.5 s without a break (a type flickering between 0 and 1 is one episode), so
+a real hand that drops out and is checked as a phantom is visible in the field. Only installed sides
 provide measured roll/abad feedback. The original hand20 command layout stays
 unchanged. Pairs containing a palm or thumb on a side configured `false` are
 excluded; all body and upper-arm/forearm pairs remain active, with the same

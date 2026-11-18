@@ -2477,9 +2477,10 @@ CbfSnapshot two_hand_readings(const CbfSafetyConfig & config)
 
 }  // namespace
 
-// The request does not change here, so the published phantom thumb is the
-// request on every frame; a changing request is held (see below).
-TEST(CbfSafety, APhantomRightThumbIsThePublishedCommandAndNoFeedbackProblem)
+// Whatever the request, a phantom thumb is the configured compact pose: its
+// target, its current angle and what is published. A request that only differs
+// there is not counted as modified.
+TEST(CbfSafety, APhantomRightThumbIsTheCompactPoseAndNoFeedbackProblem)
 {
   const auto config = fixture_config();
   CbfSafety safety(config);
@@ -2489,9 +2490,14 @@ TEST(CbfSafety, APhantomRightThumbIsThePublishedCommandAndNoFeedbackProblem)
   // An empty flange has no readings; any that arrive are not this hand's.
   snapshot.thumb->position[2] = std::numeric_limits<double>::quiet_NaN();
   snapshot.thumb->position[3] = 5.0;
-  for (int frame = 0; frame < 3; ++frame) {
+  for (int frame = 0; frame < 4; ++frame) {
     SCOPED_TRACE(frame);
     const double now = 1.0 + 0.02 * frame;
+    // The right thumb request moves every frame and never is the compact pose.
+    snapshot.requested.sequence = static_cast<std::uint32_t>(7 + frame);
+    snapshot.requested.hand[10] = config.thumb_model_limits[2][0] + 0.1 * frame;
+    snapshot.requested.hand[11] = config.thumb_model_limits[3][1] - 0.1 * frame;
+    ASSERT_NE(snapshot.requested.hand[10], config.phantom_thumb_native[2]);
     const auto decision = safety.filter(snapshot, now);
     ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
     const auto & d = safety.diagnostics();
@@ -2500,13 +2506,19 @@ TEST(CbfSafety, APhantomRightThumbIsThePublishedCommandAndNoFeedbackProblem)
       ASSERT_NE(snapshot.thumb->position[axis], snapshot.requested.hand[slots[axis]]);
     }
     for (std::size_t axis = 2; axis < 4; ++axis) {
-      EXPECT_DOUBLE_EQ(d.thumb_current_urdf[axis], snapshot.requested.hand[slots[axis]]) << axis;
+      EXPECT_EQ(d.thumb_current_urdf[axis], config.phantom_thumb_native[axis]) << axis;
+      EXPECT_EQ(d.thumb_target_urdf[axis], config.phantom_thumb_native[axis]) << axis;
+      EXPECT_EQ(decision.output.hand[slots[axis]], config.phantom_thumb_native[axis]) << axis;
     }
+    EXPECT_EQ(decision.output.arm, snapshot.requested.arm);
+    EXPECT_FALSE(decision.modified);
     EXPECT_TRUE(d.thumb_feedback_issue.empty()) << d.thumb_feedback_issue;
     EXPECT_EQ(d.thumb_feedback_frames, 0u);
     EXPECT_FALSE(d.last_thumb_feedback_event.has_value());
     safety.committed(decision, now);
   }
+  EXPECT_EQ(safety.diagnostics().accepted, 4u);
+  EXPECT_EQ(safety.diagnostics().modified, 0u);
   // Control: the same readings on a hand the platform reports are used, and flagged.
   CbfSafety reported(config);
   snapshot.hand_reported_absent = {false, false};
@@ -2515,6 +2527,48 @@ TEST(CbfSafety, APhantomRightThumbIsThePublishedCommandAndNoFeedbackProblem)
   EXPECT_EQ(reported.diagnostics().thumb_feedback_issue, "unavailable");
   EXPECT_EQ(reported.diagnostics().last_thumb_feedback_event->axis, 2);
   EXPECT_EQ(reported.diagnostics().thumb_feedback_frames, 1u);
+}
+
+TEST(CbfSafety, ThePhantomThumbPoseIsTheMostTuckedInCommandAndCanBeConfigured)
+{
+  // Default: model roll at its upper and abad at its lower end, inside the
+  // command band. URDF fixture (identity mapping): the rigid model band ends.
+  const auto urdf = fixture_config();
+  EXPECT_EQ(urdf.phantom_thumb_native[0], urdf.thumb_model_limits[0][1]);
+  EXPECT_EQ(urdf.phantom_thumb_native[1], urdf.thumb_model_limits[1][0]);
+  EXPECT_EQ(urdf.phantom_thumb_native[2], urdf.thumb_model_limits[2][1]);
+  EXPECT_EQ(urdf.phantom_thumb_native[3], urdf.thumb_model_limits[3][0]);
+  EXPECT_EQ(urdf.phantom_thumb_native, CbfSafetyConfig{}.phantom_thumb_native);
+  // The deployed mapping (signs flipped on L roll and R abad; the native
+  // limits set the model band): the native ends that map to those model ends.
+  const auto native = fixture_config(historical_native_fixture_json());
+  EXPECT_EQ(native.phantom_thumb_native, (std::array<double, 4>{-1.117, -0.05, 0.87, 0.05}));
+  for (std::size_t axis = 0; axis < 4; ++axis) {  // URDF 1.117, -1.6924, 0.294, -1.6924.
+    const double urdf = native.command_scale[axis] * native.phantom_thumb_native[axis] + native.command_offset[axis];
+    EXPECT_EQ(urdf, native.thumb_model_limits[axis][axis % 2 == 0 ? 1 : 0]) << axis;
+  }
+  // Per side override from cbf_safety_json, inside the command band.
+  auto value = urdf_fixture_json();
+  value["phantom_thumb_native"] = {{0.5, -1.0}, {0.2, -0.9}};
+  const auto set = fixture_config(value);
+  EXPECT_EQ(set.phantom_thumb_native, (std::array<double, 4>{0.5, -1.0, 0.2, -0.9}));
+  CbfSafety safety(set);
+  auto snapshot = urdf_snapshot();
+  snapshot.hand_reported_absent = {true, true};
+  const auto decision = safety.filter(snapshot, 1.0);
+  ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+  EXPECT_EQ(decision.output.hand[0], 0.5);
+  EXPECT_EQ(decision.output.hand[1], -1.0);
+  EXPECT_EQ(decision.output.hand[10], 0.2);
+  EXPECT_EQ(decision.output.hand[11], -0.9);
+  for (const char * bad : {"[[0.5, -1.0], [0.2, 0.9]]", "[[2.0, -1.0], [0.2, -0.9]]", "[[0.5, -1.0]]",
+      "[[0.5, -1.0, 0.0], [0.2, -0.9]]", "[0.5, -1.0, 0.2, -0.9]", "[[0.5, \"x\"], [0.2, -0.9]]",
+      "[[0.5, null], [0.2, -0.9]]", "\"compact\""})
+  {
+    SCOPED_TRACE(bad);
+    value["phantom_thumb_native"] = json::parse(bad);
+    EXPECT_THROW(fixture_config(value), std::invalid_argument);
+  }
 }
 
 TEST(CbfSafety, AFaultedThumbReplacesOnlyItsOwnSide)
@@ -2646,10 +2700,14 @@ TEST(CbfSafety, APhantomRightHandKeepsItsCollisionPairsInTheDecision)
         };
       return hand(pair.first) || hand(pair.second);
     };
-  const auto distances = [](const std::array<double, 14> & arm, std::array<bool, 2> hands) {
+  // The left thumb as commanded below, the phantom right thumb at its compact pose.
+  const auto compact = fixture_config().phantom_thumb_native;
+  const auto distances = [&compact](const std::array<double, 14> & arm, std::array<bool, 2> hands) {
       x2::cbf::KinematicsInput input;
       input.q_arm = arm;
-      input.q_thumb_urdf = x2::cbf::kRigidThumbBaselineUrdf;  // The commanded thumbs below.
+      input.q_thumb_urdf = x2::cbf::kRigidThumbBaselineUrdf;
+      input.q_thumb_urdf[3] = compact[2];
+      input.q_thumb_urdf[4] = compact[3];
       input.thumb_pose_valid = true;
       input.hands_installed = hands;
       return x2::cbf::evaluate_proxy_distances(input);
@@ -2758,11 +2816,12 @@ TEST(CbfSafety, APhantomThumbCommandNeverHoldsTheRealHandsGesture)
   const auto config = fixture_config();
   // Frame 0 publishes both baseline thumbs; frame 1 asks for the left gesture,
   // and the right thumb either stays or moves into the body.
-  const auto second_frame = [&](bool phantom_right, bool move_right) {
+  const auto second_frame = [&](bool phantom_right, bool move_right, bool fitted = false) {
       CbfSafety safety(config);
       auto snapshot = urdf_snapshot();
       snapshot.requested.arm = arm;
       snapshot.arm = Measured{arm, 0.0};
+      const auto thumb = snapshot.thumb;
       if (phantom_right) {
         snapshot.hand_reported_absent = {false, true};
         snapshot.thumb->position[2] = snapshot.thumb->position[3] = std::numeric_limits<double>::quiet_NaN();
@@ -2770,6 +2829,12 @@ TEST(CbfSafety, APhantomThumbCommandNeverHoldsTheRealHandsGesture)
       const auto first = safety.filter(snapshot, 1.0);
       EXPECT_TRUE(first.accept_new) << safety.diagnostics().reason;
       safety.committed(first, 1.0);
+      if (fitted) {  // The hand is fitted (type 0 to 1), its thumb reading at the compact pose.
+        snapshot.hand_reported_absent = {false, false};
+        snapshot.thumb = thumb;
+        snapshot.thumb->position[2] = config.phantom_thumb_native[2];
+        snapshot.thumb->position[3] = config.phantom_thumb_native[3];
+      }
       snapshot.requested.sequence = 8;
       snapshot.requested.hand[0] = left_gesture[0];
       snapshot.requested.hand[1] = left_gesture[1];
@@ -2790,20 +2855,138 @@ TEST(CbfSafety, APhantomThumbCommandNeverHoldsTheRealHandsGesture)
     EXPECT_FALSE(still.hand_held);
     EXPECT_EQ(still.output.hand[0], left_gesture[0]);
   }
-  // A phantom right thumb stays where it was published: the left gesture passes
-  // in that frame, bit for bit as when the right thumb command does not change.
+  // A phantom right thumb stays at its compact pose: the left gesture passes in
+  // that frame, bit for bit as when the right thumb command does not change.
   const auto [moved, first] = second_frame(true, true);
   const auto [still, unused] = second_frame(true, false);
   ASSERT_TRUE(moved.accept_new);
   EXPECT_FALSE(moved.hand_held);
   EXPECT_EQ(moved.output.hand[0], left_gesture[0]);
   EXPECT_EQ(moved.output.hand[1], left_gesture[1]);
-  EXPECT_EQ(moved.output.hand[10], first.hand[10]);
-  EXPECT_EQ(moved.output.hand[11], first.hand[11]);
+  EXPECT_EQ(first.hand[10], config.phantom_thumb_native[2]);
+  EXPECT_EQ(first.hand[11], config.phantom_thumb_native[3]);
+  EXPECT_EQ(moved.output.hand[10], config.phantom_thumb_native[2]);
+  EXPECT_EQ(moved.output.hand[11], config.phantom_thumb_native[3]);
   EXPECT_EQ(moved.output.arm, still.output.arm);
   EXPECT_EQ(moved.output.hand, still.output.hand);
   EXPECT_EQ(moved.recovery_verified, still.recovery_verified);
   EXPECT_EQ(moved.geometry_modified, still.geometry_modified);
+  EXPECT_EQ(moved.modified, still.modified);
+  // Once the hand is fitted its thumb command is real again: moving it into
+  // the body holds the whole gesture, at the compact pose last published.
+  const auto [fitted, published] = second_frame(true, true, true);
+  ASSERT_TRUE(fitted.accept_new);
+  EXPECT_TRUE(fitted.hand_held);
+  EXPECT_EQ(fitted.output.hand, published.hand);
+  EXPECT_EQ(fitted.output.hand[10], config.phantom_thumb_native[2]);
+  const auto [fitted_still, unused_fitted] = second_frame(true, false, true);
+  ASSERT_TRUE(fitted_still.accept_new);
+  EXPECT_EQ(fitted_still.output.hand[0], left_gesture[0]);
+}
+
+TEST(CbfSafety, AnOpenThumbRequestedOnTheFirstFrameNeverStopsAnArmNextToTheTorso)
+{
+  // Found offline (random poses of one arm, the other standing; seed 11, right
+  // trial 583, left trial 116): next to the torso, where that side's thumb at
+  // the open corner of its band (model roll lower, abad upper end) is inside
+  // the torso while the compact phantom thumb stays clear all along the
+  // straight path from standing.
+  const std::array<std::array<double, 7>, 2> targets{{
+    {-0.16817004593811946, 0.50360051797590355, -0.79945633016819784, -1.6949902836478548,
+      0.48068376582870265, 0.091305368791289698, -0.44492723342233548},
+    {-2.2511085790326755, -2.5551547025107828, -1.4943581714853893, -1.6068047868069351,
+      -2.5091628023563119, 0.21295394226650721, 0.53293267108764431}}};
+  const auto config = fixture_config();
+  const auto & standing = x2::cbf::generated::kNaturalStanding;
+  for (std::size_t side : {1u, 0u}) {
+    SCOPED_TRACE(side);
+    std::array<double, 14> target{};
+    std::copy_n(standing.begin(), 14, target.begin());
+    std::copy(targets[side].begin(), targets[side].end(), target.begin() + 7 * side);
+    const std::array<double, 2> open{config.thumb_model_limits[2 * side][0], config.thumb_model_limits[2 * side + 1][1]};
+    const std::array<double, 2> compact{config.phantom_thumb_native[2 * side], config.phantom_thumb_native[2 * side + 1]};
+    const auto torso_distance = [side](const std::array<double, 14> & arm, const std::array<double, 2> & thumb,
+        bool thumb_only) {
+        x2::cbf::KinematicsInput input;
+        input.q_arm = arm;
+        input.q_thumb_urdf = x2::cbf::kRigidThumbBaselineUrdf;
+        input.q_thumb_urdf[3 * side] = thumb[0];
+        input.q_thumb_urdf[3 * side + 1] = thumb[1];
+        input.thumb_pose_valid = true;
+        const auto report = x2::cbf::evaluate_proxy_distances(input);
+        const auto id = side ? x2::cbf::PrimitiveId::RightThumb : x2::cbf::PrimitiveId::LeftThumb;
+        double out = std::numeric_limits<double>::infinity();
+        for (std::size_t index = 0; index < report.distances.size(); ++index) {
+          const auto pair = x2::cbf::kPrimitivePairs[index];
+          const bool thumb_torso = (pair.first == id && pair.second == x2::cbf::PrimitiveId::Torso) ||
+            (pair.second == id && pair.first == x2::cbf::PrimitiveId::Torso);
+          if (!thumb_only || thumb_torso) {out = std::min(out, report.distances[index].signed_distance);}
+        }
+        return out;
+      };
+    ASSERT_LT(torso_distance(target, open, true), -0.02);
+    for (int k = 0; k <= 40; ++k) {
+      std::array<double, 14> arm{};
+      for (std::size_t j = 0; j < 14; ++j) {arm[j] = standing[j] + k / 40.0 * (target[j] - standing[j]);}
+      ASSERT_GT(torso_distance(arm, compact, false), 0.0) << k;
+    }
+    // Frame 0 asks for that thumb at standing; then the request walks to the
+    // target in 60 frames. The arm tracks exactly.
+    const auto walk = [&](const std::array<double, 2> & thumb, bool phantom) {
+        CbfSafety safety(config);
+        auto snapshot = urdf_snapshot();
+        snapshot.requested.hand[10 * side] = thumb[0];
+        snapshot.requested.hand[10 * side + 1] = thumb[1];
+        if (phantom) {
+          snapshot.hand_reported_absent[side] = true;
+          snapshot.thumb->position[2 * side] = snapshot.thumb->position[2 * side + 1] =
+            std::numeric_limits<double>::quiet_NaN();
+        } else {  // A reported hand whose thumb is there.
+          snapshot.thumb->position[2 * side] = thumb[0];
+          snapshot.thumb->position[2 * side + 1] = thumb[1];
+        }
+        std::vector<double> arm(standing.begin(), standing.end());
+        std::vector<CbfDecision> out;
+        for (int frame = 0; frame < 150; ++frame) {
+          const double now = 1.0 + 0.02 * frame;
+          const double t = std::min(1.0, frame / 60.0);
+          for (std::size_t j = 0; j < 14; ++j) {snapshot.requested.arm[j] = standing[j] + t * (target[j] - standing[j]);}
+          snapshot.requested.sequence = static_cast<std::uint32_t>(7 + frame);
+          snapshot.arm = Measured{arm, 0.0};
+          auto decision = safety.filter(snapshot, now);
+          decision = safety.release_if_stuck(decision, snapshot, now);
+          safety.committed(decision, now);
+          if (decision.output.kind == Output::Kind::kUpperBody) {arm = decision.output.arm;}
+          out.push_back(decision);
+        }
+        double error = 0.0;
+        for (std::size_t j = 0; j < 14; ++j) {error = std::max(error, std::abs(arm[j] - target[j]));}
+        return std::make_pair(error, out);
+      };
+    // Control: on a reported hand that open thumb is real and stops the arm short.
+    EXPECT_GT(walk(open, false).first, 0.1);
+    // A phantom hand asked for the open thumb on the first frame passes exactly
+    // as when asked for the compact pose: every frame bit for bit, no hold, no
+    // release, the arm at the target.
+    const auto [open_error, open_run] = walk(open, true);
+    const auto [compact_error, compact_run] = walk(compact, true);
+    EXPECT_LT(open_error, 1e-9);
+    EXPECT_LT(compact_error, 1e-9);
+    ASSERT_EQ(open_run.size(), compact_run.size());
+    for (std::size_t frame = 0; frame < open_run.size(); ++frame) {
+      SCOPED_TRACE(frame);
+      const auto & a = open_run[frame];
+      const auto & b = compact_run[frame];
+      ASSERT_TRUE(a.accept_new);
+      EXPECT_FALSE(a.released);
+      EXPECT_EQ(a.output.arm, b.output.arm);
+      EXPECT_EQ(a.output.hand, b.output.hand);
+      EXPECT_EQ(a.output.hand[10 * side], compact[0]);
+      EXPECT_EQ(a.output.hand[10 * side + 1], compact[1]);
+      EXPECT_EQ(a.modified, b.modified);
+      EXPECT_EQ(a.geometry_modified, b.geometry_modified);
+    }
+  }
 }
 
 TEST(CbfSafety, APhantomRightHandChangesTheLeftHandAndArmsOnlyWhereItsGeometryIsNear)
@@ -2820,8 +3003,9 @@ TEST(CbfSafety, APhantomRightHandChangesTheLeftHandAndArmsOnlyWhereItsGeometryIs
   // between the checked poses) of the body, the thighs or the left arm. Far
   // from them the outputs are bit for bit the same. Near them the phantom hand
   // may stop or bend the arm the left-only filter lets through; that is what
-  // an empty flange costs (geometry_modified 389 against 1107 frames in the
-  // 3000-frame timing input), and the reason the reverse is unsafe.
+  // an empty flange costs (geometry_modified 389 against 945 frames in the
+  // 3000-frame timing input, phantom thumb at its compact pose), and the
+  // reason the reverse is unsafe.
   //
   // After a frame that differs the two robots are put back together (a new
   // epoch, both at the phantom run's arm), so every compared frame starts from
@@ -2899,6 +3083,8 @@ TEST(CbfSafety, APhantomRightHandChangesTheLeftHandAndArmsOnlyWhereItsGeometryIs
     auto thumbs = x2::cbf::kRigidThumbBaselineUrdf;
     thumbs[0] = snapshot.requested.hand[0];
     thumbs[1] = snapshot.requested.hand[1];
+    thumbs[3] = phantom_config.phantom_thumb_native[2];  // The phantom right thumb.
+    thumbs[4] = phantom_config.phantom_thumb_native[3];
     double near = right_hand_distance(measured, thumbs);
     near = std::min(near, right_hand_distance(requested, thumbs));
     for (const auto * d : {&a, &b}) {

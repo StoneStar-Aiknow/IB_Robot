@@ -301,20 +301,31 @@ private:
 
   // An installed side reported as no hand is checked as a phantom hand. That is
   // right for an empty flange but also hides a real hand that dropped out, so
-  // each change is logged once to be visible in the field.
+  // it is logged to be visible in the field: the start at once, the end only
+  // once the hand has been reported for kPhantomEndAfterS without a break, so
+  // a type flickering between 0 and 1 logs one episode, not every flip.
   void note_phantom_transitions()
   {
     if (!cbf_) {return;}
+    static constexpr double kPhantomEndAfterS = 0.5;
     static const std::array<const char *, 2> side_names{"left", "right"};
     const auto phantom = phantom_hands();
+    const double now = monotonic_s();
     for (size_t side = 0; side < phantom.size(); ++side) {
-      if (phantom[side] == phantom_logged_[side]) {continue;}
-      phantom_logged_[side] = phantom[side];
       if (phantom[side]) {
-        RCLCPP_WARN(get_logger(), "CBF_HAND_ABSENT side=%s start: installed hand reported as type 0, "
-          "checked as a phantom hand", side_names[side]);
-      } else {
-        RCLCPP_INFO(get_logger(), "CBF_HAND_ABSENT side=%s end", side_names[side]);
+        present_since_[side].reset();
+        if (!phantom_logged_[side]) {
+          phantom_logged_[side] = true;
+          RCLCPP_WARN(get_logger(), "CBF_HAND_ABSENT side=%s start: installed hand reported as type 0, "
+            "checked as a phantom hand", side_names[side]);
+        }
+      } else if (phantom_logged_[side]) {
+        if (!present_since_[side]) {present_since_[side] = now;}
+        if (now - *present_since_[side] >= kPhantomEndAfterS) {
+          phantom_logged_[side] = false;
+          present_since_[side].reset();
+          RCLCPP_INFO(get_logger(), "CBF_HAND_ABSENT side=%s end", side_names[side]);
+        }
       }
     }
   }
@@ -933,6 +944,7 @@ private:
   rclcpp::TimerBase::SharedPtr echo_timer_;
   HandStateArray::ConstSharedPtr hand_;
   std::array<bool, 2> phantom_logged_{};
+  std::array<std::optional<double>, 2> present_since_{};
   bool hand_fresh_ = false;
   std::unique_ptr<ibrobot_msgs::msg::JointCommandState> echo_;
   std::vector<std::string> pending_rejections_;
