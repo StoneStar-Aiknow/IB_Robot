@@ -359,6 +359,8 @@ class AimdkRuntimeNode(Node):
             String, dataplane.STATUS_TOPIC, self._on_dataplane_status, 20, callback_group=self._dataplane_cb
         )
         echo = dataplane.arm_command_state(self._profile)
+        #: Whether the platform's arm target is echoed back (see commanded_arm).
+        self.has_arm_command_echo = echo is not None
         if echo is not None:
             self.create_subscription(
                 JointCommandState,
@@ -1964,6 +1966,18 @@ class AimdkRuntimeNode(Node):
         if all(math.isfinite(value) for value in commanded):
             with self._lock:
                 self._arm_command_echo = (commanded, time.monotonic())
+
+    def commanded_arm(self) -> list[float] | None:
+        """The arm target the data plane is driving (its echo, vendor order) if fresh, else None.
+
+        None also when the profile declares no arm command echo: nothing tells
+        what the platform is driving then.
+        """
+        with self._lock:
+            echo = self._arm_command_echo
+        if echo is None or time.monotonic() - echo[1] > ARM_ECHO_MAX_AGE_S:
+            return None
+        return list(echo[0])
 
     def arm_takeover_start(self, measured: list[float]) -> list[float]:
         """Where a planned arm motion must start: the platform's current target, else ``measured``.

@@ -3251,3 +3251,54 @@ def test_the_takeover_start_is_the_platforms_target_only_when_it_describes_this_
     node._arm_command_echo = (commanded, received - age_s)
     assert clock.monotonic() >= received - age_s
     assert AimdkRuntimeNode.arm_takeover_start(node, measured) == ([offset] * count if expect_commanded else measured)
+
+
+def _confirming_server(echoes, *, echoed=True):
+    """A NamedMotionServer stand-in whose node echoes ``echoes`` one per call, then the last."""
+    from types import SimpleNamespace
+
+    sent = []
+    pending = list(echoes)
+
+    def commanded_arm():
+        return pending.pop(0) if len(pending) > 1 else pending[0]
+
+    node = SimpleNamespace(
+        has_arm_command_echo=echoed,
+        commanded_arm=commanded_arm,
+        command_arm=lambda point, owner, epoch: sent.append(list(point)) or True,
+    )
+    return SimpleNamespace(_node=node, _still_current=lambda generation, epoch: None), sent
+
+
+def test_a_replay_resends_its_final_target_until_the_platform_echoes_it():
+    """The release travels apart from the final target; released first, the target was dropped."""
+    from aimdk_robot.named_motion import NamedMotionServer
+
+    final = [0.5] * len(projection.VENDOR_ARM_ORDER)
+    before = [0.4994] * len(projection.VENDOR_ARM_ORDER)
+    server, sent = _confirming_server([None, before, final])
+    assert NamedMotionServer._confirm_final_target(server, final, 1, 0, 0.001)
+    assert sent == [final, final]
+
+
+def test_without_an_echo_the_final_target_is_sent_once_more_and_not_confirmed():
+    from aimdk_robot.named_motion import NamedMotionServer
+
+    final = [0.5] * len(projection.VENDOR_ARM_ORDER)
+    server, sent = _confirming_server([None], echoed=False)
+    assert not NamedMotionServer._confirm_final_target(server, final, 1, 0, 0.001)
+    assert sent == [final]
+
+
+def test_an_unconfirmed_final_target_gives_up_at_the_deadline():
+    import time as clock
+
+    from aimdk_robot.named_motion import FINAL_TARGET_CONFIRM_S, NamedMotionServer
+
+    final = [0.5] * len(projection.VENDOR_ARM_ORDER)
+    server, sent = _confirming_server([[0.0] * len(final)])
+    began = clock.monotonic()
+    assert not NamedMotionServer._confirm_final_target(server, final, 1, 0, 0.01)
+    assert FINAL_TARGET_CONFIRM_S <= clock.monotonic() - began < FINAL_TARGET_CONFIRM_S + 0.2
+    assert sent and all(point == final for point in sent)

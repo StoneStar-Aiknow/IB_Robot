@@ -72,6 +72,11 @@ CONTROL_AREAS: dict[str, int] = {"": 0, "left": 1, "right": 2, "both": 3, "body"
 # Below this commanded excursion the follow check is skipped: measurement noise
 # would decide it, which happens when a resumed motion has little left to play.
 FOLLOW_CHECK_MIN_RAD = 0.05
+#: How long a replay keeps sending its final target for the data plane to echo it (s).
+FINAL_TARGET_CONFIRM_S = 0.25
+#: How close the echo must be to the final target to confirm it (rad); the
+#: platform may carry targets in single precision.
+FINAL_TARGET_TOLERANCE_RAD = 1e-4
 
 
 class _Superseded(Exception):
@@ -761,6 +766,7 @@ class NamedMotionServer:
                     on_progress(min(reached / recorded.duration, 1.0), point)
                 tick += 1
                 time.sleep(max(0.0, started + tick * period - time.monotonic()))
+            self._confirm_final_target(point, generation, epoch, period)
         finally:
             self._node.release_arm(generation)
         joint = max(range(len(start)), key=commanded_peak.__getitem__)
@@ -775,6 +781,31 @@ class NamedMotionServer:
                 f"{commanded_peak[joint]:.2f} rad and moved {measured_peak[joint]:.2f} rad",
             )
         return True, ExecuteNamedMotion.Result.NONE, f"replayed {name} in {mode} ({total:.1f}s){resume_note}"
+
+    def _confirm_final_target(self, point: list[float], generation: int, epoch: int, period: float) -> bool:
+        """Keep sending the final target until the data plane echoes it, then let the arm go.
+
+        The data plane takes an arm target only while this motion owns the arm,
+        and the release travels on another topic: released first, the final
+        target would be dropped and the platform would hold the one before it.
+        Waits at most ``FINAL_TARGET_CONFIRM_S``; a profile without the echo
+        gets the target once more. True when the echo confirmed it.
+        """
+        echoed = getattr(self._node, "has_arm_command_echo", False)
+        deadline = time.monotonic() + FINAL_TARGET_CONFIRM_S
+        while True:
+            echo = self._node.commanded_arm() if echoed else None
+            if (
+                echo is not None
+                and max(abs(a - b) for a, b in zip(echo, point, strict=True)) <= FINAL_TARGET_TOLERANCE_RAD
+            ):
+                return True
+            self._still_current(generation, epoch)
+            if not self._node.command_arm(point, owner=generation, epoch=epoch):
+                return False
+            if not echoed or time.monotonic() >= deadline:
+                return False
+            time.sleep(period)
 
     def _run_posture(self, name: str, goal_handle, generation: int, epoch: int) -> tuple[bool, int, str]:
         action = projection.resolve_named(name, self._postures, reason="UNKNOWN_MOTION")
