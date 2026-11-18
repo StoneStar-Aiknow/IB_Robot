@@ -285,6 +285,18 @@ def test_the_shipped_config_switched_on_loads_every_template():
     assert {"heart@50", "heart@75"} <= set(setup.segments)
 
 
+def test_the_on_site_config_loads_every_template():
+    setup = load_config(str(CONFIG_DIR / "motion_template_onsite.yaml"), HAND)
+    assert setup.notes == [] and set(setup.templates) == {"overhead_heart", "heart", "holy", "xsign"}
+    assert setup.blend == parse_config(shipped_on(), str(CONFIG_DIR), HAND).blend  # same blend as the shipped file
+
+
+def shipped_on():
+    raw = shipped()
+    raw["motion_template"]["enabled"] = True
+    return raw
+
+
 def test_config_errors_and_left_out_templates(tmp_path):
     heart = json.loads((CONFIG_DIR / "segments.json").read_text())["segments"]["heart"]
     (tmp_path / "segments.json").write_text(
