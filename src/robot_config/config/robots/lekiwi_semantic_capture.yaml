@@ -1,9 +1,8 @@
 # MID-360 + aligned front D435i semantic dataset capture on the managed base.
 # Simulation selects MuJoCo's full RGB-D/CameraInfo, LiDAR and FAST-LIO path.
-# A simulated capture writes the bag but does not pass dataset finalization:
-# slam_toolbox is not started under use_sim (no /map) and the simulated lidar
-# publishes PointCloud2 where finalization requires the Livox CustomMsg. A
-# complete capture needs the real robot.
+# slam_toolbox consumes the simulated /scan and publishes /map on simulation time.
+# lidar_message_type is PointCloud2 for physics simulation (Gazebo/MuJoCo),
+# CustomMsg for hardware/SDK/mock; a missing field defaults to hardware CustomMsg.
 robot:
   name: lekiwi_semantic_capture
   base_config: lekiwi_lidar

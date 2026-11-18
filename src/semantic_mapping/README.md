@@ -29,9 +29,14 @@ navigation stage 或录制开关，也不支持 episodic 录制。
 
 `use_sim:=true` 显式选择 MuJoCo 的 RGB-D、LiDAR 和 FAST-LIO 链路。
 MuJoCo 转发采集必需的 depth 和 aligned-depth CameraInfo。
+slam_toolbox 在仿真时使用 simulation time，订阅 scan_converter 提供的 `/scan`，发布 `/map`。
+录制 session state 和数据集 manifest 的 `lidar_message_type` 字段记录 LiDAR 消息类型：
+物理仿真（Gazebo/MuJoCo）为 `sensor_msgs/msg/PointCloud2`，其他模式（真机、SDK、mock）为
+`livox_ros_driver2/msg/CustomMsg`。
+缺少该字段的旧 session 按真机类型校验；其他必需话题的类型和非零消息数检查不变。
 Gazebo 只共享 color CameraInfo 话题，不满足当前采集清单。
 SDK 合成流缺少采集必需的原始里程计和相机安装 TF。
-单元测试只验证节点构造、传感器描述和话题接线。
+单元测试验证节点构造、传感器描述、话题接线和按 session 类型执行的采集校验。
 仿真采集尚未通过端到端验收，不能据此认定能生成有效数据集。
 
 在启动主链的主机连接手柄（默认 `/dev/input/js0`）。配置自动选择 runtime 管理的

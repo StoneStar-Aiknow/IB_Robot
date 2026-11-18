@@ -90,8 +90,21 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def validate_mcap_metadata(bag_dir: Path) -> dict[str, Any]:
+def _lidar_message_type(state: dict[str, Any]) -> str:
+    message_type = state.get("lidar_message_type", "livox_ros_driver2/msg/CustomMsg")
+    if message_type not in ("livox_ros_driver2/msg/CustomMsg", "sensor_msgs/msg/PointCloud2"):
+        raise ValueError(f"invalid lidar_message_type: {message_type!r}")
+    return message_type
+
+
+def validate_mcap_metadata(
+    bag_dir: Path, *, lidar_message_type: str = "livox_ros_driver2/msg/CustomMsg"
+) -> dict[str, Any]:
     """Validate reindexed split files, actual topic records, and available file coverage."""
+    expected_types = {
+        **SEMANTIC_RECORDED_TOPIC_TYPES,
+        "/livox/lidar": _lidar_message_type({"lidar_message_type": lidar_message_type}),
+    }
     metadata_path = bag_dir / "metadata.yaml"
     try:
         metadata = yaml.safe_load(metadata_path.read_text(encoding="utf-8"))
@@ -121,7 +134,7 @@ def validate_mcap_metadata(bag_dir: Path) -> dict[str, Any]:
     missing = sorted(set(SEMANTIC_REQUIRED_NONZERO_TOPICS) - set(actual_by_name))
     wrong_types = sorted(
         name
-        for name, expected in SEMANTIC_RECORDED_TOPIC_TYPES.items()
+        for name, expected in expected_types.items()
         if name in actual_by_name and actual_by_name[name]["type"] != expected
     )
     empty = sorted(
@@ -522,9 +535,10 @@ def finalize_dataset(
         output_prefix.resolve().relative_to(session_root.resolve())
     except ValueError as exc:
         raise ValueError("map prefix must remain inside the semantic dataset session") from exc
+    state = _stop_recorder(state_file, state, stop_timeout_sec)
+    lidar_message_type = _lidar_message_type(state)
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-    state = _stop_recorder(state_file, state, stop_timeout_sec)
     _run_step(
         ["ros2", "run", "robot_navigation", "save_lidar_map", "-f", str(output_prefix), "-t", "/map"],
         command_runner,
@@ -533,7 +547,7 @@ def finalize_dataset(
         if not map_path.is_file() or map_path.stat().st_size == 0:
             raise ValueError(f"map save did not produce a usable artifact: {map_path}")
     _run_step(["ros2", "bag", "reindex", "--storage", "mcap", str(bag_dir)], command_runner)
-    metadata = validate_mcap_metadata(bag_dir)
+    metadata = validate_mcap_metadata(bag_dir, lidar_message_type=lidar_message_type)
 
     snapshot = build_calibration_snapshot(
         bag_dir,
@@ -553,6 +567,7 @@ def finalize_dataset(
         "status": snapshot["status"],
         "dataset_id": state["session_id"],
         "profile": state["profile"],
+        "lidar_message_type": lidar_message_type,
         "generated_at": _timestamp(),
         "topics": metadata["topics"],
         "bag": {

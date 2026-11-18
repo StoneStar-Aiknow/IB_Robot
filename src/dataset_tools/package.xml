@@ -24,6 +24,7 @@
   <exec_depend>rosbag2_storage_mcap</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
+  <test_depend>robot_runtime</test_depend>
   <!-- The migrated launch-builder tests import robot_config's registry and
        loader (openspec change ``migrate-business-launch-builders``). -->
   <test_depend>robot_config</test_depend>
