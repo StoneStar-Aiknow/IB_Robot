@@ -250,9 +250,11 @@ class RemoteGestureRunner:
             self.stats["control_send_error"] += 1
             self._control = None
 
-    def _response(self, call):
+    def _response(self, call, *, allow_negative=False):
         response = call.future.result()
-        if response.success is not True or response.model.ready is not True:
+        if response.model.ready is not True:
+            raise ValueError("remote_not_ready")
+        if response.success is not True and not (allow_negative and response.success is False):
             raise ValueError("remote_not_ready")
         number(response.inference_time_ms, "inference_time_ms")
         digest(response.model.deployment_fingerprint, "deployment_fingerprint")
@@ -328,9 +330,17 @@ class RemoteGestureRunner:
             return  # Local cancellation is not proof that the model stopped; require retirement.
         confirmed_idle = False
         try:
-            response, result = self._response(call)
-            if result.status != "ok" or result.server_boot_id != self._server_boot or not result.idle:
+            response, result = self._response(call, allow_negative=True)
+            if result.server_boot_id != self._server_boot or not result.idle:
                 raise ValueError("remote_result_identity")
+            if response.success is False:
+                if result.status not in ("busy", "rejected", "error", "not_ready"):
+                    raise ValueError("remote_result_status")
+                confirmed_idle = True
+                self.stats["negative_result"] += 1
+                return  # Valid completion evidence is not a gesture vote or a retirement acknowledgement.
+            if result.status != "ok":
+                raise ValueError("remote_result_status")
             confirmed_idle = True
             age = self.ros_clock() - call.meta.stamp_ns / 1e9
             if not call.expired and current and -0.1 <= age <= self.cfg.source_age_s:

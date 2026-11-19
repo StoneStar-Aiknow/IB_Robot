@@ -40,7 +40,7 @@ class Clock:
         return ROS0 + self.t
 
 
-def response(meta, *, gesture="holy", idle=True, status="ok", request=None, server=SERVER):
+def response(meta, *, gesture="holy", idle=True, status="ok", request=None, server=SERVER, success=True):
     result = ResultMeta(
         request or meta,
         server,
@@ -52,7 +52,7 @@ def response(meta, *, gesture="holy", idle=True, status="ok", request=None, serv
         retired_through=meta.retire_through,
     )
     return SimpleNamespace(
-        success=True,
+        success=success,
         result_json=result.to_json(),
         inference_time_ms=5.0,
         model=SimpleNamespace(ready=True, deployment_fingerprint="b" * 64),
@@ -277,6 +277,84 @@ def test_unconfirmed_response_keeps_image_slot_until_matched_retirement(failure)
     r.step()
     assert (future, True) in t.reaped and len(t.images) == 2
     assert r.stats["bad_result"] == 1 and not sent
+
+
+@pytest.mark.parametrize("status", ["busy", "rejected", "error", "not_ready"])
+def test_terminal_negative_idle_response_releases_slot_without_voting_or_retirement(status):
+    r, c, t, sent, _ = make()
+    boot(r)
+    c.t = 0.1
+    assert post(r, c)
+    r.step()
+    meta, _, _, future = t.images[-1]
+    generation = r.generation
+    future.set_result(response(meta, status=status, success=False))
+    c.t = 0.11
+    r.step()
+    assert r._call is None and (future, False) in t.reaped and not sent
+    assert r._healthy and r.generation == generation
+    assert r.stats["negative_result"] == 1 and r.stats["bad_result"] == 0
+
+    c.t = 0.22
+    assert post(r, c)
+    r.step()
+    assert len(t.images) == 2 and len(t.calls) == 3
+    assert all(call[0].op != "retire" for call in t.calls)
+    next_meta, _, _, next_future = t.images[-1]
+    next_future.set_result(response(next_meta))
+    c.t = 0.23
+    r.step()
+    assert len(sent) == 1 and json.loads(sent[0])["stamp_ns"] == next_meta.stamp_ns
+    assert r.stats["negative_result"] == 1 and r.stats["results"] == 1
+
+
+@pytest.mark.parametrize("changed", ["request", "server", "engine", "idle"])
+def test_mismatched_negative_or_nonidle_response_keeps_slot(changed):
+    r, c, t, sent, _ = make()
+    boot(r)
+    c.t = 0.1
+    assert post(r, c)
+    r.step()
+    meta, _, _, future = t.images[-1]
+    reply = response(meta, status="busy", success=False)
+    if changed == "request":
+        reply = response(meta, status="busy", success=False, request=replace(meta, request_id=meta.request_id + 1))
+    elif changed == "server":
+        reply = response(meta, status="busy", success=False, server="00000000-0000-4000-8000-000000000099")
+    elif changed == "engine":
+        reply.result_json = reply.result_json.replace(ENGINE, "c" * 64)
+    else:
+        reply = response(meta, status="busy", success=False, idle=False)
+    future.set_result(reply)
+    c.t = 0.11
+    r.step()
+    assert r._call is not None and r._call.expired and not sent
+    c.t = 0.22
+    assert post(r, c)
+    for _ in range(10):
+        r.step()
+    assert len(t.images) == 1 and all(reaped is not future for reaped, _ in t.reaped)
+    assert r.stats["bad_result"] == 1 and r.stats["negative_result"] == 0
+
+
+def test_idle_busy_retirement_cannot_acknowledge_an_unconfirmed_image():
+    r, c, t, sent, _ = make()
+    boot(r)
+    assert post(r, c)
+    r.step()
+    meta, _, _, future = t.images[-1]
+    future.set_result(response(meta, status="busy", success=False, idle=False))
+    c.t = 0.01
+    r.step()
+    t.control_response = lambda meta: response(meta, status="busy", success=False)
+    c.t = 1.01
+    r.step()
+    assert t.calls[-1][0].op == "retire"
+    c.t = 1.02
+    r.step()
+    assert r._call is not None and len(t.images) == 1 and not sent
+    assert all(reaped is not future for reaped, _ in t.reaped)
+    assert r.stats["control_rejected"] == 1
 
 
 def test_restarted_server_can_retire_an_unconfirmed_response_before_new_inference():
