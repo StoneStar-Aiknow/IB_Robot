@@ -223,6 +223,91 @@ def test_busy_or_unmatched_retirement_cannot_free_the_image_slot():
     assert not t.images[0][-1].cancelled()
 
 
+@pytest.mark.parametrize(
+    "failure",
+    ["failed", "failed_idle", "not_ready", "not_idle", "bad_status", "bad_json", "future_error"],
+)
+def test_unconfirmed_response_keeps_image_slot_until_matched_retirement(failure):
+    r, c, t, sent, _ = make()
+    boot(r)
+    c.t = 0.1
+    assert post(r, c)
+    r.step()
+    meta, _, _, future = t.images[-1]
+    original_call = r._call
+    reply = response(meta)
+    if failure == "failed":
+        reply = response(meta, status="error", idle=False)
+        reply.success = reply.model.ready = False
+    elif failure == "failed_idle":
+        reply.success = False
+    elif failure == "not_ready":
+        reply.model.ready = False
+    elif failure == "not_idle":
+        reply = response(meta, idle=False)
+    elif failure == "bad_status":
+        reply = response(meta, status="error")
+    elif failure == "bad_json":
+        reply.result_json = "not JSON"
+    if failure == "future_error":
+        future.set_exception(RuntimeError("transport failed before execution could be confirmed"))
+    else:
+        future.set_result(reply)
+
+    c.t = 0.11
+    r.step()
+    assert r._call is original_call and r._call.expired
+    assert r.stats["bad_result"] == 1 and not sent
+    for tick in range(12, 31):
+        c.t = tick / 100
+        assert post(r, c)
+        r.step()
+    assert len(t.images) == 1 and len(t.calls) == 2
+    assert r.stats["bad_result"] == 1 and all(reaped is not future for reaped, _ in t.reaped)
+
+    c.t = 1.01
+    assert post(r, c)
+    r.step()
+    retirement = t.calls[-1][0]
+    assert retirement.op == "retire" and retirement.source_key == meta.source_key
+    assert retirement.retire_through == meta.request_id
+    assert r._call is original_call and len(t.images) == 1
+    c.t = 1.02
+    assert post(r, c)
+    r.step()
+    assert (future, True) in t.reaped and len(t.images) == 2
+    assert r.stats["bad_result"] == 1 and not sent
+
+
+def test_restarted_server_can_retire_an_unconfirmed_response_before_new_inference():
+    r, c, t, sent, _ = make()
+    boot(r)
+    assert post(r, c)
+    r.step()
+    meta, _, _, future = t.images[-1]
+    reply = response(meta, status="error", idle=False)
+    reply.success = reply.model.ready = False
+    future.set_result(reply)
+    c.t = 0.01
+    r.step()
+    generation = r.generation
+    restarted_server = "00000000-0000-4000-8000-000000000099"
+    t.control_response = lambda meta: response(meta, server=restarted_server, status="retired")
+    c.t = 1.01
+    assert post(r, c)
+    r.step()
+    assert t.calls[-1][0].op == "retire" and len(t.images) == 1
+    c.t = 1.02
+    r.step()
+    assert r._call is None and (future, True) in t.reaped
+    assert r._server_boot == restarted_server and r.generation > generation
+    assert len(t.images) == 1 and not sent
+    c.t = 1.03
+    assert post(r, c)
+    r.step()
+    assert len(t.images) == 2 and r.stats["bad_result"] == 1
+
+
 def test_locally_cancelled_future_is_not_a_real_terminal_response():
     r, c, t, sent, _ = make()
     boot(r)

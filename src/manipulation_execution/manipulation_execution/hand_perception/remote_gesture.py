@@ -77,6 +77,7 @@ class Call:
     expired: bool = False
     crop_ms: float = 0.0
     local_revision: int = 0
+    response_checked: bool = False
 
 
 class RemoteGestureRunner:
@@ -319,15 +320,18 @@ class RemoteGestureRunner:
                 if self._failures >= self.cfg.fail_limit:
                     with self._lock:
                         self._invalidate("inference_timeout")
-        if call.future is None or not call.future.done():
+        if call.future is None or not call.future.done() or call.response_checked:
             return
+        call.response_checked = True
         if getattr(call.future, "cancelled", lambda: False)():
             call.expired = True
             return  # Local cancellation is not proof that the model stopped; require retirement.
+        confirmed_idle = False
         try:
             response, result = self._response(call)
-            if result.status != "ok" or result.server_boot_id != self._server_boot:
+            if result.status != "ok" or result.server_boot_id != self._server_boot or not result.idle:
                 raise ValueError("remote_result_identity")
+            confirmed_idle = True
             age = self.ros_clock() - call.meta.stamp_ns / 1e9
             if not call.expired and current and -0.1 <= age <= self.cfg.source_age_s:
                 with self._lock:
@@ -336,10 +340,13 @@ class RemoteGestureRunner:
             else:
                 self.stats["stale_result"] += 1
         except Exception:
+            call.expired = True
             self.stats["bad_result"] += 1
         finally:
-            self._forget(call)
-            self._call = None
+            # A terminal Future alone cannot confirm that remote execution stopped.
+            if confirmed_idle:
+                self._forget(call)
+                self._call = None
 
     def _publish_state(self, now, force=False):
         with self._lock:
