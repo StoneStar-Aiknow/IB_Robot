@@ -25,7 +25,7 @@ from inference_service.unified_runtime import (
 )
 
 from .hand_gesture_adapter import HandGestureAdapter, validate_control_image
-from .hand_gesture_session import TensorRtHandGestureSession
+from .hand_gesture_session import HandGestureResourcePressure, TensorRtHandGestureSession
 
 
 @dataclass
@@ -40,6 +40,7 @@ class HandGestureClassifyPlugin(ModelServicePlugin):
     request_queue_depth = 1
     _session_factory = staticmethod(TensorRtHandGestureSession)
     _clock = staticmethod(time.monotonic)
+    _load_retry_period = 1.0
 
     def __init__(self, host, validated, options, *, registry_set=None, providers=None):
         del host
@@ -63,8 +64,18 @@ class HandGestureClassifyPlugin(ModelServicePlugin):
         if (model.interface, model.model_type, model.operation) != ("tensor_model", "hand_gesture", "classify"):
             raise ValueError("hand gesture plugin requires tensor_model/hand_gesture/classify")
         self.validated = validated
+        self._load_context = RuntimeContext(validated, runtime_profile=validated.runtime_profile)
+        self._providers = providers
+        self._load_pending, self._load_failure = True, ""
+        self._next_load_attempt = 0.0
+        self._new_runtime()
+        self._load_when_ready(initial=True)
+
+    def _new_runtime(self):
         self.session = self._session_factory()
-        context = RuntimeContext(validated, runtime_profile=validated.runtime_profile)
+        # The fixed result contract requires a digest even for not_ready. Read
+        # actual bytes, never label the manifest digest as a loaded engine.
+        _, _, self.engine_sha256 = self.session.validate_load(self._load_context)
         # Same explicit native assembly pattern as EchoServicePlugin. This is
         # one narrow engine resource, not a new general TensorRT registry/host.
         self._runtime_handle = ModelRuntimeHandle(
@@ -73,12 +84,52 @@ class HandGestureClassifyPlugin(ModelServicePlugin):
                 session=self.session,
                 execution_contract=ExecutionContract(),
                 runtime_id="x2-hand-gesture",
-                load_context=context,
-                providers=providers,
+                load_context=self._load_context,
+                providers=self._providers,
             )
         )
-        self._runtime_handle.load(context)
-        self.engine_sha256 = self.session.engine_sha256
+        self._load_attempted = False
+
+    def _load_when_ready(self, *, initial=False):
+        # Probe/diagnostics drive cold-start recovery; there is no background
+        # worker, sleep or inference retry. The same lock serializes all CUDA use.
+        if (
+            not self._load_pending
+            or self._closed
+            or self._clock() < self._next_load_attempt
+            or not self._model_lock.acquire(blocking=False)
+        ):
+            return
+        try:
+            # Another status call or close may have won between the checks
+            # above and acquisition. Never reload a now-ready/closed lifecycle.
+            if not self._load_pending or self._closed or self._clock() < self._next_load_attempt:
+                return
+            self._next_load_attempt = self._clock() + self._load_retry_period
+            if reason := self.session.resource_headroom_reason():
+                self._load_failure = reason
+                return
+            try:
+                if self._load_attempted:
+                    # Native FAILED lifecycles are terminal. Close one before
+                    # replacing it, only after a pre-allocation pressure pause.
+                    self._runtime_handle.close()
+                    self._new_runtime()
+                self._load_attempted = True
+                self._runtime_handle.load(self._load_context)
+            except Exception as exc:
+                self._load_failure = str(exc)
+                cause = exc
+                while cause.__cause__ is not None:
+                    cause = cause.__cause__
+                self._load_pending = isinstance(cause, HandGestureResourcePressure)
+                if initial and not self._load_pending:
+                    raise
+            else:
+                self.engine_sha256 = self.session.engine_sha256
+                self._load_pending, self._load_failure = False, ""
+        finally:
+            self._model_lock.release()
 
     @staticmethod
     def _option(options, name, default, lower, upper):
@@ -219,6 +270,7 @@ class HandGestureClassifyPlugin(ModelServicePlugin):
             self._model_lock.release()
 
     def runtime_status(self):
+        self._load_when_ready()
         diagnostics = self._runtime_handle.diagnostics()
         version = self.session.runtime_version
         pressure = self.session.resource_headroom_reason()
@@ -227,14 +279,18 @@ class HandGestureClassifyPlugin(ModelServicePlugin):
         return PluginRuntimeStatus(
             state="failed"
             if uncertain
-            else ("degraded" if pressure and diagnostics.health.ready else diagnostics.state.value),
+            else (
+                "degraded"
+                if self._load_pending or pressure and diagnostics.health.ready
+                else ("failed" if self._load_failure else diagnostics.state.value)
+            ),
             ready=ready,
             failure_reason=""
             if ready
             else (
                 "CUDA completion is unconfirmed"
                 if uncertain
-                else (pressure or diagnostics.health.message or "gesture runtime is not ready")
+                else (self._load_failure or pressure or diagnostics.health.message or "gesture runtime is not ready")
             ),
             metadata={"runtime_version": version} if version else {},
         )
@@ -243,4 +299,5 @@ class HandGestureClassifyPlugin(ModelServicePlugin):
         with self._model_lock:
             if not self._closed:
                 self._closed = True
+                self._load_pending, self._load_failure = False, ""
                 self._runtime_handle.close()

@@ -103,8 +103,8 @@ def setup_plugin(tmp_path, monkeypatch):
         _session_factory = staticmethod(lambda: TensorRtHandGestureSession(runner_factory=factory))
         _clock = staticmethod(clock)
 
-    def create(options=None):
-        plugin = Plugin(None, validated, options or {}, registry_set=registry, providers=providers)
+    def create(options=None, *, selected=None):
+        plugin = Plugin(None, selected or validated, options or {}, registry_set=registry, providers=providers)
         plugins.append(plugin)
         return plugin
 
@@ -482,6 +482,236 @@ def test_resource_pressure_pauses_admission_and_recovers_without_inference(setup
     monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: "")
     assert dispatch(setup.plugin, req).success
     assert len(setup.runner.calls) == 1 and len(setup.runners) == 1
+
+
+@pytest.mark.parametrize("pressure_reason", ["temporary low memory", "temporary high temperature"])
+def test_cold_start_pressure_recovers_through_same_ros_host(setup_plugin, monkeypatch, pressure_reason):
+    """A paused cold start must keep its control protocol and later load once."""
+    setup = setup_plugin
+    setup.plugin.close()
+    pressure = [pressure_reason]
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: pressure[0])
+    monkeypatch.setattr("inference_service.model_service_node._load_class", lambda _name: type(setup.plugin))
+    registry = RegistrySet(
+        BackendRegistry(STATIC_BACKEND_DESCRIPTORS), SessionBuilderRegistry(), RuntimeAssemblerRegistry()
+    ).freeze()
+    providers = RuntimeProviders.create(FakeAclRuntimeManager(), ResourceDomainAdmissions())
+    parameters = {
+        "bundle_path": str(setup.root),
+        "deployment": DEPLOYMENT,
+        "adapter_class": "test:InjectedFakeEnginePlugin",
+        "service_type": "ibrobot_msgs/srv/ClassifyHandGesture",
+        "service_endpoint": f"/test/gesture_startup_{uuid.uuid4().hex}",
+        "required": "false",
+    }
+    args = ["--ros-args"]
+    for name, value in parameters.items():
+        args += ["-p", f"{name}:={value}"]
+    assert os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID")
+    assert os.environ.get("ROS_LOCALHOST_ONLY") == "1"
+    rclpy.init(args=args)
+    server = None
+    try:
+        server = ModelServiceNode(registry_set=registry, providers=providers)
+        assert server.plugin is not None, server.failure_reason
+        boot = server.plugin.server_boot_id
+        probe, meta = request(op="probe")
+        response = server._dispatch(probe, ClassifyHandGesture.Response())
+        assert not response.success and not response.model.ready and pressure_reason in response.message
+        record = result(response)
+        assert record.request == meta and record.server_boot_id == boot
+        assert record.engine_sha256 == hashlib.sha256(setup.runner.blob).hexdigest()
+        assert response.model.runtime_version == ""
+        assert record.status == "not_ready" and record.idle and len(setup.runners) == 1
+        retire, _ = request(op="retire", request_id=2, source=meta, retire_through=1)
+        response = server._dispatch(retire, ClassifyHandGesture.Response())
+        assert response.success and result(response).idle and result(response).retired_through == 1
+        pressure[0] = ""
+        setup.clock.step(1.0)
+        response = server._dispatch(probe, ClassifyHandGesture.Response())
+        assert response.success and response.model.ready
+        assert response.model.backend == "tensorrt" and response.model.runtime_version == Runner.runtime_version
+        assert response.model.manifest_fingerprint == setup.validated.manifest.bundle.digest.value
+        assert result(response).server_boot_id == boot
+        assert result(response).engine_sha256 == hashlib.sha256(setup.runners[-1].blob).hexdigest()
+        assert len(setup.runners) == 2 and not setup.runners[-1].calls
+        infer, _ = request(request_id=3, source=meta)
+        response = server._dispatch(infer, ClassifyHandGesture.Response())
+        assert response.success and len(setup.runners[-1].calls) == 1
+        assert result(response).server_boot_id == boot
+    finally:
+        if server is not None:
+            server.destroy_node()
+        providers.close()
+        rclpy.try_shutdown()
+
+
+@pytest.mark.parametrize("invalid", ["artifact", "configuration"])
+def test_cold_start_pressure_does_not_hide_invalid_artifact_or_configuration(setup_plugin, monkeypatch, invalid):
+    setup = setup_plugin
+    setup.plugin.close()
+    selected = setup.validated
+    if invalid == "artifact":
+        artifact = selected.deployment.artifacts["model"]
+        (setup.root / artifact.path).write_bytes(b"corrupted before cold start")
+        message = "SHA-256"
+    else:
+        profile = selected.runtime_profile.model_copy(
+            update={"profile": selected.runtime_profile.backend_profile.model_copy(update={"precision": "fp16"})}
+        )
+        selected = replace(selected, deployment=selected.deployment.model_copy(update={"runtime_profile": profile}))
+        message = "FP32"
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: "low memory")
+    with pytest.raises(Exception, match=message):
+        setup.create(selected=selected)
+    assert len(setup.runners) == 1
+
+
+def test_cold_start_load_pressure_race_retries_at_most_once_per_second(setup_plugin, monkeypatch):
+    setup = setup_plugin
+    setup.plugin.close()
+    reasons = ["temporary low memory"]
+
+    def headroom():
+        return reasons.pop(0) if len(reasons) > 1 else reasons[0]
+
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", headroom)
+    plugin = setup.create()
+    original_handle = plugin._runtime_handle
+    probe, _ = request(op="probe")
+    reasons[:] = [""]
+    setup.clock.step(0.9)
+    for _ in range(10):
+        assert not dispatch(plugin, probe).success
+    assert original_handle.diagnostics().state.value == "created" and len(setup.runners) == 1
+    # Headroom disappears between the plugin check and the session's final
+    # check. This failure is known to precede any device lease/allocation.
+    reasons[:] = ["", "temporary raced pressure"]
+    setup.clock.step(0.1)
+    assert not dispatch(plugin, probe).success
+    assert original_handle.diagnostics().state.value == "failed" and len(setup.runners) == 1
+    reasons[:] = [""]
+    setup.clock.step(0.9)
+    for _ in range(10):
+        assert not dispatch(plugin, probe).success
+    assert plugin._runtime_handle is original_handle and len(setup.runners) == 1
+    setup.clock.step(0.1)
+    assert dispatch(plugin, probe).success
+    assert original_handle.closed and plugin._runtime_handle is not original_handle
+    assert len(setup.runners) == 2 and not setup.runners[-1].calls
+
+
+def test_cold_start_recovery_serializes_loading_with_controls_and_inference(setup_plugin, monkeypatch):
+    setup = setup_plugin
+    setup.plugin.close()
+    pressure = ["temporary low memory"]
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: pressure[0])
+    plugin = setup.create()
+    entered, release = threading.Event(), threading.Event()
+    original_factory = plugin.session._factory
+    loads = []
+
+    def factory(blob, **options):
+        loads.append(True)
+        entered.set()
+        assert release.wait(5), "test failed to release fake loading"
+        return original_factory(blob, **options)
+
+    monkeypatch.setattr(plugin.session, "_factory", factory)
+    pressure[0] = ""
+    setup.clock.step(1.0)
+    statuses = []
+    thread = threading.Thread(target=lambda: statuses.append(plugin.runtime_status()))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        for _ in range(10):
+            probe, _ = request(op="probe")
+            response = dispatch(plugin, probe)
+            assert not response.success and not result(response).idle
+        retire, _ = request(op="retire", request_id=2, retire_through=1)
+        assert not result(dispatch(plugin, retire)).idle
+        infer, _ = request()
+        assert not dispatch(plugin, infer).success
+        assert len(loads) == 1 and len(setup.runners) == 1
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive() and len(statuses) == 1 and statuses[0].ready
+    assert len(loads) == 1 and len(setup.runners) == 2 and not setup.runners[-1].calls
+
+
+def test_cold_start_stale_readiness_check_cannot_reload_a_ready_lifecycle(setup_plugin, monkeypatch):
+    setup = setup_plugin
+    setup.plugin.close()
+    pressure = ["temporary low memory"]
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: pressure[0])
+    plugin = setup.create()
+    pressure[0] = ""
+    setup.clock.step(1.0)
+    entered, release = threading.Event(), threading.Event()
+    statuses = []
+
+    def clock():
+        if threading.current_thread() is thread:
+            entered.set()
+            assert release.wait(5), "test failed to release delayed status check"
+            return setup.clock() + 2.0
+        return setup.clock()
+
+    monkeypatch.setattr(plugin, "_clock", clock)
+    thread = threading.Thread(target=lambda: statuses.append(plugin.runtime_status()))
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert plugin.runtime_status().ready
+        assert len(setup.runners) == 2
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive() and len(statuses) == 1 and statuses[0].ready
+    assert len(setup.runners) == 2 and setup.runners[-1].closes == 0
+
+
+def test_cold_start_engine_failure_is_terminal_and_not_retried_as_pressure(setup_plugin, monkeypatch):
+    setup = setup_plugin
+    setup.plugin.close()
+    pressure = ["temporary low memory"]
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: pressure[0])
+    plugin = setup.create()
+    attempts = []
+
+    def invalid_engine(*_args, **_options):
+        attempts.append(True)
+        raise RuntimeError("TensorRT engine incompatible with runtime")
+
+    monkeypatch.setattr(plugin.session, "_factory", invalid_engine)
+    pressure[0] = ""
+    setup.clock.step(1.0)
+    probe, _ = request(op="probe")
+    response = dispatch(plugin, probe)
+    assert not response.success and "engine incompatible" in response.message
+    pressure[0] = "temporary high temperature"
+    for _ in range(3):
+        setup.clock.step(2.0)
+        response = dispatch(plugin, probe)
+        assert not response.success and "engine incompatible" in response.message
+        assert response.model.runtime_state == "failed" and response.model.runtime_version == ""
+    assert len(attempts) == 1 and len(setup.runners) == 1
+
+
+def test_closed_cold_start_never_loads_after_pressure_clears(setup_plugin, monkeypatch):
+    setup = setup_plugin
+    setup.plugin.close()
+    pressure = ["temporary low memory"]
+    monkeypatch.setattr("perception_service.hand_gesture_session.resource_headroom_reason", lambda: pressure[0])
+    plugin = setup.create()
+    plugin.close()
+    pressure[0] = ""
+    setup.clock.step(1.0)
+    status = plugin.runtime_status()
+    assert not status.ready and status.state == "closed" and plugin._runtime_handle.closed
+    assert len(setup.runners) == 1
 
 
 def test_real_ros_host_keeps_retirement_behind_actual_execution(setup_plugin, monkeypatch):

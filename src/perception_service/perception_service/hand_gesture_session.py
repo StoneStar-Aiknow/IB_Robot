@@ -42,6 +42,10 @@ def resource_headroom_reason():
     return ""
 
 
+class HandGestureResourcePressure(RuntimeError):
+    """A retryable admission pause raised before acquiring any CUDA resource."""
+
+
 class _TensorRtEngine:
     """One fixed engine/context and explicit nonblocking CUDA stream.
 
@@ -183,9 +187,9 @@ class TensorRtHandGestureSession(ModelSession):
     def resource_headroom_reason(self):
         return resource_headroom_reason()
 
-    def _load(self, context, rollback):
-        if reason := self.resource_headroom_reason():
-            raise RuntimeError(reason)
+    @staticmethod
+    def validate_load(context):
+        """Validate CPU-only configuration and bytes even while admission is paused."""
         profile = context.backend_profile
         if (context.interface, context.model_type, context.operation, context.backend, context.target_runtime) != (
             "tensor_model",
@@ -224,6 +228,12 @@ class TensorRtHandGestureSession(ModelSession):
         digest = hashlib.sha256(blob).hexdigest()
         if digest != artifact.sha256:
             raise ValueError("gesture engine actual SHA-256 differs from the selected manifest")
+        return profile, blob, digest
+
+    def _load(self, context, rollback):
+        profile, blob, digest = self.validate_load(context)
+        if reason := self.resource_headroom_reason():
+            raise HandGestureResourcePressure(reason)
         device_id = profile.device_id or 0
         lock_dir = Path.home() / ".cache" / "ibrobot" / "runtime-locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
