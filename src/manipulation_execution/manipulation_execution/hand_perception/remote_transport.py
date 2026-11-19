@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import array
+
 
 class ModelServiceTransport:
     def __init__(self, node, endpoint):
@@ -24,7 +26,7 @@ class ModelServiceTransport:
             image.header.frame_id = frame_id
             image.height, image.width, image.step = 320, 320, 960
             image.encoding, image.is_bigendian = "bgr8", 0
-            image.data = pixels.tobytes()
+            image.data = array.array("B", pixels.tobytes())
         return self.client.call_async(request)
 
     def reap(self, future, *, cancel=False):
