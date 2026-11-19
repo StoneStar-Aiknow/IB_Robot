@@ -1,0 +1,7 @@
+{
+  "interface": "tensor_model",
+  "model_type": "hand_gesture",
+  "operation": "classify",
+  "preprocessing": "x2-hand-gesture-bgr320-rgb-float32-nchw-v1",
+  "postprocessing": "yolov10-cut34-top300-heart8-9-holy2-xsign7-v1"
+}

@@ -1,0 +1,12 @@
+# Review-only Orin service configuration. Installing this file starts nothing.
+hand_gesture_model_service:
+  ros__parameters:
+    instance_id: hri_hand_gesture_orin
+    bundle_path: /home/agi/x2-gesture-service-models/yolov10n_320_fp32
+    deployment: tensorrt_orin_fp32
+    adapter_class: perception_service.hand_gesture_plugin:HandGestureClassifyPlugin
+    service_type: ibrobot_msgs/srv/ClassifyHandGesture
+    service_endpoint: /perception/hand_gesture/classify
+    runtime_options_json: '{"confidence":0.25,"max_infer_rate_hz":10.0}'
+    require_semantic_identity: true
+    required: false

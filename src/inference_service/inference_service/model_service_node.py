@@ -11,6 +11,7 @@ import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile
 
 from ibrobot_msgs.msg import ModelRuntimeInfo
 from inference_manifest import (
@@ -168,6 +169,10 @@ class ModelServiceNode(Node):
             endpoint,
             self._dispatch,
             callback_group=MutuallyExclusiveCallbackGroup(),
+            qos_profile=QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=getattr(self.plugin, "request_queue_depth", 10),
+            ),
         )
 
     def _initialize_plugin(self, service_type_name: str) -> None:
@@ -213,7 +218,7 @@ class ModelServiceNode(Node):
             status = None
             try:
                 status = self.plugin.runtime_status()
-                if not status.ready:
+                if not status.ready and not self.plugin.accepts_unready_request(request):
                     raise RuntimeError(status.failure_reason or f"model runtime is {status.state}")
                 response.message = self.plugin.handle(request, response)
                 response.success = True
