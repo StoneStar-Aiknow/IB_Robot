@@ -159,7 +159,7 @@ def env(monkeypatch, tmp_path):
         node.pub = Recorder()
         node.posted, node.ran = 0, threading.Semaphore(0)
         g = node._gesture
-        if g is not None:
+        if g is not None and not getattr(g, "is_remote", False):
             node.gesture_pub = Recorder()
             assert wait_for(lambda: g.state != "loading"), "the gesture thread did not load"
             post, run = g.post, g.run

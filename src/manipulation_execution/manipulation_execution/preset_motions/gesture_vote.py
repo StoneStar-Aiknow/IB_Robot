@@ -30,6 +30,7 @@ from __future__ import annotations
 import collections
 import json
 import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, fields
 
@@ -242,7 +243,14 @@ class GestureFusion:
     session_epoch, actor_id, source_stamp_ns, sequence, active, reason.
     """
 
-    def __init__(self, config: VoteConfig | None = None, *, actor_max_age_s: float = 1.0):
+    def __init__(
+        self,
+        config: VoteConfig | None = None,
+        *,
+        actor_max_age_s: float = 1.0,
+        remote_source: bool = False,
+        source_started_ns: int | None = None,
+    ):
         self.vote = GestureVote(config)
         self.latch = TemplateLatch()
         self.actor_max_age_s = float(actor_max_age_s)
@@ -250,12 +258,48 @@ class GestureFusion:
         self._session: tuple[int, bool] | None = None
         self._sequence = dict.fromkeys(GESTURES, 0)
         self.counted = self.ignored = 0
+        self.source_gate = None
+        self.source_session_token = ""
+        if remote_source:
+            from .gesture_source import GestureSourceGate
 
-    def set_session(self, epoch: int, active: bool) -> None:
+            self.source_gate = GestureSourceGate(
+                time.monotonic_ns() if source_started_ns is None else source_started_ns
+            )
+
+    def set_session(self, epoch: int, active: bool, *, now_mono_s: float | None = None) -> None:
         """Every (epoch, active) change forgets the vote and bars the runs seen so far."""
         if (epoch, active) != self._session:
             self.vote.reset(barrier=True)
             self._session = (epoch, active)
+            if self.source_gate is not None:
+                now = time.monotonic() if now_mono_s is None else now_mono_s
+                self.source_gate.invalidate(int(now * 1e9))
+
+    def set_source_session_token(self, token: str, *, now_mono_s: float | None = None):
+        """A canonical session transition, never a remote subscriber's local epoch."""
+        if self.source_gate is not None and self.source_session_token and token != self.source_session_token:
+            self._reset_source_votes()
+            now = time.monotonic() if now_mono_s is None else now_mono_s
+            self.source_gate.invalidate(int(now * 1e9))
+        self.source_session_token = token
+
+    def _reset_source_votes(self):
+        self.vote.reset()
+        if self.latch.latched in GESTURES:
+            self.latch.latched = None
+
+    def observe_source(self, text, *, now_mono_s: float) -> bool:
+        if self.source_gate is None:
+            return False
+        accepted, reset = self.source_gate.observe(
+            text,
+            now_ns=int(now_mono_s * 1e9),
+            token=self.source_session_token,
+        )
+        if reset:
+            self._reset_source_votes()
+        return accepted
 
     def observe_actor(self, message, *, now_mono_s: float) -> None:
         """ActorState: the actor counts while present, start-ready and heard within ``actor_max_age_s``."""
@@ -280,12 +324,30 @@ class GestureFusion:
             return False
         self.vote.set_actor(self.current_actor(now_mono_s))
         try:
-            message = json.loads(data) if isinstance(data, str) else data
-        except ValueError:
+            if self.source_gate is not None:
+                from embodied_common.hand_gesture_contract import load_json
+
+                message = load_json(data, SCHEMA) if isinstance(data, str) else data
+                if not self.source_gate.allows(
+                    message,
+                    now_ns=int(now_mono_s * 1e9),
+                    token=self.source_session_token,
+                ):
+                    self.ignored += 1
+                    return False
+            else:
+                message = json.loads(data) if isinstance(data, str) else data
+                if isinstance(message, Mapping) and ("requester_boot_id" in message or "stream_generation" in message):
+                    self.vote.last_reason = "remote_source_not_configured"
+                    self.ignored += 1
+                    return False
+        except (ValueError, TypeError, RecursionError, UnicodeError):
             message = None
         ok = self.vote.observe(message, now_ros_s=now_ros_s, now_mono_s=now_mono_s)
         if ok:
             self.counted += 1
+            if self.source_gate is not None:
+                self.source_gate.commit(message)
         else:
             self.ignored += 1
         return ok
@@ -293,6 +355,8 @@ class GestureFusion:
     def results(self, *, overhead_active: bool, session_active: bool, epoch: int, now_mono_s: float) -> list:
         """One result per gesture template, in ``GESTURES`` order; each call advances their sequences."""
         actor = self.current_actor(now_mono_s)
+        if self.source_gate is not None and self.source_gate.tick(int(now_mono_s * 1e9)):
+            self._reset_source_votes()
         self.vote.set_actor(actor)
         votes = self.vote.update(now_mono_s=now_mono_s)
         raw = {name: session_active and state.active for name, state in votes.items()}
