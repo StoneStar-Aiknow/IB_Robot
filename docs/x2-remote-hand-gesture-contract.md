@@ -20,6 +20,10 @@ Orin 插件实现 `ModelServicePlugin`，复用已有 manifest 与 runtime。
 没有结果时，原镜像和过肩比心继续正常运行。
 客户端禁止在超时后把旧请求伪装成已完成。
 
+选人和换人继续沿用原有链路。
+本次不新增 ActorState 订阅或离开、重入处理。
+actor 仅作为原帧元数据传递，原匹配器校验保持原样。
+
 ## infer
 
 `RequestMeta.op` 为 `infer`。

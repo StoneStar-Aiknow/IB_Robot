@@ -64,6 +64,8 @@ class PresetMotionMatcherNode(Node):
             "gesture_enabled": False,
             "gesture_topic": GESTURE_TOPIC,
             "gesture_vote_json": "{}",  # gesture_vote.VoteConfig fields
+            "gesture_remote_source": False,
+            "gesture_source_topic": "/hri/hand/gesture_source_state",
         }
         for key, value in defaults.items():
             self.declare_parameter(key, value)
@@ -76,11 +78,16 @@ class PresetMotionMatcherNode(Node):
         self._session_active = False
         self._epoch = 0
         self._gesture = None
+        self._source_session_seq = None
         if self.get_parameter("gesture_enabled").value is True:
             try:
                 vote = VoteConfig(**json.loads(self.get_parameter("gesture_vote_json").value))
                 self._topic("gesture_topic")
-                self._gesture = GestureFusion(vote, actor_max_age_s=self._matcher.config.actor_max_age_s)
+                self._gesture = GestureFusion(
+                    vote,
+                    actor_max_age_s=self._matcher.config.actor_max_age_s,
+                    remote_source=self.get_parameter("gesture_remote_source").value is True,
+                )
             except Exception as exc:  # noqa: BLE001  the gestures are an extra: overhead_heart runs without them
                 self.get_logger().warning(f"hand gestures: {type(exc).__name__}: {exc}; gesture off")
         group = MutuallyExclusiveCallbackGroup()
@@ -99,6 +106,10 @@ class PresetMotionMatcherNode(Node):
                 self.create_subscription(
                     String, self._topic("gesture_topic"), self._gesture_msg, 10, callback_group=group
                 )
+                if self._gesture.source_gate is not None:
+                    self.create_subscription(
+                        String, self._topic("gesture_source_topic"), self._source_msg, 10, callback_group=group
+                    )
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().warning(f"hand gestures: {type(exc).__name__}: {exc}; gesture off")
                 self._gesture = None
@@ -120,7 +131,7 @@ class PresetMotionMatcherNode(Node):
         epoch, active = self._gate.permit(now_ros_s=ros, now_mono_s=mono)
         self._session_active, self._epoch = active, epoch
         if self._gesture is not None:
-            self._gesture.set_session(epoch, active)
+            self._gesture.set_session(epoch, active, now_mono_s=mono)
         self._accept(self._matcher.set_session(epoch=epoch, active=active))
         self._accept(self._matcher.tick(now_ros_s=ros, now_mono_s=mono))
 
@@ -136,6 +147,27 @@ class PresetMotionMatcherNode(Node):
         ros, mono = self._times()
         self._gate.observe(message.data, now_ros_s=ros, now_mono_s=mono)
         self._permit(ros, mono)
+        if self._gesture is not None and self._gesture.source_gate is not None:
+            from embodied_common.hand_gesture_contract import session_token
+
+            try:
+                state = json.loads(message.data)
+                seq = state.get("seq")
+                if type(seq) is int and seq != self._source_session_seq:
+                    self._source_session_seq = seq
+                    self._gesture.set_source_session_token(
+                        session_token(state) if self._session_active else "",
+                        now_mono_s=mono,
+                    )
+            except (ValueError, TypeError, AttributeError, RecursionError):
+                self._gesture.set_source_session_token("", now_mono_s=mono)
+        self._publish_match_state()
+
+    def _source_msg(self, message):
+        ros, mono = self._times()
+        self._permit(ros, mono)
+        if self._gesture is not None:
+            self._gesture.observe_source(message.data, now_mono_s=mono)
         self._publish_match_state()
 
     def _actor(self, message):

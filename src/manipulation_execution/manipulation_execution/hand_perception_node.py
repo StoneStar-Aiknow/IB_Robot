@@ -95,6 +95,15 @@ PARAMS = {
     # two-hand gesture om (hand_perception/gesture_runner.py); off unless enabled AND a model path is set.
     # Declared untyped and checked in _gesture_runner: a wrong one turns the gesture off, never the node.
     "gesture_enabled": False,
+    "gesture_mode": "",  # empty preserves the old enabled/path behavior; explicit off/local/remote selects one source.
+    "gesture_remote_service": "/perception/hand_gesture/classify",
+    "gesture_remote_source_topic": "/hri/hand/gesture_source_state",
+    "gesture_remote_timeout_s": 0.4,
+    "gesture_remote_health_s": 2.5,
+    "gesture_remote_probe_s": 1.0,
+    "gesture_remote_max_rate_hz": 10.0,
+    "gesture_remote_engine_sha256": "",
+    "gesture_session_state_topic": "/mirror_session/state",
     "gesture_model_path": "",  # the cut-head om (never *_e2e.om); relative: under $WORKSPACE
     "gesture_topic": "/hri/hand/gesture",
     # The om runs on ais_bench, in its own thread. With the hands on another backend
@@ -190,6 +199,7 @@ class HandPerceptionNode(Node):
         self._boxes = collections.deque(maxlen=64)
         self._boxes_lock = threading.Lock()
         self._box_actor = None  # actor_id of the PearFrame the last _person_box picked
+        self._box_stamp_ns = 0
         self._prev_stamp = None
         self.dropped = self.resets = self.frame_count = 0
         self.labels = {s: ("", 0.0) for s in SIDES}
@@ -202,7 +212,7 @@ class HandPerceptionNode(Node):
 
         self.pub = self.create_publisher(HandFrame, p["frame_topic"], FRAME_QOS)
         self._gesture = self.gesture_pub = None
-        if p["gesture_enabled"] is not False:
+        if p["gesture_mode"] != "off" and (p["gesture_mode"] not in ("", "local") or p["gesture_enabled"] is not False):
             self._gesture = self._gesture_runner(p)
         self.create_subscription(PearFrame, p["pear_frame_topic"], self._on_pear, qos_profile_sensor_data)
         self.camera = PausableSubscription(
@@ -233,6 +243,10 @@ class HandPerceptionNode(Node):
             return None
 
     def _try_gesture_runner(self, p, log):
+        if p["gesture_mode"] not in ("", "local", "off", "remote"):
+            raise ValueError("gesture_mode must be off, local, remote or empty")
+        if p["gesture_mode"] == "remote":
+            return self._remote_gesture_runner(p)
         from std_msgs.msg import String
 
         from .hand_perception import gesture_crop, gesture_runner
@@ -279,6 +293,64 @@ class HandPerceptionNode(Node):
             log=log,
         )
         self.gesture_pub = self.create_publisher(String, p["gesture_topic"], GESTURE_QOS)  # last: may refuse the name
+        return runner
+
+    def _remote_gesture_runner(self, p):
+        from std_msgs.msg import String
+
+        from .hand_perception.gesture_crop import CropConfig
+        from .hand_perception.remote_gesture import RemoteConfig, RemoteGestureRunner
+        from .hand_perception.remote_transport import ModelServiceTransport
+
+        for key in (
+            "gesture_topic",
+            "gesture_remote_service",
+            "gesture_remote_source_topic",
+            "gesture_session_state_topic",
+        ):
+            value = p[key]
+            if not isinstance(value, str) or not value.startswith("/") or any(c.isspace() for c in value):
+                raise ValueError(f"{key} must be an absolute ROS name")
+        crop = CropConfig(
+            far_ratio=p["gesture_far_ratio"],
+            k=p["gesture_k"],
+            one_hand_palms=p["gesture_one_hand_palms"],
+            min_side_px=p["gesture_min_side_px"],
+            max_rate_hz=p["gesture_max_rate_hz"],
+            one_hand_max_rate_hz=p["gesture_one_hand_max_rate_hz"],
+            busy_rate_hz=p["gesture_busy_rate_hz"],
+        )
+        config = RemoteConfig(
+            timeout_s=p["gesture_remote_timeout_s"],
+            health_s=p["gesture_remote_health_s"],
+            probe_s=p["gesture_remote_probe_s"],
+            max_rate_hz=p["gesture_remote_max_rate_hz"],
+            conf=p["gesture_conf"],
+            expected_engine_sha256=p["gesture_remote_engine_sha256"],
+        )
+        transport = ModelServiceTransport(self, p["gesture_remote_service"])
+        self.gesture_pub = self.create_publisher(String, p["gesture_topic"], GESTURE_QOS)
+        self.gesture_source_pub = self.create_publisher(String, p["gesture_remote_source_topic"], GESTURE_QOS)
+        runner = RemoteGestureRunner(
+            crop,
+            config,
+            transport=transport,
+            publish=lambda text: self.gesture_pub.publish(String(data=text)),
+            publish_source=lambda text: self.gesture_source_pub.publish(String(data=text)),
+            log=self.get_logger().info,
+            warn=self.get_logger().warning,
+            ros_clock=lambda: self.get_clock().now().nanoseconds / 1e9,
+        )
+        self._remote_gesture_subs = [
+            self.create_subscription(
+                String,
+                p["gesture_session_state_topic"],
+                lambda msg: runner.observe_session(
+                    msg.data, now_ros_s=self.get_clock().now().nanoseconds / 1e9, now_mono_s=time.monotonic()
+                ),
+                10,
+            ),
+        ]
         return runner
 
     # -- callbacks (executor thread) ----------------------------------------
@@ -352,8 +424,10 @@ class HandPerceptionNode(Node):
             older = [b for b in self._boxes if b[0] <= stamp]
         if not older:
             self._box_actor = None
+            self._box_stamp_ns = 0
             return None, None, False
         ts, box, source, conf, self._box_actor = max(older, key=lambda b: b[0])
+        self._box_stamp_ns = ts
         age = stamp - ts
         valid = (
             source == "yolox"
@@ -418,19 +492,25 @@ class HandPerceptionNode(Node):
         self.frame_count += 1
         self._account(out, valid, (time.time_ns() - stamp) / 1e6)
         if self._gesture is not None and img is not None:
-            self._gesture_step(stamp, img, box, hands)
+            self._gesture_step(stamp, img, box, hands, msg.header.frame_id)
 
-    def _gesture_step(self, stamp: int, img, box, hands):
+    def _gesture_step(self, stamp: int, img, box, hands, frame_id=""):
         """This frame's square to the gesture thread, after its HandFrame is out. Never waits or raises."""
         g = self._gesture
         try:
-            with self._slot_lock:
-                busy = self._slot is not None  # a newer frame waits: the hands go first, down to busy_rate_hz
             lms = [hands[s]["lm"] for s in SIDES if hands[s] is not None]
-            g.post(stamp, self._box_actor, img, box, lms, busy)
+            if getattr(g, "is_remote", False):
+                g.post(stamp, self._box_actor, img, box, lms, pear_stamp_ns=self._box_stamp_ns, frame_id=frame_id)
+            else:
+                with self._slot_lock:
+                    busy = self._slot is not None  # a newer frame waits: the hands go first, down to busy_rate_hz
+                g.post(stamp, self._box_actor, img, box, lms, busy)
             if g.off:
                 self._gesture = None
         except Exception as e:  # noqa: BLE001
+            if getattr(g, "is_remote", False):
+                g.stats["handoff_error"] += 1
+                return  # A failed optional handoff must not delete remote recovery or reach the hands.
             self._gesture = None
             g.stop(timeout=0.0)
             self.get_logger().info(f"gesture model off: {type(e).__name__}: {e}; hands unaffected")

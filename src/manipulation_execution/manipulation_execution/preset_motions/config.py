@@ -19,6 +19,7 @@ STATUS_TOPIC = "/preset_motions/status"
 STATE_TOPIC = "/mirror_session/state"
 MATCH_STATE_TOPIC = "/preset_motions/state"
 GESTURE_TOPIC = "/hri/hand/gesture"
+GESTURE_SOURCE_TOPIC = "/hri/hand/gesture_source_state"
 _KEYS = {
     "enabled",
     "motion_enabled",
@@ -100,12 +101,16 @@ def gesture_settings(value):
     """(enabled, topic, vote numbers) of ``preset_motions.gesture``."""
     if not isinstance(value, Mapping):
         raise ValueError("preset_motions.gesture must be a mapping")
-    unknown = set(value) - (_GESTURE_VOTE | {"enabled", "topic"})
+    unknown = set(value) - (_GESTURE_VOTE | {"enabled", "topic", "source", "source_topic"})
     if unknown:
         raise ValueError(f"preset_motions.gesture has unknown keys {sorted(unknown)}")
     enabled = value.get("enabled", False)
     if type(enabled) is not bool:
         raise ValueError("preset_motions.gesture.enabled must be a boolean")
+    if value.get("source", "local") not in ("local", "remote"):
+        raise ValueError("preset_motions.gesture.source must be local or remote")
+    if value.get("source") == "remote":
+        topic(value.get("source_topic", GESTURE_SOURCE_TOPIC), "gesture source topic")
     vote = {key: value[key] for key in _GESTURE_VOTE & value.keys()}
     for key, number in vote.items():
         if type(number) not in (int, float) or not math.isfinite(number) or number <= 0:
@@ -170,6 +175,11 @@ def launch_parameters(robot_config, stream, warn=None):
         parameters.update(
             gesture_enabled=enabled, gesture_topic=gesture_topic, gesture_vote_json=json.dumps(vote, sort_keys=True)
         )
+        if enabled and section["gesture"].get("source") == "remote":
+            parameters.update(
+                gesture_remote_source=True,
+                gesture_source_topic=section["gesture"].get("source_topic", GESTURE_SOURCE_TOPIC),
+            )
     return parameters
 
 

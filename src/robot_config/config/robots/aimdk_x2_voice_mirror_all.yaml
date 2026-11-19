@@ -320,6 +320,18 @@ robot:
             # and enable; with backend inference_service also gesture_allow_mixed_backend
             # (untested: the two runtimes in two threads of one process) or the om stays off.
             gesture_enabled: false
+            # Empty preserves the legacy enabled/path behavior. Remote is an
+            # explicit optional model-service client; it never loads this om.
+            # Enable only together with preset_motions.gesture.source: remote.
+            gesture_mode: ""
+            gesture_remote_service: /perception/hand_gesture/classify
+            gesture_remote_source_topic: /hri/hand/gesture_source_state
+            gesture_remote_timeout_s: 0.4
+            gesture_remote_health_s: 2.5
+            gesture_remote_probe_s: 1.0
+            gesture_remote_max_rate_hz: 10.0
+            gesture_remote_engine_sha256: ""  # optional explicit pin; an empty value pins the first healthy handshake
+            gesture_session_state_topic: /mirror_session/state
             gesture_model_path: ""
             gesture_topic: /hri/hand/gesture
             gesture_allow_mixed_backend: false
@@ -517,6 +529,8 @@ robot:
     # hands.perception.parameters.gesture_enabled and a consumer that reads them.
     gesture:
       enabled: false
+      source: local  # remote requires the source-state fence; local keeps the existing observer unchanged.
+      source_topic: /hri/hand/gesture_source_state
       topic: /hri/hand/gesture
       window_s: 0.6
       min_frames: 4
