@@ -246,6 +246,10 @@ identity tensor session 验证 bundle -> runtime -> adapter -> typed response �
 生产模型或 accelerator deployment 已通过语义/硬件 conformance。生产服务类型、adapter、wrapper 和配置由各自
 消费功能负责。
 
+X2 的可选远端手势服务候选见 [Orin 手势服务说明](README_hand_gesture.md)。
+该插件复用通用宿主、manifest 和原生模型生命周期。
+本机测试通过不代表机器人上的部署或共存验收已通过。
+
 ## 9. Semantic Mapping Model Services
 
 新语义建图流水线使用五个独立的 generic `model_service_node` 进程：SAM2 mask、RAM++ tagging、SigLIP2

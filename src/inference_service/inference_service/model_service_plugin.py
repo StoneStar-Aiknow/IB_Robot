@@ -37,6 +37,15 @@ class ModelServicePlugin(ABC):
     """Bind one concrete ROS service type to one model adapter and runtime session."""
 
     service_type: str
+    request_queue_depth: int = 10
+
+    def accepts_unready_request(self, request) -> bool:
+        """Opt in to control-only calls while the underlying runtime is unready.
+
+        The default preserves the existing readiness gate. A plugin opting in
+        must validate the request itself and must not execute unready models.
+        """
+        return False
 
     @abstractmethod
     def handle(self, request, response) -> str:

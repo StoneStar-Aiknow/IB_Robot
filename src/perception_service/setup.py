@@ -9,6 +9,15 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/config", ["config/hand_gesture_model_service.yaml"]),
+        (
+            "share/" + package_name + "/config/hand_gesture_bundle",
+            ["config/hand_gesture_bundle/inference_manifest.json"],
+        ),
+        (
+            "share/" + package_name + "/config/hand_gesture_bundle/assets",
+            ["config/hand_gesture_bundle/assets/adapter.json"],
+        ),
     ],
     install_requires=["setuptools"],
     extras_require={"test": ["pytest"]},
@@ -25,6 +34,7 @@ setup(
             "package_graspgen_ascend_bundle = perception_service.package_graspgen_ascend_bundle:main",
             "package_graspgen_torch_bundle = perception_service.package_graspgen_torch_bundle:main",
             "package_graspgenx_torch_bundle = perception_service.package_graspgenx_torch_bundle:main",
+            "package_hand_gesture_bundle = perception_service.package_hand_gesture_bundle:main",
         ],
     },
 )

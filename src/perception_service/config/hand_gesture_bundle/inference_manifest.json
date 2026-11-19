@@ -1,0 +1,118 @@
+{
+  "bundle": {
+    "digest": {
+      "algorithm": "sha256",
+      "scope": "structure",
+      "value": "b028a7b3b38465d45b6918bd46d21609226fe33ce16a5ac4467115e13f345842"
+    },
+    "files": [
+      {
+        "path": "assets/adapter.json"
+      }
+    ],
+    "name": "x2_hand_gesture_yolov10n_320",
+    "revision": 1,
+    "uuid": "54680c81-880b-5523-a4a0-4cedc2bcf655"
+  },
+  "deployments": {
+    "tensorrt_orin_fp32": {
+      "artifacts": {
+        "model": {
+          "format": "engine",
+          "path": "artifacts/tensorrt_orin/yolov10n_gestures_320_fp32.engine",
+          "sha256": "421c325669b665e3331430f98365fe3a126bce92a4588097e9faeaa89fd7d639"
+        }
+      },
+      "bindings": {
+        "model": {
+          "inputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "layout": "NCHW",
+              "runtime_name": "images",
+              "semantic": "observation.image",
+              "shape": [
+                1,
+                3,
+                320,
+                320
+              ]
+            }
+          ],
+          "outputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "runtime_name": "/model.23/Concat_3_output_0",
+              "semantic": "gesture.raw",
+              "shape": [
+                1,
+                38,
+                2100
+              ]
+            }
+          ]
+        }
+      },
+      "execution": [
+        "model"
+      ],
+      "execution_contract": {
+        "cancellation_granularity": "request_boundary",
+        "execution_structure": "direct",
+        "state_scope": "request"
+      },
+      "revision": 1,
+      "runtime_profile": {
+        "backend": "tensorrt",
+        "profile": {
+          "device_id": 0,
+          "engine_version": "10.7.0",
+          "precision": "fp32"
+        },
+        "target": {
+          "runtime": "tensorrt",
+          "runtime_abi": "tensorrt-10.7.0-cuda-12.6",
+          "soc": "orin"
+        }
+      },
+      "uuid": "87983598-4e6c-573d-80a0-f43775270fbe"
+    }
+  },
+  "model": {
+    "inputs": [
+      {
+        "dtype": "float32",
+        "layout": "NCHW",
+        "semantic": "observation.image",
+        "shape": [
+          1,
+          3,
+          320,
+          320
+        ]
+      }
+    ],
+    "interface": "tensor_model",
+    "model_type": "hand_gesture",
+    "operation": "classify",
+    "outputs": [
+      {
+        "dtype": "float32",
+        "semantic": "gesture.raw",
+        "shape": [
+          1,
+          38,
+          2100
+        ]
+      }
+    ],
+    "semantic_identity": {
+      "logical_model_revision": "yolov10n-hagridv2-320-cut-v1",
+      "output_semantics": "yolov10-cut34-top300-heart8-9-holy2-xsign7-v1",
+      "preprocessing_contract": "x2-hand-gesture-bgr320-rgb-float32-nchw-v1"
+    }
+  },
+  "schema_version": 3
+}
