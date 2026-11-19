@@ -1,0 +1,11 @@
+# Hosted by inference_service/model_service_node. The image and its immutable
+# request metadata are one atomic request. probe/retire use an empty image.
+sensor_msgs/Image image
+string<=4096 metadata_json
+---
+# Versioned result metadata, including the echoed request and server boot ID.
+string<=4096 result_json
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message
