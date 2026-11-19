@@ -47,6 +47,10 @@ class CropConfig:
     min_side_px: float = 64.0
     max_rate_hz: float = 15.0
     one_hand_max_rate_hz: float = 5.0
+    # A newer hand frame waiting only yields up to this rate, it never starves the
+    # gesture: with the hands saturated (out ~17 fps) 10 Hz is every 2nd frame,
+    # ~5 runs in the matcher's 0.6 s vote window (it needs 4).
+    busy_rate_hz: float = 10.0
 
     def __post_init__(self):
         for f in fields(self):
@@ -139,11 +143,13 @@ class RateGate:
     """All runs <= ``max_rate_hz``, one-hand runs <= ``one_hand_max_rate_hz``, by camera stamp (ns).
 
     ``allow`` only asks; ``mark`` records a run. A stamp going backwards forgets
-    the history (the next frame may run)."""
+    the history (the next frame may run). ``allow_busy``: may a frame run while a
+    newer hand frame is waiting (``busy_rate_hz`` since the last run)."""
 
     def __init__(self, cfg: CropConfig):
         self._any_ns = int(1e9 / cfg.max_rate_hz) - RATE_SLACK_NS
         self._one_ns = int(1e9 / cfg.one_hand_max_rate_hz) - RATE_SLACK_NS
+        self._busy_ns = int(1e9 / cfg.busy_rate_hz) - RATE_SLACK_NS
         self.last_any: int | None = None
         self.last_one: int | None = None
 
@@ -155,6 +161,10 @@ class RateGate:
         if self.last_any is not None and stamp_ns - self.last_any < self._any_ns:
             return False
         return not (mode == ONE and self.last_one is not None and stamp_ns - self.last_one < self._one_ns)
+
+    def allow_busy(self, stamp_ns: int) -> bool:
+        last = self.last_any
+        return last is None or stamp_ns < last or stamp_ns - last >= self._busy_ns
 
     def mark(self, mode: str, stamp_ns: int) -> None:
         self.last_any = stamp_ns

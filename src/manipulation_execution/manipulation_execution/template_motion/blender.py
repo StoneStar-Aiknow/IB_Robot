@@ -79,7 +79,7 @@ class BlendConfig:
     done_margin_s: float = 0.3  # WAIT_DONE ends this long after the exit should have finished
     min_hold_s: float = 0.8  # a lost label releases only after this long in HOLD
     c_duration_s: float = 0.8  # C from beta = 1
-    c_peak_speed: float = 1.5
+    c_peak_speed: float = 1.8  # rad/s; the CBF caps 2.0 (0.04 rad a tick), the rest is the mirror's own motion
     c_peak_accel: float = 6.0  # rad/s2; a C of 0.6 rad in 0.8 s peaks at 5.4
     c_min_s: float = 0.3
     cooldown_s: float = 1.0
@@ -236,6 +236,7 @@ class Blender:
         self._a_elapsed = 0.0
         self._anchor: tuple[float, ...] | None = None
         self._c_curve: _Quintic | None = None
+        self._c_dist = 0.0
         self._deadline = math.inf
         self._wait_reason = ""
         self._released = False
@@ -608,6 +609,7 @@ class Blender:
         self._exit_log(reason, now)
         self._anchor = tuple(anchor)
         dist = 0.0 if m is None else _farthest(self._anchor, m)
+        self._c_dist = dist
         duration = max(config.c_duration_s * beta, MIN_JERK_PEAK * beta * dist / config.c_peak_speed, config.c_min_s)
         curve = _Quintic(beta, speed, accel, duration)
         # Leaving A half way, beta still moves toward P and has to turn round. Never faster than
@@ -631,6 +633,12 @@ class Blender:
         beta = min(max(self._c_curve.at(t), 0.0), 1.0)
         arm = _lerp(m, self._anchor, beta)
         if t >= self._c_curve.duration:
+            name = self._label.template if self._label is not None else "?"
+            total = now - self._entered_at if self._entered_at is not None else 0.0
+            self._log(
+                f"template mirror {name} c_elapsed={t:.2f} c_T={self._c_curve.duration:.2f} "
+                f"c_dist={self._c_dist:.3f} total={total:.2f}"
+            )
             self._phase, self._since = Phase.COOLDOWN, now
             self._label = self._segment = None
         return arm

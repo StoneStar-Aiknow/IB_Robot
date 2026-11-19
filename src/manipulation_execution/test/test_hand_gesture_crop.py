@@ -139,6 +139,23 @@ def test_rate_one_hand_at_most_5hz_but_both_is_not_held_back_by_it():
     assert gate.allow(gc.ONE, 200 * ms)
 
 
+def test_busy_lets_a_frame_through_at_10hz_by_stamp():
+    ms = 1_000_000
+    gate = gc.RateGate(CFG)
+    assert gate.allow_busy(0)
+    gate.mark(gc.BOTH, 1000 * ms)
+    assert not gate.allow_busy(1067 * ms)
+    assert gate.allow_busy(1096 * ms)  # within the 5 ms slack
+    assert gate.allow_busy(900 * ms)  # stamp went back
+    assert gc.RateGate(gc.CropConfig(busy_rate_hz=5.0)).allow_busy(0)
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, float("inf"), "x", True])
+def test_busy_rate_must_be_positive(bad):
+    with pytest.raises(ValueError):
+        gc.CropConfig(busy_rate_hz=bad)
+
+
 def test_rate_stamp_going_back_forgets_the_history():
     gate = gc.RateGate(CFG)
     gate.mark(gc.ONE, 10_000_000_000)

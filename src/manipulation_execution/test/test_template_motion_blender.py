@@ -293,7 +293,7 @@ def test_leaving_A_half_way_is_smooth_and_never_faster_than_c_peak_speed():
     assert rig.blender.phase is Phase.C and exit_reason(rig) == "label_lost"
     assert rig.run(3.0, lambda: rig.blender.phase is Phase.COOLDOWN)
     assert rig.last_sent.arm == MIRROR
-    assert max_step(rig.out) <= 1.5 * 1.03 * TICK
+    assert max_step(rig.out) <= BlendConfig().c_peak_speed * 1.03 * TICK
     assert max_jerkless(rig.out) <= 0.0025  # 6.25 rad/s², a min-jerk C of 0.6 rad in 0.8 s
     assert rig.messages == []
 
@@ -343,6 +343,25 @@ def test_T_A_has_no_upper_bound_and_respects_the_hand_travel():
     rig2.active["heart"] = 7
     rig2.step()
     assert "T_A=1.50" in rig2.logs[-1]
+
+
+def test_C_back_to_a_far_mirror_takes_its_peak_speed_and_logs_how_long():
+    rig = Rig()
+    to_playing(rig, state="HOLD")
+    rig.mirror = pose(j0=1.8, j7=1.8)  # the arms came down: 2.4 rad from P
+    rig.run(0.9)
+    del rig.active["heart"]
+    seg_id = rig.started()
+    rig.publish_port(state="EXIT_B", seg_id=seg_id, reason="released", P_actual=list(P_HEART))
+    rig.run(0.2)
+    rig.port = {"state": "DONE", "seg_id": seg_id, "seg": "heart", "reason": "released", "P_actual": list(P_HEART)}
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    c_start = rig.now
+    assert rig.run(4.0, lambda: rig.blender.phase is Phase.COOLDOWN)
+    assert rig.now - c_start == pytest.approx(1.875 * 2.4 / 1.8, abs=2 * TICK)  # 2.5 s (3.0 s at 1.5 rad/s)
+    line = rig.logs[-1]
+    assert line.startswith("template mirror heart ") and "c_T=2.50" in line and "c_dist=2.400" in line
+    assert max_step(rig.out[-int(2.4 / TICK) :]) <= 1.8 * TICK * 1.01
 
 
 # -- entry gates ------------------------------------------------------------------------
@@ -508,7 +527,8 @@ def test_a_data_plane_restart_mid_playback_goes_back_to_the_mirror():
     assert rig.run(3.0, lambda: rig.blender.phase is Phase.IDLE)
     assert len(rig.messages) == sent and rig.last_sent.arm == MIRROR
     assert max_step(rig.out) <= 0.03
-    assert "total=" in rig.logs[-1] and "reason=port_lost" in rig.logs[-1]
+    assert "total=" in rig.logs[-2] and "reason=port_lost" in rig.logs[-2]
+    assert rig.logs[-1].startswith("template mirror heart c_elapsed=")
     del rig.active["heart"]
     rig.step()
     rig.active["heart"] = 7

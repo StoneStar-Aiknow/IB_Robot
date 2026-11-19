@@ -330,7 +330,8 @@ robot:
             gesture_min_side_px: 64.0
             gesture_max_rate_hz: 15.0
             gesture_one_hand_max_rate_hz: 5.0
-            gesture_slow_ms: 20.0           # gesture_slow_limit of the last gesture_slow_window runs this slow: off
+            gesture_busy_rate_hz: 10.0      # hands saturated (a newer frame waiting): the gesture still runs this often
+            gesture_slow_ms: 50.0           # gesture_slow_limit of the last gesture_slow_window runs this slow: off
             gesture_slow_window: 10
             gesture_slow_limit: 3
             gesture_fail_limit: 5           # failed runs in a row: off
@@ -523,7 +524,7 @@ robot:
     geometry_file: ""  # A certified runtime artifact is required before enabling motion.
     matcher:
       enter_confirm_s: 0.5
-      exit_confirm_s: 0.4
+      exit_confirm_s: 0.3  # 0.4 on the real robot 1119: the arms were down before the template let go
       min_enter_frames: 3
     # Hand gesture templates heart / holy / xsign on /preset_motions/state, voted
     # from hands.perception's gesture model (/hri/hand/gesture). Off: it needs

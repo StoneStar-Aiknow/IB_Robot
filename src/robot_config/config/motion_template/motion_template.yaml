@@ -34,7 +34,7 @@ motion_template:
     done_margin_s: 0.3        # an exit not DONE this long after its t_out: back to the mirror anyway
     min_hold_s: 0.8           # a lost label releases only after this long at T
     c_duration_s: 0.8         # C (P -> mirror)
-    c_peak_speed: 1.5         # rad/s, C lasts longer when the mirror is far
+    c_peak_speed: 1.8         # rad/s, C lasts longer when the mirror is far (the CBF caps 2.0)
     c_peak_accel: 6.0         # rad/s2, and when it has to turn round (leaving A half way)
     c_min_s: 0.3
     cooldown_s: 1.0           # mirror only, this long after C
