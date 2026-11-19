@@ -323,14 +323,14 @@ robot:
             # Empty preserves the legacy enabled/path behavior. Remote is an
             # explicit optional model-service client; it never loads this om.
             # Enable only together with preset_motions.gesture.source: remote.
-            gesture_mode: ""
+            gesture_mode: "remote"
             gesture_remote_service: /perception/hand_gesture/classify
             gesture_remote_source_topic: /hri/hand/gesture_source_state
             gesture_remote_timeout_s: 0.4
             gesture_remote_health_s: 2.5
             gesture_remote_probe_s: 1.0
             gesture_remote_max_rate_hz: 10.0
-            gesture_remote_engine_sha256: ""  # optional explicit pin; an empty value pins the first healthy handshake
+            gesture_remote_engine_sha256: "421c325669b665e3331430f98365fe3a126bce92a4588097e9faeaa89fd7d639"
             gesture_session_state_topic: /mirror_session/state
             gesture_model_path: ""
             gesture_topic: /hri/hand/gesture
@@ -542,8 +542,8 @@ robot:
     # from hands.perception's gesture model (/hri/hand/gesture). Off: it needs
     # hands.perception.parameters.gesture_enabled and a consumer that reads them.
     gesture:
-      enabled: false
-      source: local  # remote requires the source-state fence; local keeps the existing observer unchanged.
+      enabled: true
+      source: remote
       source_topic: /hri/hand/gesture_source_state
       topic: /hri/hand/gesture
       window_s: 0.6
