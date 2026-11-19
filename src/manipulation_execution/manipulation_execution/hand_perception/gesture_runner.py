@@ -9,8 +9,10 @@ published, the worker calls ``post`` with the frame it already decoded, its
 person box and the 21 image points of each hand found.
 
 ``post`` (hand worker) never waits and never raises: nothing until the om is
-loaded; skip if the hand slot already holds a newer frame (the hands come
-first); ``gesture_crop.plan_crop`` picks the square or a skip; ``RateGate``
+loaded; if the hand slot already holds a newer frame (busy) the hands come
+first, but only down to ``busy_rate_hz``: with the hands saturated the gesture
+still runs that often (busy yields, it never starves it);
+``gesture_crop.plan_crop`` picks the square or a skip; ``RateGate``
 keeps the runs under the rates; then it copies the square out of the frame and
 drops it in a one-slot mailbox (latest only: a job not yet taken is replaced).
 The gesture thread takes it, resizes, runs the om and ``post_fast``, and
@@ -54,7 +56,7 @@ LOADING, ON, OFF = "loading", "on", "off"
 @dataclass(frozen=True)
 class RunnerConfig:
     conf: float = 0.25
-    slow_ms: float = 20.0
+    slow_ms: float = 50.0  # 24 ms on the real robot with the hands saturated (1119): CPU shared, not the NPU
     slow_window: int = 10  # the last this many runs ...
     slow_limit: int = 3  # ... with this many over slow_ms: off
     fail_limit: int = 5  # failed runs in a row: off
@@ -137,6 +139,8 @@ class GestureRunner:
         self._period_t0 = clock()
         self._runs: Counter = Counter()
         self._skips: Counter = Counter()
+        self._busy_posts = 0  # this period: posted although a newer hand frame was waiting
+        self._post_ms_max = 0.0  # this period: the longest crop + copy on the hand worker
         self._last: dict = {}
 
     @property
@@ -193,7 +197,8 @@ class GestureRunner:
             self.state = ON
         self._log(
             f"gesture model {getattr(om, 'path', self.model_path)} ready; conf {self.cfg.conf:g}, "
-            f"rate <= {self.crop.max_rate_hz:g} Hz (one hand <= {self.crop.one_hand_max_rate_hz:g} Hz), "
+            f"rate <= {self.crop.max_rate_hz:g} Hz (one hand <= {self.crop.one_hand_max_rate_hz:g} Hz, "
+            f"hands busy >= {self.crop.busy_rate_hz:g} Hz), "
             f"watchdog {self.cfg.watchdog_ms:g} ms"
         )
         return True
@@ -245,7 +250,7 @@ class GestureRunner:
         return False
 
     def _post(self, stamp_ns, actor_id, img, box, lms, busy):
-        if busy:
+        if busy and not self.rate.allow_busy(stamp_ns):
             return self._skip("busy")
         if actor_id is None:
             return self._skip("actor")
@@ -266,6 +271,8 @@ class GestureRunner:
             if self._job is not None:
                 self._skips["replaced"] += 1
             self._job = job
+            self._busy_posts += bool(busy)
+            self._post_ms_max = max(self._post_ms_max, job.crop_ms)
         self._has_job.set()
         return True
 
@@ -345,8 +352,10 @@ class GestureRunner:
             runs = " ".join(f"{k}={v}" for k, v in sorted(self._runs.items())) or "0"
             skips = " ".join(f"{k}={v}" for k, v in sorted(self._skips.items())) or "0"
             last = dict(self._last)
+            busy_posts, post_ms = self._busy_posts, self._post_ms_max
             self._runs.clear()
             self._skips.clear()
+            self._busy_posts, self._post_ms_max = 0, 0.0
         elapsed, self._period_t0 = now - self._period_t0, now
 
         def num(key, fmt):
@@ -354,7 +363,8 @@ class GestureRunner:
             return "-" if v is None or (isinstance(v, float) and not math.isfinite(v)) else format(v, fmt)
 
         self._log(
-            f"gesture {elapsed:.1f}s runs {runs} skips {skips} | last box_h {num('box_h', '.0f')} "
+            f"gesture {elapsed:.1f}s runs {runs} skips {skips} busy_posts {busy_posts} "
+            f"post_ms max {post_ms:.1f} | last box_h {num('box_h', '.0f')} "
             f"dist/h {num('dist', '.2f')} palm {num('palm', '.0f')} side {num('side', 'd')} "
             f"cls {last.get('cls', '-')} score {num('score', '.2f')} npu_ms {num('npu_ms', '.1f')} "
             f"total_ms {num('total_ms', '.1f')}"

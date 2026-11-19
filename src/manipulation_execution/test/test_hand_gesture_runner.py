@@ -146,15 +146,54 @@ def test_no_gesture_is_sent_as_none():
 def test_busy_no_hands_far_and_rate_do_not_run():
     r, om, sent, _ = runner()
     r.load()
-    assert step(r, 0, busy=True) is None
     assert step(r, 0, lms=[]) is None
     assert step(r, 0, lms=[hand(100, 300), hand(800, 300)]) is None
     assert step(r, 0, actor=None) is None
     assert om.calls == 0
     assert step(r, 0) is not None
     assert step(r, 33 * MS) is None  # 15 Hz
+    assert step(r, 67 * MS, busy=True) is None  # a newer hand frame waits: 10 Hz
     assert step(r, 67 * MS) is not None
-    assert om.calls == 2 and len(sent) == 2
+    assert step(r, 133 * MS, busy=True) is None
+    assert step(r, 167 * MS, busy=True) is not None  # 100 ms since the last run: busy only yields
+    assert om.calls == 3 and len(sent) == 3
+
+
+def test_the_first_frame_runs_even_when_busy():
+    r, om, _, _ = runner()
+    r.load()
+    assert step(r, 0, busy=True) is not None and om.calls == 1
+
+
+def test_hands_saturated_the_gesture_still_runs_at_the_busy_floor():
+    """Real robot 1119: hands out ~17.4 fps, a newer camera frame always waiting, the gesture ran once in 3 min.
+
+    The frames the hand worker gets are 1 or 2 camera frames (33 / 67 ms) apart.
+    At 10 Hz the gesture runs every 100-133 ms, so every 0.6 s vote window
+    (preset matcher, min_frames 4) has at least 4 runs, and never faster than
+    10 Hz while busy."""
+    rng = np.random.default_rng(1119)
+    gaps = rng.choice([33_333_333, 66_666_667], size=180, p=[0.25, 0.75])
+    stamps = np.concatenate([[0], np.cumsum(gaps)]).tolist()
+    assert 16.5 < len(stamps) / (stamps[-1] / 1e9) < 18.5  # ~17.4 fps, like the robot
+    r, om, sent, _ = runner()
+    r.load()
+    runs = [s for s in stamps if step(r, s, busy=True) is not None]
+    assert len(runs) == om.calls == len(sent) and r.enabled
+    hz = (len(runs) - 1) / ((runs[-1] - runs[0]) / 1e9)
+    assert 7.5 < hz <= 10.0, hz
+    apart = np.diff(runs)
+    assert apart.min() >= 95 * MS and apart.max() <= 134 * MS
+    windows = [sum(t <= s < t + 600 * MS for s in runs) for t in stamps if t + 600 * MS <= stamps[-1]]
+    assert min(windows) >= 4
+
+
+def test_hands_saturated_one_hand_keeps_its_5hz():
+    r, _, _, _ = runner()
+    r.load()
+    stamps = [i * 66_666_667 for i in range(31)]
+    runs = [s for s in stamps if step(r, s, lms=[hand(300, 300)], busy=True) is not None]
+    assert np.diff(runs).min() >= 195 * MS and len(runs) == 11  # 2 s: every 3rd frame
 
 
 def test_one_hand_runs_at_most_5hz():
@@ -207,12 +246,19 @@ def test_a_good_run_resets_the_error_count():
     assert r.enabled
 
 
+SLOW_20 = gr.RunnerConfig(slow_ms=20.0)  # the slow tests: 25 ms is slow
+
+
 def slow():
     time.sleep(0.025)
 
 
+def test_slow_default_leaves_room_for_the_saturated_hands():
+    assert gr.RunnerConfig().slow_ms == 50.0  # 24 ms seen on the robot with the hands saturated
+
+
 def test_three_slow_runs_turn_it_off():
-    r, _, sent, logs = runner(FakeOm(delay=slow))
+    r, _, sent, logs = runner(FakeOm(delay=slow), cfg=SLOW_20)
     r.load()
     for i in range(3):
         assert r.enabled
@@ -224,7 +270,7 @@ def test_three_slow_runs_turn_it_off():
 def test_alternating_fast_and_slow_runs_turn_it_off():
     """3 slow of the last 10 is enough; a fast run in between no longer saves it."""
     om = FakeOm()
-    r, _, sent, logs = runner(om)
+    r, _, sent, logs = runner(om, cfg=SLOW_20)
     r.load()
     for i in range(5):
         assert r.enabled
@@ -236,7 +282,7 @@ def test_alternating_fast_and_slow_runs_turn_it_off():
 
 def test_two_slow_runs_in_every_ten_stay_on():
     om = FakeOm()
-    r, _, sent, _ = runner(om)
+    r, _, sent, _ = runner(om, cfg=SLOW_20)
     r.load()
     for i in range(25):
         om.delay = slow if i % 5 == 0 else None  # 2 of any 10 in a row
@@ -264,15 +310,18 @@ def test_summary_line_is_numbers_only_and_rate_limited():
     logs.clear()
     step(r, 0)
     step(r, 10 * MS)
+    step(r, 50 * MS, busy=True)
     assert not logs
     clock.t = 1.0
-    step(r, 100 * MS, busy=True)
+    step(r, 150 * MS, busy=True)
     assert len(logs) == 1
     line = logs[0]
     for key in (
-        "runs both=1",
+        "runs both=1",  # the line goes out as the 150 ms square is posted, before it runs
         "rate=1",
         "busy=1",
+        "busy_posts 1",
+        "post_ms max ",
         "box_h 1000",
         "dist/h 0.08",
         "palm 40",

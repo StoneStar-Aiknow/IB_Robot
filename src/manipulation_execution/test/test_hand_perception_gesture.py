@@ -375,14 +375,14 @@ def test_inference_errors_five_in_a_row_turn_it_off_and_hands_go_on(env, monkeyp
 
 def test_three_slow_runs_turn_it_off_and_hands_go_on(env, monkeypatch):
     monkeypatch.setattr(Session, "delay_s", 0.025)
-    node = env.make(gesture_enabled=True, gesture_model_path=env.model)
+    node = env.make(gesture_enabled=True, gesture_model_path=env.model, gesture_slow_ms=20.0)
     run_frames(node, 6)
     assert Session.instances[0].calls == 3 and wait_for(lambda: Session.instances[0].freed)
     assert node._gesture is None and len(node.pub.msgs) == 6 and len(gestures(node)) == 3
 
 
 def test_slow_runs_spread_over_the_window_turn_it_off(env, monkeypatch):
-    node = env.make(gesture_enabled=True, gesture_model_path=env.model)
+    node = env.make(gesture_enabled=True, gesture_model_path=env.model, gesture_slow_ms=20.0)
     for i in range(5):  # slow, fast, slow, fast, slow: 3 of the last 5
         monkeypatch.setattr(Session, "delay_s", 0.025 if i % 2 == 0 else 0.0)
         feed(node, 1_000_000_000_000 + i * 100 * MS)
@@ -435,20 +435,26 @@ def test_a_raising_runner_is_dropped_silently(env):
     assert node._gesture is None and len(node.pub.msgs) == 3
 
 
-def test_skips_when_a_newer_frame_is_waiting(env):
+def test_a_newer_frame_waiting_skips_the_gesture_only_down_to_the_busy_rate(env):
     node = env.make(gesture_enabled=True, gesture_model_path=env.model)
     base = 1_000_000_000_000
-    nxt = base + 100 * MS
+    feed(node, base)
+    newer = {}
 
     def park(n):
-        if n == 1:  # a newer frame arrives while the first one is being published
-            node._on_pear(pear(nxt))
-            node._on_image(image(nxt))
+        if n in newer:  # a newer frame arrives while this one is being published
+            stamp = newer.pop(n)
+            node._on_pear(pear(stamp))
+            node._on_image(image(stamp))
 
     node.pub.on_publish = park
-    feed(node, base, n=2)
-    assert [m.timestamp_ns for m in node.pub.msgs] == [base, nxt]
-    assert [g["stamp_ns"] for g in gestures(node)] == [nxt]
+    newer[2] = base + 100 * MS
+    feed(node, base + 50 * MS, n=2)  # busy, 50 ms after the last run: the hands go first
+    newer[4] = base + 230 * MS
+    feed(node, base + 200 * MS, n=2)  # busy, 100 ms after the last run: runs anyway (230: 15 Hz cap)
+    ms = [(m.timestamp_ns - base) // MS for m in node.pub.msgs]
+    assert ms == [0, 50, 100, 200, 230]
+    assert [(g["stamp_ns"] - base) // MS for g in gestures(node)] == [0, 100, 200]
 
 
 def test_actor_id_comes_from_the_pear_frame_the_box_came_from(env):

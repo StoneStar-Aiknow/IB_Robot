@@ -107,7 +107,8 @@ PARAMS = {
     "gesture_min_side_px": 64.0,
     "gesture_max_rate_hz": 15.0,
     "gesture_one_hand_max_rate_hz": 5.0,
-    "gesture_slow_ms": 20.0,
+    "gesture_busy_rate_hz": 10.0,  # a newer hand frame waiting skips the gesture only down to this rate
+    "gesture_slow_ms": 50.0,
     "gesture_slow_window": 10,  # gesture_slow_limit of the last this many runs over gesture_slow_ms: off
     "gesture_slow_limit": 3,
     "gesture_fail_limit": 5,  # failed runs in a row: off
@@ -256,6 +257,7 @@ class HandPerceptionNode(Node):
             min_side_px=p["gesture_min_side_px"],
             max_rate_hz=p["gesture_max_rate_hz"],
             one_hand_max_rate_hz=p["gesture_one_hand_max_rate_hz"],
+            busy_rate_hz=p["gesture_busy_rate_hz"],
         )
         cfg = gesture_runner.RunnerConfig(
             conf=p["gesture_conf"],
@@ -423,7 +425,7 @@ class HandPerceptionNode(Node):
         g = self._gesture
         try:
             with self._slot_lock:
-                busy = self._slot is not None  # a newer frame waits: the hands go first
+                busy = self._slot is not None  # a newer frame waits: the hands go first, down to busy_rate_hz
             lms = [hands[s]["lm"] for s in SIDES if hands[s] is not None]
             g.post(stamp, self._box_actor, img, box, lms, busy)
             if g.off:
