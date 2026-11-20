@@ -96,6 +96,7 @@ from manipulation_execution.template_motion.registry import MIN_JERK_PEAK, Segme
 
 C_STRETCH = 1.25  # C is made this much longer until its peaks are within c_peak_speed / c_peak_accel
 C_STRETCH_STEPS = 12
+MIRROR_SPEED_SPAN_S = 0.1  # m' for a resume is taken over this much of the mirror command
 PERSON_SOURCE = "yolox"  # a PEAR frame of a detected person; center_fallback never enters a template
 DEFAULT_HAND_TRAVEL_S = 1.0  # T_A's hand share when the hand output is not known yet
 COMPLETE = ("label_inactive", "hold_max", "release")  # the playback ran and the port said DONE
@@ -390,15 +391,22 @@ def _farthest(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _resume_peaks(
-    start: Sequence[float], m: Sequence[float], P: Sequence[float], tau_f: float, T_A: float, ramp: float
+    start: Sequence[float],
+    m: Sequence[float],
+    P: Sequence[float],
+    tau_f: float,
+    T_A: float,
+    ramp: float,
+    m_speed: Sequence[float] | None = None,
 ) -> tuple[float, float]:
     """(max |d/dt|, max |d2/dt2|), any joint, of A's output from a pause through a resume of ``ramp``.
 
-    M eases from ``start`` to a still ``m``, A's clock from ``tau_f`` as in :class:`_Clock`; sampled from
-    the still pose before to a little after the ramp.
+    M eases from ``start`` to ``m``, which moves on at ``m_speed`` (None: stands still), A's clock from
+    ``tau_f`` as in :class:`_Clock`; sampled from the still pose before to a little after the ramp.
     """
     samples = 64
     dt = ramp / samples
+    m_speed = m_speed or (0.0,) * len(m)
 
     def out(t: float) -> tuple[float, ...]:
         if t <= 0.0:
@@ -408,7 +416,8 @@ def _resume_peaks(
         else:
             s = t / ramp
             tau, r = tau_f + ramp * s**4 * (2.5 + s * (-3.0 + s)), _min_jerk(s)[0]
-        return _lerp(_lerp(start, m, r), P, _min_jerk(tau / T_A)[0])
+        moved = tuple(a + v * t for a, v in zip(m, m_speed, strict=False))
+        return _lerp(_lerp(start, moved, r), P, _min_jerk(tau / T_A)[0])
 
     x = [out(k * dt) for k in range(-2, samples + 8)]
     speed = max(_farthest(b, a) for a, b in zip(x, x[1:], strict=False)) / dt
@@ -487,6 +496,7 @@ class Blender:
         self._port_suspect = False
         self._pear_source: str | None = None  # of the newest PEAR frame this round
         self._older_than: dict[object, tuple[bool, float | None]] = {}  # _older's verdicts, with their tick
+        self._mirror_seen: list[tuple[float, tuple[float, ...]]] = []  # (now, m) over MIRROR_SPEED_SPAN_S
         self._last_step = None  # the round's first tick is punctual
         self._clear()
         self._refresh_snapshot()
@@ -654,6 +664,10 @@ class Blender:
         self._tick_late = late_s > 0.0 and self._last_step is not None and now - self._last_step > late_s
         self._prev_step, self._last_step = self._last_step, now
         m = _arm(mirror)
+        if m is not None:
+            self._mirror_seen.append((now, m))
+            while len(self._mirror_seen) > 2 and now - self._mirror_seen[1][0] >= MIRROR_SPEED_SPAN_S:
+                self._mirror_seen.pop(0)
         frames = getattr(getattr(inputs, "window", None), "frames", ())
         if frames:  # the window holds only the frames since the previous tick
             self._pear_source = getattr(frames[-1], "source", None)
@@ -1241,21 +1255,36 @@ class Blender:
 
     def _ramp_duration(self, now: float, m: tuple[float, ...]) -> float:
         """T_r: M eases from M_f to m and alpha's clock from 0 to 1; stretched until no joint is faster than
-        c_peak_speed nor accelerates harder than a_resume_accel (or than A does) while m stands still."""
+        c_peak_speed nor accelerates harder than a_resume_accel (or than A does), m moving on as it did.
+
+        Easing back to a moving m adds 2 r' m' (x2-wt-18 REPORT 3.1): the ramp is stretched for it. What
+        the mirror's motion adds to A itself, the mirror's speed and up to 2 alpha' m', is allowed on top.
+        """
         config, P, T_A = self._config, self._segment.P, self._t_a
         start, tau_f = self._ref.value(now, m), self._clock.at(now)
         gap = _farthest(start, m)
         floor = config.a_resume_ramp_s if self._pause_long else config.a_short_ramp_s
         ramp = max(floor, MIN_JERK_PEAK * gap / config.a_peak_speed)
         dist = _farthest(P, m)
-        speed_limit = max(config.c_peak_speed, MIN_JERK_PEAK * dist / T_A) * 1.02
+        m_speed = self._mirror_speed()
+        moving = max(map(abs, m_speed or ()), default=0.0)
+        speed_limit = max(config.c_peak_speed, MIN_JERK_PEAK * dist / T_A) * 1.02 + moving
         accel_limit = max(config.a_resume_accel, MIN_JERK_ACCEL * dist / T_A**2) * 1.02
+        accel_limit += 2.0 * MIN_JERK_PEAK / T_A * moving
         for _ in range(C_STRETCH_STEPS):
-            speed, accel = _resume_peaks(start, m, P, tau_f, T_A, ramp)
+            speed, accel = _resume_peaks(start, m, P, tau_f, T_A, ramp, m_speed)
             if speed <= speed_limit and accel <= accel_limit:
                 break
             ramp *= C_STRETCH
         return ramp
+
+    def _mirror_speed(self) -> tuple[float, ...] | None:
+        """m', each joint, over the last MIRROR_SPEED_SPAN_S of mirror commands (None: not known)."""
+        seen = self._mirror_seen
+        if len(seen) < 2 or seen[-1][0] - seen[0][0] < MIRROR_SPEED_SPAN_S / 2.0:
+            return None
+        (t0, a), (t1, b) = seen[0], seen[-1]
+        return tuple((y - x) / (t1 - t0) for x, y in zip(a, b, strict=False))
 
     def _label_check(self, now: float, inputs) -> str | None:
         """Why the person no longer asks for this template, or None.

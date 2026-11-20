@@ -251,6 +251,32 @@ def test_a_resume_is_smooth_whatever_the_person_did_in_the_pause(gap):
     assert max_jerkless(after) <= accel_limit() * TICK * TICK * 1.1
 
 
+@pytest.mark.parametrize("speed", [0.3, 0.6, 1.0])
+@pytest.mark.parametrize("hold", [0.1, 0.35])
+def test_a_resume_while_the_mirror_moves_stays_within_the_acceleration_limit(speed, hold):
+    # x2-wt-18 REPORT 3.1: M eases back to a moving m; r(t) m(t) adds 2 r' m', a short ramp made it 2.5x.
+    rig = PauseRig()
+    rig.into_a(0.4)
+    rig.hold(0.0, hold)
+    t0 = rig.now
+
+    def moving():
+        rig.mirror = tuple(v + (speed * (rig.now + TICK - t0) if j in (1, 8) else 0.0) for j, v in enumerate(MIRROR))
+
+    for _ in range(round(2.0 / TICK)):
+        moving()
+        rig.step()
+        if rig.blender.phase is not Phase.A:
+            break
+    (first, last), = rig.spans()
+    resume = lines(rig, "template resume")[0]
+    # A itself, with this mirror: up to 2 alpha' m' (alpha' at most MIN_JERK_PEAK / T_A); the mirror's own is 0.
+    own = 2.0 * MIN_JERK_PEAK / 1.1 * speed
+    after = rig.out[last:last + round(0.5 / TICK)]
+    assert max_jerkless(after) <= (accel_limit() * 1.1 + own) * TICK * TICK, resume
+    assert max_step(after) <= (speed_limit(0.6) + speed) * TICK * 1.05, resume
+
+
 def test_releasing_keeps_the_pause_and_a_long_hold_needs_two_clean_statuses():
     rig = PauseRig()
     rig.into_a(0.3)
