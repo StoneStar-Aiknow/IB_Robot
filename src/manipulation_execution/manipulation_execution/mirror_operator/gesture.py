@@ -24,11 +24,13 @@
   exactly as strict as without the bridge: the frames it is timed from are
   never more than ``frame_gap_reset_s`` apart. Without this, a hand lifted
   and put back unseen inside the gap would turn two covers into one short
-  one. The unseen-lift risk stays for the long cover: a clear moment shorter
-  than ``cover_frame_gap_s`` hidden between two covered frames counts as
-  covered, so in the worst case a long cover fires after
-  ``long_cover_s - cover_frame_gap_s`` of continuous cover at the end, and
-  only if the frame at ``long_cover_s`` is still covered. A double cover
+  one. The unseen-lift risk stays for the long cover: the unknown time
+  between two covered frames up to ``cover_frame_gap_s`` apart counts as
+  covered, and such gaps can follow one another, so a hand lifted inside any
+  of them goes unseen. Nothing here guarantees how long the real cover was
+  continuous; the code only needs the frame at ``long_cover_s`` to be
+  covered. This can only make a stop more likely; it never starts the
+  mirror or makes a double cover. A double cover
   (both covers within ``total_max_s`` < ``long_cover_s``) followed by a clear
   frame never becomes a long cover; one followed by a hold was already a long
   cover in the making.
