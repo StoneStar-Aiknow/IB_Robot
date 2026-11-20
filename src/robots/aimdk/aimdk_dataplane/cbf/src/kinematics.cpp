@@ -216,6 +216,7 @@ PrimitiveDistanceReport evaluate_proxy_distances(
     const KinematicsOutput& kinematics) {
   PrimitiveDistanceReport report;
   report.minimum_distance = 1e9;
+  report.cross_minimum_distance = 1e9;
   for (std::size_t index = 0; index < kPrimitivePairs.size(); ++index) {
     if (!proxy_pair_enabled(kinematics, index)) {
       report.distances[index].signed_distance = 1e9;
@@ -229,6 +230,11 @@ PrimitiveDistanceReport evaluate_proxy_distances(
     if (report.distances[index].signed_distance < report.minimum_distance) {
       report.minimum_distance = report.distances[index].signed_distance;
       report.minimum_pair_index = index;
+    }
+    if (cross_arm_pair(index) &&
+        report.distances[index].signed_distance < report.cross_minimum_distance) {
+      report.cross_minimum_distance = report.distances[index].signed_distance;
+      report.cross_minimum_pair_index = index;
     }
   }
   return report;

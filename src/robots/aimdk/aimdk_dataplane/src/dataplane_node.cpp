@@ -122,6 +122,14 @@ private:
   TickTiming::Clock::time_point begun_;
 };
 
+// "first/second", by the CBF model's primitive names.
+std::string pair_name(size_t pair_index)
+{
+  if (pair_index >= x2::cbf::kPrimitivePairs.size()) {return "";}
+  const auto pair = x2::cbf::kPrimitivePairs[pair_index];
+  return std::string(x2::cbf::primitive_name(pair.first)) + "/" + x2::cbf::primitive_name(pair.second);
+}
+
 }  // namespace
 
 class Dataplane : public rclcpp::Node
@@ -1104,6 +1112,12 @@ private:
         {"elapsed_us", d.elapsed_us}, {"max_elapsed_us", d.max_elapsed_us},
         {"minimum_distance_m", d.distance_valid ? nlohmann::json(d.minimum_distance_m) : nlohmann::json(nullptr)}
       };
+      // The measured state of this frame (observation only); null on frames that did not evaluate it.
+      status["cbf"]["input_distance"] = d.input_distance_valid ? nlohmann::json{
+        {"min_distance_m", d.input_min_distance_m}, {"min_margin_m", d.input_min_margin_m},
+        {"min_margin_pair", pair_name(d.input_min_margin_pair)},
+        {"cross_min_distance_m", d.input_cross_min_distance_m},
+        {"cross_min_pair", pair_name(d.input_cross_min_pair)}} : nlohmann::json(nullptr);
       status["cbf"]["invalid_input_frames"] = d.invalid_input_frames;
       status["cbf"]["thumb_feedback_frames"] = d.thumb_feedback_frames;
       status["cbf"]["thumb_feedback_issue"] = d.thumb_feedback_issue;

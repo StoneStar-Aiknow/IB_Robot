@@ -14,6 +14,7 @@
 
 #include "aimdk_dataplane/cbf_safety.hpp"
 #include "aimdk_dataplane/tick_timing.hpp"
+#include "cbf/proxy_model.hpp"
 #include "nlohmann/json.hpp"
 
 namespace
@@ -203,6 +204,52 @@ TEST(TickTiming, EachFrameIsCountedByOutcomeAndHoldsByReason)
   EXPECT_EQ(report.at("paths").at("discarded"), 1);
   // The discarded tick still solved: its segments count.
   EXPECT_EQ(histogram(report, "filter").at("n"), 7);
+}
+
+TEST(TickTiming, EachFrameIsCountedByOutcomeAgainstTheMeasuredDistances)
+{
+  constexpr size_t kBody = 0;  // left shoulder / head
+  constexpr size_t kCross = x2::cbf::kPrimitivePairCount - 1;  // the two thumbs
+  static_assert(!x2::cbf::cross_arm_pair(kBody) && x2::cbf::cross_arm_pair(kCross));
+  TickTiming timing(0.02);
+  const auto reading = [](double min_m, double cross_m, size_t margin_pair) {
+      CbfDiagnostics diagnostics;
+      diagnostics.input_distance_valid = true;
+      diagnostics.input_min_distance_m = min_m;
+      diagnostics.input_cross_min_distance_m = cross_m;
+      diagnostics.input_min_margin_pair = margin_pair;
+      diagnostics.input_cross_min_pair = kCross;
+      return diagnostics;
+    };
+  auto d = reading(0.15, 0.35, kBody);
+  timing.tick(cbf(0.0, true, false, false), &d);
+  d = reading(0.04, 0.04, kCross);
+  timing.tick(cbf(20.0, false, false, true), &d);
+  d = reading(-0.01, 0.08, kCross);
+  timing.tick(cbf(40.0, false, false, true), &d);
+  d = reading(0.05, 0.3, kBody);  // on an edge: the upper bucket
+  timing.tick(cbf(60.0, true, true, false), &d);
+  CbfDiagnostics none;
+  timing.tick(cbf(80.0, false, false, false), &none);
+  // Not a CBF frame: not counted.
+  timing.tick(plain(100.0), &d);
+
+  auto report = timing.report(0.0);
+  const auto & by = report.at("outcome_distances");
+  EXPECT_EQ(by.at("edges_m"), (nlohmann::json{0.0, 0.05, 0.1, 0.2, 0.3}));
+  EXPECT_EQ(by.at("verified"), (nlohmann::json{
+      {"min", {0, 0, 0, 1, 0, 0}}, {"cross_min", {0, 0, 0, 0, 0, 1}},
+      {"least_margin_cross", 0}, {"no_reading", 0}}));
+  EXPECT_EQ(by.at("held"), (nlohmann::json{
+      {"min", {1, 1, 0, 0, 0, 0}}, {"cross_min", {0, 1, 1, 0, 0, 0}},
+      {"least_margin_cross", 2}, {"no_reading", 1}}));
+  EXPECT_EQ(by.at("released"), (nlohmann::json{
+      {"min", {0, 0, 1, 0, 0, 0}}, {"cross_min", {0, 0, 0, 0, 0, 1}},
+      {"least_margin_cross", 0}, {"no_reading", 0}}));
+  EXPECT_EQ(report.at("outcomes").at("held"), 3);
+  // With the histograms, once a second; cumulative, so nothing is lost in between.
+  EXPECT_FALSE(timing.report(0.5).contains("outcome_distances"));
+  EXPECT_EQ(timing.report(1.0).at("outcome_distances"), by);
 }
 
 TEST(TickTiming, ShadowFramesAreNotHolds)

@@ -14,6 +14,8 @@
 #include <ctime>
 #include <utility>
 
+#include "cbf/proxy_model.hpp"
+
 namespace aimdk_dataplane
 {
 namespace
@@ -88,6 +90,24 @@ void TimingHistogram::add(double ms)
   sum_ms += ms;
   max_ms = std::max(max_ms, ms);
   window_max_ms = std::max(window_max_ms, ms);
+}
+
+void DistanceCounts::add(const CbfDiagnostics & diagnostics)
+{
+  if (!diagnostics.input_distance_valid) {
+    ++no_reading;
+    return;
+  }
+  const auto bucket = [](double m) {
+      return static_cast<size_t>(std::upper_bound(kEdgesM.begin(), kEdgesM.end(), m) - kEdgesM.begin());
+    };
+  ++min[bucket(diagnostics.input_min_distance_m)];
+  ++cross_min[bucket(diagnostics.input_cross_min_distance_m)];
+  if (diagnostics.input_min_margin_pair < x2::cbf::kPrimitivePairCount &&
+    x2::cbf::cross_arm_pair(diagnostics.input_min_margin_pair))
+  {
+    ++least_margin_cross;
+  }
 }
 
 void TickTrace::decided(const CbfDecision & decision, bool enforce_mode)
@@ -239,19 +259,22 @@ void TickTiming::tick(const TickTrace & trace, const CbfDiagnostics * diagnostic
   if (tick_tid_ == 0) {tick_tid_ = static_cast<int>(::syscall(SYS_gettid));}
   if (trace.path == TickPath::kCbf && diagnostics) {
     const auto reason = strip(diagnostics->reason, "unverified_mapping/");
+    const char * outcome = nullptr;
     if (!trace.enforce) {
-      ++outcomes_["shadow"];
+      outcome = "shadow";
     } else if (trace.released) {
-      ++outcomes_["released"];
+      outcome = "released";
       if (diagnostics->stuck_collision) {++outcomes_["released_collision"];}
       count(released_reasons_, strip(strip(diagnostics->reason, "released/"), "unverified_mapping/"));
     } else if (trace.accept_new) {
-      ++outcomes_["verified"];
+      outcome = "verified";
     } else {
-      ++outcomes_[trace.upper_body ? "held" : "withheld"];
+      outcome = trace.upper_body ? "held" : "withheld";
       if (trace.upper_body && trace.collision_refusal) {++outcomes_["held_collision"];}
       count(held_reasons_, reason);
     }
+    ++outcomes_[outcome];
+    outcome_distances_[outcome].add(*diagnostics);
   }
   add_locked(TimingSegment::kBookkeeping, since(begun, Clock::now()));
   clock_reads_.fetch_add(1, std::memory_order_relaxed);
@@ -295,6 +318,13 @@ json TickTiming::report(double now_s)
         {"n", h.n}, {"sum_ms", h.sum_ms}, {"max_ms", h.max_ms}, {"counts", h.counts}};
     }
     out["histograms"] = std::move(histograms);
+    json distances = {{"edges_m", DistanceCounts::kEdgesM}};
+    for (const auto & [outcome, counts] : outcome_distances_) {
+      distances[outcome] = {
+        {"min", counts.min}, {"cross_min", counts.cross_min},
+        {"least_margin_cross", counts.least_margin_cross}, {"no_reading", counts.no_reading}};
+    }
+    out["outcome_distances"] = std::move(distances);
     histograms_reported_s_ = now_s;
   }
   return out;

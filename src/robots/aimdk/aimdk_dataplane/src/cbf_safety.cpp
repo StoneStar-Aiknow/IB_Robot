@@ -345,6 +345,7 @@ void CbfSafety::inactive(uint64_t epoch)
   diagnostics_.releasing = false;
   diagnostics_.stuck_s = 0.0;
   diagnostics_.thumb_feedback_issue.clear();
+  diagnostics_.input_distance_valid = false;
   diagnostics_.reason = "inactive";
 }
 
@@ -372,6 +373,7 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   ++diagnostics_.calls;
   diagnostics_.active = true;
   diagnostics_.distance_valid = false;
+  diagnostics_.input_distance_valid = false;
   diagnostics_.thumb_angles_valid = false;
   diagnostics_.available_budget_us = std::max(0.0, remaining());
   diagnostics_.hand_check_us = 0.0;
@@ -570,6 +572,20 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       if (thumb_only) {diagnostics_.hand_check_us += cost;}
       else if (verify_only) {diagnostics_.verification_us += cost;}
       else {diagnostics_.projection_us += cost;}
+      if (!diagnostics_.input_distance_valid &&
+        result.status != x2::cbf::FilterStatus::InvalidInputFallback &&
+        result.input_cross_min_pair < x2::cbf::kPrimitivePairCount &&
+        result.input_min_pair < x2::cbf::kPrimitivePairCount &&
+        std::isfinite(result.input_min_distance_m) && std::isfinite(result.input_min_safety_margin_m) &&
+        std::isfinite(result.input_cross_min_distance_m))
+      {
+        diagnostics_.input_distance_valid = true;
+        diagnostics_.input_min_distance_m = result.input_min_distance_m;
+        diagnostics_.input_min_margin_m = result.input_min_safety_margin_m;
+        diagnostics_.input_min_margin_pair = result.input_min_pair;
+        diagnostics_.input_cross_min_distance_m = result.input_cross_min_distance_m;
+        diagnostics_.input_cross_min_pair = result.input_cross_min_pair;
+      }
       if (result.status == x2::cbf::FilterStatus::InvalidInputFallback && !invalid_input_this_frame) {
         invalid_input_this_frame = true;
         ++diagnostics_.invalid_input_frames;
@@ -942,6 +958,7 @@ void CbfSafety::played(const Output & output, uint64_t epoch, double now)
   diagnostics_.hand_held = false;
   diagnostics_.recovery_verified = false;
   diagnostics_.distance_valid = false;
+  diagnostics_.input_distance_valid = false;
   diagnostics_.reason = "played";
 }
 
@@ -961,5 +978,6 @@ void CbfSafety::discarded()
   diagnostics_.recovery_verified = false;
   diagnostics_.hand_held = false;
   diagnostics_.distance_valid = false;
+  diagnostics_.input_distance_valid = false;
 }
 }  // namespace aimdk_dataplane

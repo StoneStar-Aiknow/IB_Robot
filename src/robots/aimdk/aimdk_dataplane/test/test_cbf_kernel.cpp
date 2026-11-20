@@ -1087,3 +1087,106 @@ TEST(CbfKernel, AbsentRightThumbModelPoseDoesNotChangeProjectedOrVerifiedOutput)
     EXPECT_FALSE(verified.deadline_missed);
   }
 }
+
+TEST(CbfKernel, TheCrossArmPairsAreTheSixteenBetweenTheTwoArms)
+{
+  std::size_t cross = 0;
+  for (std::size_t index = 0; index < x2::cbf::kPrimitivePairCount; ++index) {
+    const auto pair = x2::cbf::kPrimitivePairs[index];
+    const bool expected =
+      (x2::cbf::left_arm_primitive(pair.first) && x2::cbf::right_arm_primitive(pair.second)) ||
+      (x2::cbf::right_arm_primitive(pair.first) && x2::cbf::left_arm_primitive(pair.second));
+    EXPECT_EQ(x2::cbf::cross_arm_pair(index), expected) << index;
+    cross += expected;
+  }
+  EXPECT_EQ(cross, 16u);
+  EXPECT_TRUE(x2::cbf::cross_arm_pair(
+    find_pair(x2::cbf::PrimitiveId::LeftForearm, x2::cbf::PrimitiveId::RightForearm)));
+  EXPECT_FALSE(x2::cbf::cross_arm_pair(
+    find_pair(x2::cbf::PrimitiveId::RightForearm, x2::cbf::PrimitiveId::Torso)));
+}
+
+TEST(CbfKernel, TheCrossArmMinimumIsTheLeastEnabledPairBetweenTheArms)
+{
+  using x2::cbf::PrimitiveId;
+  for (const auto hands : {std::array<bool, 2>{true, true}, std::array<bool, 2>{true, false}}) {
+    SCOPED_TRACE(hands[1]);
+    auto input = proxy_input();
+    input.hands_installed = hands;
+    auto kinematics = x2::cbf::forward_kinematics(input);
+    // An overlap that is not between the arms, so the overall minimum is not the cross one.
+    kinematics.primitives[static_cast<std::size_t>(PrimitiveId::LeftForearm)].pose.translation =
+      kinematics.primitives[static_cast<std::size_t>(PrimitiveId::Head)].pose.translation;
+    // An empty flange's palm on the other forearm counts for nothing.
+    kinematics.primitives[static_cast<std::size_t>(PrimitiveId::RightPalm)].pose.translation =
+      kinematics.primitives[static_cast<std::size_t>(PrimitiveId::LeftShoulder)].pose.translation;
+    const auto report = x2::cbf::evaluate_proxy_distances(kinematics);
+    double expected = 1e9;
+    std::size_t expected_pair = x2::cbf::kPrimitivePairCount;
+    for (std::size_t index = 0; index < x2::cbf::kPrimitivePairCount; ++index) {
+      if (!x2::cbf::cross_arm_pair(index) || !x2::cbf::proxy_pair_enabled(kinematics, index)) {continue;}
+      if (report.distances[index].signed_distance < expected) {
+        expected = report.distances[index].signed_distance;
+        expected_pair = index;
+      }
+    }
+    ASSERT_LT(expected_pair, x2::cbf::kPrimitivePairCount);
+    EXPECT_DOUBLE_EQ(report.cross_minimum_distance, expected);
+    EXPECT_EQ(report.cross_minimum_pair_index, expected_pair);
+    EXPECT_FALSE(x2::cbf::cross_arm_pair(report.minimum_pair_index));
+    EXPECT_LT(report.minimum_distance, 0.0);
+    if (hands[1]) {
+      EXPECT_EQ(expected_pair, find_pair(PrimitiveId::LeftShoulder, PrimitiveId::RightPalm));
+      EXPECT_LT(report.cross_minimum_distance, 0.0);
+    } else {
+      EXPECT_GT(report.cross_minimum_distance, 0.0);
+    }
+  }
+}
+
+TEST(CbfKernel, EveryEntryReportsTheCrossArmMinimumOfTheMeasuredState)
+{
+  const auto measured = [](const SafetyFilterInput & input) {
+      x2::cbf::KinematicsInput pose;
+      pose.q_arm = input.q_current;
+      pose.q_thumb_urdf = x2::cbf::rigid_thumb_pose(
+        input.thumb_current_valid ? input.q_thumb_current_urdf : input.q_thumb_urdf);
+      pose.thumb_pose_valid = true;
+      pose.hands_installed = input.hands_installed;
+      return x2::cbf::evaluate_proxy_distances(pose);
+    };
+  auto still = baseline_input();
+  auto reaching = moving_input();
+  reaching.q_current[0] -= 0.05;
+  reaching.q_current[7] += 0.05;
+  const auto config = test_config();
+  for (const auto & input : {still, reaching, airwall_incident_input()}) {
+    const auto expected = measured(input);
+    ASSERT_LT(expected.cross_minimum_pair_index, x2::cbf::kPrimitivePairCount);
+    const std::array<x2::cbf::SafetyFilterResult, 3> results{
+      x2::cbf::filter_arm_target(input, config), x2::cbf::verify_arm_target(input, config),
+      x2::cbf::verify_thumb_target_with_arm_held(input, config)};
+    for (std::size_t entry = 0; entry < results.size(); ++entry) {
+      SCOPED_TRACE(entry);
+      const auto & result = results[entry];
+      ASSERT_NE(result.status, FilterStatus::InvalidInputFallback);
+      // The same state as input_min_distance_m.
+      EXPECT_DOUBLE_EQ(result.input_min_distance_m, expected.minimum_distance);
+      EXPECT_DOUBLE_EQ(result.input_cross_min_distance_m, expected.cross_minimum_distance);
+      EXPECT_EQ(result.input_cross_min_pair, expected.cross_minimum_pair_index);
+    }
+  }
+}
+
+TEST(CbfKernel, AVerificationThatEvaluatesNothingReportsNoCrossArmMinimum)
+{
+  auto input = baseline_input();
+  input.q_current[0] = std::numeric_limits<double>::quiet_NaN();
+  const auto config = test_config();
+  for (const auto & result : {x2::cbf::verify_arm_target(input, config),
+      x2::cbf::verify_thumb_target_with_arm_held(input, config)})
+  {
+    EXPECT_EQ(result.status, FilterStatus::InvalidInputFallback);
+    EXPECT_EQ(result.input_cross_min_pair, x2::cbf::kPrimitivePairCount);
+  }
+}

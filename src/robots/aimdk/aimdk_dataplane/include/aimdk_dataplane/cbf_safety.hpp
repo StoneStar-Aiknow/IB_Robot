@@ -189,6 +189,14 @@ struct CbfDiagnostics
   uint64_t hand_budget_holds = 0;
   double minimum_distance_m = 0.0;
   bool distance_valid = false;
+  // Observation only: the measured state as this frame's first kernel call that
+  // evaluated it saw it. Kept through a later hold or release of the same frame.
+  bool input_distance_valid = false;
+  double input_min_distance_m = 0.0;
+  double input_min_margin_m = 0.0;
+  size_t input_min_margin_pair = 0;  // The pair with the least margin.
+  double input_cross_min_distance_m = 0.0;
+  size_t input_cross_min_pair = 0;  // The closest pair between the two arms.
   bool active = false;
   bool recovery_verified = false;
   bool hand_held = false;

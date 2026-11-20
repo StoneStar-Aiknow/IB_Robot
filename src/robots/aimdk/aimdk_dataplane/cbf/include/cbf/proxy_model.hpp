@@ -104,7 +104,26 @@ struct PrimitiveDistanceReport {
   std::array<DistanceResult, kPrimitivePairCount> distances{};
   double minimum_distance{0.0};
   std::size_t minimum_pair_index{0};
+  // Diagnostics only: the closest enabled pair between the two arms;
+  // kPrimitivePairCount when none was evaluated.
+  double cross_minimum_distance{0.0};
+  std::size_t cross_minimum_pair_index{kPrimitivePairCount};
 };
+
+constexpr bool left_arm_primitive(PrimitiveId id) {
+  return id >= PrimitiveId::LeftShoulder && id <= PrimitiveId::LeftThumb;
+}
+
+constexpr bool right_arm_primitive(PrimitiveId id) {
+  return id >= PrimitiveId::RightShoulder && id <= PrimitiveId::RightThumb;
+}
+
+// A pair between a left-arm and a right-arm primitive.
+constexpr bool cross_arm_pair(std::size_t pair_index) {
+  const PrimitivePair pair = kPrimitivePairs[pair_index];
+  return (left_arm_primitive(pair.first) && right_arm_primitive(pair.second)) ||
+         (right_arm_primitive(pair.first) && left_arm_primitive(pair.second));
+}
 
 const char* primitive_name(PrimitiveId id);
 DistanceResult distance_between(const ProxyPrimitive& first,

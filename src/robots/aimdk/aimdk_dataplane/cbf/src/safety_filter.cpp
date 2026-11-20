@@ -457,6 +457,8 @@ static SafetyFilterResult filter_arm_target_fixed_thumb(
       evaluate_distance_gradients(make_kinematics_input(current, input));
   result.input_min_distance_m = current_report.distances.minimum_distance;
   result.input_min_pair = current_report.distances.minimum_pair_index;
+  result.input_cross_min_distance_m = current_report.distances.cross_minimum_distance;
+  result.input_cross_min_pair = current_report.distances.cross_minimum_pair_index;
   result.input_min_safety_margin_m = minimum_safety_margin(
       current_report.kinematics, current_report.distances, config,
       result.input_min_pair);
@@ -806,6 +808,8 @@ SafetyFilterResult filter_arm_target(const SafetyFilterInput& raw_input,
       result.output_min_safety_margin_m = actual_current.minimum_safety_margin;
       result.input_min_pair = actual_current.minimum_pair;
       result.output_min_pair = actual_current.minimum_pair;
+      result.input_cross_min_distance_m = actual_current.distances.cross_minimum_distance;
+      result.input_cross_min_pair = actual_current.distances.cross_minimum_pair_index;
     }
     result.elapsed_us = elapsed_us(start);
     return result;
@@ -994,6 +998,8 @@ SafetyFilterResult filter_arm_target(const SafetyFilterInput& raw_input,
   result.input_min_distance_m = actual_current.distances.minimum_distance;
   result.input_min_safety_margin_m = actual_current.minimum_safety_margin;
   result.input_min_pair = actual_current.minimum_pair;
+  result.input_cross_min_distance_m = actual_current.distances.cross_minimum_distance;
+  result.input_cross_min_pair = actual_current.distances.cross_minimum_pair_index;
   result.elapsed_us = elapsed_us(start);
   return result;
 }
@@ -1050,6 +1056,8 @@ static SafetyFilterResult verify_target_impl(const SafetyFilterInput& raw_input,
   result.input_min_distance_m = current.distances.minimum_distance;
   result.input_min_safety_margin_m = current.minimum_safety_margin;
   result.input_min_pair = current.minimum_pair;
+  result.input_cross_min_distance_m = current.distances.cross_minimum_distance;
+  result.input_cross_min_pair = current.distances.cross_minimum_pair_index;
   const bool recovering = !strictly_safe(current);
   if (!valid_evaluation(current) || (recovering && !config.allow_airwall_recovery)) {
     return finish(FilterStatus::DegradedHold);

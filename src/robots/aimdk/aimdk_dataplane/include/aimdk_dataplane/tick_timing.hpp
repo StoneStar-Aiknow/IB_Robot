@@ -6,7 +6,8 @@
 // executor thread is added to bounded cumulative histograms, so a 20 Hz status
 // still accounts for every 50 Hz tick; the histograms themselves are reported
 // once a second, the counters and the maxima since the previous report in every
-// status. Timer invocations, CBF frames and published commands are counted
+// status. CBF ticks are also counted by outcome against the distances of the
+// measured state, reported with the histograms. Timer invocations, CBF frames and published commands are counted
 // apart: fewer CBF calls alone does not show the timer did not run. The
 // thread's own clocks split a slow tick into computing and waiting for a CPU.
 
@@ -122,6 +123,19 @@ struct TickTrace
   void decided(const CbfDecision & decision, bool enforce_mode);
 };
 
+// CBF ticks of one outcome, by the measured state's distances (CbfDiagnostics'
+// input_*): counts[i] holds kEdgesM[i - 1] <= m < kEdgesM[i], below 0 in counts[0].
+struct DistanceCounts
+{
+  static constexpr std::array<double, 5> kEdgesM{0.0, 0.05, 0.1, 0.2, 0.3};
+  std::array<uint64_t, kEdgesM.size() + 1> min{};  // the least distance of any pair
+  std::array<uint64_t, kEdgesM.size() + 1> cross_min{};  // the least between the two arms
+  uint64_t least_margin_cross = 0;  // the pair with the least margin was between the two arms
+  uint64_t no_reading = 0;  // the tick did not evaluate the measured state
+
+  void add(const CbfDiagnostics & diagnostics);
+};
+
 class TickTiming
 {
 public:
@@ -175,6 +189,7 @@ private:
   std::map<std::string, uint64_t> outcomes_;
   std::map<std::string, uint64_t> held_reasons_;
   std::map<std::string, uint64_t> released_reasons_;
+  std::map<std::string, DistanceCounts> outcome_distances_;
   std::optional<double> histograms_reported_s_;
 };
 

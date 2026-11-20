@@ -465,6 +465,20 @@ def test_the_status_accounts_for_every_command_tick(node):
         assert histograms["tick_runqueue"]["n"] == report["invocations"]
         assert histograms["filter_cpu"]["n"] == solved
         assert histograms["status"]["n"] > 0
+        # Every CBF frame once by the measured distances, under the same lock.
+        by = report["outcome_distances"]
+        assert set(by) - {"edges_m"} == set(report["outcomes"]) - {"held_collision", "released_collision"}
+        for outcome, counts in by.items():
+            if outcome != "edges_m":
+                assert sum(counts["min"]) + counts["no_reading"] == report["outcomes"][outcome]
+                assert sum(counts["cross_min"]) == sum(counts["min"])
+
+    # The measured state of a verified frame, by pair names.
+    readings = [s["cbf"]["input_distance"] for s in steady if s["cbf"]["input_distance"]]
+    assert readings
+    left, right = readings[-1]["cross_min_pair"].split("/")
+    assert {left.split("_")[0], right.split("_")[0]} == {"left", "right"}
+    assert readings[-1]["min_distance_m"] <= readings[-1]["cross_min_distance_m"]
 
     line = harness.wait_for(lambda: logged.matching("CBF status:"), "an INFO line")[-1]
     counters = fields(line)

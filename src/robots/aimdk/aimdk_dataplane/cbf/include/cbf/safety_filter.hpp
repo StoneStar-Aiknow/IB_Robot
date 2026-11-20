@@ -77,6 +77,10 @@ struct SafetyFilterResult {
   double elapsed_us{0.0};
   std::size_t input_min_pair{0};
   std::size_t output_min_pair{0};
+  // Diagnostics only, of the same state as input_min_distance_m: its closest
+  // pair between the two arms, kPrimitivePairCount where that state was not evaluated.
+  double input_cross_min_distance_m{0.0};
+  std::size_t input_cross_min_pair{kPrimitivePairCount};
   std::size_t active_pair_count{0};
   int projection_iterations{0};
   bool nonlinear_verified{false};

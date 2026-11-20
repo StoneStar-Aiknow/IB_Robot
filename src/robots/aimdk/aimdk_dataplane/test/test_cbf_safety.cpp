@@ -3323,3 +3323,58 @@ TEST(CbfSafety, UnderTheACapACollisionHoldReleasesSlowlyTowardsTheFrozenPoint)
   EXPECT_EQ(released.output.hand, lagging.requested.hand);
   EXPECT_EQ(released.output.head, later.requested.head);
 }
+
+TEST(CbfSafety, AFrameRecordsTheMeasuredDistancesUntilAFrameThatDoesNotEvaluateThem)
+{
+  CbfSafety safety(fixture_config());
+  auto snapshot = urdf_snapshot();
+  EXPECT_FALSE(safety.diagnostics().input_distance_valid);
+  const auto first = safety.filter(snapshot, 1.0);
+  ASSERT_TRUE(first.accept_new);
+  const auto & d = safety.diagnostics();
+  ASSERT_TRUE(d.input_distance_valid);
+  EXPECT_TRUE(std::isfinite(d.input_min_distance_m));
+  EXPECT_TRUE(std::isfinite(d.input_min_margin_m));
+  ASSERT_LT(d.input_min_margin_pair, x2::cbf::kPrimitivePairCount);
+  ASSERT_LT(d.input_cross_min_pair, x2::cbf::kPrimitivePairCount);
+  EXPECT_TRUE(x2::cbf::cross_arm_pair(d.input_cross_min_pair));
+  EXPECT_LE(d.input_min_distance_m, d.input_cross_min_distance_m);
+  EXPECT_LT(d.input_cross_min_distance_m, 1e9);
+  const auto recorded = d.input_cross_min_distance_m;
+
+  // A hold of the same frame keeps the reading: it is of the measured state, not of the verdict.
+  const auto late = safety.deadline_fallback(first);
+  EXPECT_FALSE(late.accept_new);
+  EXPECT_TRUE(safety.diagnostics().input_distance_valid);
+  EXPECT_DOUBLE_EQ(safety.diagnostics().input_cross_min_distance_m, recorded);
+  safety.committed(first, 1.0);
+
+  // No kernel call: no reading.
+  auto stale = snapshot;
+  stale.arm->age_s = safety.config().feedback_max_age_s + 0.001;
+  safety.filter(stale, 1.02);
+  EXPECT_FALSE(safety.diagnostics().input_distance_valid);
+
+  safety.filter(snapshot, 1.04);
+  EXPECT_TRUE(safety.diagnostics().input_distance_valid);
+  safety.played(first.output, 1, 1.06);
+  EXPECT_FALSE(safety.diagnostics().input_distance_valid);
+  safety.filter(snapshot, 1.08);
+  ASSERT_TRUE(safety.diagnostics().input_distance_valid);
+  safety.discarded();
+  EXPECT_FALSE(safety.diagnostics().input_distance_valid);
+  safety.filter(snapshot, 1.10);
+  ASSERT_TRUE(safety.diagnostics().input_distance_valid);
+  safety.inactive(1);
+  EXPECT_FALSE(safety.diagnostics().input_distance_valid);
+}
+
+TEST(CbfSafety, AnInvalidInputFrameRecordsNoMeasuredDistances)
+{
+  CbfSafety safety(fixture_config());
+  auto snapshot = urdf_snapshot();
+  snapshot.arm->position[5] = x2::cbf::generated::kArmLimits[5][1] + 0.0001;
+  safety.filter(snapshot, 1.0);
+  ASSERT_EQ(safety.diagnostics().invalid_input_frames, 1u);
+  EXPECT_FALSE(safety.diagnostics().input_distance_valid);
+}
