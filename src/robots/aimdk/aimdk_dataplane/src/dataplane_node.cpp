@@ -874,6 +874,10 @@ private:
     // included), not from the moment its own callback happened to run.
     status["at"] = now_s;
     status["control_seq"] = core_.control_seq();
+    // Observation only. Unlike control_seq, which the runtime's heartbeat moves,
+    // this moves only when the mode, owner, admission, clear or safe state does,
+    // or the data plane clears: equal before and after means nothing was revoked.
+    status["safety_epoch"] = core_.safety_epoch();
     status["groups"] = core_.group_ages(now_s);
     status["hand_types"] = core_.hand_types();
     const auto hand = core_.measured_hand(now_s);

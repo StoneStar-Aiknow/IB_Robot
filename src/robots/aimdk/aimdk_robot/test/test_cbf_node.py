@@ -5,7 +5,8 @@ the node around it: the status fields the runtime reads, the INFO line, the
 CBF_RELEASE log when the right hand is swapped for one the geometry was not
 built for mid-mirror and comes back, and an empty right flange checked as a
 phantom hand instead of released, its thumb at the compact pose and its start
-and end logged once even when its type flickers.
+and end logged once even when its type flickers; and the safety epoch the
+template layer checks, which the control heartbeat does not move.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from pathlib import Path
 import pytest
 import rclpy
 from ament_index_python.packages import get_package_prefix
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 
 from aimdk_robot import dataplane
 
@@ -282,6 +283,56 @@ def test_an_empty_right_flange_is_a_phantom_hand_not_a_release(node):
     assert len(logged.matching("CBF_HAND_ABSENT side=right start")) == 1
     assert len(logged.matching("CBF_HAND_ABSENT side=right end")) == 1
     assert not logged.matching("CBF_HAND_ABSENT side=left")
+
+
+def test_the_status_carries_a_safety_epoch_the_heartbeat_does_not_move(node):
+    """safety_epoch, top level: steady through mirroring while control_seq climbs, new on revocation."""
+    harness, _logged = node
+    harness.wait_active()
+    seen: list[dict] = []
+    lock = threading.Lock()
+
+    def on_status(message):
+        data = json.loads(message.data)
+        with lock:
+            seen.append(data)
+
+    harness.node.create_subscription(String, dataplane.STATUS_TOPIC, on_status, 20)
+
+    def since(start):
+        with lock:
+            return list(seen[start:])
+
+    harness.wait_for(lambda: since(0), "a status")
+    assert all(isinstance(status["safety_epoch"], int) and status["safety_epoch"] >= 1 for status in since(0))
+
+    assert harness.set_mode("policy_stream").success
+    stop = threading.Event()
+    thread = stream(harness, stop)
+    try:
+        harness.wait_for(
+            lambda: [s for s in since(0) if (s.get("cbf") or {}).get("mirror_active")], "mirroring in the status"
+        )
+        with lock:
+            start = len(seen)
+        time.sleep(1.5)  # 15 heartbeats of the runtime's control
+        steady = [s for s in since(start) if (s.get("cbf") or {}).get("mirror_active")]
+        assert len(steady) >= 20
+        assert steady[-1]["control_seq"] - steady[0]["control_seq"] >= 5
+        assert {s["safety_epoch"] for s in steady} == {steady[0]["safety_epoch"]}
+        mirroring_epoch = steady[0]["safety_epoch"]
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+    # Leaving the mode revokes the stream: the epoch moves and does not come back.
+    with lock:
+        start = len(seen)
+    assert harness.set_mode("stream").success
+    after = harness.wait_for(
+        lambda: [s for s in since(start) if s["safety_epoch"] != mirroring_epoch], "a new safety epoch"
+    )
+    assert after[0]["safety_epoch"] > mirroring_epoch
 
 
 @pytest.mark.parametrize("node", [{"hands_installed": [True, False]}], indirect=True)
