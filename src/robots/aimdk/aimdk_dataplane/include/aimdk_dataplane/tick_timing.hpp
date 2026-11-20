@@ -38,7 +38,7 @@ enum class TimingSegment : size_t
   kFilter,  // CBF ticks: the filter, outside the lock
   kRelock,  // CBF ticks: the wait to take the lock back
   kPublish,  // the time inside publish(), on ticks that published
-  kWarn,  // the CBF_RELEASE log line, on ticks that logged one
+  kWarn,  // queueing the CBF_RELEASE log line, on ticks that logged one; printed in kLogs
   kOther,  // CBF ticks: the rest (checks, release, commit, notes)
   // Of a command tick, from the thread's own clocks: on a CPU, and ready to run
   // but waiting for one. The rest of its time it slept (the lock).
@@ -56,6 +56,7 @@ enum class TimingSegment : size_t
   kTouch,
   kEcho,
   kStream,  // a public command channel message
+  kLogs,  // printing queued log lines, on the node's log thread
   kBookkeeping,  // adding one tick to these figures
   kCount
 };
@@ -64,7 +65,7 @@ constexpr std::array<const char *, static_cast<size_t>(TimingSegment::kCount)> k
   "late", "tick", "lock_wait", "snapshot", "filter", "relock", "publish", "warn", "other",
   "tick_cpu", "tick_runqueue", "between_runqueue", "filter_cpu", "filter_offcpu",
   "template_status", "status", "status_lock_wait", "timing_json", "joint_states", "control", "touch",
-  "echo", "stream", "bookkeeping"};
+  "echo", "stream", "logs", "bookkeeping"};
 
 struct TimingHistogram
 {

@@ -108,7 +108,7 @@ def enabled(directory: Path, **settings) -> str:
 @pytest.fixture
 def start(monkeypatch):
     """Run the bridge, the mock and a data plane given ``template_play_json`` (None: not set at all)."""
-    running: list[Harness] = []
+    running: list[tuple[Harness, Logged]] = []
 
     def run(template_play: str | None) -> tuple[Harness, Logged]:
         logged = Logged()
@@ -123,22 +123,21 @@ def start(monkeypatch):
             process = subprocess.Popen(
                 [str(executable), "--ros-args", "--params-file", file.name],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
+                stderr=logged.write_fd,
             )
-            logged.follow(process.stderr)
+            logged.follow()
             return process
 
         monkeypatch.setattr(dataplane, "start_process", start_process)
         harness = Harness(profile=OMNIHAND_PROFILE, hand_type="dexterous", initial_action="UPPERBODY_REMOTE_SPLIT")
-        running.append(harness)
+        running.append((harness, logged))
         # The arm stands where the stream will ask it to, the hands where the segment starts.
         harness.mock.set_positions(dict(zip(ARM_JOINTS, STAND, strict=True)))
         harness.mock.set_positions({f"L_{DEXTEROUS_HAND_PARTS[0]}_joint": HAND[0]})
         return harness, logged
 
     yield run
-    for harness in running:
+    for harness, logged in running:
         # A data plane signalled before it spins does not exit on SIGTERM (an existing issue, not the port's).
         harness.dataplane.terminate()
         try:
@@ -147,6 +146,7 @@ def start(monkeypatch):
             harness.dataplane.kill()
             harness.dataplane.wait(timeout=5.0)
         harness.shutdown()
+        logged.close()
         # Humble's MultiThreadedExecutor leaves its worker threads behind; under the
         # address-space limit a run of harnesses would run out of threads.
         harness.executor._executor.shutdown(wait=True)
