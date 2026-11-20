@@ -39,6 +39,7 @@ constexpr std::array<std::size_t, 4> kThumbSlots{0, 1, 10, 11};
 constexpr std::array<std::size_t, 4> kMovedJoints{0, 3, 7, 10};
 constexpr double kMove = 0.25;
 const std::string kSha(64, 'a');
+constexpr std::array<bool, 2> kBothReported{false, false};
 
 CbfSafetyConfig limits(const std::string & mode = "enforce")
 {
@@ -140,7 +141,7 @@ struct Rig
   bool admit(uint64_t id, const CbfDecision & decision = published())
   {
     start(id);
-    return player.evaluate_start(decision, 1, config.enforce, now);
+    return player.evaluate_start(decision, 1, config.enforce, now, kBothReported);
   }
   Output requested() const
   {
@@ -635,7 +636,7 @@ TEST(TemplatePlayer, StartsThatCannotBeJudgedAreRefusedWithTheirReason)
   ASSERT_TRUE(rig.player.start_pending());
   rig.release(5, false);
   EXPECT_FALSE(rig.player.start_pending());
-  EXPECT_FALSE(rig.player.evaluate_start(published(), 1, true, rig.now));
+  EXPECT_FALSE(rig.player.evaluate_start(published(), 1, true, rig.now, kBothReported));
   status = rig.last_status();
   EXPECT_EQ(status["reason"], "released");
   EXPECT_EQ(status["seg_id"], 5);
@@ -653,7 +654,7 @@ TEST(TemplatePlayer, AStartNotKeptAliveIsRefusedAsStaleAndNeverLocksThePort)
   Rig rig;
   rig.start(1);
   rig.now += TemplatePlayer::kKeepaliveTimeoutS + 0.01;
-  EXPECT_FALSE(rig.player.evaluate_start(published(), 1, true, rig.now));
+  EXPECT_FALSE(rig.player.evaluate_start(published(), 1, true, rig.now, kBothReported));
   auto status = rig.last_status();
   EXPECT_EQ(status["state"], "REJECTED");
   EXPECT_EQ(status["reason"], "stale_start");
@@ -669,7 +670,7 @@ TEST(TemplatePlayer, AStartNotKeptAliveIsRefusedAsStaleAndNeverLocksThePort)
   EXPECT_EQ(status["seg_id"], 2);
   EXPECT_EQ(status["reason"], "stale_start");
   for (const auto & text : messages) {EXPECT_NE(json::parse(text)["reason"], "busy");}
-  EXPECT_TRUE(rig.player.evaluate_start(published(), 1, true, rig.now));
+  EXPECT_TRUE(rig.player.evaluate_start(published(), 1, true, rig.now, kBothReported));
 
   // A start kept alive waits as long as its keepalives come.
   Rig kept;
@@ -678,7 +679,7 @@ TEST(TemplatePlayer, AStartNotKeptAliveIsRefusedAsStaleAndNeverLocksThePort)
     kept.now += 0.1;
     kept.keepalive(4);
   }
-  EXPECT_TRUE(kept.player.evaluate_start(published(), 1, true, kept.now));
+  EXPECT_TRUE(kept.player.evaluate_start(published(), 1, true, kept.now, kBothReported));
 }
 
 TEST(TemplatePlayer, ARefusalDoesNotHideADoneNotYetPublished)
@@ -755,7 +756,7 @@ TEST(TemplatePlayer, TheGateRefusesEachUnsuitablePublishedDecision)
     auto config = limits(test.enforce ? "enforce" : "shadow");
     Rig rig(whitelist_json(), config);
     rig.start(11);
-    EXPECT_FALSE(rig.player.evaluate_start(test.decision, 1, test.enforce, rig.now)) << test.reason;
+    EXPECT_FALSE(rig.player.evaluate_start(test.decision, 1, test.enforce, rig.now, kBothReported)) << test.reason;
     const auto status = rig.last_status();
     EXPECT_EQ(status["state"], "REJECTED") << test.reason;
     EXPECT_EQ(status["reason"], test.reason);
@@ -774,7 +775,7 @@ TEST(TemplatePlayer, ShadowAdmitsWhateverTheFilterDidAndEnforceNeedsAnUnmodified
     decision.modified = true;
     decision.epoch = 9;
     rig.start(1);
-    EXPECT_EQ(rig.player.evaluate_start(decision, 1, enforce, rig.now), !enforce);
+    EXPECT_EQ(rig.player.evaluate_start(decision, 1, enforce, rig.now, kBothReported), !enforce);
   }
   // Within tolerance on every value is admitted.
   Rig rig;
@@ -782,6 +783,48 @@ TEST(TemplatePlayer, ShadowAdmitsWhateverTheFilterDidAndEnforceNeedsAnUnmodified
   for (std::size_t j = 0; j < 14; ++j) {decision.output.arm[j] += j == 8 ? -0.029 : 0.029;}
   for (auto & v : decision.output.hand) {v -= 0.049;}
   EXPECT_TRUE(rig.admit(1, decision));
+}
+
+TEST(TemplatePlayer, APhantomHandsThumbIsNotHeldToHandPButStaysInItsBand)
+{
+  // [T,T] with the right flange empty: the CBF publishes the right thumb at
+  // phantom_thumb_native, off hand_P, whatever the session requested.
+  const auto config = limits();
+  auto phantom = published();
+  phantom.output.hand[10] = config.phantom_thumb_native[2];
+  phantom.output.hand[11] = config.phantom_thumb_native[3];
+  ASSERT_GT(std::abs(phantom.output.hand[10] - start_hand()[10]), 0.05);
+  const std::array<bool, 2> right_absent{false, true};
+  {
+    Rig rig;
+    rig.start(1);
+    ASSERT_TRUE(rig.player.evaluate_start(phantom, 1, true, rig.now, right_absent));
+    // It plays out and ends on the exact start point it was admitted at.
+    rig.run_while(TemplateState::kEnterB, 1);
+    rig.release(1, false);
+    rig.run_while(TemplateState::kHold, 1);
+    rig.run_while(TemplateState::kExitB, 1);
+    EXPECT_EQ(rig.player.state(), TemplateState::kDone);
+    EXPECT_EQ(rig.outputs.back().hand, phantom.output.hand);
+  }
+  // The same frame from a hand reported present, either side, is refused.
+  for (const auto & absent : {kBothReported, std::array<bool, 2>{true, false}}) {
+    Rig rig;
+    rig.start(2);
+    EXPECT_FALSE(rig.player.evaluate_start(phantom, 1, true, rig.now, absent));
+    EXPECT_EQ(rig.last_status()["reason"], "hand_off_start");
+  }
+  // On the phantom side the other eight slots still count, and so does the band.
+  auto finger = phantom;
+  finger.output.hand[15] += 0.05 + 1e-6;
+  auto out_of_band = phantom;
+  out_of_band.output.hand[10] = aimdk_dataplane::cbf_thumb_command_band(config, 2)[1] + 1e-3;
+  for (const auto & decision : {finger, out_of_band}) {
+    Rig rig;
+    rig.start(3);
+    EXPECT_FALSE(rig.player.evaluate_start(decision, 1, true, rig.now, right_absent));
+    EXPECT_EQ(rig.last_status()["reason"], "hand_off_start");
+  }
 }
 
 TEST(TemplatePlayer, BusyRefusesTheNewStartAndLeavesThePlayingOneAlone)
@@ -819,7 +862,7 @@ TEST(TemplatePlayer, BusyRefusesTheNewStartAndLeavesThePlayingOneAlone)
   ASSERT_FALSE(refused.empty());
   EXPECT_EQ(json::parse(refused.front())["reason"], "busy");
   EXPECT_EQ(json::parse(refused.back())["state"], "IDLE");
-  EXPECT_TRUE(pending.player.evaluate_start(published(), 1, true, pending.now));
+  EXPECT_TRUE(pending.player.evaluate_start(published(), 1, true, pending.now, kBothReported));
   EXPECT_EQ(pending.last_status()["seg_id"], 1);
 }
 

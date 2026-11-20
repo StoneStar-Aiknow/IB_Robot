@@ -124,7 +124,11 @@ public:
   // or refuse a pending start against it. True when admitted; the decision is
   // published unchanged either way and playing starts on the next tick. A start
   // not kept alive for kKeepaliveTimeoutS is refused as stale_start.
-  bool evaluate_start(const CbfDecision & decision, uint64_t epoch, bool enforce, double now);
+  // ``hand_reported_absent`` is the tick's snapshot: an installed side reported
+  // as no hand has its thumb at phantom_thumb_native, never hand_P.
+  bool evaluate_start(
+    const CbfDecision & decision, uint64_t epoch, bool enforce, double now,
+    const std::array<bool, 2> & hand_reported_absent);
   // Refuse a pending start on a tick that published nothing the gate can judge.
   void reject_pending(const std::string & reason);
 

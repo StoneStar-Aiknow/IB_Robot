@@ -323,7 +323,9 @@ bool TemplatePlayer::judge_a_cap(uint64_t safety_epoch, double now)
   return valid;
 }
 
-bool TemplatePlayer::evaluate_start(const CbfDecision & decision, uint64_t epoch, bool enforce, double now)
+bool TemplatePlayer::evaluate_start(
+  const CbfDecision & decision, uint64_t epoch, bool enforce, double now,
+  const std::array<bool, 2> & hand_reported_absent)
 {
   if (!pending_) {return false;}
   const auto pending = *pending_;
@@ -368,6 +370,10 @@ bool TemplatePlayer::evaluate_start(const CbfDecision & decision, uint64_t epoch
     }
   }
   for (size_t i = 0; i < 20; ++i) {
+    // A phantom hand's thumb is published at phantom_thumb_native whatever was
+    // requested; only the band below applies to it.
+    const size_t side = i / 10;
+    if (i % 10 < 2 && limits_->hands_installed[side] && hand_reported_absent[side]) {continue;}
     if (!(std::abs(out.hand[i] - segment.hand_P[i]) <= segment.hand_start_tol)) {
       refuse(pending.seg_id, pending.segment, "hand_off_start");
       return false;
