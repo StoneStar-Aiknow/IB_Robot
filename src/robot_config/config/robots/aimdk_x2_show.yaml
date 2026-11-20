@@ -1,0 +1,578 @@
+# AgiBot X2: one stack with the voice agent, the preset gestures and the mirror.
+#
+# Layers on aimdk_x2_voice_mirror (agent + ZipVoice + PEAR stream + mirror
+# session) and re-enables the preset named motions. The two skill families run
+# in different control modes (gestures named_motion, mirror model_inference), so
+# this deployment states the supported modes explicitly instead of using
+# nav_stage: hybrid — the X2 compute pack has no navigation service, and hybrid
+# would demand navigation.command_server.
+#
+# show-profile-1120: the summit show profile, derived from
+# aimdk_x2_voice_mirror_all.yaml at template-round1 99011676 (sha256 c98f60ce...).
+# The show needs the mirror (arms + hands, CBF), the look (看图说话, prerecorded
+# clips only), the photo node and the motion templates with the remote gesture.
+# It does not need speech input: the mirror is started by a double cover / head
+# touch / mirror.sh and stopped by a long cover, the session timeout or stop.sh.
+# Changes against the source file, all marked "show-profile-1120":
+#   1. voice_asr.enabled false: no ASR process (sherpa model, 54 s load).
+#   2. embodied.entry_mode hermes: no ibrobot_agent_node, no voice bridge
+#      (the Gateway, safety_guard and robot-skill CLI stay).
+#   3. internvl_voice.asr keep: nothing to mute once there is no ASR.
+# Copy it next to aimdk_x2_voice_mirror_all.yaml (base_config must be a sibling).
+robot:
+  base_config: aimdk_x2_voice_mirror.yaml
+  name: aimdk_x2_all
+
+  # The mirror session takes over exactly the mode the Gateway switches to, and
+  # its builder requires that mode to be the deployment's skill mode. Gestures
+  # still run: their own required mode (named_motion) is in the supported list,
+  # so the executor switches the runtime to idle for them.
+  default_control_mode: model_inference
+  skill_required_control_mode: model_inference
+  skill_supported_control_modes:
+    - named_motion
+    - model_inference
+
+  control_modes:
+    named_motion:
+      description: "Runtime-owned named motions (preset gestures)"
+      description_cn: "运行时自持的命名动作（预设手势）"
+      runtime_mode: idle
+      inference:
+        enabled: false
+      executor:
+        enabled: false
+
+  # The vendor enhanced stream is the ASR input: the runtime republishes the
+  # vendor's VAD-segmented chunks on audio.speech.
+  voice_asr:
+    # show-profile-1120: off. Nothing in the show listens; the rest of this
+    # block stays so turning it back on is this one line.
+    enabled: false
+    # Beam search + domain hotwords: the quantized streaming transducer is weak on
+    # command words, and sherpa only applies hotwords through this file.
+    hotwords_file: $(find robot_config)/config/hotwords/x2_commands.txt
+    input_mode: external_vad
+    active_mode: continuous
+    audio_input:
+      interface: audio.speech
+      type: ibrobot_msgs/msg/SpeechAudioChunk
+    output_topic: /voice_command
+
+  embodied:
+    # show-profile-1120: hermes = no ibrobot_agent_node and no
+    # ibrobot_agent_voice_bridge (embodied.py:699). The agent block below is then
+    # ignored (loader.py:3041) and kept only so "agent" restores the voice entry.
+    entry_mode: hermes
+    skill_catalog_profile: aimdk_x2_all
+    agent:
+      # Replaces the mirror-only allowlist inherited from the base: this
+      # deployment exposes both families to the planner.
+      test_allowlist:
+        - wave_hand
+        - handshake
+        - raise_hand
+        - blow_kiss
+        - clap_hands
+        - mirror_start
+        - mirror_stop
+        - self_introduction
+      voice_bridge:
+        # Ending the interaction is a stop, not a request: the field corpus shows the
+        # model cannot learn it (a session ends on "不玩了", "我结束了"), and a chat reply
+        # to a goodbye is worse than simply stopping. Stop matching is a substring test,
+        # so a bare "结束" is deliberately absent: it would shadow the "结束照镜子" skill,
+        # and "不玩" would shadow "不玩照镜子了".
+        stop_phrases:
+          - 别动了
+          - 别动
+          - 停止
+          - 停下
+          - 停
+          - stop
+          - halt
+          - 不玩了
+          - 别玩了
+          - 我结束了
+          - 好了我结束了
+          - 不聊了
+          - 退下吧
+        # Known mishearings of the command vocabulary, mapped to the canonical form
+        # (the planner matches aliases, so canonical text is enough).
+        text_corrections:
+          # "停止" is the fragile part: the transducer hears 停止照镜子 as 银子/名字照镜子,
+          # and the planner then matches the 照镜子 tail and starts a round instead of stopping.
+          停止照镜子: [银子照镜子, 名字照镜子, 明子照镜子, 瓶子照镜子, 影子照镜子, 林子照镜子, 停了照镜子, 听止照镜子, 停止找镜子, 挺直照镜子, 停下照镜子, 停止照镜像]
+          停止: [银子, 名字, 听止, 停职, 挺直]
+          挥挥手: [灰灰手, 恢恢手, 回回手, 挥挥手手]
+          握个手: [卧个手, 我个手, 握握手]
+          举手: [据手, 举起手]
+          比个心: [比个星, 比个信, 比心]
+          鼓掌: [古掌, 股掌]
+          照镜子: [找镜子, 照境子, 照紧子]
+          自我介绍: [自我介少, 自我结绍]
+        # The clip is the reply: announcing the plan and then saying "执行完成。"
+        # would talk over the self-introduction.
+        silent_skills:
+          - self_introduction
+        # L3 semantic gate: decide whether an utterance is addressed to the robot at
+        # all, before the planner sees it. enforce drops the vetoed ones; the JSONL log
+        # stays the queue of sentences worth labelling for the next model.
+        semantic_gate_mode: enforce
+        # Trained on the 639-sentence field corpus (see tools/addressee and
+        # docs/aimdk_x2_addressee_semantic_gate_design_zh.md). Copy the artefact to
+        # this path on the board; a missing file only disables the gate (fail_open).
+        semantic_gate_model_path: /root/workspace/lyx/addressee/addressee_zh_v1.json
+        semantic_gate_threshold: 0.10
+        semantic_gate_model_only_threshold: 0.90
+        semantic_gate_log_path: /var/log/ibrobot/semantic_gate.jsonl
+        semantic_gate_fail_open: true
+        # A catalog alias beats the model: "帮我抓取橘子" is rare in the corpus but
+        # unmistakably addressed to the robot. Generated from the skill catalog by
+        # tools/addressee/emit_lexicon.py -- regenerate it when a skill is renamed.
+        semantic_gate_lexicon:
+          - 撒娇
+          - 卖萌
+          - 装可爱
+          - 可爱一下
+          - 求关注
+          - 飞吻
+          - 飞个吻
+          - 庆祝
+          - 庆祝一下
+          - 欢呼
+          - 太棒了
+          - 鼓掌
+          - 拍手
+          - 拍拍手
+          - 关闭夹爪
+          - 合拢夹爪
+          - 夹爪关闭
+          - 夹爪合拢
+          - 夹紧
+          - 闭爪
+          - 跳舞
+          - 跳个舞
+          - 舞动
+          - 举手致意
+          - 正式打招呼
+          - 举手打招呼
+          - 握手
+          - 握个手
+          - 开心转圈
+          - 高兴转圈
+          - 快乐转圈
+          - 直立转圈
+          - 开心地转圈
+          - 模仿动作
+          - 模仿人类动作
+          - 跟我做动作
+          - 观察桌面
+          - 观察场景
+          - 看看桌面
+          - 扫描桌面
+          - 观察点
+          - 观察位置
+          - 照镜子
+          - 开始照镜子
+          - 学我动作
+          - 模仿我
+          - 停止照镜子
+          - 结束照镜子
+          - 不玩照镜子了
+          - 往前一点
+          - 往上一点
+          - 夹爪往左
+          - 移动一点
+          - 点头
+          - 点头表示同意
+          - 打开夹爪
+          - 张开夹爪
+          - 展开夹爪
+          - 夹爪打开
+          - 夹爪张开
+          - 开爪
+          - 抓取物体
+          - 拿起物体
+          - 放进容器
+          - 放到盒子里
+          - 投入料框
+          - 举手
+          - 举起手
+          - 回原位
+          - 回安全位
+          - 回安全位置
+          - 原位
+          - 原点
+          - 回到home
+          - 返回home
+          - 零点
+          - 零位
+          - 回零点
+          - 到零点
+          - 查物品位置
+          - 查停靠位
+          - 找物品
+          - 逆时针旋转
+          - 逆时针转
+          - 顺时针旋转
+          - 顺时针转
+          - 自我介绍
+          - 介绍一下你自己
+          - 介绍下你自己
+          - 做个自我介绍
+          - 你是谁
+          - 摇头
+          - 不同意
+          - 摇头表示否定
+          - 开启声源跟随
+          - 开始声源跟随
+          - 声源跟随
+          - 停止声源跟随
+          - 关闭声源跟随
+          - 挥手
+          - 挥挥手
+          - 打招呼
+          - 招手
+          - 再见
+          - 嗨
+        # Requests to talk are addressed to whatever can answer them. Without this list
+        # the gate read "讲个故事" as chatter, because the corpus that trained the model
+        # holds commands and meetings but almost no small talk.
+        semantic_gate_dialogue_requests:
+          - 讲个故事
+          - 讲一个故事
+          - 讲个笑话
+          - 讲一个笑话
+          - 说个笑话
+          - 讲个段子
+          - 唱首歌
+          - 唱一首歌
+          - 背首诗
+          - 聊聊天
+          - 陪我聊聊
+          - 说点什么
+          # Questions about what the robot just did. The corpus has no such phrasing, so
+          # the model scores them at zero even though only this robot can answer them.
+          - 你做了什么
+          - 你刚刚做了什么
+          - 你刚才做了什么
+          - 你做了哪些
+          - 你都做了哪些
+          - 做了哪些动作
+          - 干了什么
+          - 执行了什么
+          - 还做了什么
+        # Corrupted wake words the model was trained to recognise as opening an
+        # utterance; a hit accepts it even when the rest scores low.
+        semantic_gate_wake_prefixes:
+          - 灵犀灵犀
+          - 灵犀
+          - 灵溪
+          - 林星
+          - 林静熙
+          - 年轻人
+          - 小欧
+          - 零七零七
+    # The self-introduction plays a recorded clip and waves while it plays; the
+    # catalog binds the clip name and the runtime motion (runtime_named_motion below).
+    runtime_play_audio:
+      enabled: true
+      service: /voice_tts/play
+      asr_control_topic: /voice_control
+      clips:
+        self_intro: /root/workspace/lyx/IB_Robot_hz/assets/audio/self_introduction.wav
+    runtime_named_motion:
+      enabled: true
+      interface: motion.named
+      kind: action
+      type: ibrobot_msgs/action/ExecuteNamedMotion
+      requires:
+        capability: motion.named
+
+  # Back to the half-resolution stream for PEAR and the hands:
+  # aimdk_x2_voice_mirror.yaml switched to full resolution because the firmware
+  # of that time published the full-resolution stream only; the robots now
+  # publish rgb_image_half (check the topic list before a run).
+  motion_imitation_stream:
+    frame_source:
+      topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+    mock_playback:
+      # The dexterous hands follow the person's hands while mirroring: the hand
+      # perception node (MediaPipe hand landmarks + gestures on the NPU) reads the
+      # same camera, the retarget node turns its frames into 20 hand radians, and
+      # mirror_session overlays them on every command it sends (neutral when not
+      # mirroring or when hand feedback is lost).
+      hands:
+        enabled: true
+        frame_topic: /hri/hand/frame
+        # The gestures with a preset on both hands in dexhand_robot.json.
+        gesture_labels: [Victory, Thumb_Up, Pointing_Up]
+        # Score a label must hold (0.15 s) to enter its preset; hand_core's default is 0.7.
+        # The person's left hand scores ~0.65 on a held Victory (10-24 run 162444), so 0.7
+        # left the robot's right hand following; 0.6 entered on 0.97 of those frames.
+        gesture_theta_in: 0.6
+        # Thumb follow: the tracked thumb otherwise follows the four-finger mean only, so a
+        # "six" (three fingers curled, thumb out) folded the robot thumb halfway. thumb_tuck
+        # (thumb tip to index/middle PIP/DIP over palm length, world keypoints) on 10-24 run
+        # 164923: six 0.71-0.87, fists 0.23-0.45. <= d_tuck: no change; >= d_out: thumb open.
+        thumb_follow: {d_tuck: 0.45, d_out: 0.60}
+        # Tracked thumb by its tip's distance to the fingers (zll 10-24), not the four-finger
+        # curl: thumb tip to each fingertip / pinky MCP over palm length picks a stop on
+        # open -> ok -> (middle) -> Victory thumb -> fist thumb ("four"), closer = deeper.
+        # 10-24 run 175919: touching 0.06-0.25, open palm >= 0.60, six >= 0.80; four, thumb to
+        # pinky MCP 0.13-0.44 (run 171354 up to 0.60). <= *_in: the stop; >= *_out: open.
+        # Fist / gestures stay hand_core's; collision order in thumb_fold.py.
+        thumb_fold: {pk_in: 0.55, pk_out: 0.85, tip_in: 0.25, tip_out: 0.60}
+        perception:
+          parameters:
+            camera_topic: /aima/hal/sensor/rgb_head_front_center/rgb_image_half/compressed
+            # Relative to $WORKSPACE, like the perception services' bundle_path.
+            model_dir: models/hand_mediapipe_310p
+            # In-process inference_service; the node's default stays ais_bench
+            # for the older flat model directories.
+            backend: inference_service
+            # Two-hand gesture om (heart / holy / xsign -> /hri/hand/gesture) on its own
+            # thread, fed each HandFrame's frame without waiting. Off: nothing is loaded or
+            # run. To try it, set the cut-head om (never *_e2e.om; relative to $WORKSPACE)
+            # and enable; with backend inference_service also gesture_allow_mixed_backend
+            # (untested: the two runtimes in two threads of one process) or the om stays off.
+            gesture_enabled: false
+            # Empty preserves the legacy enabled/path behavior. Remote is an
+            # explicit optional model-service client; it never loads this om.
+            # Enable only together with preset_motions.gesture.source: remote.
+            gesture_mode: "remote"
+            gesture_remote_service: /perception/hand_gesture/classify
+            gesture_remote_source_topic: /hri/hand/gesture_source_state
+            gesture_remote_timeout_s: 0.4
+            gesture_remote_health_s: 2.5
+            gesture_remote_probe_s: 1.0
+            gesture_remote_max_rate_hz: 10.0
+            gesture_remote_engine_sha256: "421c325669b665e3331430f98365fe3a126bce92a4588097e9faeaa89fd7d639"
+            gesture_session_state_topic: /mirror_session/state
+            gesture_model_path: ""
+            gesture_topic: /hri/hand/gesture
+            gesture_allow_mixed_backend: true
+            gesture_conf: 0.25
+            gesture_far_ratio: 0.6          # two hands further apart than this x person box height: no run
+            gesture_k: 1.5                  # two-hand square = union of the hands' points x k
+            gesture_one_hand_palms: 4.0     # one-hand square side in palms
+            gesture_min_side_px: 64.0
+            gesture_max_rate_hz: 15.0
+            gesture_one_hand_max_rate_hz: 5.0
+            gesture_busy_rate_hz: 10.0      # hands saturated (a newer frame waiting): the gesture still runs this often
+            gesture_slow_ms: 50.0           # gesture_slow_limit of the last gesture_slow_window runs this slow: off
+            gesture_slow_window: 10
+            gesture_slow_limit: 3
+            gesture_fail_limit: 5           # failed runs in a row: off
+            gesture_watchdog_ms: 200.0      # one run not back after this: off (the hands never wait on it)
+            gesture_log_period_s: 1.0
+    # The standing-zone selector: only the person whose feet are inside the floor
+    # quad is mirrored. The zone is the 2026-10-28 field calibration; the camera
+    # rides the head and the robot stands still, so it holds on any X2 standing
+    # the same way. Both files are validated at launch: a bad one stops the launch
+    # with the field named. Delete both lines to go back to ActorSelector.
+    actor_zone_file: $(find robot_config)/config/actor_zone/actor_zone.yaml
+    actor_tuning_file: $(find robot_config)/config/actor_zone/actor_tuning.yaml
+
+  # The mirror drives the upper body itself. The demo rules are the relaxed
+  # copy: a reply's TTS synthesis shares this board's single NPU with the
+  # detector, and the default 1.0 s freshness rule would end the round mid-gesture.
+  mirror_session:
+    enabled: true
+    publish_enabled: true
+    motion_template_config: $(find robot_config)/config/motion_template/motion_template_onsite.yaml
+    # The mirror speaks again (2026-10-23 evening, on request): the four phrases
+    # (starting / ready / mirroring / goodbye) go through the same ZipVoice the
+    # agent uses. Each phrase costs ~2 s of NPU inference, so the opening seconds
+    # of a round now share the device with the pose stream -- watch the stutter
+    # before raising anything else.
+    voice:
+      enabled: true
+    # The physical triggers act instead of only being recorded: double cover asks
+    # for mirror_start, a long cover stops the session, a head touch starts or
+    # cancels a round. The operator reads the rear head camera, so covering the
+    # back of the head IS a long cover (a stop) -- that is the gesture, by design.
+    operator:
+      send_enabled: true
+    # feat/x2-photo-capture
+    # One photo per MIRRORING round, sent with its person box to the upper PC
+    # (the AIGC machine). The address is the first line of target_file, written
+    # on the board with scripts/x2_photo_capture/photo_target.sh <ip>[:port]; it
+    # is read again before every send, so no restart. A photo the PC has not
+    # confirmed waits in <photos_dir>/outbox and is retried until it is, at most
+    # 200 kept. The mirror never waits on any of it; enabled: false (here or in
+    # an entry built on this one) and the launch is the one before the feature.
+    photo:
+      enabled: true
+      photos_dir: /root/x2-feat-photo-capture-run/photos
+      target_file: /root/x2-feat-photo-capture-run/photo_target
+      warmup_sec: 1.5
+      triggers:
+        uniform: {enabled: true, period_sec: 3.0, weight: 0.0}
+        # Body speed in rad/s; first values, to be tuned on the robot.
+        still: {enabled: true, v_still: 0.25, v_move: 0.6, hold_sec: 0.4, min_gap_sec: 2.0, weight: 1.5}
+        # The hand perception recognizes only these three.
+        gesture:
+          enabled: true
+          min_score: 0.6
+          hold_sec: 0.2
+          min_gap_sec: 1.5
+          labels: {Victory: 3.0, Thumb_Up: 3.0, Pointing_Up: 1.5}
+        # Requests on /mirror_photo/trigger (embodied_common.mirror_photo_contract).
+        event: {enabled: true, default_weight: 2.5}
+      weights: {stillness: 0.5, sharpness: 0.5}
+      scoring_deadline_sec: 1.0
+      limits: {max_candidates_per_round: 24, reserve_for_priority: 6, max_priority_per_minute: 20}
+      upload:
+        default_target: ""   # the target is target_file's; leave this empty
+        timeout_sec: 3.0
+        outbox_max_files: 200
+        outbox_max_mb: 100
+        min_free_gb: 2.0
+    # /feat/x2-photo-capture
+
+  # The base entry turns the visual interaction ("看图说话") on. This deployment
+  # does not run it: the base names the fake backend, whose scripted replies
+  # would ride the mirror voice's utterance queue the moment a half-resolution
+  # stream appears, and the robots now publish one. A round would also share
+  # the single NPU with the detector, the hands and ZipVoice. Take the
+  # internvl settings from aimdk_x2_magicmirror_board.yaml when it is wanted.
+  visual_interaction:
+    enabled: false
+
+  # feat/x2-cbf-safety
+  # Operator-authorized development trial, not a calibrated deployment default.
+  cbf_safety:
+    enabled: true
+    mode: enforce
+    # User-confirmed hardware: left OmniHand only; both arms remain protected.
+    # The data plane also takes [true, true] with the right flange empty (a
+    # phantom hand, commissioning/PIPELINE_STARTUP.md); kept at the fitted hands
+    # until its cost is measured on the board.
+    hands_installed: [true, true]  # showtest-1120: [T,T] baseline
+    deadline_us: 10000
+    deadline_guard_us: 500
+    # Observation-only allowance (1 degree); outgoing limits and raw FK are unchanged.
+    feedback_limit_tolerance_rad: 0.017453292519943295
+    # Encoder feedback is raw geometry, not a goal to be admitted by travel limits.
+    check_arm_feedback_goal_range: false
+    # feat/x2-cbf-dual
+    # A hold that is not a collision verdict (feedback, budget, authorization)
+    # lasts at most this long; then the request goes out within joint and
+    # velocity limits. Thumb feedback no longer holds a frame at all.
+    hold_release_after_s: 0.2
+    # A collision verdict is released too: 2 s after it began on a published pose
+    # (the arm waits at the boundary, a move-away is followed at once), 0.5 s when
+    # nothing had been published yet; then the arm steps at 0.3x its speed limit.
+    collision_release_after_s: 2.0
+    collision_release_without_history_s: 0.5
+    collision_release_speed_scale: 0.3
+    # /feat/x2-cbf-dual
+    thumb_mapping:
+      # Historical candidate only. The operator requested a live trial before calibration.
+      verified: false
+      command_scale: [-1.0, 1.0, 1.0, -1.0]
+      command_offset: [0.0, -1.6424, -0.576, -1.6424]
+      feedback_scale: [-1.0, 1.0, 1.0, -1.0]
+      feedback_offset: [0.0, -1.6424, -0.576, -1.6424]
+      native_lower: [-1.117, -0.05, -0.03, -1.64]
+      native_upper: [0.03, 1.64, 0.87, 0.05]
+  # /feat/x2-cbf-safety
+
+  # feat/x2-cbf-dual: template playback port
+  # The data plane plays whitelisted contact segments itself (P -> T -> P) within
+  # the CBF's limits; the mirror session only starts, keeps alive and releases.
+  # Without cbf_safety or the file every start is refused; the launch never fails
+  # on this block. Off: no topic, the data plane is the e965d015 one.
+  template_play:
+    enabled: true
+    segments_file: $(find robot_config)/config/motion_template/segments.json
+  # /feat/x2-cbf-dual
+
+  # feat/x2-internvl-voice
+  # The mirror speaks prerecorded clips only: transitions, standby words and a
+  # line matched to what InternVL sees. Never synthesis. Remove this block (or
+  # set enabled: false) and the mirror voice is the 676fa608 one again.
+  # Deployment: src/robot_config/config/mirror_voice/README.md
+  internvl_voice:
+    enabled: true
+    clips_table: $(find robot_config)/config/mirror_voice/x2_clips_v3.yaml
+    clip_dir: assets/audio/x2_mirror_clips_v3   # relative to $WORKSPACE
+    # feat/x2-retarget-tune: ASR stopped through STANDBY and MIRRORING (was mute).
+    # Suspected: the ASR resuming after a clip stalls the board mid-mirroring. WAIT
+    # still listens, so voice can start mirroring; it cannot stop it.
+    # show-profile-1120: keep (send nothing), since voice_asr is off.
+    asr: keep                    # mute | off | session | keep
+    # feat/x2-retarget-tune end
+    asr_resume_delay_sec: 0.8
+    asr_control_topic: /voice_control
+    standby:
+      first_after_sec: [1.0, 3.0]
+      gap_sec: [2.0, 5.0]
+    look:
+      enabled: true
+      demo_root: /root/vlx_internvl_310p
+      round_period_sec: 0.0      # 0 = start the next look as soon as the last one ends
+      window_sec: 0.0            # 0 = look all through MIRRORING; >0 = only this long before a line is due
+      quick_gap_sec: 2.0         # a verified named gesture may be answered this soon after the last line
+      nice: 10                   # CPU niceness of the look node; the data plane comes first
+      crop_actor: true
+      refine_hand: true          # second question when the answer is a vague hand gesture
+      verify: true               # yes/no check before a line that names a gesture
+      first_after_sec: [1.0, 2.5]
+      gap_sec: [2.5, 5.0]
+      max_per_round: auto        # fill mirror_session operator max_session_s (demo.yaml); 8 if none
+      fresh_sec: 5.0
+      pool_cooldown_sec: 10.0
+      fallback_after_sec: 1.5
+      latest_start_sec: 2.0
+      dump_dir: ""
+      key_actions:               # a choice question every look; a confident key action is answered at once
+        enabled: true            # zll 11-10: on with thumb, wave, open; false = the look above, unchanged
+        frames: 1                # 1 = newest frame; 4 = spread over the last 0.75 s
+        calibrate: none          # none | blank = divide by the scores on a grey picture
+        smooth: 3                # average each action's score over this many looks
+        confirm: 2               # looks in a row over the threshold before it triggers
+        release: 1               # looks under the threshold before the same action can trigger again
+        cooldown_sec: 8.0        # per action, after it triggered
+        q1_period_sec: 3.0       # free description for the general lines at most this often
+        say_within_sec: 3.0      # a key line not said this soon after its trigger is dropped
+        thresholds: {thumb: 0.5, wave: 0.38, open: 0.38}   # only these trigger: yeah | thumb | wave | heart | open
+  # /feat/x2-internvl-voice
+
+  # feat/x2-preset-motions
+  preset_motions:
+    enabled: true
+    # Matching emits perception events. Motion stays off until the complete
+    # dual-hand target and session handoff pass the head-clearance gates.
+    motion_enabled: false
+    match_topic: /preset_motions/matched
+    status_topic: /preset_motions/status
+    state_topic: /preset_motions/state
+    motion_name: overhead_heart
+    template_file: $(find robot_config)/config/preset_motions/overhead_heart.yaml
+    geometry_file: ""  # A certified runtime artifact is required before enabling motion.
+    matcher:
+      enter_confirm_s: 0.5
+      exit_confirm_s: 0.3  # 0.4 on the real robot 1119: the arms were down before the template let go
+      min_enter_frames: 3
+    # Hand gesture templates heart / holy / xsign on /preset_motions/state, voted
+    # from hands.perception's gesture model (/hri/hand/gesture). Off: it needs
+    # hands.perception.parameters.gesture_enabled and a consumer that reads them.
+    gesture:
+      enabled: true
+      source: remote
+      source_topic: /hri/hand/gesture_source_state
+      topic: /hri/hand/gesture
+      window_s: 0.6
+      min_frames: 4
+      min_frames_one_hand: 3   # one-hand runs come <= 5 Hz: 3 fit the window even with 15% jitter
+      min_score: 0.5
+      # Remote results come ~4.4 Hz (3.2 Hz in the slowest 5 s), one-hand runs ~3 Hz:
+      # 0.6 s bridges one lost result at 4.4 Hz (0.45 s gap), 0.7 s one lost one-hand
+      # result at 3 Hz (0.67 s). A real letting go ends the template this much later
+      # (zll 11-20). Per class from the step-0 gap histograms once they are in.
+      exit_s: 0.6
+      exit_s_one_hand: 0.7     # exit_s after a one-hand run
+  # /feat/x2-preset-motions
