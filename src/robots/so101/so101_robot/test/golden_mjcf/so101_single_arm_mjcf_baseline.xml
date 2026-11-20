@@ -91,6 +91,7 @@
                 <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_7" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
                 <geom class="visual" type="mesh" mesh="sts3215" rgba="0.1 0.1 0.1 1" pos="0.0077 0.0001 -0.0234" euler="-1.5708 0 0" />
                 <geom class="visual" type="mesh" mesh="wrist_roll_follower" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
+                <camera name="gripper_follow" mode="track" fovy="60" pos="0.3705 0.2628 0.2117" xyaxes="0 -0.766 0.6428 0.5736 -0.5265 -0.6275" />
                 <body name="jaw" pos="0.0202 0.0188 -0.0234" euler="1.5708 0.209440 0.000001">
                   <joint name="6" type="hinge" axis="0 0 1" range="0.0 1.0" damping="1.5" armature="0.028" frictionloss="0.052" />
                   <inertial pos="-0.00157495 -0.0300244 0.0192755" mass="0.012" fullinertia="6.61427e-06 1.89032e-06 5.28738e-06 -3.19807e-07 -5.90717e-09 -1.09945e-07" />

@@ -12,6 +12,8 @@ description: "Table-top scene with banana and plate for pick-and-place task"
 # The table surface is at z=0; the so101 URDF base_link origin sits ~3cm above the
 # physical table contact point, so we lower the spawn by 0.03m to align visually.
 # gazebo_adapter reads this and overrides initial_pose_z when the scene is loaded.
+# If the spawn moves, re-aim the world-fixed viewer-only cameras placed for it:
+# pick_banana.xml.template side_view and mujoco_viewer below.
 robot_spawn:
   x: 0.0
   y: 0.30
@@ -63,6 +65,25 @@ task:
   executable: pick_banana_task_node
   platforms: [mujoco, gazebo]
 
+# ── MuJoCo viewer (operator view only) ───────────────────────────────────────
+# The viewer's start view (a free camera: mouse-draggable, Ctrl+A returns
+# here). compose_mujoco_model writes it into statistic/center and
+# visual/global; the distance is realised through the free camera's fovy, so
+# the model extent (which scales every camera's znear) stays untouched and the
+# recorded cameras are not affected. Behind-right of the robot (spawn y=0.30),
+# 55 deg down onto the banana/plate area: a forward hand motion moves the
+# gripper up the screen, and the upright start pose does not hide the banana.
+# Trade-off: with the extent fixed the free camera sits ~3.7 m away, so the
+# 0.72 m framing needs a ~9.3 deg fovy — a near-orthographic, long-lens view
+# with a weak depth cue. Zooming and Ctrl + right double-click tracking keep
+# that narrow fovy; use side_view / gripper_follow (']' / '[') for height and
+# close-up judgement.
+mujoco_viewer:
+  lookat: [0.10, 0.06, 0.0]
+  distance: 0.72
+  azimuth: -110
+  elevation: -55
+
 # ── Evaluation criteria (shared by every physics platform, D9) ───────────────
 # The plate centre is derived from objects[plate].position; these radii are
 # the success / flew-out / fell-off limits the AutoTest judges with. A scene
@@ -77,6 +98,8 @@ evaluation:
 # list both platforms index: the MuJoCo backend applies placements[k] through
 # ResetWorld state overrides, the Gazebo backend through SetEntityPose.
 # mode: grid (default) | uniform (deterministic sampling from seed+count).
+# The world-fixed viewer-only side_view (pick_banana.xml.template) is aimed to
+# cover this banana area and the plate; re-check it when the ranges change.
 randomization:
   banana:
     mode: grid               # grid keeps the historical index order/values

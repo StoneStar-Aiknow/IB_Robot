@@ -20,7 +20,7 @@ import pytest
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import runtime_stack_actions
+from robot_runtime.launch_support import RuntimeProfileError, runtime_stack_actions
 from robot_runtime_sim.mujoco import (
     CAMERA_PLUGIN_INSTANCE,
     CAMERA_PLUGIN_TYPE,
@@ -421,6 +421,40 @@ def test_camera_plugin_parameters_without_cameras_is_empty(tmp_path):
     assert camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals) == {}
 
 
+def test_camera_plugin_parameters_disable_every_other_model_camera(tmp_path):
+    """mujoco_ros2_control 0.1.2's CameraPlugin streams every model camera
+    whose policy is unset, so each model camera that is not an enabled
+    peripheral (a viewer-only camera, a disabled peripheral's camera) gets
+    an explicit ``disabled`` policy; the declared cameras keep streaming."""
+    peripherals = [TOP, {**WRIST, "disabled": True}]
+    profile = _profile(tmp_path, peripherals=peripherals)
+    model_cameras = ["top_camera", "side_view", "wrist_camera", "gripper_follow"]
+    instance = camera_plugin_parameters(profile, peripherals, model_cameras)["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    policy = {name: (instance.get(name) or {}).get("policy", "streaming") for name in model_cameras}
+    assert policy == {
+        "top_camera": "streaming",
+        "side_view": "disabled",
+        "wrist_camera": "disabled",
+        "gripper_follow": "disabled",
+    }
+    assert (
+        instance["top_camera"]
+        == camera_plugin_parameters(profile, peripherals)["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["top_camera"]
+    )
+    # no enabled camera: no plugin is loaded, so nothing is published either way
+    none = [{**TOP, "disabled": True}]
+    assert camera_plugin_parameters(_profile(tmp_path, peripherals=none), none, model_cameras) == {}
+
+
+@pytest.mark.parametrize("name", ["", "type", "camera_publish_rate"])
+def test_camera_plugin_parameters_reject_a_model_camera_no_parameter_can_disable(tmp_path, name):
+    """An unnamed camera, or one named like an instance key, would stream
+    with no way to disable it by parameter."""
+    peripherals = [TOP]
+    with pytest.raises(RuntimeProfileError, match="cannot disable"):
+        camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals, ["top_camera", name])
+
+
 # ---------------------------------------------------------------------------
 # issue #195: the FreeJointStatePublisherPlugin parameters for scene objects
 # ---------------------------------------------------------------------------
@@ -666,6 +700,12 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     monkeypatch.setattr(
         scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
     )
+    # the fake model's cameras (the composition is faked, so is its camera list)
+    monkeypatch.setattr(
+        scene_compiler,
+        "mujoco_model_camera_names",
+        lambda path: ["top_camera", "side_view", "wrist_camera", "gripper_follow"],
+    )
     profile = _profile(tmp_path)
     description = render_mujoco_description(profile, tmp_path / "profile.yaml")
     actions = mujoco_embodiment_actions(
@@ -688,6 +728,11 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
     tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
     assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
+    # model cameras that are not enabled peripherals are disabled, or the plugin would stream them
+    cameras = tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert cameras["side_view"] == {"policy": "disabled"}
+    assert cameras["gripper_follow"] == {"policy": "disabled"}
+    assert cameras["top_camera"]["policy"] == "streaming"
     # the empty scene composes no dynamic objects: no free-joint publisher
     assert FREE_JOINT_STATE_PLUGIN_INSTANCE not in tree["mujoco_plugins"]
 
@@ -708,6 +753,8 @@ def test_mujoco_embodiment_adds_the_free_joint_state_plugin_for_dynamic_scenes(t
     monkeypatch.setattr(
         scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
     )
+    # the fake model's cameras (the composition is faked, so is its camera list)
+    monkeypatch.setattr(scene_compiler, "mujoco_model_camera_names", lambda path: [])
     profile = _profile(tmp_path)
     description = render_mujoco_description(profile, tmp_path / "profile.yaml")
     actions = mujoco_embodiment_actions(
@@ -1942,3 +1989,38 @@ def test_no_option_section_leaves_the_render_byte_identical(tmp_path):
     profile["simulation"]["mujoco"]["option"] = {"cone": "elliptic"}
     with pytest.raises(RuntimeError, match="no <option> element"):
         render_robot_mjcf(profile)
+
+
+def _hardware(plugin, *params):
+    body = "".join(params)
+    return f'<ros2_control name="s" type="system"><hardware><plugin>{plugin}</plugin>{body}</hardware></ros2_control>'
+
+
+_MUJOCO = "mujoco_ros2_control/MujocoSystemInterface"
+_MODEL = '<param name="mujoco_model">{}</param>'
+
+
+def _description_with_model(model_param: str) -> str:
+    return f'<robot name="r">{_hardware(_MUJOCO, model_param)}</robot>'
+
+
+@pytest.mark.parametrize(
+    "model_param",
+    [
+        _MODEL.format("/tmp/ibrobot_no_such_composed_model.mjb"),
+        # no parameter: the simulator would load the model from a topic
+        "",
+    ],
+    ids=["missing-file", "no-mujoco_model"],
+)
+def test_mujoco_embodiment_fails_when_the_model_cameras_cannot_be_listed(tmp_path, model_param):
+    """With cameras configured, a model whose cameras cannot be listed would
+    stream cameras nobody declared: the launch fails instead."""
+    profile = _profile(tmp_path)
+    with pytest.raises(RuntimeProfileError, match="camera"):
+        mujoco_embodiment_actions(
+            profile,
+            tmp_path / "profile.yaml",
+            robot_description=_description_with_model(model_param),
+            mujoco_scene="",
+        )

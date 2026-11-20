@@ -365,6 +365,8 @@ def test_sim_world_argument_reaches_the_mujoco_composition(monkeypatch):
         return Path("/tmp/ibrobot_fake_composed.mjb")
 
     monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
+    # the fake model has no cameras beyond the declared ones
+    monkeypatch.setattr(scene_compiler, "mujoco_model_camera_names", lambda path: [])
     actions = _render({"use_sim": "true", "sim_platform": "mujoco", "sim_world": "pick_banana"})
     assert captured["scene"] == "pick_banana"
     assert captured["sdf_meshes"] == ["wrist_roll_follower", "moving_jaw"]
@@ -386,6 +388,8 @@ def test_mujoco_without_a_scene_composes_the_empty_scene(monkeypatch):
         return Path("/tmp/ibrobot_fake_composed.mjb")
 
     monkeypatch.setattr(scene_compiler, "compose_mujoco_model", fake_compose)
+    # the fake model has no cameras beyond the declared ones
+    monkeypatch.setattr(scene_compiler, "mujoco_model_camera_names", lambda path: [])
     _render({"use_sim": "true", "sim_platform": "mujoco"})
     assert captured["scene"] == "empty"
 
@@ -426,7 +430,15 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
     monkeypatch.setattr(
         scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
     )
+    listed = []
+    # the fake model's cameras: the declared ones plus a viewer-only one
+    model_cameras = ["top_camera", "side_view", "front_camera", "wrist_camera"]
+    monkeypatch.setattr(
+        scene_compiler, "mujoco_model_camera_names", lambda path: listed.append(path) or list(model_cameras)
+    )
     actions = _render({"use_sim": "true", "sim_platform": "mujoco"})
+    # the cameras are listed from the model the simulator loads
+    assert listed and set(listed) == {"/tmp/ibrobot_fake_composed.mjb"}
     simulator_nodes = [
         node for node in actions if isinstance(node, Node) and node._Node__node_executable == "ros2_control_node"
     ]
@@ -450,6 +462,9 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(monkeypatch):
     # the shipped profile's cameras: one entry per MJCF camera name
     assert set(key for key in instance if key.endswith("_camera")) == {"top_camera", "wrist_camera", "front_camera"}
     assert instance["camera_publish_rate"] > 0
+    # every other model camera is disabled, or the plugin would stream it
+    assert instance["side_view"] == {"policy": "disabled"}
+    assert all(instance[name]["policy"] == "streaming" for name in ("top_camera", "wrist_camera", "front_camera"))
 
 
 # ---------------------------------------------------------------------------

@@ -383,7 +383,7 @@ def camera_depth_topics(periph: dict) -> tuple[str, bool]:
     return f"/_runtime/mujoco/{name}/depth", False
 
 
-def camera_plugin_parameters(profile: dict, peripherals: list) -> dict:
+def camera_plugin_parameters(profile: dict, peripherals: list, model_cameras: list[str] | tuple[str, ...] = ()) -> dict:
     """The nested ``mujoco_plugins`` CameraPlugin parameter tree (D3).
 
     One plugin instance carries every enabled camera. The per-camera key is
@@ -396,6 +396,16 @@ def camera_plugin_parameters(profile: dict, peripherals: list) -> dict:
     is ``mujoco_camera_publish_rate``. An empty camera list returns ``{}``
     (no plugin is configured, and with ``auto_register_cameras=false`` no
     deprecated auto-registration fills in).
+
+    The plugin (mujoco_ros2_control 0.1.2 ``register_cameras``) walks every
+    camera of the loaded model and streams any camera without a ``policy``
+    parameter. ``model_cameras`` are the composed model's camera names
+    (``sim_models.scene_compiler.mujoco_model_camera_names``); each one that
+    is not an enabled peripheral camera, such as a scene's viewer-only
+    cameras, gets ``policy: disabled`` so it is neither rendered nor
+    published. A model camera no parameter can address (unnamed, or named
+    like an instance key such as ``type``) fails with ``RuntimeProfileError``
+    while the plugin is configured.
     """
     cameras = _enabled_cameras(peripherals)
     if not cameras:
@@ -416,6 +426,18 @@ def camera_plugin_parameters(profile: dict, peripherals: list) -> dict:
             "info_topic": f"/camera/{name}/camera_info",
             "depth_topic": depth_topic,
         }
+    for camera in model_cameras:
+        entry = instance.get(camera) if camera else None
+        if not camera or (entry is not None and not isinstance(entry, dict)):
+            from robot_runtime.launch_support import RuntimeProfileError
+
+            # the plugin would stream it, and no parameter of its own can be set
+            raise RuntimeProfileError(
+                f"the composed MuJoCo model has a camera named {camera!r}, which the CameraPlugin "
+                "would publish and a parameter cannot disable; rename it in the scene"
+            )
+        if entry is None:
+            instance[camera] = {"policy": "disabled"}
     return {"mujoco_plugins": {CAMERA_PLUGIN_INSTANCE: instance}}
 
 

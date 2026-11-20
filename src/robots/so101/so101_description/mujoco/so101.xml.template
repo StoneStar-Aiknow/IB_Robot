@@ -292,6 +292,34 @@
                      peripherals[name=wrist, driver=opencv, transform.parent_frame=gripper] -->
 
                 <!--
+                  gripper_follow: viewer-only chase camera for the teleop
+                  operator (cycle to it with ']' / '[' in the MuJoCo viewer).
+                  mode="track" keeps the world-frame offset and orientation it
+                  has at qpos0, so it follows the gripper's position without
+                  rolling with the wrist. At qpos0 this local pose is the world
+                  offset (+0.263, +0.212, +0.371) m from the gripper origin
+                  (robot frame at spawn yaw 0: behind-right and well above),
+                  0.55 m from and 55 deg down onto a point 6 cm toward +X,
+                  3 cm ahead and 8 cm below the gripper origin. With the 60 deg
+                  fovy that frames the gripper together with an object
+                  ~0.2 m to either side of it, so in the pick_banana scene the
+                  banana and the plate stay in view while grasping and while
+                  placing. The CameraPlugin would stream every model camera
+                  without a policy, so the runtime gives each camera that is
+                  not an enabled peripheral policy "disabled": this one is
+                  never rendered for or published by the plugin, and the
+                  recorded top/wrist cameras are unaffected.
+                  The template is shared: lekiwi_nav_grasp includes it too, so
+                  the camera exists there as well (disabled the same way),
+                  but its offset was tuned only for so101 single-arm +
+                  pick_banana, and on LeKiwi the
+                  world-frame track offset does not turn with the mobile base.
+                -->
+                <camera name="gripper_follow" mode="track" fovy="60"
+                        pos="0.3705 0.2628 0.2117"
+                        xyaxes="0 -0.766 0.6428 0.5736 -0.5265 -0.6275"/>
+
+                <!--
                   body jaw
                   URDF joint "6": origin xyz="0.0202 0.0188 -0.0234"
                                    rpy="1.5708 0 0"
