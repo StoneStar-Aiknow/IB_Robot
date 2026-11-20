@@ -2,9 +2,20 @@
 
 第 0 步的数据显示，按住主要发生在 dataplane 主线程排队等 CPU 的时候。这个脚本只改**正在运行的 dataplane 进程里每个线程**的 nice 值，CPU 亲和性可选。不改内核、sysctl 和网络，launch 那一行也不动。
 
-**默认关。** 在 .5 上要不要开，由 zll 决定。
+**脚本本身默认关。** zll 11-20 定：展会每次启动都开 -5（F3 A/B 之后），由展会 start.sh 在 launch 之后调 `apply-when-up`，见下一节。
 
-## 接进启动脚本（一行，加在 ros2 launch 之前）
+## 展会 start.sh 用的：apply-when-up（launch 之后，后台跑）
+
+```bash
+python3 <树>/scripts/x2_dataplane_sched/x2_dataplane_nice.py apply-when-up --nice -5 --result <日志目录>/dataplane_nice.result
+```
+
+- 最多等 `--wait`（默认 60 s），直到正好有一个 dataplane；然后每隔 `--settle`（默认 3 s）改一遍，一共两遍。第二遍是为了补上第一遍进行中才起来的线程。
+- 最后逐个线程读回来，都等于目标值才算 `ok`。结论只有一行：`ok ...` 或 `FAIL ...`，写进 `--result`，退出码也是同一个结论。
+- 没等到 dataplane、有两个 dataplane、中途 dataplane 退出、有线程没改成，都算 `FAIL`。start.sh 只把它打出来，不因此停止整套。
+- 原值照样保存在 `/run/x2-dataplane-nice/`。dataplane 退出后，`restore` 会顺手把这些已经没用的记录删掉，stop.sh 最后会调一次。
+
+## 接进启动脚本的另一种方式：hook（一行，加在 ros2 launch 之前）
 
 ```bash
 python3 <树>/scripts/x2_dataplane_sched/x2_dataplane_nice.py hook || true

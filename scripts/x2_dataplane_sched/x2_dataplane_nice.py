@@ -15,6 +15,10 @@ adds one line before it.
                                              until the dataplane is gone for --linger seconds
     x2_dataplane_nice.py hook                for start scripts: X2_DATAPLANE_NICE=1 starts the
                                              watcher in the background; otherwise as restore
+    x2_dataplane_nice.py apply-when-up [--nice N] [--wait S] [--settle S] [--result FILE]
+                                             for start scripts, after the launch: wait for the
+                                             dataplane, apply twice, read every thread back;
+                                             one line "ok ..." or "FAIL ..." to FILE
 
 Every thread gets the same nice: the intake threads and the command tick share
 one lock, so lifting only the tick thread could leave it waiting on a starved
@@ -280,6 +284,54 @@ def cmd_apply(args) -> int:
     return 1 if failed else 0
 
 
+def cmd_apply_when_up(args) -> int:
+    """The verdict is read back from the threads, not taken from apply's counts.
+
+    A start script runs this in the background and goes on whatever it says.
+    """
+    wanted = f"nice={args.nice}{' cpus=' + cpus_text(args.cpus) if args.cpus else ''}"
+
+    def verdict(ok: bool, text: str) -> int:
+        line = f"{'ok' if ok else 'FAIL'} {wanted}：{text}"
+        say(line)
+        if args.result:
+            Path(args.result).write_text(line + "\n")
+        return 0 if ok else 1
+
+    end = time.monotonic() + args.wait
+    found = dataplanes()
+    while not found and time.monotonic() < end:
+        time.sleep(args.interval)
+        found = dataplanes()
+    if not found:
+        return verdict(False, f"{args.wait:.0f} s 内没等到 dataplane，不改")
+    if len(found) > 1:
+        return verdict(False, f"找到 {len(found)} 个 dataplane {found}，不改")
+    pid = found[0]
+    started = start_time(pid)
+    say(f"dataplane {pid} 已起，每隔 {args.settle:g} s 改两遍")
+    # Twice: a thread started during the first pass by a thread not yet changed
+    # keeps its own nice; threads started after both inherit the change.
+    for _ in range(2):
+        time.sleep(args.settle)
+        if started is None or start_time(pid) != started:
+            return verdict(False, f"dataplane {pid} 已退出，没改完")
+        changed, failed = apply(pid, args.nice, args.cpus, started)
+        say(f"dataplane {pid}：改了 {changed} 个线程，失败 {failed}")
+    seen = off = 0
+    for tid in threads(pid):
+        now = read_thread(tid)
+        if now is None:
+            continue
+        seen += 1
+        off += now["nice"] != args.nice or (args.cpus is not None and set(now["cpus"]) != args.cpus)
+    if start_time(pid) != started or seen == 0:
+        return verdict(False, f"dataplane {pid} 已退出，没改完")
+    if off:
+        return verdict(False, f"dataplane {pid} 有 {off}/{seen} 个线程没改成")
+    return verdict(True, f"dataplane {pid} 全部 {seen} 个线程")
+
+
 def cmd_restore(args) -> int:
     stop_watcher()
     failed_any = False
@@ -356,18 +408,21 @@ def cmd_hook(args) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["status", "apply", "restore", "watch", "hook"])
+    parser.add_argument("command", choices=["status", "apply", "restore", "watch", "hook", "apply-when-up"])
     parser.add_argument("--pid", type=int, help="this dataplane (default: the only one running)")
     parser.add_argument("--nice", type=int, default=DEFAULT_NICE)
     parser.add_argument("--cpus", type=parse_cpus, default=parse_cpus(DEFAULT_CPUS) if DEFAULT_CPUS else None)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--linger", type=float, default=30.0)
     parser.add_argument("--wait-first", action="store_true", help="watch: wait for the first dataplane however long")
+    parser.add_argument("--wait", type=float, default=60.0, help="apply-when-up: for the dataplane, at most")
+    parser.add_argument("--settle", type=float, default=3.0, help="apply-when-up: before each pass")
+    parser.add_argument("--result", help="apply-when-up: write the verdict line here")
     args = parser.parse_args(argv)
     if not -20 <= args.nice <= 19:
         parser.error("--nice is -20..19")
     return {"status": cmd_status, "apply": cmd_apply, "restore": cmd_restore, "watch": cmd_watch,
-            "hook": cmd_hook}[args.command](args)
+            "hook": cmd_hook, "apply-when-up": cmd_apply_when_up}[args.command](args)
 
 
 if __name__ == "__main__":
