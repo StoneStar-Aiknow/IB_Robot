@@ -33,7 +33,7 @@ TICK = 0.02
 MIRROR = (0.0, 0.2, 0.0, -0.4, 0.0, 0.0, 0.0, 0.0, -0.2, 0.0, -0.4, 0.0, 0.0, 0.0)
 HAND_MIRROR = (0.5,) * 20
 # v1.2 off: bc35e2d3's behaviour, which the tests here pin (test_template_motion_pause.py has v1.2's)
-OFF = BlendConfig(a_pause_budget_s=0, enter_hold_window_s=0, load_backoff_s=0, b_label_unlatch=False)
+OFF = BlendConfig(a_pause_budget_s=0, enter_hold_window_s=0, load_backoff_s=0, b_label_unlatch=False, late_tick_s=0)
 
 
 def pose(**changes):

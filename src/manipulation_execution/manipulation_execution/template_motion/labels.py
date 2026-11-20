@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import math
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 
@@ -62,16 +62,25 @@ class LabelBook:
                 self._episode[name] += 1
             self._latest[name] = (active, actor, now)
 
-    def current(self, template: str, now: float) -> Label | None:
-        """The template's activation, if it is active and fresh now."""
+    def current(
+        self, template: str, now: float, older: Callable[[float, float], bool] | None = None
+    ) -> Label | None:
+        """The template's activation, if it is active and fresh now.
+
+        ``older(age, stale_s)`` judges the newest message's age instead of ``age > stale_s``.
+        """
         with self._lock:
             latest = self._latest.get(template)
             if latest is None:
                 return None
             active, actor, at = latest
-            if not active or actor is None or not 0 <= now - at <= self._stale_s or not math.isfinite(now):
-                return None
-            return Label(template, actor, self._episode[template])
+            episode = self._episode[template]
+        age = now - at
+        if not active or actor is None or not math.isfinite(now) or age < 0.0:
+            return None
+        if older(age, self._stale_s) if older is not None else age > self._stale_s:
+            return None
+        return Label(template, actor, episode)
 
     def describe(self, template: str, now: float) -> str:
         """For the logs: the template's newest message as ``active|inactive|stale|none``, its age and episode."""

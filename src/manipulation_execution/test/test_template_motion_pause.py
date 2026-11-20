@@ -98,14 +98,35 @@ class PauseRig(Rig):
         self.plane = Plane(self.now)
         self.extra = []  # statuses received with the next tick's, before them
         self.paused = []  # the blender's paused flag after each tick
+        self.deaf = False  # the tick runs before the subscriptions: nothing is read, the statuses queue
+        self.labels_muted = False  # the label publisher went silent
         if warm:
             self.run(1.2)  # the held-share gate needs a second of statuses
 
     def hear(self):
-        super().hear()
-        for message in self.extra + self.plane.tick(self.now):
+        received = self.extra + self.plane.tick(self.now)
+        if self.deaf:
+            self.extra = received
+            return
+        if self.labels_muted:
+            self._port_now()
+        else:
+            super().hear()
+        for message in received:
             self.cbf_monitor.observe(json.dumps(message), self.now)
         self.extra = []
+
+    def starve(self, seconds):
+        """The session is not scheduled for ``seconds`` while the data plane goes on. The first tick
+        after it runs before the queued messages are read; the next one reads them all."""
+        for _ in range(round(seconds / TICK) - 1):
+            self.now += TICK
+            self.extra += self.plane.tick(self.now)
+        self.deaf = True
+        try:
+            self.step()
+        finally:
+            self.deaf = False
 
     def step(self, dt=TICK):
         arm = super().step(dt)
@@ -316,6 +337,97 @@ def test_a_hold_heard_late_keeps_the_request_still_before_the_cbf_releases():
     advance = max(abs(a - b) for a, b in zip(rig.out[k0 - 1], window[0], strict=True))
     assert advance <= speed_limit(0.6) * (NEW.a_status_age_s + 2 * TICK)  # what the CBF's release moves at most
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.WAIT_ACK)
+
+
+# -- ages judged on punctual ticks (the session starved) -------------------------------------
+
+LATE = 0.06  # every tick this late: the session starved for good
+
+
+def newest_status_at(rig):
+    return rig.cbf_monitor.latest().at
+
+
+@pytest.mark.parametrize("starved", [0.1, 0.2, 0.4, 0.6])
+def test_a_starved_session_never_leaves_A_and_pauses_only_past_twice_the_status_age(starved):
+    rig = PauseRig()
+    rig.into_a(0.2)
+    seen = newest_status_at(rig)
+    rig.starve(starved)
+    age = rig.now - seen  # of the newest status the late tick knows
+    assert rig.blender.snapshot()["paused"] == (age > 2 * NEW.a_status_age_s)
+    assert rig.run(3.0, lambda: rig.blender.phase in (Phase.WAIT_ACK, Phase.C))
+    assert rig.blender.phase is Phase.WAIT_ACK and exit_reason(rig) == ""  # the label too: 0.6 < 2 x 0.5
+    assert len(rig.spans()) <= 1 and not lines(rig, "template exit")
+
+
+@pytest.mark.parametrize("starved", [0.2, 0.4, 0.6])
+def test_a_starved_session_keeps_the_hold_in_B(starved):
+    rig = PauseRig()
+    to_playing_new(rig)
+    rig.run(1.0)  # past min_hold: any release would be sent at once
+    rig.starve(starved)
+    rig.run(0.5)
+    assert rig.blender.phase is Phase.PLAYING and not rig.sent("release")
+
+
+@pytest.mark.parametrize("dt", [TICK, LATE])
+def test_a_status_that_stopped_is_untrusted_by_twice_its_age_at_most(dt):
+    rig = PauseRig()
+    rig.into_a(0.3)
+    rig.plane.delay = lambda at: None
+    seen = newest_status_at(rig)
+    while not rig.blender.snapshot()["paused"]:
+        rig.step(dt)
+    limit = NEW.a_status_age_s * (2 if dt > NEW.late_tick_s else 1)
+    assert limit < rig.now - seen <= limit + dt + 1e-9
+    paused = rig.now
+    while rig.blender.phase is Phase.A:
+        rig.step(dt)
+    assert exit_reason(rig) == "a_cbf_untrusted" and "why=cbf_late" in lines(rig, "template pause")[0]
+    assert rig.now - paused <= NEW.a_untrusted_max_s + dt + 1e-9
+
+
+@pytest.mark.parametrize("dt", [TICK, LATE])
+def test_a_port_status_that_stopped_in_B_is_stale_by_twice_its_limit_at_most(dt):
+    rig = PauseRig()
+    to_playing_new(rig)
+    rig.run(0.5)
+    rig.port = None
+    seen = rig.now
+    while not rig.sent("release"):
+        rig.step(dt)
+    limit = NEW.status_stale_s * (2 if dt > NEW.late_tick_s else 1)
+    assert limit < rig.now - seen <= limit + dt + 1e-9
+    assert rig.sent("release")[-1]["fast"]
+    assert rig.run(2.0, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "status_stale"
+
+
+@pytest.mark.parametrize("dt", [TICK, LATE])
+def test_a_label_that_stopped_is_lost_by_twice_its_stale_s_at_most(dt):
+    rig = PauseRig()
+    rig.into_a(0.1)
+    rig.hold(0.0, 3.0)  # A stays, paused, until the label runs out
+    rig.labels_muted = True
+    seen = rig.now
+    while rig.blender.phase is Phase.A:
+        rig.step(dt)
+    limit = rig.labels._stale_s * (2 if dt > NEW.late_tick_s else 1)
+    assert exit_reason(rig) == "label_lost" and limit < rig.now - seen <= limit + dt + 1e-9
+
+
+def test_a_late_tick_keeps_only_the_previous_tick_s_verdict():
+    rig = PauseRig()
+    older = rig.blender._older
+    rig.step()
+    assert older("kept", 0.6, 0.5) and older("old", 0.6, 0.5)
+    rig.step()
+    assert older("kept", 0.6, 0.5)  # "old" is not judged on this tick
+    rig.step(LATE)
+    assert older("kept", 0.6, 0.5) and older("kept", 0.6, 0.5)  # twice in one tick: the same
+    assert not older("old", 0.6, 0.5)  # no verdict from the tick before: starvation is no evidence
+    assert older("old", 1.01, 0.5) and not older("new", 0.6, 0.5)
 
 
 # -- the safety epoch ------------------------------------------------------------------------
@@ -568,7 +680,8 @@ def test_v12_keys_are_checked(raw):
 
 
 def test_the_off_values_are_accepted():
-    raw = {"a_pause_budget_s": 0, "enter_hold_window_s": 0, "load_backoff_s": 0, "b_label_unlatch": False}
+    raw = {"a_pause_budget_s": 0, "enter_hold_window_s": 0, "load_backoff_s": 0, "b_label_unlatch": False,
+           "late_tick_s": 0}
     assert BlendConfig.from_mapping(raw) == OFF
 
 

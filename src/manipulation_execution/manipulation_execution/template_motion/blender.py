@@ -57,6 +57,10 @@ value in :class:`BlendConfig` that restores the behaviour above):
 * B is not latched: a label that comes back (also as a new episode of the
   same person's gesture) keeps the hold; a release once sent is never taken
   back.
+* Ages are judged on punctual ticks: a tick more than ``late_tick_s`` after
+  the previous one (the session was starved, and what it has not read yet
+  may be queued) keeps the previous verdict on the A status age, the B port
+  status and the labels, up to twice their limit, never beyond.
 """
 
 from __future__ import annotations
@@ -149,7 +153,8 @@ class BlendConfig:
     wind_down_s: float = 0.5  # keepalive this long after giving a segment up (+ t_out_stop on errors)
     require_person_frame: bool = True
     # v1.2. Off values (bc35e2d3's behaviour): a_pause_budget_s 0 (also turns off the safety epoch and
-    # status age checks), enter_hold_window_s 0, load_backoff_s 0, b_label_unlatch false, enter_max_wait_s 0.
+    # status age checks), enter_hold_window_s 0, load_backoff_s 0, b_label_unlatch false, enter_max_wait_s 0,
+    # late_tick_s 0.
     # zll: once entered, a template is never given up for load: standing still beats going back.
     a_pause_budget_s: float = 4.0  # A may fall this far behind its schedule through pauses...
     a_pause_budget_per_s: float = 0.0  # ...plus this much per second of T_A...
@@ -169,6 +174,7 @@ class BlendConfig:
     # person's, not tried yet) is given up: one rejection, never a late entry. 0: it waits for ever.
     enter_max_wait_s: float = 1.5
     b_label_unlatch: bool = True  # B holds while the label is back; a new episode of it is the same request
+    late_tick_s: float = 0.04  # a tick this long after the previous one (2 at 50 Hz) judges no age on its own
 
     _FLAGS = ("require_person_frame", "b_label_unlatch")
     _MAY_BE_ZERO = (
@@ -178,6 +184,7 @@ class BlendConfig:
         "enter_hold_window_s",
         "load_backoff_s",
         "enter_max_wait_s",
+        "late_tick_s",
     )
 
     @classmethod
@@ -423,6 +430,9 @@ class Blender:
         self._last_exit = ""
         self._hand_out: tuple[float, ...] | None = None
         self._snap: dict = {}
+        self._last_step: float | None = None  # this tick's now
+        self._prev_step: float | None = None
+        self._tick_late = False  # this tick came more than late_tick_s after the previous one
         self.begin_round()
 
     # -- round --------------------------------------------------------------------
@@ -432,6 +442,8 @@ class Blender:
         self._round_disabled = False
         self._port_suspect = False
         self._pear_source: str | None = None  # of the newest PEAR frame this round
+        self._older_than: dict[object, tuple[bool, float | None]] = {}  # _older's verdicts, with their tick
+        self._last_step = None  # the round's first tick is punctual
         self._clear()
         self._refresh_snapshot()
 
@@ -565,6 +577,9 @@ class Blender:
             self._refresh_snapshot()
 
     def _step(self, now: float, inputs, mirror: Sequence[float] | None) -> tuple[float, ...] | None:
+        late_s = self._config.late_tick_s
+        self._tick_late = late_s > 0.0 and self._last_step is not None and now - self._last_step > late_s
+        self._prev_step, self._last_step = self._last_step, now
         m = _arm(mirror)
         frames = getattr(getattr(inputs, "window", None), "frames", ())
         if frames:  # the window holds only the frames since the previous tick
@@ -643,6 +658,27 @@ class Blender:
     def _pausing(self) -> bool:
         return self._config.a_pause_budget_s > 0.0
 
+    def _older(self, key: object, age: float, limit: float) -> bool:
+        """``age > limit``, judged on punctual ticks.
+
+        A late tick runs before the messages queued while the session was
+        starved are read: there, an age between ``limit`` and twice it keeps
+        the previous tick's verdict on ``key`` (not old: none was made); beyond
+        twice it is too old anyway.
+        """
+        if age <= limit:
+            verdict = False
+        elif age > 2.0 * limit or not self._tick_late:
+            verdict = True
+        else:
+            verdict, at = self._older_than.get(key, (False, None))
+            verdict = verdict and at is not None and at in (self._prev_step, self._last_step)
+        self._older_than[key] = (verdict, self._last_step)
+        return verdict
+
+    def _label_now(self, template: str, now: float) -> Label | None:
+        return self._labels.current(template, now, lambda age, limit: self._older(("label", template), age, limit))
+
     def _update_gate(self, now: float) -> None:
         """The held-share gate, with hysteresis: closes above enter_hold_ratio_close, opens at or below _open."""
         config = self._config
@@ -671,7 +707,7 @@ class Blender:
                 self._clock_warned = now
                 self._log(f"cbf status clock mismatch at={cbf.at:.3f} received={cbf.received_at:.3f}")
             return "cbf_clock"
-        if now - cbf.at > self._config.a_status_age_s:
+        if self._older("cbf_late", now - cbf.at, self._config.a_status_age_s):
             return "cbf_late"
         if cbf.has_cbf and cbf.mirror_active is not True:
             return "mirror_inactive"
@@ -687,7 +723,7 @@ class Blender:
         """Note each trigger and why it is kept out; with no ``block``, enter the first one that may be."""
         live = set()
         for template, names in self._templates.items():
-            label = self._labels.current(template, now)
+            label = self._label_now(template, now)
             if label is None or (template, label.episode) in self._attempted:
                 continue
             key = (template, label.episode)
@@ -975,7 +1011,7 @@ class Blender:
         actor = inputs.actor
         if actor is None or actor.actor_id != self._actor:
             return "actor_changed"
-        label = self._labels.current(self._label.template, now)
+        label = self._label_now(self._label.template, now)
         if label is None or label.actor_id != self._actor:
             return "label_lost"
         if label.episode != self._label.episode:
@@ -1050,7 +1086,7 @@ class Blender:
         status = self._port.latest()
         arm = self._status_arm()
         self._hand_target = self._status_hand()
-        if status is None or now - status.received_at > config.status_stale_s:
+        if status is None or self._older("port_stale", now - status.received_at, config.status_stale_s):
             self._client.release(self._seg_id, fast=True)
             return self._to_wait_done(now, "status_stale", segment.t_out_stop)
         if self._port_lost(status):
@@ -1094,7 +1130,7 @@ class Blender:
         status = self._port.latest()
         arm = self._status_arm()
         self._hand_target = self._status_hand()
-        stale = status is None or now - status.received_at > config.status_stale_s
+        stale = status is None or self._older("port_stale", now - status.received_at, config.status_stale_s)
         if stale:
             self._deadline = min(self._deadline, now + segment.t_out_stop + config.done_margin_s)
         elif status.seg_id == self._seg_id and status.state in TERMINAL:
