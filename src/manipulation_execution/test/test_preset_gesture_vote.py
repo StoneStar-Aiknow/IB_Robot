@@ -266,6 +266,56 @@ def test_one_hand_runs_exit_after_exit_s_one_hand():
     assert not f.vote.update(now_mono_s=last + 0.51)["heart"].active
 
 
+SITE = gv.VoteConfig(exit_s=0.6, exit_s_one_hand=0.7)  # aimdk_x2_voice_mirror_all.yaml (zll 11-20)
+
+
+def _site_feed(crop="both"):
+    f = Feed(gv.GestureVote(SITE))
+    for _ in range(4):
+        _, s = f.run(cls="heart", step_ms=150, crop=crop)
+    assert s["heart"].active
+    return f
+
+
+def _held(f, steps_ms, crop="both"):
+    """Heart runs ``steps_ms`` apart; whether it stayed active at every run and every 50 ms tick."""
+    held = []
+    for step in steps_ms:
+        t = f.mono()
+        _, s = f.run(cls="heart", step_ms=step, crop=crop)
+        held.append(s["heart"].active)
+        while t + 0.05 < f.mono():  # the node's 50 ms ticks up to the next run
+            t += 0.05
+            held.append(f.vote.update(now_mono_s=t)["heart"].active)
+    return all(held)
+
+
+def test_site_exit_s_bridges_one_lost_remote_result_not_two():
+    assert _held(_site_feed(), [227, 454, 227, 454, 227])  # 4.4 Hz, every other one lost
+    assert _held(_site_feed(), [312] * 6)  # the slowest 5 s: 3.2 Hz, none lost
+    assert not _held(_site_feed(), [312, 625, 312])  # 3.2 Hz with one lost is beyond 0.6 s
+    assert not _held(_site_feed(), [227, 681, 227])  # two lost in a row at 4.4 Hz
+
+
+def test_site_one_hand_exit_bridges_one_lost_result_at_3_hz():
+    assert _held(_site_feed("one"), [333, 667, 333, 667], crop="one")
+    old = Feed()
+    for _ in range(4):
+        old.run(cls="heart", step_ms=150, crop="one")
+    assert not _held(old, [333, 667], crop="one")  # 0.5 s did not
+
+
+def test_site_letting_go_ends_within_exit_s_and_one_interval():
+    f = _site_feed()
+    last = f.stamp - 150 * MS
+    for _ in range(6):
+        stamp = f.stamp
+        _, s = f.run(cls="none", step_ms=227)
+        if not s["heart"].active:
+            break
+    assert not s["heart"].active and (stamp - last) / 1e9 <= SITE.exit_s + 0.227
+
+
 def test_one_hand_entry_needs_its_own_count():
     f = Feed(gv.GestureVote(gv.VoteConfig(min_frames_one_hand=4)))
     for _ in range(6):

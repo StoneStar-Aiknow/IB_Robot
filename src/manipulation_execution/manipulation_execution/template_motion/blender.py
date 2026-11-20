@@ -31,10 +31,31 @@ done_margin_s``. Every exit goes through C back to the mirror, and every exit
 is logged with its reason and the time since the template was entered.
 
 Counting (logs only): a trigger is a label episode of the session's actor
-that was not entered yet; it ends admitted (``template enter``) or rejected
-(``template reject``, with the last reason that kept it out). Every attempt,
-from entering A, ends in one outcome (``outcome=`` in its first ``template
-exit`` line): complete, the person let go before B, or an abort by reason.
+that was not entered yet (nor taken over by the running template); it ends
+admitted (``template enter``) or rejected (``template reject``, with the last
+reason that kept it out). Every attempt, from entering A, ends in one outcome
+(``outcome=`` in its first ``template exit`` line): complete, the person let
+go before B, or an abort by reason. Pauses and resumes stay in their attempt
+(``pauses=`` / ``paused_s=`` in the exit line).
+
+v1.2 (``X2-TEMPLATE-ROUND1-DESIGN-c5.md``, "v1.2 改动"; each part has an off
+value in :class:`BlendConfig` that restores the behaviour above):
+
+* A pauses on a non-collision CBF hold, or while the data plane's newest
+  status is older than ``a_status_age_s`` by its own ``at``: the arm request,
+  the hand target, A's clock and the mirror reference M all stand still, so
+  what the CBF releases after ``hold_release_after_s`` is a still pose. A
+  resumes on clean, recent statuses of the same safety epoch, easing M and
+  the clock back in over a ramp as long as the pause needs (short holds
+  cost little). A leaves for C on a collision, a let-go, a safety epoch or
+  arm owner change, ``a_untrusted_max_s`` without a status it can trust, or
+  once it is ``a_pause_budget_s`` (+ per second of T_A) behind its schedule.
+  C blends from the same M, so leaving mid-pause or mid-ramp is continuous.
+* Entry needs the safety epoch, a recent status, a held share of CBF calls
+  below a gate with hysteresis, and no load exit within ``load_backoff_s``.
+* B is not latched: a label that comes back (also as a new episode of the
+  same person's gesture) keeps the hold; a release once sent is never taken
+  back.
 """
 
 from __future__ import annotations
@@ -55,21 +76,31 @@ PERSON_SOURCE = "yolox"  # a PEAR frame of a detected person; center_fallback ne
 DEFAULT_HAND_TRAVEL_S = 1.0  # T_A's hand share when the hand output is not known yet
 COMPLETE = ("label_inactive", "hold_max", "release")  # the playback ran and the port said DONE
 LET_GO = ("label_lost", "actor_changed")  # the person stopped asking before B
+LOAD_EXITS = ("a_cbf_hold", "a_pause_budget", "a_cbf_untrusted")  # load_backoff_s follows these (and paused a_timeout)
+MIN_JERK_ACCEL = 5.7735  # a min-jerk's peak d2/ds2 (10 / sqrt 3)
+RELEASE_AFTER_S = 0.2  # the CBF's hold_release_after_s when its status does not say (on site 0.2)
+CLOCK_AHEAD_S = 0.05  # a status made this far after it was received: the two clocks differ
+CLOCK_BEHIND_S = 1.0  # or received this long after it was made
+PAUSE_LOG_LINES = 2  # pause / resume lines per attempt; the rest are counted in the exit line
 
 
 def outcome_of(reason: str) -> str:
-    """complete, let_go, or the abort's kind: cbf_hold, timeout, port, safety, stop, error."""
+    """complete, let_go, or the abort's kind: collision, cbf_hold, untrusted, timeout, port, safety, stop, error."""
     if reason in COMPLETE:
         return "complete"
     if reason in LET_GO:
         return "let_go"
     if reason.startswith("error"):
         return "error"
-    if reason.startswith("stopped") or reason.startswith("safety"):
+    if reason.startswith(("stopped", "safety", "a_epoch", "a_owner")):
         return "safety"
     if reason == "stop":
         return "stop"
-    if reason.startswith("a_cbf"):
+    if reason == "a_cbf_collision":
+        return "collision"
+    if reason == "a_cbf_untrusted":
+        return "untrusted"
+    if reason.startswith("a_cbf") or reason == "a_pause_budget":
         return "cbf_hold"
     if reason == "a_timeout":
         return "timeout"
@@ -116,6 +147,25 @@ class BlendConfig:
     wrap_min_s: float = 0.3
     wind_down_s: float = 0.5  # keepalive this long after giving a segment up (+ t_out_stop on errors)
     require_person_frame: bool = True
+    # v1.2. Off values (bc35e2d3's behaviour): a_pause_budget_s 0 (also turns off the safety epoch and
+    # status age checks), enter_hold_window_s 0, load_backoff_s 0, b_label_unlatch false.
+    a_pause_budget_s: float = 0.6  # A may fall this far behind its schedule through pauses...
+    a_pause_budget_per_s: float = 0.5  # ...plus this much per second of T_A (2X held share)...
+    a_pause_max_s: float = 2.0  # ...but never more than this
+    a_status_age_s: float = 0.1  # A moves only while the newest status is this recent by its `at` (2 periods)
+    a_untrusted_max_s: float = 0.5  # no status A can trust this long: back to the mirror (absolute)
+    a_release_guard_s: float = 0.05  # a hold this close to the CBF's release counts as released
+    a_resume_ramp_s: float = 0.2  # the shortest resume after a hold the CBF released (or nearly)
+    a_short_ramp_s: float = 0.06  # the shortest resume after a short hold
+    a_resume_accel: float = 12.0  # rad/s2; a resume is stretched until no joint accelerates harder (or than A does)
+    enter_hold_window_s: float = 2.0  # the held share of CBF calls over this long gates the entry
+    enter_hold_ratio_open: float = 0.1  # opens at or below this share (X: 2x the ~5% held after the load cut)...
+    enter_hold_ratio_close: float = 0.2  # ...and closes above this one (2X)
+    load_backoff_s: float = 3.0  # no entry this long after an attempt ended for load
+    b_label_unlatch: bool = True  # B holds while the label is back; a new episode of it is the same request
+
+    _FLAGS = ("require_person_frame", "b_label_unlatch")
+    _MAY_BE_ZERO = ("cooldown_s", "a_pause_budget_s", "a_pause_budget_per_s", "enter_hold_window_s", "load_backoff_s")
 
     @classmethod
     def from_mapping(cls, raw: Mapping | None) -> BlendConfig:
@@ -127,17 +177,22 @@ class BlendConfig:
             raise ValueError(f"unknown motion_template keys: {', '.join(unknown)}")
         values = {}
         for name, value in raw.items():
-            if name == "require_person_frame":
+            if name in cls._FLAGS:
                 if not isinstance(value, bool):
-                    raise ValueError("require_person_frame must be true or false")
+                    raise ValueError(f"{name} must be true or false")
             elif not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
                 raise ValueError(f"{name} must be a finite number")
-            elif value < 0.0 or (value == 0.0 and name != "cooldown_s"):
+            elif value < 0.0 or (value == 0.0 and name not in cls._MAY_BE_ZERO):
                 raise ValueError(f"{name}={value:g} must be positive")
-            elif name == "arrive_fraction" and value > 1.0:
-                raise ValueError("arrive_fraction must be within (0, 1]")
-            values[name] = value if name == "require_person_frame" else float(value)
-        return cls(**values)
+            elif name in ("arrive_fraction", "enter_hold_ratio_open", "enter_hold_ratio_close") and value > 1.0:
+                raise ValueError(f"{name} must be within (0, 1]")
+            values[name] = value if name in cls._FLAGS else float(value)
+        config = cls(**values)
+        if config.enter_hold_ratio_open > config.enter_hold_ratio_close:
+            raise ValueError("enter_hold_ratio_open must not exceed enter_hold_ratio_close")
+        if config.a_status_age_s >= RELEASE_AFTER_S:
+            raise ValueError(f"a_status_age_s must stay below the CBF's release after {RELEASE_AFTER_S:g} s")
+        return config
 
 
 # Which joint counts how much when a label has several segments (xsign: left / right front):
@@ -185,6 +240,81 @@ class _Quintic:
         return speed, accel
 
 
+class _Clock:
+    """A's own time tau: wall time, stopped in a pause, then eased back in.
+
+    After a pause the rate goes 0 -> 1 as a min-jerk over the ramp T_r, so
+    tau = tau_f + T_r (2.5 s^4 - 3 s^5 + s^6), s = t / T_r: alpha starts again
+    from rest, and the ramp costs T_r / 2 of schedule.
+    """
+
+    def __init__(self, now: float):
+        self._t0, self._tau0, self._ramp, self._stopped = now, 0.0, 0.0, False
+
+    def at(self, now: float) -> float:
+        if self._stopped:
+            return self._tau0
+        t, T = max(now - self._t0, 0.0), self._ramp
+        if t >= T:
+            return self._tau0 + t - T / 2.0
+        s = t / T
+        return self._tau0 + T * s**4 * (2.5 + s * (-3.0 + s))
+
+    def rate(self, now: float) -> tuple[float, float]:
+        """(dtau/dt, d2tau/dt2)."""
+        if self._stopped:
+            return 0.0, 0.0
+        t, T = now - self._t0, self._ramp
+        if t >= T:
+            return 1.0, 0.0
+        value, slope, _ = _min_jerk(t / T)
+        return value, slope / T
+
+    def stop(self, now: float) -> None:
+        self._tau0, self._stopped = self.at(now), True
+
+    def go(self, now: float, ramp: float) -> None:
+        self._t0, self._ramp, self._stopped = now, ramp, False
+
+
+class _MirrorRef:
+    """M, what A and C blend from: the mirror command m; frozen in a pause, eased back to m (min-jerk) after it."""
+
+    def __init__(self):
+        self._frozen: tuple[float, ...] | None = None
+        self._ramp: tuple[float, float] | None = None  # (start, duration)
+
+    @property
+    def held(self) -> bool:
+        return self._frozen is not None and self._ramp is None
+
+    def value(self, now: float, m: tuple[float, ...]) -> tuple[float, ...]:
+        if self._frozen is None:
+            return m
+        if self._ramp is None:
+            return self._frozen
+        t0, T = self._ramp
+        s = (now - t0) / T
+        if s >= 1.0:
+            self._frozen = self._ramp = None
+            return m
+        return _lerp(self._frozen, m, _min_jerk(s)[0])
+
+    def freeze(self, now: float, m: tuple[float, ...]) -> None:
+        self._frozen, self._ramp = self.value(now, m), None
+
+    def ramp(self, now: float, duration: float) -> None:
+        if self._frozen is not None:
+            self._ramp = (now, duration)
+
+    def remaining(self, now: float) -> float:
+        if self._frozen is None:
+            return 0.0
+        if self._ramp is None:
+            return math.inf
+        return max(self._ramp[0] + self._ramp[1] - now, 0.0)
+
+
 def _fmt(counts: Mapping[str, int]) -> str:
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items())) or "-"
 
@@ -195,6 +325,36 @@ def _lerp(m: Sequence[float], anchor: Sequence[float], weight: float) -> tuple[f
 
 def _farthest(a: Sequence[float], b: Sequence[float]) -> float:
     return max(abs(x - y) for x, y in zip(a, b, strict=False))
+
+
+def _resume_peaks(
+    start: Sequence[float], m: Sequence[float], P: Sequence[float], tau_f: float, T_A: float, ramp: float
+) -> tuple[float, float]:
+    """(max |d/dt|, max |d2/dt2|), any joint, of A's output from a pause through a resume of ``ramp``.
+
+    M eases from ``start`` to a still ``m``, A's clock from ``tau_f`` as in :class:`_Clock`; sampled from
+    the still pose before to a little after the ramp.
+    """
+    samples = 64
+    dt = ramp / samples
+
+    def out(t: float) -> tuple[float, ...]:
+        if t <= 0.0:
+            tau, r = tau_f, 0.0
+        elif t >= ramp:
+            tau, r = tau_f + t - ramp / 2.0, 1.0
+        else:
+            s = t / ramp
+            tau, r = tau_f + ramp * s**4 * (2.5 + s * (-3.0 + s)), _min_jerk(s)[0]
+        return _lerp(_lerp(start, m, r), P, _min_jerk(tau / T_A)[0])
+
+    x = [out(k * dt) for k in range(-2, samples + 8)]
+    speed = max(_farthest(b, a) for a, b in zip(x, x[1:], strict=False)) / dt
+    accel = max(
+        max(abs(p - 2.0 * q + r) for p, q, r in zip(a, b, c, strict=False))
+        for a, b, c in zip(x, x[1:], x[2:], strict=False)
+    )
+    return speed, accel / (dt * dt)
 
 
 def _arm(values) -> tuple[float, ...] | None:
@@ -242,6 +402,11 @@ class Blender:
         self.aborts: dict[str, int] = {}  # attempts that neither completed nor were let go, by reason
         self._pending: dict[tuple[str, int], list] = {}  # trigger -> [first seen, last reason, reasons seen]
         self._attempt_open = False
+        self.pauses = 0  # A's pauses, all attempts
+        self._backoff_until = -math.inf  # load_backoff_s after a load exit
+        self._gate_open = True  # the held-share gate (enter_hold_*)
+        self._gate_ratio: float | None = None
+        self._clock_warned = -math.inf
         self._last_exit = ""
         self._hand_out: tuple[float, ...] | None = None
         self._snap: dict = {}
@@ -286,6 +451,23 @@ class Blender:
         self._wrap_from: tuple[float, ...] | None = None
         self._wrap_t0: float | None = None
         self._wrap_duration = 0.0
+        # A's pauses (v1.2)
+        self._clock = _Clock(0.0)
+        self._ref = _MirrorRef()
+        self._budget = 0.0  # how far behind its schedule this A may fall
+        self._epoch: int | None = None  # the safety epoch and arm owner A was entered in
+        self._owner: int | None = None
+        self._cbf_serial = 0  # the newest data-plane status A has read
+        self._paused = False
+        self._pause_since = 0.0
+        self._pause_why = ""
+        self._pause_long = False  # the CBF released, or was about to: two clean statuses and a full ramp
+        self._clean_run = 0  # clean statuses in a row since the pause began
+        self._clean_serial = 0
+        self._untrusted_since: float | None = None
+        self._pauses = 0
+        self._paused_s = 0.0
+        self._pause_lines = 0
 
     def end_round(self, now: float) -> None:
         """The session's round ends (wrap-up next, or WAIT). A playback is released fast."""
@@ -374,6 +556,7 @@ class Blender:
         frames = getattr(getattr(inputs, "window", None), "frames", ())
         if frames:  # the window holds only the frames since the previous tick
             self._pear_source = getattr(frames[-1], "source", None)
+        self._update_gate(now)
         phase = self._phase
         if phase is Phase.IDLE:
             if m is not None:
@@ -428,9 +611,60 @@ class Blender:
         cbf = self._cbf.latest()
         if cbf is None or not 0 <= now - cbf.received_at <= self._config.cbf_fresh_s:
             return "cbf_stale", None
+        if self._pausing:
+            trust = self._trust(cbf, now)
+            if trust is not None:
+                return trust, None
         if cbf.intervening:
             return "cbf_hold", None
+        if now < self._backoff_until:
+            return "backoff", None
+        if self._config.enter_hold_window_s > 0.0:
+            if self._gate_ratio is None:
+                return "hold_ratio_unknown", None
+            if not self._gate_open:
+                return "hold_ratio", None
         return None, status
+
+    @property
+    def _pausing(self) -> bool:
+        return self._config.a_pause_budget_s > 0.0
+
+    def _update_gate(self, now: float) -> None:
+        """The held-share gate, with hysteresis: closes above enter_hold_ratio_close, opens at or below _open."""
+        config = self._config
+        if config.enter_hold_window_s <= 0.0:
+            return
+        ratio = self._gate_ratio = self._cbf.hold_ratio(now, config.enter_hold_window_s)
+        if ratio is None:
+            return
+        if self._gate_open and ratio > config.enter_hold_ratio_close:
+            self._gate_open = False
+        elif not self._gate_open and ratio <= config.enter_hold_ratio_open:
+            self._gate_open = True
+        else:
+            return
+        word = "open" if self._gate_open else "closed"
+        self._log(f"template gate {word} held={ratio:.3f} window={config.enter_hold_window_s:.1f}")
+
+    def _trust(self, cbf, now: float) -> str | None:
+        """Why the data plane's status ``cbf`` cannot be relied on at ``now`` (None: it can)."""
+        if cbf is None:
+            return "cbf_none"
+        if cbf.at is None:
+            return "cbf_no_time"
+        if cbf.at > cbf.received_at + CLOCK_AHEAD_S or cbf.received_at - cbf.at > CLOCK_BEHIND_S:
+            if now - self._clock_warned >= 1.0:
+                self._clock_warned = now
+                self._log(f"cbf status clock mismatch at={cbf.at:.3f} received={cbf.received_at:.3f}")
+            return "cbf_clock"
+        if now - cbf.at > self._config.a_status_age_s:
+            return "cbf_late"
+        if cbf.has_cbf and cbf.mirror_active is not True:
+            return "mirror_inactive"
+        if cbf.safety_epoch is None:
+            return "epoch_missing"
+        return None
 
     def _try_enter(self, now: float, inputs, m: tuple[float, ...]) -> None:
         block, status = self._entry_block(now, inputs)
@@ -513,6 +747,14 @@ class Blender:
             MIN_JERK_PEAK * self._entry_dist / config.a_peak_speed, hand + config.a_hand_margin_s, config.a_min_s
         )
         self._phase, self._since, self._entered_at = Phase.A, now, now
+        self._clock = _Clock(now)
+        cbf = self._cbf.latest()
+        if cbf is not None:
+            self._epoch, self._owner, self._cbf_serial = cbf.safety_epoch, cbf.arm_owner, cbf.serial
+        if self._pausing:
+            self._budget = min(
+                config.a_pause_budget_s + config.a_pause_budget_per_s * self._t_a, config.a_pause_max_s
+            )
         self._hand_target = segment.hand_P
         self.entries += 1
         self._attempt_open = True
@@ -524,26 +766,25 @@ class Blender:
     # -- A ------------------------------------------------------------------------
 
     def _blend_a(self, now: float, m: tuple[float, ...]) -> tuple[float, ...]:
-        alpha = _min_jerk((now - self._since) / self._t_a)[0]
-        return _lerp(m, self._segment.P, alpha)
+        alpha = _min_jerk(self._clock.at(now) / self._t_a)[0]
+        return _lerp(self._ref.value(now, m), self._segment.P, alpha)
 
     def _tick_a(self, now: float, inputs, m: tuple[float, ...]) -> tuple[float, ...]:
         config, segment = self._config, self._segment
-        elapsed = now - self._since
-        self._a_elapsed = elapsed
         reason = self._label_check(now, inputs)
         cbf = self._cbf.latest()
-        if reason is None and cbf is not None and cbf.received_at > self._since and cbf.intervening:
+        if reason is None and self._pausing:
+            reason = self._a_cbf(now, cbf, m)
+        elif reason is None and cbf is not None and cbf.received_at > self._since and cbf.intervening:
             reason = "a_cbf_hold"
+        elapsed = self._a_elapsed = self._clock.at(now)
         if reason is None and elapsed > self._t_a + config.a_timeout_margin_s:
             reason = "a_timeout"
+        if reason is None and now - self._entered_at > self._t_a + config.a_timeout_margin_s + self._budget:
+            reason = "a_pause_budget" if self._paused else "a_timeout"
         if reason is not None:
-            s = elapsed / self._t_a
-            value, speed, accel = _min_jerk(s)
-            if s >= 1.0:
-                speed = accel = 0.0
-            return self._to_c(now, reason, m, segment.P, value, speed / self._t_a, accel / self._t_a**2)
-        if elapsed >= self._t_a and self._arrived(now, inputs, cbf):
+            return self._leave_a(now, reason, m)
+        if not self._paused and elapsed >= self._t_a and self._arrived(now, inputs, cbf):
             try:
                 self._seg_id = self._client.start(segment.name, now)
             except RuntimeError:
@@ -570,18 +811,167 @@ class Blender:
             return False
         if status.state not in _PORT_FREE or self._client.busy:
             return False
+        if self._pausing and (self._trust(cbf, now) is not None or cbf.safety_epoch != self._epoch):
+            return False
         return cbf is not None and 0 <= now - cbf.received_at <= config.cbf_fresh_s and not cbf.intervening
 
+    def _leave_a(self, now: float, reason: str, m: tuple[float, ...]) -> tuple[float, ...]:
+        """To C from where A is: alpha's value, speed and acceleration (0 in a pause); M eases back to m."""
+        config = self._config
+        s = self._clock.at(now) / self._t_a
+        value, speed, accel = _min_jerk(s)
+        if s >= 1.0:
+            speed = accel = 0.0
+        rate, rate_slope = self._clock.rate(now)
+        if self._paused:
+            self._paused_s += now - self._pause_since
+            self._paused = False
+        if self._ref.held:  # left in a pause: M goes back to the mirror within C
+            gap = _farthest(self._ref.value(now, m), m)
+            self._ref.ramp(now, max(config.a_resume_ramp_s, MIN_JERK_PEAK * gap / config.c_peak_speed))
+        T = self._t_a
+        return self._to_c(
+            now, reason, m, self._segment.P, value, speed * rate / T, accel * rate**2 / T**2 + speed * rate_slope / T
+        )
+
+    def _a_cbf(self, now: float, cbf, m: tuple[float, ...]) -> str | None:
+        """A's reading of the data plane (v1.2): an exit reason, or None after pausing or resuming as due.
+
+        In order: every status since the last tick (a collision, a safety epoch
+        or arm owner change in any of them ends A); then whether the newest can
+        be trusted now; then hold -> pause, clean -> resume.
+        """
+        config = self._config
+        for state in self._cbf.after(self._cbf_serial):
+            self._cbf_serial = state.serial
+            if state.collision:
+                return "a_cbf_collision"
+            if state.safety_epoch is not None and state.safety_epoch != self._epoch:
+                return "a_epoch_changed"
+            if state.arm_owner != self._owner:
+                return "a_owner_changed"
+            if not self._paused:
+                continue
+            clean = (
+                not state.intervening
+                and state.at is not None
+                and -CLOCK_BEHIND_S <= state.at - state.received_at <= CLOCK_AHEAD_S
+                and (state.mirror_active is True or not state.has_cbf)
+            )
+            if clean:
+                self._clean_run = self._clean_run + 1 if state.serial == self._clean_serial + 1 else 1
+                self._clean_serial = state.serial
+            else:
+                self._clean_run = 0
+                release_at = state.hold_release_after_s or RELEASE_AFTER_S
+                self._pause_long |= state.releasing or state.stuck_s >= release_at - config.a_release_guard_s
+        trust = self._trust(cbf, now)
+        if trust == "epoch_missing":
+            return "a_epoch_missing"  # all else is trusted: a checked hand-back through C
+        if trust is None:
+            self._untrusted_since = None
+        elif self._untrusted_since is None:
+            self._untrusted_since = now
+        elif now - self._untrusted_since > config.a_untrusted_max_s:
+            return "a_cbf_untrusted"
+        holding = trust is None and cbf.intervening
+        if not self._paused:
+            if trust is not None or holding:
+                self._pause(now, m, "hold" if holding else trust, cbf)
+            return None
+        release_at = (cbf.hold_release_after_s if cbf is not None else None) or RELEASE_AFTER_S
+        if holding:  # how long the CBF has held by now
+            held_for = cbf.stuck_s + max(now - cbf.at, 0.0)
+        else:  # nothing known since the newest status: it may have held since then
+            held_for = now - cbf.at if cbf is not None and cbf.at is not None else now - self._pause_since
+        self._pause_long |= held_for >= release_at - config.a_release_guard_s
+        if trust is None and not holding and self._clean_run >= (2 if self._pause_long else 1):
+            return self._resume(now, m)
+        if now - self._entered_at - self._clock.at(now) > self._budget:
+            return "a_pause_budget"
+        return None
+
+    def _pause(self, now: float, m: tuple[float, ...], why: str, cbf) -> None:
+        """Arm, hand, A's clock and M stand still: the CBF's release after hold_release_after_s is this pose."""
+        self._ref.freeze(now, m)
+        self._clock.stop(now)
+        self._paused, self._pause_since, self._pause_why, self._pause_long = True, now, why, False
+        self._clean_run = 0
+        hand = self._hand_out
+        if hand is not None and len(hand) == len(self._segment.hand_P):
+            self._hand_target = hand
+        self._pauses += 1
+        self.pauses += 1
+        if self._pause_lines < PAUSE_LOG_LINES:
+            self._pause_lines += 1
+            detail = "none" if cbf is None else f"{cbf.detail} age={now - cbf.received_at:.2f}"
+            self._log(
+                f"template pause {self._label.template} why={why} n={self._pauses} tau={self._clock.at(now):.2f} "
+                f"behind={now - self._entered_at - self._clock.at(now):.2f} cbf=[{detail}]"
+            )
+
+    def _resume(self, now: float, m: tuple[float, ...]) -> str | None:
+        ramp = self._ramp_duration(now, m)
+        behind = now - self._entered_at - self._clock.at(now)
+        if behind + ramp / 2.0 > self._budget:  # never begin a ramp that the budget cannot finish
+            return "a_pause_budget"
+        paused = now - self._pause_since
+        self._paused_s += paused
+        self._ref.ramp(now, ramp)
+        self._clock.go(now, ramp)
+        self._paused, self._untrusted_since = False, None
+        self._hand_target = self._segment.hand_P
+        if self._pause_lines < PAUSE_LOG_LINES:
+            self._pause_lines += 1
+            self._log(
+                f"template resume {self._label.template} n={self._pauses} paused={paused:.2f} "
+                f"long={self._pause_long} ramp={ramp:.2f} behind={behind + ramp / 2.0:.2f}"
+            )
+        return None
+
+    def _ramp_duration(self, now: float, m: tuple[float, ...]) -> float:
+        """T_r: M eases from M_f to m and alpha's clock from 0 to 1; stretched until no joint is faster than
+        c_peak_speed nor accelerates harder than a_resume_accel (or than A does) while m stands still."""
+        config, P, T_A = self._config, self._segment.P, self._t_a
+        start, tau_f = self._ref.value(now, m), self._clock.at(now)
+        gap = _farthest(start, m)
+        floor = config.a_resume_ramp_s if self._pause_long else config.a_short_ramp_s
+        ramp = max(floor, MIN_JERK_PEAK * gap / config.a_peak_speed)
+        dist = _farthest(P, m)
+        speed_limit = max(config.c_peak_speed, MIN_JERK_PEAK * dist / T_A) * 1.02
+        accel_limit = max(config.a_resume_accel, MIN_JERK_ACCEL * dist / T_A**2) * 1.02
+        for _ in range(C_STRETCH_STEPS):
+            speed, accel = _resume_peaks(start, m, P, tau_f, T_A, ramp)
+            if speed <= speed_limit and accel <= accel_limit:
+                break
+            ramp *= C_STRETCH
+        return ramp
+
     def _label_check(self, now: float, inputs) -> str | None:
-        """Why the person no longer asks for this template, or None."""
+        """Why the person no longer asks for this template, or None.
+
+        With ``b_label_unlatch`` a new episode of the same template by the same
+        actor is the same request (the label dropped out and came back): it is
+        taken over, not counted as a trigger, and never entered on its own.
+        """
         actor = inputs.actor
         if actor is None or actor.actor_id != self._actor:
             return "actor_changed"
         label = self._labels.current(self._label.template, now)
-        if label is None:
+        if label is None or label.actor_id != self._actor:
             return "label_lost"
-        if label.episode != self._label.episode or label.actor_id != self._actor:
-            return "label_lost"
+        if label.episode != self._label.episode:
+            if not self._config.b_label_unlatch:
+                return "label_lost"
+            key = (label.template, label.episode)
+            self._attempted.add(key)
+            if self._pending.pop(key, None) is not None:
+                self.triggers -= 1
+            self._log(
+                f"template relabel {label.template} episode={self._label.episode}->{label.episode} "
+                f"phase={self._phase.value}"
+            )
+            self._label = label
         return None
 
     # -- the playback ---------------------------------------------------------------
@@ -657,8 +1047,13 @@ class Blender:
                 return self._to_wait_done(now, status.reason or "exit", segment.t_out)
             if status.state == "HOLD" and self._hold_since is None:
                 self._hold_since = now
-        if not self._label_lost and self._label_check(now, inputs) is not None:
-            self._label_lost, self._label_lost_at = True, now
+        lost = self._label_check(now, inputs) is not None
+        if lost and not self._label_lost:
+            self._label_lost_at = now
+        if config.b_label_unlatch:  # the label came back: hold on (a release once sent stays)
+            self._label_lost = lost
+        else:
+            self._label_lost |= lost
         if self._label_lost and self._hold_since is not None and now - self._hold_since >= config.min_hold_s:
             self._client.release(self._seg_id, fast=False)
             self._released = True
@@ -721,7 +1116,7 @@ class Blender:
         config = self._config
         self._exit_log(reason, now)
         self._anchor = tuple(anchor)
-        dist = 0.0 if m is None else _farthest(self._anchor, m)
+        dist = 0.0 if m is None else _farthest(self._anchor, self._ref.value(now, m))
         self._c_dist = dist
         duration = max(config.c_duration_s * beta, MIN_JERK_PEAK * beta * dist / config.c_peak_speed, config.c_min_s)
         curve = _Quintic(beta, speed, accel, duration)
@@ -734,6 +1129,9 @@ class Blender:
             if peak_speed * dist <= speed_limit and peak_accel * dist <= accel_limit:
                 break
             curve = _Quintic(beta, speed, accel, curve.duration * C_STRETCH)
+        easing = self._ref.remaining(now)  # A was left in a pause: C ends after M is back on the mirror
+        if easing > curve.duration:
+            curve = _Quintic(beta, speed, accel, easing)
         self._c_curve = curve
         self._phase, self._since = Phase.C, now
         self._hand_target = None
@@ -744,7 +1142,7 @@ class Blender:
     def _blend_c(self, now: float, m: tuple[float, ...]) -> tuple[float, ...]:
         t = now - self._since
         beta = min(max(self._c_curve.at(t), 0.0), 1.0)
-        arm = _lerp(m, self._anchor, beta)
+        arm = _lerp(self._ref.value(now, m), self._anchor, beta)
         if t >= self._c_curve.duration:
             name = self._label.template if self._label is not None else "?"
             total = now - self._entered_at if self._entered_at is not None else 0.0
@@ -822,6 +1220,7 @@ class Blender:
             )
         label = self._labels.describe(self._label.template, now) if self._label is not None else "none"
         outcome = "repeat"  # a later exit of the same attempt (a stop or an error during C)
+        backoff = ""
         if self._attempt_open:
             self._attempt_open = False
             outcome = outcome_of(reason)
@@ -829,12 +1228,18 @@ class Blender:
             if outcome not in ("complete", "let_go"):
                 key = reason.split(":", 1)[0]
                 self.aborts[key] = self.aborts.get(key, 0) + 1
+            load = reason in LOAD_EXITS or (reason == "a_timeout" and self._pauses > 0)
+            if load and self._config.load_backoff_s > 0.0:
+                self._backoff_until = now + self._config.load_backoff_s
+                backoff = f" backoff={self._config.load_backoff_s:.1f}"
+        paused_s = self._paused_s + (now - self._pause_since if self._paused else 0.0)
         self._log(
             f"template exit {name} seg={seg} phase={self._phase.value} reason={reason} "
             f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f} "
             f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f} "
             f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f} "
-            f"outcome={outcome} played={self._played_at is not None} cbf=[{cbf_text}] label=[{label}]"
+            f"outcome={outcome} played={self._played_at is not None} cbf=[{cbf_text}] label=[{label}] "
+            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}"
         )
 
     def _refresh_snapshot(self) -> None:
@@ -854,6 +1259,10 @@ class Blender:
             "last_exit": self._last_exit,
             "round_disabled": self._round_disabled,
             "port_suspect": self._port_suspect,
+            "pauses": self.pauses,
+            "paused": self._paused,
+            "gate": {"open": self._gate_open, "held": self._gate_ratio},
+            "backoff_until": None if math.isinf(self._backoff_until) else self._backoff_until,
         }
 
     def snapshot(self) -> dict:

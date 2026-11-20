@@ -4,7 +4,9 @@
   (``x2_template_status/v1``) with the time it was received;
 * :class:`CbfMonitor`: whether the data plane's CBF is holding or releasing,
   from ``/aimdk_runtime/dataplane/status`` (``cbf.stuck_s``, ``releasing``,
-  ``stuck_collision``);
+  ``stuck_collision``), the status's own time and safety epoch, the recent
+  statuses in order (one older than the newest is dropped) and the share of
+  held CBF calls over a window;
 * :class:`PlayClient`: ``start`` / ``release`` from the blender, ``pump``
   from the node's tick for the keepalive.
 
@@ -25,6 +27,7 @@ from __future__ import annotations
 import json
 import math
 import threading
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -36,6 +39,7 @@ STATES = ("IDLE", "ENTER_B", "HOLD", "EXIT_B", "DONE", "REJECTED", "STOPPED")
 PLAYING = ("ENTER_B", "HOLD", "EXIT_B")
 TERMINAL = ("DONE", "REJECTED", "STOPPED")
 KEEPALIVE_SLACK_S = 0.005  # a tick that comes a little early still sends: 0.02 at 50 Hz is every tick
+CBF_HISTORY = 400  # data-plane statuses kept: 20 s at 20 Hz
 
 
 @dataclass(frozen=True)
@@ -131,6 +135,7 @@ class CbfState:
     hold_release_after_s: float | None = None
     release_episodes: int | None = None
     collision_release_episodes: int | None = None
+    has_cbf: bool = False  # the status had a cbf section (without one the CBF is off)
 
 
 def _count(value) -> int | None:
@@ -150,7 +155,9 @@ class CbfMonitor:
         self._lock = threading.Lock()
         self._latest: CbfState | None = None
         self._serial = 0
+        self._history: deque[CbfState] = deque(maxlen=CBF_HISTORY)
         self.malformed = 0
+        self.reordered = 0
 
     def observe(self, data: str, now: float) -> None:
         try:
@@ -182,6 +189,7 @@ class CbfMonitor:
                     hold_release_after_s=_seconds(cbf.get("hold_release_after_s")),
                     release_episodes=_count(cbf.get("release_episodes")),
                     collision_release_episodes=_count(cbf.get("collision_release_episodes")),
+                    has_cbf=True,
                     **top,
                 )
         except Exception:
@@ -189,12 +197,51 @@ class CbfMonitor:
                 self.malformed += 1
             return
         with self._lock:
+            before = self._latest
+            if before is not None and None not in (before.at, state.at) and state.at < before.at:
+                self.reordered += 1  # older than the newest: one publisher never does this, a queue might
+                return
             self._serial += 1
+            if before is not None and None not in (before.calls, state.calls) and state.calls < before.calls:
+                self._history.clear()  # the data plane restarted: its counters began again
             self._latest = replace(state, serial=self._serial)
+            self._history.append(self._latest)
 
     def latest(self) -> CbfState | None:
         with self._lock:
             return self._latest
+
+    def after(self, serial: int) -> list[CbfState]:
+        """The statuses received after the one numbered ``serial``, oldest first (the newest CBF_HISTORY)."""
+        with self._lock:
+            return [state for state in self._history if state.serial > serial]
+
+    def hold_ratio(self, now: float, window_s: float) -> float | None:
+        """Held CBF calls / CBF calls over the last ``window_s``, from the cumulative counters.
+
+        0 while the newest status has no cbf section (the CBF is off). None when
+        it cannot be told: no status for half the window, less than half the
+        window of statuses since the counters (re)started, or counters missing.
+        """
+        with self._lock:
+            history = list(self._history)
+        if not history or now - history[-1].received_at > window_s / 2.0:
+            return None
+        newest = history[-1]
+        if not newest.has_cbf:
+            return 0.0
+        base = None
+        for state in history:  # the newest status at or before the window's start, else the oldest
+            if state.received_at <= now - window_s or base is None:
+                base = state
+        if newest.received_at - base.received_at < window_s / 2.0:
+            return None
+        if None in (base.held, base.calls, newest.held, newest.calls):
+            return None
+        calls = newest.calls - base.calls
+        if calls <= 0:
+            return 0.0  # nothing was filtered: nothing was held
+        return min(max((newest.held - base.held) / calls, 0.0), 1.0)
 
 
 class PlayClient:

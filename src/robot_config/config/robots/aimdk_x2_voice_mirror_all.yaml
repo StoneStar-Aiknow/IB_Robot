@@ -550,6 +550,10 @@ robot:
       min_frames: 4
       min_frames_one_hand: 3   # one-hand runs come <= 5 Hz: 3 fit the window even with 15% jitter
       min_score: 0.5
-      exit_s: 0.3
-      exit_s_one_hand: 0.5     # exit_s after a one-hand run (2.5 periods at 5 Hz)
+      # Remote results come ~4.4 Hz (3.2 Hz in the slowest 5 s), one-hand runs ~3 Hz:
+      # 0.6 s bridges one lost result at 4.4 Hz (0.45 s gap), 0.7 s one lost one-hand
+      # result at 3 Hz (0.67 s). A real letting go ends the template this much later
+      # (zll 11-20). Per class from the step-0 gap histograms once they are in.
+      exit_s: 0.6
+      exit_s_one_hand: 0.7     # exit_s after a one-hand run
   # /feat/x2-preset-motions
