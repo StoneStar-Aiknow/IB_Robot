@@ -140,7 +140,8 @@ class Rig:
             self.labels.observe(json.dumps(message), self.now)
         self._port_now()
         if self.cbf is not None:
-            self.cbf_monitor.observe(json.dumps(self.cbf), self.now)
+            # Every status of this data plane has its time and safety epoch (else CbfMonitor drops it).
+            self.cbf_monitor.observe(json.dumps({"at": self.now, "safety_epoch": 1, **self.cbf}), self.now)
 
     def step(self, dt=TICK):
         self.now += dt
@@ -788,10 +789,9 @@ def test_another_label_during_an_attempt_is_a_busy_trigger_and_an_attempt_has_on
     rig.step()
     exit_line = lines(rig, "template exit heart")[-1]
     assert "reason=label_inactive" in exit_line and "outcome=complete played=True" in exit_line
-    assert (  # no field of the status is made up: unknown, never 0
-        "cbf=[no cbf reason=unknown of=newest recv_age=0.000 status_age=unknown arm_age=unknown at=unknown "
-        "epoch=unknown owner=unknown active=unknown]"
-    ) in exit_line
+    # No field of the status is made up: unknown, never 0.
+    assert "cbf=[no cbf reason=unknown of=newest recv_age=0.000 status_age=0.000 arm_age=unknown at=" in exit_line
+    assert " epoch=1 owner=unknown active=unknown]" in exit_line
     rig.blender.end_round(rig.now)  # a stop during C is logged, but the attempt already had its outcome
     assert "outcome=repeat" in lines(rig, "template exit heart")[-1]
     assert rig.blender.outcomes == {"complete": 1} and rig.blender.aborts == {}

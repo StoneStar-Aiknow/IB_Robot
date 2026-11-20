@@ -118,11 +118,12 @@ class PauseRig(Rig):
         self.paused = []  # the blender's paused flag after each tick
         self.deaf = False  # the tick runs before the subscriptions: nothing is read, the statuses queue
         self.labels_muted = False  # the label publisher went silent
+        self.foreign = None  # now -> another data plane's status, received after this one's every tick
         if warm:
             self.run(1.2)  # the held-share gate needs a second of statuses
 
     def hear(self):
-        received = self.extra + self.plane.tick(self.now)
+        received = self.extra + self.plane.tick(self.now) + ([self.foreign(self.now)] if self.foreign else [])
         if self.deaf:
             self.extra = received
             return
@@ -836,21 +837,56 @@ def test_a_round_end_while_C_waits_for_trust_wraps_up_as_before():
 
 
 def test_no_safety_epoch_no_entry_and_in_A_a_safety_exit():
+    # Without one a status is not this data plane's (CbfMonitor drops it): no status at all.
     rig = PauseRig()
     rig.plane.with_epoch = False
-    rig.run(0.2)
+    rig.run(0.6)
     rig.active["heart"] = 7
     rig.run(1.0)
     assert rig.blender.phase is Phase.IDLE
     del rig.active["heart"]
     rig.run(0.1)
-    assert "reason=epoch_missing" in lines(rig, "template reject")[0]
+    assert "reason=cbf_stale" in lines(rig, "template reject")[0]
     rig.plane.with_epoch = True
+    rig.run(2.5)
     rig.into_a(0.3)
     rig.plane.with_epoch = False
-    assert rig.run(0.2, lambda: safety_stopped(rig))
-    assert exit_reason(rig) == "a_epoch_missing"
+    assert rig.run(0.2, lambda: rig.blender.snapshot()["paused"])  # untrusted from a_status_age_s on
+    assert rig.run(NEW.a_untrusted_max_s + 0.1, lambda: safety_stopped(rig))
+    assert exit_reason(rig) == "a_cbf_untrusted"
     the_mirror_passes(rig)
+
+
+def old_kit(offset):
+    """A colleague's older data plane on the same ROS network (real robot 11-20 17:01): no cbf section,
+    no safety_epoch, no arm_owner; ``at`` on its own machine's clock (None: none sent)."""
+
+    def status(now):
+        message = {"control_seq": 5, "groups": {}, "faults": {}, "rejected": []}
+        if offset is not None:
+            message["at"] = now + offset
+        return message
+
+    return status
+
+
+@pytest.mark.parametrize("offset", [None, 0.0, 1000.0, -1000.0])
+def test_an_old_data_plane_on_the_network_is_no_evidence_and_no_exit(offset):
+    rig = PauseRig()
+    rig.plane.every = 2  # half the CBF calls held: the held-share gate is closed
+    rig.run(2.5)
+    rig.foreign = old_kit(offset)  # newest at every tick: its "CBF off" would read held=0
+    rig.active["heart"] = 7
+    rig.run(1.0)
+    assert rig.blender.phase is Phase.IDLE and rig.blender._gate_ratio == pytest.approx(0.5, abs=0.05)
+    assert all("reason=hold_ratio" in line for line in lines(rig, "template reject")), lines(rig, "template reject")
+    del rig.active["heart"]
+    rig.plane.every = None
+    rig.run(3.0)
+    rig.active["heart"] = 7
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)  # this plane's statuses still count
+    assert rig.run(2.0, lambda: rig.blender.phase is Phase.WAIT_ACK), lines(rig, "template exit")
+    assert not lines(rig, "template pause") and rig.cbf_monitor.foreign > 0
 
 
 # -- entry ---------------------------------------------------------------------------------
@@ -1040,8 +1076,11 @@ def test_cbf_monitor_after_and_hold_ratio():
     assert monitor.hold_ratio(13.0, 2.0) is None  # nothing for half the window
     monitor.observe(cbf_message(11.5, 0, 3), 11.5)  # the data plane restarted
     assert monitor.hold_ratio(11.5, 2.0) is None and len(monitor.after(0)) == 1
-    monitor.observe(json.dumps({"at": 11.55}), 11.55)
+    monitor.observe(json.dumps({"at": 11.55, "safety_epoch": 1}), 11.55)
     assert monitor.hold_ratio(11.55, 2.0) == 0.0  # the CBF is off
+    monitor.observe(cbf_message(11.6, 0, 3), 11.6)
+    monitor.observe(json.dumps({"at": 11.65}), 11.65)  # another data plane's: no epoch
+    assert monitor.hold_ratio(11.65, 2.0) is None and monitor.foreign == 1
 
 
 @pytest.mark.parametrize(

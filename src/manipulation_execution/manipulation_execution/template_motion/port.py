@@ -5,7 +5,8 @@
 * :class:`CbfMonitor`: whether the data plane's CBF is holding or releasing,
   from ``/aimdk_runtime/dataplane/status`` (``cbf.stuck_s``, ``releasing``,
   ``stuck_collision``), the status's own time and safety epoch, the recent
-  statuses in order (one older than the newest is dropped) and the share of
+  statuses in order (one older than the newest is dropped, one without ``at``
+  or ``safety_epoch`` too: another data plane's) and the share of
   held CBF calls over a window;
 * :class:`PlayClient`: ``start`` / ``release`` from the blender, ``pump``
   from the node's tick for the keepalive; ``a_cap`` from the blender in A
@@ -163,7 +164,14 @@ def _seconds(value) -> float | None:
 
 
 class CbfMonitor:
-    """Without a ``cbf`` section (CBF off) the CBF never intervenes."""
+    """Without a ``cbf`` section (CBF off) the CBF never intervenes.
+
+    A status without ``at`` or ``safety_epoch`` is not this data plane's: every
+    one has both since 8f7d38f9, an older one on the same ROS network (real
+    robot 11-20 17:01) has neither. It is counted in ``foreign`` and dropped
+    before anything reads it: never the newest, never in the held share, never
+    the order's reference, never an epoch or owner change.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -172,6 +180,7 @@ class CbfMonitor:
         self._history: deque[CbfState] = deque(maxlen=CBF_HISTORY)
         self.malformed = 0
         self.reordered = 0
+        self.foreign = 0
 
     def observe(self, data: str, now: float) -> None:
         try:
@@ -183,6 +192,10 @@ class CbfMonitor:
                 "control_seq": _count(message.get("control_seq")),
                 "arm_owner": _count(message.get("arm_owner")),
             }
+            if top["at"] is None or top["safety_epoch"] is None:
+                with self._lock:
+                    self.foreign += 1
+                return
             if cbf is None:
                 state = CbfState(False, now, "no cbf", **top)
             else:
