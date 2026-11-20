@@ -78,6 +78,50 @@ ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
 ```
 
+A profile's `hardware.xacro_args.mujoco_headless` is applied last and
+overrides the environment variable.
+
+With a window, the launch log prints the viewer key guide. The viewer starts
+on the free camera (left-drag rotates, right-drag pans, scroll zooms,
+Ctrl+A returns to the start view). `]` / `[` cycle the model's fixed cameras
+in model id order (`]` from the first, `[` from the last), and `Esc` returns
+to the free camera. In `pick_banana` the order is `top_camera -> side_view ->
+front_camera -> gripper_follow -> wrist_camera`: `side_view` (near
+horizontal, for the gripper height above table and plate) and
+`gripper_follow` (a chase view of gripper, banana and plate) are viewer-only
+cameras. They are not published or recorded: the simulator's CameraPlugin
+streams every model camera that has no policy, so the launch reads the
+composed model's cameras and sets every camera that is not an enabled
+peripheral to `policy: disabled` (a model whose cameras cannot be read, or
+an unnamed camera, fails the launch).
+
+The start view comes from the scene's `layout.yaml`:
+
+```yaml
+mujoco_viewer:
+  lookat: [x, y, z]   # world point at the centre of the view (m)
+  distance: 0.72      # framing: shows what a 45 deg camera would show from 0.72 m
+  azimuth: -110       # degrees
+  elevation: -55      # degrees, in [-89, 89] (the viewer clamps to this range)
+```
+
+`distance` sets the framing, not the camera position: MuJoCo keeps the free
+camera at 1.5 x the model extent (changing the extent would move every
+camera's near/far planes), so the compiler narrows the field of view instead.
+The result is a long-lens, nearly orthographic view with little depth cue;
+use `side_view` to judge heights. A malformed view, including an empty
+`mujoco_viewer:` key, fails the launch with `ViewerViewError`. So does a
+model whose `visual/global` sets `orthographic` (MuJoCo then reads the
+free camera's fovy as a length) or a `cameraid` naming one of its cameras
+(the viewer would start on that fixed camera, and Ctrl+A would return to
+it). So does a
+view that fails the numeric checks on the stored angles and field of
+view, the free camera position and transform, and the vertical
+projection. These checks do not cover every renderer computation: only
+scenes whose camera and geom coordinates stay within about 1e18 m are
+supported, and a view beyond that may pass the checks and still render
+wrongly.
+
 The workspace Python `mujoco` must equal the simulator's libmujoco
 (`requirements/mujoco-sim.txt` pins 3.12.0); a mismatch fails the launch
 before the model is composed. A venv installed with the LIBERO benchmark
