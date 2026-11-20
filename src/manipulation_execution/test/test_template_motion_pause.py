@@ -14,7 +14,19 @@ import random
 from dataclasses import replace
 
 import pytest
-from test_template_motion_blender import MIRROR, OFF, P_HEART, TICK, Rig, exit_reason, lines, max_jerkless, max_step
+from test_template_motion_blender import (
+    HAND_MIRROR,
+    MIRROR,
+    OFF,
+    P_HEART,
+    TICK,
+    Rig,
+    exit_reason,
+    hooked,
+    lines,
+    max_jerkless,
+    max_step,
+)
 
 from manipulation_execution.template_motion.blender import (
     A_CAP_ECHO_AGE_S,
@@ -168,6 +180,22 @@ def accel_limit():
     return max(NEW.a_resume_accel, NEW.c_peak_accel) * 1.02
 
 
+def safety_stopped(rig):
+    """The template ended without a C: a safety exit (plan 3.6)."""
+    exits = lines(rig, "template exit")
+    return rig.blender.phase is Phase.COOLDOWN and bool(exits) and "back=safety" in exits[-1]
+
+
+def the_mirror_passes(rig, seconds=0.3):
+    """From the safety exit's tick on the blender sends nothing: the gate gets the mirror command, the hand
+    the mirror's; no C target, ever (the outer safety path decides what reaches the robot)."""
+    assert rig.out[-1] == rig.mirror
+    for _ in range(round(seconds / TICK)):
+        assert rig.step() is None
+        assert rig.out[-1] == rig.mirror and rig.hand == HAND_MIRROR
+    assert rig.blender.phase in (Phase.COOLDOWN, Phase.IDLE)
+
+
 # -- pause and resume ----------------------------------------------------------------------
 
 
@@ -306,13 +334,14 @@ def test_no_status_A_can_trust_ends_A_at_the_absolute_cap():
     rig.into_a(0.3)
     rig.plane.delay = lambda at: None
     t0 = rig.now
-    assert rig.run(1.5, lambda: rig.blender.phase is Phase.C)
+    assert rig.run(1.5, lambda: safety_stopped(rig))
     assert exit_reason(rig) == "a_cbf_untrusted"
     assert rig.now - t0 <= NEW.a_status_age_s + NEW.a_untrusted_max_s + 3 * TICK
     assert "why=cbf_late" in lines(rig, "template pause")[0]
     (first, last), = rig.spans()
     assert len(set(rig.out[first:last + 1])) == 1
     assert "outcome=untrusted" in lines(rig, "template exit")[0]
+    the_mirror_passes(rig)
 
 
 def test_late_statuses_alone_pause_and_resume():
@@ -456,9 +485,11 @@ def test_an_epoch_change_before_the_start_never_starts():
     rig.run(0.95)  # past T_A (1.1), within its margin
     assert rig.blender.phase is Phase.A
     rig.plane.epoch += 1
-    assert rig.run(0.2, lambda: rig.blender.phase is Phase.C)
+    assert rig.run(0.2, lambda: safety_stopped(rig))
     assert exit_reason(rig) == "a_epoch_changed" and rig.started() is None
     assert "outcome=safety" in lines(rig, "template exit")[0]
+    the_mirror_passes(rig)
+    assert rig.started() is None
 
 
 @pytest.mark.parametrize("epochs, reason", [((4, 5), "a_epoch_changed"), ((3, 3), "a_owner_changed")])
@@ -471,7 +502,8 @@ def test_a_revoke_and_restore_by_the_same_owner_in_one_batch_never_continues(epo
     plane.epoch = epochs[1]
     rig.extra = [revoke, restore]
     rig.step()
-    assert rig.blender.phase is Phase.C and exit_reason(rig) == reason
+    assert safety_stopped(rig) and exit_reason(rig) == reason
+    the_mirror_passes(rig)
 
 
 def test_an_epoch_change_in_a_pause_ends_it():
@@ -481,8 +513,112 @@ def test_an_epoch_change_in_a_pause_ends_it():
     rig.run(0.15)
     assert rig.blender.snapshot()["paused"]
     rig.plane.epoch += 1
-    assert rig.run(0.2, lambda: rig.blender.phase is Phase.C)
+    assert rig.run(0.2, lambda: safety_stopped(rig))
     assert exit_reason(rig) == "a_epoch_changed"
+    the_mirror_passes(rig)
+
+
+def test_unverifiable_permission_sends_no_C_and_the_gate_gets_the_inner_command():
+    # Codex review 1120 T1: mirror_active false for good; the C used to go on moving the request.
+    rig = PauseRig()
+    rig.into_a(0.3)
+    inner, hooks = hooked(rig)
+    rig.plane.mirror_active = False
+    published, phases = [], []
+    for _ in range(round(1.0 / TICK)):
+        rig.now += TICK
+        rig.hear()
+        published.append(hooks.retarget(rig.inputs()))
+        phases.append(rig.blender.phase)
+        rig.client.pump(rig.now)
+    assert safety_stopped(rig) and exit_reason(rig) == "a_cbf_untrusted"
+    assert Phase.C not in phases
+    stop = phases.index(Phase.COOLDOWN)
+    assert stop * TICK <= NEW.a_status_age_s + NEW.a_untrusted_max_s + 3 * TICK
+    assert len(set(c.arm for c in published[1:stop])) == 1  # paused until then
+    assert all(c.arm == MIRROR and c.hand == (0.3,) * 20 for c in published[stop:])  # the inner's own command
+    assert rig.cbf_monitor.latest().mirror_active is False
+
+
+def test_a_let_go_without_a_trusted_status_waits_paused_then_goes_through_C():
+    rig = PauseRig()
+    rig.into_a(0.3)
+    rig.plane.delay = lambda at: 0.2  # each status already too old
+    assert rig.run(0.3, lambda: rig.blender.snapshot()["paused"])
+    del rig.active["heart"]
+    rig.run(0.1)
+    assert rig.blender.phase is Phase.A and rig.blender.snapshot()["paused"]
+    assert not lines(rig, "template exit")
+    rig.plane.delay = lambda at: 0.0
+    assert rig.run(0.5, lambda: rig.blender.phase is Phase.C)
+    exit = lines(rig, "template exit")[0]
+    assert "reason=label_lost" in exit and " back=c after=label_lost:" in exit and "outcome=let_go" in exit
+    rig.run(2.0)
+    assert rig.out[-1] == rig.mirror
+    assert max_step(rig.out) <= speed_limit(0.6) * TICK * 1.05
+
+
+def test_a_let_go_never_trusted_is_a_safety_exit_at_the_absolute_cap():
+    rig = PauseRig()
+    rig.into_a(0.3)
+    rig.plane.delay = lambda at: 0.2
+    assert rig.run(0.3, lambda: rig.blender.snapshot()["paused"])
+    untrusted_at = rig.now
+    rig.run(0.2)
+    del rig.active["heart"]
+    assert rig.run(1.0, lambda: safety_stopped(rig))
+    exit = lines(rig, "template exit")[0]
+    assert "reason=a_cbf_untrusted" in exit and " after=label_lost:" in exit
+    assert rig.now - untrusted_at <= NEW.a_untrusted_max_s + 3 * TICK  # not restarted by the let-go
+    the_mirror_passes(rig)
+
+
+@pytest.mark.parametrize("same_status", [True, False])
+def test_a_collision_and_an_epoch_change_in_one_batch_send_no_C(same_status):
+    rig = PauseRig()
+    rig.into_a(0.3)
+    plane = rig.plane
+    hit = plane.status(rig.now)
+    hit["cbf"].update(stuck_collision=True)
+    if same_status:
+        rig.extra = [dict(hit, safety_epoch=4)]
+    else:
+        rig.extra = [hit, dict(plane.status(rig.now), safety_epoch=4)]
+    plane.epoch = 4
+    rig.step()
+    assert safety_stopped(rig) and exit_reason(rig) == "a_epoch_changed"
+    assert same_status or " after=a_cbf_collision:" in lines(rig, "template exit")[0]
+    the_mirror_passes(rig)
+
+
+def test_a_restarted_data_plane_with_the_same_epoch_is_a_safety_exit():
+    rig = PauseRig()
+    rig.into_a(0.3)
+    rig.plane.calls = rig.plane.held = 0  # counters begin again; the epoch number happens to be equal
+    assert rig.run(0.2, lambda: safety_stopped(rig))
+    assert exit_reason(rig) == "a_epoch_reset" and "outcome=safety" in lines(rig, "template exit")[0]
+    the_mirror_passes(rig)
+
+
+@pytest.mark.parametrize("what", ["epoch", "owner", "silent"])
+def test_a_checked_C_stops_on_what_would_be_a_safety_exit_in_A(what):
+    rig = PauseRig()
+    rig.into_a(1.0)  # near P: a full-length C
+    del rig.active["heart"]
+    assert rig.run(0.2, lambda: rig.blender.phase is Phase.C)
+    assert " back=c" in lines(rig, "template exit")[0]
+    rig.run(0.1)
+    if what == "epoch":
+        rig.plane.epoch += 1
+    elif what == "owner":
+        rig.plane.owner = 2
+    else:
+        rig.plane.delay = lambda at: None
+    assert rig.run(0.7, lambda: safety_stopped(rig))
+    reason = {"epoch": "a_epoch_changed", "owner": "a_owner_changed", "silent": "a_cbf_untrusted"}[what]
+    exit = lines(rig, "template exit")[-1]
+    assert f"reason={reason}" in exit and "outcome=repeat" in exit and "phase=C" in exit
+    the_mirror_passes(rig)
 
 
 def test_revoked_or_stopped_in_B_still_goes_back():
@@ -494,7 +630,7 @@ def test_revoked_or_stopped_in_B_still_goes_back():
     assert outcome_of(exit_reason(rig)) == "safety"
 
 
-def test_no_safety_epoch_no_entry_and_in_A_a_checked_hand_back():
+def test_no_safety_epoch_no_entry_and_in_A_a_safety_exit():
     rig = PauseRig()
     rig.plane.with_epoch = False
     rig.run(0.2)
@@ -507,9 +643,9 @@ def test_no_safety_epoch_no_entry_and_in_A_a_checked_hand_back():
     rig.plane.with_epoch = True
     rig.into_a(0.3)
     rig.plane.with_epoch = False
-    assert rig.run(0.2, lambda: rig.blender.phase is Phase.C)
+    assert rig.run(0.2, lambda: safety_stopped(rig))
     assert exit_reason(rig) == "a_epoch_missing"
-    assert max_step(rig.out) <= speed_limit(0.6) * TICK * 1.05
+    the_mirror_passes(rig)
 
 
 # -- entry ---------------------------------------------------------------------------------
@@ -896,8 +1032,9 @@ def test_a_cap_an_epoch_change_takes_the_epoch_exit():
     rig = CapRig(latency=0.1)
     rig.into_a(0.3)
     rig.plane.epoch += 1  # the flag is no longer valid either: its epoch is the old one
-    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    assert rig.run(1.0, lambda: safety_stopped(rig))
     assert exit_reason(rig) == "a_epoch_changed"
+    assert caps(rig)[-1] == (False, 3)
 
 
 @pytest.mark.parametrize("starved", [0.2, 0.4, 0.6])

@@ -140,6 +140,7 @@ class CbfState:
     release_episodes: int | None = None
     collision_release_episodes: int | None = None
     has_cbf: bool = False  # the status had a cbf section (without one the CBF is off)
+    restarted: bool = False  # its counters went back: the data plane restarted, an equal epoch proves nothing
 
 
 def _count(value) -> int | None:
@@ -206,9 +207,10 @@ class CbfMonitor:
                 self.reordered += 1  # older than the newest: one publisher never does this, a queue might
                 return
             self._serial += 1
-            if before is not None and None not in (before.calls, state.calls) and state.calls < before.calls:
+            restarted = before is not None and None not in (before.calls, state.calls) and state.calls < before.calls
+            if restarted:
                 self._history.clear()  # the data plane restarted: its counters began again
-            self._latest = replace(state, serial=self._serial)
+            self._latest = replace(state, serial=self._serial, restarted=restarted)
             self._history.append(self._latest)
 
     def latest(self) -> CbfState | None:

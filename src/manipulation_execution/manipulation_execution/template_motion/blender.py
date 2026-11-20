@@ -47,10 +47,16 @@ value in :class:`BlendConfig` that restores the behaviour above):
   what the CBF releases after ``hold_release_after_s`` is a still pose. A
   resumes on clean, recent statuses of the same safety epoch, easing M and
   the clock back in over a ramp as long as the pause needs (short holds
-  cost little). A leaves for C on a collision, a let-go, a safety epoch or
-  arm owner change, ``a_untrusted_max_s`` without a status it can trust, or
-  once it is ``a_pause_budget_s`` (+ per second of T_A) behind its schedule.
-  C blends from the same M, so leaving mid-pause or mid-ramp is continuous.
+  cost little). A leaves for C on a collision, a let-go, or once it is
+  ``a_pause_budget_s`` (+ per second of T_A) behind its schedule; C blends
+  from the same M, so leaving mid-pause or mid-ramp is continuous.
+* Safety exits send no C (plan 3.6): a safety epoch or arm owner change, a
+  restarted data plane, no epoch, or ``a_untrusted_max_s`` without a status
+  it can trust end the template at once; the mirror command passes unchanged
+  and the existing safety path decides what reaches the robot. Any other exit
+  goes to C only on a trusted status of A's epoch and owner, waiting for one
+  paused (at most ``a_untrusted_max_s``, then a safety exit); that C stops
+  the same way on what would be a safety exit in A.
 * Entry needs the safety epoch, a recent status, a held share of CBF calls
   below a gate with hysteresis, and no load exit within ``load_backoff_s``;
   a trigger kept out ``enter_max_wait_s`` is rejected, never entered late.
@@ -90,6 +96,8 @@ DEFAULT_HAND_TRAVEL_S = 1.0  # T_A's hand share when the hand output is not know
 COMPLETE = ("label_inactive", "hold_max", "release")  # the playback ran and the port said DONE
 LET_GO = ("label_lost", "actor_changed")  # the person stopped asking before B
 LOAD_EXITS = ("a_cbf_hold", "a_pause_budget", "a_cbf_untrusted")  # load_backoff_s follows these (and paused a_timeout)
+# v1.2: no C after these: the hand-back cannot be checked, the existing safety path has the gate (plan 3.6)
+SAFETY_EXITS = ("a_epoch_changed", "a_epoch_missing", "a_epoch_reset", "a_owner_changed", "a_cbf_untrusted")
 A_CAP_ECHO_AGE_S = 0.3  # an a_cap echo older than this tells nothing (sent on change and every 0.1 s)
 MIN_JERK_ACCEL = 5.7735  # a min-jerk's peak d2/ds2 (10 / sqrt 3)
 RELEASE_AFTER_S = 0.2  # the CBF's hold_release_after_s when its status does not say (on site 0.2)
@@ -509,6 +517,9 @@ class Blender:
         self._pauses = 0
         self._paused_s = 0.0
         self._pause_lines = 0
+        self._exit_pending: str | None = None  # A's exit waits, paused, for a status the hand-back can rest on
+        self._exit_pending_since = 0.0
+        self._c_checked = False  # C from A after a checked hand-back: it stops on what a safety exit would
         # (b)
         self._a_cap_from = 0.0  # the echo is to be true from here on: entering A, or a late tick
         self._a_cap_seen = False  # a true echo since _a_cap_from
@@ -647,7 +658,7 @@ class Blender:
         if phase is Phase.WAIT_DONE:
             return self._tick_wait_done(now, m)
         if phase is Phase.C:
-            return self._blend_c(now, m)
+            return self._tick_c(now, m)
         return None  # STOP_WAIT outside a wrap-up: the round is over
 
     # -- IDLE -> A ----------------------------------------------------------------
@@ -862,8 +873,10 @@ class Blender:
         alpha = _min_jerk(self._clock.at(now) / self._t_a)[0]
         return _lerp(self._ref.value(now, m), self._segment.P, alpha)
 
-    def _tick_a(self, now: float, inputs, m: tuple[float, ...]) -> tuple[float, ...]:
+    def _tick_a(self, now: float, inputs, m: tuple[float, ...]) -> tuple[float, ...] | None:
         config, segment = self._config, self._segment
+        if self._exit_pending is not None:
+            return self._tick_exit_pending(now, m)
         reason = self._label_check(now, inputs)
         cbf = self._cbf.latest()
         if reason is None and self._pausing:
@@ -937,9 +950,32 @@ class Blender:
             return "a_cap_lost" if now - self._a_cap_from >= config.a_cap_confirm_s else None
         return "a_cap_lost" if now - self._a_cap_false_since >= config.a_cap_lost_s else None
 
-    def _leave_a(self, now: float, reason: str, m: tuple[float, ...]) -> tuple[float, ...]:
-        """To C from where A is: alpha's value, speed and acceleration (0 in a pause); M eases back to m."""
+    def _leave_a(self, now: float, reason: str, m: tuple[float, ...]) -> tuple[float, ...] | None:
+        """To C from where A is: alpha's value, speed and acceleration (0 in a pause); M eases back to m.
+
+        v1.2 (plan 3.6): only on a hand-back it can check now. A safety exit, or
+        one seen in the statuses not read yet, sends no C (:meth:`_safety_stop`);
+        any other exit without a trusted status of A's epoch and owner waits for
+        one, paused, at most ``a_untrusted_max_s``.
+        """
         config = self._config
+        if self._pausing:
+            safety = reason if reason in SAFETY_EXITS else self._safety_change()
+            if safety is not None:
+                return self._safety_stop(now, safety, "" if safety == reason else reason)
+            if not self._hand_back_ok(now):
+                if not self._paused:
+                    self._pause(now, m, "hand_back", self._cbf.latest())
+                if self._exit_pending is None:
+                    self._exit_pending, self._exit_pending_since = reason, now
+                return self._blend_a(now, m)
+            self._c_checked, self._untrusted_since = True, None
+        back = ""
+        if self._exit_pending is not None:
+            back = f" back=c after={self._exit_pending}:{now - self._exit_pending_since:.2f}"
+            reason, self._exit_pending = self._exit_pending, None
+        elif self._pausing:
+            back = " back=c"
         self._a_cap_off()
         s = self._clock.at(now) / self._t_a
         value, speed, accel = _min_jerk(s)
@@ -954,8 +990,67 @@ class Blender:
             self._ref.ramp(now, max(config.a_resume_ramp_s, MIN_JERK_PEAK * gap / config.c_peak_speed))
         T = self._t_a
         return self._to_c(
-            now, reason, m, self._segment.P, value, speed * rate / T, accel * rate**2 / T**2 + speed * rate_slope / T
+            now,
+            reason,
+            m,
+            self._segment.P,
+            value,
+            speed * rate / T,
+            accel * rate**2 / T**2 + speed * rate_slope / T,
+            back,
         )
+
+    @staticmethod
+    def _safety_of(state, epoch: int | None, owner: int | None) -> str | None:
+        if state.restarted:
+            return "a_epoch_reset"  # a restarted data plane counts its epochs again: equal proves nothing
+        if state.safety_epoch is not None and state.safety_epoch != epoch:
+            return "a_epoch_changed"
+        if state.arm_owner != owner:
+            return "a_owner_changed"
+        return None
+
+    def _safety_change(self) -> str | None:
+        """A safety exit in the statuses not read yet (they are read)."""
+        for state in self._cbf.after(self._cbf_serial):
+            self._cbf_serial = state.serial
+            safety = self._safety_of(state, self._epoch, self._owner)
+            if safety is not None:
+                return safety
+        return None
+
+    def _hand_back_ok(self, now: float) -> bool:
+        """C may follow A: the newest status is trusted now, of A's safety epoch and arm owner."""
+        cbf = self._cbf.latest()
+        return self._trust(cbf, now) is None and cbf.safety_epoch == self._epoch and cbf.arm_owner == self._owner
+
+    def _tick_exit_pending(self, now: float, m: tuple[float, ...]) -> tuple[float, ...] | None:
+        safety = self._safety_change()
+        if safety is not None:
+            return self._safety_stop(now, safety, self._exit_pending)
+        if self._hand_back_ok(now):
+            return self._leave_a(now, self._exit_pending, m)
+        since = self._exit_pending_since
+        if self._untrusted_since is not None:
+            since = min(since, self._untrusted_since)  # a_untrusted_max_s stays absolute
+        if now - since > self._config.a_untrusted_max_s:
+            return self._safety_stop(now, "a_cbf_untrusted", self._exit_pending)
+        return self._blend_a(now, m)  # paused: stands still
+
+    def _safety_stop(self, now: float, reason: str, after: str = "") -> None:
+        """Ends the template without a C: from this tick the mirror command passes unchanged and the
+        existing safety path (runtime gate, data plane epoch and owner) decides what reaches the robot."""
+        self._a_cap_off()
+        if self._paused:
+            self._paused_s += now - self._pause_since
+            self._paused = False
+        back = " back=safety" + (f" after={after}:{now - self._exit_pending_since:.2f}" if after else "")
+        self._exit_log(reason, now, back)
+        self._phase, self._since = Phase.COOLDOWN, now
+        self._label = self._segment = None
+        self._hand_target = None
+        self._exit_pending, self._c_checked = None, False
+        return None
 
     def _a_cbf(self, now: float, cbf, m: tuple[float, ...]) -> str | None:
         """A's reading of the data plane (v1.2): an exit reason, or None after pausing or resuming as due.
@@ -967,12 +1062,11 @@ class Blender:
         config = self._config
         for state in self._cbf.after(self._cbf_serial):
             self._cbf_serial = state.serial
+            safety = self._safety_of(state, self._epoch, self._owner)
+            if safety is not None:
+                return safety
             if state.collision:
                 return "a_cbf_collision"
-            if state.safety_epoch is not None and state.safety_epoch != self._epoch:
-                return "a_epoch_changed"
-            if state.arm_owner != self._owner:
-                return "a_owner_changed"
             if not self._paused:
                 continue
             clean = (
@@ -990,7 +1084,7 @@ class Blender:
                 self._pause_long |= state.releasing or state.stuck_s >= release_at - config.a_release_guard_s
         trust = self._trust(cbf, now)
         if trust == "epoch_missing":
-            return "a_epoch_missing"  # all else is trusted: a checked hand-back through C
+            return "a_epoch_missing"  # the epoch cannot be checked: a safety exit
         if trust is None:
             self._untrusted_since = None
         elif self._untrusted_since is None:
@@ -1235,9 +1329,10 @@ class Blender:
         beta: float,
         speed: float = 0.0,
         accel: float = 0.0,
+        back: str = "",
     ) -> tuple[float, ...]:
         config = self._config
-        self._exit_log(reason, now)
+        self._exit_log(reason, now, back)
         self._anchor = tuple(anchor)
         dist = 0.0 if m is None else _farthest(self._anchor, self._ref.value(now, m))
         self._c_dist = dist
@@ -1262,6 +1357,21 @@ class Blender:
             return self._anchor
         return self._blend_c(now, m)
 
+    def _tick_c(self, now: float, m: tuple[float, ...]) -> tuple[float, ...] | None:
+        """C after a checked hand-back from A stops (no more C) on what would be a safety exit in A."""
+        if self._c_checked:
+            safety = self._safety_change()
+            if safety is None:
+                if self._trust(self._cbf.latest(), now) is None:
+                    self._untrusted_since = None
+                elif self._untrusted_since is None:
+                    self._untrusted_since = now
+                elif now - self._untrusted_since > self._config.a_untrusted_max_s:
+                    safety = "a_cbf_untrusted"
+            if safety is not None:
+                return self._safety_stop(now, safety)
+        return self._blend_c(now, m)
+
     def _blend_c(self, now: float, m: tuple[float, ...]) -> tuple[float, ...]:
         t = now - self._since
         beta = min(max(self._c_curve.at(t), 0.0), 1.0)
@@ -1275,6 +1385,7 @@ class Blender:
             )
             self._phase, self._since = Phase.COOLDOWN, now
             self._label = self._segment = None
+            self._c_checked = False
         return arm
 
     # -- wrap-up after a round that ended mid-playback ------------------------------
@@ -1330,7 +1441,7 @@ class Blender:
         self.exits[key] = self.exits.get(key, 0) + 1
         self._last_exit = reason
 
-    def _exit_log(self, reason: str, now: float) -> None:
+    def _exit_log(self, reason: str, now: float, back: str = "") -> None:
         self._count_exit(reason)
         name = self._label.template if self._label is not None else "?"
         seg = self._segment.name if self._segment is not None else "?"
@@ -1362,7 +1473,7 @@ class Blender:
             f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f} "
             f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f} "
             f"outcome={outcome} played={self._played_at is not None} cbf=[{cbf_text}] label=[{label}] "
-            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}"
+            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}{back}"
         )
 
     def _refresh_snapshot(self) -> None:
