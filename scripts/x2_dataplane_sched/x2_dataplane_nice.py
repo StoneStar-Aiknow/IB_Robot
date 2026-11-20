@@ -89,19 +89,17 @@ def start_time(pid: int) -> str | None:
         return None
 
 
+def is_dataplane(pid: int) -> bool:
+    """argv[0] is the dataplane executable (not a shell naming it)."""
+    try:
+        argv0 = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0", 1)[0].decode(errors="replace")
+    except OSError:
+        return False
+    return argv0.endswith(EXE)
+
+
 def dataplanes() -> list[int]:
-    """Every process whose argv[0] is the dataplane executable (not a shell naming it)."""
-    found = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            argv0 = (entry / "cmdline").read_bytes().split(b"\0", 1)[0].decode(errors="replace")
-        except OSError:
-            continue
-        if argv0.endswith(EXE):
-            found.append(int(entry.name))
-    return sorted(found)
+    return sorted(int(e.name) for e in Path("/proc").iterdir() if e.name.isdigit() and is_dataplane(int(e.name)))
 
 
 def threads(pid: int) -> list[int]:
@@ -131,7 +129,10 @@ def state_file(pid: int, started: str) -> Path:
 
 def one_dataplane(pid: int | None) -> int | None:
     if pid is not None:
-        return pid if start_time(pid) else None
+        if not is_dataplane(pid):
+            say(f"停：进程 {pid} 不是 dataplane（argv[0] 不以 {EXE} 结尾）")
+            return None
+        return pid
     found = dataplanes()
     if len(found) > 1:
         say(f"停：找到 {len(found)} 个 dataplane {found}，用 --pid 指定一个")
@@ -139,24 +140,34 @@ def one_dataplane(pid: int | None) -> int | None:
     return found[0] if found else None
 
 
-def apply(pid: int, nice: int, cpus: set[int] | None) -> tuple[int, int]:
-    """Set every thread of ``pid``; save each thread's original first. Returns (changed, failed)."""
-    started = start_time(pid)
-    if started is None:
+def apply(pid: int, nice: int, cpus: set[int] | None, started: str | None = None) -> tuple[int, int]:
+    """Set every thread of ``pid``; save each thread's original first. Returns (changed, failed).
+
+    ``started``: the start time ``pid`` had when it was chosen; nothing changes if
+    it is not that process any more, or not a dataplane.
+    """
+    started = started or start_time(pid)
+    if started is None or start_time(pid) != started or not is_dataplane(pid):
         return 0, 0
     STATE.mkdir(parents=True, exist_ok=True)
     path = state_file(pid, started)
-    saved = json.loads(path.read_text()) if path.exists() else {"pid": pid, "threads": {}}
+    if path.exists():
+        saved, first = json.loads(path.read_text()), False
+    else:
+        main = read_thread(pid)
+        if main is None:
+            return 0, 0
+        saved, first = {"pid": pid, "threads": {}, "default": main}, True
     changed = failed = 0
     for tid in threads(pid):
         before = read_thread(tid)
         if before is None:
             continue
         if str(tid) not in saved["threads"]:
-            saved["threads"][str(tid)] = before
-            # A new thread inherits from the thread that made it, so the main
-            # thread's original stands for threads born after this.
-            saved.setdefault("default", saved["threads"].get(str(pid), before))
+            # Only threads there before the first change have their own original.
+            # One born later inherited the change from the thread that made it:
+            # its original is the main thread's.
+            saved["threads"][str(tid)] = before if first else saved["default"]
             path.write_text(json.dumps(saved))
         wanted = {"nice": nice, "cpus": sorted(cpus) if cpus is not None else before["cpus"]}
         if before == wanted:
@@ -166,6 +177,8 @@ def apply(pid: int, nice: int, cpus: set[int] | None) -> tuple[int, int]:
                           ("cpus", lambda v: os.sched_setaffinity(tid, v))):
             if before[name] == wanted[name]:
                 continue
+            if start_time(pid) != started or not Path(f"/proc/{pid}/task/{tid}").exists():
+                break  # it ended; the tid is not this dataplane's any more
             try:
                 put(wanted[name])
             except OSError as error:
@@ -257,10 +270,11 @@ def cmd_status(args) -> int:
 
 def cmd_apply(args) -> int:
     pid = one_dataplane(args.pid)
-    if pid is None:
+    started = start_time(pid) if pid is not None else None
+    if started is None:
         say("没有可改的 dataplane")
         return 1
-    changed, failed = apply(pid, args.nice, args.cpus)
+    changed, failed = apply(pid, args.nice, args.cpus, started)
     say(f"dataplane {pid}：改了 {changed} 个线程，失败 {failed}（nice={args.nice}"
         f"{' cpus=' + cpus_text(args.cpus) if args.cpus else ''}）")
     return 1 if failed else 0
@@ -301,7 +315,7 @@ def cmd_watch(args) -> int:
             elif found:
                 pid = found[0]
                 key = (pid, start_time(pid) or "")
-                changed, failed = apply(pid, args.nice, args.cpus)
+                changed, failed = apply(pid, args.nice, args.cpus, key[1] or None)
                 if key not in seen or changed or failed:
                     say(f"dataplane {pid}：改了 {changed} 个线程，失败 {failed}")
                     seen.add(key)

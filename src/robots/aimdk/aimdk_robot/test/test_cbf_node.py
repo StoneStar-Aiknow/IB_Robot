@@ -7,12 +7,15 @@ built for mid-mirror and comes back, and an empty right flange checked as a
 phantom hand instead of released, its thumb at the compact pose and its start
 and end logged once even when its type flickers; and the safety epoch the
 template layer checks, which the control heartbeat does not move; and the
-tick timing figures in the status, and their absence when switched off.
+tick timing figures in the status, and their absence when switched off; and
+a log output that stops taking lines, which holds up neither the commands nor
+the status.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -49,19 +52,63 @@ NODE_PARAMETERS = ("tick_timing",)
 
 
 class Logged:
-    """The node's log lines, read from its stderr as they come."""
+    """The node's log lines, read from its stderr pipe as they come; the reading can pause."""
 
     def __init__(self) -> None:
         self.lines: list[str] = []
         self._lock = threading.Lock()
+        self._reading = threading.Event()
+        self._reading.set()
+        self.read_fd, self.write_fd = os.pipe()  # the write end is the node's stderr
 
-    def follow(self, stream) -> None:
+    def follow(self) -> None:
         def read():
-            for line in stream:
+            pending = b""
+            while True:
+                self._reading.wait()
+                data = os.read(self.read_fd, 65536)
+                if not data:
+                    break
+                *complete, pending = (pending + data).split(b"\n")
                 with self._lock:
-                    self.lines.append(line.rstrip())
+                    self.lines.extend(line.decode(errors="replace").rstrip() for line in complete)
+            os.close(self.read_fd)
 
         threading.Thread(target=read, daemon=True).start()
+
+    def close(self) -> None:
+        """After the node is gone: the reader sees the end of the pipe."""
+        os.close(self.write_fd)
+
+    def stall(self) -> None:
+        """Stop reading and fill the pipe: the node's next write to stderr blocks."""
+        self._reading.clear()
+        time.sleep(0.1)  # a read in progress takes one more chunk, then waits
+        # A description of its own, so non-blocking here leaves the node's writes blocking.
+        writer = os.open(f"/proc/self/fd/{self.write_fd}", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            for size in (4096, 1):  # 4096 is all or nothing on a pipe; then the last bytes
+                try:
+                    while True:
+                        os.write(writer, b"\n" * size)
+                except BlockingIOError:
+                    pass
+        finally:
+            os.close(writer)
+        assert self.full()
+
+    def full(self) -> bool:
+        writer = os.open(f"/proc/self/fd/{self.write_fd}", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            os.write(writer, b"\n")
+            return False
+        except BlockingIOError:
+            return True
+        finally:
+            os.close(writer)
+
+    def resume(self) -> None:
+        self._reading.set()
 
     def matching(self, text: str) -> list[str]:
         with self._lock:
@@ -94,10 +141,9 @@ def node(monkeypatch, request):
         process = subprocess.Popen(
             [str(executable), "--ros-args", "--params-file", parameters.name],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
+            stderr=logged.write_fd,
         )
-        logged.follow(process.stderr)
+        logged.follow()
         return process
 
     monkeypatch.setattr(dataplane, "start_process", start_process)
@@ -105,7 +151,9 @@ def node(monkeypatch, request):
     try:
         yield harness, logged
     finally:
+        logged.resume()
         harness.shutdown()
+        logged.close()
 
 
 def stream(harness, stop: threading.Event, topic="/aimdk/arm/commands", data=None) -> threading.Thread:
@@ -417,6 +465,20 @@ def test_the_status_accounts_for_every_command_tick(node):
         assert histograms["tick_runqueue"]["n"] == report["invocations"]
         assert histograms["filter_cpu"]["n"] == solved
         assert histograms["status"]["n"] > 0
+        # Every CBF frame once by the measured distances, under the same lock.
+        by = report["outcome_distances"]
+        assert set(by) - {"edges_m"} == set(report["outcomes"]) - {"held_collision", "released_collision"}
+        for outcome, counts in by.items():
+            if outcome != "edges_m":
+                assert sum(counts["min"]) + counts["no_reading"] == report["outcomes"][outcome]
+                assert sum(counts["cross_min"]) == sum(counts["min"])
+
+    # The measured state of a verified frame, by pair names.
+    readings = [s["cbf"]["input_distance"] for s in steady if s["cbf"]["input_distance"]]
+    assert readings
+    left, right = readings[-1]["cross_min_pair"].split("/")
+    assert {left.split("_")[0], right.split("_")[0]} == {"left", "right"}
+    assert readings[-1]["min_distance_m"] <= readings[-1]["cross_min_distance_m"]
 
     line = harness.wait_for(lambda: logged.matching("CBF status:"), "an INFO line")[-1]
     counters = fields(line)
@@ -461,3 +523,37 @@ def test_a_right_hand_on_a_left_only_configuration_is_refused(node):
     cbf_report(harness, lambda cbf: cbf.get("hand_configuration_matches") is True, "matching hands")
     response = harness.set_mode("policy_stream")
     assert response.success, response.message
+
+
+def test_a_log_output_that_stops_holds_up_neither_the_commands_nor_the_status(node):
+    """Log lines are printed on a thread of their own. With the node's stderr pipe full every
+    write to it blocks; the command ticks and the status go on, and the lines come out after."""
+    harness, logged = node
+    harness.wait_active()
+    statuses = Statuses(harness)
+    assert harness.set_mode("policy_stream").success
+    stop = threading.Event()
+    thread = stream(harness, stop)
+    try:
+        harness.wait_for(lambda: mirroring(statuses.since(0)), "mirroring in the status")
+        harness.wait_for(lambda: logged.matching("CBF status:"), "an INFO line")
+        logged.stall()
+        lines = len(logged.matching("CBF status:"))
+        time.sleep(2.5)  # past the next INFO line (every 2 s): it is written into the full pipe
+        start, commands = statuses.count(), harness.mock.upper_body_count
+        time.sleep(1.0)  # measured after it
+        during = mirroring(statuses.since(start))
+        sent = harness.mock.upper_body_count - commands
+        assert logged.full(), "nothing may drain the pipe meanwhile"
+        logged.resume()
+        # The line made while the pipe was full was kept, not lost.
+        harness.wait_for(lambda: len(logged.matching("CBF status:")) > lines, "the INFO line held back")
+    finally:
+        logged.resume()
+        stop.set()
+        thread.join(timeout=1.0)
+
+    # 1 s: 20 statuses at 20 Hz, 50 commands at 50 Hz.
+    assert len(during) >= 14, len(during)
+    assert sent >= 35, sent
+    assert during[-1]["cbf"]["calls"] - during[0]["cbf"]["calls"] >= 25

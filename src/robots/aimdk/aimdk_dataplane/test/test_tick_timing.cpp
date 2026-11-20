@@ -8,11 +8,13 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <initializer_list>
 #include <string>
 #include <thread>
 
 #include "aimdk_dataplane/cbf_safety.hpp"
 #include "aimdk_dataplane/tick_timing.hpp"
+#include "cbf/proxy_model.hpp"
 #include "nlohmann/json.hpp"
 
 namespace
@@ -83,16 +85,18 @@ TEST(TimingHistogram, BucketsAreHalfOpenWithAnOpenTop)
   EXPECT_DOUBLE_EQ(h.max_ms, 1e6);
 }
 
-TEST(TickTiming, LateAndMissedTicksComeFromTheGapBetweenStarts)
+TEST(TickTiming, TheLateComesFromTheGapAndTheMissedFromTheSlots)
 {
   TickTiming timing(0.02);
-  // 20, 21 (1 ms late), 41 (one missed tick), 70 (three missed), 19 (early).
+  // Starts 0, 20, 41, 82, 152, 171 on slots of 20 ms: 41 serves slot 40 late;
+  // 82 serves 60 and skips 80; 152 serves 100 and skips 120 and 140; 171 serves
+  // 160. Nine slots, six calls.
   double t = 0.0;
   for (double gap : {0.0, 20.0, 21.0, 41.0, 70.0, 19.0}) {
     t += gap;
     timing.tick(plain(t), nullptr);
   }
-  EXPECT_EQ(timing.missed_ticks(), 1u + 3u);
+  EXPECT_EQ(timing.missed_ticks(), 3u);
   const auto report = timing.report(0.0);
   EXPECT_EQ(report.at("invocations"), 6);
   const auto & late = histogram(report, "late");
@@ -104,6 +108,36 @@ TEST(TickTiming, LateAndMissedTicksComeFromTheGapBetweenStarts)
   // A plain tick has no solve segments.
   EXPECT_EQ(histogram(report, "filter").at("n"), 0);
   EXPECT_EQ(histogram(report, "tick").at("n"), 6);
+}
+
+uint64_t missed(std::initializer_list<double> starts_ms)
+{
+  TickTiming timing(0.02);
+  for (double t : starts_ms) {timing.tick(plain(t), nullptr);}
+  return timing.missed_ticks();
+}
+
+TEST(TickTiming, ALateTickAndTheShortGapAfterItMissNothing)
+{
+  // 52 serves slot 40, 12 ms late; the timer keeps its phase, so 60 comes 8 ms later.
+  EXPECT_EQ(missed({0.0, 20.0, 52.0, 60.0, 80.0}), 0u);
+  // Late twice in a row, still every slot served.
+  EXPECT_EQ(missed({0.0, 20.0, 55.0, 75.0, 95.0, 100.0}), 0u);
+}
+
+TEST(TickTiming, ASlotAlreadyPastWhenACallIsMadeIsMissed)
+{
+  // 65 serves 40 and skips 60; 80 is on time.
+  EXPECT_EQ(missed({0.0, 20.0, 65.0, 80.0}), 1u);
+  // 109 serves 40 and skips 60, 80, 100.
+  EXPECT_EQ(missed({0.0, 20.0, 109.0, 120.0}), 3u);
+}
+
+TEST(TickTiming, TheFirstStartLateDoesNotShiftThePhase)
+{
+  // Slots 0, 20, 40, ...; the first call is 5 ms late. 20 shows the phase,
+  // so 64 serves 40 and skips 60.
+  EXPECT_EQ(missed({5.0, 20.0, 64.0, 80.0}), 1u);
 }
 
 TEST(TickTiming, ASolvedTickIsSplitIntoItsSegments)
@@ -170,6 +204,52 @@ TEST(TickTiming, EachFrameIsCountedByOutcomeAndHoldsByReason)
   EXPECT_EQ(report.at("paths").at("discarded"), 1);
   // The discarded tick still solved: its segments count.
   EXPECT_EQ(histogram(report, "filter").at("n"), 7);
+}
+
+TEST(TickTiming, EachFrameIsCountedByOutcomeAgainstTheMeasuredDistances)
+{
+  constexpr size_t kBody = 0;  // left shoulder / head
+  constexpr size_t kCross = x2::cbf::kPrimitivePairCount - 1;  // the two thumbs
+  static_assert(!x2::cbf::cross_arm_pair(kBody) && x2::cbf::cross_arm_pair(kCross));
+  TickTiming timing(0.02);
+  const auto reading = [](double min_m, double cross_m, size_t margin_pair) {
+      CbfDiagnostics diagnostics;
+      diagnostics.input_distance_valid = true;
+      diagnostics.input_min_distance_m = min_m;
+      diagnostics.input_cross_min_distance_m = cross_m;
+      diagnostics.input_min_margin_pair = margin_pair;
+      diagnostics.input_cross_min_pair = kCross;
+      return diagnostics;
+    };
+  auto d = reading(0.15, 0.35, kBody);
+  timing.tick(cbf(0.0, true, false, false), &d);
+  d = reading(0.04, 0.04, kCross);
+  timing.tick(cbf(20.0, false, false, true), &d);
+  d = reading(-0.01, 0.08, kCross);
+  timing.tick(cbf(40.0, false, false, true), &d);
+  d = reading(0.05, 0.3, kBody);  // on an edge: the upper bucket
+  timing.tick(cbf(60.0, true, true, false), &d);
+  CbfDiagnostics none;
+  timing.tick(cbf(80.0, false, false, false), &none);
+  // Not a CBF frame: not counted.
+  timing.tick(plain(100.0), &d);
+
+  auto report = timing.report(0.0);
+  const auto & by = report.at("outcome_distances");
+  EXPECT_EQ(by.at("edges_m"), (nlohmann::json{0.0, 0.05, 0.1, 0.2, 0.3}));
+  EXPECT_EQ(by.at("verified"), (nlohmann::json{
+      {"min", {0, 0, 0, 1, 0, 0}}, {"cross_min", {0, 0, 0, 0, 0, 1}},
+      {"least_margin_cross", 0}, {"no_reading", 0}}));
+  EXPECT_EQ(by.at("held"), (nlohmann::json{
+      {"min", {1, 1, 0, 0, 0, 0}}, {"cross_min", {0, 1, 1, 0, 0, 0}},
+      {"least_margin_cross", 2}, {"no_reading", 1}}));
+  EXPECT_EQ(by.at("released"), (nlohmann::json{
+      {"min", {0, 0, 1, 0, 0, 0}}, {"cross_min", {0, 0, 0, 0, 0, 1}},
+      {"least_margin_cross", 0}, {"no_reading", 0}}));
+  EXPECT_EQ(report.at("outcomes").at("held"), 3);
+  // With the histograms, once a second; cumulative, so nothing is lost in between.
+  EXPECT_FALSE(timing.report(0.5).contains("outcome_distances"));
+  EXPECT_EQ(timing.report(1.0).at("outcome_distances"), by);
 }
 
 TEST(TickTiming, ShadowFramesAreNotHolds)

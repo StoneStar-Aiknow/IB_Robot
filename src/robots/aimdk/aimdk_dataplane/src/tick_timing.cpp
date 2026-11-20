@@ -14,6 +14,8 @@
 #include <ctime>
 #include <utility>
 
+#include "cbf/proxy_model.hpp"
+
 namespace aimdk_dataplane
 {
 namespace
@@ -90,6 +92,24 @@ void TimingHistogram::add(double ms)
   window_max_ms = std::max(window_max_ms, ms);
 }
 
+void DistanceCounts::add(const CbfDiagnostics & diagnostics)
+{
+  if (!diagnostics.input_distance_valid) {
+    ++no_reading;
+    return;
+  }
+  const auto bucket = [](double m) {
+      return static_cast<size_t>(std::upper_bound(kEdgesM.begin(), kEdgesM.end(), m) - kEdgesM.begin());
+    };
+  ++min[bucket(diagnostics.input_min_distance_m)];
+  ++cross_min[bucket(diagnostics.input_cross_min_distance_m)];
+  if (diagnostics.input_min_margin_pair < x2::cbf::kPrimitivePairCount &&
+    x2::cbf::cross_arm_pair(diagnostics.input_min_margin_pair))
+  {
+    ++least_margin_cross;
+  }
+}
+
 void TickTrace::decided(const CbfDecision & decision, bool enforce_mode)
 {
   enforce = enforce_mode;
@@ -100,7 +120,8 @@ void TickTrace::decided(const CbfDecision & decision, bool enforce_mode)
 }
 
 TickTiming::TickTiming(double period_s)
-: period_ms_(period_s * 1e3)
+: period_ms_(period_s * 1e3),
+  period_(std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(period_s)))
 {
   // What one reading costs here, to tell the overhead of the readings apart.
   constexpr int kReadings = 1000;
@@ -181,11 +202,23 @@ void TickTiming::tick(const TickTrace & trace, const CbfDiagnostics * diagnostic
   std::lock_guard<std::mutex> lock(mutex_);
   ++invocations_;
   if (previous_entered_) {
-    // A timer that fell behind skips the ticks it missed (it does not burst).
     const double gap = since(*previous_entered_, trace.entered);
     add_locked(TimingSegment::kLate, gap - period_ms_);
-    const auto periods = std::lround(gap / period_ms_);
-    if (periods > 1) {missed_ticks_ += static_cast<uint64_t>(periods - 1);}
+    // Missed ticks by rcl's timer rule (rcl_timer_call), not by the gap: a late
+    // call serves its own slot and the next slot stays on the phase, so a late
+    // tick and the short gap after it miss nothing; slots already past when a
+    // call is made are skipped. The phase is the earliest start seen, since a
+    // call never comes before its slot. A start right on a slot boundary can be
+    // counted one off.
+    if (trace.entered < next_due_) {next_due_ = trace.entered;}
+    next_due_ += period_;
+    if (next_due_ < trace.entered) {
+      const auto skipped = static_cast<uint64_t>(std::ceil(since(next_due_, trace.entered) / period_ms_));
+      missed_ticks_ += skipped;
+      next_due_ += static_cast<Clock::duration::rep>(skipped) * period_;
+    }
+  } else {
+    next_due_ = trace.entered + period_;
   }
   previous_entered_ = trace.entered;
   add_locked(TimingSegment::kTick, since(trace.entered, trace.ended));
@@ -226,19 +259,22 @@ void TickTiming::tick(const TickTrace & trace, const CbfDiagnostics * diagnostic
   if (tick_tid_ == 0) {tick_tid_ = static_cast<int>(::syscall(SYS_gettid));}
   if (trace.path == TickPath::kCbf && diagnostics) {
     const auto reason = strip(diagnostics->reason, "unverified_mapping/");
+    const char * outcome = nullptr;
     if (!trace.enforce) {
-      ++outcomes_["shadow"];
+      outcome = "shadow";
     } else if (trace.released) {
-      ++outcomes_["released"];
+      outcome = "released";
       if (diagnostics->stuck_collision) {++outcomes_["released_collision"];}
       count(released_reasons_, strip(strip(diagnostics->reason, "released/"), "unverified_mapping/"));
     } else if (trace.accept_new) {
-      ++outcomes_["verified"];
+      outcome = "verified";
     } else {
-      ++outcomes_[trace.upper_body ? "held" : "withheld"];
+      outcome = trace.upper_body ? "held" : "withheld";
       if (trace.upper_body && trace.collision_refusal) {++outcomes_["held_collision"];}
       count(held_reasons_, reason);
     }
+    ++outcomes_[outcome];
+    outcome_distances_[outcome].add(*diagnostics);
   }
   add_locked(TimingSegment::kBookkeeping, since(begun, Clock::now()));
   clock_reads_.fetch_add(1, std::memory_order_relaxed);
@@ -282,6 +318,13 @@ json TickTiming::report(double now_s)
         {"n", h.n}, {"sum_ms", h.sum_ms}, {"max_ms", h.max_ms}, {"counts", h.counts}};
     }
     out["histograms"] = std::move(histograms);
+    json distances = {{"edges_m", DistanceCounts::kEdgesM}};
+    for (const auto & [outcome, counts] : outcome_distances_) {
+      distances[outcome] = {
+        {"min", counts.min}, {"cross_min", counts.cross_min},
+        {"least_margin_cross", counts.least_margin_cross}, {"no_reading", counts.no_reading}};
+    }
+    out["outcome_distances"] = std::move(distances);
     histograms_reported_s_ = now_s;
   }
   return out;

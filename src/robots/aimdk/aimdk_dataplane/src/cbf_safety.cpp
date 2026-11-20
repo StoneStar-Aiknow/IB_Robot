@@ -345,6 +345,7 @@ void CbfSafety::inactive(uint64_t epoch)
   diagnostics_.releasing = false;
   diagnostics_.stuck_s = 0.0;
   diagnostics_.thumb_feedback_issue.clear();
+  diagnostics_.input_distance_valid = false;
   diagnostics_.reason = "inactive";
 }
 
@@ -372,6 +373,7 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
   ++diagnostics_.calls;
   diagnostics_.active = true;
   diagnostics_.distance_valid = false;
+  diagnostics_.input_distance_valid = false;
   diagnostics_.thumb_angles_valid = false;
   diagnostics_.available_budget_us = std::max(0.0, remaining());
   diagnostics_.hand_check_us = 0.0;
@@ -570,6 +572,20 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       if (thumb_only) {diagnostics_.hand_check_us += cost;}
       else if (verify_only) {diagnostics_.verification_us += cost;}
       else {diagnostics_.projection_us += cost;}
+      if (!diagnostics_.input_distance_valid &&
+        result.status != x2::cbf::FilterStatus::InvalidInputFallback &&
+        result.input_cross_min_pair < x2::cbf::kPrimitivePairCount &&
+        result.input_min_pair < x2::cbf::kPrimitivePairCount &&
+        std::isfinite(result.input_min_distance_m) && std::isfinite(result.input_min_safety_margin_m) &&
+        std::isfinite(result.input_cross_min_distance_m))
+      {
+        diagnostics_.input_distance_valid = true;
+        diagnostics_.input_min_distance_m = result.input_min_distance_m;
+        diagnostics_.input_min_margin_m = result.input_min_safety_margin_m;
+        diagnostics_.input_min_margin_pair = result.input_min_pair;
+        diagnostics_.input_cross_min_distance_m = result.input_cross_min_distance_m;
+        diagnostics_.input_cross_min_pair = result.input_cross_min_pair;
+      }
       if (result.status == x2::cbf::FilterStatus::InvalidInputFallback && !invalid_input_this_frame) {
         invalid_input_this_frame = true;
         ++diagnostics_.invalid_input_frames;
@@ -837,10 +853,12 @@ CbfDecision CbfSafety::cached_fallback(const CbfDecision & decision, const std::
   return held;
 }
 
-CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now)
+CbfDecision CbfSafety::release_if_stuck(
+  const CbfDecision & decision, const CbfSnapshot & snapshot, double now, bool a_cap)
 {
   const auto settle = [&]() {
       stuck_since_.reset();
+      a_cap_point_.reset();
       diagnostics_.releasing = false;
       diagnostics_.stuck_collision = false;
       diagnostics_.stuck_s = 0.0;
@@ -854,6 +872,14 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
     stuck_since_ = now;
     stuck_with_history_ = accepted_.has_value();
     stuck_released_ = false;
+    a_cap_point_.reset();
+  }
+  // Frozen on the hold's first tick under the cap, by the data plane itself, so
+  // the session's view of the hold may come late. Dropped when the cap does.
+  if (!a_cap) {
+    a_cap_point_.reset();
+  } else if (!a_cap_point_ && complete_upper_body(requested)) {
+    a_cap_point_ = requested;
   }
   // One clock per hold. Once a verdict is seen the whole hold uses the collision
   // time, so a deadline frame amid verdicts cannot cut it short.
@@ -876,6 +902,12 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   CbfDecision out;
   out.epoch = decision.epoch;
   out.output = requested;
+  if (a_cap_point_) {
+    out.output.arm = a_cap_point_->arm;
+    out.output.hand = a_cap_point_->hand;
+    out.output.hand_sub_mode = a_cap_point_->hand_sub_mode;
+    ++diagnostics_.a_cap_capped_ticks;
+  }
   clamp_thumb_command(config_, out.output);
   place_phantom_thumbs(config_, snapshot.hand_reported_absent, out.output);
   const bool measured = snapshot.arm && snapshot.arm->position.size() == 14 && finite(snapshot.arm->position);
@@ -926,6 +958,7 @@ void CbfSafety::played(const Output & output, uint64_t epoch, double now)
   diagnostics_.hand_held = false;
   diagnostics_.recovery_verified = false;
   diagnostics_.distance_valid = false;
+  diagnostics_.input_distance_valid = false;
   diagnostics_.reason = "played";
 }
 
@@ -945,5 +978,6 @@ void CbfSafety::discarded()
   diagnostics_.recovery_verified = false;
   diagnostics_.hand_held = false;
   diagnostics_.distance_valid = false;
+  diagnostics_.input_distance_valid = false;
 }
 }  // namespace aimdk_dataplane

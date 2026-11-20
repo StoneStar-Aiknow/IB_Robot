@@ -19,6 +19,8 @@
 #include <chrono>
 #include <csignal>
 #include <cmath>
+#include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -119,6 +121,14 @@ private:
   TimingSegment segment_;
   TickTiming::Clock::time_point begun_;
 };
+
+// "first/second", by the CBF model's primitive names.
+std::string pair_name(size_t pair_index)
+{
+  if (pair_index >= x2::cbf::kPrimitivePairs.size()) {return "";}
+  const auto pair = x2::cbf::kPrimitivePairs[pair_index];
+  return std::string(x2::cbf::primitive_name(pair.first)) + "/" + x2::cbf::primitive_name(pair.second);
+}
 
 }  // namespace
 
@@ -233,6 +243,18 @@ public:
       get_logger(), "data plane up: %zu joint group(s)%s%s, %zu view(s), %zu command channel(s)",
       plan.joint_state.size(), plan.hand_state ? " + hands" : "", plan.arm_command_state ? " + arm command echo" : "",
       plan.views.size(), plan.channels.size());
+    // Last: a constructor that throws leaves no thread to join.
+    log_thread_ = std::thread([this]() {print_logs();});
+  }
+
+  ~Dataplane() override
+  {
+    {
+      std::lock_guard<std::mutex> lock(log_mutex_);
+      log_stop_ = true;
+    }
+    log_ready_.notify_one();
+    if (log_thread_.joinable()) {log_thread_.join();}
   }
 
   // An explicit zero velocity before this process stops publishing: the vendor's
@@ -310,7 +332,7 @@ private:
             try {
               player_->on_message(message->data, monotonic_s());
             } catch (const std::exception & error) {
-              RCLCPP_ERROR(get_logger(), "template command dropped: %s", error.what());
+              note_log(LogLevel::kError, "template command dropped: %s", error.what());
             }
           }));
       RCLCPP_INFO(
@@ -390,7 +412,6 @@ private:
       }
     }
     const int64_t stamp = stamp_ns(message->header);
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::string faulted;
     for (const auto & [name, code] : codes) {
       if (code != 0) {faulted += " " + name + "=" + std::to_string(code);}
@@ -398,6 +419,7 @@ private:
     if (!faulted.empty()) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "HAND_FAULT%s", faulted.c_str());
     }
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     note_intake("hand", stamp);
     core_.on_hand_state(
       {message->left_hand_type.value, message->right_hand_type.value}, std::move(entries), std::move(measured),
@@ -424,7 +446,7 @@ private:
         present_since_[side].reset();
         if (!phantom_logged_[side]) {
           phantom_logged_[side] = true;
-          RCLCPP_WARN(get_logger(), "CBF_HAND_ABSENT side=%s start: installed hand reported as type 0, "
+          note_log(LogLevel::kWarn, "CBF_HAND_ABSENT side=%s start: installed hand reported as type 0, "
             "checked as a phantom hand", side_names[side]);
         }
       } else if (phantom_logged_[side]) {
@@ -432,7 +454,7 @@ private:
         if (now - *present_since_[side] >= kPhantomEndAfterS) {
           phantom_logged_[side] = false;
           present_since_[side].reset();
-          RCLCPP_INFO(get_logger(), "CBF_HAND_ABSENT side=%s end", side_names[side]);
+          note_log(LogLevel::kInfo, "CBF_HAND_ABSENT side=%s end", side_names[side]);
         }
       }
     }
@@ -481,7 +503,7 @@ private:
     try {
       control = control_from_json(text);
     } catch (const std::exception & error) {
-      RCLCPP_ERROR(get_logger(), "ignoring a malformed control word: %s", error.what());
+      note_log(LogLevel::kError, "ignoring a malformed control word: %s", error.what());
       return;
     }
     const auto old_epoch = core_.safety_epoch();
@@ -591,8 +613,16 @@ private:
     command_tick();
     if (player_) {
       const Timed timed(timing_, TimingSegment::kTemplateStatus);
-      std::lock_guard<std::recursive_mutex> lock(mutex_);
-      publish_template_status(monotonic_s());
+      std::vector<std::string> messages;
+      {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        messages = take_template_status(monotonic_s());
+      }
+      for (auto & text : messages) {
+        std_msgs::msg::String message;
+        message.data = std::move(text);
+        template_status_pub_->publish(message);
+      }
     }
   }
 
@@ -634,6 +664,8 @@ private:
     if (lapsed) {
       publish_safe_command();
     }
+    // Every tick, so a late one is known as late; after the lapse, which may move the epoch.
+    const bool a_cap = player_ && player_->judge_a_cap(core_.safety_epoch(), now_s);
     const bool mirror_context = cbf_ && core_.mirror_context(cbf_->config().mirror_mode, now_s);
     const bool source_ready = cbf_ && core_.mirror_candidate(cbf_->config().mirror_mode, now_s);
     const bool named_only = core_.candidate_arm_is_named() && !source_ready;
@@ -722,7 +754,10 @@ private:
     try {
       decision = cbf_->filter(snapshot, now_s);
     } catch (const std::exception & error) {
-      RCLCPP_ERROR_THROTTLE(get_logger(), *get_clock(), 1000, "CBF rejected frame: %s", error.what());
+      if (now_s - last_filter_error_log_s_ >= 1.0) {
+        note_log(LogLevel::kError, "CBF rejected frame: %s", error.what());
+        last_filter_error_log_s_ = now_s;
+      }
       decision.epoch = snapshot.epoch;
       if (!cbf_->config().enforce) {decision.output = snapshot.requested;}
     }
@@ -770,7 +805,7 @@ private:
     const double previous_stuck_s = cbf_->diagnostics().stuck_s;
     const bool was_collision = cbf_->diagnostics().stuck_collision;
     const double release_at = monotonic_s();
-    decision = cbf_->release_if_stuck(decision, snapshot, release_at);
+    decision = cbf_->release_if_stuck(decision, snapshot, release_at, a_cap);
     const auto & d = cbf_->diagnostics();
     // For the INFO line only: the closest verified output since it last printed.
     // A held or released frame has no distance of its own.
@@ -785,11 +820,11 @@ private:
     trace_.decided(decision, cbf_->config().enforce);
     // Start, end and every second of a period published without verification.
     // Observation only: a long release is a CBF criterion to fix, not to act on.
-    // Logged after the command is out, so the WARN never delays it.
+    // Queued after the command is out; printed on the log thread (note_log).
     if (d.releasing != was_releasing || (d.releasing && release_at - last_release_log_s_ >= 1.0)) {
       const auto warn_begun = timing_ ? timing_->now() : TickTiming::Clock::time_point{};
-      RCLCPP_WARN(
-        get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu collision=%d reason=%s",
+      note_log(
+        LogLevel::kWarn, "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu collision=%d reason=%s",
         d.releasing != was_releasing ? (d.releasing ? "start" : "end") : "ongoing",
         static_cast<unsigned long long>(d.release_episodes),
         d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released),
@@ -807,7 +842,7 @@ private:
       try {
         player_->evaluate_start(decision, core_.safety_epoch(), cbf_->config().enforce, now_s);
       } catch (const std::exception & error) {
-        RCLCPP_ERROR(get_logger(), "template start not judged: %s", error.what());
+        note_log(LogLevel::kError, "template start not judged: %s", error.what());
         player_->reject_pending("internal_error");
       }
     }
@@ -838,7 +873,7 @@ private:
       try {
         output = player_->step(core_.tick(now_s, false), now_s);
       } catch (const std::exception & error) {
-        RCLCPP_ERROR(get_logger(), "template playback failed: %s", error.what());
+        note_log(LogLevel::kError, "template playback failed: %s", error.what());
         stop = "internal_error";
       }
     }
@@ -857,23 +892,20 @@ private:
     return true;
   }
 
-  void publish_template_status(double now_s)
+  // The template status messages due, published by the caller outside the lock.
+  std::vector<std::string> take_template_status(double now_s)
   {
-    const auto messages = player_->take_status(now_s);
-    for (const auto & text : messages) {
-      std_msgs::msg::String message;
-      message.data = text;
-      template_status_pub_->publish(message);
-    }
+    auto messages = player_->take_status(now_s);
     // Every transition and refusal once in the log; the periodic repeats are not.
     const auto & counters = player_->counters();
     if (!messages.empty() &&
       (player_->state() != logged_template_state_ || counters.rejected != logged_template_rejected_))
     {
-      RCLCPP_INFO(get_logger(), "TEMPLATE %s", messages.back().c_str());
+      note_log(LogLevel::kInfo, "TEMPLATE %s", messages.back().c_str());
       logged_template_state_ = player_->state();
       logged_template_rejected_ = counters.rejected;
     }
+    return messages;
   }
 
   // The hands the platform reports are the ones the CBF geometry was built for.
@@ -937,7 +969,7 @@ private:
   void flush_notes()
   {
     for (const auto & warning : core_.take_warnings()) {
-      RCLCPP_WARN(get_logger(), "%s", warning.c_str());
+      note_log(LogLevel::kWarn, "%s", warning.c_str());
     }
     auto rejected = core_.take_rejections();
     if (!rejected.empty()) {
@@ -945,13 +977,78 @@ private:
     }
   }
 
+  enum class LogLevel {kInfo, kWarn, kError};
+  static constexpr size_t kMaxQueuedLogs = 1000;
+
+  // Every log line made after start-up goes through here, to be printed on a
+  // thread of its own (print_logs): a slow log sink (the console pipe, /rosout,
+  // the log file) then holds up neither the command tick nor anyone waiting on
+  // mutex_. Lines keep their order and may come out a little after the command
+  // they are about. Past kMaxQueuedLogs unprinted, lines are counted, not kept.
+  __attribute__((format(printf, 3, 4))) void note_log(LogLevel level, const char * format, ...)
+  {
+    va_list args;
+    va_start(args, format);
+    va_list again;
+    va_copy(again, args);
+    const int size = std::vsnprintf(nullptr, 0, format, args);
+    va_end(args);
+    std::string text(size > 0 ? static_cast<size_t>(size) : 0, '\0');
+    if (size > 0) {std::vsnprintf(text.data(), text.size() + 1, format, again);}
+    va_end(again);
+    {
+      std::lock_guard<std::mutex> lock(log_mutex_);
+      if (pending_logs_.size() >= kMaxQueuedLogs) {
+        ++dropped_logs_;
+        return;
+      }
+      pending_logs_.emplace_back(level, std::move(text));
+    }
+    log_ready_.notify_one();
+  }
+
+  void print_logs()
+  {
+    std::unique_lock<std::mutex> lock(log_mutex_);
+    while (true) {
+      log_ready_.wait(lock, [this]() {return log_stop_ || !pending_logs_.empty();});
+      if (pending_logs_.empty()) {
+        return;  // stopping, and everything queued is out
+      }
+      const auto logs = std::exchange(pending_logs_, {});
+      const auto dropped = std::exchange(dropped_logs_, 0);
+      lock.unlock();
+      {
+        const Timed timed(timing_, TimingSegment::kLogs);
+        for (const auto & [level, text] : logs) {
+          switch (level) {
+            case LogLevel::kInfo: RCLCPP_INFO(get_logger(), "%s", text.c_str()); break;
+            case LogLevel::kWarn: RCLCPP_WARN(get_logger(), "%s", text.c_str()); break;
+            case LogLevel::kError: RCLCPP_ERROR(get_logger(), "%s", text.c_str()); break;
+          }
+        }
+        if (dropped > 0) {
+          RCLCPP_WARN(get_logger(), "%llu log line(s) dropped: the log output did not keep up",
+            static_cast<unsigned long long>(dropped));
+        }
+      }
+      lock.lock();
+    }
+  }
+
+  // Everything is read under the lock into the status and copies; the JSON text,
+  // the detail of a fault line and the publication are made after it is released.
+  // From on_control the lock stays held by the caller through all of it, as before.
   void publish_status()
   {
     const auto entered = timing_ ? timing_->now() : TickTiming::Clock::time_point{};
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    std::unique_lock<std::recursive_mutex> lock(mutex_);
     if (timing_) {timing_->add(TimingSegment::kStatusLockWait, TickTiming::ms(timing_->now() - entered));}
     flush_notes();
     const double now_s = monotonic_s();
+    std::optional<CbfThumbFeedbackEvent> thumb_event;
+    uint64_t thumb_frames = 0;
+    std::optional<CbfInputFault> input_fault;
     nlohmann::json status;
     // ``at`` is when this report was generated, on the monotonic clock both
     // processes share: the runtime ages the report end to end (its queue time
@@ -1015,11 +1112,22 @@ private:
         {"elapsed_us", d.elapsed_us}, {"max_elapsed_us", d.max_elapsed_us},
         {"minimum_distance_m", d.distance_valid ? nlohmann::json(d.minimum_distance_m) : nlohmann::json(nullptr)}
       };
+      // The measured state of this frame (observation only); null on frames that did not evaluate it.
+      status["cbf"]["input_distance"] = d.input_distance_valid ? nlohmann::json{
+        {"min_distance_m", d.input_min_distance_m}, {"min_margin_m", d.input_min_margin_m},
+        {"min_margin_pair", pair_name(d.input_min_margin_pair)},
+        {"cross_min_distance_m", d.input_cross_min_distance_m},
+        {"cross_min_pair", pair_name(d.input_cross_min_pair)}} : nlohmann::json(nullptr);
       status["cbf"]["invalid_input_frames"] = d.invalid_input_frames;
       status["cbf"]["thumb_feedback_frames"] = d.thumb_feedback_frames;
       status["cbf"]["thumb_feedback_issue"] = d.thumb_feedback_issue;
       status["cbf"]["released"] = d.released;
-      if (player_) {status["cbf"]["played"] = d.played;}
+      if (player_) {
+        status["cbf"]["played"] = d.played;
+        status["cbf"]["a_cap"] = player_->a_cap();
+        status["cbf"]["a_cap_capped_ticks"] = d.a_cap_capped_ticks;
+        status["cbf"]["a_cap_epoch_mismatch"] = player_->counters().a_cap_epoch_mismatch;
+      }
       status["cbf"]["release_episodes"] = d.release_episodes;
       status["cbf"]["collision_release_episodes"] = d.collision_release_episodes;
       status["cbf"]["releasing"] = d.releasing;
@@ -1050,8 +1158,8 @@ private:
           std::snprintf(min_distance, sizeof(min_distance), "%.4f", log_min_distance_m_);
         }
         const auto missed_ticks = timing_ ? std::to_string(timing_->missed_ticks()) : std::string("na");
-        RCLCPP_INFO(
-          get_logger(),
+        note_log(
+          LogLevel::kInfo,
           "CBF status: mode=%s mirror_active=%s calls=%llu published=%llu geometry_modified=%llu "
           "held=%llu withheld=%llu released=%llu thumb_feedback_frames=%llu "
           "recovery_verified=%s hand_held=%s "
@@ -1080,94 +1188,16 @@ private:
       if (d.last_thumb_feedback_event && d.last_thumb_feedback_event->event != logged_thumb_event_ &&
         (logged_thumb_event_ == 0 || now_s - last_thumb_event_log_s_ >= 2.0))
       {
-        // Advisory: the frame went ahead with a clamped or substituted reading.
-        static constexpr std::array<const char *, 4> names{
-          "L_thumb_roll", "L_thumb_abad", "R_thumb_roll", "R_thumb_abad"};
-        const auto & event = *d.last_thumb_feedback_event;
-        const auto number = [](double value) {
-            return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
-          };
-        const nlohmann::json detail = {
-          {"event", event.event}, {"at_monotonic_s", number(event.at_s)}, {"issue", event.issue},
-          {"joint", event.axis >= 0 && event.axis < 4 ? nlohmann::json(names[event.axis]) : nlohmann::json(nullptr)},
-          {"value", number(event.value)}, {"lower", number(event.lower)}, {"upper", number(event.upper)},
-          {"frames", d.thumb_feedback_frames}, {"angle_units", "native rad"}
-        };
-        RCLCPP_WARN(get_logger(), "CBF_THUMB_FEEDBACK %s", detail.dump().c_str());
-        logged_thumb_event_ = event.event;
+        thumb_event = d.last_thumb_feedback_event;
+        thumb_frames = d.thumb_feedback_frames;
+        logged_thumb_event_ = thumb_event->event;
         last_thumb_event_log_s_ = now_s;
       }
       if (d.last_input_fault && d.last_input_fault->event != logged_input_fault_event_ &&
         (logged_input_fault_event_ == 0 || now_s - last_input_fault_log_s_ >= 2.0))
       {
-        const auto & fault = *d.last_input_fault;
-        const auto number = [](double value) {
-            return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
-          };
-        const auto numbers = [&](const auto & values) {
-            auto array = nlohmann::json::array();
-            for (double value : values) {array.push_back(number(value));}
-            return array;
-          };
-        nlohmann::json detail = {
-          {"event", fault.event}, {"call", fault.call}, {"epoch", fault.epoch},
-          {"command_sequence", fault.command_sequence}, {"stage", fault.stage},
-          {"at_monotonic_s", number(fault.at_s)},
-          {"issue", fault.issue}, {"index", fault.index}, {"joint", nullptr},
-          {"arm_current14", numbers(fault.arm_current)}, {"arm_target14", numbers(fault.arm_target)},
-          {"arm_requested14", numbers(fault.arm_requested)},
-          {"kernel_thumb_current6", numbers(fault.thumb_current_urdf)},
-          {"kernel_thumb_target6", numbers(fault.thumb_target_urdf)},
-          {"thumb_native_feedback_compact", numbers(fault.thumb_native_current)},
-          {"thumb_native_target_slots_0_1_10_11", numbers(fault.thumb_native_target)},
-          {"hands_installed", cbf_->config().hands_installed},
-          {"mapping_verified", cbf_->config().mapping_verified},
-          {"feedback_limit_tolerance_rad", cbf_->config().feedback_limit_tolerance_rad},
-          {"check_arm_feedback_goal_range", cbf_->config().check_arm_feedback_goal_range},
-          {"arm_age_s", number(fault.arm_age_s)}, {"thumb_age_s", number(fault.thumb_age_s)},
-          {"angle_units", "rad"}
-        };
-        auto bounds = nlohmann::json::array();
-        for (const auto & band : fault.thumb_limits_urdf) {
-          bounds.push_back({number(band[0]), number(band[1])});
-        }
-        detail["kernel_thumb_limits4"] = std::move(bounds);
-        auto current_thumb_bounds = nlohmann::json::array();
-        for (const auto & band : fault.thumb_current_limits_urdf) {
-          current_thumb_bounds.push_back({number(band[0]), number(band[1])});
-        }
-        detail["kernel_thumb_feedback_limits4"] = std::move(current_thumb_bounds);
-        auto arm_bounds = nlohmann::json::array();
-        for (const auto & band : fault.arm_feedback_limits) {
-          arm_bounds.push_back({number(band[0]), number(band[1])});
-        }
-        detail["kernel_arm_feedback_limits14"] = std::move(arm_bounds);
-        const bool arm_issue = fault.issue.find("_arm_") != std::string::npos;
-        const bool thumb_pose_issue = fault.issue.find("current_thumb_") == 0 ||
-          fault.issue.find("target_thumb_") == 0;
-        if (arm_issue && fault.index >= 0 && static_cast<size_t>(fault.index) < kVendorArmOrder.size()) {
-          detail["joint"] = kVendorArmOrder[static_cast<size_t>(fault.index)];
-        } else if (thumb_pose_issue && fault.index >= 0 && fault.index < 6) {
-          static constexpr std::array<const char *, 6> names{
-            "L_thumb_roll", "L_thumb_abad", "ignored_L_thumb_mcp",
-            "R_thumb_roll", "R_thumb_abad", "ignored_R_thumb_mcp"};
-          detail["joint"] = names[static_cast<size_t>(fault.index)];
-        }
-        if (fault.index >= 0 && (arm_issue || thumb_pose_issue || fault.issue == "thumb_limits_invalid")) {
-          detail["value"] = number(fault.value);
-          detail["lower"] = number(fault.lower);
-          detail["upper"] = number(fault.upper);
-        }
-        if (fault.issue == "distance_gradient_invalid") {
-          detail["pair_index"] = fault.index;
-          if (fault.index >= 0 && static_cast<size_t>(fault.index) < x2::cbf::kPrimitivePairs.size()) {
-            const auto pair = x2::cbf::kPrimitivePairs[static_cast<size_t>(fault.index)];
-            detail["pair_first"] = x2::cbf::primitive_name(pair.first);
-            detail["pair_second"] = x2::cbf::primitive_name(pair.second);
-          }
-        }
-        RCLCPP_WARN(get_logger(), "CBF_INPUT_FAULT %s", detail.dump().c_str());
-        logged_input_fault_event_ = fault.event;
+        input_fault = d.last_input_fault;
+        logged_input_fault_event_ = input_fault->event;
         last_input_fault_log_s_ = now_s;
       }
     }
@@ -1177,6 +1207,92 @@ private:
       const auto begun = timing_->now();
       status["tick_timing"] = timing_->report(now_s);
       timing_->add(TimingSegment::kTimingJson, TickTiming::ms(timing_->now() - begun));
+    }
+    lock.unlock();
+    if (thumb_event) {
+      // Advisory: the frame went ahead with a clamped or substituted reading.
+      static constexpr std::array<const char *, 4> names{
+        "L_thumb_roll", "L_thumb_abad", "R_thumb_roll", "R_thumb_abad"};
+      const auto & event = *thumb_event;
+      const auto number = [](double value) {
+          return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
+        };
+      const nlohmann::json detail = {
+        {"event", event.event}, {"at_monotonic_s", number(event.at_s)}, {"issue", event.issue},
+        {"joint", event.axis >= 0 && event.axis < 4 ? nlohmann::json(names[event.axis]) : nlohmann::json(nullptr)},
+        {"value", number(event.value)}, {"lower", number(event.lower)}, {"upper", number(event.upper)},
+        {"frames", thumb_frames}, {"angle_units", "native rad"}
+      };
+      note_log(LogLevel::kWarn, "CBF_THUMB_FEEDBACK %s", detail.dump().c_str());
+    }
+    if (input_fault) {
+      const auto & fault = *input_fault;
+      const auto number = [](double value) {
+          return std::isfinite(value) ? nlohmann::json(value) : nlohmann::json(nullptr);
+        };
+      const auto numbers = [&](const auto & values) {
+          auto array = nlohmann::json::array();
+          for (double value : values) {array.push_back(number(value));}
+          return array;
+        };
+      nlohmann::json detail = {
+        {"event", fault.event}, {"call", fault.call}, {"epoch", fault.epoch},
+        {"command_sequence", fault.command_sequence}, {"stage", fault.stage},
+        {"at_monotonic_s", number(fault.at_s)},
+        {"issue", fault.issue}, {"index", fault.index}, {"joint", nullptr},
+        {"arm_current14", numbers(fault.arm_current)}, {"arm_target14", numbers(fault.arm_target)},
+        {"arm_requested14", numbers(fault.arm_requested)},
+        {"kernel_thumb_current6", numbers(fault.thumb_current_urdf)},
+        {"kernel_thumb_target6", numbers(fault.thumb_target_urdf)},
+        {"thumb_native_feedback_compact", numbers(fault.thumb_native_current)},
+        {"thumb_native_target_slots_0_1_10_11", numbers(fault.thumb_native_target)},
+        {"hands_installed", cbf_->config().hands_installed},
+        {"mapping_verified", cbf_->config().mapping_verified},
+        {"feedback_limit_tolerance_rad", cbf_->config().feedback_limit_tolerance_rad},
+        {"check_arm_feedback_goal_range", cbf_->config().check_arm_feedback_goal_range},
+        {"arm_age_s", number(fault.arm_age_s)}, {"thumb_age_s", number(fault.thumb_age_s)},
+        {"angle_units", "rad"}
+      };
+      auto bounds = nlohmann::json::array();
+      for (const auto & band : fault.thumb_limits_urdf) {
+        bounds.push_back({number(band[0]), number(band[1])});
+      }
+      detail["kernel_thumb_limits4"] = std::move(bounds);
+      auto current_thumb_bounds = nlohmann::json::array();
+      for (const auto & band : fault.thumb_current_limits_urdf) {
+        current_thumb_bounds.push_back({number(band[0]), number(band[1])});
+      }
+      detail["kernel_thumb_feedback_limits4"] = std::move(current_thumb_bounds);
+      auto arm_bounds = nlohmann::json::array();
+      for (const auto & band : fault.arm_feedback_limits) {
+        arm_bounds.push_back({number(band[0]), number(band[1])});
+      }
+      detail["kernel_arm_feedback_limits14"] = std::move(arm_bounds);
+      const bool arm_issue = fault.issue.find("_arm_") != std::string::npos;
+      const bool thumb_pose_issue = fault.issue.find("current_thumb_") == 0 ||
+        fault.issue.find("target_thumb_") == 0;
+      if (arm_issue && fault.index >= 0 && static_cast<size_t>(fault.index) < kVendorArmOrder.size()) {
+        detail["joint"] = kVendorArmOrder[static_cast<size_t>(fault.index)];
+      } else if (thumb_pose_issue && fault.index >= 0 && fault.index < 6) {
+        static constexpr std::array<const char *, 6> names{
+          "L_thumb_roll", "L_thumb_abad", "ignored_L_thumb_mcp",
+          "R_thumb_roll", "R_thumb_abad", "ignored_R_thumb_mcp"};
+        detail["joint"] = names[static_cast<size_t>(fault.index)];
+      }
+      if (fault.index >= 0 && (arm_issue || thumb_pose_issue || fault.issue == "thumb_limits_invalid")) {
+        detail["value"] = number(fault.value);
+        detail["lower"] = number(fault.lower);
+        detail["upper"] = number(fault.upper);
+      }
+      if (fault.issue == "distance_gradient_invalid") {
+        detail["pair_index"] = fault.index;
+        if (fault.index >= 0 && static_cast<size_t>(fault.index) < x2::cbf::kPrimitivePairs.size()) {
+          const auto pair = x2::cbf::kPrimitivePairs[static_cast<size_t>(fault.index)];
+          detail["pair_first"] = x2::cbf::primitive_name(pair.first);
+          detail["pair_second"] = x2::cbf::primitive_name(pair.second);
+        }
+      }
+      note_log(LogLevel::kWarn, "CBF_INPUT_FAULT %s", detail.dump().c_str());
     }
     std_msgs::msg::String message;
     message.data = status.dump();
@@ -1201,6 +1317,7 @@ private:
   uint64_t logged_thumb_event_ = 0;
   double last_thumb_event_log_s_ = 0.0;
   double last_release_log_s_ = 0.0;
+  double last_filter_error_log_s_ = -std::numeric_limits<double>::infinity();
   double last_status_log_s_ = -std::numeric_limits<double>::infinity();
   double log_min_distance_m_ = std::numeric_limits<double>::infinity();
   uint64_t log_distance_frames_ = 0;
@@ -1225,6 +1342,14 @@ private:
   std::unique_ptr<ibrobot_msgs::msg::JointCommandState> echo_;
   std::vector<std::string> pending_rejections_;
   std::map<std::string, double> intake_lag_ms_;
+  // The log lines waiting for the log thread; their own lock, so that queueing
+  // one never waits on mutex_ and printing them never holds it.
+  std::mutex log_mutex_;
+  std::condition_variable log_ready_;
+  std::vector<std::pair<LogLevel, std::string>> pending_logs_;
+  uint64_t dropped_logs_ = 0;
+  bool log_stop_ = false;
+  std::thread log_thread_;
 };
 
 }  // namespace aimdk_dataplane

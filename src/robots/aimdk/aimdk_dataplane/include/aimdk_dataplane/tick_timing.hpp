@@ -6,7 +6,8 @@
 // executor thread is added to bounded cumulative histograms, so a 20 Hz status
 // still accounts for every 50 Hz tick; the histograms themselves are reported
 // once a second, the counters and the maxima since the previous report in every
-// status. Timer invocations, CBF frames and published commands are counted
+// status. CBF ticks are also counted by outcome against the distances of the
+// measured state, reported with the histograms. Timer invocations, CBF frames and published commands are counted
 // apart: fewer CBF calls alone does not show the timer did not run. The
 // thread's own clocks split a slow tick into computing and waiting for a CPU.
 
@@ -38,7 +39,7 @@ enum class TimingSegment : size_t
   kFilter,  // CBF ticks: the filter, outside the lock
   kRelock,  // CBF ticks: the wait to take the lock back
   kPublish,  // the time inside publish(), on ticks that published
-  kWarn,  // the CBF_RELEASE log line, on ticks that logged one
+  kWarn,  // queueing the CBF_RELEASE log line, on ticks that logged one; printed in kLogs
   kOther,  // CBF ticks: the rest (checks, release, commit, notes)
   // Of a command tick, from the thread's own clocks: on a CPU, and ready to run
   // but waiting for one. The rest of its time it slept (the lock).
@@ -56,6 +57,7 @@ enum class TimingSegment : size_t
   kTouch,
   kEcho,
   kStream,  // a public command channel message
+  kLogs,  // printing queued log lines, on the node's log thread
   kBookkeeping,  // adding one tick to these figures
   kCount
 };
@@ -64,7 +66,7 @@ constexpr std::array<const char *, static_cast<size_t>(TimingSegment::kCount)> k
   "late", "tick", "lock_wait", "snapshot", "filter", "relock", "publish", "warn", "other",
   "tick_cpu", "tick_runqueue", "between_runqueue", "filter_cpu", "filter_offcpu",
   "template_status", "status", "status_lock_wait", "timing_json", "joint_states", "control", "touch",
-  "echo", "stream", "bookkeeping"};
+  "echo", "stream", "logs", "bookkeeping"};
 
 struct TimingHistogram
 {
@@ -121,6 +123,19 @@ struct TickTrace
   void decided(const CbfDecision & decision, bool enforce_mode);
 };
 
+// CBF ticks of one outcome, by the measured state's distances (CbfDiagnostics'
+// input_*): counts[i] holds kEdgesM[i - 1] <= m < kEdgesM[i], below 0 in counts[0].
+struct DistanceCounts
+{
+  static constexpr std::array<double, 5> kEdgesM{0.0, 0.05, 0.1, 0.2, 0.3};
+  std::array<uint64_t, kEdgesM.size() + 1> min{};  // the least distance of any pair
+  std::array<uint64_t, kEdgesM.size() + 1> cross_min{};  // the least between the two arms
+  uint64_t least_margin_cross = 0;  // the pair with the least margin was between the two arms
+  uint64_t no_reading = 0;  // the tick did not evaluate the measured state
+
+  void add(const CbfDiagnostics & diagnostics);
+};
+
 class TickTiming
 {
 public:
@@ -142,6 +157,7 @@ public:
   // A finished command tick, on the thread that ran it. ``diagnostics`` is the
   // CBF's, on kCbf ticks, for the reason of a held or released frame.
   void tick(const TickTrace & trace, const CbfDiagnostics * diagnostics);
+  // Timer slots that got no call, by rcl's skip rule (see tick()).
   uint64_t missed_ticks() const;
   // The report for the status at ``now_s`` (seconds, monotonic); starts the
   // next window of maxima. Histograms are included at most once a kHistogramPeriodS.
@@ -153,6 +169,7 @@ private:
 
   mutable std::mutex mutex_;
   double period_ms_;
+  Clock::duration period_;
   double clock_ns_ = 0.0;
   double thread_times_ns_ = 0.0;
   double thread_cpu_ns_ = 0.0;
@@ -161,6 +178,7 @@ private:
   std::atomic<uint64_t> thread_reads_{0};
   std::array<TimingHistogram, static_cast<size_t>(TimingSegment::kCount)> histograms_{};
   std::optional<Clock::time_point> previous_entered_;
+  Clock::time_point next_due_{};  // the slot after the one the last tick served
   std::optional<ThreadTimes> previous_ended_;
   int tick_tid_ = 0;
   uint64_t invocations_ = 0;
@@ -171,6 +189,7 @@ private:
   std::map<std::string, uint64_t> outcomes_;
   std::map<std::string, uint64_t> held_reasons_;
   std::map<std::string, uint64_t> released_reasons_;
+  std::map<std::string, DistanceCounts> outcome_distances_;
   std::optional<double> histograms_reported_s_;
 };
 

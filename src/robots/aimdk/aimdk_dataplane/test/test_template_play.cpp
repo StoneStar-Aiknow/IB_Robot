@@ -844,3 +844,154 @@ TEST(TemplatePlayer, StatusIsSentOnEveryChangeAndEveryHundredMilliseconds)
     EXPECT_TRUE(status["counters"].contains(key)) << key;
   }
 }
+
+namespace
+{
+json a_cap_message(bool on, json epoch, std::optional<json> attempt = std::nullopt)
+{
+  json out = {{"schema", "x2_template_play/v1"}, {"op", "a_cap"}, {"on", on}, {"epoch", epoch}};
+  if (attempt) {out["attempt"] = *attempt;}
+  return out;
+}
+}  // namespace
+
+TEST(TemplateCommand, ParsesACapWithoutASegIdAndRefusesBadFields)
+{
+  const auto parsed = parse_template_command(a_cap_message(true, 3).dump());
+  ASSERT_TRUE(parsed);
+  EXPECT_EQ(parsed->op, TemplateCommand::Op::kACap);
+  EXPECT_TRUE(parsed->on);
+  EXPECT_EQ(parsed->epoch, 3u);
+  EXPECT_FALSE(parsed->attempt);
+  auto tagged = a_cap_message(false, 0, 9);
+  tagged["seg_id"] = "not read";
+  const auto with_tag = parse_template_command(tagged.dump());
+  ASSERT_TRUE(with_tag);
+  EXPECT_FALSE(with_tag->on);
+  EXPECT_EQ(with_tag->epoch, 0u);
+  EXPECT_EQ(with_tag->attempt, std::optional<uint64_t>(9));
+
+  std::vector<json> bad;
+  auto no_on = a_cap_message(true, 1);
+  no_on.erase("on");
+  bad.push_back(no_on);
+  auto number_on = a_cap_message(true, 1);
+  number_on["on"] = 1;
+  bad.push_back(number_on);
+  auto no_epoch = a_cap_message(true, 1);
+  no_epoch.erase("epoch");
+  bad.push_back(no_epoch);
+  bad.push_back(a_cap_message(true, -1));
+  bad.push_back(a_cap_message(true, 1.5));
+  bad.push_back(a_cap_message(true, "1"));
+  bad.push_back(a_cap_message(true, 1, -1));
+  bad.push_back(a_cap_message(true, 1, 0.5));
+  bad.push_back(a_cap_message(true, 1, "a"));
+  for (const auto & value : bad) {EXPECT_FALSE(parse_template_command(value.dump())) << value.dump();}
+}
+
+TEST(TemplatePlayer, TheACapHoldsOnlyForAFreshOnInTheCurrentEpoch)
+{
+  Rig rig;
+  EXPECT_FALSE(rig.player.judge_a_cap(1, rig.now));
+  rig.send(a_cap_message(true, 1));
+  EXPECT_EQ(rig.player.counters().malformed, 0u);
+  rig.now += kTick;
+  EXPECT_TRUE(rig.player.judge_a_cap(1, rig.now));
+  EXPECT_TRUE(rig.player.a_cap());
+  // The safety epoch moved on: not this flag's, counted, and back when it is.
+  rig.now += kTick;
+  EXPECT_FALSE(rig.player.judge_a_cap(2, rig.now));
+  EXPECT_EQ(rig.player.counters().a_cap_epoch_mismatch, 1u);
+  rig.now += kTick;
+  EXPECT_TRUE(rig.player.judge_a_cap(1, rig.now));
+  // Off holds at once, and a cap never touches the player's own state.
+  rig.send(a_cap_message(false, 1));
+  rig.now += kTick;
+  EXPECT_FALSE(rig.player.judge_a_cap(1, rig.now));
+  EXPECT_EQ(rig.player.state(), TemplateState::kIdle);
+  EXPECT_EQ(rig.player.counters().a_cap_epoch_mismatch, 1u);
+
+  // Without the CBF's configuration there is nothing to cap with.
+  TemplatePlayer bare(std::nullopt, TemplateWhitelist{}, false);
+  bare.on_message(a_cap_message(true, 1).dump(), 100.0);
+  EXPECT_FALSE(bare.judge_a_cap(1, 100.02));
+}
+
+TEST(TemplatePlayer, TheACapLapsesAfterThreeTenthsOnOnTimeTicksOnly)
+{
+  Rig rig;
+  const auto judge = [&rig](double dt) {
+      rig.now += dt;
+      return rig.player.judge_a_cap(1, rig.now);
+    };
+  rig.send(a_cap_message(true, 1));
+  const double sent = rig.now;
+  // On time, every 20 ms: held through 0.3 s, lapsed on the first tick past it.
+  while (rig.now + kTick - sent <= TemplatePlayer::kACapTimeoutS + 1e-9) {ASSERT_TRUE(judge(kTick));}
+  EXPECT_FALSE(judge(kTick));
+  // A lapse stays until the next message, even on a late tick.
+  EXPECT_FALSE(judge(0.1));
+  rig.send(a_cap_message(true, 1));
+  EXPECT_TRUE(judge(kTick));
+
+  // A late tick (the executor stalled with the refresh still queued) is not
+  // judged: 0.5 s after the message, three periods after the last tick.
+  rig.send(a_cap_message(true, 1));
+  EXPECT_TRUE(judge(kTick));
+  EXPECT_TRUE(judge(0.48));
+  // The queued refresh runs next; without it the next on-time tick lapses.
+  EXPECT_FALSE(judge(kTick));
+
+  // Past twice the time it lapses on any tick.
+  rig.send(a_cap_message(true, 1));
+  EXPECT_TRUE(judge(kTick));
+  EXPECT_FALSE(judge(0.6));
+  EXPECT_FALSE(judge(kTick));
+}
+
+TEST(TemplatePlayer, TheStatusEchoesTheACapAtOnceWithItsEpochAttemptAndAge)
+{
+  Rig rig;
+  auto first = rig.last_status();
+  EXPECT_EQ(first["a_cap"], false);
+  EXPECT_TRUE(first["a_cap_epoch"].is_null());
+  EXPECT_TRUE(first["a_cap_attempt"].is_null());
+  EXPECT_TRUE(first["a_cap_age_s"].is_null());
+
+  rig.send(a_cap_message(true, 4, 11));
+  rig.now += kTick;
+  rig.player.judge_a_cap(4, rig.now);
+  rig.now += 0.01;
+  // 30 ms after the last periodic status: sent for the change.
+  const auto on = rig.last_status();
+  ASSERT_FALSE(on.is_null());
+  EXPECT_EQ(on["a_cap"], true);
+  EXPECT_EQ(on["a_cap_epoch"], 4);
+  EXPECT_EQ(on["a_cap_attempt"], 11);
+  EXPECT_NEAR(on["a_cap_age_s"].get<double>(), 0.03, 1e-9);
+  // A new attempt is a change too; the same one is not.
+  rig.now += 0.01;
+  rig.send(a_cap_message(true, 4, 11));
+  rig.player.judge_a_cap(4, rig.now);
+  EXPECT_TRUE(rig.player.take_status(rig.now).empty());
+  rig.send(a_cap_message(true, 4, 12));
+  rig.now += kTick;
+  rig.player.judge_a_cap(4, rig.now);
+  EXPECT_EQ(rig.last_status()["a_cap_attempt"], 12);
+
+  // Off: sent at once, and an untagged flag echoes a null attempt.
+  rig.send(a_cap_message(false, 4, 12));
+  rig.now += kTick;
+  rig.player.judge_a_cap(4, rig.now);
+  const auto off = rig.last_status();
+  ASSERT_FALSE(off.is_null());
+  EXPECT_EQ(off["a_cap"], false);
+  EXPECT_TRUE(off["a_cap_epoch"].is_null());
+  rig.send(a_cap_message(true, 4));
+  rig.now += kTick;
+  rig.player.judge_a_cap(4, rig.now);
+  const auto untagged = rig.last_status();
+  EXPECT_EQ(untagged["a_cap"], true);
+  EXPECT_TRUE(untagged["a_cap_attempt"].is_null());
+}
