@@ -9,6 +9,8 @@ nice, and a restore of the nice is checked to fail out loud there (not silently)
 
 from __future__ import annotations
 
+import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -194,3 +196,64 @@ def test_one_watcher_at_a_time_and_it_ends_with_its_dataplane(env):
         if watch.poll() is None:
             watch.kill()
             watch.wait()
+
+
+def test_a_thread_born_after_the_change_gets_the_main_threads_original_back(env):
+    """It inherits the changed nice and CPUs; a later apply must not save those as its original."""
+    stand_in, run, values = env
+    process = stand_in()
+    original = affinities(process.pid)[process.pid]
+    one_cpu = min(os.sched_getaffinity(0))
+    run("apply", "--cpus", str(one_cpu))
+    more_threads(process)
+    wait_for(lambda: len(tids(process.pid)) == 5, "a thread born after the change")
+    born = max(set(tids(process.pid)))
+    assert nices(process.pid)[born] == 7 and affinities(process.pid)[born] == {one_cpu}  # inherited
+    run("apply", "--cpus", str(one_cpu))  # as the watcher does every second
+
+    # The born thread lives on through the restore.
+    result = run("restore", check=False)
+    assert born in tids(process.pid)
+    assert affinities(process.pid) == {tid: original for tid in tids(process.pid)}
+    if ROOT:
+        assert result.returncode == 0
+        assert set(nices(process.pid).values()) == {0}
+    else:
+        # The nice cannot come back unprivileged; what was saved for it must be the original.
+        assert result.returncode == 1
+        (state,) = Path(values["X2_DATAPLANE_NICE_STATE"]).glob("*-*.json")
+        saved = json.loads(state.read_text())
+        assert saved["threads"][str(born)] == {"nice": 0, "cpus": sorted(original)}
+        assert f"线程 {born}" in result.stdout
+
+
+def load_script(values, monkeypatch):
+    for key in ("X2_DATAPLANE_EXE", "X2_DATAPLANE_NICE_STATE", "X2_DATAPLANE_NICE_VALUE"):
+        monkeypatch.setenv(key, values[key])
+    spec = importlib.util.spec_from_file_location("x2_dataplane_nice_under_test", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    calls = []
+    monkeypatch.setattr(os, "setpriority", lambda *a: calls.append(("setpriority", a)))
+    monkeypatch.setattr(os, "sched_setaffinity", lambda *a: calls.append(("sched_setaffinity", a)))
+    return module, calls
+
+
+def test_an_explicit_pid_that_is_not_a_dataplane_is_refused_untouched(env, monkeypatch, capsys):
+    stand_in, _, values = env
+    process = stand_in()
+    other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        module, calls = load_script(values, monkeypatch)
+        assert module.main(["apply", "--pid", str(other.pid), "--nice", "7"]) == 1
+        assert "不是 dataplane" in capsys.readouterr().out
+        # A dataplane chosen earlier that is not the same process now (another start time).
+        assert module.apply(process.pid, 7, None, started="0") == (0, 0)
+        assert calls == []
+        assert not list(Path(values["X2_DATAPLANE_NICE_STATE"]).glob("*-*.json"))
+        # The check does not refuse the real one.
+        assert module.main(["apply", "--pid", str(process.pid), "--nice", "7"]) == 0
+        assert {name for name, _ in calls} == {"setpriority"}
+    finally:
+        other.kill()
+        other.wait()

@@ -36,6 +36,12 @@ python3 x2_dataplane_nice.py restore           # 一条命令还原：停监视�
 
 另外，Linux 的 nice 是按线程算的：`renice -p PID` 只改主线程，所以脚本会逐个改 `/proc/PID/task/*` 下的每个线程。
 
+## 只碰 dataplane，只还原成真正的原值
+
+- 只认 argv[0] 以 `/lib/aimdk_dataplane/aimdk_dataplane` 结尾的进程（可用 `X2_DATAPLANE_EXE` 改）。`--pid` 指到别的进程会直接拒绝，什么都不改。
+- 每改一个线程之前，都重新核对进程的启动时间。pid 被别的进程复用了，就停手。
+- 第一次改动之后才出生的线程，从主线程继承的已经是改过的值。所以它保存的「原值」不是它自己当时读到的，而是第一次改动之前主线程的原值。
+
 ## 测试
 
 ```bash
