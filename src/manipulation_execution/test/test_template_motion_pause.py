@@ -807,6 +807,34 @@ def test_a_trigger_entered_within_enter_max_wait_says_how_long_it_waited():
     assert not lines(rig, "template reject")
 
 
+@pytest.mark.parametrize("clears", [-TICK, 0.0, TICK])
+def test_a_block_that_clears_at_enter_max_wait_never_enters_late(clears):
+    # Codex review 1120 T2: the block cleared at 1.52 s and the trigger still went into A.
+    rig = PauseRig()
+    wait = NEW.enter_max_wait_s
+    rig.active["heart"] = 7
+    rig.publish_enabled = False
+    rig.step()
+    first = rig.now
+    last_blocked = first + wait + min(clears, 0.0) - TICK  # after: a late tick jumps the threshold (Codex's 1.52)
+    while rig.now + TICK <= last_blocked + 1e-9:
+        rig.step()
+    assert rig.blender.phase is Phase.IDLE and not lines(rig, "template reject")
+    rig.publish_enabled = True
+    rig.now = first + wait + clears - TICK  # exactly: the next tick is the one the block clears on
+    rig.step()
+    assert rig.now - first == wait if clears == 0 else math.isclose(rig.now - first, wait + clears)
+    if clears < 0:
+        enter = lines(rig, "template enter")
+        assert rig.blender.phase is Phase.A and len(enter) == 1 and "blocked=publish_off" in enter[0]
+        return
+    assert rig.blender.phase is Phase.IDLE and not lines(rig, "template enter")
+    reject = lines(rig, "template reject")
+    assert len(reject) == 1 and "reason=publish_off" in reject[0] and "at=enter_max_wait" in reject[0]
+    rig.run(0.5)
+    assert rig.blender.phase is Phase.IDLE and not lines(rig, "template enter")  # that episode is over
+
+
 def test_entry_waits_for_a_second_of_statuses():
     rig = PauseRig(warm=False)
     rig.active["heart"] = 7

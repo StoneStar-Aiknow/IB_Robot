@@ -794,11 +794,13 @@ class Blender:
                     reason = "not_whitelisted"
             if reason is not None:
                 self._note_trigger(key, reason, now)
-                wait_max = self._config.enter_max_wait_s
-                if wait_max > 0.0 and now - self._pending[key][0] >= wait_max:
-                    self._attempted.add(key)  # answered late or not at all: not at all
-                    live.discard(key)
-                    self._reject(key, now, " at=enter_max_wait")
+            wait_max = self._config.enter_max_wait_s
+            if key in self._pending and wait_max > 0.0 and now - self._pending[key][0] >= wait_max:
+                self._attempted.add(key)  # answered late or not at all: not at all (also on the tick it clears)
+                live.discard(key)
+                self._reject(key, now, " at=enter_max_wait")
+                continue
+            if reason is not None:
                 continue
             pending = self._pending.pop(key, None)
             if pending is None:
