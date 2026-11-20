@@ -519,6 +519,7 @@ class Blender:
         self._pause_lines = 0
         self._exit_pending: str | None = None  # A's exit waits, paused, for a status the hand-back can rest on
         self._exit_pending_since = 0.0
+        self._exit_pending_c: tuple | None = None  # after B started: the C waited for (anchor, beta)
         self._c_checked = False  # C from A after a checked hand-back: it stops on what a safety exit would
         # (b)
         self._a_cap_from = 0.0  # the echo is to be true from here on: entering A, or a late tick
@@ -543,6 +544,7 @@ class Blender:
                 self._client.release(self._seg_id, fast=True)
             self._exit_log("stop", now)
             self._phase, self._since = Phase.STOP_WAIT, now
+            self._exit_pending = self._exit_pending_c = None
             self._hand_target = self._status_hand()
             return
         self._a_cap_off()
@@ -649,6 +651,8 @@ class Blender:
             m = _arm(getattr(inputs.last_sent, "arm", None))
             if m is None:
                 return None
+        if self._exit_pending_c is not None:
+            return self._tick_back_pending(now, m)
         if phase is Phase.A:
             return self._tick_a(now, inputs, m)
         if phase is Phase.WAIT_ACK:
@@ -897,7 +901,7 @@ class Blender:
             try:
                 self._seg_id = self._client.start(segment.name, now)
             except RuntimeError:
-                return self._to_c(now, "port_busy", m, segment.P, 1.0)
+                return self._hand_back(now, "port_busy", m, segment.P, 1.0)
             status = self._port.latest()
             self._status_serial = self._seen_serial = 0 if status is None else status.serial
             self._play_deadline = now + segment.t_in + segment.hold_max_s + segment.t_out + config.play_margin_s
@@ -1044,13 +1048,54 @@ class Blender:
         if self._paused:
             self._paused_s += now - self._pause_since
             self._paused = False
-        back = " back=safety" + (f" after={after}:{now - self._exit_pending_since:.2f}" if after else "")
+        waited = now - self._exit_pending_since if self._exit_pending or self._exit_pending_c else 0.0
+        back = " back=safety" + (f" after={after}:{waited:.2f}" if after else "")
         self._exit_log(reason, now, back)
         self._phase, self._since = Phase.COOLDOWN, now
         self._label = self._segment = None
         self._hand_target = None
-        self._exit_pending, self._c_checked = None, False
+        self._exit_pending, self._exit_pending_c, self._c_checked = None, None, False
         return None
+
+    def _hand_back(
+        self, now: float, reason: str, m: tuple[float, ...], anchor: tuple[float, ...], beta: float
+    ) -> tuple[float, ...] | None:
+        """To C from the segment's side of A (from P, or where the port says the arm is).
+
+        v1.2 (plan 3.6, review 1120 T1b): a STOPPED playback (the data plane
+        stopped it: epoch_changed, revoked, named_arm, control_lapsed,
+        internal_error, or a reason not known here) and a safety change in the
+        statuses send no C: the data plane's CBF path goes on from P_actual.
+        Any other exit waits for a trusted status of A's epoch and owner, the
+        arm kept where it is, at most ``a_untrusted_max_s``.
+        """
+        if not self._pausing:
+            return self._to_c(now, reason, m, anchor, beta)
+        pending = self._exit_pending_c is not None
+        after = reason if pending else ""
+        if reason.startswith("stopped"):
+            return self._safety_stop(now, reason)
+        safety = self._safety_change()
+        if safety is not None:
+            return self._safety_stop(now, safety, reason)
+        if not self._hand_back_ok(now):
+            if not pending:
+                self._exit_pending, self._exit_pending_since = reason, now
+                self._exit_pending_c = (tuple(anchor), beta)
+            return self._exit_pending_c[0]
+        back = " back=c"
+        if pending:
+            back = f" back=c after={after}:{now - self._exit_pending_since:.2f}"
+            self._exit_pending = self._exit_pending_c = None
+        self._c_checked, self._untrusted_since = True, None
+        return self._to_c(now, reason, m, anchor, beta, back=back)
+
+    def _tick_back_pending(self, now: float, m: tuple[float, ...]) -> tuple[float, ...] | None:
+        reason, (anchor, beta) = self._exit_pending, self._exit_pending_c
+        if now - self._exit_pending_since > self._config.a_untrusted_max_s and not self._hand_back_ok(now):
+            safety = self._safety_change() or "a_cbf_untrusted"
+            return self._safety_stop(now, safety, reason)
+        return self._hand_back(now, reason, m, anchor, beta)
 
     def _a_cbf(self, now: float, cbf, m: tuple[float, ...]) -> str | None:
         """A's reading of the data plane (v1.2): an exit reason, or None after pausing or resuming as due.
@@ -1221,11 +1266,11 @@ class Blender:
             self._hand_target = self._status_hand()
             return self._status_arm()
         if status is not None and status.state in TERMINAL:
-            return self._to_c(now, f"{status.state.lower()}:{status.reason}", m, self._segment.P, 1.0)
+            return self._hand_back(now, f"{status.state.lower()}:{status.reason}", m, self._segment.P, 1.0)
         if now - self._since > self._config.ack_timeout_s:
             self._client.release(self._seg_id, fast=True)
             self._port_suspect = True
-            return self._to_c(now, "no_ack", m, self._segment.P, 1.0)
+            return self._hand_back(now, "no_ack", m, self._segment.P, 1.0)
         return self._segment.P
 
     def _port_lost(self, status) -> bool:
@@ -1259,7 +1304,7 @@ class Blender:
             return self._to_wait_done(now, "play_timeout", segment.t_out_stop)
         if status.seg_id == self._seg_id:
             if status.state in TERMINAL:
-                return self._to_c(now, f"{status.state.lower()}:{status.reason}", m, arm, 1.0)
+                return self._hand_back(now, f"{status.state.lower()}:{status.reason}", m, arm, 1.0)
             if status.state == "EXIT_B":
                 return self._to_wait_done(now, status.reason or "exit", segment.t_out)
             if status.state == "HOLD" and self._hold_since is None:
@@ -1298,7 +1343,7 @@ class Blender:
             self._deadline = min(self._deadline, now + segment.t_out_stop + config.done_margin_s)
         elif status.seg_id == self._seg_id and status.state in TERMINAL:
             reason = self._wait_reason if status.state == "DONE" else f"{status.state.lower()}:{status.reason}"
-            return self._to_c(now, reason, m, arm, 1.0)
+            return self._hand_back(now, reason, m, arm, 1.0)
         elif self._port_lost(status):
             return self._lose_port(now, m, arm)
         if now >= self._deadline:
@@ -1309,14 +1354,14 @@ class Blender:
                 reason = "status_stale"
             else:
                 reason = "play_timeout" if self._wait_reason == "play_timeout" else "done_timeout"
-            return self._to_c(now, reason, m, arm, 1.0)
+            return self._hand_back(now, reason, m, arm, 1.0)
         return arm
 
     def _lose_port(self, now: float, m: tuple[float, ...], arm: tuple[float, ...]) -> tuple[float, ...]:
         # One fast release costs nothing: a port that still has the segment after all lets it go at once.
         self._client.release(self._seg_id, fast=True)
         self._client.abandon()
-        return self._to_c(now, "port_lost", m, arm, 1.0)
+        return self._hand_back(now, "port_lost", m, arm, 1.0)
 
     # -- C ------------------------------------------------------------------------
 

@@ -621,13 +621,121 @@ def test_a_checked_C_stops_on_what_would_be_a_safety_exit_in_A(what):
     the_mirror_passes(rig)
 
 
-def test_revoked_or_stopped_in_B_still_goes_back():
+def via_hooks(rig, seconds):
+    """Ticks through TemplateBlendHooks: what it publishes, and the phase after each tick."""
+    inner, hooks = hooked(rig)
+    published, phases = [], []
+    for _ in range(round(seconds / TICK)):
+        rig.now += TICK
+        rig.hear()
+        published.append(hooks.retarget(rig.inputs()))
+        phases.append(rig.blender.phase)
+        rig.client.pump(rig.now)
+    return published, phases
+
+
+def port_says(rig, seg_id, state, reason="hold_max"):
+    rig.publish_port(state=state, seg_id=seg_id, seg="heart", reason=reason, P_actual=list(P_HEART), hand_P=[0.2] * 20)
+
+
+# T1b: the data plane STOPPED it (its reasons, or one not known here): no C, its CBF path goes on from P_actual.
+@pytest.mark.parametrize("why", ["epoch_changed", "revoked", "named_arm", "control_lapsed", "internal_error", "new"])
+@pytest.mark.parametrize("phase", [Phase.PLAYING, Phase.WAIT_DONE])
+def test_a_playback_the_data_plane_stopped_sends_no_C(why, phase):
     rig = PauseRig()
     seg_id = to_playing_new(rig)
-    rig.publish_port(state="STOPPED", seg_id=seg_id, reason="safety_epoch", P_actual=list(P_HEART))
+    if phase is Phase.WAIT_DONE:
+        del rig.active["heart"]
+        assert rig.run(1.5, lambda: rig.blender.phase is Phase.WAIT_DONE)
+    port_says(rig, seg_id, "STOPPED", why)
+    published, phases = via_hooks(rig, 0.3)
+    assert Phase.C not in phases and safety_stopped(rig)
+    assert exit_reason(rig) == f"stopped:{why}" and outcome_of(exit_reason(rig)) == "safety"
+    assert all(c.arm == MIRROR and c.hand == (0.3,) * 20 for c in published)  # the inner's own command
+
+
+def test_off_a_stopped_playback_still_goes_back():
+    rig = PauseRig(OFF)
+    seg_id = to_playing_new(rig)
+    port_says(rig, seg_id, "STOPPED", "revoked")
     rig.step()
-    assert rig.blender.phase is Phase.C and exit_reason(rig) == "stopped:safety_epoch"
-    assert outcome_of(exit_reason(rig)) == "safety"
+    assert rig.blender.phase is Phase.C and exit_reason(rig) == "stopped:revoked"
+
+
+@pytest.mark.parametrize("state", ["DONE", "REJECTED"])
+def test_done_or_rejected_goes_through_C_on_a_trusted_status(state):
+    rig = PauseRig()
+    seg_id = to_playing_new(rig) if state == "DONE" else None
+    if seg_id is None:
+        rig.active["heart"] = 7
+        assert rig.run(4.0, lambda: rig.blender.phase is Phase.WAIT_ACK)
+        seg_id = rig.started()
+    port_says(rig, seg_id, state)
+    rig.step()
+    assert rig.blender.phase is Phase.C
+    assert " back=c" in lines(rig, "template exit")[-1] and " after=" not in lines(rig, "template exit")[-1]
+
+
+def test_done_while_the_statuses_are_late_holds_P_actual_then_goes_through_C():
+    rig = PauseRig()
+    seg_id = to_playing_new(rig)
+    rig.plane.delay = lambda at: 0.2
+    rig.run(0.2)
+    port_says(rig, seg_id, "DONE")
+    rig.run(0.3)
+    assert rig.blender.phase is Phase.PLAYING and not lines(rig, "template exit")
+    assert rig.out[-15:] == [P_HEART] * 15
+    rig.plane.delay = lambda at: 0.0
+    assert rig.run(0.3, lambda: rig.blender.phase is Phase.C)
+    exit = lines(rig, "template exit")[-1]
+    assert "reason=done:hold_max" in exit and " back=c after=done:hold_max:" in exit
+    rig.run(2.5)
+    assert rig.out[-1] == rig.mirror
+
+
+def test_done_never_trusted_is_a_safety_exit_after_a_untrusted_max_s():
+    rig = PauseRig()
+    seg_id = to_playing_new(rig)
+    rig.plane.delay = lambda at: None
+    rig.run(0.2)
+    port_says(rig, seg_id, "DONE")
+    published, phases = via_hooks(rig, 1.0)
+    stop = phases.index(Phase.COOLDOWN)
+    assert Phase.C not in phases and NEW.a_untrusted_max_s <= stop * TICK <= NEW.a_untrusted_max_s + 3 * TICK
+    exit = lines(rig, "template exit")[-1]
+    assert "reason=a_cbf_untrusted" in exit and " back=safety after=done:hold_max:0.5" in exit
+    assert all(c.arm == P_HEART for c in published[:stop])
+    assert all(c.arm == MIRROR and c.hand == (0.3,) * 20 for c in published[stop:])
+
+
+@pytest.mark.parametrize("what", ["epoch", "owner"])
+def test_a_safety_change_during_B_then_done_sends_no_C(what):
+    rig = PauseRig()
+    seg_id = to_playing_new(rig)
+    if what == "epoch":
+        rig.plane.epoch += 1
+    else:
+        rig.plane.owner = 2
+    rig.run(0.1)
+    assert rig.blender.phase is Phase.PLAYING  # B is the data plane's: it stops it itself
+    port_says(rig, seg_id, "DONE")
+    rig.step()
+    assert safety_stopped(rig) and exit_reason(rig) == f"a_{what}_changed"
+    assert " back=safety after=done:hold_max:0.00" in lines(rig, "template exit")[-1]
+    the_mirror_passes(rig)
+
+
+def test_a_round_end_while_C_waits_for_trust_wraps_up_as_before():
+    rig = PauseRig()
+    seg_id = to_playing_new(rig)
+    rig.plane.delay = lambda at: 0.2
+    rig.run(0.2)
+    port_says(rig, seg_id, "DONE")
+    rig.run(0.1)
+    rig.blender.end_round(rig.now)
+    assert rig.blender.phase is Phase.STOP_WAIT and exit_reason(rig) == "stop"
+    rig.run(0.6)
+    assert rig.blender.phase is not Phase.C and "a_cbf_untrusted" not in "".join(lines(rig, "template exit"))
 
 
 def test_no_safety_epoch_no_entry_and_in_A_a_safety_exit():
