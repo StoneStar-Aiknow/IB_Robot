@@ -1155,15 +1155,18 @@ CAP_EXPIRY = 0.3  # the data plane's: no refresh this long and the flag is gone
 
 
 class CapRig(PauseRig):
-    """PauseRig with a data plane that takes a_cap and echoes it in the port status (zll-64's plan
-    section 9). ``latency`` is the round trip from the session's message to its echo. ``echo``:
-    "plane" as the data plane would, None leaves the field out, False forces it false."""
+    """PauseRig with a data plane that takes a_cap and echoes it in the port status as e8cee8c7 does
+    (M0 revision 3: a_cap, and a_cap_epoch / a_cap_attempt / a_cap_age_s of the held message, null
+    while the flag is not in force). ``latency`` is the round trip from the session's message to its
+    echo. ``echo``: "plane" as the data plane would, None leaves the fields out, False forces it false;
+    ``tamper`` edits the echo of a held flag."""
 
     def __init__(self, config=CAP, latency=0.0, **kw):
         self.latency = latency
         self.echo = "plane"
-        self.flags = []  # (effective at, on, epoch)
+        self.flags = []  # (effective at, on, epoch, attempt)
         self.read = 0
+        self.tamper = lambda echo: echo
         super().__init__(config, **kw)
 
     def step(self, dt=TICK):
@@ -1171,23 +1174,27 @@ class CapRig(PauseRig):
         for raw in self.messages[self.read:]:
             message = json.loads(raw)
             if message["op"] == "a_cap":
-                self.flags.append((self.now + self.latency, message["on"], message["epoch"]))
+                self.flags.append((self.now + self.latency, message["on"], message["epoch"], message["attempt"]))
         self.read = len(self.messages)
         return arm
 
     def plane_flag(self):
         sent = [flag for flag in self.flags if flag[0] <= self.now + 1e-9]
+        none = {"a_cap": False, "a_cap_epoch": None, "a_cap_attempt": None, "a_cap_age_s": None}
         if not sent:
-            return False
-        at, on, epoch = sent[-1]
-        return on and epoch == self.plane.epoch and self.now - at <= CAP_EXPIRY
+            return none
+        at, on, epoch, attempt = sent[-1]
+        if not (on and epoch == self.plane.epoch and self.now - at <= CAP_EXPIRY):
+            return none
+        echo = {"a_cap": True, "a_cap_epoch": epoch, "a_cap_attempt": attempt, "a_cap_age_s": self.now - at}
+        return self.tamper(echo)
 
     def _port_now(self):
         if self.port is None:
             return
         port = dict(self.port)
         if self.echo == "plane":
-            port["a_cap"] = self.plane_flag()
+            port.update(self.plane_flag())
         elif self.echo is not None:
             port["a_cap"] = self.echo
         self.port_monitor.observe(json.dumps({"schema": "x2_template_status/v1", **port}), self.now)
@@ -1195,6 +1202,18 @@ class CapRig(PauseRig):
 
 def caps(rig):
     return [(m["on"], m["epoch"]) for m in map(json.loads, rig.messages) if m["op"] == "a_cap"]
+
+
+def a_cap_wait(rig):
+    return [float(line.split(" a_cap_wait=")[1].split()[0]) for line in lines(rig, "template exit")]
+
+
+def a_waits_at_0(rig, seconds):
+    """A, with the flag not confirmed: its clock stays at 0 and the gate gets the mirror command."""
+    for _ in range(round(seconds / TICK)):
+        rig.step()
+        assert rig.blender.phase is Phase.A and rig.blender._clock.at(rig.now) == 0.0
+        assert rig.out[-1] == rig.mirror
 
 
 def test_a_cap_off_sends_nothing_and_needs_no_echo():
@@ -1244,21 +1263,73 @@ def test_a_cap_echo_lost_midway_goes_back_through_C_without_backoff():
 
 
 @pytest.mark.parametrize("latency", [0.0, 0.25, 0.4])
-def test_a_cap_echo_late_at_entry_is_waited_for(latency):
+def test_a_cap_echo_late_at_entry_is_waited_for_without_moving(latency):
+    # Codex review 1120 D1: the arm requests come first, the on (or its echo) 0.25 / 0.4 s late.
     rig = CapRig(latency=latency)
+    rig.mirror = MIRROR
     rig.active["heart"] = 7
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)
+    a_waits_at_0(rig, latency)
     assert rig.run(4.0, lambda: rig.blender.phase in (Phase.WAIT_ACK, Phase.C))
     assert rig.blender.phase is Phase.WAIT_ACK
+    rig.run(3.0)
+    assert latency <= a_cap_wait(rig)[0] <= latency + 2 * TICK
+    assert max_step(rig.out) <= speed_limit(0.6) * TICK  # A starts from rest, as it always did
 
 
-def test_a_cap_never_echoed_true_ends_A_after_the_confirm_window():
+def test_a_cap_a_pause_before_the_first_echo_does_not_start_A():
+    rig = CapRig(latency=0.4)
+    rig.mirror = MIRROR
+    rig.active["heart"] = 7
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)
+    rig.hold(0.0, 0.06)  # paused and resumed while the flag is not confirmed
+    for _ in range(round(0.36 / TICK)):
+        rig.step()
+        assert rig.blender._clock.at(rig.now) == 0.0
+    assert lines(rig, "template pause") and lines(rig, "template resume")
+    assert rig.run(0.2, lambda: rig.blender._clock.at(rig.now) > 0.0)
+    assert rig.run(4.0, lambda: rig.blender.phase is Phase.WAIT_ACK)
+
+
+@pytest.mark.parametrize("echo", ["false", "old_attempt", "old_epoch", "old_message", "no_age", "no_attempt"])
+def test_a_cap_never_echoed_for_this_A_ends_it_after_the_confirm_window_without_moving(echo):
+    # D1: the on lost while the arm requests go on; an echo of an earlier A's flag, of an earlier
+    # epoch's, or of a message the data plane got too long ago, confirms nothing.
     rig = CapRig()
-    rig.echo = False  # an old data plane cannot send the field; one that sends it but never holds the flag
+    rig.mirror = MIRROR
+    if echo == "false":
+        rig.echo = False  # an old data plane cannot send the field; one that sends it but never holds the flag
+    else:
+        key, value = {
+            "old_attempt": ("a_cap_attempt", lambda e: e["a_cap_attempt"] - 1),
+            "old_epoch": ("a_cap_epoch", lambda e: e["a_cap_epoch"] - 1),
+            "old_message": ("a_cap_age_s", lambda e: A_CAP_ECHO_AGE_S + TICK),
+            "no_age": ("a_cap_age_s", lambda e: None),
+            "no_attempt": ("a_cap_attempt", lambda e: None),  # a data plane that drops the attempt
+        }[echo]
+        rig.tamper = lambda e: dict(e, **{key: value(e)})
     rig.active["heart"] = 7
     assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)
     entered = rig.now
+    a_waits_at_0(rig, CAP.a_cap_confirm_s - 2 * TICK)
     assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
     assert exit_reason(rig) == "a_cap_lost" and rig.now - entered == pytest.approx(CAP.a_cap_confirm_s, abs=TICK)
+    assert "a_cap_wait=unknown" in lines(rig, "template exit")[0]
+    assert rig.out[-1] == rig.mirror  # C from alpha 0 at rest: the mirror
+
+
+def test_a_cap_each_A_is_a_new_attempt_and_waits_for_its_own_echo():
+    rig = CapRig(latency=0.1)
+    for _ in range(2):
+        rig.active["heart"] = 7
+        for _ in range(round(4.0 / TICK)):  # A, B (played), C
+            play(rig)
+            rig.step()
+        del rig.active["heart"]
+        rig.run(1.0)  # cooldown
+    attempts = [m["attempt"] for m in map(json.loads, rig.messages) if m["op"] == "a_cap"]
+    assert attempts[0] == 1 and attempts[-1] == 2 and attempts == sorted(attempts)
+    assert rig.blender.entries == 2 and all(0.1 <= wait <= 0.1 + 2 * TICK for wait in a_cap_wait(rig))
 
 
 def test_a_cap_an_epoch_change_takes_the_epoch_exit():
@@ -1297,8 +1368,10 @@ def test_a_cap_needs_the_safety_epoch():
 
 @pytest.mark.parametrize("share", [0.05, 0.15])
 def test_stress_a_cap_with_a_working_echo_changes_nothing(share):
-    """The data plane echoes 0.1 s after the message: the same entries and completions as a_cap off."""
+    """The data plane echoes 0.1 s after the message: the same entries and completions as a_cap off; each
+    A only starts that much later (D1)."""
     for seed in range(3):
         off, on = stress(NEW, seed, share), stress(CAP, seed, share, rig_type=lambda config: CapRig(config, 0.1))
         assert on.blender.outcomes == off.blender.outcomes and on.blender.rejected == off.blender.rejected
-        assert on.out == off.out
+        waits = a_cap_wait(on)
+        assert waits and all(0.1 <= wait <= 0.1 + 2 * TICK for wait in waits)

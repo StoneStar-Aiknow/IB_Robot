@@ -71,8 +71,12 @@ value in :class:`BlendConfig` that restores the behaviour above):
   asks the data plane, in A's safety epoch, to aim the CBF's releases of a
   hold at the request of its first flagged tick; ``on: false`` once when A
   ends. The port status echoes ``a_cap``: no field, no entry
-  (``a_cap_missing``); in A, no true echo ``a_cap_confirm_s`` after entering
-  (or after a late tick: the flag may have expired meanwhile), or false
+  (``a_cap_missing``). Each entry into A is an attempt (from 1, never
+  reused), sent with the flag; an echo counts only with A's epoch, this
+  attempt, ``a_cap_age_s`` within A_CAP_ECHO_AGE_S and received in A
+  (review 1120 D1). A does not move before one: its clock waits at 0, the
+  output is the mirror. No such echo ``a_cap_confirm_s`` after entering (or
+  after a late tick: the flag may have expired meanwhile), or none
   ``a_cap_lost_s`` in a row after one, goes back through C (``a_cap_lost``,
   no backoff). An owner or epoch change takes the existing exits first.
 """
@@ -195,7 +199,7 @@ class BlendConfig:
     # (b): off until the data plane that echoes a_cap ships in the same package, or nothing is ever entered.
     a_cap: bool = False
     a_cap_lost_s: float = 0.15  # in A, the echo false this long in a row after a true one: back through C
-    a_cap_confirm_s: float = 0.5  # in A, no true echo this long after entering (or a late tick): the same
+    a_cap_confirm_s: float = 0.5  # in A, no echo this long after entering (or a late tick): the same; A waits at 0
 
     _FLAGS = ("require_person_frame", "b_label_unlatch", "a_cap")
     _MAY_BE_ZERO = (
@@ -470,7 +474,8 @@ class Blender:
         self._last_step: float | None = None  # this tick's now
         self._prev_step: float | None = None
         self._tick_late = False  # this tick came more than late_tick_s after the previous one
-        self._a_cap_epoch: int | None = None  # (b): on: true was sent in this epoch and no off since
+        self._a_cap_sent: tuple[int, int] | None = None  # (b): on: true was sent for (epoch, attempt), no off since
+        self._attempts = 0  # entries into A: the a_cap attempt, from 1, never reused
         self.begin_round()
 
     # -- round --------------------------------------------------------------------
@@ -540,6 +545,7 @@ class Blender:
         # (b)
         self._a_cap_from = 0.0  # the echo is to be true from here on: entering A, or a late tick
         self._a_cap_seen = False  # a true echo since _a_cap_from
+        self._a_cap_waited: float | None = None  # entering A to its first echo; A's clock starts there
         self._a_cap_false_since: float | None = None
 
     def end_round(self, now: float) -> None:
@@ -628,8 +634,8 @@ class Blender:
         try:
             arm = self._step(now, inputs, mirror)
             if self._phase is Phase.A and self._config.a_cap and self._epoch is not None:
-                self._a_cap_epoch = self._epoch
-                self._client.a_cap(True, self._epoch)
+                self._a_cap_sent = (self._epoch, self._attempts)
+                self._client.a_cap(True, self._epoch, self._attempts)
             else:
                 self._a_cap_off()
             return arm
@@ -637,9 +643,9 @@ class Blender:
             self._refresh_snapshot()
 
     def _a_cap_off(self) -> None:
-        epoch, self._a_cap_epoch = self._a_cap_epoch, None
-        if epoch is not None:
-            self._client.a_cap(False, epoch)
+        sent, self._a_cap_sent = self._a_cap_sent, None
+        if sent is not None:
+            self._client.a_cap(False, *sent)
 
     def _step(self, now: float, inputs, mirror: Sequence[float] | None) -> tuple[float, ...] | None:
         late_s = self._config.late_tick_s
@@ -873,7 +879,10 @@ class Blender:
         )
         self._phase, self._since, self._entered_at = Phase.A, now, now
         self._a_cap_from = now
+        self._attempts += 1
         self._clock = _Clock(now)
+        if config.a_cap:
+            self._clock.stop(now)  # D1: no step towards P before the data plane holds the flag for this A
         cbf = self._cbf.latest()
         if cbf is not None:
             self._epoch, self._owner, self._cbf_serial = cbf.safety_epoch, cbf.arm_owner, cbf.serial
@@ -962,9 +971,17 @@ class Blender:
             and status.a_cap is True
             and status.received_at > self._a_cap_from  # an echo from before cannot answer this window's flags
             and not self._older("a_cap_echo", now - status.received_at, A_CAP_ECHO_AGE_S)
+            and status.a_cap_epoch == self._epoch
+            and status.a_cap_attempt == self._attempts  # an echo of an earlier A's flag answers nothing here
+            and status.a_cap_age_s is not None
+            and status.a_cap_age_s <= A_CAP_ECHO_AGE_S
         )
         if echo:
             self._a_cap_seen, self._a_cap_false_since = True, None
+            if self._a_cap_waited is None:
+                self._a_cap_waited = now - self._entered_at
+                if not self._paused:
+                    self._clock.go(now, 0.0)  # alpha leaves 0 at rest: no ramp needed
             return None
         if self._a_cap_false_since is None:
             self._a_cap_false_since = now
@@ -1207,7 +1224,8 @@ class Blender:
         paused = now - self._pause_since
         self._paused_s += paused
         self._ref.ramp(now, ramp)
-        self._clock.go(now, ramp)
+        if not self._config.a_cap or self._a_cap_waited is not None:
+            self._clock.go(now, ramp)  # else alpha stays at 0 until the first echo
         self._paused, self._untrusted_since = False, None
         self._hand_target = self._segment.hand_P
         if self._pause_lines < PAUSE_LOG_LINES:
@@ -1543,13 +1561,14 @@ class Blender:
                 self._backoff_until = now + self._config.load_backoff_s
                 backoff = f" backoff={self._config.load_backoff_s:.1f}"
         paused_s = self._paused_s + (now - self._pause_since if self._paused else 0.0)
+        a_cap = f" a_cap_wait={_known(self._a_cap_waited, '.2f')}" if self._config.a_cap else ""
         self._log(
             f"template exit {name} seg={seg} phase={self._phase.value} reason={reason} "
             f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f} "
             f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f} "
             f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f} "
             f"outcome={outcome} played={self._played_at is not None} cbf=[{cbf_text}] label=[{label}] "
-            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}{back}"
+            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}{back}{a_cap}"
         )
 
     def _refresh_snapshot(self) -> None:

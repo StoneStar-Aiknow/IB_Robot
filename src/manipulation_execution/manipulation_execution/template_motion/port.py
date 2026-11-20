@@ -55,6 +55,10 @@ class PortStatus:
     received_at: float
     serial: int  # counts received statuses, so the blender can tell a new one
     a_cap: bool | None = None  # the (b) flag is in force on the data plane; None: the field is not sent
+    # Of the a_cap message the data plane holds (M0 revision 3); None while the flag is not in force:
+    a_cap_epoch: int | None = None
+    a_cap_attempt: int | None = None
+    a_cap_age_s: float | None = None  # since the data plane received it, by its clock
 
 
 def _vector(values, length: int) -> tuple[float, ...] | None:
@@ -94,6 +98,9 @@ def decode_status(data: str, now: float, serial: int) -> PortStatus:
         received_at=now,
         serial=serial,
         a_cap=a_cap if isinstance(a_cap, bool) else None,
+        a_cap_epoch=_count(message.get("a_cap_epoch")),
+        a_cap_attempt=_count(message.get("a_cap_attempt")),
+        a_cap_age_s=_seconds(message.get("a_cap_age_s")),
     )
 
 
@@ -305,10 +312,11 @@ class PlayClient:
             if self._seg_id == seg_id:
                 self._send({"op": "release", "seg_id": seg_id, "fast": bool(fast)})
 
-    def a_cap(self, on: bool, epoch: int) -> None:
-        """The (b) flag for the data plane's CBF, in the safety epoch A was entered in. No segment needed."""
+    def a_cap(self, on: bool, epoch: int, attempt: int) -> None:
+        """The (b) flag for the data plane's CBF, in the safety epoch A was entered in, for this entry into A
+        (``attempt``, echoed back so an old echo never answers a new A). No segment needed."""
         with self._lock:
-            self._send({"op": "a_cap", "on": bool(on), "epoch": int(epoch)})
+            self._send({"op": "a_cap", "on": bool(on), "epoch": int(epoch), "attempt": int(attempt)})
 
     def abandon(self) -> None:
         with self._lock:
