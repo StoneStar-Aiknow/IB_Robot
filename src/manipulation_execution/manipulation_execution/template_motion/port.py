@@ -8,7 +8,8 @@
   statuses in order (one older than the newest is dropped) and the share of
   held CBF calls over a window;
 * :class:`PlayClient`: ``start`` / ``release`` from the blender, ``pump``
-  from the node's tick for the keepalive.
+  from the node's tick for the keepalive; ``a_cap`` from the blender in A
+  (the (b) flag: the CBF's releases target the hold's first request).
 
 The client's obligations (M0 §2.1): a keepalive at least every 50 ms from the
 start until the status reports DONE, REJECTED or STOPPED for that ``seg_id``,
@@ -53,6 +54,7 @@ class PortStatus:
     segments: tuple[str, ...] | None
     received_at: float
     serial: int  # counts received statuses, so the blender can tell a new one
+    a_cap: bool | None = None  # the (b) flag is in force on the data plane; None: the field is not sent
 
 
 def _vector(values, length: int) -> tuple[float, ...] | None:
@@ -80,6 +82,7 @@ def decode_status(data: str, now: float, serial: int) -> PortStatus:
     segments = tuple(s for s in segments if isinstance(s, str)) if isinstance(segments, list) else None
     seg = message.get("seg")
     reason = message.get("reason")
+    a_cap = message.get("a_cap")
     return PortStatus(
         seg_id=seg_id,
         seg=seg if isinstance(seg, str) else None,
@@ -90,6 +93,7 @@ def decode_status(data: str, now: float, serial: int) -> PortStatus:
         segments=segments,
         received_at=now,
         serial=serial,
+        a_cap=a_cap if isinstance(a_cap, bool) else None,
     )
 
 
@@ -270,7 +274,7 @@ class PlayClient:
         message["schema"] = PLAY_SCHEMA
         try:
             self._publish(json.dumps(message, sort_keys=True))
-            self.sent[message["op"]] += 1
+            self.sent[message["op"]] = self.sent.get(message["op"], 0) + 1
         except Exception:
             self.publish_errors += 1
 
@@ -294,6 +298,11 @@ class PlayClient:
         with self._lock:
             if self._seg_id == seg_id:
                 self._send({"op": "release", "seg_id": seg_id, "fast": bool(fast)})
+
+    def a_cap(self, on: bool, epoch: int) -> None:
+        """The (b) flag for the data plane's CBF, in the safety epoch A was entered in. No segment needed."""
+        with self._lock:
+            self._send({"op": "a_cap", "on": bool(on), "epoch": int(epoch)})
 
     def abandon(self) -> None:
         with self._lock:

@@ -16,7 +16,13 @@ from dataclasses import replace
 import pytest
 from test_template_motion_blender import MIRROR, OFF, P_HEART, TICK, Rig, exit_reason, lines, max_jerkless, max_step
 
-from manipulation_execution.template_motion.blender import MIN_JERK_PEAK, BlendConfig, Phase, outcome_of
+from manipulation_execution.template_motion.blender import (
+    A_CAP_ECHO_AGE_S,
+    MIN_JERK_PEAK,
+    BlendConfig,
+    Phase,
+    outcome_of,
+)
 from manipulation_execution.template_motion.port import CbfMonitor
 
 PERIOD = 0.05  # the data plane's status
@@ -688,12 +694,12 @@ def test_the_off_values_are_accepted():
 # -- a fixed-seed stress: the same events, old and new -------------------------------------------
 
 
-def stress(config, seed, share, seconds=40.0):
+def stress(config, seed, share, seconds=40.0, rig_type=None):
     """Holds of 0.04-0.4 s (clustered) covering about ``share`` of the time, statuses sometimes late,
     lost or batched, a mirror that moves; the label held 5 s at a time. Returns the counts and the
     output, checked for continuity outside pause ticks."""
     rng = random.Random(seed)
-    rig = PauseRig(config=config)
+    rig = (rig_type or PauseRig)(config=config)
     t, end = rig.now, rig.now + seconds
     while t < end:  # holds in clusters
         burst = rng.randint(1, 4)
@@ -771,3 +777,158 @@ def test_stress_new_completes_at_least_as_often_aborts_less_and_never_jumps(shar
         results[name] = (done, aborts)
     print(f"share={share} complete/aborts old={results['old']} new={results['new']}")
     assert results["new"][0] >= results["old"][0] and results["new"][1] <= results["old"][1]
+
+
+# -- (b) a_cap: the session's side, against a data plane that echoes it ----------------------------
+
+CAP = replace(NEW, a_cap=True)
+CAP_EXPIRY = 0.3  # the data plane's: no refresh this long and the flag is gone
+
+
+class CapRig(PauseRig):
+    """PauseRig with a data plane that takes a_cap and echoes it in the port status (zll-64's plan
+    section 9). ``latency`` is the round trip from the session's message to its echo. ``echo``:
+    "plane" as the data plane would, None leaves the field out, False forces it false."""
+
+    def __init__(self, config=CAP, latency=0.0, **kw):
+        self.latency = latency
+        self.echo = "plane"
+        self.flags = []  # (effective at, on, epoch)
+        self.read = 0
+        super().__init__(config, **kw)
+
+    def step(self, dt=TICK):
+        arm = super().step(dt)
+        for raw in self.messages[self.read:]:
+            message = json.loads(raw)
+            if message["op"] == "a_cap":
+                self.flags.append((self.now + self.latency, message["on"], message["epoch"]))
+        self.read = len(self.messages)
+        return arm
+
+    def plane_flag(self):
+        sent = [flag for flag in self.flags if flag[0] <= self.now + 1e-9]
+        if not sent:
+            return False
+        at, on, epoch = sent[-1]
+        return on and epoch == self.plane.epoch and self.now - at <= CAP_EXPIRY
+
+    def _port_now(self):
+        if self.port is None:
+            return
+        port = dict(self.port)
+        if self.echo == "plane":
+            port["a_cap"] = self.plane_flag()
+        elif self.echo is not None:
+            port["a_cap"] = self.echo
+        self.port_monitor.observe(json.dumps({"schema": "x2_template_status/v1", **port}), self.now)
+
+
+def caps(rig):
+    return [(m["on"], m["epoch"]) for m in map(json.loads, rig.messages) if m["op"] == "a_cap"]
+
+
+def test_a_cap_off_sends_nothing_and_needs_no_echo():
+    rig = CapRig(NEW, latency=0.1)
+    rig.echo = None
+    to_playing_new(rig)
+    assert not caps(rig) and "a_cap" not in rig.client.snapshot()
+
+
+def test_a_cap_flags_every_A_tick_in_its_epoch_and_ends_with_one_off_before_the_start():
+    rig = CapRig(latency=0.1)
+    rig.active["heart"] = 7
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)
+    ticks = 1
+    while rig.blender.phase is Phase.A:
+        rig.step()
+        ticks += rig.blender.phase is Phase.A
+    assert rig.blender.phase is Phase.WAIT_ACK
+    assert caps(rig) == [(True, 3)] * ticks + [(False, 3)]
+    ops = [json.loads(m)["op"] for m in rig.messages]
+    assert ops.index("start") > len(ops) - 1 - ops[::-1].index("a_cap")  # the off went first
+    rig.run(1.0)
+    assert len(caps(rig)) == ticks + 1
+
+
+def test_a_cap_no_echo_field_no_entry():
+    rig = CapRig()
+    rig.echo = None
+    rig.active["heart"] = 7
+    rig.run(2.0)
+    assert rig.blender.entries == 0 and rig.blender.rejected == {"a_cap_missing": 1} and not caps(rig)
+
+
+def test_a_cap_echo_lost_midway_goes_back_through_C_without_backoff():
+    rig = CapRig(latency=0.1)
+    rig.into_a(0.3)
+    rig.echo = False
+    lost = rig.now
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "a_cap_lost"
+    assert CAP.a_cap_lost_s - 1e-9 <= rig.now - lost <= CAP.a_cap_lost_s + 2 * TICK
+    exit = lines(rig, "template exit")[0]
+    assert "outcome=port" in exit and "backoff=" not in exit
+    assert caps(rig)[-1] == (False, 3) and caps(rig).count((False, 3)) == 1
+    out = rig.out[-3:]
+    assert max_step(out) <= speed_limit(0.6) * TICK  # through C: no jump
+
+
+@pytest.mark.parametrize("latency", [0.0, 0.25, 0.4])
+def test_a_cap_echo_late_at_entry_is_waited_for(latency):
+    rig = CapRig(latency=latency)
+    rig.active["heart"] = 7
+    assert rig.run(4.0, lambda: rig.blender.phase in (Phase.WAIT_ACK, Phase.C))
+    assert rig.blender.phase is Phase.WAIT_ACK
+
+
+def test_a_cap_never_echoed_true_ends_A_after_the_confirm_window():
+    rig = CapRig()
+    rig.echo = False  # an old data plane cannot send the field; one that sends it but never holds the flag
+    rig.active["heart"] = 7
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)
+    entered = rig.now
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "a_cap_lost" and rig.now - entered == pytest.approx(CAP.a_cap_confirm_s, abs=TICK)
+
+
+def test_a_cap_an_epoch_change_takes_the_epoch_exit():
+    rig = CapRig(latency=0.1)
+    rig.into_a(0.3)
+    rig.plane.epoch += 1  # the flag is no longer valid either: its epoch is the old one
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "a_epoch_changed"
+
+
+@pytest.mark.parametrize("starved", [0.2, 0.4, 0.6])
+def test_a_cap_a_starved_session_waits_for_the_flag_again(starved):
+    rig = CapRig(latency=0.2)
+    rig.into_a(0.2)
+    rig.starve(starved)  # past 0.3 the data plane dropped the flag; the echo comes back 0.2 s after the next on
+    assert rig.run(3.0, lambda: rig.blender.phase in (Phase.WAIT_ACK, Phase.C))
+    assert rig.blender.phase is Phase.WAIT_ACK
+
+
+def test_a_cap_a_silent_port_status_counts_as_no_flag():
+    rig = CapRig(latency=0.1)
+    rig.into_a(0.2)
+    rig.port = None
+    silent = rig.now
+    assert rig.run(1.5, lambda: rig.blender.phase is Phase.C)
+    assert exit_reason(rig) == "a_cap_lost"
+    assert rig.now - silent == pytest.approx(A_CAP_ECHO_AGE_S + CAP.a_cap_lost_s, abs=2 * TICK)
+
+
+def test_a_cap_needs_the_safety_epoch():
+    with pytest.raises(ValueError):
+        BlendConfig.from_mapping({"a_cap": True, "a_pause_budget_s": 0})
+    assert BlendConfig.from_mapping({"a_cap": True}).a_cap
+
+
+@pytest.mark.parametrize("share", [0.05, 0.15])
+def test_stress_a_cap_with_a_working_echo_changes_nothing(share):
+    """The data plane echoes 0.1 s after the message: the same entries and completions as a_cap off."""
+    for seed in range(3):
+        off, on = stress(NEW, seed, share), stress(CAP, seed, share, rig_type=lambda config: CapRig(config, 0.1))
+        assert on.blender.outcomes == off.blender.outcomes and on.blender.rejected == off.blender.rejected
+        assert on.out == off.out

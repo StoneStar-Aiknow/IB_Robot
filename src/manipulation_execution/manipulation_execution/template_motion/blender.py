@@ -61,6 +61,14 @@ value in :class:`BlendConfig` that restores the behaviour above):
   the previous one (the session was starved, and what it has not read yet
   may be queued) keeps the previous verdict on the A status age, the B port
   status and the labels, up to twice their limit, never beyond.
+* With ``a_cap`` (off by default, until the data plane has (b)): every A tick
+  asks the data plane, in A's safety epoch, to aim the CBF's releases of a
+  hold at the request of its first flagged tick; ``on: false`` once when A
+  ends. The port status echoes ``a_cap``: no field, no entry
+  (``a_cap_missing``); in A, no true echo ``a_cap_confirm_s`` after entering
+  (or after a late tick: the flag may have expired meanwhile), or false
+  ``a_cap_lost_s`` in a row after one, goes back through C (``a_cap_lost``,
+  no backoff). An owner or epoch change takes the existing exits first.
 """
 
 from __future__ import annotations
@@ -82,6 +90,7 @@ DEFAULT_HAND_TRAVEL_S = 1.0  # T_A's hand share when the hand output is not know
 COMPLETE = ("label_inactive", "hold_max", "release")  # the playback ran and the port said DONE
 LET_GO = ("label_lost", "actor_changed")  # the person stopped asking before B
 LOAD_EXITS = ("a_cbf_hold", "a_pause_budget", "a_cbf_untrusted")  # load_backoff_s follows these (and paused a_timeout)
+A_CAP_ECHO_AGE_S = 0.3  # an a_cap echo older than this tells nothing (sent on change and every 0.1 s)
 MIN_JERK_ACCEL = 5.7735  # a min-jerk's peak d2/ds2 (10 / sqrt 3)
 RELEASE_AFTER_S = 0.2  # the CBF's hold_release_after_s when its status does not say (on site 0.2)
 CLOCK_AHEAD_S = 0.05  # a status made this far after it was received: the two clocks differ
@@ -175,8 +184,12 @@ class BlendConfig:
     enter_max_wait_s: float = 1.5
     b_label_unlatch: bool = True  # B holds while the label is back; a new episode of it is the same request
     late_tick_s: float = 0.04  # a tick this long after the previous one (2 at 50 Hz) judges no age on its own
+    # (b): off until the data plane that echoes a_cap ships in the same package, or nothing is ever entered.
+    a_cap: bool = False
+    a_cap_lost_s: float = 0.15  # in A, the echo false this long in a row after a true one: back through C
+    a_cap_confirm_s: float = 0.5  # in A, no true echo this long after entering (or a late tick): the same
 
-    _FLAGS = ("require_person_frame", "b_label_unlatch")
+    _FLAGS = ("require_person_frame", "b_label_unlatch", "a_cap")
     _MAY_BE_ZERO = (
         "cooldown_s",
         "a_pause_budget_s",
@@ -212,6 +225,8 @@ class BlendConfig:
             raise ValueError("enter_hold_ratio_open must not exceed enter_hold_ratio_close")
         if config.a_status_age_s >= RELEASE_AFTER_S:
             raise ValueError(f"a_status_age_s must stay below the CBF's release after {RELEASE_AFTER_S:g} s")
+        if config.a_cap and config.a_pause_budget_s <= 0.0:
+            raise ValueError("a_cap needs the safety epoch: a_pause_budget_s must be positive")
         return config
 
 
@@ -433,6 +448,7 @@ class Blender:
         self._last_step: float | None = None  # this tick's now
         self._prev_step: float | None = None
         self._tick_late = False  # this tick came more than late_tick_s after the previous one
+        self._a_cap_epoch: int | None = None  # (b): on: true was sent in this epoch and no off since
         self.begin_round()
 
     # -- round --------------------------------------------------------------------
@@ -493,6 +509,10 @@ class Blender:
         self._pauses = 0
         self._paused_s = 0.0
         self._pause_lines = 0
+        # (b)
+        self._a_cap_from = 0.0  # the echo is to be true from here on: entering A, or a late tick
+        self._a_cap_seen = False  # a true echo since _a_cap_from
+        self._a_cap_false_since: float | None = None
 
     def end_round(self, now: float) -> None:
         """The session's round ends (wrap-up next, or WAIT). A playback is released fast."""
@@ -514,6 +534,7 @@ class Blender:
             self._phase, self._since = Phase.STOP_WAIT, now
             self._hand_target = self._status_hand()
             return
+        self._a_cap_off()
         if self._phase in (Phase.A, Phase.C):
             self._exit_log("stop", now)
         if self._phase is not Phase.STOP_WAIT:
@@ -532,6 +553,10 @@ class Blender:
             self._client.wind_down(now, linger)
         except Exception:
             self._client.abandon()
+        try:
+            self._a_cap_off()
+        except Exception:
+            pass  # the data plane drops the flag 0.3 s after the last on
         if self._phase not in (Phase.IDLE, Phase.COOLDOWN):
             try:
                 self._exit_log(f"error:{reason}", now)
@@ -572,9 +597,20 @@ class Blender:
         ``mirror`` is the newest mirror command (14), ``inputs`` the session's.
         """
         try:
-            return self._step(now, inputs, mirror)
+            arm = self._step(now, inputs, mirror)
+            if self._phase is Phase.A and self._config.a_cap and self._epoch is not None:
+                self._a_cap_epoch = self._epoch
+                self._client.a_cap(True, self._epoch)
+            else:
+                self._a_cap_off()
+            return arm
         finally:
             self._refresh_snapshot()
+
+    def _a_cap_off(self) -> None:
+        epoch, self._a_cap_epoch = self._a_cap_epoch, None
+        if epoch is not None:
+            self._client.a_cap(False, epoch)
 
     def _step(self, now: float, inputs, mirror: Sequence[float] | None) -> tuple[float, ...] | None:
         late_s = self._config.late_tick_s
@@ -636,6 +672,8 @@ class Blender:
             return "port_stale", None
         if status.state not in _PORT_FREE:
             return "port_playing", None
+        if self._config.a_cap and status.a_cap is None:
+            return "a_cap_missing", None  # a data plane without (b): the flag would be dropped
         cbf = self._cbf.latest()
         if cbf is None or not 0 <= now - cbf.received_at <= self._config.cbf_fresh_s:
             return "cbf_stale", None
@@ -801,6 +839,7 @@ class Blender:
             MIN_JERK_PEAK * self._entry_dist / config.a_peak_speed, hand + config.a_hand_margin_s, config.a_min_s
         )
         self._phase, self._since, self._entered_at = Phase.A, now, now
+        self._a_cap_from = now
         self._clock = _Clock(now)
         cbf = self._cbf.latest()
         if cbf is not None:
@@ -836,9 +875,12 @@ class Blender:
             reason = "a_timeout"
         if reason is None and now - self._entered_at > self._t_a + config.a_timeout_margin_s + self._budget:
             reason = "a_pause_budget" if self._paused else "a_timeout"
+        if reason is None and config.a_cap:
+            reason = self._a_cap_lost(now)
         if reason is not None:
             return self._leave_a(now, reason, m)
         if not self._paused and elapsed >= self._t_a and self._arrived(now, inputs, cbf):
+            self._a_cap_off()  # before the start: B is the port's, not the CBF's
             try:
                 self._seg_id = self._client.start(segment.name, now)
             except RuntimeError:
@@ -869,9 +911,36 @@ class Blender:
             return False
         return cbf is not None and 0 <= now - cbf.received_at <= config.cbf_fresh_s and not cbf.intervening
 
+    def _a_cap_lost(self, now: float) -> str | None:
+        """``a_cap_lost`` when the data plane does not hold the (b) flag for A, else None.
+
+        Runs after the CBF checks, so an owner or epoch change already seen
+        takes its own exit. A late tick never concludes: what the session sent
+        may have expired while it starved; the echo gets a_cap_confirm_s again.
+        """
+        config = self._config
+        if self._tick_late:
+            self._a_cap_from, self._a_cap_seen = now, False
+        status = self._port.latest()
+        echo = (
+            status is not None
+            and status.a_cap is True
+            and status.received_at > self._a_cap_from  # an echo from before cannot answer this window's flags
+            and not self._older("a_cap_echo", now - status.received_at, A_CAP_ECHO_AGE_S)
+        )
+        if echo:
+            self._a_cap_seen, self._a_cap_false_since = True, None
+            return None
+        if self._a_cap_false_since is None:
+            self._a_cap_false_since = now
+        if not self._a_cap_seen:
+            return "a_cap_lost" if now - self._a_cap_from >= config.a_cap_confirm_s else None
+        return "a_cap_lost" if now - self._a_cap_false_since >= config.a_cap_lost_s else None
+
     def _leave_a(self, now: float, reason: str, m: tuple[float, ...]) -> tuple[float, ...]:
         """To C from where A is: alpha's value, speed and acceleration (0 in a pause); M eases back to m."""
         config = self._config
+        self._a_cap_off()
         s = self._clock.at(now) / self._t_a
         value, speed, accel = _min_jerk(s)
         if s >= 1.0:
