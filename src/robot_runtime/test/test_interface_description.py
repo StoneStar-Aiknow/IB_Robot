@@ -513,7 +513,9 @@ def test_sdk_and_non_usb_cam_cameras_keep_best_effort(profile):
     sdk = build_description(profile, use_sim=True)
     assert sdk["interfaces"]["camera.front.color"]["qos"]["reliability"] == "best_effort"
     assert sdk["interfaces"]["camera.front.color_info"]["qos"]["reliability"] == "best_effort"
-    # other hardware drivers are unchanged until their publisher QoS is checked
+    # other hardware drivers keep the historical declaration until their
+    # publisher QoS is checked (camera_ros 0.6.0 publishes reliable, but its
+    # contract migration is tracked separately)
     profile["peripherals"][0] = {**profile["peripherals"][0], "driver": "camera_ros", "format": "MJPEG"}
     other = build_description(profile)
     assert other["interfaces"]["camera.front.color"]["qos"]["reliability"] == "best_effort"

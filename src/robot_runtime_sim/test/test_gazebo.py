@@ -651,7 +651,8 @@ def test_descriptor_interfaces_match_generated_sensors_and_bridge_entries(tmp_pa
         # a sensor exists for every non-disabled camera with the advertised frame
         assert f"<gz_frame_id>{advertised_camera_frame(periph)}</gz_frame_id>" in urdf
     # the hardware usb_cam reliable offer (issue #247) does not reach gazebo:
-    # its bridged camera publishers keep the best-effort sensor contract
+    # the description keeps the historical best-effort contract (the bridge
+    # publisher itself is not audited here; see the PR description)
     for key in ("camera.top.color", "camera.top.color_info", "camera.wrist.color", "camera.front.color"):
         assert description["interfaces"][key]["qos"]["reliability"] == "best_effort", key
     # opencv cameras are color-only; the realsense gets an rgbd sensor
