@@ -840,7 +840,8 @@ private:
     if (player_ && player_->start_pending()) {
       // Judged on what was just published; admitted, it plays from the next tick.
       try {
-        player_->evaluate_start(decision, core_.safety_epoch(), cbf_->config().enforce, now_s);
+        player_->evaluate_start(
+          decision, core_.safety_epoch(), cbf_->config().enforce, now_s, snapshot.hand_reported_absent);
       } catch (const std::exception & error) {
         note_log(LogLevel::kError, "template start not judged: %s", error.what());
         player_->reject_pending("internal_error");
