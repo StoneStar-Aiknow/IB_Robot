@@ -22,6 +22,7 @@ from manipulation_execution.template_motion.port import CbfMonitor
 PERIOD = 0.05  # the data plane's status
 RELEASE_AFTER = 0.2  # the CBF's hold_release_after_s on site
 NEW = BlendConfig()
+SHORT = BlendConfig(a_pause_budget_s=0.6, a_pause_budget_per_s=0.5, a_pause_max_s=2.0)  # 43274d30's budget
 
 
 class Plane:
@@ -233,14 +234,14 @@ def test_label_lost_or_collision_in_a_pause_or_a_ramp_goes_to_C_continuously():
 
 
 def test_a_hold_that_outlasts_the_budget_goes_back_and_backs_off():
-    rig = PauseRig()
+    rig = PauseRig(SHORT)
     rig.into_a(0.4)
     rig.hold(0.0, 3.0)
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.C)
     assert exit_reason(rig) == "a_pause_budget"
     exit = lines(rig, "template exit")[0]
     assert "outcome=cbf_hold" in exit and "pauses=1" in exit and "backoff=3.0" in exit
-    budget = NEW.a_pause_budget_s + NEW.a_pause_budget_per_s * 1.1
+    budget = SHORT.a_pause_budget_s + SHORT.a_pause_budget_per_s * 1.1
     total = float(exit.split(" total=")[1].split()[0])
     assert total <= 1.1 + NEW.a_timeout_margin_s + budget
     del rig.active["heart"]
@@ -252,7 +253,7 @@ def test_a_hold_that_outlasts_the_budget_goes_back_and_backs_off():
 
 
 def test_pauses_add_up_and_a_resume_never_resets_the_budget():
-    rig = PauseRig()
+    rig = PauseRig(SHORT)
     rig.into_a(0.2)
     rig.hold(0.0, 0.5)
     rig.hold(0.9, 0.5)
@@ -263,13 +264,13 @@ def test_pauses_add_up_and_a_resume_never_resets_the_budget():
 
 
 def test_a_ramp_the_budget_cannot_finish_is_never_begun():
-    rig = PauseRig(BlendConfig(a_resume_ramp_s=0.4))  # a resume costs 0.2 s of schedule
+    rig = PauseRig(replace(SHORT, a_resume_ramp_s=0.4))  # a resume costs 0.2 s of schedule
     rig.into_a(0.2)
     rig.hold(0.0, 0.97)  # clean after about 1.0 s, 0.15 s of budget left
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.C)
     exit = lines(rig, "template exit")[0]
     assert exit_reason(rig) == "a_pause_budget" and not lines(rig, "template resume")
-    budget = NEW.a_pause_budget_s + NEW.a_pause_budget_per_s * 1.1
+    budget = SHORT.a_pause_budget_s + SHORT.a_pause_budget_per_s * 1.1
     assert float(exit.split(" paused_s=")[1].split()[0]) < budget  # left at the resume, not at the end
 
 
@@ -397,19 +398,51 @@ def test_no_safety_epoch_no_entry_and_in_A_a_checked_hand_back():
 
 
 def test_the_held_share_gate_has_hysteresis():
-    rig = PauseRig()
-    rig.plane.every = 3  # a third of the calls held, one call at a time: never a stuck status
+    rig = PauseRig(replace(NEW, enter_max_wait_s=0.0))  # waits for ever: the gate alone
+    rig.plane.every = 2  # half the calls held, one call at a time: never a stuck status
     rig.run(2.5)
     assert rig.blender.snapshot()["gate"]["open"] is False
     assert "template gate closed" in rig.logs[-1] or lines(rig, "template gate closed")
     rig.active["heart"] = 7
-    rig.plane.every = 7  # 14%: between open (0.1) and close (0.2)
+    rig.plane.every = 5  # 20%: between open (0.15) and close (0.3)
     rig.run(3.0)
     assert rig.blender.phase is Phase.IDLE
     rig.plane.every = None
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.A)
     assert lines(rig, "template gate open")
     assert "blocked=hold_ratio" in lines(rig, "template enter")[0]
+
+
+def test_a_trigger_kept_out_enter_max_wait_is_rejected_never_entered_late():
+    rig = PauseRig()
+    rig.plane.every = 2
+    rig.run(2.5)
+    rig.active["heart"] = 7  # seen from the next tick; the wait starts there
+    rig.plane.every = 5
+    rig.run(2.0)
+    reject = lines(rig, "template reject")
+    assert len(reject) == 1 and "reason=hold_ratio" in reject[0] and "at=enter_max_wait" in reject[0]
+    assert NEW.enter_max_wait_s <= float(reject[0].split(" waited=")[1].split()[0]) < NEW.enter_max_wait_s + 0.03
+    rig.plane.every = None
+    assert rig.run(2.0, lambda: lines(rig, "template gate open"))
+    rig.run(0.5)
+    assert rig.blender.phase is Phase.IDLE and not lines(rig, "template enter")  # that episode is over
+    del rig.active["heart"]
+    rig.run(0.3)
+    rig.active["heart"] = 7  # the person asks again
+    assert rig.run(0.5, lambda: rig.blender.phase is Phase.A)
+    assert "waited=" not in lines(rig, "template enter")[0]
+
+
+def test_a_trigger_entered_within_enter_max_wait_says_how_long_it_waited():
+    rig = PauseRig()
+    rig.hold(0.0, 0.5)  # 25% of the window at most: the share gate stays open
+    rig.run(0.1)  # the status saying so is in
+    rig.active["heart"] = 7
+    assert rig.run(1.0, lambda: rig.blender.phase is Phase.A)
+    enter = lines(rig, "template enter")[0]
+    assert "blocked=cbf_hold" in enter and 0.35 <= float(enter.split(" waited=")[1].split()[0]) < 0.6
+    assert not lines(rig, "template reject")
 
 
 def test_entry_waits_for_a_second_of_statuses():
@@ -526,7 +559,7 @@ def test_cbf_monitor_after_and_hold_ratio():
 
 @pytest.mark.parametrize(
     "raw",
-    [{"b_label_unlatch": 1}, {"enter_hold_ratio_open": 1.5}, {"enter_hold_ratio_open": 0.3},
+    [{"b_label_unlatch": 1}, {"enter_hold_ratio_open": 1.5}, {"enter_hold_ratio_open": 0.35},
      {"a_status_age_s": 0.2}, {"a_untrusted_max_s": 0}, {"a_pause_typo": 1.0}],
 )  # fmt: skip
 def test_v12_keys_are_checked(raw):
@@ -594,7 +627,20 @@ def play(rig):
                      hand_P=[0.2] * 20)  # fmt: skip
 
 
-@pytest.mark.parametrize("share", [0.1, 0.15, 0.3, 0.5])  # 0.15: step 0 today ([T,T], 10-15% held)
+@pytest.mark.parametrize("share", [0.05, 0.1, 0.15])  # 0.15: step 0 today ([T,T], 8-15% held)
+def test_stress_up_to_today_s_load_never_gives_up_an_entered_template(share):
+    """zll: once entered, no abort but for safety; the triggers kept out are few at 5% (bb: <= 2%)."""
+    rejects = triggers = 0
+    for seed in range(10):
+        rig = stress(NEW, seed, share)
+        assert not {key for key in rig.blender.outcomes if key not in ("complete", "let_go")}, rig.blender.outcomes
+        rejects += len(lines(rig, "template reject"))
+        triggers += rig.blender.triggers
+    if share <= 0.05:
+        assert rejects <= 0.02 * triggers
+
+
+@pytest.mark.parametrize("share", [0.1, 0.15, 0.3, 0.5])  # 0.15: step 0 today ([T,T], 8-15% held)
 def test_stress_new_completes_at_least_as_often_aborts_less_and_never_jumps(share):
     """The same seeds, old (every switch off) and new; prints the completion / hold curve (-s)."""
     results = {}

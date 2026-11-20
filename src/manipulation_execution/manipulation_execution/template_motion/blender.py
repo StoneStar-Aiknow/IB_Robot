@@ -52,7 +52,8 @@ value in :class:`BlendConfig` that restores the behaviour above):
   once it is ``a_pause_budget_s`` (+ per second of T_A) behind its schedule.
   C blends from the same M, so leaving mid-pause or mid-ramp is continuous.
 * Entry needs the safety epoch, a recent status, a held share of CBF calls
-  below a gate with hysteresis, and no load exit within ``load_backoff_s``.
+  below a gate with hysteresis, and no load exit within ``load_backoff_s``;
+  a trigger kept out ``enter_max_wait_s`` is rejected, never entered late.
 * B is not latched: a label that comes back (also as a new episode of the
   same person's gesture) keeps the hold; a release once sent is never taken
   back.
@@ -148,10 +149,11 @@ class BlendConfig:
     wind_down_s: float = 0.5  # keepalive this long after giving a segment up (+ t_out_stop on errors)
     require_person_frame: bool = True
     # v1.2. Off values (bc35e2d3's behaviour): a_pause_budget_s 0 (also turns off the safety epoch and
-    # status age checks), enter_hold_window_s 0, load_backoff_s 0, b_label_unlatch false.
-    a_pause_budget_s: float = 0.6  # A may fall this far behind its schedule through pauses...
-    a_pause_budget_per_s: float = 0.5  # ...plus this much per second of T_A (2X held share)...
-    a_pause_max_s: float = 2.0  # ...but never more than this
+    # status age checks), enter_hold_window_s 0, load_backoff_s 0, b_label_unlatch false, enter_max_wait_s 0.
+    # zll: once entered, a template is never given up for load: standing still beats going back.
+    a_pause_budget_s: float = 4.0  # A may fall this far behind its schedule through pauses...
+    a_pause_budget_per_s: float = 0.0  # ...plus this much per second of T_A...
+    a_pause_max_s: float = 4.0  # ...but never more than this
     a_status_age_s: float = 0.1  # A moves only while the newest status is this recent by its `at` (2 periods)
     a_untrusted_max_s: float = 0.5  # no status A can trust this long: back to the mirror (absolute)
     a_release_guard_s: float = 0.05  # a hold this close to the CBF's release counts as released
@@ -159,13 +161,24 @@ class BlendConfig:
     a_short_ramp_s: float = 0.06  # the shortest resume after a short hold
     a_resume_accel: float = 12.0  # rad/s2; a resume is stretched until no joint accelerates harder (or than A does)
     enter_hold_window_s: float = 2.0  # the held share of CBF calls over this long gates the entry
-    enter_hold_ratio_open: float = 0.1  # opens at or below this share (X: 2x the ~5% held after the load cut)...
-    enter_hold_ratio_close: float = 0.2  # ...and closes above this one (2X)
+    # X 0.15: step 0 held 8-11% of the calls, clustered; 0.1 kept out 4% of the triggers at 5% (stress test).
+    enter_hold_ratio_open: float = 0.15  # opens at or below this share (X)...
+    enter_hold_ratio_close: float = 0.3  # ...and closes above this one (2X)
     load_backoff_s: float = 3.0  # no entry this long after an attempt ended for load
+    # A trigger not entered this long after the blender first saw it (its label episode active, the
+    # person's, not tried yet) is given up: one rejection, never a late entry. 0: it waits for ever.
+    enter_max_wait_s: float = 1.5
     b_label_unlatch: bool = True  # B holds while the label is back; a new episode of it is the same request
 
     _FLAGS = ("require_person_frame", "b_label_unlatch")
-    _MAY_BE_ZERO = ("cooldown_s", "a_pause_budget_s", "a_pause_budget_per_s", "enter_hold_window_s", "load_backoff_s")
+    _MAY_BE_ZERO = (
+        "cooldown_s",
+        "a_pause_budget_s",
+        "a_pause_budget_per_s",
+        "enter_hold_window_s",
+        "load_backoff_s",
+        "enter_max_wait_s",
+    )
 
     @classmethod
     def from_mapping(cls, raw: Mapping | None) -> BlendConfig:
@@ -692,6 +705,11 @@ class Blender:
                     reason = "not_whitelisted"
             if reason is not None:
                 self._note_trigger(key, reason, now)
+                wait_max = self._config.enter_max_wait_s
+                if wait_max > 0.0 and now - self._pending[key][0] >= wait_max:
+                    self._attempted.add(key)  # answered late or not at all: not at all
+                    live.discard(key)
+                    self._reject(key, now, " at=enter_max_wait")
                 continue
             pending = self._pending.pop(key, None)
             if pending is None:
