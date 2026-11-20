@@ -10,6 +10,11 @@ motion_template:
   play_topic: /mirror_session/template_play
   status_topic: /aimdk_dataplane/template_status
   dataplane_status_topic: /aimdk_runtime/dataplane/status
+  # Real robot 11-20 (run-1120-183345): /preset_motions/state reached the
+  # session with 0.5-0.9 s holes while the gesture was held, and 0.5 cut A
+  # short and made each hole a new episode. A real inactive still exits at
+  # once; only a dead matcher is noticed at most 0.5 s later.
+  label_stale_s: 1.0
   templates:
     overhead_heart: {enabled: true, segments: [overhead_heart]}
     heart: {enabled: true, segments: [heart]}

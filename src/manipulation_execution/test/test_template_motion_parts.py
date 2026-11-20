@@ -333,6 +333,7 @@ def test_the_on_site_config_loads_every_template():
     setup = load_config(str(CONFIG_DIR / "motion_template_onsite.yaml"), HAND)
     assert setup.notes == [] and set(setup.templates) == {"overhead_heart", "heart", "holy", "xsign"}
     assert setup.blend == parse_config(shipped_on(), str(CONFIG_DIR), HAND).blend  # same blend as the shipped file
+    assert setup.label_stale_s == 1.0  # the real robot's label holes (run-1120-183345)
 
 
 def shipped_on():
