@@ -206,6 +206,7 @@ struct CbfDiagnostics
   uint64_t played = 0;  // Frames published by the template player, not by the filter.
   uint64_t release_episodes = 0;
   uint64_t collision_release_episodes = 0;  // Episodes that released after a collision verdict.
+  uint64_t a_cap_capped_ticks = 0;  // Released frames whose arm and hand were capped to the frozen point.
   bool releasing = false;
   bool stuck_collision = false;  // The current hold has seen a collision verdict.
   double stuck_s = 0.0;  // Length of the current hold.
@@ -224,7 +225,12 @@ public:
   CbfDecision deadline_fallback(const CbfDecision & decision);
   CbfDecision feedback_fallback(const CbfDecision & decision, const std::string & reason);
   // Last step before publication. Every hold ends: see the release times in the config.
-  CbfDecision release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now);
+  // ``a_cap``: a template A segment holds the cap on this tick. Then the arm and
+  // hand are released towards the request of the hold's first tick under the cap
+  // (the frozen point), not the latest one; the head follows the latest request.
+  // When, how fast and within which limits the release goes is unchanged.
+  CbfDecision release_if_stuck(
+    const CbfDecision & decision, const CbfSnapshot & snapshot, double now, bool a_cap = false);
   // A frame the template player published instead of the filter. Under enforce it
   // becomes the committed pair of the same epoch, so the filter resumes from where
   // the arm is; it is never verified and ends any hold. A frame of another epoch,
@@ -247,6 +253,7 @@ private:
   std::optional<double> stuck_since_;
   bool stuck_with_history_ = false;  // The hold began on a published pair.
   bool stuck_released_ = false;  // The hold has begun to release.
+  std::optional<Output> a_cap_point_;  // This hold's frozen point, while the cap holds.
   int kernel_call_limit_ = -1;
 };
 

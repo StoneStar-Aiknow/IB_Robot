@@ -167,14 +167,36 @@ std::optional<TemplateCommand> parse_template_command(const std::string & text)
   try {
     const auto value = json::parse(text);
     if (!value.is_object() || !value.contains("schema") || value.at("schema") != "x2_template_play/v1" ||
-      !value.contains("op") || !value.at("op").is_string() || !value.contains("seg_id") ||
-      !value.at("seg_id").is_number_integer() || value.at("seg_id").get<int64_t>() < 0)
+      !value.contains("op") || !value.at("op").is_string())
     {
       return std::nullopt;
     }
     TemplateCommand out;
-    out.seg_id = value.at("seg_id").get<uint64_t>();
     const auto op = value.at("op").get<std::string>();
+    // No seg_id: the cap belongs to the session's A segment, not to a played one.
+    if (op == "a_cap") {
+      if (!value.contains("on") || !value.at("on").is_boolean() || !value.contains("epoch") ||
+        !value.at("epoch").is_number_integer() || value.at("epoch").get<int64_t>() < 0)
+      {
+        return std::nullopt;
+      }
+      if (value.contains("attempt")) {
+        if (!value.at("attempt").is_number_integer() || value.at("attempt").get<int64_t>() < 0) {
+          return std::nullopt;
+        }
+        out.attempt = value.at("attempt").get<uint64_t>();
+      }
+      out.op = TemplateCommand::Op::kACap;
+      out.on = value.at("on").get<bool>();
+      out.epoch = value.at("epoch").get<uint64_t>();
+      return out;
+    }
+    if (!value.contains("seg_id") || !value.at("seg_id").is_number_integer() ||
+      value.at("seg_id").get<int64_t>() < 0)
+    {
+      return std::nullopt;
+    }
+    out.seg_id = value.at("seg_id").get<uint64_t>();
     if (op == "start") {
       if (!value.contains("seg") || !value.at("seg").is_string() || value.at("seg").get<std::string>().empty()) {
         return std::nullopt;
@@ -269,7 +291,36 @@ void TemplatePlayer::on_message(const std::string & text, double now)
         ++counters_.mismatched;
       }
       return;
+    case TemplateCommand::Op::kACap:
+      a_cap_ = ACap{command->on, command->epoch, command->attempt, now, false};
+      return;
   }
+}
+
+bool TemplatePlayer::judge_a_cap(uint64_t safety_epoch, double now)
+{
+  const bool on_time = limits_ && last_tick_ && now - *last_tick_ <= 2.0 * limits_->period_s + kTimeEpsilonS;
+  last_tick_ = now;
+  bool valid = false;
+  if (limits_ && a_cap_ && a_cap_->on && !a_cap_->lapsed) {
+    const double age = now - a_cap_->received;
+    if (age > 2.0 * kACapTimeoutS + kTimeEpsilonS || (on_time && age > kACapTimeoutS + kTimeEpsilonS)) {
+      a_cap_->lapsed = true;
+    } else if (a_cap_->epoch != safety_epoch) {
+      ++counters_.a_cap_epoch_mismatch;
+    } else {
+      valid = true;
+    }
+  }
+  // The echo names the message the flag holds on, as judged here; a new
+  // attempt tag is a change too.
+  const auto held = valid ? std::optional<ACap>(*a_cap_) : std::nullopt;
+  if (valid != a_cap_valid_ || (held && a_cap_held_ && held->attempt != a_cap_held_->attempt)) {
+    a_cap_changed_ = true;
+  }
+  a_cap_valid_ = valid;
+  a_cap_held_ = held;
+  return valid;
 }
 
 bool TemplatePlayer::evaluate_start(const CbfDecision & decision, uint64_t epoch, bool enforce, double now)
@@ -466,12 +517,14 @@ std::vector<std::string> TemplatePlayer::take_status(double now)
   // A refusal that became the current state was just sent; the next periodic one repeats it.
   if (refused_now && state_ == TemplateState::kRejected && changed_) {
     changed_ = false;
+    a_cap_changed_ = false;
     last_status_ = now;
     return out;
   }
-  if (changed_ || last_status_ < 0.0 || now - last_status_ >= kStatusPeriodS - kTimeEpsilonS) {
+  if (changed_ || a_cap_changed_ || last_status_ < 0.0 || now - last_status_ >= kStatusPeriodS - kTimeEpsilonS) {
     out.push_back(status_json(now, seg_id_, segment_name_, state_, reason_));
     changed_ = false;
+    a_cap_changed_ = false;
     last_status_ = now;
   }
   return out;
@@ -603,6 +656,12 @@ std::string TemplatePlayer::status_json(double now, std::optional<uint64_t> seg_
   out["state"] = template_state_name(state);
   out["reason"] = reason;
   out["at"] = now;
+  out["a_cap"] = a_cap_valid_;
+  // So the session can tell the flag is its own: this epoch, this attempt, a
+  // fresh message (``at`` and the age are on the data plane's steady clock).
+  out["a_cap_epoch"] = a_cap_held_ ? json(a_cap_held_->epoch) : json(nullptr);
+  out["a_cap_attempt"] = a_cap_held_ && a_cap_held_->attempt ? json(*a_cap_held_->attempt) : json(nullptr);
+  out["a_cap_age_s"] = a_cap_held_ ? json(now - a_cap_held_->received) : json(nullptr);
   if (have_start_point_) {
     out["P_actual"] = p_actual_;
     out["hand_P"] = hand_p_;

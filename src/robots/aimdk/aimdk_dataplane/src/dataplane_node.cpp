@@ -656,6 +656,8 @@ private:
     if (lapsed) {
       publish_safe_command();
     }
+    // Every tick, so a late one is known as late; after the lapse, which may move the epoch.
+    const bool a_cap = player_ && player_->judge_a_cap(core_.safety_epoch(), now_s);
     const bool mirror_context = cbf_ && core_.mirror_context(cbf_->config().mirror_mode, now_s);
     const bool source_ready = cbf_ && core_.mirror_candidate(cbf_->config().mirror_mode, now_s);
     const bool named_only = core_.candidate_arm_is_named() && !source_ready;
@@ -795,7 +797,7 @@ private:
     const double previous_stuck_s = cbf_->diagnostics().stuck_s;
     const bool was_collision = cbf_->diagnostics().stuck_collision;
     const double release_at = monotonic_s();
-    decision = cbf_->release_if_stuck(decision, snapshot, release_at);
+    decision = cbf_->release_if_stuck(decision, snapshot, release_at, a_cap);
     const auto & d = cbf_->diagnostics();
     // For the INFO line only: the closest verified output since it last printed.
     // A held or released frame has no distance of its own.
@@ -1106,7 +1108,12 @@ private:
       status["cbf"]["thumb_feedback_frames"] = d.thumb_feedback_frames;
       status["cbf"]["thumb_feedback_issue"] = d.thumb_feedback_issue;
       status["cbf"]["released"] = d.released;
-      if (player_) {status["cbf"]["played"] = d.played;}
+      if (player_) {
+        status["cbf"]["played"] = d.played;
+        status["cbf"]["a_cap"] = player_->a_cap();
+        status["cbf"]["a_cap_capped_ticks"] = d.a_cap_capped_ticks;
+        status["cbf"]["a_cap_epoch_mismatch"] = player_->counters().a_cap_epoch_mismatch;
+      }
       status["cbf"]["release_episodes"] = d.release_episodes;
       status["cbf"]["collision_release_episodes"] = d.collision_release_episodes;
       status["cbf"]["releasing"] = d.releasing;

@@ -59,11 +59,14 @@ struct TemplateWhitelist
 
 struct TemplateCommand
 {
-  enum class Op { kStart, kKeepalive, kRelease };
+  enum class Op { kStart, kKeepalive, kRelease, kACap };
   Op op = Op::kKeepalive;
   std::string segment;
-  uint64_t seg_id = 0;
+  uint64_t seg_id = 0;  // Not read for a_cap.
   bool fast = false;
+  bool on = false;  // a_cap only, with the safety epoch it was sent for
+  uint64_t epoch = 0;
+  std::optional<uint64_t> attempt;  // and the session's own tag, echoed back.
 };
 
 // nullopt for anything that is not a well-formed x2_template_play/v1 message.
@@ -81,12 +84,17 @@ struct TemplateCounters
   uint64_t malformed = 0;
   uint64_t mismatched = 0;
   uint64_t clamped = 0;  // Played ticks a joint, velocity or thumb limit changed; 0 for a valid segment.
+  uint64_t a_cap_epoch_mismatch = 0;  // Ticks a live a_cap carried another safety epoch.
 };
 
 class TemplatePlayer
 {
 public:
   static constexpr double kKeepaliveTimeoutS = 0.15;
+  // Judged on on-time ticks only (at most two periods after the previous one):
+  // a stalled executor runs the late tick before the queued messages. At twice
+  // the time it lapses on any tick.
+  static constexpr double kACapTimeoutS = 0.3;
   static constexpr double kStatusPeriodS = 0.1;
   static constexpr double kMinExitS = 0.3;
 
@@ -99,6 +107,13 @@ public:
 
   // A message from the mirror session; counted and dropped if malformed.
   void on_message(const std::string & text, double now);
+
+  // The template A segment's release cap, kept up by the session with a_cap
+  // messages. Judged once per command tick, before the tick uses it: it holds
+  // while the latest a_cap is on, for ``safety_epoch`` and not lapsed. Without
+  // the CBF's configuration it never holds.
+  bool judge_a_cap(uint64_t safety_epoch, double now);
+  bool a_cap() const {return a_cap_valid_;}
 
   bool playing() const;
   bool start_pending() const {return pending_.has_value();}
@@ -139,6 +154,14 @@ private:
     std::string segment;
     uint64_t seg_id = 0;
     double received = 0.0;  // The start or its latest keepalive.
+  };
+  struct ACap
+  {
+    bool on = false;
+    uint64_t epoch = 0;
+    std::optional<uint64_t> attempt;
+    double received = 0.0;
+    bool lapsed = false;  // Until the next a_cap message.
   };
   struct Refusal
   {
@@ -192,6 +215,11 @@ private:
   std::vector<Refusal> outbox_;
   bool changed_ = false;
   double last_status_ = -1.0;
+  std::optional<ACap> a_cap_;
+  bool a_cap_valid_ = false;
+  std::optional<ACap> a_cap_held_;  // The message it holds on, while it does.
+  bool a_cap_changed_ = false;
+  std::optional<double> last_tick_;  // The previous judge_a_cap.
 };
 
 }  // namespace aimdk_dataplane

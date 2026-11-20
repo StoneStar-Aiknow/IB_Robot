@@ -641,3 +641,72 @@ def test_malformed_settings_leave_the_port_off_and_the_node_running(start, tmp_p
         assert len(logged.matching(logged_as)) == 1, logged.matching("template")
     finally:
         session.close()
+
+
+# --- (b): the template A segment's release cap ------------------------------
+
+
+def test_the_a_cap_is_echoed_with_its_epoch_and_lapses_without_refresh(start, tmp_path):
+    """a_cap kept up for the status's safety_epoch: echoed at once, then gone 0.3 s after the last refresh.
+
+    Which point a release goes to under the cap is test_cbf_safety.cpp's; here
+    the node judges and echoes it, and mirroring goes on as before.
+    """
+    harness, _logged = start(enabled(tmp_path))
+    main: list[dict] = []
+    harness.node.create_subscription(String, dataplane.STATUS_TOPIC, lambda m: main.append(json.loads(m.data)), 20)
+    session = mirroring(harness)
+    sending = threading.Event()
+    fields: dict = {}
+
+    def keep_up():
+        while sending.is_set():
+            session.send(op="a_cap", on=True, **fields)
+            time.sleep(0.05)
+
+    def a_cap_statuses(begin):
+        with session._lock:
+            return [(at, s) for at, s in session.statuses if at >= begin and s["seg_id"] is None]
+
+    try:
+        harness.wait_for(lambda: main, "a data plane status")
+        epoch = main[-1]["safety_epoch"]
+        assert all(s["a_cap"] is False for _, s in a_cap_statuses(0.0))
+
+        # Another epoch's flag never holds; it is counted.
+        fields.update(epoch=epoch + 1, attempt=4)
+        sending.set()
+        threading.Thread(target=keep_up, daemon=True).start()
+        harness.wait_for(lambda: counter(harness, "a_cap_epoch_mismatch") > 10, "the mismatches counted")
+        sending.clear()
+        assert all(s["a_cap"] is False for _, s in a_cap_statuses(0.0))
+        time.sleep(0.1)
+
+        fields.update(epoch=epoch, attempt=5)
+        begin = time.monotonic()
+        sending.set()
+        threading.Thread(target=keep_up, daemon=True).start()
+        on_at, on = harness.wait_for(
+            lambda: next(((at, s) for at, s in a_cap_statuses(begin) if s["a_cap"]), None), "the a_cap echoed"
+        )
+        assert (on["a_cap_epoch"], on["a_cap_attempt"]) == (epoch, 5)
+        assert 0.0 <= on["a_cap_age_s"] < 0.06
+        assert on_at - begin < 0.2
+        harness.wait_for(lambda: cbf(harness).get("a_cap") is True, "the a_cap in the data plane status")
+        accepted = counter(harness, "accepted")
+        time.sleep(0.5)
+        assert all(s["a_cap"] for _, s in a_cap_statuses(on_at))
+        assert counter(harness, "accepted") > accepted + 10  # mirroring goes on, verified
+        assert counter(harness, "a_cap_capped_ticks") == 0  # no hold, nothing to cap
+
+        sending.clear()
+        stopped = time.monotonic()
+        off_at, off = harness.wait_for(
+            lambda: next(((at, s) for at, s in a_cap_statuses(stopped) if not s["a_cap"]), None), "the a_cap lapsed"
+        )
+        assert 0.2 < off_at - stopped < 0.5  # the last refresh went out up to 0.05 s before ``stopped``
+        assert off["a_cap_epoch"] is None and off["a_cap_attempt"] is None
+        assert max_gap(session.upper_between(begin, time.monotonic())) < NO_PAUSE_S
+    finally:
+        sending.clear()
+        session.close()

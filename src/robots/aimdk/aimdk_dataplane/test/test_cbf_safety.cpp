@@ -3189,3 +3189,137 @@ TEST(CbfSafety, APhantomRightHandChangesTheLeftHandAndArmsOnlyWhereItsGeometryIs
   EXPECT_GT(same_far, 100);
   EXPECT_GT(differed, 10);
 }
+
+TEST(CbfSafety, UnderTheACapTheReleaseGoesToTheFrozenPointAndTheHeadFollows)
+{
+  CbfSafety safety(fixture_config());
+  const auto & config = safety.config();
+  const auto seed = safety.filter(urdf_snapshot(), 1.0);
+  ASSERT_TRUE(seed.accept_new);
+  safety.committed(seed, 1.0);
+
+  // The hold's first tick asks for `first`; the request then runs on to `later`.
+  auto first = urdf_snapshot();
+  first.requested.arm[0] = std::min(config.upper[0], first.requested.arm[0] + 0.1);
+  first.requested.hand[5] = 0.4;
+  auto later = first;
+  later.requested.arm[0] = std::min(config.upper[0], first.requested.arm[0] + 0.2);
+  later.requested.hand[5] = 0.8;
+  later.requested.head = {0.2, 0.1};
+  ASSERT_GT(later.requested.arm[0], first.requested.arm[0] + 0.05);
+
+  Output previous = seed.output;
+  int released = 0;
+  const auto run = [&](const CbfSnapshot & snapshot, double now, bool a_cap) {
+      auto decision = safety.deadline_fallback(safety.filter(snapshot, now));
+      EXPECT_FALSE(decision.accept_new);
+      decision = safety.release_if_stuck(decision, snapshot, now, a_cap);
+      if (decision.released) {
+        ++released;
+        for (std::size_t joint = 0; joint < 14; ++joint) {
+          EXPECT_LE(std::abs(decision.output.arm[joint] - previous.arm[joint]),
+            config.velocity[joint] * config.period_s + 1e-9) << joint;
+        }
+      }
+      safety.committed(decision, now);
+      previous = decision.output;
+      return decision;
+    };
+  double now = 1.02;
+  run(first, now, true);
+  for (int frame = 1; frame < 60; ++frame) {
+    SCOPED_TRACE(frame);
+    now = 1.02 + config.period_s * frame;
+    const auto decision = run(later, now, true);
+    if (!decision.released) {
+      expect_held_pair(decision, seed.output);
+      continue;
+    }
+    EXPECT_LE(decision.output.arm[0], first.requested.arm[0] + 1e-12);
+    EXPECT_DOUBLE_EQ(decision.output.hand[5], 0.4);
+    EXPECT_EQ(decision.output.head, later.requested.head);
+  }
+  EXPECT_EQ(released, 50);
+  EXPECT_EQ(safety.diagnostics().a_cap_capped_ticks, 50u);
+  EXPECT_DOUBLE_EQ(previous.arm[0], first.requested.arm[0]);
+
+  // The cap goes: the same hold's release follows the request again (two
+  // steps, part of the way).
+  for (int frame = 0; frame < 2; ++frame) {
+    now += config.period_s;
+    run(later, now, false);
+  }
+  EXPECT_EQ(safety.diagnostics().a_cap_capped_ticks, 50u);
+  EXPECT_GT(previous.arm[0], first.requested.arm[0] + 1e-6);
+  EXPECT_LT(previous.arm[0], later.requested.arm[0] - 1e-6);
+  EXPECT_DOUBLE_EQ(previous.hand[5], 0.8);
+  EXPECT_EQ(safety.diagnostics().release_episodes, 1u);
+
+  // Back on mid-hold: frozen again, at the request of that tick.
+  const double refrozen = previous.arm[0];
+  auto third = later;
+  third.requested.arm[0] = refrozen;
+  third.requested.hand[5] = 0.6;
+  now += config.period_s;
+  run(third, now, true);
+  for (int frame = 0; frame < 10; ++frame) {
+    now += config.period_s;
+    const auto decision = run(later, now, true);
+    EXPECT_DOUBLE_EQ(decision.output.arm[0], refrozen);
+    EXPECT_DOUBLE_EQ(decision.output.hand[5], 0.6);
+  }
+  EXPECT_EQ(safety.diagnostics().a_cap_capped_ticks, 61u);
+
+  // A verified frame ends the hold and its frozen point: the next hold under
+  // the cap freezes its own first request (0.8), not the old one (0.6).
+  auto valid = urdf_snapshot();
+  valid.arm->position = previous.arm;
+  valid.requested.arm = previous.arm;
+  now += config.period_s;
+  const auto verified = safety.release_if_stuck(safety.filter(valid, now), valid, now, true);
+  ASSERT_TRUE(verified.accept_new) << safety.diagnostics().reason;
+  EXPECT_FALSE(verified.released);
+  safety.committed(verified, now);
+  previous = verified.output;
+  const double start = now;
+  run(later, now += config.period_s, true);
+  while (now - start < config.hold_release_after_s + 0.1) {run(first, now += config.period_s, true);}
+  EXPECT_TRUE(safety.diagnostics().releasing);
+  EXPECT_DOUBLE_EQ(previous.hand[5], 0.8);
+}
+
+TEST(CbfSafety, UnderTheACapACollisionHoldReleasesSlowlyTowardsTheFrozenPoint)
+{
+  const auto config = fixture_config(freeze091650_config());
+  const auto frozen = freeze094711_snapshot(config);
+  CbfSafety safety(config);
+  const auto seed = safety.filter(frozen, 1.0);
+  ASSERT_TRUE(seed.accept_new) << safety.diagnostics().reason;
+  safety.committed(seed, 1.0);
+
+  auto lagging = frozen;
+  lagging.arm->position[3] += 0.05;
+  auto later = lagging;
+  later.requested.arm[0] = std::clamp(later.requested.arm[0] + 0.3, config.lower[0], config.upper[0]);
+  later.requested.hand[5] = 0.5;
+  later.requested.head = {0.3, 0.0};
+  ASSERT_NE(later.requested.arm[0], lagging.requested.arm[0]);
+
+  const auto verdict = safety.filter(lagging, 1.0);
+  ASSERT_TRUE(verdict.collision_refusal) << safety.diagnostics().reason;
+  EXPECT_FALSE(safety.release_if_stuck(verdict, lagging, 1.0, true).accept_new);
+  EXPECT_FALSE(safety.release_if_stuck(safety.filter(lagging, 1.0), later, 2.0, true).accept_new);
+  const auto released = safety.release_if_stuck(safety.filter(lagging, 1.0), later, 3.0, true);
+  ASSERT_TRUE(released.released);
+  EXPECT_EQ(safety.diagnostics().collision_release_episodes, 1u);
+  EXPECT_EQ(safety.diagnostics().a_cap_capped_ticks, 1u);
+  for (std::size_t joint = 0; joint < 14; ++joint) {
+    SCOPED_TRACE(joint);
+    const double step = 0.3 * config.velocity[joint] * config.period_s;
+    const double towards = std::clamp(lagging.requested.arm[joint], config.lower[joint], config.upper[joint]);
+    EXPECT_NEAR(released.output.arm[joint],
+      std::clamp(towards, seed.output.arm[joint] - step, seed.output.arm[joint] + step), 1e-12);
+  }
+  EXPECT_EQ(released.output.hand, lagging.requested.hand);
+  EXPECT_EQ(released.output.head, later.requested.head);
+}

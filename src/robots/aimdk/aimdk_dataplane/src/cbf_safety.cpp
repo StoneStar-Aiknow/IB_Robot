@@ -837,10 +837,12 @@ CbfDecision CbfSafety::cached_fallback(const CbfDecision & decision, const std::
   return held;
 }
 
-CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfSnapshot & snapshot, double now)
+CbfDecision CbfSafety::release_if_stuck(
+  const CbfDecision & decision, const CbfSnapshot & snapshot, double now, bool a_cap)
 {
   const auto settle = [&]() {
       stuck_since_.reset();
+      a_cap_point_.reset();
       diagnostics_.releasing = false;
       diagnostics_.stuck_collision = false;
       diagnostics_.stuck_s = 0.0;
@@ -854,6 +856,14 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
     stuck_since_ = now;
     stuck_with_history_ = accepted_.has_value();
     stuck_released_ = false;
+    a_cap_point_.reset();
+  }
+  // Frozen on the hold's first tick under the cap, by the data plane itself, so
+  // the session's view of the hold may come late. Dropped when the cap does.
+  if (!a_cap) {
+    a_cap_point_.reset();
+  } else if (!a_cap_point_ && complete_upper_body(requested)) {
+    a_cap_point_ = requested;
   }
   // One clock per hold. Once a verdict is seen the whole hold uses the collision
   // time, so a deadline frame amid verdicts cannot cut it short.
@@ -876,6 +886,12 @@ CbfDecision CbfSafety::release_if_stuck(const CbfDecision & decision, const CbfS
   CbfDecision out;
   out.epoch = decision.epoch;
   out.output = requested;
+  if (a_cap_point_) {
+    out.output.arm = a_cap_point_->arm;
+    out.output.hand = a_cap_point_->hand;
+    out.output.hand_sub_mode = a_cap_point_->hand_sub_mode;
+    ++diagnostics_.a_cap_capped_ticks;
+  }
   clamp_thumb_command(config_, out.output);
   place_phantom_thumbs(config_, snapshot.hand_reported_absent, out.output);
   const bool measured = snapshot.arm && snapshot.arm->position.size() == 14 && finite(snapshot.arm->position);
