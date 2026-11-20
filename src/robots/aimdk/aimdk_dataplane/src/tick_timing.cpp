@@ -100,7 +100,8 @@ void TickTrace::decided(const CbfDecision & decision, bool enforce_mode)
 }
 
 TickTiming::TickTiming(double period_s)
-: period_ms_(period_s * 1e3)
+: period_ms_(period_s * 1e3),
+  period_(std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(period_s)))
 {
   // What one reading costs here, to tell the overhead of the readings apart.
   constexpr int kReadings = 1000;
@@ -181,11 +182,23 @@ void TickTiming::tick(const TickTrace & trace, const CbfDiagnostics * diagnostic
   std::lock_guard<std::mutex> lock(mutex_);
   ++invocations_;
   if (previous_entered_) {
-    // A timer that fell behind skips the ticks it missed (it does not burst).
     const double gap = since(*previous_entered_, trace.entered);
     add_locked(TimingSegment::kLate, gap - period_ms_);
-    const auto periods = std::lround(gap / period_ms_);
-    if (periods > 1) {missed_ticks_ += static_cast<uint64_t>(periods - 1);}
+    // Missed ticks by rcl's timer rule (rcl_timer_call), not by the gap: a late
+    // call serves its own slot and the next slot stays on the phase, so a late
+    // tick and the short gap after it miss nothing; slots already past when a
+    // call is made are skipped. The phase is the earliest start seen, since a
+    // call never comes before its slot. A start right on a slot boundary can be
+    // counted one off.
+    if (trace.entered < next_due_) {next_due_ = trace.entered;}
+    next_due_ += period_;
+    if (next_due_ < trace.entered) {
+      const auto skipped = static_cast<uint64_t>(std::ceil(since(next_due_, trace.entered) / period_ms_));
+      missed_ticks_ += skipped;
+      next_due_ += static_cast<Clock::duration::rep>(skipped) * period_;
+    }
+  } else {
+    next_due_ = trace.entered + period_;
   }
   previous_entered_ = trace.entered;
   add_locked(TimingSegment::kTick, since(trace.entered, trace.ended));

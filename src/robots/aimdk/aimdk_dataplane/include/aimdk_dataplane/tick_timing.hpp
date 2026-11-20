@@ -143,6 +143,7 @@ public:
   // A finished command tick, on the thread that ran it. ``diagnostics`` is the
   // CBF's, on kCbf ticks, for the reason of a held or released frame.
   void tick(const TickTrace & trace, const CbfDiagnostics * diagnostics);
+  // Timer slots that got no call, by rcl's skip rule (see tick()).
   uint64_t missed_ticks() const;
   // The report for the status at ``now_s`` (seconds, monotonic); starts the
   // next window of maxima. Histograms are included at most once a kHistogramPeriodS.
@@ -154,6 +155,7 @@ private:
 
   mutable std::mutex mutex_;
   double period_ms_;
+  Clock::duration period_;
   double clock_ns_ = 0.0;
   double thread_times_ns_ = 0.0;
   double thread_cpu_ns_ = 0.0;
@@ -162,6 +164,7 @@ private:
   std::atomic<uint64_t> thread_reads_{0};
   std::array<TimingHistogram, static_cast<size_t>(TimingSegment::kCount)> histograms_{};
   std::optional<Clock::time_point> previous_entered_;
+  Clock::time_point next_due_{};  // the slot after the one the last tick served
   std::optional<ThreadTimes> previous_ended_;
   int tick_tid_ = 0;
   uint64_t invocations_ = 0;

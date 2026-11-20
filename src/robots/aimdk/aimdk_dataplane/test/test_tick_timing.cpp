@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <initializer_list>
 #include <string>
 #include <thread>
 
@@ -83,16 +84,18 @@ TEST(TimingHistogram, BucketsAreHalfOpenWithAnOpenTop)
   EXPECT_DOUBLE_EQ(h.max_ms, 1e6);
 }
 
-TEST(TickTiming, LateAndMissedTicksComeFromTheGapBetweenStarts)
+TEST(TickTiming, TheLateComesFromTheGapAndTheMissedFromTheSlots)
 {
   TickTiming timing(0.02);
-  // 20, 21 (1 ms late), 41 (one missed tick), 70 (three missed), 19 (early).
+  // Starts 0, 20, 41, 82, 152, 171 on slots of 20 ms: 41 serves slot 40 late;
+  // 82 serves 60 and skips 80; 152 serves 100 and skips 120 and 140; 171 serves
+  // 160. Nine slots, six calls.
   double t = 0.0;
   for (double gap : {0.0, 20.0, 21.0, 41.0, 70.0, 19.0}) {
     t += gap;
     timing.tick(plain(t), nullptr);
   }
-  EXPECT_EQ(timing.missed_ticks(), 1u + 3u);
+  EXPECT_EQ(timing.missed_ticks(), 3u);
   const auto report = timing.report(0.0);
   EXPECT_EQ(report.at("invocations"), 6);
   const auto & late = histogram(report, "late");
@@ -104,6 +107,36 @@ TEST(TickTiming, LateAndMissedTicksComeFromTheGapBetweenStarts)
   // A plain tick has no solve segments.
   EXPECT_EQ(histogram(report, "filter").at("n"), 0);
   EXPECT_EQ(histogram(report, "tick").at("n"), 6);
+}
+
+uint64_t missed(std::initializer_list<double> starts_ms)
+{
+  TickTiming timing(0.02);
+  for (double t : starts_ms) {timing.tick(plain(t), nullptr);}
+  return timing.missed_ticks();
+}
+
+TEST(TickTiming, ALateTickAndTheShortGapAfterItMissNothing)
+{
+  // 52 serves slot 40, 12 ms late; the timer keeps its phase, so 60 comes 8 ms later.
+  EXPECT_EQ(missed({0.0, 20.0, 52.0, 60.0, 80.0}), 0u);
+  // Late twice in a row, still every slot served.
+  EXPECT_EQ(missed({0.0, 20.0, 55.0, 75.0, 95.0, 100.0}), 0u);
+}
+
+TEST(TickTiming, ASlotAlreadyPastWhenACallIsMadeIsMissed)
+{
+  // 65 serves 40 and skips 60; 80 is on time.
+  EXPECT_EQ(missed({0.0, 20.0, 65.0, 80.0}), 1u);
+  // 109 serves 40 and skips 60, 80, 100.
+  EXPECT_EQ(missed({0.0, 20.0, 109.0, 120.0}), 3u);
+}
+
+TEST(TickTiming, TheFirstStartLateDoesNotShiftThePhase)
+{
+  // Slots 0, 20, 40, ...; the first call is 5 ms late. 20 shows the phase,
+  // so 64 serves 40 and skips 60.
+  EXPECT_EQ(missed({5.0, 20.0, 64.0, 80.0}), 1u);
 }
 
 TEST(TickTiming, ASolvedTickIsSplitIntoItsSegments)
