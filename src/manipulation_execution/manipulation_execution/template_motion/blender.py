@@ -23,7 +23,7 @@ One template per label activation, from the mirror and back to it::
   did when it was left).
 
 Nothing here waits without a deadline: A has ``T_A + a_timeout_margin_s``,
-WAIT_ACK ``ack_timeout_s``, the playback ``t_in + hold_max_s + t_out +
+WAIT_ACK ``ack_timeout_s`` (one tick more when it runs out on a late one), the playback ``t_in + hold_max_s + t_out +
 play_margin_s`` from its start, a stale-status check and a port-lost check
 (fresh statuses that are not this segment's for ``port_lost_s``: the data
 plane restarted, or plays something else), WAIT_DONE ``t_out +
@@ -66,7 +66,8 @@ value in :class:`BlendConfig` that restores the behaviour above):
 * Ages are judged on punctual ticks: a tick more than ``late_tick_s`` after
   the previous one (the session was starved, and what it has not read yet
   may be queued) keeps the previous verdict on the A status age, the B port
-  status and the labels, up to twice their limit, never beyond.
+  status and the labels, up to twice their limit, never beyond. An ack
+  timeout that runs out on a late tick is judged on the next one.
 * With ``a_cap`` (off by default, until the data plane has (b)): every A tick
   asks the data plane, in A's safety epoch, to aim the CBF's releases of a
   hold at the request of its first flagged tick; ``on: false`` once when A
@@ -498,6 +499,7 @@ class Blender:
         self._since = 0.0  # when the current phase began
         self._entered_at: float | None = None
         self._play_deadline = math.inf
+        self._ack_late_seen = False  # WAIT_ACK put off its timeout for one late tick
         self._foreign_since: float | None = None  # newest statuses not this segment's, since
         self._seen_serial = 0
         self._t_a = 0.0
@@ -933,6 +935,7 @@ class Blender:
             self._status_serial = self._seen_serial = 0 if status is None else status.serial
             self._play_deadline = now + segment.t_in + segment.hold_max_s + segment.t_out + config.play_margin_s
             self._phase, self._since = Phase.WAIT_ACK, now
+            self._ack_late_seen = False
             return segment.P
         return self._blend_a(now, m)
 
@@ -1313,6 +1316,11 @@ class Blender:
         if status is not None and status.state in TERMINAL:
             return self._hand_back(now, f"{status.state.lower()}:{status.reason}", m, self._segment.P, 1.0)
         if now - self._since > self._config.ack_timeout_s:
+            if self._tick_late and not self._ack_late_seen:
+                # Judged on punctual ticks: a late one runs before the statuses queued while starving, the next
+                # one reads them (port_suspect would keep every template out for the rest of the round).
+                self._ack_late_seen = True
+                return self._segment.P
             self._client.release(self._seg_id, fast=True)
             self._port_suspect = True
             return self._hand_back(now, "no_ack", m, self._segment.P, 1.0)

@@ -473,6 +473,31 @@ def test_a_starved_session_keeps_the_hold_in_B(starved):
     assert rig.blender.phase is Phase.PLAYING and not rig.sent("release")
 
 
+@pytest.mark.parametrize("starved", [0.3, 0.6])
+@pytest.mark.parametrize("answer", ["ENTER_B", "STOPPED", None])
+def test_a_session_starved_right_after_the_start_reads_the_port_s_answer_before_no_ack(starved, answer):
+    # The late tick runs before the statuses queued while starving: ack_timeout_s is not judged on it
+    # (port_suspect would keep templates out for the rest of the round), the next tick reads them.
+    rig = PauseRig()
+    rig.into_a(0.0)
+    assert rig.run(2.0, lambda: rig.blender.phase is Phase.WAIT_ACK)
+    seg_id = rig.started()
+    if answer is not None:  # queued: seen from the tick after the late one on
+        rig.port = {"state": answer, "seg_id": seg_id, "seg": "heart", "P_actual": list(P_HEART), "hand_P": [0.2] * 20,
+                    "reason": "keepalive_timeout" if answer == "STOPPED" else ""}  # fmt: skip
+    rig.starve(starved)
+    assert rig.blender.phase is Phase.WAIT_ACK and not lines(rig, "template exit")
+    assert not rig.blender.snapshot()["port_suspect"] and not rig.sent("release")
+    rig.step()
+    snap = rig.blender.snapshot()
+    if answer == "ENTER_B":
+        assert rig.blender.phase is Phase.PLAYING and not snap["port_suspect"]
+    elif answer == "STOPPED":
+        assert exit_reason(rig) == "stopped:keepalive_timeout" and not snap["port_suspect"]
+    else:  # no answer even then: the port is suspect, as on a punctual tick
+        assert exit_reason(rig) == "no_ack" and snap["port_suspect"]
+
+
 @pytest.mark.parametrize("dt", [TICK, LATE])
 def test_a_status_that_stopped_is_untrusted_by_twice_its_age_at_most(dt):
     rig = PauseRig()
