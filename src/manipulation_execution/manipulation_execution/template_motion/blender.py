@@ -358,6 +358,20 @@ class _MirrorRef:
         return max(self._ramp[0] + self._ramp[1] - now, 0.0)
 
 
+def _known(value, spec: str = "") -> str:
+    return "unknown" if value is None else format(value, spec)
+
+
+def _cbf_ages(cbf, now: float) -> str:
+    """The three ages of a status, apart: since it was received, since it was made (its own ``at``),
+    and of the arm feedback the CBF call used (``cbf.arm_age_s``). A missing one is unknown, never 0."""
+    status_age = None if cbf.at is None else now - cbf.at
+    return (
+        f"recv_age={now - cbf.received_at:.3f} status_age={_known(status_age, '.3f')} "
+        f"arm_age={_known(cbf.arm_age_s, '.3f')}"
+    )
+
+
 def _fmt(counts: Mapping[str, int]) -> str:
     return ",".join(f"{key}:{value}" for key, value in sorted(counts.items())) or "-"
 
@@ -522,6 +536,7 @@ class Blender:
         self._exit_pending_since = 0.0
         self._exit_pending_c: tuple | None = None  # after B started: the C waited for (anchor, beta)
         self._c_checked = False  # C from A after a checked hand-back: it stops on what a safety exit would
+        self._exit_cbf = None  # the status a CBF exit was read in, for its log line (not the batch's newest)
         # (b)
         self._a_cap_from = 0.0  # the echo is to be true from here on: entering A, or a late tick
         self._a_cap_seen = False  # a true echo since _a_cap_from
@@ -1023,6 +1038,7 @@ class Blender:
             self._cbf_serial = state.serial
             safety = self._safety_of(state, self._epoch, self._owner)
             if safety is not None:
+                self._exit_cbf = state
                 return safety
         return None
 
@@ -1111,10 +1127,9 @@ class Blender:
         for state in self._cbf.after(self._cbf_serial):
             self._cbf_serial = state.serial
             safety = self._safety_of(state, self._epoch, self._owner)
-            if safety is not None:
-                return safety
-            if state.collision:
-                return "a_cbf_collision"
+            if safety is not None or state.collision:
+                self._exit_cbf = state
+                return safety or "a_cbf_collision"
             if not self._paused:
                 continue
             if state.at is not None and self._clean_ats and state.at <= self._clean_ats[-1]:
@@ -1178,7 +1193,7 @@ class Blender:
         self.pauses += 1
         if self._pause_lines < PAUSE_LOG_LINES:
             self._pause_lines += 1
-            detail = "none" if cbf is None else f"{cbf.detail} age={now - cbf.received_at:.2f}"
+            detail = "none" if cbf is None else f"{cbf.detail} {_cbf_ages(cbf, now)}"
             self._log(
                 f"template pause {self._label.template} why={why} n={self._pauses} tau={self._clock.at(now):.2f} "
                 f"behind={now - self._entered_at - self._clock.at(now):.2f} cbf=[{detail}]"
@@ -1502,12 +1517,16 @@ class Blender:
         self._count_exit(reason)
         name = self._label.template if self._label is not None else "?"
         seg = self._segment.name if self._segment is not None else "?"
-        cbf = self._cbf.latest()
+        cbf, source = self._exit_cbf, "trigger"
+        if cbf is None:
+            cbf, source = self._cbf.latest(), "newest"
+        self._exit_cbf = None
         cbf_text = "none"
         if cbf is not None:
             cbf_text = (
-                f"{cbf.detail} age={now - cbf.received_at:.2f} epoch={cbf.safety_epoch} "
-                f"owner={cbf.arm_owner} active={cbf.mirror_active}"
+                f"{cbf.detail} reason={_known(cbf.reason)} of={source} {_cbf_ages(cbf, now)} "
+                f"at={_known(cbf.at, '.3f')} epoch={_known(cbf.safety_epoch)} owner={_known(cbf.arm_owner)} "
+                f"active={_known(cbf.mirror_active)}"
             )
         label = self._labels.describe(self._label.template, now) if self._label is not None else "none"
         outcome = "repeat"  # a later exit of the same attempt (a stop or an error during C)

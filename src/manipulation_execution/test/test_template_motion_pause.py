@@ -657,6 +657,37 @@ def test_a_collision_and_an_epoch_change_in_one_batch_send_no_C(same_status):
     the_mirror_passes(rig)
 
 
+@pytest.mark.parametrize("what", ["collision", "epoch", "nulls"])
+def test_an_exit_line_describes_the_status_that_ended_A_and_its_three_ages(what):
+    # Codex review 1120 5.2: the raw cbf.reason, arm_age_s and at of the status the exit was read in,
+    # not the batch's newest; receipt, status and feedback ages apart; a missing field is unknown, never 0.
+    rig = PauseRig()
+    rig.into_a(0.3)
+    hit = rig.plane.status(rig.now)
+    hit["cbf"].update(reason="geometry", arm_age_s=0.042)
+    if what == "epoch":
+        hit["safety_epoch"] = rig.plane.epoch = 4
+    else:
+        hit["cbf"]["stuck_collision"] = True
+    if what == "nulls":
+        del hit["cbf"]["reason"]
+        hit["cbf"]["arm_age_s"] = None  # what the data plane sends without feedback
+    newest = rig.plane.status(rig.now + TICK / 2)
+    newest["cbf"].update(reason="passed", arm_age_s=0.011)
+    if what == "epoch":
+        newest["safety_epoch"] = 4
+    rig.extra = [hit, newest]
+    rig.step()
+    line = lines(rig, "template exit")[0]
+    assert exit_reason(rig) == ("a_epoch_changed" if what == "epoch" else "a_cbf_collision")
+    assert "of=trigger recv_age=0.000 status_age=0.020 " in line and f"at={hit['at']:.3f} " in line
+    if what == "nulls":
+        assert "reason=unknown" in line and "arm_age=unknown" in line
+    else:
+        assert "reason=geometry" in line and "arm_age=0.042" in line
+    assert "reason=passed" not in line and "arm_age=0.011" not in line
+
+
 def test_a_restarted_data_plane_with_the_same_epoch_is_a_safety_exit():
     rig = PauseRig()
     rig.into_a(0.3)

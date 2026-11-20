@@ -139,6 +139,8 @@ class CbfState:
     hold_release_after_s: float | None = None
     release_episodes: int | None = None
     collision_release_episodes: int | None = None
+    reason: str | None = None  # cbf.reason as sent: why the newest CBF call held, modified or passed
+    arm_age_s: float | None = None  # cbf.arm_age_s: the arm feedback's age at the CBF call (null: none)
     has_cbf: bool = False  # the status had a cbf section (without one the CBF is off)
     restarted: bool = False  # its counters went back: the data plane restarted, an equal epoch proves nothing
 
@@ -194,6 +196,8 @@ class CbfMonitor:
                     hold_release_after_s=_seconds(cbf.get("hold_release_after_s")),
                     release_episodes=_count(cbf.get("release_episodes")),
                     collision_release_episodes=_count(cbf.get("collision_release_episodes")),
+                    reason=cbf.get("reason") if isinstance(cbf.get("reason"), str) else None,
+                    arm_age_s=_seconds(cbf.get("arm_age_s")),
                     has_cbf=True,
                     **top,
                 )
