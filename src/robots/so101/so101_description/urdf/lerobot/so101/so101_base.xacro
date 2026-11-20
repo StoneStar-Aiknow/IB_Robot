@@ -35,7 +35,7 @@
 	     (wrist_roll_follower_col_0..7 / moving_jaw_col_0..7, poses exactly as
 	     in so101.xml.template), so a Gazebo simulation collides with the
 	     same jaw shapes MuJoCo does. The Gazebo render paths set `hulls`
-	     (robot_runtime.launch_support.render_gazebo_description). The
+	     (robot_runtime_sim.gazebo_embodiment.render_gazebo_description). The
 	     visuals never change. First <xacro:arg> declaration wins. -->
 	<xacro:arg name="jaw_collision" default="mesh" />
 	<!-- jaw_collision validation: an unknown value FAILS the render (an
@@ -53,7 +53,7 @@
 	     maintainer decision 2026-10-30): the joint-6 effort limit. The
 	     default 10 keeps every hardware/SDK/MoveIt render byte-identical
 	     (pinned by test/golden); only the Gazebo render path sets the
-	     measured value (robot_runtime.launch_support.render_gazebo_description)
+	     measured value (robot_runtime_sim.gazebo_embodiment.render_gazebo_description)
 	     — on Gazebo the shipped 10 (and 2.75) eject the grasped cube while
 	     1.0 captures it (spike 1.1r diagnostics). First <xacro:arg>
 	     declaration wins. -->

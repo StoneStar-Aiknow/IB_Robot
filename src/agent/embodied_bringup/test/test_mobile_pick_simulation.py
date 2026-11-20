@@ -56,8 +56,8 @@ from tf2_ros import Buffer, TransformListener
 
 from ibrobot_msgs.action import PickObject
 from ibrobot_msgs.msg import RuntimeStatus
-from robot_runtime.testing.entity_ground_truth import open_entity_ground_truth
-from robot_runtime.testing.sim_ground_truth import RUN_MARKER_ENV, terminate_marked_processes
+from robot_runtime_sim.testing.entity_ground_truth import open_entity_ground_truth
+from robot_runtime_sim.testing.sim_ground_truth import RUN_MARKER_ENV, terminate_marked_processes
 from sim_models.scene_compiler import get_scene_layout, mobile_manipulation_spec
 from test.mobile_grasp_support import (
     JUDGE_GRASP_REGION_M,
@@ -1135,7 +1135,7 @@ def test_pick_end_to_end(sim_platform: str, tmp_path: Path) -> None:
                     mjcf_path = (param.text or "").strip()
             if not mjcf_path:
                 pytest.fail("no mujoco_model hardware parameter in /robot_description")
-        from robot_runtime.testing.entity_ground_truth import MujocoFloatingBaseGroundTruthStream
+        from robot_runtime_sim.testing.entity_ground_truth import MujocoFloatingBaseGroundTruthStream
 
         object_stream = open_entity_ground_truth(
             sim_platform, world=WORLD_NAME, scene=SCENE_NAME, entity=OBJECT_NAME, env=env

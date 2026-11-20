@@ -145,7 +145,7 @@ The simulated IMU publishes SI units (m/s², rad/s); at rest it reads gravity
 (`|acc| ≈ 9.81` m/s² along +z of the sensor frame). Gazebo's pre-settle
 samples — the zero window before the physics starts and the landing impulse
 when the entity drops onto the ground — are held back by
-`robot_runtime/imu_settle_filter` until gravity has been stable for a full
+`robot_runtime_sim/imu_settle_filter` until gravity has been stable for a full
 run, so FAST-LIO's gravity initialization only ever sees valid samples.
 
 `lekiwi_sensor_calib` (the MID-360 / camera extrinsic calibration workflow)
@@ -301,7 +301,7 @@ in-process; extension-free models stay `.mjb`).
   the ros2_control joints stay `7/8/9` (SimpleTransmission mappings, MuJoCo
   branch only — a `PidROS` topic token may not start with a digit).
 - The chassis is a KINEMATIC base: `base_node`'s wheel odometry (`/odom`)
-  drives the floating base through `robot_runtime/odometry_twist_relay`
+  drives the floating base through `robot_runtime_sim/odometry_twist_relay`
   (validated: frame, freshness, order) and the simulator's
   `BaseVelocityPlugin`. There is no wheel slip — wheel odometry tracks the
   ground truth to sub-millimetre — and walls do not stop the driven axes

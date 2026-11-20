@@ -101,7 +101,7 @@
   <test_depend>builtin_interfaces</test_depend>
   <test_depend>so101_robot</test_depend>
   <!-- test_navgrasp_reach_accuracy reads the ground-truth gripper link
-       through robot_runtime.testing.entity_ground_truth (D4, #205 grasp
+       through robot_runtime_sim.testing.entity_ground_truth (D4, #205 grasp
        stage) and composes the GT base pose with the mount transform from
        TF. -->
   <test_depend>tf2_ros</test_depend>

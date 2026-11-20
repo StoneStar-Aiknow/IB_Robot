@@ -87,10 +87,9 @@
   <test_depend>tf2_msgs</test_depend>
   <test_depend>rosgraph_msgs</test_depend>
   <!-- The gate's direct imports (<depend> covers build+exec scope only, the
-       robot_config precedent): the environment probe, the require-or-skip
-       rule, the collection-safety helper and ground truth come from
-       robot_runtime.testing; the gate probes RuntimeStatus from
-       ibrobot_msgs. -->
+       robot_config precedent): the collection-safety helper and the arm
+       envelope verdicts come from robot_runtime.testing; the gate probes
+       RuntimeStatus from ibrobot_msgs. -->
   <test_depend>robot_runtime</test_depend>
   <!-- the lidar-odometry gate imports the simulator test support
        (robot_runtime_sim.testing, sim-platform-registry D6) -->

@@ -177,7 +177,7 @@ interfaces:
 
 # D6b: on the Gazebo transport the joint.current interface is a simulated
 # estimate derived from the simulated joint effort (/joint_states effort ×
-# scale, republished by robot_runtime/joint_current_publisher). Scale 1
+# scale, republished by robot_runtime_sim/joint_current_publisher). Scale 1
 # matches the hardware adapter's effort-as-current semantics.
 #
 # The platform-scoped xacro_args below are the LeKiwi grasp profile's D7
