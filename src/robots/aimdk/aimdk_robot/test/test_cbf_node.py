@@ -6,7 +6,8 @@ CBF_RELEASE log when the right hand is swapped for one the geometry was not
 built for mid-mirror and comes back, and an empty right flange checked as a
 phantom hand instead of released, its thumb at the compact pose and its start
 and end logged once even when its type flickers; and the safety epoch the
-template layer checks, which the control heartbeat does not move.
+template layer checks, which the control heartbeat does not move; and the
+tick timing figures in the status, and their absence when switched off.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ CBF = {
         "feedback_offset": [0, 0, 0, 0],
     },
 }
+NODE_PARAMETERS = ("tick_timing",)
 
 
 class Logged:
@@ -69,8 +71,10 @@ class Logged:
 @pytest.fixture
 def node(monkeypatch, request):
     logged = Logged()
-    # Indirect parametrization overrides keys of the CBF section.
-    cbf_config = {**CBF, **getattr(request, "param", {})}
+    # Indirect parametrization overrides keys of the CBF section, and the node's own parameters.
+    overrides = dict(getattr(request, "param", {}))
+    node_parameters = {key: overrides.pop(key) for key in NODE_PARAMETERS if key in overrides}
+    cbf_config = {**CBF, **overrides}
 
     def start_process(profile):
         executable = Path(get_package_prefix("aimdk_dataplane")) / "lib" / "aimdk_dataplane" / "aimdk_dataplane"
@@ -81,6 +85,7 @@ def node(monkeypatch, request):
                         "ros__parameters": {
                             "plan_json": json.dumps(dataplane.plan(profile)),
                             "cbf_safety_json": json.dumps(cbf_config),
+                            **node_parameters,
                         }
                     }
                 },
@@ -333,6 +338,108 @@ def test_the_status_carries_a_safety_epoch_the_heartbeat_does_not_move(node):
         lambda: [s for s in since(start) if s["safety_epoch"] != mirroring_epoch], "a new safety epoch"
     )
     assert after[0]["safety_epoch"] > mirroring_epoch
+
+
+class Statuses:
+    """The data plane's status messages as they come, parsed."""
+
+    def __init__(self, harness) -> None:
+        self.seen: list[dict] = []
+        self._lock = threading.Lock()
+        harness.node.create_subscription(String, dataplane.STATUS_TOPIC, self._on_status, 20)
+
+    def _on_status(self, message) -> None:
+        data = json.loads(message.data)
+        with self._lock:
+            self.seen.append(data)
+
+    def since(self, start: int) -> list[dict]:
+        with self._lock:
+            return list(self.seen[start:])
+
+    def count(self) -> int:
+        with self._lock:
+            return len(self.seen)
+
+
+def mirroring(statuses: list[dict]) -> list[dict]:
+    return [s for s in statuses if (s.get("cbf") or {}).get("mirror_active")]
+
+
+def test_the_status_accounts_for_every_command_tick(node):
+    """tick_timing: counters in every status, histograms once a second, each count once."""
+    harness, logged = node
+    harness.wait_active()
+    statuses = Statuses(harness)
+    assert harness.set_mode("policy_stream").success
+    stop = threading.Event()
+    thread = stream(harness, stop)
+    try:
+        harness.wait_for(lambda: mirroring(statuses.since(0)), "mirroring in the status")
+        start = statuses.count()
+        time.sleep(2.0)
+        steady = mirroring(statuses.since(start))
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+
+    assert len(steady) >= 30
+    timing = [s["tick_timing"] for s in steady]
+    invocations = [t["invocations"] for t in timing]
+    assert invocations == sorted(invocations)
+    # The command timer at 50 Hz, 2 s: counted whether or not the CBF ran.
+    assert invocations[-1] - invocations[0] >= 60
+    assert timing[-1]["period_ms"] == pytest.approx(20.0)
+    assert timing[-1]["paths"]["cbf"] > 0
+    assert timing[-1]["outcomes"]["verified"] > 0
+    # Each CBF frame with an upper body is published; a withheld one is not.
+    outcomes = timing[-1]["outcomes"]
+    assert timing[-1]["publishes"] >= timing[-1]["paths"]["cbf"] - outcomes.get("withheld", 0)
+    assert timing[-1]["clock_reads"] > 0 and timing[-1]["clock_ns"] > 0
+    assert set(timing[-1]["window_max_ms"]) >= {"tick", "filter", "status", "late", "bookkeeping", "tick_runqueue"}
+    assert timing[-1]["scheduler"] is True
+    assert isinstance(timing[-1]["tick_nice"], int) and timing[-1]["tick_tid"] > 0
+
+    # Histograms about once a second, not in every 20 Hz status.
+    with_histograms = [t for t in timing if "histograms" in t]
+    assert 1 <= len(with_histograms) <= 4
+    for report in with_histograms:
+        histograms = report["histograms"]
+        assert len(histograms["edges_ms"]) + 1 == len(histograms["tick"]["counts"])
+        # Taken under one lock: every tick counted once, and each solve once.
+        assert histograms["tick"]["n"] == report["invocations"]
+        assert sum(histograms["tick"]["counts"]) == histograms["tick"]["n"]
+        solved = report["paths"].get("cbf", 0) + report["paths"].get("discarded", 0)
+        assert histograms["filter"]["n"] == solved
+        assert histograms["late"]["n"] == report["invocations"] - 1
+        # The thread's clocks for every tick: on a CPU, and waiting for one.
+        assert histograms["tick_cpu"]["n"] == report["invocations"]
+        assert histograms["tick_runqueue"]["n"] == report["invocations"]
+        assert histograms["filter_cpu"]["n"] == solved
+        assert histograms["status"]["n"] > 0
+
+    line = harness.wait_for(lambda: logged.matching("CBF status:"), "an INFO line")[-1]
+    counters = fields(line)
+    for name in ("missed_ticks", "node_deadlines", "deadlines", "publish_overruns"):
+        assert counters[name].isdigit(), (name, line)
+
+
+@pytest.mark.parametrize("node", [{"tick_timing": False}], indirect=True)
+def test_without_tick_timing_the_status_has_no_figures(node):
+    harness, logged = node
+    harness.wait_active()
+    statuses = Statuses(harness)
+    assert harness.set_mode("policy_stream").success
+    stop = threading.Event()
+    thread = stream(harness, stop)
+    try:
+        harness.wait_for(lambda: len(mirroring(statuses.since(0))) >= 20, "mirroring in the status")
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
+    assert not [s for s in statuses.since(0) if "tick_timing" in s]
+    line = harness.wait_for(lambda: logged.matching("CBF status:"), "an INFO line")[-1]
+    assert fields(line)["missed_ticks"] == "na"
 
 
 @pytest.mark.parametrize("node", [{"hands_installed": [True, False]}], indirect=True)

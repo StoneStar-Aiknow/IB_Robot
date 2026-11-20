@@ -24,7 +24,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 add_library(aimdk_dataplane_core STATIC src/projection.cpp src/core.cpp src/cbf_safety.cpp
-  src/template_play.cpp)
+  src/template_play.cpp src/tick_timing.cpp)
 target_include_directories(aimdk_dataplane_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
@@ -66,6 +66,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_cbf_safety aimdk_dataplane_core)
   ament_add_gtest(test_template_play test/test_template_play.cpp)
   target_link_libraries(test_template_play aimdk_dataplane_core)
+  ament_add_gtest(test_tick_timing test/test_tick_timing.cpp)
+  target_link_libraries(test_tick_timing aimdk_dataplane_core)
 endif()
 
 ament_package()
