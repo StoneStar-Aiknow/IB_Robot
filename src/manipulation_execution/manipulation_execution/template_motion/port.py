@@ -5,10 +5,12 @@
 * :class:`CbfMonitor`: whether the data plane's CBF is holding or releasing,
   from ``/aimdk_runtime/dataplane/status`` (``cbf.stuck_s``, ``releasing``,
   ``stuck_collision``), the status's own time and safety epoch, the recent
-  statuses in order (one older than the newest is dropped) and the share of
+  statuses in order (one older than the newest is dropped, one without ``at``
+  or ``safety_epoch`` too: another data plane's) and the share of
   held CBF calls over a window;
 * :class:`PlayClient`: ``start`` / ``release`` from the blender, ``pump``
-  from the node's tick for the keepalive.
+  from the node's tick for the keepalive; ``a_cap`` from the blender in A
+  (the (b) flag: the CBF's releases target the hold's first request).
 
 The client's obligations (M0 §2.1): a keepalive at least every 50 ms from the
 start until the status reports DONE, REJECTED or STOPPED for that ``seg_id``,
@@ -53,6 +55,11 @@ class PortStatus:
     segments: tuple[str, ...] | None
     received_at: float
     serial: int  # counts received statuses, so the blender can tell a new one
+    a_cap: bool | None = None  # the (b) flag is in force on the data plane; None: the field is not sent
+    # Of the a_cap message the data plane holds (M0 revision 3); None while the flag is not in force:
+    a_cap_epoch: int | None = None
+    a_cap_attempt: int | None = None
+    a_cap_age_s: float | None = None  # since the data plane received it, by its clock
 
 
 def _vector(values, length: int) -> tuple[float, ...] | None:
@@ -80,6 +87,7 @@ def decode_status(data: str, now: float, serial: int) -> PortStatus:
     segments = tuple(s for s in segments if isinstance(s, str)) if isinstance(segments, list) else None
     seg = message.get("seg")
     reason = message.get("reason")
+    a_cap = message.get("a_cap")
     return PortStatus(
         seg_id=seg_id,
         seg=seg if isinstance(seg, str) else None,
@@ -90,6 +98,10 @@ def decode_status(data: str, now: float, serial: int) -> PortStatus:
         segments=segments,
         received_at=now,
         serial=serial,
+        a_cap=a_cap if isinstance(a_cap, bool) else None,
+        a_cap_epoch=_count(message.get("a_cap_epoch")),
+        a_cap_attempt=_count(message.get("a_cap_attempt")),
+        a_cap_age_s=_seconds(message.get("a_cap_age_s")),
     )
 
 
@@ -135,7 +147,10 @@ class CbfState:
     hold_release_after_s: float | None = None
     release_episodes: int | None = None
     collision_release_episodes: int | None = None
+    reason: str | None = None  # cbf.reason as sent: why the newest CBF call held, modified or passed
+    arm_age_s: float | None = None  # cbf.arm_age_s: the arm feedback's age at the CBF call (null: none)
     has_cbf: bool = False  # the status had a cbf section (without one the CBF is off)
+    restarted: bool = False  # its counters went back: the data plane restarted, an equal epoch proves nothing
 
 
 def _count(value) -> int | None:
@@ -149,7 +164,14 @@ def _seconds(value) -> float | None:
 
 
 class CbfMonitor:
-    """Without a ``cbf`` section (CBF off) the CBF never intervenes."""
+    """Without a ``cbf`` section (CBF off) the CBF never intervenes.
+
+    A status without ``at`` or ``safety_epoch`` is not this data plane's: every
+    one has both since 8f7d38f9, an older one on the same ROS network (real
+    robot 11-20 17:01) has neither. It is counted in ``foreign`` and dropped
+    before anything reads it: never the newest, never in the held share, never
+    the order's reference, never an epoch or owner change.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -158,6 +180,7 @@ class CbfMonitor:
         self._history: deque[CbfState] = deque(maxlen=CBF_HISTORY)
         self.malformed = 0
         self.reordered = 0
+        self.foreign = 0
 
     def observe(self, data: str, now: float) -> None:
         try:
@@ -169,6 +192,10 @@ class CbfMonitor:
                 "control_seq": _count(message.get("control_seq")),
                 "arm_owner": _count(message.get("arm_owner")),
             }
+            if top["at"] is None or top["safety_epoch"] is None:
+                with self._lock:
+                    self.foreign += 1
+                return
             if cbf is None:
                 state = CbfState(False, now, "no cbf", **top)
             else:
@@ -189,6 +216,8 @@ class CbfMonitor:
                     hold_release_after_s=_seconds(cbf.get("hold_release_after_s")),
                     release_episodes=_count(cbf.get("release_episodes")),
                     collision_release_episodes=_count(cbf.get("collision_release_episodes")),
+                    reason=cbf.get("reason") if isinstance(cbf.get("reason"), str) else None,
+                    arm_age_s=_seconds(cbf.get("arm_age_s")),
                     has_cbf=True,
                     **top,
                 )
@@ -202,9 +231,10 @@ class CbfMonitor:
                 self.reordered += 1  # older than the newest: one publisher never does this, a queue might
                 return
             self._serial += 1
-            if before is not None and None not in (before.calls, state.calls) and state.calls < before.calls:
+            restarted = before is not None and None not in (before.calls, state.calls) and state.calls < before.calls
+            if restarted:
                 self._history.clear()  # the data plane restarted: its counters began again
-            self._latest = replace(state, serial=self._serial)
+            self._latest = replace(state, serial=self._serial, restarted=restarted)
             self._history.append(self._latest)
 
     def latest(self) -> CbfState | None:
@@ -270,7 +300,7 @@ class PlayClient:
         message["schema"] = PLAY_SCHEMA
         try:
             self._publish(json.dumps(message, sort_keys=True))
-            self.sent[message["op"]] += 1
+            self.sent[message["op"]] = self.sent.get(message["op"], 0) + 1
         except Exception:
             self.publish_errors += 1
 
@@ -294,6 +324,12 @@ class PlayClient:
         with self._lock:
             if self._seg_id == seg_id:
                 self._send({"op": "release", "seg_id": seg_id, "fast": bool(fast)})
+
+    def a_cap(self, on: bool, epoch: int, attempt: int) -> None:
+        """The (b) flag for the data plane's CBF, in the safety epoch A was entered in, for this entry into A
+        (``attempt``, echoed back so an old echo never answers a new A). No segment needed."""
+        with self._lock:
+            self._send({"op": "a_cap", "on": bool(on), "epoch": int(epoch), "attempt": int(attempt)})
 
     def abandon(self) -> None:
         with self._lock:
