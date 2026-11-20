@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,7 @@ from manipulation_execution.mirror_session.hand_overlay import (
     HandOverlay,
     travel_time_s,
 )
+from manipulation_execution.template_motion.blender import BlendConfig
 from manipulation_execution.template_motion.config import ARM_LIMITS, load_config, parse_config
 from manipulation_execution.template_motion.labels import LabelBook
 from manipulation_execution.template_motion.port import CbfMonitor, PlayClient, PortMonitor
@@ -363,7 +365,10 @@ def test_the_shipped_config_switched_on_loads_every_template():
 def test_the_on_site_config_loads_every_template():
     setup = load_config(str(CONFIG_DIR / "motion_template_onsite.yaml"), HAND)
     assert setup.notes == [] and set(setup.templates) == {"overhead_heart", "heart", "holy", "xsign"}
-    assert setup.blend == parse_config(shipped_on(), str(CONFIG_DIR), HAND).blend  # same blend as the shipped file
+    shipped_blend = parse_config(shipped_on(), str(CONFIG_DIR), HAND).blend
+    assert setup.blend == replace(shipped_blend, a_pause_budget_s=2.0)  # the shipped file's blend but for zll 11-20
+    assert (setup.blend.a_pause_budget_s, setup.blend.a_pause_budget_per_s, setup.blend.a_pause_max_s) == (2.0, 0, 4)
+    assert setup.blend.min_hold_s == 0.8 and BlendConfig().a_pause_budget_s == 4.0  # the code default stays
     assert setup.label_stale_s == 1.0  # the real robot's label holes (run-1120-183345)
 
 
