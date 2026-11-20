@@ -22,6 +22,7 @@
 #include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <limits>
@@ -247,6 +248,7 @@ public:
     log_thread_ = std::thread([this]() {print_logs();});
   }
 
+  // Without main()'s finish_logs (an exception) this waits for the log thread however long.
   ~Dataplane() override
   {
     {
@@ -255,6 +257,22 @@ public:
     }
     log_ready_.notify_one();
     if (log_thread_.joinable()) {log_thread_.join();}
+  }
+
+  // Prints what is still queued and ends the log thread, waiting at most
+  // ``timeout``. False when the thread is still inside a write: a log output
+  // that stopped taking lines (a full console pipe) holds it there for good,
+  // and with it rclcpp's logging lock, which rclcpp::shutdown() and every
+  // other RCLCPP_* call wait on too. The thread is left as it is then.
+  bool finish_logs(std::chrono::milliseconds timeout)
+  {
+    std::unique_lock<std::mutex> lock(log_mutex_);
+    log_stop_ = true;
+    log_ready_.notify_one();
+    if (!log_finished_.wait_for(lock, timeout, [this]() {return log_done_;})) {return false;}
+    lock.unlock();
+    if (log_thread_.joinable()) {log_thread_.join();}
+    return true;
   }
 
   // An explicit zero velocity before this process stops publishing: the vendor's
@@ -416,10 +434,14 @@ private:
     for (const auto & [name, code] : codes) {
       if (code != 0) {faulted += " " + name + "=" + std::to_string(code);}
     }
-    if (!faulted.empty()) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000, "HAND_FAULT%s", faulted.c_str());
-    }
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (!faulted.empty()) {
+      const double now = monotonic_s();
+      if (now - last_hand_fault_log_s_ >= 1.0) {
+        last_hand_fault_log_s_ = now;
+        note_log(LogLevel::kWarn, "HAND_FAULT%s", faulted.c_str());
+      }
+    }
     note_intake("hand", stamp);
     core_.on_hand_state(
       {message->left_hand_type.value, message->right_hand_type.value}, std::move(entries), std::move(measured),
@@ -981,11 +1003,12 @@ private:
   enum class LogLevel {kInfo, kWarn, kError};
   static constexpr size_t kMaxQueuedLogs = 1000;
 
-  // Every log line made after start-up goes through here, to be printed on a
-  // thread of its own (print_logs): a slow log sink (the console pipe, /rosout,
-  // the log file) then holds up neither the command tick nor anyone waiting on
-  // mutex_. Lines keep their order and may come out a little after the command
-  // they are about. Past kMaxQueuedLogs unprinted, lines are counted, not kept.
+  // Every log line this node makes after start-up goes through here, to be
+  // printed on a thread of its own (print_logs): a slow log sink (the console
+  // pipe, /rosout, the log file) then holds up neither the command tick, nor a
+  // vendor input thread, nor anyone waiting on mutex_. Lines keep their order
+  // and may come out a little after the command they are about. Past
+  // kMaxQueuedLogs unprinted, lines are counted, not kept.
   __attribute__((format(printf, 3, 4))) void note_log(LogLevel level, const char * format, ...)
   {
     va_list args;
@@ -1014,7 +1037,10 @@ private:
     while (true) {
       log_ready_.wait(lock, [this]() {return log_stop_ || !pending_logs_.empty();});
       if (pending_logs_.empty()) {
-        return;  // stopping, and everything queued is out
+        // Stopping, and everything queued is out.
+        log_done_ = true;
+        log_finished_.notify_all();
+        return;
       }
       const auto logs = std::exchange(pending_logs_, {});
       const auto dropped = std::exchange(dropped_logs_, 0);
@@ -1318,6 +1344,7 @@ private:
   uint64_t logged_thumb_event_ = 0;
   double last_thumb_event_log_s_ = 0.0;
   double last_release_log_s_ = 0.0;
+  double last_hand_fault_log_s_ = -std::numeric_limits<double>::infinity();
   double last_filter_error_log_s_ = -std::numeric_limits<double>::infinity();
   double last_status_log_s_ = -std::numeric_limits<double>::infinity();
   double log_min_distance_m_ = std::numeric_limits<double>::infinity();
@@ -1350,6 +1377,8 @@ private:
   std::vector<std::pair<LogLevel, std::string>> pending_logs_;
   uint64_t dropped_logs_ = 0;
   bool log_stop_ = false;
+  bool log_done_ = false;  // print_logs returned
+  std::condition_variable log_finished_;
   std::thread log_thread_;
 };
 
@@ -1396,6 +1425,13 @@ int main(int argc, char ** argv)
     }
     node->publish_safe_command();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // A launch escalates 5 s after its SIGINT. A log thread stuck in a write
+    // holds rclcpp's logging lock, so the node's destructor and rclcpp::shutdown()
+    // would wait for good: with the safe command out, leave without them, and
+    // print nothing (the output is what stopped).
+    if (!node->finish_logs(std::chrono::seconds(1))) {
+      std::_Exit(code);
+    }
   } catch (const std::exception & error) {
     std::fprintf(stderr, "aimdk_dataplane failed: %s\n", error.what());
     code = 1;

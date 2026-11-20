@@ -9,7 +9,8 @@ and end logged once even when its type flickers; and the safety epoch the
 template layer checks, which the control heartbeat does not move; and the
 tick timing figures in the status, and their absence when switched off; and
 a log output that stops taking lines, which holds up neither the commands nor
-the status.
+the status, and a stop while it stays stopped, which still sends the safe
+command and ends in time.
 """
 
 from __future__ import annotations
@@ -83,16 +84,19 @@ class Logged:
     def stall(self) -> None:
         """Stop reading and fill the pipe: the node's next write to stderr blocks."""
         self._reading.clear()
-        time.sleep(0.1)  # a read in progress takes one more chunk, then waits
         # A description of its own, so non-blocking here leaves the node's writes blocking.
         writer = os.open(f"/proc/self/fd/{self.write_fd}", os.O_WRONLY | os.O_NONBLOCK)
         try:
-            for size in (4096, 1):  # 4096 is all or nothing on a pipe; then the last bytes
-                try:
-                    while True:
-                        os.write(writer, b"\n" * size)
-                except BlockingIOError:
-                    pass
+            # Twice: the reader is mostly blocked in a read of the empty pipe, which the
+            # first filling wakes and which then takes up to 64 KiB of it before it waits.
+            for _ in range(2):
+                time.sleep(0.1)  # a read in progress takes its chunk, then waits
+                for size in (4096, 1):  # 4096 is all or nothing on a pipe; then the last bytes
+                    try:
+                        while True:
+                            os.write(writer, b"\n" * size)
+                    except BlockingIOError:
+                        pass
         finally:
             os.close(writer)
         assert self.full()
@@ -557,3 +561,51 @@ def test_a_log_output_that_stops_holds_up_neither_the_commands_nor_the_status(no
     assert len(during) >= 14, len(during)
     assert sent >= 35, sent
     assert during[-1]["cbf"]["calls"] - during[0]["cbf"]["calls"] >= 25
+
+
+def test_a_shutdown_while_the_log_output_is_stopped_sends_the_safe_command_and_exits(node):
+    """A stop that comes while the node's stderr pipe is full and stays full: the explicit
+    zero velocity still goes out, and the process ends in time, before a launch would
+    escalate (5 s from SIGINT to SIGTERM), its log thread still blocked in a write."""
+    harness, logged = node
+    harness.wait_active()
+    statuses = Statuses(harness)
+    assert harness.set_mode("policy_stream").success
+    stop = threading.Event()
+    thread = stream(harness, stop)
+    process = harness.dataplane
+    try:
+        harness.wait_for(lambda: mirroring(statuses.since(0)), "mirroring in the status")
+        harness.wait_for(lambda: logged.matching("CBF status:"), "an INFO line")
+        logged.stall()
+        time.sleep(2.5)  # past the next INFO line (every 2 s): the log thread is blocked writing it
+        before = harness.mock.locomotion_count
+        time.sleep(0.5)
+        assert harness.mock.locomotion_count == before, "no velocity command before the stop"
+        process.terminate()  # SIGTERM, handled as SIGINT
+        started = time.monotonic()
+        try:
+            process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            pass
+        exited_s = time.monotonic() - started if process.poll() is not None else None
+        deadline = time.monotonic() + 1.0
+        while harness.mock.locomotion_count == before and time.monotonic() < deadline:
+            time.sleep(0.02)
+        safe = harness.mock.locomotion_count - before
+        last = harness.mock.last_locomotion
+        assert logged.full(), "nothing may drain the pipe meanwhile"
+    finally:
+        logged.resume()  # a node still blocked writes on and can end
+        stop.set()
+        thread.join(timeout=1.0)
+        if process.poll() is None:
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+    assert safe >= 1, "the explicit zero velocity did not go out"
+    assert (last.forward_velocity, last.lateral_velocity, last.angular_velocity) == (0.0, 0.0, 0.0)
+    assert exited_s is not None, "the process did not end within 3 s of the stop, its log output stopped"
