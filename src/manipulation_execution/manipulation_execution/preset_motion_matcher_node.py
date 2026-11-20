@@ -36,7 +36,7 @@ from manipulation_execution.preset_motions.config import (
     topic,
 )
 from manipulation_execution.preset_motions.events import match_event, match_state
-from manipulation_execution.preset_motions.gesture_vote import GestureFusion, VoteConfig
+from manipulation_execution.preset_motions.gesture_vote import GestureFusion, VoteConfig, gesture_transition_lines
 from manipulation_execution.preset_motions.session_gate import SessionGate
 
 
@@ -214,6 +214,8 @@ class PresetMotionMatcherNode(Node):
         for result in results:
             payload = match_state(result, now_ns, session_active=self._session_active)
             self._match_state_pub.publish(String(data=json.dumps(payload, sort_keys=True, allow_nan=False)))
+        for line in gesture_transition_lines(self._gesture.last_votes):
+            self.get_logger().info(line)
 
     def _status(self):
         result = asdict(self._result) if self._result is not None else {}
@@ -231,6 +233,7 @@ class PresetMotionMatcherNode(Node):
                 "counted": g.counted,
                 "ignored": g.ignored,
                 "last_ignored": g.vote.last_reason,
+                "stats": g.vote.stats,
             }
         self._status_pub.publish(String(data=json.dumps(result, sort_keys=True, allow_nan=False)))
 

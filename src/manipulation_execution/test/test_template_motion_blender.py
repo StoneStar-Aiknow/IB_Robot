@@ -728,6 +728,87 @@ def test_disable_round_outside_a_playback_logs_nothing_and_sends_nothing():
     assert rig.messages == [] and rig.logs == [] and rig.blender.exits == {}
 
 
+# -- counting (logs only) -----------------------------------------------------------------
+
+
+def lines(rig, prefix):
+    return [line for line in rig.logs if line.startswith(prefix)]
+
+
+def test_a_trigger_kept_out_is_counted_once_with_its_reasons_and_admitted_later():
+    rig = Rig()
+    rig.cbf = {"cbf": {"stuck_s": 0.1}}
+    rig.active["heart"] = 7
+    rig.run(0.2)
+    rig.publish_enabled = False
+    rig.run(0.1)
+    assert rig.blender.triggers == 1 and rig.blender.entries == 0 and not lines(rig, "template reject")
+    rig.publish_enabled = True
+    rig.cbf = {}
+    rig.step()
+    assert rig.blender.phase is Phase.A and rig.blender.triggers == 1
+    assert lines(rig, "template enter")[-1].endswith("waited=0.30 blocked=cbf_hold,publish_off")
+    assert rig.blender.rejected == {}
+
+
+def test_a_trigger_that_ends_outside_is_rejected_with_its_last_reason():
+    rig = Rig()
+    rig.cbf = {"cbf": {"releasing": True}}
+    rig.active["heart"] = 7
+    rig.run(0.5)
+    del rig.active["heart"]
+    rig.step()
+    assert rig.blender.rejected == {"cbf_hold": 1} and rig.blender.triggers == 1
+    assert lines(rig, "template reject heart episode=1 reason=cbf_hold waited=0.50 reasons=cbf_hold")
+    rig.cbf, rig.port = {}, None
+    rig.run(0.6)
+    rig.active["heart"] = 7  # episode 2 during a round end: flushed with the round
+    rig.step()
+    rig.blender.end_round(rig.now)
+    assert rig.blender.rejected == {"cbf_hold": 1, "port_stale": 1} and rig.blender.triggers == 2
+    assert lines(rig, "template reject heart episode=2 reason=port_stale")[0].endswith(" at=round_end")
+    tally = lines(rig, "template tally")[-1]
+    assert tally == "template tally triggers=2 entries=0 played=0 outcomes=- rejected=cbf_hold:1,port_stale:1 aborts=-"
+
+
+def test_another_label_during_an_attempt_is_a_busy_trigger_and_an_attempt_has_one_outcome():
+    rig = Rig()
+    seg_id = to_playing(rig, state="HOLD")
+    rig.active["xsign"] = 7
+    rig.run(0.9)
+    assert rig.blender.triggers == 2 and rig.blender._pending[("xsign", 1)][1] == "busy"
+    del rig.active["heart"], rig.active["xsign"]
+    rig.step()
+    assert rig.blender.rejected == {"busy": 1}
+    release = lines(rig, "template release heart seg=heart hold=")[0]
+    assert "label_lost_for=0.00" in release and "label=[inactive age=0.00 ep=1]" in release
+    rig.publish_port(state="DONE", seg_id=seg_id, reason="release", P_actual=list(P_HEART))
+    rig.step()
+    exit_line = lines(rig, "template exit heart")[-1]
+    assert "reason=label_inactive" in exit_line and "outcome=complete played=True" in exit_line
+    assert "cbf=[no cbf age=0.00 epoch=None owner=None active=None]" in exit_line
+    rig.blender.end_round(rig.now)  # a stop during C is logged, but the attempt already had its outcome
+    assert "outcome=repeat" in lines(rig, "template exit heart")[-1]
+    assert rig.blender.outcomes == {"complete": 1} and rig.blender.aborts == {}
+    snap = rig.blender.snapshot()
+    assert snap["triggers"] == 2 and snap["outcomes"] == {"complete": 1} and snap["rejected"] == {"busy": 1}
+
+
+def test_outcomes_split_let_go_from_aborts():
+    rig = Rig()
+    rig.active["heart"] = 7
+    rig.run(0.3)
+    del rig.active["heart"]
+    rig.step()
+    rig.run(2.5)
+    rig.active["heart"] = 7
+    rig.run(0.3)
+    rig.cbf = {"cbf": {"stuck_s": 0.1, "stuck_collision": True}}
+    rig.step()
+    assert rig.blender.outcomes == {"let_go": 1, "cbf_hold": 1} and rig.blender.aborts == {"a_cbf_hold": 1}
+    assert rig.blender.entries == 2 and rig.blender.triggers == 2
+
+
 # -- config -----------------------------------------------------------------------------
 
 

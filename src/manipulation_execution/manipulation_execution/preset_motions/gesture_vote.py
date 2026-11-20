@@ -20,6 +20,10 @@ each with the camera stamp, the PearFrame actor, the best class and its score.
 - A camera stamp going backwards resets the vote; a repeated stamp is ignored;
   a run older than the ``barrier`` (set on a session change) or staler than
   ``max_source_age_s`` against ROS time never counts.
+- ``stats`` only counts, per class: runs, enters, exits, re-entries within
+  ``REENTER_S`` of an exit, and the receive-time gaps between its positive
+  runs (one histogram after two-hand runs, one after one-hand runs), so
+  exit_s can be set from each class's own interval.
 
 Reasons are the pose reasons of preset_motions.match_signal, so the matcher node
 can put them in ``/preset_motions/state`` as they are.
@@ -38,6 +42,21 @@ SCHEMA = "x2_hand_gesture/v1"
 GESTURES = ("heart", "holy", "xsign")
 NONE = "none"
 _CLASSES = frozenset((*GESTURES, NONE))
+GAP_BINS_S = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1.0, 1.5, 2.0)  # upper edges; longer gaps are not counted
+REENTER_S = 1.0  # an enter this soon after the class's exit counts as a re-entry (the flicker zll sees)
+
+
+def _new_stats() -> dict:
+    return {
+        "runs": 0,
+        "one_hand_runs": 0,
+        "enters": 0,
+        "exits": 0,
+        "reenters": 0,
+        "gaps": [0] * len(GAP_BINS_S),
+        "gaps_one_hand": [0] * len(GAP_BINS_S),
+        "gap_max_active_s": 0.0,
+    }
 
 
 @dataclass(frozen=True)
@@ -73,6 +92,9 @@ class VoteState:
     votes: int  # runs of this class in the window
     runs: int  # all runs in the window
     source_stamp_ns: int | None  # newest counted run, any class
+    held_s: float | None = None  # on exit: how long it was active (receive time)
+    since_pos_s: float | None = None  # on exit: since its newest positive run (receive time)
+    one_hand: bool = False  # its newest positive run was a one-hand run
 
 
 def _int(value) -> bool:
@@ -106,6 +128,10 @@ class GestureVote:
         self._active = dict.fromkeys(GESTURES, False)
         self._last_pos: dict[str, tuple[int, float, bool] | None] = dict.fromkeys(GESTURES)  # (stamp, mono, one)
         self._pending_exit: set[str] = set()
+        self._entered_at: dict[str, float | None] = dict.fromkeys(GESTURES)
+        self._exited_at: dict[str, float | None] = dict.fromkeys(GESTURES)
+        self._prev_pos_mono: dict[str, float | None] = dict.fromkeys(GESTURES)  # survives reset: gaps only
+        self.stats = {name: _new_stats() for name in GESTURES}
 
     def reset(self, *, barrier: bool = False) -> None:
         """Forget the window; active classes exit. ``barrier``: runs up to the newest seen stamp never count."""
@@ -152,8 +178,31 @@ class GestureVote:
         self._frames.append((stamp, counted, now_mono_s, one))
         if counted != NONE:
             self._last_pos[counted] = (stamp, now_mono_s, one)
+            self._note_positive(counted, now_mono_s, one)
         self.last_reason = ""
         return True
+
+    def _note_positive(self, name: str, now: float, one: bool) -> None:
+        stats = self.stats[name]
+        stats["runs"] += 1
+        stats["one_hand_runs"] += one
+        before, self._prev_pos_mono[name] = self._prev_pos_mono[name], now
+        if before is None:
+            return
+        gap = now - before
+        if self._active[name]:
+            stats["gap_max_active_s"] = max(stats["gap_max_active_s"], gap)
+        for k, edge in enumerate(GAP_BINS_S):
+            if 0.0 <= gap <= edge:
+                stats["gaps_one_hand" if one else "gaps"][k] += 1
+                break
+
+    def _note_exit(self, name: str, now: float) -> tuple[float | None, float | None]:
+        entered, self._entered_at[name] = self._entered_at[name], None
+        self._exited_at[name] = now
+        self.stats[name]["exits"] += 1
+        pos = self._prev_pos_mono[name]
+        return (None if entered is None else now - entered), (None if pos is None else now - pos)
 
     def update(self, *, now_mono_s: float) -> dict[str, VoteState]:
         """The state of each gesture now (receive time = the caller's monotonic clock)."""
@@ -173,6 +222,7 @@ class GestureVote:
             votes = counts[name]
             was = self._active[name]
             entered = exited = False
+            held = since_pos = None
             pos = self._last_pos[name]
             exit_s = cfg.exit_s_one_hand if pos is not None and pos[2] else cfg.exit_s
             # A run of this class within exit_s, by both clocks: keeps it active, and is needed to
@@ -193,6 +243,14 @@ class GestureVote:
                 self._active[name] = entered = True
             if name in self._pending_exit and not self._active[name]:
                 exited = True
+            if exited and (was or self._entered_at[name] is not None):
+                held, since_pos = self._note_exit(name, now_mono_s)
+            if entered:
+                stats = self.stats[name]
+                stats["enters"] += 1
+                last_exit = self._exited_at[name]
+                stats["reenters"] += last_exit is not None and now_mono_s - last_exit <= REENTER_S
+                self._entered_at[name] = now_mono_s
             active = self._active[name]
             if entered:
                 reason = "matched"
@@ -204,9 +262,35 @@ class GestureVote:
                 reason = "confirming"
             else:
                 reason = "pose_not_matched"
-            out[name] = VoteState(name, active, entered, exited, reason, votes, runs, self._last_stamp)
+            out[name] = VoteState(
+                name,
+                active,
+                entered,
+                exited,
+                reason,
+                votes,
+                runs,
+                self._last_stamp,
+                held,
+                since_pos,
+                pos is not None and pos[2],
+            )
         self._pending_exit.clear()
         return out
+
+
+def gesture_transition_lines(votes: Mapping[str, VoteState]) -> list[str]:
+    """One log line per enter / exit of the vote (before the latch), for the matcher's log."""
+    lines = []
+    for state in votes.values():
+        hand = "one" if state.one_hand else "two"
+        if state.exited:
+            held = "?" if state.held_s is None else f"{state.held_s:.2f}"
+            since = "?" if state.since_pos_s is None else f"{state.since_pos_s:.2f}"
+            lines.append(f"gesture exit {state.template_name} held={held} since_pos={since} last={hand}")
+        if state.entered:
+            lines.append(f"gesture enter {state.template_name} votes={state.votes}/{state.runs} last={hand}")
+    return lines
 
 
 OVERHEAD = "overhead_heart"
@@ -258,6 +342,7 @@ class GestureFusion:
         self._session: tuple[int, bool] | None = None
         self._sequence = dict.fromkeys(GESTURES, 0)
         self.counted = self.ignored = 0
+        self.last_votes: dict[str, VoteState] = {}  # of the newest results(), for the node's enter / exit log
         self.source_gate = None
         self.source_session_token = ""
         if remote_source:
@@ -359,6 +444,7 @@ class GestureFusion:
             self._reset_source_votes()
         self.vote.set_actor(actor)
         votes = self.vote.update(now_mono_s=now_mono_s)
+        self.last_votes = votes
         raw = {name: session_active and state.active for name, state in votes.items()}
         raw[OVERHEAD] = session_active and overhead_active
         active = self.latch.update(raw)

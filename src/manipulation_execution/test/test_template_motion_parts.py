@@ -165,6 +165,30 @@ def test_cbf_monitor():
     assert cbf.malformed == 1 and cbf.latest().received_at == 2.0
 
 
+def test_cbf_monitor_reads_the_status_fields_without_judging_them():
+    cbf = CbfMonitor()
+    status = {
+        "at": 12.5, "control_seq": 41, "safety_epoch": 3, "arm_owner": 2,
+        "cbf": {"stuck_s": 0.08, "releasing": False, "stuck_collision": False, "mirror_active": True, "held": 9,
+                "calls": 400, "hold_release_after_s": 0.2, "release_episodes": 1, "collision_release_episodes": 0},
+    }  # fmt: skip
+    cbf.observe(json.dumps(status), 5.0)
+    state = cbf.latest()
+    assert state.serial == 1 and state.intervening and state.at == 12.5 and state.stuck_s == 0.08
+    assert (state.safety_epoch, state.control_seq, state.arm_owner, state.mirror_active) == (3, 41, 2, True)
+    assert (state.held, state.calls, state.hold_release_after_s) == (9, 400, 0.2)
+    assert (state.release_episodes, state.collision_release_episodes) == (1, 0)
+    # Missing or odd fields are None, never a malformed status: the old data plane has no safety_epoch.
+    cbf.observe(json.dumps({"at": "x", "safety_epoch": True, "arm_owner": None, "cbf": {"mirror_active": 1}}), 6.0)
+    state = cbf.latest()
+    assert state.serial == 2 and not state.intervening and cbf.malformed == 0
+    assert state.at is None and state.safety_epoch is None and state.arm_owner is None and state.mirror_active is None
+    cbf.observe(json.dumps({"safety_epoch": 4}), 7.0)  # CBF off: the top level still counts
+    assert cbf.latest().serial == 3 and cbf.latest().safety_epoch == 4 and not cbf.latest().intervening
+    cbf.observe("[", 8.0)
+    assert cbf.latest().serial == 3
+
+
 class Client:
     def __init__(self, **kwargs):
         self.port = PortMonitor()

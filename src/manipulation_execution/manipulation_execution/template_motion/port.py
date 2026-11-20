@@ -26,7 +26,7 @@ import json
 import math
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from manipulation_execution.mirror_session.endpoints import ARM_JOINT_COUNT, HAND_JOINT_COUNT
 
@@ -116,6 +116,31 @@ class CbfState:
     intervening: bool  # holding (stuck_s > 0, stuck_collision) or releasing
     received_at: float
     detail: str
+    # The rest only describes the status; a field the data plane does not send is None.
+    serial: int = 0  # counts received statuses, so the blender can tell a new one
+    at: float | None = None  # the data plane's CLOCK_MONOTONIC when it published (time.monotonic's clock)
+    stuck_s: float = 0.0
+    releasing: bool = False
+    collision: bool = False
+    safety_epoch: int | None = None  # moves only on mode / owner / admission / clear / safe changes
+    control_seq: int | None = None  # moves with every control heartbeat (0.1 s): never a revocation sign
+    arm_owner: int | None = None
+    mirror_active: bool | None = None
+    held: int | None = None  # cumulative held ticks
+    calls: int | None = None  # cumulative CBF calls
+    hold_release_after_s: float | None = None
+    release_episodes: int | None = None
+    collision_release_episodes: int | None = None
+
+
+def _count(value) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _seconds(value) -> float | None:
+    if not isinstance(value, int | float) or isinstance(value, bool) or not math.isfinite(value):
+        return None
+    return float(value)
 
 
 class CbfMonitor:
@@ -124,28 +149,48 @@ class CbfMonitor:
     def __init__(self):
         self._lock = threading.Lock()
         self._latest: CbfState | None = None
+        self._serial = 0
         self.malformed = 0
 
     def observe(self, data: str, now: float) -> None:
         try:
-            cbf = json.loads(data).get("cbf")
+            message = json.loads(data)
+            cbf = message.get("cbf")
+            top = {
+                "at": _seconds(message.get("at")),
+                "safety_epoch": _count(message.get("safety_epoch")),
+                "control_seq": _count(message.get("control_seq")),
+                "arm_owner": _count(message.get("arm_owner")),
+            }
             if cbf is None:
-                state = CbfState(False, now, "no cbf")
+                state = CbfState(False, now, "no cbf", **top)
             else:
                 stuck = float(cbf.get("stuck_s") or 0.0)
                 releasing = cbf.get("releasing") is True
                 collision = cbf.get("stuck_collision") is True
+                active = cbf.get("mirror_active")
                 state = CbfState(
                     (stuck > 0.0) or releasing or collision,
                     now,
                     f"stuck_s={stuck:.2f} releasing={releasing} stuck_collision={collision}",
+                    stuck_s=stuck,
+                    releasing=releasing,
+                    collision=collision,
+                    mirror_active=active if isinstance(active, bool) else None,
+                    held=_count(cbf.get("held")),
+                    calls=_count(cbf.get("calls")),
+                    hold_release_after_s=_seconds(cbf.get("hold_release_after_s")),
+                    release_episodes=_count(cbf.get("release_episodes")),
+                    collision_release_episodes=_count(cbf.get("collision_release_episodes")),
+                    **top,
                 )
         except Exception:
             with self._lock:
                 self.malformed += 1
             return
         with self._lock:
-            self._latest = state
+            self._serial += 1
+            self._latest = replace(state, serial=self._serial)
 
     def latest(self) -> CbfState | None:
         with self._lock:

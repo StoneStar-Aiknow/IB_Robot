@@ -73,6 +73,18 @@ class LabelBook:
                 return None
             return Label(template, actor, self._episode[template])
 
+    def describe(self, template: str, now: float) -> str:
+        """For the logs: the template's newest message as ``active|inactive|stale|none``, its age and episode."""
+        with self._lock:
+            latest = self._latest.get(template)
+            episode = self._episode.get(template, 0)
+        if latest is None:
+            return f"none ep={episode}"
+        active, actor, at = latest
+        age = now - at
+        word = "stale" if not 0 <= age <= self._stale_s else "active" if active and actor is not None else "inactive"
+        return f"{word} age={age:.2f} ep={episode}"
+
     def snapshot(self, now: float) -> dict:
         with self._lock:
             return {

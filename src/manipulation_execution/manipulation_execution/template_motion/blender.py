@@ -29,6 +29,12 @@ play_margin_s`` from its start, a stale-status check and a port-lost check
 plane restarted, or plays something else), WAIT_DONE ``t_out +
 done_margin_s``. Every exit goes through C back to the mirror, and every exit
 is logged with its reason and the time since the template was entered.
+
+Counting (logs only): a trigger is a label episode of the session's actor
+that was not entered yet; it ends admitted (``template enter``) or rejected
+(``template reject``, with the last reason that kept it out). Every attempt,
+from entering A, ends in one outcome (``outcome=`` in its first ``template
+exit`` line): complete, the person let go before B, or an abort by reason.
 """
 
 from __future__ import annotations
@@ -47,6 +53,27 @@ C_STRETCH = 1.25  # C is made this much longer until its peaks are within c_peak
 C_STRETCH_STEPS = 12
 PERSON_SOURCE = "yolox"  # a PEAR frame of a detected person; center_fallback never enters a template
 DEFAULT_HAND_TRAVEL_S = 1.0  # T_A's hand share when the hand output is not known yet
+COMPLETE = ("label_inactive", "hold_max", "release")  # the playback ran and the port said DONE
+LET_GO = ("label_lost", "actor_changed")  # the person stopped asking before B
+
+
+def outcome_of(reason: str) -> str:
+    """complete, let_go, or the abort's kind: cbf_hold, timeout, port, safety, stop, error."""
+    if reason in COMPLETE:
+        return "complete"
+    if reason in LET_GO:
+        return "let_go"
+    if reason.startswith("error"):
+        return "error"
+    if reason.startswith("stopped") or reason.startswith("safety"):
+        return "safety"
+    if reason == "stop":
+        return "stop"
+    if reason.startswith("a_cbf"):
+        return "cbf_hold"
+    if reason == "a_timeout":
+        return "timeout"
+    return "port"
 
 
 class Phase(str, Enum):
@@ -158,6 +185,10 @@ class _Quintic:
         return speed, accel
 
 
+def _fmt(counts: Mapping[str, int]) -> str:
+    return ",".join(f"{key}:{value}" for key, value in sorted(counts.items())) or "-"
+
+
 def _lerp(m: Sequence[float], anchor: Sequence[float], weight: float) -> tuple[float, ...]:
     return tuple(a + weight * (b - a) for a, b in zip(m, anchor, strict=False))
 
@@ -205,6 +236,12 @@ class Blender:
         self.exits: dict[str, int] = {}
         self.entries = 0
         self.played = 0
+        self.triggers = 0  # label episodes of the actor, not entered before
+        self.rejected: dict[str, int] = {}  # triggers that ended without an entry, by their last reason
+        self.outcomes: dict[str, int] = {}  # one per attempt (entry): outcome_of
+        self.aborts: dict[str, int] = {}  # attempts that neither completed nor were let go, by reason
+        self._pending: dict[tuple[str, int], list] = {}  # trigger -> [first seen, last reason, reasons seen]
+        self._attempt_open = False
         self._last_exit = ""
         self._hand_out: tuple[float, ...] | None = None
         self._snap: dict = {}
@@ -241,6 +278,8 @@ class Blender:
         self._wait_reason = ""
         self._released = False
         self._label_lost = False
+        self._label_lost_at: float | None = None
+        self._played_at: float | None = None
         self._hold_since: float | None = None
         self._status_serial = 0
         self._hand_target: tuple[float, ...] | None = None
@@ -256,6 +295,11 @@ class Blender:
             self._refresh_snapshot()
 
     def _end_round(self, now: float) -> None:
+        self._flush_triggers(now, "round_end")
+        self._log(
+            f"template tally triggers={self.triggers} entries={self.entries} played={self.played} "
+            f"outcomes={_fmt(self.outcomes)} rejected={_fmt(self.rejected)} aborts={_fmt(self.aborts)}"
+        )
         if self._phase in (Phase.WAIT_ACK, Phase.PLAYING, Phase.WAIT_DONE):
             if self._seg_id is not None:
                 self._client.release(self._seg_id, fast=True)
@@ -334,7 +378,10 @@ class Blender:
         if phase is Phase.IDLE:
             if m is not None:
                 self._try_enter(now, inputs, m)
+            else:
+                self._scan_triggers(now, inputs, "no_mirror")
             return self._blend_a(now, m) if self._phase is Phase.A else None
+        self._scan_triggers(now, inputs, "cooldown" if phase is Phase.COOLDOWN else "busy")
         if phase is Phase.COOLDOWN:
             if now - self._since >= self._config.cooldown_s:
                 self._phase = Phase.IDLE
@@ -358,41 +405,100 @@ class Blender:
 
     # -- IDLE -> A ----------------------------------------------------------------
 
-    def _try_enter(self, now: float, inputs, m: tuple[float, ...]) -> None:
-        if self._round_disabled or self._port_suspect or self._client.busy:
-            return
+    def _entry_block(self, now: float, inputs) -> tuple[str | None, object]:
+        """Why nothing may be entered this tick (None: it may), and the port status."""
+        if self._round_disabled:
+            return "round_disabled", None
+        if self._port_suspect:
+            return "port_suspect", None
+        if self._client.busy:
+            return "port_busy", None
         if not getattr(inputs, "publish_enabled", False):
-            return
+            return "publish_off", None
         actor = inputs.actor
         if actor is None or not actor.present or actor.actor_id is None:
-            return
+            return "no_actor", None
         if self._config.require_person_frame and self._pear_source != PERSON_SOURCE:
-            return
+            return "no_person_frame", None
         status = self._port.latest()
         if status is None or not 0 <= now - status.received_at <= self._config.port_fresh_s:
-            return
+            return "port_stale", None
         if status.state not in _PORT_FREE:
-            return
+            return "port_playing", None
         cbf = self._cbf.latest()
-        if cbf is None or not 0 <= now - cbf.received_at <= self._config.cbf_fresh_s or cbf.intervening:
-            return
+        if cbf is None or not 0 <= now - cbf.received_at <= self._config.cbf_fresh_s:
+            return "cbf_stale", None
+        if cbf.intervening:
+            return "cbf_hold", None
+        return None, status
+
+    def _try_enter(self, now: float, inputs, m: tuple[float, ...]) -> None:
+        block, status = self._entry_block(now, inputs)
+        self._scan_triggers(now, inputs, block, status, m)
+
+    def _scan_triggers(self, now: float, inputs, block: str | None, status=None, m=None) -> None:
+        """Note each trigger and why it is kept out; with no ``block``, enter the first one that may be."""
+        live = set()
         for template, names in self._templates.items():
             label = self._labels.current(template, now)
-            if label is None or label.actor_id != actor.actor_id or (template, label.episode) in self._attempted:
+            if label is None or (template, label.episode) in self._attempted:
                 continue
-            candidates = [self._segments[name] for name in names if status.segments is None or name in status.segments]
-            if not candidates:
+            key = (template, label.episode)
+            live.add(key)
+            reason = block
+            if reason is None:
+                actor = inputs.actor
+                if label.actor_id != actor.actor_id:
+                    reason = "actor_mismatch"
+            if reason is None:
+                candidates = [
+                    self._segments[name] for name in names if status.segments is None or name in status.segments
+                ]
+                if not candidates:
+                    reason = "not_whitelisted"
+            if reason is not None:
+                self._note_trigger(key, reason, now)
                 continue
-            self._attempted.add((template, label.episode))
+            pending = self._pending.pop(key, None)
+            if pending is None:
+                self.triggers += 1
+            self._attempted.add(key)
             segment = min(candidates, key=lambda seg: self._weighted(seg.P, m))
-            self._enter_a(now, label, actor.actor_id, segment, m)
-            return
+            waited = "" if pending is None else f" waited={now - pending[0]:.2f} blocked={','.join(pending[2])}"
+            self._enter_a(now, label, actor.actor_id, segment, m, waited)
+            live.discard(key)
+            block = "busy"  # the rest are still noted, so they are not taken for gone
+        for key in [key for key in self._pending if key not in live]:
+            self._reject(key, now, "")
+
+    def _note_trigger(self, key: tuple[str, int], reason: str, now: float) -> None:
+        pending = self._pending.get(key)
+        if pending is None:
+            self.triggers += 1
+            self._pending[key] = pending = [now, reason, []]
+        pending[1] = reason
+        if reason not in pending[2]:
+            pending[2].append(reason)
+
+    def _reject(self, key: tuple[str, int], now: float, why: str) -> None:
+        first, reason, reasons = self._pending.pop(key)
+        self.rejected[reason] = self.rejected.get(reason, 0) + 1
+        self._log(
+            f"template reject {key[0]} episode={key[1]} reason={reason} waited={now - first:.2f} "
+            f"reasons={','.join(reasons)}{why}"
+        )
+
+    def _flush_triggers(self, now: float, why: str) -> None:
+        for key in list(self._pending):
+            self._reject(key, now, f" at={why}")
 
     @staticmethod
     def _weighted(P: Sequence[float], m: Sequence[float]) -> float:
         return max(w * abs(p - q) for w, p, q in zip(SELECT_WEIGHTS, P, m, strict=False))
 
-    def _enter_a(self, now: float, label: Label, actor: int, segment: Segment, m: tuple[float, ...]) -> None:
+    def _enter_a(
+        self, now: float, label: Label, actor: int, segment: Segment, m: tuple[float, ...], waited: str = ""
+    ) -> None:
         config = self._config
         self._clear()
         self._label, self._actor, self._segment = label, actor, segment
@@ -409,9 +515,10 @@ class Blender:
         self._phase, self._since, self._entered_at = Phase.A, now, now
         self._hand_target = segment.hand_P
         self.entries += 1
+        self._attempt_open = True
         self._log(
             f"template enter {label.template} seg={segment.name} actor={actor} episode={label.episode} "
-            f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f}"
+            f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f}{waited}"
         )
 
     # -- A ------------------------------------------------------------------------
@@ -502,6 +609,7 @@ class Blender:
         if status is not None and status.state in PLAYING:
             self._phase, self._since = Phase.PLAYING, now
             self._hold_since = now if status.state == "HOLD" else None
+            self._played_at = now
             self.played += 1
             self._hand_target = self._status_hand()
             return self._status_arm()
@@ -550,10 +658,15 @@ class Blender:
             if status.state == "HOLD" and self._hold_since is None:
                 self._hold_since = now
         if not self._label_lost and self._label_check(now, inputs) is not None:
-            self._label_lost = True
+            self._label_lost, self._label_lost_at = True, now
         if self._label_lost and self._hold_since is not None and now - self._hold_since >= config.min_hold_s:
             self._client.release(self._seg_id, fast=False)
             self._released = True
+            self._log(
+                f"template release {self._label.template} seg={segment.name} hold={now - self._hold_since:.2f} "
+                f"label_lost_for={now - self._label_lost_at:.2f} play={now - self._played_at:.2f} "
+                f"label=[{self._labels.describe(self._label.template, now)}]"
+            )
             return self._to_wait_done(now, "label_inactive", segment.t_out)
         return arm
 
@@ -700,11 +813,28 @@ class Blender:
         self._count_exit(reason)
         name = self._label.template if self._label is not None else "?"
         seg = self._segment.name if self._segment is not None else "?"
+        cbf = self._cbf.latest()
+        cbf_text = "none"
+        if cbf is not None:
+            cbf_text = (
+                f"{cbf.detail} age={now - cbf.received_at:.2f} epoch={cbf.safety_epoch} "
+                f"owner={cbf.arm_owner} active={cbf.mirror_active}"
+            )
+        label = self._labels.describe(self._label.template, now) if self._label is not None else "none"
+        outcome = "repeat"  # a later exit of the same attempt (a stop or an error during C)
+        if self._attempt_open:
+            self._attempt_open = False
+            outcome = outcome_of(reason)
+            self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
+            if outcome not in ("complete", "let_go"):
+                key = reason.split(":", 1)[0]
+                self.aborts[key] = self.aborts.get(key, 0) + 1
         self._log(
             f"template exit {name} seg={seg} phase={self._phase.value} reason={reason} "
             f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f} "
             f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f} "
-            f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f}"
+            f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f} "
+            f"outcome={outcome} played={self._played_at is not None} cbf=[{cbf_text}] label=[{label}]"
         )
 
     def _refresh_snapshot(self) -> None:
@@ -717,6 +847,10 @@ class Blender:
             "entries": self.entries,
             "played": self.played,
             "exits": dict(self.exits),
+            "triggers": self.triggers,
+            "rejected": dict(self.rejected),
+            "outcomes": dict(self.outcomes),
+            "aborts": dict(self.aborts),
             "last_exit": self._last_exit,
             "round_disabled": self._round_disabled,
             "port_suspect": self._port_suspect,

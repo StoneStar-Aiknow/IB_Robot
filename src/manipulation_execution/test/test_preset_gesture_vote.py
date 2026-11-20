@@ -390,3 +390,34 @@ def test_fusion_actor_must_be_present_ready_and_fresh():
     assert not results["holy"].active and results["holy"].actor_id is None
     fu.observe_actor(Actor(actor_id=True), now_mono_s=0.6)
     assert fu.current_actor(0.6) is None
+
+
+def test_stats_count_gaps_enters_exits_and_fast_reentries():
+    f = Feed()
+    for _ in range(5):
+        f.run()  # 66 ms gaps: the 0.1 s bin
+    last = f.mono(f.stamp - 66 * MS)
+    s = f.vote.update(now_mono_s=last + 0.31)
+    assert s["holy"].exited and s["holy"].held_s == pytest.approx(0.066 + 0.31)  # entered on run 4
+    assert s["holy"].since_pos_s == pytest.approx(0.31) and not s["holy"].one_hand
+    assert gv.gesture_transition_lines(s) == ["gesture exit holy held=0.38 since_pos=0.31 last=two"]
+    f.stamp += int(0.4e9)  # back 0.4 s after the last run (0.09 s after the exit)
+    for _ in range(4):
+        _, s = f.run()
+    assert s["holy"].entered
+    stats = f.vote.stats["holy"]
+    assert stats["runs"] == 9 and stats["enters"] == 2 and stats["exits"] == 1 and stats["reenters"] == 1
+    assert stats["gaps"][0] == 7 and sum(stats["gaps"]) == 8 and stats["gaps"][4] == 1  # 0.466 s: the 0.5 s bin
+    assert stats["gap_max_active_s"] == pytest.approx(0.066)  # the long gap came while inactive
+    assert f.vote.stats["heart"]["runs"] == 0
+
+
+def test_stats_one_hand_gaps_and_a_reset_exit_have_their_own_fields():
+    f = Feed()
+    for _ in range(4):
+        _, s = f.run(crop="one", step_ms=200)
+    assert s["holy"].active and s["holy"].one_hand
+    assert f.vote.stats["holy"]["gaps_one_hand"][1] == 3 and sum(f.vote.stats["holy"]["gaps"]) == 0
+    f.vote.set_actor(4)
+    s = f.vote.update(now_mono_s=f.mono())
+    assert s["holy"].exited and s["holy"].held_s is not None and f.vote.stats["holy"]["exits"] == 1

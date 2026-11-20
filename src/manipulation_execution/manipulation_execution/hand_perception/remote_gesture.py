@@ -467,7 +467,9 @@ class RemoteGestureRunner:
         started = time.perf_counter()
         plan = gc.plan_crop(job.landmarks, job.box, self.crop, job.image.shape[:2])
         if not plan.run or not self.rate.allow(plan.mode, job.stamp_ns):
+            # crop_or_rate_skip stays the sum: field-review's findings read it.
             self.stats["crop_or_rate_skip"] += 1
+            self.stats["crop_skip" if not plan.run else "rate_skip"] += 1
             return
         import cv2
 
@@ -491,6 +493,7 @@ class RemoteGestureRunner:
         try:
             call.future = self.transport.begin(meta, square, job.frame_id)
             self.stats["sent"] += 1
+            self.stats["sent_one"] += plan.mode == gc.ONE
         except Exception:
             call.expired = True
             self.stats["send_error"] += 1

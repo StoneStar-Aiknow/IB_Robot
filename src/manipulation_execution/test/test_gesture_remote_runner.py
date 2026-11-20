@@ -525,3 +525,23 @@ def test_transmitted_crop_preserves_the_original_local_model_input(near_edge):
     original = gesture_crop.extract_square(image, plan.x0, plan.y0, plan.side)
     transmitted = t.images[-1][1]
     np.testing.assert_array_equal(gesture_om.preprocess(original), gesture_om.preprocess(transmitted))
+
+
+def test_skip_counters_split_crop_from_rate_and_keep_the_old_sum():
+    r, c, t, _, _ = make()
+    boot(r)
+    assert post(r, c)
+    r.step()
+    assert len(t.images) == 1 and r.stats["sent"] == 1 and r.stats["sent_one"] == 0
+    t.images[-1][3].set_result(response(t.images[-1][0]))
+    c.t = 0.01
+    r.step()
+    assert post(r, c)  # 10 ms later: the rate gate skips it
+    r.step()
+    assert r.stats["rate_skip"] == 1 and r.stats["crop_skip"] == 0
+    c.t = 0.5
+    r.step()
+    assert post(r, c, hands=[landmarks(280)[:, :] * 0.0 + 1.0])  # a degenerate hand: nothing to crop
+    r.step()
+    assert r.stats["crop_skip"] == 1
+    assert r.stats["crop_or_rate_skip"] == r.stats["crop_skip"] + r.stats["rate_skip"] == 2
