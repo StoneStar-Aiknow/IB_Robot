@@ -84,16 +84,19 @@ class Logged:
     def stall(self) -> None:
         """Stop reading and fill the pipe: the node's next write to stderr blocks."""
         self._reading.clear()
-        time.sleep(0.1)  # a read in progress takes one more chunk, then waits
         # A description of its own, so non-blocking here leaves the node's writes blocking.
         writer = os.open(f"/proc/self/fd/{self.write_fd}", os.O_WRONLY | os.O_NONBLOCK)
         try:
-            for size in (4096, 1):  # 4096 is all or nothing on a pipe; then the last bytes
-                try:
-                    while True:
-                        os.write(writer, b"\n" * size)
-                except BlockingIOError:
-                    pass
+            # Twice: the reader is mostly blocked in a read of the empty pipe, which the
+            # first filling wakes and which then takes up to 64 KiB of it before it waits.
+            for _ in range(2):
+                time.sleep(0.1)  # a read in progress takes its chunk, then waits
+                for size in (4096, 1):  # 4096 is all or nothing on a pipe; then the last bytes
+                    try:
+                        while True:
+                            os.write(writer, b"\n" * size)
+                    except BlockingIOError:
+                        pass
         finally:
             os.close(writer)
         assert self.full()
