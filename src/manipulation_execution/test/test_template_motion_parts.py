@@ -134,6 +134,37 @@ def test_invalid_input_unknown_actor_and_bad_messages_are_inactive():
     assert book.malformed == 4
 
 
+def stamped(template, stamp, sequence):
+    message = json.loads(label(template))
+    message.update(stamp=stamp, sequence=sequence)
+    return json.dumps(message)
+
+
+def test_a_hole_in_the_labels_says_whether_the_matcher_stalled_or_the_messages_were_late_or_lost(monkeypatch):
+    monkeypatch.setattr("manipulation_execution.template_motion.labels.time.time", lambda: 500.0)
+    book = LabelBook(["heart", "overhead_heart"])
+    book.observe(stamped("heart", 400.0, 1), 1.0)
+    book.observe(stamped("heart", 400.05, 2), 1.2)  # 0.2 s: no hole
+    book.observe(stamped("heart", 400.1, 3), 2.0)  # published on time, arrived 0.8 s after the last
+    book.observe(stamped("heart", 400.9, 4), 2.8)  # the matcher published nothing
+    book.observe(stamped("heart", 401.7, 20), 3.6)  # published, never arrived
+    book.observe(stamped("overhead_heart", 400.0, 1), 1.0)
+    book.observe(stamped("overhead_heart", 400.8, 9), 1.8)  # its sequence is the PEAR frame's: not lost
+    book.observe(label(), 4.5)  # no stamp
+    assert book.take_holes() == [
+        "heart gap=0.80 stamp_gap=0.05 skipped=1 lag=99.900 kind=late",
+        "heart gap=0.80 stamp_gap=0.80 skipped=1 lag=99.100 kind=matcher",
+        "heart gap=0.80 stamp_gap=0.80 skipped=16 lag=98.300 kind=lost",
+        "overhead_heart gap=0.80 stamp_gap=0.80 skipped=8 lag=99.200 kind=matcher",
+        "heart gap=0.90 stamp_gap=- skipped=- lag=- kind=unknown",
+    ]
+    assert book.take_holes() == []
+    assert book.holes() == "heart:4/max=0.90(late=1 lost=1 matcher=1 unknown=1),overhead_heart:1/max=0.80(matcher=1)"
+    assert book.describe("overhead_heart", 1.8) == "active age=0.00 ep=2 seq=9 lag=99.200"
+    assert book.describe("heart", 4.5) == "active age=0.00 ep=5"  # each hole over stale_s began an episode
+    assert LabelBook(["heart"]).holes() == "-"
+
+
 # -- port -------------------------------------------------------------------------------
 
 
@@ -333,6 +364,7 @@ def test_the_on_site_config_loads_every_template():
     setup = load_config(str(CONFIG_DIR / "motion_template_onsite.yaml"), HAND)
     assert setup.notes == [] and set(setup.templates) == {"overhead_heart", "heart", "holy", "xsign"}
     assert setup.blend == parse_config(shipped_on(), str(CONFIG_DIR), HAND).blend  # same blend as the shipped file
+    assert setup.label_stale_s == 1.0  # the real robot's label holes (run-1120-183345)
 
 
 def shipped_on():

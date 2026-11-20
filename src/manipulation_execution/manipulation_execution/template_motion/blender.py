@@ -110,6 +110,7 @@ RELEASE_AFTER_S = 0.2  # the CBF's hold_release_after_s when its status does not
 CLOCK_AHEAD_S = 0.05  # a status made this far after it was received: the two clocks differ
 CLOCK_BEHIND_S = 1.0  # or received this long after it was made
 PAUSE_LOG_LINES = 2  # pause / resume lines per attempt; the rest are counted in the exit line
+LABEL_HOLES_PERIOD_S = 10.0  # the label holes so far, at most this often and only when they changed
 
 
 def outcome_of(reason: str) -> str:
@@ -475,6 +476,7 @@ class Blender:
         self._attempt_open = False
         self.pauses = 0  # A's pauses, all attempts
         self._backoff_until = -math.inf  # load_backoff_s after a load exit
+        self._holes_logged, self._holes_logged_at = "-", -math.inf
         self._gate_open = True  # the held-share gate (enter_hold_*)
         self._gate_ratio: float | None = None
         self._clock_warned = -math.inf
@@ -571,7 +573,8 @@ class Blender:
         self._flush_triggers(now, "round_end")
         self._log(
             f"template tally triggers={self.triggers} entries={self.entries} played={self.played} "
-            f"outcomes={_fmt(self.outcomes)} rejected={_fmt(self.rejected)} aborts={_fmt(self.aborts)}"
+            f"outcomes={_fmt(self.outcomes)} rejected={_fmt(self.rejected)} aborts={_fmt(self.aborts)} "
+            f"label_holes={self._labels.holes()}"
         )
         if self._phase in (Phase.WAIT_ACK, Phase.PLAYING, Phase.WAIT_DONE):
             if self._seg_id is not None:
@@ -652,7 +655,20 @@ class Blender:
                 self._a_cap_off()
             return arm
         finally:
+            self._log_holes(now)
             self._refresh_snapshot()
+
+    def _log_holes(self, now: float) -> None:
+        """The label topic's holes: each as it ends, and the tally of them now and then."""
+        holes = self._labels.take_holes()
+        if holes:
+            self._log(f"template label holes {'; '.join(holes)}")
+        if now - self._holes_logged_at >= LABEL_HOLES_PERIOD_S:
+            self._holes_logged_at = now
+            tally = self._labels.holes()
+            if tally != self._holes_logged:
+                self._holes_logged = tally
+                self._log(f"template label hole tally {tally}")
 
     def _a_cap_off(self) -> None:
         sent, self._a_cap_sent = self._a_cap_sent, None

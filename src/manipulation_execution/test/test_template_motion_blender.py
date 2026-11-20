@@ -771,7 +771,28 @@ def test_a_trigger_that_ends_outside_is_rejected_with_its_last_reason():
     assert rig.blender.rejected == {"cbf_hold": 1, "port_stale": 1} and rig.blender.triggers == 2
     assert lines(rig, "template reject heart episode=2 reason=port_stale")[0].endswith(" at=round_end")
     tally = lines(rig, "template tally")[-1]
-    assert tally == "template tally triggers=2 entries=0 played=0 outcomes=- rejected=cbf_hold:1,port_stale:1 aborts=-"
+    assert tally == (
+        "template tally triggers=2 entries=0 played=0 outcomes=- rejected=cbf_hold:1,port_stale:1 aborts=- "
+        "label_holes=-"
+    )
+
+
+def test_label_holes_are_logged_as_they_end_and_counted_in_the_tallies():
+    rig = Rig()
+    rig.run(0.1)
+    assert lines(rig, "template label hole tally") == []  # none yet
+    rig.now += 0.4  # nothing heard for 0.42 s
+    rig.step()
+    assert lines(rig, "template label holes") == [
+        "template label holes "
+        + "; ".join(f"{name} gap=0.42 stamp_gap=- skipped=- lag=- kind=unknown" for name in rig.labels._templates)
+    ]
+    rig.run(10.0)
+    assert len(lines(rig, "template label holes")) == 1
+    tally = lines(rig, "template label hole tally")
+    assert len(tally) == 1 and tally[0].startswith("template label hole tally heart:1/max=0.42(unknown=1),")
+    rig.blender.end_round(rig.now)
+    assert lines(rig, "template tally")[-1].endswith(tally[0].split("tally ", 1)[1])
 
 
 def test_another_label_during_an_attempt_is_a_busy_trigger_and_an_attempt_has_one_outcome():
