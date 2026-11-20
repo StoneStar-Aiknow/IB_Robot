@@ -789,10 +789,15 @@ def port_says(rig, seg_id, state, reason="hold_max"):
 
 # T1b: the data plane STOPPED it (its reasons, or one not known here): no C, its CBF path goes on from P_actual.
 @pytest.mark.parametrize("why", ["epoch_changed", "revoked", "named_arm", "control_lapsed", "internal_error", "new"])
-@pytest.mark.parametrize("phase", [Phase.PLAYING, Phase.WAIT_DONE])
+@pytest.mark.parametrize("phase", [Phase.WAIT_ACK, Phase.PLAYING, Phase.WAIT_DONE])
 def test_a_playback_the_data_plane_stopped_sends_no_C(why, phase):
     rig = PauseRig()
-    seg_id = to_playing_new(rig)
+    if phase is Phase.WAIT_ACK:
+        rig.active["heart"] = 7
+        assert rig.run(4.0, lambda: rig.blender.phase is Phase.WAIT_ACK)
+        seg_id = rig.started()
+    else:
+        seg_id = to_playing_new(rig)
     if phase is Phase.WAIT_DONE:
         del rig.active["heart"]
         assert rig.run(1.5, lambda: rig.blender.phase is Phase.WAIT_DONE)
@@ -801,6 +806,53 @@ def test_a_playback_the_data_plane_stopped_sends_no_C(why, phase):
     assert Phase.C not in phases and safety_stopped(rig)
     assert exit_reason(rig) == f"stopped:{why}" and outcome_of(exit_reason(rig)) == "safety"
     assert all(c.arm == MIRROR and c.hand == (0.3,) * 20 for c in published)  # the inner's own command
+
+
+def waiting_to_hand_back(rig, origin):
+    """A hand-back from ``origin`` waiting for a trusted status (the CBF's statuses stopped); the seg_id."""
+    if origin == "no_ack":
+        rig.active["heart"] = 7
+        assert rig.run(4.0, lambda: rig.blender.phase is Phase.WAIT_ACK)
+        seg_id = rig.started()
+        rig.plane.delay = lambda at: None
+        rig.run(NEW.ack_timeout_s + 0.1)
+    else:
+        seg_id = to_playing_new(rig)
+        if origin == "label_inactive":
+            del rig.active["heart"]
+            assert rig.run(1.5, lambda: rig.blender.phase is Phase.WAIT_DONE)
+        rig.plane.delay = lambda at: None
+        rig.run(0.2)
+        port_says(rig, seg_id, "DONE")
+        rig.run(0.1)
+    assert rig.blender._exit_pending_c is not None and not lines(rig, "template exit")
+    return seg_id
+
+
+# R1 (Codex 1120 R2): STOPPED after the hand-back began waiting still wins, also when a clean status of the old
+# safety context arrives in the same tick (two topics, no order between them).
+@pytest.mark.parametrize("origin", ["no_ack", "done:hold_max", "label_inactive"])
+def test_a_stopped_playback_heard_while_the_hand_back_waits_sends_no_C(origin):
+    rig = PauseRig()
+    seg_id = waiting_to_hand_back(rig, origin)
+    port_says(rig, seg_id, "STOPPED", "control_lapsed")
+    rig.plane.delay = lambda at: 0.0
+    published, phases = via_hooks(rig, 0.3)
+    assert Phase.C not in phases and safety_stopped(rig) and rig.blender.hand_target(rig.now) is None
+    exit = lines(rig, "template exit")[-1]
+    assert "reason=stopped:control_lapsed" in exit and f" back=safety after={origin}:" in exit
+    assert outcome_of(exit_reason(rig)) == "safety"
+    assert all(c.arm == MIRROR and c.hand == (0.3,) * 20 for c in published)  # the inner's own command
+
+
+@pytest.mark.parametrize("other", [-1, 1])
+def test_another_segment_s_stopped_never_ends_the_hand_back_wait(other):
+    rig = PauseRig()
+    seg_id = waiting_to_hand_back(rig, "no_ack")
+    port_says(rig, seg_id + other, "STOPPED", "control_lapsed")
+    rig.plane.delay = lambda at: 0.0
+    assert rig.run(0.3, lambda: rig.blender.phase is Phase.C)
+    assert "reason=no_ack" in lines(rig, "template exit")[-1] and " back=c after=no_ack:" in lines(rig, "template exit")[-1]
 
 
 def test_off_a_stopped_playback_still_goes_back():

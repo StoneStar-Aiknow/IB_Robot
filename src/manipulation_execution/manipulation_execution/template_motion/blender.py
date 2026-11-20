@@ -1144,7 +1144,11 @@ class Blender:
         return self._to_c(now, reason, m, anchor, beta, back=back)
 
     def _tick_back_pending(self, now: float, m: tuple[float, ...]) -> tuple[float, ...] | None:
+        """The hand-back waiting for trust: this playback's STOPPED still wins over the exit waited on (R1)."""
         reason, (anchor, beta) = self._exit_pending, self._exit_pending_c
+        status = self._our_status()
+        if status is not None and status.state == "STOPPED":
+            return self._safety_stop(now, f"stopped:{status.reason}", reason)
         if now - self._exit_pending_since > self._config.a_untrusted_max_s and not self._hand_back_ok(now):
             safety = self._safety_change() or "a_cbf_untrusted"
             return self._safety_stop(now, safety, reason)
