@@ -35,6 +35,7 @@
 #include "aimdk_dataplane/core.hpp"
 #include "aimdk_dataplane/cbf_safety.hpp"
 #include "aimdk_dataplane/template_play.hpp"
+#include "aimdk_dataplane/tick_timing.hpp"
 #include "cbf/proxy_model.hpp"
 #include "aimdk_msgs/msg/hand_state_array.hpp"
 #include "aimdk_msgs/msg/joint_command_array.hpp"
@@ -99,6 +100,26 @@ int64_t to_ns(const builtin_interfaces::msg::Time & stamp)
   return static_cast<int64_t>(stamp.sec) * 1000000000LL + static_cast<int64_t>(stamp.nanosec);
 }
 
+// Times a callback from its entry to its return, its wait for the lock included.
+// Nothing at all when timing is off.
+class Timed
+{
+public:
+  Timed(std::optional<TickTiming> & timing, TimingSegment segment)
+  : timing_(timing), segment_(segment), begun_(timing ? timing->now() : TickTiming::Clock::time_point{}) {}
+  ~Timed()
+  {
+    if (timing_) {timing_->add(segment_, TickTiming::ms(timing_->now() - begun_));}
+  }
+  Timed(const Timed &) = delete;
+  Timed & operator=(const Timed &) = delete;
+
+private:
+  std::optional<TickTiming> & timing_;
+  TimingSegment segment_;
+  TickTiming::Clock::time_point begun_;
+};
+
 }  // namespace
 
 class Dataplane : public rclcpp::Node
@@ -126,6 +147,10 @@ public:
       }
     }
     setup_template_play(declare_parameter<std::string>("template_play_json", ""));
+    // Observation only (tick_timing.hpp): off, the status and the INFO line are as before.
+    if (declare_parameter<bool>("tick_timing", true)) {
+      timing_.emplace(1.0 / std::max(plan.command_rate_hz, 1.0));
+    }
     // Each vendor input is taken on a thread of its own (see intake_groups): the
     // 500 Hz groups alone are more than one rclcpp thread keeps up with on the
     // loaded 310P.
@@ -166,6 +191,7 @@ public:
         subscriptions_.push_back(
           create_subscription<geometry_msgs::msg::Twist>(
             channel.topic, command_qos(), [this, &channel](geometry_msgs::msg::Twist::ConstSharedPtr message) {
+              const Timed timed(timing_, TimingSegment::kStream);
               std::lock_guard<std::recursive_mutex> lock(mutex_);
               core_.on_twist(channel, message->linear.x, message->linear.y, message->angular.z, monotonic_s());
               flush_notes();
@@ -175,6 +201,7 @@ public:
           create_subscription<std_msgs::msg::Float64MultiArray>(
             channel.topic, command_qos(),
             [this, &channel](std_msgs::msg::Float64MultiArray::ConstSharedPtr message) {
+              const Timed timed(timing_, TimingSegment::kStream);
               std::lock_guard<std::recursive_mutex> lock(mutex_);
               core_.on_stream(channel, message->data, monotonic_s());
               flush_notes();
@@ -448,6 +475,7 @@ private:
 
   void on_control(const std::string & text)
   {
+    const Timed timed(timing_, TimingSegment::kControl);
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     Control control;
     try {
@@ -473,6 +501,7 @@ private:
 
   void publish_joint_states()
   {
+    const Timed timed(timing_, TimingSegment::kJointStates);
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     const double now_s = monotonic_s();
     for (const auto & [publisher, order] : views_) {
@@ -494,6 +523,7 @@ private:
   // family has them; a gripper's all-zero fields are no sensor, not "no contact".
   void publish_touch()
   {
+    const Timed timed(timing_, TimingSegment::kTouch);
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (!hand_fresh_ || !hand_) {
       return;
@@ -549,6 +579,7 @@ private:
 
   void publish_echo()
   {
+    const Timed timed(timing_, TimingSegment::kEcho);
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (echo_) {
       echo_pub_->publish(std::move(echo_));
@@ -559,6 +590,7 @@ private:
   {
     command_tick();
     if (player_) {
+      const Timed timed(timing_, TimingSegment::kTemplateStatus);
       std::lock_guard<std::recursive_mutex> lock(mutex_);
       publish_template_status(monotonic_s());
     }
@@ -566,8 +598,36 @@ private:
 
   void command_tick()
   {
+    if (timing_) {
+      trace_ = TickTrace{};
+      trace_.entered = timing_->now();
+      trace_.at_entered = timing_->thread_times();
+    }
     std::unique_lock<std::recursive_mutex> lock(mutex_);
     const auto tick_started = std::chrono::steady_clock::now();
+    run_tick(lock, tick_started);
+    if (timing_) {
+      trace_.locked = tick_started;
+      trace_.at_ended = timing_->thread_times();
+      trace_.ended = timing_->now();
+      timing_->tick(trace_, cbf_ ? &cbf_->diagnostics() : nullptr);
+    }
+  }
+
+  // A clock reading for the tick's trace, when timing is on.
+  void mark(TickTrace::Clock::time_point & at)
+  {
+    if (timing_) {at = timing_->now();}
+  }
+
+  void mark_cpu(std::optional<double> & cpu_ms)
+  {
+    if (timing_) {cpu_ms = timing_->thread_cpu_ms();}
+  }
+
+  void run_tick(
+    std::unique_lock<std::recursive_mutex> & lock, std::chrono::steady_clock::time_point tick_started)
+  {
     const double now_s = std::chrono::duration<double>(tick_started.time_since_epoch()).count();
     // Read once: the check latches the lapse and clears, so a second read sees no lapse.
     const bool lapsed = core_.control_lapsed(now_s);
@@ -583,6 +643,7 @@ private:
     if (!cbf_ || !mirror_context || named_only) {
       if (player_) {player_->reject_pending(cbf_ ? "not_admitted" : "disabled");}
       if (cbf_) {cbf_->inactive(core_.safety_epoch());}
+      trace_.path = TickPath::kPlain;
       publish(core_.tick(now_s));
       flush_notes();
       return;
@@ -654,6 +715,8 @@ private:
         }
       }
     }
+    mark(trace_.unlocked);
+    mark_cpu(trace_.unlocked_cpu_ms);
     lock.unlock();  // Vendor feedback intake continues on its existing threads.
     CbfDecision decision;
     try {
@@ -663,7 +726,10 @@ private:
       decision.epoch = snapshot.epoch;
       if (!cbf_->config().enforce) {decision.output = snapshot.requested;}
     }
+    mark_cpu(trace_.filtered_cpu_ms);
+    mark(trace_.filtered);
     lock.lock();
+    mark(trace_.relocked);
     double finished = monotonic_s();
     std::string latest_feedback_problem;
     if (cbf_->config().enforce) {
@@ -680,6 +746,7 @@ private:
       !core_.mirror_context(cbf_->config().mirror_mode, finished))
     {
       cbf_->discarded();
+      trace_.path = TickPath::kDiscarded;
       if (player_) {player_->reject_pending("not_admitted");}
       cbf_->tick_finished((finished - now_s) * 1e6);
       flush_notes();
@@ -714,16 +781,23 @@ private:
       ++log_no_distance_frames_;
     }
     publish(decision.output);
+    trace_.path = TickPath::kCbf;
+    trace_.decided(decision, cbf_->config().enforce);
     // Start, end and every second of a period published without verification.
     // Observation only: a long release is a CBF criterion to fix, not to act on.
     // Logged after the command is out, so the WARN never delays it.
     if (d.releasing != was_releasing || (d.releasing && release_at - last_release_log_s_ >= 1.0)) {
+      const auto warn_begun = timing_ ? timing_->now() : TickTiming::Clock::time_point{};
       RCLCPP_WARN(
         get_logger(), "CBF_RELEASE %s episode=%llu held_s=%.3f released_frames=%llu collision=%d reason=%s",
         d.releasing != was_releasing ? (d.releasing ? "start" : "end") : "ongoing",
         static_cast<unsigned long long>(d.release_episodes),
         d.releasing ? d.stuck_s : previous_stuck_s, static_cast<unsigned long long>(d.released),
         d.releasing ? d.stuck_collision : was_collision, d.reason.c_str());
+      if (timing_) {
+        trace_.warn_ms += TickTiming::ms(timing_->now() - warn_begun);
+        trace_.warned = true;
+      }
       last_release_log_s_ = release_at;
     }
     core_.remember_arm_output(decision.output);
@@ -775,6 +849,7 @@ private:
       return false;
     }
     publish(output);
+    trace_.path = TickPath::kPlayed;
     cbf_->played(output, player_->epoch(), now_s);
     core_.remember_arm_output(output);
     cbf_->tick_finished((monotonic_s() - now_s) * 1e6);
@@ -825,6 +900,8 @@ private:
 
   void publish(const Output & output)
   {
+    const bool timed = timing_ && output.kind != Output::Kind::kNone;
+    const auto begun = timed ? timing_->now() : TickTiming::Clock::time_point{};
     const auto header = [this, &output](const char * frame_id) {
         aimdk_msgs::msg::MessageHeader header;
         header.stamp = now();  // the platform drops commands stamped outside its window
@@ -850,6 +927,11 @@ private:
       message.angular_velocity = output.twist[2];
       locomotion_pub_->publish(message);
     }
+    if (timed) {
+      trace_.publish_ms += TickTiming::ms(timing_->now() - begun);
+      ++trace_.publishes;
+      timing_->published();
+    }
   }
 
   void flush_notes()
@@ -865,7 +947,9 @@ private:
 
   void publish_status()
   {
+    const auto entered = timing_ ? timing_->now() : TickTiming::Clock::time_point{};
     std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (timing_) {timing_->add(TimingSegment::kStatusLockWait, TickTiming::ms(timing_->now() - entered));}
     flush_notes();
     const double now_s = monotonic_s();
     nlohmann::json status;
@@ -965,6 +1049,7 @@ private:
         if (log_distance_frames_ > 0) {
           std::snprintf(min_distance, sizeof(min_distance), "%.4f", log_min_distance_m_);
         }
+        const auto missed_ticks = timing_ ? std::to_string(timing_->missed_ticks()) : std::string("na");
         RCLCPP_INFO(
           get_logger(),
           "CBF status: mode=%s mirror_active=%s calls=%llu published=%llu geometry_modified=%llu "
@@ -972,7 +1057,8 @@ private:
           "recovery_verified=%s hand_held=%s "
           "budget_us=%.0f hand_us=%.0f verify_us=%.0f project_us=%.0f reuses=%llu "
           "max_tick_us=%.0f max_filter_us=%.0f max_after_check_us=%.0f "
-          "min_distance_m=%s distance_frames=%llu no_distance_frames=%llu reason=%s",
+          "min_distance_m=%s distance_frames=%llu no_distance_frames=%llu "
+          "missed_ticks=%s node_deadlines=%llu deadlines=%llu publish_overruns=%llu reason=%s",
           cbf_->config().enforce ? "enforce" : "shadow", d.active ? "true" : "false",
           static_cast<unsigned long long>(d.calls), static_cast<unsigned long long>(d.published),
           static_cast<unsigned long long>(d.geometry_modified), static_cast<unsigned long long>(d.held),
@@ -982,7 +1068,10 @@ private:
           d.verification_us, d.projection_us, static_cast<unsigned long long>(d.verification_reuses),
           d.max_tick_us, d.max_elapsed_us, d.max_after_check_us, min_distance,
           static_cast<unsigned long long>(log_distance_frames_),
-          static_cast<unsigned long long>(log_no_distance_frames_), d.reason.c_str());
+          static_cast<unsigned long long>(log_no_distance_frames_),
+          missed_ticks.c_str(),
+          static_cast<unsigned long long>(d.node_deadlines), static_cast<unsigned long long>(d.deadlines),
+          static_cast<unsigned long long>(d.publish_overruns), d.reason.c_str());
         last_status_log_s_ = now_s;
         log_min_distance_m_ = std::numeric_limits<double>::infinity();
         log_distance_frames_ = 0;
@@ -1084,9 +1173,15 @@ private:
     }
     const auto age = core_.public_arm_age(now_s);
     status["public_arm_age_s"] = age ? nlohmann::json(*age) : nlohmann::json(nullptr);
+    if (timing_) {
+      const auto begun = timing_->now();
+      status["tick_timing"] = timing_->report(now_s);
+      timing_->add(TimingSegment::kTimingJson, TickTiming::ms(timing_->now() - begun));
+    }
     std_msgs::msg::String message;
     message.data = status.dump();
     status_pub_->publish(message);
+    if (timing_) {timing_->add(TimingSegment::kStatus, TickTiming::ms(timing_->now() - entered));}
   }
 
   // The vendor input threads and the main thread share the core and the latest
@@ -1096,6 +1191,8 @@ private:
   Core core_;
   std::optional<CbfSafety> cbf_;
   std::optional<TemplatePlayer> player_;
+  std::optional<TickTiming> timing_;
+  TickTrace trace_;  // the command tick in progress, when timing is on
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr template_status_pub_;
   TemplateState logged_template_state_ = TemplateState::kIdle;
   uint64_t logged_template_rejected_ = 0;
