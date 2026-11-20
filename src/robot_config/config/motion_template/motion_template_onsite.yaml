@@ -2,7 +2,8 @@
 # mirror_session.motion_template_config here (with template_play, the gesture
 # model and preset_motions.gesture switched on, motion_enabled kept false; see
 # motion-template-integ-yaml). The blend settings are the code defaults, the
-# same as in motion_template.yaml. Must sit next to segments.json.
+# same as in motion_template.yaml, but for a_pause_budget_s. Must sit next to
+# segments.json.
 motion_template:
   enabled: true
   segments_file: segments.json
@@ -15,6 +16,12 @@ motion_template:
   # short and made each hole a new episode. A real inactive still exits at
   # once; only a dead matcher is noticed at most 0.5 s later.
   label_stale_s: 1.0
+  blend:
+    # zll 11-20: a compromise between the code's 4.0 (an entered template is
+    # never given up for load) and going back sooner: A may fall at most 2 s
+    # behind its schedule through CBF pauses, then goes back through C.
+    # a_pause_budget_per_s stays 0 and a_pause_max_s 4.0 (no cap below 2).
+    a_pause_budget_s: 2.0
   templates:
     overhead_heart: {enabled: true, segments: [overhead_heart]}
     heart: {enabled: true, segments: [heart]}
