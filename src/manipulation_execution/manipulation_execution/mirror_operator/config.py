@@ -7,6 +7,10 @@ being ignored. Times are seconds.
 ``frame_rate_max_hz``  camera frames decoded per second at most
 ``frame_gap_reset_s``  a longer gap between frames clears the gesture state
                        (a stalled stream is not a cover)
+``cover_frame_gap_s``  but a gap up to this long from a covered frame to a
+                       covered frame keeps a cover going: a covered camera
+                       exposes longer and drops frames. At or below
+                       ``frame_gap_reset_s``: off
 ``startup_clear_s``    after startup, the camera must be clear this long
                        before a gesture counts
 ``double_cover``       two short covers: each lasts ``cover_min_s`` to
@@ -87,6 +91,7 @@ class LedConfig:
 class OperatorConfig:
     frame_rate_max_hz: float = 10.0
     frame_gap_reset_s: float = 0.5
+    cover_frame_gap_s: float = 1.5
     startup_clear_s: float = 1.0
     double_cover: DoubleCover = field(default_factory=DoubleCover)
     long_cover_s: float = 2.5
