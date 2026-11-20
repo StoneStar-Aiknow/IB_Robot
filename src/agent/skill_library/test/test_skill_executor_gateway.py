@@ -1758,6 +1758,50 @@ def test_constructor_declares_catalog_parameters_and_drops_legacy_template_param
         node.destroy_node()
 
 
+def _own_subscription_count(node, topic: str) -> int:
+    return sum(
+        1
+        for info in node.get_subscriptions_info_by_topic(topic)
+        if info.node_name == node.get_name() and info.node_namespace == node.get_namespace()
+    )
+
+
+@pytest.mark.parametrize(
+    ("semantic_map_target_service", "expect_tf"),
+    [("", False), ("/semantic_mapping/resolve_target", True)],
+)
+def test_tf_listener_only_created_when_semantic_map_query_is_configured(
+    tmp_path, semantic_map_target_service, expect_tf
+):
+    _assert_test_ros_environment()
+    suffix = f"tf_{os.getpid()}_{uuid.uuid4().hex}"
+    profile_name = f"robot_{suffix}"
+    _write_test_catalog(tmp_path, profile_name)
+    overrides = _constructor_overrides(suffix, tmp_path, profile_name)
+    overrides["semantic_map_target_service"] = semantic_map_target_service
+
+    node = SkillExecutorNode(
+        parameter_overrides=[Parameter(name, value=value) for name, value in overrides.items()],
+        node_name=f"executor_{suffix}",
+    )
+    try:
+        # The joint state subscription is always created; once the graph shows
+        # it, the node's own subscriptions are visible and /tf can be judged.
+        _wait_for(lambda: _own_subscription_count(node, f"/{suffix}/joint_state") == 1)
+        if expect_tf:
+            _wait_for(lambda: _own_subscription_count(node, "/tf") == 1)
+            assert _own_subscription_count(node, "/tf_static") == 1
+            assert node._tf_listener is not None
+        else:
+            assert _own_subscription_count(node, "/tf") == 0
+            assert _own_subscription_count(node, "/tf_static") == 0
+            assert node._tf_listener is None
+        # The buffer is kept either way so the semantic map path never sees None.
+        assert node._tf_buffer is not None
+    finally:
+        node.destroy_node()
+
+
 @pytest.mark.parametrize("gateway_rig", [{"active_control_mode": "startup_override_mode"}], indirect=True)
 def test_active_mode_override_is_reported_and_rejects_without_primitive_dispatch(gateway_rig, monkeypatch):
     dispatched_primitives = []

@@ -1094,7 +1094,14 @@ class SkillExecutorNode(Node):
 
         callback_group = ReentrantCallbackGroup()
         self._tf_buffer = Buffer()
-        self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
+        # Only the semantic map query reads TF (map -> base_link). Without a
+        # configured target service the listener would still subscribe to /tf
+        # on this node's executor and deserialize every transform for nothing,
+        # which on X2 (~45 Hz, ~31 transforms per message) costs close to a
+        # core during mirroring. The buffer stays so lookups fail cleanly.
+        self._tf_listener = None
+        if self._semantic_map_target_service:
+            self._tf_listener = TransformListener(self._tf_buffer, self, spin_thread=False)
         self._pose_publisher = self.create_publisher(Pose, self._cmd_pose_topic, 10)
         self._task_executor_client = ActionClient(
             self, ExecuteTaskPlan, self._task_executor_action_name, callback_group=callback_group

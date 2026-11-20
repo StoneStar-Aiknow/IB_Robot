@@ -11,6 +11,7 @@ from ibrobot_msgs.srv import ValidateSkill
 from manipulation_execution.mirror_operator.config import OperatorConfig
 from manipulation_execution.mirror_operator.core import GATEWAY_TIMEOUT_S, STOP_TIMEOUT_S, TIMEOUT_RETRY_S, Operator
 from manipulation_execution.mirror_operator.gateway import MIRROR_START, MIRROR_STOP, GatewayError, MirrorSkillRequest
+from manipulation_execution.mirror_operator.gesture import DOUBLE_COVER, LONG_COVER, GestureRecognizer
 from manipulation_execution.mirror_operator.judge import CoverJudge, GrayFrame
 from manipulation_execution.mirror_operator_node import RosOperatorCalls
 
@@ -314,6 +315,131 @@ def test_touch_still_goes_to_the_session():
         rig.operator.on_touch(touch.pressed_event_types[0])
     assert len(rig.calls.touches) == 1
     assert rig.calls.stops == [] and rig.calls.direct == []
+
+
+# ---------------------------------------------------------------------------
+# a covered camera drops frames: the cover goes on, other gaps still clear
+# ---------------------------------------------------------------------------
+
+DARK_GAPS = (0.4, 0.7, 0.5, 0.6, 0.4, 0.7)  # about 2-3 Hz once the exposure is long
+
+
+def armed_recognizer(config=None):
+    """A recognizer armed by clear frames at 10 Hz; returns it and the last frame time."""
+    config = config or OperatorConfig()
+    gestures = GestureRecognizer(config)
+    now = 0.0
+    while not gestures.armed:
+        now = round(now + 0.1, 6)
+        gestures.update(False, now)
+    return gestures, now
+
+
+def feed(gestures, now, covered, gaps):
+    """One frame after each gap; the (time, gesture) of each and the last time."""
+    seen = []
+    for gap in gaps:
+        now = round(now + gap, 6)
+        seen.append((now, gestures.update(covered, now)))
+    return seen, now
+
+
+def test_long_cover_fires_at_dark_frame_rates():
+    config = OperatorConfig()
+    gestures, now = armed_recognizer(config)
+    start = round(now + 0.1, 6)
+    assert gestures.update(True, start) is None
+    seen, _ = feed(gestures, start, True, DARK_GAPS)
+    fired = [at for at, gesture in seen if gesture == LONG_COVER]
+    assert fired, "the long cover never fired at 2-3 Hz"
+    # Real time: the first covered frame at or after long_cover_s, not earlier.
+    expected = next(at for at, _ in seen if at - start >= config.long_cover_s)
+    assert fired == [expected]
+    assert all(gesture is None for at, gesture in seen if at < expected)
+
+
+def test_long_cover_at_dark_frame_rates_stops_the_session():
+    rig = Rig()
+    rig.judge.is_covered = True
+    for gap in (0.1,) + DARK_GAPS:
+        rig.clock.now += gap
+        rig.operator.on_state({"state": "MIRRORING"})
+        rig.operator.on_frame(FRAME)
+        rig.operator.tick()
+    assert len(rig.calls.stops) == 1
+
+
+def test_bridge_off_when_cover_frame_gap_is_not_over_the_reset_gap():
+    config = OperatorConfig.from_mapping({"cover_frame_gap_s": 0.5})
+    gestures, now = armed_recognizer(config)
+    seen, _ = feed(gestures, now, True, (0.1,) + DARK_GAPS)
+    assert [gesture for _, gesture in seen] == [None] * len(seen)
+    assert gestures.armed is False
+
+
+def test_a_clear_stream_gap_still_disarms():
+    gestures, now = armed_recognizer()
+    seen, now = feed(gestures, now, False, (0.8,))
+    assert gestures.armed is False
+    # and a cover right after it is not timed: the startup clear comes first
+    seen, _ = feed(gestures, now, True, (0.1,) * 30)
+    assert [gesture for _, gesture in seen] == [None] * 30
+
+
+@pytest.mark.parametrize(("before", "after"), [(False, True), (True, False)])
+def test_a_gap_into_or_out_of_a_cover_still_disarms(before, after):
+    gestures, now = armed_recognizer()
+    seen, now = feed(gestures, now, before, (0.1, 0.1))
+    seen, now = feed(gestures, now, after, (0.8,))
+    assert [gesture for _, gesture in seen] == [None]
+    assert gestures.armed is False
+
+
+def test_a_cover_gap_over_cover_frame_gap_still_disarms():
+    config = OperatorConfig()
+    gestures, now = armed_recognizer(config)
+    seen, now = feed(gestures, now, True, (0.1, 0.4, 0.6))
+    assert gestures.armed is True
+    seen, now = feed(gestures, now, True, (config.cover_frame_gap_s + 0.1,))
+    assert gestures.armed is False
+    seen, _ = feed(gestures, now, True, (0.4,) * 10)
+    assert [gesture for _, gesture in seen] == [None] * 10
+
+
+def test_double_cover_still_fires_at_full_frame_rate():
+    gestures, now = armed_recognizer()
+    seen, now = feed(gestures, now, True, (0.1,) * 5)
+    seen, now = feed(gestures, now, False, (0.1,) * 4)
+    seen, now = feed(gestures, now, True, (0.1,) * 5)
+    seen, now = feed(gestures, now, False, (0.1,))
+    assert seen[-1][1] == DOUBLE_COVER
+
+
+def test_a_bridged_cover_is_never_half_a_double_cover():
+    """0.7 s from cover to clear fits cover_max_s, but a hand may have lifted unseen in the 0.6 s gap."""
+    gestures, now = armed_recognizer()
+    seen, now = feed(gestures, now, True, (0.1, 0.6))  # bridged first cover
+    seen, now = feed(gestures, now, False, (0.1,) * 4)
+    assert gestures.armed is True
+    seen, now = feed(gestures, now, True, (0.1,) * 5)
+    seen, _ = feed(gestures, now, False, (0.1,) * 5)
+    assert [gesture for _, gesture in seen] == [None] * 5
+    gestures, now = armed_recognizer()
+    seen, now = feed(gestures, now, True, (0.1,) * 5)
+    seen, now = feed(gestures, now, False, (0.1,) * 4)
+    seen, now = feed(gestures, now, True, (0.1, 0.6))  # bridged second cover
+    seen, _ = feed(gestures, now, False, (0.1,) * 5)
+    assert [gesture for _, gesture in seen] == [None] * 5
+
+
+def test_a_double_cover_hidden_in_a_bridge_is_not_a_long_cover():
+    """Cover, an unseen lift inside a bridged gap, cover, then clear: no gesture at all."""
+    gestures, now = armed_recognizer()
+    seen, now = feed(gestures, now, True, (0.1, 0.1, 0.1, 1.2, 0.1, 0.1))  # 1.7 s of cover frames
+    assert [gesture for _, gesture in seen] == [None] * 6
+    seen, _ = feed(gestures, now, False, (0.1,) * 15)
+    assert [gesture for _, gesture in seen] == [None] * 15
+    assert gestures.armed is True
 
 
 # ---------------------------------------------------------------------------

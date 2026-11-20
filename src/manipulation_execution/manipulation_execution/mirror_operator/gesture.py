@@ -8,11 +8,30 @@
   a hand already over the camera at startup fires nothing.
 * A gap between frames longer than ``frame_gap_reset_s`` clears everything
   and needs the startup clear again: a stalled stream is not a cover.
+* Except inside a cover: covering the camera lengthens the exposure and the
+  frame rate drops (10 Hz to 2-4 Hz on X2). While armed, a gap of up to
+  ``cover_frame_gap_s`` from a covered frame to another covered frame keeps
+  the cover going, timed by the real receive times. Any other long gap (from
+  or to a clear frame, or longer than ``cover_frame_gap_s``) still clears
+  everything as above.
 * Double cover: a cover of ``cover_min_s``..``cover_max_s``, a gap of
   ``gap_min_s``..``gap_max_s``, another such cover, both within
   ``total_max_s``; it fires when the second cover ends.
 * Long cover: fires on the frame the cover reaches ``long_cover_s``, once.
 * A cover of any other length clears a pending first cover.
+* A cover bridged over a long gap is never one of the two covers of a double
+  cover (it ends like a cover of the wrong length), so the double cover is
+  exactly as strict as without the bridge: the frames it is timed from are
+  never more than ``frame_gap_reset_s`` apart. Without this, a hand lifted
+  and put back unseen inside the gap would turn two covers into one short
+  one. The unseen-lift risk stays for the long cover: a clear moment shorter
+  than ``cover_frame_gap_s`` hidden between two covered frames counts as
+  covered, so in the worst case a long cover fires after
+  ``long_cover_s - cover_frame_gap_s`` of continuous cover at the end, and
+  only if the frame at ``long_cover_s`` is still covered. A double cover
+  (both covers within ``total_max_s`` < ``long_cover_s``) followed by a clear
+  frame never becomes a long cover; one followed by a hold was already a long
+  cover in the making.
 * A gesture within ``debounce_s`` of the last one fired is dropped, and
   still needs the rearm clear.
 """
@@ -29,6 +48,7 @@ class GestureRecognizer:
     def __init__(self, config: OperatorConfig):
         self._config = config
         self._last_at: float | None = None
+        self._last_covered = False
         self._last_fired_at: float | None = None
         self.dropped = 0  # gestures dropped by the debounce
         self._disarm(config.startup_clear_s)
@@ -38,6 +58,7 @@ class GestureRecognizer:
         self._clear_needed_s = clear_s
         self._clear_since: float | None = None
         self._cover_since: float | None = None
+        self._cover_bridged = False  # the current cover spans a gap over frame_gap_reset_s
         self._first: tuple[float, float] | None = None  # (start, end) of a qualifying first cover
 
     @property
@@ -47,8 +68,12 @@ class GestureRecognizer:
     def update(self, covered: bool, now: float) -> str | None:
         config = self._config
         if self._last_at is not None and not 0 <= now - self._last_at <= config.frame_gap_reset_s:
-            self._disarm(config.startup_clear_s)
+            if self._bridges_cover(covered, now - self._last_at):
+                self._cover_bridged = True
+            else:
+                self._disarm(config.startup_clear_s)
         self._last_at = now
+        self._last_covered = covered
         if not self._armed:
             if covered:
                 self._clear_since = None
@@ -72,10 +97,21 @@ class GestureRecognizer:
             self._first = None
         return gesture
 
+    def _bridges_cover(self, covered: bool, gap: float) -> bool:
+        """A long gap inside an armed cover: covered frame to covered frame."""
+        return (
+            self._armed
+            and self._cover_since is not None
+            and self._last_covered
+            and covered
+            and 0 <= gap <= self._config.cover_frame_gap_s
+        )
+
     def _cover_ended(self, start: float, end: float) -> str | None:
         double = self._config.double_cover
         self._cover_since = None
-        if not double.cover_min_s <= end - start <= double.cover_max_s:
+        bridged, self._cover_bridged = self._cover_bridged, False
+        if bridged or not double.cover_min_s <= end - start <= double.cover_max_s:
             self._first = None
             return None
         first = self._first
