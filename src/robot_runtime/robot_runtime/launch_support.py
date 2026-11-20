@@ -365,6 +365,15 @@ def resolve_sim_selection(
     return True, platform
 
 
+# xacro args render_robot_description derives itself, and where each one comes from.
+_RENDER_RESERVED_XACRO_ARGS = {
+    "simulated": "the launch use_sim selection",
+    "port": "hardware.port",
+    "calib_file": "hardware.calib_file",
+    "reset_positions": "hardware.reset_positions",
+}
+
+
 def render_robot_description(profile: dict[str, Any], profile_path: Path, simulated: bool) -> str:
     """Render the profile's xacro with hardware parameters; fails fast on missing keys or calibration."""
     description = profile.get("description") or {}
@@ -381,8 +390,41 @@ def render_robot_description(profile: dict[str, Any], profile_path: Path, simula
             "reset_positions": xacro_value(hardware.get("reset_positions") or {}),
         }
     )
-    for key, value in (hardware.get("xacro_args") or {}).items():
-        xacro_args[str(key)] = xacro_value(value)
+    overrides = {str(key): value for key, value in (hardware.get("xacro_args") or {}).items()}
+    # xacro strips each argument name before matching (cli.py load_mappings:
+    # ``[x.strip() for x in arg.split(':=')]``), so a name that only differs by
+    # surrounding whitespace still overrides the derived value afterwards —
+    # and two such names are one argument to xacro, the later one winning.
+    # Decide on the stripped names: anything the hardware plugin could read
+    # must be rejected by its own spelling, never by a whitespace variant.
+    stripped_names = [key.strip() for key in overrides]
+    reserved = sorted({name for name in stripped_names if name in _RENDER_RESERVED_XACRO_ARGS})
+    if reserved:
+        # Reject the spelling the profile wrote, not the stripped form: that
+        # is what the author sees and what the message must point back at.
+        raise RuntimeProfileError(
+            f"runtime profile 'hardware.xacro_args' must not set "
+            f"{[key for key in overrides if key.strip() in reserved]}: they come from "
+            f"'hardware' ({', '.join(_RENDER_RESERVED_XACRO_ARGS[name] for name in reserved)}) and the "
+            f"launch selection: {profile_path}"
+        )
+    if any(not name for name in stripped_names):
+        raise RuntimeProfileError(
+            f"runtime profile 'hardware.xacro_args' has an empty argument name: "
+            f"{[key for key in overrides if not key.strip()]} ({profile_path})"
+        )
+    if len(set(stripped_names)) != len(stripped_names):
+        # Two names that xacro treats as one argument: the later one silently
+        # wins, which is exactly how a reserved value gets smuggled past the
+        # check above. Echo the spellings the profile wrote, like the
+        # reserved and empty-name errors do.
+        raise RuntimeProfileError(
+            "runtime profile 'hardware.xacro_args' maps multiple names to one argument: "
+            f"{[key for key in overrides if stripped_names.count(key.strip()) > 1]} "
+            f"(xacro treats them as one argument, the later one winning) ({profile_path})"
+        )
+    for key, value in overrides.items():
+        xacro_args[key] = xacro_value(value)
     if not simulated and calib and not Path(calib).is_file():
         raise RuntimeProfileError(
             f"calibration file not found: {calib} (profile {profile_path}); "

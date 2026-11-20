@@ -26,6 +26,29 @@ ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=tru
 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=gazebo     # Gazebo physics
 ```
 
+The hardware launch checks the local calibration against the profile before
+any hardware node starts and logs the result as `runtime_preflight`: one line
+on a pass, the joint table when a home pose is within 0.05 rad of a limit, and
+a FAIL report followed by the launch error when the calibration file is
+missing or unreadable or a home pose lies outside the calibrated limits. The
+FAIL report includes the joint table whenever the model can still be
+projected (a home pose out of range); a missing or unreadable file gives the
+file path and the error only. To check
+without launching (no serial port or driver is opened; exit 1 on a failure):
+
+```bash
+ros2 run robot_runtime runtime_preflight --package so101_robot --profile so101_single_arm
+```
+
+The table shows every joint's limits, home pose and margin; a negative margin
+is the joint that fails, and a warning marks a margin below 0.05 rad. Check
+the arm before acting: if that joint was not driven to its end stop during
+calibration, recalibrate; if the arm cannot reach the home pose, the
+deployment profile's home is what needs changing. A pass does not check the
+fields only the SO-101 SDK validates (`homing_offset`, and `drive_mode` and
+motor ids when present), nor
+that the file was made on the attached arm.
+
 `profile` is a path or the name of a file in `profiles/`. The profile is the
 single source of runtime parameters: port, calibration, controllers config,
 modes → controller sets, capabilities with parameters (incl. stop latency

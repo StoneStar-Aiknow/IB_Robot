@@ -12,11 +12,13 @@ collected 0 tests for so101_robot (it shipped no tests at all).
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import re
 from pathlib import Path
 
 import launch
+import pytest
 import yaml
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
@@ -24,6 +26,134 @@ from launch_ros.actions import Node
 _PACKAGE = Path(__file__).resolve().parents[1]
 _LAUNCH = _PACKAGE / "launch" / "runtime.launch.py"
 _PROFILE = _PACKAGE / "profiles" / "so101_single_arm.yaml"
+
+
+# Physical renders read the follower calibration from $(env HOME)/.calibrate.
+# These tests check how the launch code interprets a calibration, so every test
+# here reads a fixed one, never the calibration of the arm attached to the test
+# machine. TEST DATA ONLY, never deploy it: the servo ranges are those of one
+# SO-101 recalibrated on 2026-11-04, with every homing_offset zeroed (the joint
+# conversion reads only the ranges). Whether a real arm's calibration is valid is
+# checked at launch time on that arm, not here.
+_FOLLOWER_CALIBRATION = {
+    "1": {"id": 1, "drive_mode": 0, "homing_offset": 0, "range_min": 618, "range_max": 3356},
+    "2": {"id": 2, "drive_mode": 0, "homing_offset": 0, "range_min": 851, "range_max": 3112},
+    "3": {"id": 3, "drive_mode": 0, "homing_offset": 0, "range_min": 1105, "range_max": 3238},
+    "4": {"id": 4, "drive_mode": 0, "homing_offset": 0, "range_min": 787, "range_max": 2787},
+    "5": {"id": 5, "drive_mode": 0, "homing_offset": 0, "range_min": 0, "range_max": 4095},
+    "6": {"id": 6, "drive_mode": 0, "homing_offset": 0, "range_min": 2039, "range_max": 3421},
+}
+_FOLLOWER_FILE = "so101_follower_calibrate.json"
+
+
+def _calibration_home(tmp_path, monkeypatch, files):
+    """Point HOME at a fresh directory whose .calibrate holds exactly ``files`` (name -> JSON value)."""
+    home = tmp_path / "calibration_home"
+    calibrate = home / ".calibrate"
+    calibrate.mkdir(parents=True)
+    for name, content in files.items():
+        (calibrate / name).write_text(json.dumps(content), encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+
+@pytest.fixture(autouse=True)
+def _fixed_calibration_home(tmp_path, monkeypatch):
+    # The leader calibration path is only forwarded to the leader node as a
+    # parameter; the launch never opens it, so no leader file is needed.
+    _calibration_home(tmp_path, monkeypatch, {_FOLLOWER_FILE: _FOLLOWER_CALIBRATION})
+
+
+def test_physical_renders_use_the_pinned_calibration():
+    from robot_runtime.launch_support import render_robot_description
+    from robot_runtime.model_metadata import build_model_metadata
+    from robot_runtime.profile import load_profile
+
+    profile = load_profile(_PROFILE)
+    model = build_model_metadata(
+        profile, use_sim=False, sim_platform=None, robot_description=render_robot_description(profile, _PROFILE, False)
+    )
+    assert model["joint_limits"]["3"]["max"] == pytest.approx((3238 - 2048) * 2 * math.pi / 4096)
+
+
+@pytest.fixture
+def _stack_spy(monkeypatch):
+    """Record whether the launch reached the runtime stack actions (the hardware nodes)."""
+    import robot_runtime.launch_support as launch_support
+
+    calls = []
+    real = launch_support.runtime_stack_actions
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(launch_support, "runtime_stack_actions", spy)
+    return calls
+
+
+@pytest.fixture
+def _preflight_log(monkeypatch):
+    """Capture what the calibration preflight logs from inside the launch."""
+    import robot_runtime.preflight as preflight
+
+    logged = []
+    monkeypatch.setattr(preflight, "_launch_log", lambda level, text: logged.append((level, text)))
+    return logged
+
+
+def test_pinned_calibration_reaches_the_runtime_stack(_stack_spy, _preflight_log):
+    _render({"use_sim": "false"})
+    assert len(_stack_spy) == 1
+    # The physical launch reports the calibration in one line and goes on.
+    # With the pinned calibration joint 2 is the tightest: (851 - 2048) * 2*pi / 4096
+    # = -1.836 rad lower limit, home -1.5854 rad.
+    assert len(_preflight_log) == 1
+    level, text = _preflight_log[0]
+    assert level == "info"
+    assert text.startswith("calibration preflight: PASS, 5 home poses within limits, min margin 0.251 rad at joint 2")
+    assert text.endswith(f"{_FOLLOWER_FILE})")
+
+
+def test_simulated_launch_runs_no_calibration_preflight(_preflight_log):
+    _render({"use_sim": "true"})
+    _render({"use_sim": "true", "sim_platform": "gazebo"})
+    assert _preflight_log == []
+
+
+def test_calibration_excluding_the_home_pose_stops_the_launch_before_the_stack(
+    tmp_path, monkeypatch, _stack_spy, _preflight_log
+):
+    """A calibration whose range excludes a profile home pose must fail the launch.
+
+    Joint 3 (elbow_flex) has home 1.5708 rad. range_max 2986 gives a limit of
+    (2986 - 2048) * 2*pi / 4096 = 1.439 rad, below home; this is the elbow range
+    of a real SO-101 calibration that was later redone.
+    """
+    calibration = {**_FOLLOWER_CALIBRATION, "3": {**_FOLLOWER_CALIBRATION["3"], "range_max": 2986}}
+    _calibration_home(tmp_path / "bad_range", monkeypatch, {_FOLLOWER_FILE: calibration})
+    with pytest.raises(ValueError, match=r"robot_model\.home_positions\.3 is outside physical limits"):
+        _render({"use_sim": "false"})
+    assert _stack_spy == []
+    # Before failing, the launch logs every joint with its limits and margin.
+    assert [level for level, _ in _preflight_log] == ["error"]
+    report = _preflight_log[0][1]
+    row = next(line for line in report.splitlines() if line.startswith("3 "))
+    assert row.split()[-2:] == ["+1.571", "-0.132"]
+    assert "FAIL  ValueError: robot_model.home_positions.3 is outside physical limits" in report
+
+
+def test_missing_calibration_stops_the_launch_before_the_stack(tmp_path, monkeypatch, _stack_spy):
+    _calibration_home(tmp_path / "no_calibration", monkeypatch, {})
+    with pytest.raises(ValueError, match="calibration file not found"):
+        _render({"use_sim": "false"})
+    assert _stack_spy == []
+
+
+def test_non_object_calibration_stops_the_launch_before_the_stack(tmp_path, monkeypatch, _stack_spy):
+    _calibration_home(tmp_path / "list_calibration", monkeypatch, {_FOLLOWER_FILE: []})
+    with pytest.raises(ValueError, match="runtime calibration must be a JSON object"):
+        _render({"use_sim": "false"})
+    assert _stack_spy == []
 
 
 def _launch_module():

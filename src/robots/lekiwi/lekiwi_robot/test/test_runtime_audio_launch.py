@@ -14,7 +14,12 @@ import importlib.util
 from pathlib import Path
 
 import launch
+import pytest
 import yaml
+
+# Its physical renders read the arm calibration; every test here reads the
+# fixed one from conftest.py, never the host's (issue #248).
+pytestmark = pytest.mark.usefixtures("pinned_calibration")
 
 _PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_nav_grasp.yaml"
 _LAUNCH = Path(__file__).resolve().parents[1] / "launch" / "runtime.launch.py"

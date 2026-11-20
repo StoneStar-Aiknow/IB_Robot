@@ -35,6 +35,7 @@ from robot_runtime.launch_support import (
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import load_peripherals_file, merge_peripherals
+from robot_runtime.preflight import checked_physical_description
 from robot_runtime.profile import load_profile
 from robot_runtime.sim_platforms import is_physics_selection
 
@@ -76,6 +77,16 @@ def _launch_setup(context, *_args, **_kwargs):
     # that never sets sim_world resolves like an empty value, not an error.
     sim_world = LaunchConfiguration("sim_world", default="").perform(context).strip()
     spawn_pose = tuple(float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw"))
+
+    def describe(urdf):
+        return build_description(
+            effective_profile,
+            robot_description=urdf,
+            use_sim=use_sim,
+            sim_platform=sim_platform,
+            profile_path=profile_path,
+        )
+
     if is_physics_selection(use_sim, sim_platform):
         # D3: one generic render entry — the effective embodiment renders
         # (the advertised camera streams must match what it generates, so
@@ -89,15 +100,20 @@ def _launch_setup(context, *_args, **_kwargs):
             spawn_pose=spawn_pose,
             world=sim_world,
         )
-    else:
+        description = describe(robot_description)
+    elif simulated:
         robot_description = render_robot_description(effective_profile, profile_path, simulated)
-    description = build_description(
-        effective_profile,
-        robot_description=robot_description,
-        use_sim=use_sim,
-        sim_platform=sim_platform,
-        profile_path=profile_path,
-    )
+        description = describe(robot_description)
+    else:
+        # Physical: the calibration preflight report wraps the same two calls,
+        # logging the joint limits and margins; a failure still raises before
+        # any hardware node starts (issue #248).
+        robot_description, description = checked_physical_description(
+            effective_profile,
+            profile_path,
+            lambda: render_robot_description(effective_profile, profile_path, False),
+            describe,
+        )
 
     motion = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(

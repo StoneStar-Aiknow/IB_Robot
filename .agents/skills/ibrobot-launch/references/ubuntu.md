@@ -107,6 +107,21 @@ Pass criteria:
 
 ## Real Hardware Launch
 
+The SO-101 and LeKiwi hardware launches check the local calibration against
+the profile before any hardware node starts and log it as `runtime_preflight`:
+one PASS line, the joint table with each limit, home pose and margin when a
+margin is small, or a FAIL report (with the table when the model can still be
+projected) when the launch fails on the calibration. To check before
+powering the arm, run the same check offline; it opens no serial port and
+exits 1 when the calibration file is missing or unreadable or a profile home
+pose lies outside the calibrated limits. Neither checks what only the SO-101
+SDK validates (`homing_offset`, and `drive_mode` and motor ids when present):
+
+```bash
+source .shrc_local && \
+  ros2 run robot_runtime runtime_preflight --package so101_robot --profile so101_single_arm
+```
+
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.zsh && \
   ros2 launch robot_config robot.launch.py \

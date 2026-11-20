@@ -45,6 +45,7 @@ from robot_runtime.launch_support import (
     runtime_stack_actions,
 )
 from robot_runtime.peripherals import fast_lio_nodes, load_peripherals_file, merge_peripherals
+from robot_runtime.preflight import checked_physical_description
 from robot_runtime.profile import load_profile
 from robot_runtime.sim_platforms import is_physics_selection
 
@@ -89,26 +90,10 @@ def _launch_setup(context, *_args, **_kwargs):
         output="screen",
         parameters=[base_params],
     )
-    # A base-only deployment has no arm, so it declares no `motion` section and
-    # must not start the arm motion services. Composing them anyway would make
-    # the runtime advertise FK/IK for joints the hardware never opens.
-    motion_actions = []
-    if profile.get("motion"):
-        motion_actions.append(
-            IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(
-                    os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
-                ),
-                launch_arguments={
-                    **motion_launch_arguments(profile, profile_path, simulated, sim_platform or "", display),
-                    "robot_description": arm_motion_model(profile, profile_path, simulated),
-                }.items(),
-            )
-        )
     # The whole robot (arm and wheels) is the public model: ros2_control and
     # robot_state_publisher load it, and the facade derives the robot model and
     # the teleoperation interfaces from the same rendering. The arm-only model
-    # above is what so101_motion plans against; it is not the public model.
+    # below is what so101_motion plans against; it is not the public model.
     # D7/sim-platform-registry D3: one generic render entry — on a physics
     # platform the effective embodiment renders (the public model and the
     # interface description derive from that exact render, sensors included);
@@ -118,6 +103,17 @@ def _launch_setup(context, *_args, **_kwargs):
     # default="" mirrors the declared argument: a caller (or test context)
     # that never sets sim_world resolves like an empty value, not an error.
     sim_world = LaunchConfiguration("sim_world", default="").perform(context).strip()
+
+    def describe(urdf):
+        return build_description(
+            {**profile, "fast_lio": fast_lio_config},
+            peripherals=merged_peripherals,
+            use_sim=simulated,
+            sim_platform=sim_platform,
+            robot_description=urdf,
+            profile_path=profile_path,
+        )
+
     if is_physics_selection(simulated, sim_platform):
         spawn_pose = tuple(
             float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw")
@@ -133,16 +129,38 @@ def _launch_setup(context, *_args, **_kwargs):
             spawn_pose=spawn_pose,
             world=sim_world,
         )
-    else:
+        description = describe(robot_description)
+    elif simulated:
         robot_description = render_robot_description(profile, profile_path, simulated)
-    description = build_description(
-        {**profile, "fast_lio": fast_lio_config},
-        peripherals=merged_peripherals,
-        use_sim=simulated,
-        sim_platform=sim_platform,
-        robot_description=robot_description,
-        profile_path=profile_path,
-    )
+        description = describe(robot_description)
+    else:
+        # Physical: the calibration preflight report wraps the same two calls;
+        # a failure still raises before any hardware node starts (#248).
+        robot_description, description = checked_physical_description(
+            profile,
+            profile_path,
+            lambda: render_robot_description(profile, profile_path, False),
+            describe,
+        )
+    # A base-only deployment has no arm, so it declares no `motion` section and
+    # must not start the arm motion services. Composing them anyway would make
+    # the runtime advertise FK/IK for joints the hardware never opens.
+    # This comes after the public render on purpose: on hardware the arm-only
+    # render reads the same calibration, and the checked render above must be
+    # the first step to report a missing or unreadable file (#248).
+    motion_actions = []
+    if profile.get("motion"):
+        motion_actions.append(
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(get_package_share_directory("so101_motion"), "launch", "motion.launch.py")
+                ),
+                launch_arguments={
+                    **motion_launch_arguments(profile, profile_path, simulated, sim_platform or "", display),
+                    "robot_description": arm_motion_model(profile, profile_path, simulated),
+                }.items(),
+            )
+        )
     peripherals = [
         *peripheral_stack_actions(
             profile, peripherals_file, simulated, description=description, sim_platform=sim_platform or ""

@@ -198,3 +198,111 @@ def test_profile_controllers_rejects_a_bad_platform_table():
     profile["modes"]["idle"]["controllers_by_platform"] = {"embedded_sensor": ["x"]}
     with pytest.raises(ValueError, match="not a simulation platform"):
         profile_controllers(profile, "mujoco")
+
+
+@pytest.mark.parametrize("key", ["simulated", "port", "calib_file", "reset_positions"])
+def test_hardware_xacro_args_cannot_override_a_derived_render_arg(tmp_path, key):
+    from robot_runtime.launch_support import RuntimeProfileError, render_robot_description
+
+    xacro = tmp_path / "robot.urdf.xacro"
+    xacro.write_text(
+        '<?xml version="1.0"?><robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="base"/></robot>',
+        encoding="utf-8",
+    )
+    profile = {
+        "description": {"xacro": str(xacro)},
+        "hardware": {"port": "/dev/null", "xacro_args": {key: "override", "profile_acc": "254"}},
+    }
+    with pytest.raises(RuntimeProfileError, match=rf"'hardware.xacro_args' must not set \['{key}'\]"):
+        render_robot_description(profile, tmp_path / "profile.yaml", True)
+    # Other keys stay allowed, as the shipped SO-101 servo tuning uses them.
+    profile["hardware"]["xacro_args"] = {"profile_acc": "254"}
+    assert "<robot" in render_robot_description(profile, tmp_path / "profile.yaml", True)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [" calib_file", "calib_file ", "\tcalib_file", " port ", "\n simulated \n", "\freset_positions"],
+)
+def test_hardware_xacro_args_whitespace_cannot_smuggle_a_reserved_arg(tmp_path, name):
+    # xacro strips argument names before matching (cli.py load_mappings), so
+    # " calib_file" is the calib_file argument to the renderer. The check must
+    # fire on the stripped name, or the plugin reads a calibration every check
+    # reports on as a different one (#248).
+    from robot_runtime.launch_support import RuntimeProfileError, render_robot_description
+
+    xacro = tmp_path / "robot.urdf.xacro"
+    xacro.write_text(
+        '<?xml version="1.0"?><robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="base"/></robot>',
+        encoding="utf-8",
+    )
+    profile = {
+        "description": {"xacro": str(xacro)},
+        "hardware": {"port": "/dev/null", "xacro_args": {name: "override"}},
+    }
+    with pytest.raises(RuntimeProfileError, match="'hardware.xacro_args' must not set"):
+        render_robot_description(profile, tmp_path / "profile.yaml", True)
+
+
+def test_hardware_xacro_args_empty_name_is_rejected(tmp_path):
+    from robot_runtime.launch_support import RuntimeProfileError, render_robot_description
+
+    xacro = tmp_path / "robot.urdf.xacro"
+    xacro.write_text(
+        '<?xml version="1.0"?><robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="base"/></robot>',
+        encoding="utf-8",
+    )
+    profile = {
+        "description": {"xacro": str(xacro)},
+        "hardware": {"port": "/dev/null", "xacro_args": {"  ": "override"}},
+    }
+    with pytest.raises(RuntimeProfileError, match="empty argument name"):
+        render_robot_description(profile, tmp_path / "profile.yaml", True)
+
+
+def test_hardware_xacro_args_names_stripping_to_one_argument_are_rejected(tmp_path):
+    # Two names that differ only in whitespace are one xacro argument; the
+    # later one wins, which is how a reserved value slips past the check.
+    from robot_runtime.launch_support import RuntimeProfileError, render_robot_description
+
+    xacro = tmp_path / "robot.urdf.xacro"
+    xacro.write_text(
+        '<?xml version="1.0"?><robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="base"/></robot>',
+        encoding="utf-8",
+    )
+    profile = {
+        "description": {"xacro": str(xacro)},
+        "hardware": {"port": "/dev/null", "xacro_args": {"profile_acc": "254", " profile_acc ": "120"}},
+    }
+    with pytest.raises(
+        RuntimeProfileError,
+        match=r"maps multiple names to one argument: \['profile_acc', ' profile_acc '\]",
+    ):
+        render_robot_description(profile, tmp_path / "profile.yaml", True)
+
+
+def test_render_robot_description_reports_the_evil_calibration_end_to_end(tmp_path):
+    # End to end over the real renderer: a whitespace-prefixed calib_file must
+    # never reach xacro, or the rendered URDF hands the hardware plugin a
+    # calibration the preflight never checked (the reported P2).
+    from robot_runtime.launch_support import RuntimeProfileError, render_robot_description
+
+    xacro = tmp_path / "robot.urdf.xacro"
+    xacro.write_text(
+        '<?xml version="1.0"?><robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">'
+        '<xacro:arg name="calib_file" default=""/>'
+        '<link name="$(arg calib_file)"/></robot>',
+        encoding="utf-8",
+    )
+    profile = {
+        "description": {"xacro": str(xacro)},
+        "hardware": {
+            "port": "/dev/null",
+            "calib_file": str(tmp_path / "checked.json"),
+            "xacro_args": {" calib_file": str(tmp_path / "evil.json")},
+        },
+    }
+    (tmp_path / "checked.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "evil.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeProfileError, match="'hardware.xacro_args' must not set"):
+        render_robot_description(profile, tmp_path / "profile.yaml", False)

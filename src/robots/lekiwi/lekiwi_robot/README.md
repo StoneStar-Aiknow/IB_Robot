@@ -94,6 +94,14 @@ ros2 launch lekiwi_robot runtime.launch.py profile:=lekiwi_lidar [simulated:=tru
 `simulated:=true` keeps the production controller and hardware-adapter path
 and replaces only the serial bus with the SDK's simulated transport.
 
+On hardware, a profile with an arm calibration (`hardware.calib_file`, for
+example `lekiwi_nav_grasp`) is checked against that file before any hardware
+node starts and the result is logged as `runtime_preflight`: one PASS line,
+the arm joint table with each limit, home pose and margin when a margin is
+small, or a FAIL report (with the table when the model can still be
+projected) when the launch fails on the calibration. The same check runs offline with
+`ros2 run robot_runtime runtime_preflight --package lekiwi_robot --profile lekiwi_nav_grasp`.
+
 ## Gazebo simulation
 
 The Gazebo platform (`sim_platform:=gazebo`) stands in for the physical

@@ -168,7 +168,7 @@ def test_nav_grasp_gazebo_render_carries_the_arm_and_the_initial_values():
     assert root.find(".//sensor[@name='front_camera']") is None
 
 
-def test_nav_grasp_arm_root_on_every_execution(tmp_path):
+def test_nav_grasp_arm_root_on_every_execution(tmp_path, pinned_calibration):
     """D8: the reserved-name fix applies to hardware, SDK and both physics
     platforms — the TF frame set is the same on every execution."""
     from robot_runtime.launch_support import render_robot_description
