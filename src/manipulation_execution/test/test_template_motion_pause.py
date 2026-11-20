@@ -268,6 +268,72 @@ def test_releasing_keeps_the_pause_and_a_long_hold_needs_two_clean_statuses():
     assert "long=True" in lines(rig, "template resume")[0]
 
 
+def long_pause_then_silent(rig):
+    """A in a long pause (past the release), the hold over and the data plane's statuses not coming."""
+    rig.into_a(0.3)
+    rig.hold(0.0, 2.0)
+    rig.run(0.35)
+    assert rig.blender.snapshot()["paused"]
+    rig.plane.holds = []
+    rig.plane.delay = lambda at: None
+
+
+def clean_status(rig, at, **top):
+    message = rig.plane.status(at)
+    message["cbf"].update(stuck_s=0.0, releasing=False, stuck_collision=False)
+    message.update(top)
+    return message
+
+
+def tick_with(rig, *messages):
+    rig.now += TICK
+    rig.hear()
+    for message in messages:
+        rig.cbf_monitor.observe(json.dumps(message), rig.now)
+    rig.blender.step(rig.now, rig.inputs(), rig.mirror)
+    return rig.blender.snapshot()["paused"]
+
+
+def test_a_long_pause_needs_two_individually_fresh_statuses():
+    # Codex review 1120 T3: a 0.2 s old one and a fresh one resumed it.
+    rig = PauseRig()
+    long_pause_then_silent(rig)
+    rig.run(0.3)  # silent long enough that a 0.2 s old one is newer than the last received (else: reordered)
+    assert tick_with(rig, clean_status(rig, rig.now - 0.2 + TICK), clean_status(rig, rig.now + TICK))
+    assert not lines(rig, "template resume")
+    assert not tick_with(rig, clean_status(rig, rig.now + TICK))  # the next fresh one makes two
+    assert "long=True" in lines(rig, "template resume")[0]
+
+
+def test_a_counted_status_that_ages_out_before_the_second_no_longer_counts():
+    rig = PauseRig()
+    long_pause_then_silent(rig)
+    rig.run(0.3)
+    assert tick_with(rig, clean_status(rig, rig.now + TICK))
+    for _ in range(round(NEW.a_status_age_s / TICK) + 1):
+        assert tick_with(rig)  # no status: the newest gets old, A stays paused
+    assert tick_with(rig, clean_status(rig, rig.now + TICK))  # one fresh: the first is too old to make two
+    assert not tick_with(rig, clean_status(rig, rig.now + TICK))
+
+
+@pytest.mark.parametrize("bad", ["duplicate", "no_epoch", "no_at"])
+def test_a_duplicate_or_incomplete_status_does_not_count_towards_a_resume(bad):
+    rig = PauseRig()
+    long_pause_then_silent(rig)
+    rig.run(0.3)
+    first = clean_status(rig, rig.now + TICK)
+    if bad == "duplicate":
+        assert tick_with(rig, first, first)  # read twice: counts once
+        assert tick_with(rig, dict(first))  # and again on the next tick
+    else:
+        broken = dict(first)
+        del broken["safety_epoch" if bad == "no_epoch" else "at"]
+        assert tick_with(rig, broken, clean_status(rig, rig.now + TICK))
+        assert not lines(rig, "template exit")  # the newest is complete: no safety exit
+    assert not lines(rig, "template resume")
+    assert not tick_with(rig, clean_status(rig, rig.now + TICK))
+
+
 def test_label_lost_or_collision_in_a_pause_or_a_ramp_goes_to_C_continuously():
     for when, what in [(0.1, "label"), (0.1, "collision"), (0.42, "label"), (0.42, "collision")]:
         rig = PauseRig()

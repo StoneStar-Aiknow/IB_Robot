@@ -513,6 +513,7 @@ class Blender:
         self._pause_long = False  # the CBF released, or was about to: two clean statuses and a full ramp
         self._clean_run = 0  # clean statuses in a row since the pause began
         self._clean_serial = 0
+        self._clean_ats: list[float] = []  # their ``at``, oldest first: each must still be fresh to count
         self._untrusted_since: float | None = None
         self._pauses = 0
         self._paused_s = 0.0
@@ -1116,17 +1117,24 @@ class Blender:
                 return "a_cbf_collision"
             if not self._paused:
                 continue
+            if state.at is not None and self._clean_ats and state.at <= self._clean_ats[-1]:
+                self._clean_serial = state.serial  # the same status again: it neither counts nor breaks the run
+                continue
             clean = (
                 not state.intervening
                 and state.at is not None
                 and -CLOCK_BEHIND_S <= state.at - state.received_at <= CLOCK_AHEAD_S
+                and now - state.at <= config.a_status_age_s  # T3: each one fresh, not only the newest
+                and state.safety_epoch == self._epoch
                 and (state.mirror_active is True or not state.has_cbf)
             )
             if clean:
-                self._clean_run = self._clean_run + 1 if state.serial == self._clean_serial + 1 else 1
+                if state.serial != self._clean_serial + 1:
+                    self._clean_ats = []
+                self._clean_ats.append(state.at)
                 self._clean_serial = state.serial
             else:
-                self._clean_run = 0
+                self._clean_ats = []
                 release_at = state.hold_release_after_s or RELEASE_AFTER_S
                 self._pause_long |= state.releasing or state.stuck_s >= release_at - config.a_release_guard_s
         trust = self._trust(cbf, now)
@@ -1149,6 +1157,8 @@ class Blender:
         else:  # nothing known since the newest status: it may have held since then
             held_for = now - cbf.at if cbf is not None and cbf.at is not None else now - self._pause_since
         self._pause_long |= held_for >= release_at - config.a_release_guard_s
+        self._clean_ats = [at for at in self._clean_ats if now - at <= config.a_status_age_s]  # the run's fresh tail
+        self._clean_run = len(self._clean_ats)
         if trust is None and not holding and self._clean_run >= (2 if self._pause_long else 1):
             return self._resume(now, m)
         if now - self._entered_at - self._clock.at(now) > self._budget:
@@ -1160,7 +1170,7 @@ class Blender:
         self._ref.freeze(now, m)
         self._clock.stop(now)
         self._paused, self._pause_since, self._pause_why, self._pause_long = True, now, why, False
-        self._clean_run = 0
+        self._clean_run, self._clean_ats = 0, []
         hand = self._hand_out
         if hand is not None and len(hand) == len(self._segment.hand_P):
             self._hand_target = hand
