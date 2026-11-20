@@ -257,3 +257,71 @@ def test_an_explicit_pid_that_is_not_a_dataplane_is_refused_untouched(env, monke
     finally:
         other.kill()
         other.wait()
+
+
+def test_apply_when_up_waits_for_the_dataplane_and_reads_every_thread_back(env, tmp_path):
+    stand_in, _, values = env
+    result = tmp_path / "result"
+    waiting = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "apply-when-up", "--wait", "20", "--settle", "0.3", "--interval", "0.1",
+         "--result", str(result)],
+        env=values, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        time.sleep(0.5)  # started before the dataplane, as from a start script
+        process = stand_in()
+        assert waiting.wait(timeout=20) == 0
+        line = result.read_text()
+        assert line.startswith("ok nice=7") and "全部 4 个线程" in line, line
+        assert line.strip() in waiting.stdout.read()
+        assert set(nices(process.pid).values()) == {7}
+    finally:
+        if waiting.poll() is None:
+            waiting.kill()
+            waiting.wait()
+
+
+def test_apply_when_up_fails_out_loud_without_one_dataplane(env, tmp_path):
+    stand_in, run, _ = env
+    result = tmp_path / "result"
+    nothing = run("apply-when-up", "--wait", "0.5", "--interval", "0.1", "--result", str(result), check=False)
+    assert nothing.returncode == 1
+    assert result.read_text().startswith("FAIL nice=7") and "没等到 dataplane" in result.read_text()
+
+    first, second = stand_in(), stand_in()
+    two = run("apply-when-up", "--wait", "1", "--settle", "0.1", "--result", str(result), check=False)
+    assert two.returncode == 1
+    assert "找到 2 个 dataplane" in result.read_text()
+    assert set(nices(first.pid).values()) == set(nices(second.pid).values()) == {0}
+
+
+@pytest.mark.skipif(ROOT, reason="as root the nice can be lowered")
+def test_apply_when_up_says_fail_when_the_threads_are_not_changed(env, tmp_path):
+    stand_in, run, _ = env
+    process = stand_in()
+    result = tmp_path / "result"
+    lowered = run("apply-when-up", "--nice", "-5", "--wait", "1", "--settle", "0.1", "--result", str(result),
+                  check=False)
+    assert lowered.returncode == 1
+    assert result.read_text().startswith("FAIL nice=-5") and "4/4 个线程没改成" in result.read_text()
+    assert set(nices(process.pid).values()) == {0}
+
+
+def test_apply_when_up_fails_when_the_dataplane_ends_before_it_is_done(env, tmp_path):
+    stand_in, _, values = env
+    process = stand_in()
+    result = tmp_path / "result"
+    waiting = subprocess.Popen(
+        [sys.executable, str(SCRIPT), "apply-when-up", "--wait", "5", "--settle", "1.5", "--result", str(result)],
+        env=values, stdout=subprocess.PIPE, text=True,
+    )
+    try:
+        wait_for(lambda: "已起" in (waiting.stdout.readline() or ""), "the dataplane found")
+        process.kill()
+        process.wait()
+        assert waiting.wait(timeout=10) == 1
+        assert result.read_text().startswith("FAIL") and "已退出" in result.read_text()
+    finally:
+        if waiting.poll() is None:
+            waiting.kill()
+            waiting.wait()
