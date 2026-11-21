@@ -1027,7 +1027,9 @@ the repository; this is what they do, in order.
 1. **One stack per robot network.** Nothing else on the robot LAN may run a
    pipeline or a data plane; `ROS_DOMAIN_ID=0`, DDS restricted to the robot LAN
    interface (10.0.1.50 on the board) with a FastDDS profile XML.
-2. **Build** in a clean shell (project venv, the tree's `.shrc_local`, the
+2. **Build** in a tree already set up for the X2 (dependencies installed by
+   the normal setup; this is not a from-scratch install) in a clean shell
+   (project venv, the tree's `.shrc_local`, the
    vendor overlay `~/aimdk/install/local_setup.bash`; without the overlay
    `aimdk_dataplane` builds no node and only fails at launch):
    `./scripts/build.sh -- --packages-select ibrobot_msgs embodied_common robot_config manipulation_execution aimdk_dataplane aimdk_robot skill_library`.
@@ -1048,19 +1050,26 @@ the repository; this is what they do, in order.
 4. **Preconditions**: the board clock is set (it has no RTC; a 1970 date means
    the robot clock service has not synced and covers do nothing), the vendor
    state is `action STAND_DEFAULT`, and no other launch is running.
-5. **Start** in the background, from the tree with the environment above:
+5. **Start** in the background, from the tree with the environment above. The
+   launch gets its own process group (its pid is the group id, saved for the
+   stop step) and writes `launch.log`:
 
    ```bash
-   ros2 launch embodied_bringup embodied_pipeline.launch.py robot_config:=aimdk_x2_magicmirror \
-     config_path:=$PWD/src/robot_config/config/robots/aimdk_x2_show.yaml \
-     control_mode:=model_inference authorize_motion:=true
-   python3 scripts/x2_dataplane_sched/x2_dataplane_nice.py apply-when-up --nice -5 --settle 2 \
-     --result dataplane_nice.result
+   LOG=$PWD/log/show-$(date +%m%d-%H%M%S); mkdir -p "$LOG"
+   setsid bash -c 'echo $$ > "$0/launch.pid"; exec ros2 launch embodied_bringup embodied_pipeline.launch.py \
+       robot_config:=aimdk_x2_magicmirror \
+       config_path:="$1"/src/robot_config/config/robots/aimdk_x2_show.yaml \
+       control_mode:=model_inference authorize_motion:=true' "$LOG" "$PWD" \
+     </dev/null >"$LOG/launch.log" 2>&1 &
+   setsid python3 scripts/x2_dataplane_sched/x2_dataplane_nice.py apply-when-up --nice -5 --settle 2 \
+     --result "$LOG/dataplane_nice.result" </dev/null >"$LOG/dataplane_nice.log" 2>&1 &
+   tail -f "$LOG/launch.log"    # Ctrl-C here only stops tail
    ```
 
-   The second command waits for the data plane and sets all its threads to
-   nice -5 (the show runs with it; see `scripts/x2_dataplane_sched/README.md`).
-   Its result line starts with `ok` when it took effect; the stack runs either way.
+   The second command waits for the data plane, sets all its threads to nice -5
+   (the show runs with it; see `scripts/x2_dataplane_sched/README.md`) and exits
+   by itself. `dataplane_nice.result` starts with `ok` when it took effect; the
+   stack runs either way.
 6. **Mirror without gestures**: once `launch.log` has `Runtime interfaces bound;
    consumer snapshot: <file>`, run
    `robot-skill --config-path <file> execute mirror_start --task-id <id>`
@@ -1069,9 +1078,12 @@ the repository; this is what they do, in order.
 7. **Stop in this order**: `ros2 service call /mirror_session/set_session
    std_srvs/srv/SetBool "{data: false}"`, wait until the vendor state is back to
    `STAND_DEFAULT` (the arms return to the vendor stand: keep clear), then SIGINT
-   the launch's process group. Killing the processes first leaves no one to
-   request idle, and the robot has to be restarted.
+   the launch's process group, `kill -INT -- -"$(cat "$LOG/launch.pid")"`, and
+   wait for it to exit. Killing the processes first leaves no one to request
+   idle, and the robot has to be restarted.
 
 The templates need the remote two-hand gesture service on the Orin
 (`/perception/hand_gesture/classify`, engine sha256 `421c3256…d639`, pinned in
-the profile). Without it the mirror runs unchanged and no template starts.
+the profile). Its source is in this repository; deploying it on the Orin, its
+autostart and its model weights are not. Without it the mirror runs unchanged
+and no template starts.
