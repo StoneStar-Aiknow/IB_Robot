@@ -1,4 +1,4 @@
-# X2 #3 on site: every template on. Only used when the robot yaml points
+# X2 #3 on site: every template on but xsign. Only used when the robot yaml points
 # mirror_session.motion_template_config here (with template_play, the gesture
 # model and preset_motions.gesture switched on, motion_enabled kept false; see
 # motion-template-integ-yaml). The blend settings are the code defaults, the
@@ -26,4 +26,5 @@ motion_template:
     overhead_heart: {enabled: true, segments: [overhead_heart]}
     heart: {enabled: true, segments: [heart]}
     holy: {enabled: true, segments: [holy]}
-    xsign: {enabled: true, segments: [xsign_left_front, xsign_right_front]}
+    # 11-21 zll：本次展会不用 X，代码和段保留
+    xsign: {enabled: false, segments: [xsign_left_front, xsign_right_front]}

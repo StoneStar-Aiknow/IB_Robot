@@ -362,9 +362,10 @@ def test_the_shipped_config_switched_on_loads_every_template():
     assert {"heart@50", "heart@75"} <= set(setup.segments)
 
 
-def test_the_on_site_config_loads_every_template():
+def test_the_on_site_config_loads_every_template_but_xsign():
     setup = load_config(str(CONFIG_DIR / "motion_template_onsite.yaml"), HAND)
-    assert setup.notes == [] and set(setup.templates) == {"overhead_heart", "heart", "holy", "xsign"}
+    assert setup.notes == [] and set(setup.templates) == {"overhead_heart", "heart", "holy"}
+    assert {"xsign_left_front", "xsign_right_front"} <= set(setup.segments)  # zll 11-21: off, segments kept
     shipped_blend = parse_config(shipped_on(), str(CONFIG_DIR), HAND).blend
     assert setup.blend == replace(shipped_blend, a_pause_budget_s=2.0)  # the shipped file's blend but for zll 11-20
     assert (setup.blend.a_pause_budget_s, setup.blend.a_pause_budget_per_s, setup.blend.a_pause_max_s) == (2.0, 0, 4)
