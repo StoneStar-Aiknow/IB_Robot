@@ -1012,3 +1012,66 @@ The supplied motion metadata remains `draft`; permission basis, license,
 and hand firmware metadata have not been supplied. Local vendor Mock
 verification does not constitute physical robot acceptance. Workstation
 headset playback is not X2 speaker or human pronunciation acceptance.
+
+### Mirror show on the board (`aimdk_x2_show`)
+
+`robot_config/config/robots/aimdk_x2_show.yaml` is the show profile run on the
+X2 310P compute pack for the 2026 summit: the mirror (arms and left hand, CBF
+enforced, the empty right flange computed as a phantom hand), the look clips,
+the photo node and the motion templates heart, holy and overhead_heart (xsign
+stays in the segments but is off). It has no ASR and no voice agent: a double
+cover, a head touch or the `mirror_start` skill starts a round; a long cover,
+the session timeout or `mirror_stop` ends it. The site start scripts are not in
+the repository; this is what they do, in order.
+
+1. **One stack per robot network.** Nothing else on the robot LAN may run a
+   pipeline or a data plane; `ROS_DOMAIN_ID=0`, DDS restricted to the robot LAN
+   interface (10.0.1.50 on the board) with a FastDDS profile XML.
+2. **Build** in a clean shell (project venv, the tree's `.shrc_local`, the
+   vendor overlay `~/aimdk/install/local_setup.bash`; without the overlay
+   `aimdk_dataplane` builds no node and only fails at launch):
+   `./scripts/build.sh -- --packages-select ibrobot_msgs embodied_common robot_config manipulation_execution aimdk_dataplane aimdk_robot skill_library`.
+   Do not build or run tests while the robot moves.
+3. **Hand model.** `models/hand_mediapipe_310p` under the tree root (not in
+   git; the profile's `model_dir`). Check it before the first start:
+
+   ```text
+   af62025fdcc1c56d1e0f5270c983ecf8419e1b1514a578bc9f706662ce3e5224  hand_mediapipe_310p/README.md
+   a51229a067c2e48d4e329ca44b660defda2eb5752ca61f72ac3afdbdb01b96e0  hand_mediapipe_310p/artifacts/ascend_310p/canned_gesture_classifier.npz
+   a2c476793bfe4c0689d5f0ce4a7c6f453c0f1bc5fdd710d7188967329b630843  hand_mediapipe_310p/artifacts/ascend_310p/gesture_embedder.om
+   211318c5f40b35ed6e379e03d544d43e3cf6afe8d59ac65bab3188efab768a46  hand_mediapipe_310p/artifacts/ascend_310p/hand_landmarks_detector.om
+   c34c8f3677eba1ee58e4a9dd9c35370cbcd9c61013f7e3da752c39426b36a61e  hand_mediapipe_310p/artifacts/ascend_310p/hd_npu.om
+   7c7163bc48f43b22b289974e4e866d9f1324c88b7b7051cce6f758d363792472  hand_mediapipe_310p/assets/adapter.json
+   99c13e41e121bb739158df863d7cc53fb1d3fb1148c943e7a71b75b87b30c375  hand_mediapipe_310p/inference_manifest.json
+   ```
+
+4. **Preconditions**: the board clock is set (it has no RTC; a 1970 date means
+   the robot clock service has not synced and covers do nothing), the vendor
+   state is `action STAND_DEFAULT`, and no other launch is running.
+5. **Start** in the background, from the tree with the environment above:
+
+   ```bash
+   ros2 launch embodied_bringup embodied_pipeline.launch.py robot_config:=aimdk_x2_magicmirror \
+     config_path:=$PWD/src/robot_config/config/robots/aimdk_x2_show.yaml \
+     control_mode:=model_inference authorize_motion:=true
+   python3 scripts/x2_dataplane_sched/x2_dataplane_nice.py apply-when-up --nice -5 --settle 2 \
+     --result dataplane_nice.result
+   ```
+
+   The second command waits for the data plane and sets all its threads to
+   nice -5 (the show runs with it; see `scripts/x2_dataplane_sched/README.md`).
+   Its result line starts with `ok` when it took effect; the stack runs either way.
+6. **Mirror without gestures**: once `launch.log` has `Runtime interfaces bound;
+   consumer snapshot: <file>`, run
+   `robot-skill --config-path <file> execute mirror_start --task-id <id>`
+   (`mirror_stop` the same way). `/mirror_session/state` (latched) and
+   `/mirror_operator/status` show the round.
+7. **Stop in this order**: `ros2 service call /mirror_session/set_session
+   std_srvs/srv/SetBool "{data: false}"`, wait until the vendor state is back to
+   `STAND_DEFAULT` (the arms return to the vendor stand: keep clear), then SIGINT
+   the launch's process group. Killing the processes first leaves no one to
+   request idle, and the robot has to be restarted.
+
+The templates need the remote two-hand gesture service on the Orin
+(`/perception/hand_gesture/classify`, engine sha256 `421c3256…d639`, pinned in
+the profile). Without it the mirror runs unchanged and no template starts.
