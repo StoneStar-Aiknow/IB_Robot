@@ -497,7 +497,8 @@ def test_cbf_only_voice_mirror_all_emits_configuration_across_robot_profiles(con
     # hardware interfaces. Checking raw YAML would miss an inherited enable.
     _, config = _load_robot_section(config_path)
     payload = _cbf_safety_json(config)
-    if config_path.stem == "aimdk_x2_voice_mirror_all":
+    # The summit show profile (show-profile-1120) runs the mirror with the CBF on.
+    if config_path.stem in ("aimdk_x2_voice_mirror_all", "aimdk_x2_show"):
         assert json.loads(payload)["enabled"] is True
     else:
         assert payload == "", f"{config_path.name} unexpectedly enables the mirror-only CBF"
@@ -691,6 +692,10 @@ def test_template_play_is_off_in_every_shipped_robot_profile(config_path):
 
     # Inherited sections included: grasp and summit inherit voice_mirror_all.
     _, config = _load_robot_section(config_path)
+    if config_path.stem == "aimdk_x2_show":
+        # The summit show profile plays the motion templates on purpose.
+        assert json.loads(_template_play_json(config))["enabled"] is True
+        return
     assert _template_play_json(config) == "", f"{config_path.name} unexpectedly enables the template port"
 
 
