@@ -249,6 +249,8 @@ public:
   void inactive(uint64_t epoch);
   // Tests only: after this many kernel calls in a frame its budget reads as spent.
   void limit_kernel_calls_for_test(int calls) {kernel_call_limit_ = calls;}
+  // Tests only: the gesture-ordering query gets at most this much computation (us).
+  void cap_hand_budget_for_test(double us) {hand_budget_cap_ = us;}
 
 private:
   CbfDecision cached_fallback(const CbfDecision & decision, const std::string & reason);
@@ -263,6 +265,7 @@ private:
   bool stuck_released_ = false;  // The hold has begun to release.
   std::optional<Output> a_cap_point_;  // This hold's frozen point, while the cap holds.
   int kernel_call_limit_ = -1;
+  double hand_budget_cap_ = -1.0;
 };
 
 }  // namespace aimdk_dataplane

@@ -1625,9 +1625,10 @@ TEST(CbfSafety, HandSubBudgetTimeoutDefersTheWholeGestureButLeavesBudgetForArmWi
   }
   observed.requested.hand[2] = 0.3;
   ASSERT_NE(observed.requested.hand, seed.output.hand);
-  // At most (100 ms - 40 ms) / 4 = 15 ms is offered to the hand query.
-  // Its existing 40 ms guard makes that sub-budget expire immediately, without
-  // sleeping or relying on a microsecond timing race. The arm retains ~60 ms compute.
+  // The hand query is offered no computation, so its sub-budget expires
+  // immediately, without sleeping or relying on a microsecond timing race.
+  // The arm retains ~60 ms compute.
+  safety.cap_hand_budget_for_test(0.0);
   const auto retreat = safety.filter(observed, 1.02);
   ASSERT_EQ(retreat.output.kind, Output::Kind::kUpperBody) << safety.diagnostics().reason;
   ASSERT_TRUE(retreat.accept_new) << safety.diagnostics().reason;
@@ -1655,6 +1656,34 @@ TEST(CbfSafety, HandSubBudgetTimeoutDefersTheWholeGestureButLeavesBudgetForArmWi
   EXPECT_EQ(safety.diagnostics().published, 2u);
   EXPECT_EQ(safety.diagnostics().held, 0u);
   EXPECT_EQ(safety.diagnostics().withheld, 0u);
+}
+
+TEST(CbfSafety, TheGestureQueryGetsAQuarterOfTheFrameNotAQuarterLessTheGuard)
+{
+  auto value = urdf_fixture_json();
+  value["deadline_us"] = 100000.0;
+  value["deadline_guard_us"] = 40000.0;
+  const auto config = fixture_config(value);
+  CbfSafety safety(config);
+  auto snapshot = urdf_snapshot();
+  const auto seed = safety.filter(snapshot, 1.0);
+  ASSERT_TRUE(seed.accept_new) << safety.diagnostics().reason;
+  safety.committed(seed, 1.0);
+  const auto budget_holds_before = safety.diagnostics().hand_budget_holds;
+
+  // A small thumb move at the standing pose, far from every other body.
+  snapshot.requested = seed.output;
+  ++snapshot.requested.sequence;
+  snapshot.requested.hand[1] += 0.01;
+  ASSERT_NE(snapshot.requested.hand, seed.output.hand);
+  // The query is offered (100 ms - 40 ms) / 4 = 15 ms. Taking the 40 ms guard
+  // off that again would leave it nothing (run-1121-103600: 1.74 ms, not 2.24 ms).
+  const auto decision = safety.filter(snapshot, 1.02);
+  ASSERT_TRUE(decision.accept_new) << safety.diagnostics().reason;
+  EXPECT_EQ(safety.diagnostics().hand_budget_holds, budget_holds_before);
+  EXPECT_FALSE(decision.hand_held) << safety.diagnostics().reason;
+  EXPECT_EQ(decision.output.hand, snapshot.requested.hand);
+  EXPECT_GT(safety.diagnostics().hand_check_us, 0.0);
 }
 
 TEST(CbfSafety, ProjectedRecoveryReusesItsKernelProofForTheUnchangedActualSnapshot)
