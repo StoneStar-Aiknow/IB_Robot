@@ -309,6 +309,7 @@ def test_a_gate_that_never_reaches_P_times_out_without_a_start():
     rig.step()
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.C)
     assert exit_reason(rig) == "a_timeout" and not rig.messages
+    assert " arrive=arm:" in lines(rig, "template exit heart")[0]  # the first check that failed, with its values
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.COOLDOWN)
 
 
@@ -320,6 +321,29 @@ def test_a_hand_that_does_not_arrive_times_out_too():
     rig.blender._hand_out = HAND_MIRROR
     assert rig.run(2.0, lambda: rig.blender.phase is Phase.C)
     assert exit_reason(rig) == "a_timeout" and not rig.messages
+    far = max(abs(a - b) for a, b in zip(HAND_MIRROR, SEGMENTS["heart"].hand_P))
+    tol = 0.5 * SEGMENTS["heart"].hand_start_tol
+    assert f" arrive=hand:{far:.3f}/{tol:.3f} " in lines(rig, "template exit heart")[0]
+
+
+def test_the_exit_line_counts_As_ticks_its_longest_gap_and_the_hand_overlays_holds():
+    rig = Rig()
+    rig.active["heart"] = 7
+    rig.blender.observe_hand_output(HAND_MIRROR, held_state=40)
+    rig.step()
+    assert rig.blender.phase is Phase.A
+    rig.run(0.2)
+    rig.step(0.13)  # the session starved for one tick
+    rig.blender.observe_hand_output(rig.hand, held_state=46)
+    rig.blender.observe_hand_output = lambda values: None  # the overlay's count stays at 46
+    rig.publish_port(state="HOLD", seg_id=999)  # another segment's: the port is busy, A cannot start
+    ticks = 11
+    while rig.blender.phase is Phase.A:
+        rig.step()
+        ticks += 1
+    line = lines(rig, "template exit heart")[0]
+    assert "reason=a_timeout" in line and " arrive=port_busy:HOLD " in line
+    assert f" a_ticks={ticks} a_gap_max=0.130 " in line and line.endswith(" hand_held_state=+6")
 
 
 def test_a_cbf_that_holds_during_A_goes_back_to_the_mirror():
@@ -810,6 +834,7 @@ def test_another_label_during_an_attempt_is_a_busy_trigger_and_an_attempt_has_on
     rig.step()
     exit_line = lines(rig, "template exit heart")[-1]
     assert "reason=label_inactive" in exit_line and "outcome=complete played=True" in exit_line
+    assert " arrive=ok " in exit_line and exit_line.endswith(" hand_held_state=unknown")  # the rig has no overlay
     # No field of the status is made up: unknown, never 0.
     assert "cbf=[no cbf reason=unknown of=newest recv_age=0.000 status_age=0.000 arm_age=unknown at=" in exit_line
     assert " epoch=1 owner=unknown active=unknown]" in exit_line

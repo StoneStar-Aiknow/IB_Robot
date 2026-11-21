@@ -138,9 +138,9 @@ class TemplateBlendHooks(SessionHooks):
             self._fail("hand_target", exc)
             return None
 
-    def observe_hand_output(self, values: Sequence[float] | None) -> None:
+    def observe_hand_output(self, values: Sequence[float] | None, held_state: int | None = None) -> None:
         try:
-            self._blender.observe_hand_output(values)
+            self._blender.observe_hand_output(values, held_state)
         except Exception as exc:
             self._fail("observe_hand_output", exc)
 

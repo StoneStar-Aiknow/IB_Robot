@@ -720,7 +720,7 @@ class MirrorSessionNode(Node):
             if self._hands_last is not None:
                 command = dataclasses.replace(command, hand=self._hands_last)
             if self._template is not None:
-                self._template.observe_hand_output(self._hands_last)
+                self._template.observe_hand_output(self._hands_last, self._hands.counts["held_state"])
         arm, hand = Float64MultiArray(data=list(command.arm)), Float64MultiArray(data=list(command.hand))
         if self._publish_enabled:
             self._arm_publisher.publish(arm)
