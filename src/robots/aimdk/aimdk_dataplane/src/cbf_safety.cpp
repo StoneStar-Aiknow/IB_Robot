@@ -560,7 +560,10 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
       const auto input = input_for(target);
       x2::cbf::SafetyFilterConfig cfg;
       const double available = remaining();
-      cfg.deadline_us = std::max(1.0, budget_cap_us < 0.0 ? available : std::min(available, budget_cap_us));
+      // The kernel stops its guard short of the deadline: a capped stage gets
+      // the guard on top, so that its own computation is the whole cap.
+      cfg.deadline_us = std::max(1.0, budget_cap_us < 0.0 ? available :
+        std::min(available, budget_cap_us + config_.guard_us));
       cfg.deadline_guard_us = std::min(config_.guard_us, cfg.deadline_us);
       cfg.max_step_rad = step;
       cfg.path_check_substeps = 64;
@@ -649,7 +652,8 @@ CbfDecision CbfSafety::filter(const CbfSnapshot & snapshot, double now)
     // Gesture ordering cannot consume the whole frame while the user needs
     // the arm to withdraw. Reserve three quarters of the available computation
     // window for arm verification/projection, without changing the frame limit.
-    const double hand_budget = 0.25 * std::max(0.0, remaining() - config_.guard_us);
+    double hand_budget = 0.25 * std::max(0.0, remaining() - config_.guard_us);
+    if (hand_budget_cap_ >= 0.0) {hand_budget = std::min(hand_budget, hand_budget_cap_);}
     const auto hand_first = run(target, 6.5, true, "thumb_ordering", true, hand_budget);
     if (remaining() <= config_.guard_us) {
       ++diagnostics_.deadlines;
