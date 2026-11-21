@@ -482,6 +482,7 @@ class Blender:
         self._clock_warned = -math.inf
         self._last_exit = ""
         self._hand_out: tuple[float, ...] | None = None
+        self._hand_held_state: int | None = None  # the hand overlay's held_state count, with its output
         self._snap: dict = {}
         self._last_step: float | None = None  # this tick's now
         self._prev_step: float | None = None
@@ -518,6 +519,12 @@ class Blender:
         self._entry_d = 0.0
         self._entry_dist = 0.0
         self._a_elapsed = 0.0
+        # A's log only: the first arrival check that failed (None: arrived, "-": not checked), the ticks
+        # and their longest gap, and the hand overlay's held_state count at entry.
+        self._arrive_why: str | None = "-"
+        self._a_ticks = 0
+        self._a_gap_max = 0.0
+        self._a_held_from: int | None = None
         self._anchor: tuple[float, ...] | None = None
         self._c_curve: _Quintic | None = None
         self._c_dist = 0.0
@@ -619,8 +626,9 @@ class Blender:
 
     # -- per tick -----------------------------------------------------------------
 
-    def observe_hand_output(self, values: Sequence[float] | None) -> None:
+    def observe_hand_output(self, values: Sequence[float] | None, held_state: int | None = None) -> None:
         self._hand_out = None if values is None else tuple(float(v) for v in values)
+        self._hand_held_state = held_state
 
     def hand_target(self, now: float) -> tuple[float, ...] | None:
         """The hand overlay's goal instead of the mirror's, or None for the mirror's.
@@ -910,6 +918,7 @@ class Blender:
             MIN_JERK_PEAK * self._entry_dist / config.a_peak_speed, hand + config.a_hand_margin_s, config.a_min_s
         )
         self._phase, self._since, self._entered_at = Phase.A, now, now
+        self._a_held_from = self._hand_held_state
         self._a_cap_from = now
         self._attempts += 1
         self._clock = _Clock(now)
@@ -938,6 +947,9 @@ class Blender:
 
     def _tick_a(self, now: float, inputs, m: tuple[float, ...]) -> tuple[float, ...] | None:
         config, segment = self._config, self._segment
+        self._a_ticks += 1
+        if self._prev_step is not None:
+            self._a_gap_max = max(self._a_gap_max, now - self._prev_step)
         if self._exit_pending is not None:
             return self._tick_exit_pending(now, m)
         reason = self._label_check(now, inputs)
@@ -955,7 +967,9 @@ class Blender:
             reason = self._a_cap_lost(now)
         if reason is not None:
             return self._leave_a(now, reason, m)
-        if not self._paused and elapsed >= self._t_a and self._arrived(now, inputs, cbf):
+        if not self._paused and elapsed >= self._t_a:
+            self._arrive_why = self._not_arrived(now, inputs, cbf)
+        if not self._paused and elapsed >= self._t_a and self._arrive_why is None:
             self._a_cap_off()  # before the start: B is the port's, not the CBF's
             try:
                 self._seg_id = self._client.start(segment.name, now)
@@ -969,24 +983,41 @@ class Blender:
             return segment.P
         return self._blend_a(now, m)
 
-    def _arrived(self, now: float, inputs, cbf) -> bool:
+    def _not_arrived(self, now: float, inputs, cbf) -> str | None:
+        """The first check A's start fails, with its values, for the exit line; None: A has arrived."""
         config, segment = self._config, self._segment
         sent = _arm(getattr(inputs.last_sent, "arm", None))
-        if sent is None or _farthest(sent, segment.P) > config.arrive_fraction * segment.start_tol_rad:
-            return False
+        tol = config.arrive_fraction * segment.start_tol_rad
+        if sent is None:
+            return "arm:none"
+        if _farthest(sent, segment.P) > tol:
+            return f"arm:{_farthest(sent, segment.P):.3f}/{tol:.3f}"
         hand = self._hand_out
         if hand is None or len(hand) != len(segment.hand_P):
-            return False
-        if _farthest(hand, segment.hand_P) > config.arrive_fraction * segment.hand_start_tol:
-            return False
+            return "hand:none"
+        tol = config.arrive_fraction * segment.hand_start_tol
+        if _farthest(hand, segment.hand_P) > tol:
+            return f"hand:{_farthest(hand, segment.hand_P):.3f}/{tol:.3f}"
         status = self._port.latest()
-        if status is None or not 0 <= now - status.received_at <= config.port_fresh_s:
-            return False
-        if status.state not in _PORT_FREE or self._client.busy:
-            return False
-        if self._pausing and (self._trust(cbf, now) is not None or cbf.safety_epoch != self._epoch):
-            return False
-        return cbf is not None and 0 <= now - cbf.received_at <= config.cbf_fresh_s and not cbf.intervening
+        if status is None:
+            return "port_stale:none"
+        if not 0 <= now - status.received_at <= config.port_fresh_s:
+            return f"port_stale:{now - status.received_at:.3f}"
+        if status.state not in _PORT_FREE:
+            return f"port_busy:{status.state}"
+        if self._client.busy:
+            return "port_busy:client"
+        if self._pausing:
+            why = self._trust(cbf, now)
+            if why is not None:
+                return f"untrusted:{why}"
+            if cbf.safety_epoch != self._epoch:
+                return f"epoch:{cbf.safety_epoch}/{self._epoch}"
+        if cbf is None:
+            return "cbf_stale:none"
+        if not 0 <= now - cbf.received_at <= config.cbf_fresh_s:
+            return f"cbf_stale:{now - cbf.received_at:.3f}"
+        return "cbf_intervening" if cbf.intervening else None
 
     def _a_cap_lost(self, now: float) -> str | None:
         """``a_cap_lost`` when the data plane does not hold the (b) flag for A, else None.
@@ -1619,13 +1650,18 @@ class Blender:
                 backoff = f" backoff={self._config.load_backoff_s:.1f}"
         paused_s = self._paused_s + (now - self._pause_since if self._paused else 0.0)
         a_cap = f" a_cap_wait={_known(self._a_cap_waited, '.2f')}" if self._config.a_cap else ""
+        held = "unknown"
+        if self._a_held_from is not None and self._hand_held_state is not None:
+            held = f"+{self._hand_held_state - self._a_held_from}"
+        arrive = "ok" if self._arrive_why is None else self._arrive_why
         self._log(
             f"template exit {name} seg={seg} phase={self._phase.value} reason={reason} "
             f"d={self._entry_d:.3f} dist={self._entry_dist:.3f} T_A={self._t_a:.2f} "
             f"a_elapsed={self._a_elapsed:.2f} phase_elapsed={now - self._since:.2f} "
             f"total={now - self._entered_at if self._entered_at is not None else 0.0:.2f} "
             f"outcome={outcome} played={self._played_at is not None} cbf=[{cbf_text}] label=[{label}] "
-            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}{back}{a_cap}"
+            f"pauses={self._pauses} paused_s={paused_s:.2f}{backoff}{back}{a_cap} "
+            f"arrive={arrive} a_ticks={self._a_ticks} a_gap_max={self._a_gap_max:.3f} hand_held_state={held}"
         )
 
     def _refresh_snapshot(self) -> None:
