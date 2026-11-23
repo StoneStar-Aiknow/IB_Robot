@@ -8,13 +8,13 @@ skip with a reason naming what is missing — unless
 platform, in which case any skip of it fails instead, so an acceptance run
 can never silently lose a platform.
 
-This is test-support API, not runtime API (see ``robot_runtime/testing``):
+This is test-support API, not runtime API (see ``robot_runtime_sim.testing``):
 importing this module starts no process and creates no ROS entity; the
 probes run short-lived subprocesses and ament lookups only when called. The
 module lives here — not in a robot package — so any test in a package that
-depends on robot_runtime (robot_config's navigation end-to-end test,
-lekiwi_robot's gates) can share ONE rule without a test_depend cycle
-(lekiwi-mujoco-runtime-platform D15).
+declares a test_depend on robot_runtime_sim (robot_config's navigation
+end-to-end test, lekiwi_robot's gates) can share ONE rule without a
+test_depend cycle (lekiwi-mujoco-runtime-platform D15).
 """
 
 from __future__ import annotations

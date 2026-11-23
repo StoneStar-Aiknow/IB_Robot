@@ -150,3 +150,16 @@ def test_recording_uses_public_topics():
     assert "/unit/front/image" in topics and "/unit/front/info" in topics and "/unit/joints" in topics
     assert "/unit/velocity" in topics
     assert "/joint_states" not in topics and "/camera/not_public/image_raw" not in topics
+
+
+def test_offline_gamepad_config_records_without_a_runtime_snapshot():
+    # An active provider gamepad needs a live base.cmd_vel binding at launch, but
+    # an offline configuration whose contract binds nothing carries no runtime
+    # description; topic discovery must not require one.
+    config = load_robot_config_dict(ROBOT_CONFIG_SHARE / "config" / "robots" / "lekiwi_lidar.yaml")
+    config["teleoperation"]["active_device"] = "lekiwi_gamepad"
+    config.get("recording", {}).pop("topics", None)
+
+    topics = get_recording_topics(config)
+
+    assert "/joint_states" in topics

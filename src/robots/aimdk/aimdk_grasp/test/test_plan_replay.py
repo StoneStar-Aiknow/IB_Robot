@@ -6,9 +6,10 @@ import pickle
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from aimdk_grasp.feedback import Feedback
 from aimdk_grasp.plan_replay import recorded_calls, replay, shifted, summary, with_leg_boxes
-from aimdk_grasp.scene_estimation import LEG_OBSTACLE, SceneEstimate, leg_boxes
+from aimdk_grasp.scene_estimation import LEG_OBSTACLE, SceneEstimate, leg_boxes, leg_obstacle_name
 
 
 def recorded(received_at, *, success=True, snapshot_now=None):
@@ -56,7 +57,11 @@ class FakeService:
     def plan(self, feedback, estimate, grasps, confidence, matrix, *, deadline, **options):
         self.calls.append("plan")
         self.seen.append((estimate.received_at, options.get("snapshot_now"), deadline))
-        if not any(name.startswith(LEG_OBSTACLE) for name in estimate.scene["cuboid"]):
+        self.leg_boxes = sorted(name for name in estimate.scene["cuboid"] if "_leg_" in name)
+        # The leg this service's arm keeps away from (a left-arm service when it does not say).
+        if not any(
+            name.startswith(leg_obstacle_name(getattr(self, "side", "left"))) for name in estimate.scene["cuboid"]
+        ):
             raise RuntimeError("Interpolated approach segment violates fine collision constraints: world 50 mm")
         return None, {"candidate_index": 2, "planning_attempts": [{}, {}]}
 
@@ -80,3 +85,25 @@ def test_a_replay_runs_each_call_in_order_on_increasing_clocks_beside_its_live_o
     assert [(row["success"], row["candidate"], row["attempts"]) for row in boxed] == [(True, 2, 2)] * 2
     totals = summary(rows)
     assert (totals["calls"], totals["planned"], totals["live_planned"], totals["fine_failures"]) == (4, 0, 2, 4)
+
+
+def test_each_call_replays_on_the_arm_it_was_recorded_on(tmp_path):
+    """Right-arm recordings used to replay on a left-arm planner without a word."""
+    for name, side in (("plan_1.pkl", "right"), ("plan_2.pkl", "left")):
+        call = recorded(50.0)
+        call["service"] = {"side": side}
+        (tmp_path / name).write_bytes(pickle.dumps(call))
+    files = recorded_calls([tmp_path])
+    services = {side: FakeService() for side in ("left", "right")}
+    for side, service in services.items():
+        service.side = side
+    rows = replay(files, services, leg_shrink_m=0.025)
+    assert services["right"].calls == ["prepare", "plan"] and services["left"].calls == ["prepare", "plan"]
+    # Each arm's coarse scene gets its own leg's boxes, so both plan.
+    assert all(row["success"] for row in rows)
+    for side, service in services.items():
+        assert service.leg_boxes and all(name.startswith(f"{side}_leg_") for name in service.leg_boxes)
+    left_only = FakeService()
+    left_only.side = "left"
+    with pytest.raises(ValueError, match="right arm"):
+        replay(files, left_only)

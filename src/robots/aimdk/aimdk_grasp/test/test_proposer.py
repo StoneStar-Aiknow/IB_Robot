@@ -16,8 +16,8 @@ from aimdk_grasp.proposer import NO_EXECUTABLE_CANDIDATE, PerceptionSettings, X2
 from aimdk_grasp.scene_estimation import SceneEstimate
 from aimdk_grasp.types import CameraIntrinsics, RGBDFrame
 
-from manipulation_execution.pick.pipeline.contracts import GraspFailure, Observation
 from manipulation_execution.pick.pipeline.perception import Detection
+from manipulation_execution.shared.contracts import GraspFailure, Observation
 
 SIZE, STAMP, FRAME = 50, 123_000_000, "optical"
 ON_TABLE = np.s_[20:28, 20:28]  # 0.1 m above the table
@@ -121,6 +121,10 @@ def test_the_target_comes_with_its_candidates_and_the_scene_the_planner_preloads
         report["perception_timings_s"]
     )
     assert [call["service"] for call in report["model_rpc"]] == ["detect", "segment", "grasps"]
+    spans = {name: (start, end) for name, start, end in report["perception_timings_s"]["spans_s"]}
+    assert {"detect", "grasp", "scene"} <= set(spans)
+    assert all(0 <= start <= end for start, end in spans.values())
+    assert spans["detect"][1] <= spans["grasp"][0]  # GraspGen-X needs the target's points
 
 
 def test_a_detection_with_no_support_beneath_gives_way_to_the_next_one():
@@ -322,3 +326,20 @@ def test_an_upside_down_camera_is_detected_upright_and_its_target_found_where_it
     assert proposals.target_mask[ON_TABLE].all() and proposals.target_mask.sum() == 64
     assert proposals.report["detection"]["box_xyxy"] == [20.0, 20.0, 28.0, 28.0]
     assert proposals.report["detection_turns"] == 2 and len(proposals.target_points) == 64
+
+
+def test_capture_scene_is_prepared_around_the_image_time_robot(monkeypatch):
+    from aimdk_grasp import proposer, scene_estimation
+
+    frame = SimpleNamespace(depth="depth", intrinsics="K", frame_id="camera", depth_scale=0.001)
+    transform = SimpleNamespace(stamp_ns=7)
+    registered = SimpleNamespace(frame=frame, transform=transform, received_at=3.5, image_feedback="image feedback")
+    observation = SimpleNamespace(robot_state=SimpleNamespace(live=SimpleNamespace(observation=registered)))
+    seen = {}
+    monkeypatch.setattr(proposer, "measured_spheres", lambda model, feedback: (model, feedback))
+    monkeypatch.setattr(scene_estimation, "prepare_scene", lambda *args, **kwargs: seen.update(args=args, **kwargs))
+    proposer.prepare_capture_scene(observation, "right model", "config")
+    assert seen["args"] == ("depth", "K", transform)
+    assert seen["robot_spheres_torso"] == ("right model", "image feedback")
+    assert (seen["stamp_ns"], seen["camera_frame"], seen["received_at"]) == (7, "camera", 3.5)
+    assert (seen["depth_scale"], seen["config"]) == (0.001, "config")

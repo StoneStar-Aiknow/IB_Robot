@@ -34,6 +34,10 @@ string request_id
 string program_digest
 string workflow_digest
 uint32 completed_step_count
+uint64 last_event_sequence
+uint32 workflow_step_index
+string current_skill
+ExecutionDetail execution_detail
 string state
 string error_code
 string message
@@ -49,3 +53,4 @@ uint32 workflow_step_index
 string current_skill
 string detail
 string program_digest
+ExecutionDetail execution_detail

@@ -1,0 +1,17 @@
+# Start a pick's capture and perception before its PickObject goal (while the
+# task-pose preparation runs). Fire and forget.
+# Identity: the result belongs to dispatch_binding.root_task_id and target_query;
+# a goal of another root task or target never uses it.
+# Clock: the capture is stamped in the ROS clock domain (image time); its age
+# is measured by the pick executor on its own monotonic clock from when the
+# capture returned. No monotonic value crosses hosts.
+# Invalidation: the goal observes again when the robot's measured posture
+# changed since the capture, the capture is older than the executor's limit,
+# the ROS clock jumped back, or another prefetch replaced it.
+# container_query, when set, also detects the place's container.
+DispatchBinding dispatch_binding
+string target_query
+string container_query
+---
+bool accepted
+string reason

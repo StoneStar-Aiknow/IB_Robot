@@ -13,7 +13,8 @@
 
 ## RGB-D LiDAR 数据采集
 
-联合采集使用独立 capture profile。开始前必须已批准 D435i/MID-360 标定，确保
+联合采集配置是 `base_config: lekiwi_lidar` 的 overlay，默认选择 `mapping` stage，
+由 `lekiwi_robot` provider 的 `lekiwi_lidar` profile 管理底盘和传感器。开始前必须已批准 D435i/MID-360 标定，确保
 `~/.ros/ibrobot/calib/current/base_to_front_camera.yaml` 存在且状态为 `approved`。
 
 开发板终端 A 启动采集主链，并在保存结束前保持运行：
@@ -26,11 +27,21 @@ ros2 launch robot_config robot.launch.py \
 该 profile 直接启用 MID-360、FAST-LIO、slam_toolbox、D435i 和 continuous MCAP 录制，不需要额外选择
 navigation stage 或录制开关，也不支持 episodic 录制。
 
-开发板终端 B 使用键盘遥控完成建图轨迹：
+`use_sim:=true` 显式选择 MuJoCo 的 RGB-D、LiDAR 和 FAST-LIO 链路。
+MuJoCo 转发采集必需的 depth 和 aligned-depth CameraInfo。
+slam_toolbox 在仿真时使用 simulation time，订阅 scan_converter 提供的 `/scan`，发布 `/map`。
+录制 session state 和数据集 manifest 的 `lidar_message_type` 字段记录 LiDAR 消息类型：
+物理仿真（Gazebo/MuJoCo）为 `sensor_msgs/msg/PointCloud2`，其他模式（真机、SDK、mock）为
+`livox_ros_driver2/msg/CustomMsg`。
+缺少该字段的旧 session 按真机类型校验；其他必需话题的类型和非零消息数检查不变。
+Gazebo 只共享 color CameraInfo 话题，不满足当前采集清单。
+SDK 合成流缺少采集必需的原始里程计和相机安装 TF。
+单元测试验证节点构造、传感器描述、话题接线和按 session 类型执行的采集校验。
+仿真采集尚未通过端到端验收，不能据此认定能生成有效数据集。
 
-```bash
-ros2 run teleop_twist_keyboard teleop_twist_keyboard
-```
+在启动主链的主机连接手柄（默认 `/dev/input/js0`）。配置自动选择 runtime 管理的
+`lekiwi_gamepad`：按住 LB 后用摇杆移动，松开停止，B 调用 `/runtime/stop` 并锁止。
+启动准入会先选择 `base_navigation` 模式并打开导航门；不要另启键盘或其他 `/cmd_vel` 发布者。
 
 在同一 ROS domain 的 PC 端启动低带宽 RViz 预览：
 
@@ -98,8 +109,8 @@ ros2 run semantic_mapping save_semantic_map
 
 reindex 后的 `metadata.yaml` 是 topic/type/count 的唯一事实源。LiDAR、IMU、FAST-LIO raw/filtered odometry、
 registered cloud、scan、map、RGB、raw/aligned depth、三路 CameraInfo、`/tf` 和 `/tf_static` 必须类型匹配且非零。
-当前 capture profile 禁止 cmd bridge 发布另一套 wheel odometry，且 20 秒静止烟测可以没有操作员命令，因此
-`/wheel/odom` 和 `/cmd_vel` 只做 reported/optional，不会造成无害的静止烟测失败；`/diagnostics` 不录制也不检查。
+runtime 提供底盘 `/odom`，且 20 秒静止烟测可以没有操作员命令，因此
+`/odom` 和 `/cmd_vel` 只做 reported/optional，不会造成无害的静止烟测失败；`/diagnostics` 不录制也不检查。
 metadata 有 per-file 时间时，顶层 start/duration 必须覆盖所有 split；旧 Humble metadata 没有 per-file 时间时只记录
 coverage unavailable。
 
@@ -188,7 +199,8 @@ semantic_mapping:
 ```
 
 完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、labels、target-watch 和 public interface
-参数，参考 `robot_config/config/robots/lekiwi_realsense_mapping.yaml`。模型 endpoint 的唯一配置源是顶层
+参数；验证用模板已移到 `robot_config/test/config/semantic_mapping_fixture.yaml`，它不是部署入口。
+独立 launch 必须通过 `config_path` 或 `robot_config` 指定已启用语义建图的部署配置。模型 endpoint 的唯一配置源是顶层
 `perception_services.services`；每个 role 指向一个 enabled service ID，不再直接配置 backend、endpoint 或模型
 identity。service 模式下 loader 从 schema-v3 bundle manifest 取得 semantic identity，验证精确 service type 和 required/optional
 policy，并拒绝 SigLIP2 image/text embedding metadata 不兼容的配置。检查入库的 service entries 是 disabled

@@ -202,6 +202,18 @@ def platform_settings(profile: Mapping[str, Any], platform: str) -> dict[str, An
     return dict(section)
 
 
+def platform_extensions(settings: Mapping[str, Any], platform: str) -> list[str]:
+    """``simulation.<platform>.extensions``: ``module:attr`` of the optional layers the profile attaches.
+
+    Shipped profiles name none; a caller that needs a layer (an evaluation run, for one)
+    starts the runtime with its own copy of the profile that lists it.
+    """
+    raw = settings.get("extensions") or []
+    if isinstance(raw, str) or not isinstance(raw, list | tuple):
+        raise DescriptorError(f"runtime profile simulation.{platform}.extensions must be a list of module:attr")
+    return [str(entry).strip() for entry in raw if str(entry).strip()]
+
+
 def descriptor_from_profile(profile: Mapping[str, Any], *, platform: str, clock_mode: str) -> AdapterDescriptor:
     """Build a descriptor from a runtime profile's ``motion_groups`` and ``simulation.<platform>``.
 

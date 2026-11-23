@@ -1,0 +1,23 @@
+# Take custody for a place. Idempotent per request_id: a repeated request
+# returns the first answer and never transfers twice.
+uint32 schema_version
+string request_id
+string custody_id
+string custody_epoch
+string target_query
+# Who claims: only "place" (embodied_common.held_custody_contract.CLAIMANTS).
+string claimant
+# Renew: the token of an earlier claim by the same claimant (accepted while that
+# place still holds the custody; held_custody_contract.accepts_renewal).
+string claim_token
+# In (0, held_custody_contract.CLAIM_LEASE_MAX_S]; only a custody the pick holds is handed over.
+float64 lease_s
+DispatchBinding dispatch_binding
+---
+bool success
+# Why the claim was refused (held_custody_contract.CUSTODY_ERRORS); empty on success.
+string error_code
+string claim_token
+HeldObject held_object
+# The container the pick detected for this place; empty query when none.
+PrefetchedContainer container

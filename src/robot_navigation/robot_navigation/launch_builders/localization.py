@@ -39,7 +39,7 @@ def generate_localization_nodes(
     nodes = []
 
     slam_toolbox_config = nav_config.get("slam_toolbox", {})
-    if slam_toolbox_config.get("enabled", False) and not use_sim:
+    if slam_toolbox_config.get("enabled", False):
         params_file = slam_toolbox_config.get("params_file", "")
         parameters = [resolve_ros_path(params_file)] if params_file else []
         parameters.append(

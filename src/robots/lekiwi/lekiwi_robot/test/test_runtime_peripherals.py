@@ -3,7 +3,8 @@
 Renders the shipped ``runtime.launch.py`` against the real ``lekiwi_nav_grasp``
 profile: a deployment fragment disabling the declared ``front`` RealSense
 camera removes it from the live description and from the physical and
-synthetic peripheral actions alike.
+synthetic peripheral actions alike. The physical launch also reports the
+follower arm calibration against the profile (issue #248).
 """
 
 from __future__ import annotations
@@ -13,11 +14,30 @@ import json
 from pathlib import Path
 
 import launch
+import pytest
 import yaml
 from launch_ros.actions import Node
 
 _PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_nav_grasp.yaml"
 _LAUNCH = Path(__file__).resolve().parents[1] / "launch" / "runtime.launch.py"
+
+_FOLLOWER_FILE = "so101_follower_calibrate.json"
+
+
+@pytest.fixture(autouse=True)
+def _pinned(pinned_calibration):
+    # Every test here renders the physical robot; see conftest.pinned_calibration.
+    return pinned_calibration
+
+
+@pytest.fixture
+def _preflight_log(monkeypatch):
+    """Capture what the calibration preflight logs from inside the launch."""
+    import robot_runtime.preflight as preflight
+
+    logged = []
+    monkeypatch.setattr(preflight, "_launch_log", lambda level, text: logged.append((level, text)))
+    return logged
 
 
 def _runtime_launch_module():
@@ -126,3 +146,37 @@ def test_launch_declares_the_peripherals_argument():
         if isinstance(action, DeclareLaunchArgument)
     }
     assert "peripherals" in names
+
+
+def test_physical_launch_reports_the_arm_calibration_in_one_line(_preflight_log):
+    _render("false", "")
+    assert len(_preflight_log) == 1
+    level, text = _preflight_log[0]
+    assert level == "info"
+    # Arm joints 1-5 carry a home pose; joint 2 is the tightest (see so101_robot).
+    assert text.startswith("calibration preflight: PASS, 5 home poses within limits, min margin 0.251 rad at joint 2")
+
+
+def test_arm_calibration_excluding_a_home_pose_fails_the_physical_launch_with_the_table(_pinned, _preflight_log):
+    # Elbow (joint 3) range_max 2986: limit 1.439 rad, below its home 1.5708 rad.
+    _pinned.use({_FOLLOWER_FILE: _pinned.follower(**{"3": {"range_max": 2986}})})
+    with pytest.raises(ValueError, match=r"robot_model\.home_positions\.3 is outside physical limits"):
+        _render("false", "")
+    assert [level for level, _ in _preflight_log] == ["error"]
+    row = next(line for line in _preflight_log[0][1].splitlines() if line.startswith("3 "))
+    assert row.split()[-2:] == ["+1.571", "-0.132"]
+
+
+def test_simulated_launch_runs_no_calibration_preflight(_preflight_log):
+    _render("true", "")
+    assert _preflight_log == []
+
+
+def test_missing_arm_calibration_is_reported_by_the_checked_render(_pinned, _preflight_log):
+    # The arm-only motion model reads the same file; the checked public render
+    # runs first, so the missing file is reported before the launch fails.
+    _pinned.use({})
+    with pytest.raises(ValueError, match="calibration file not found"):
+        _render("false", "")
+    assert [level for level, _ in _preflight_log] == ["error"]
+    assert "FAIL  RuntimeProfileError: calibration file not found" in _preflight_log[0][1]

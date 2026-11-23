@@ -74,6 +74,25 @@ def test_buffer_owns_data_and_never_refreshes_source_age(observation):
     assert not buffer.update_feedback(replace(original.image_feedback, received_at=-1.0))
 
 
+@pytest.mark.parametrize("side", ["left", "right", None])
+def test_snapshot_can_own_one_hand_or_no_hands_without_fabricating_the_other(observation, side):
+    from aimdk_grasp.observation import copy_feedback, observation_hand_mapping
+
+    hands = {f"{s}_hand": None for s in ("left", "right")}
+    if side is not None:
+        hands[f"{side}_hand"] = observation_hand_mapping(side).to_native(OPEN)
+    source = replace(observation().image_feedback, **hands)
+    copied = copy_feedback(source)
+    if side is not None:
+        np.testing.assert_array_equal(copied.hand(side), source.hand(side))
+        source.hand(side)[0] += 0.01
+        assert copied.hand(side)[0] != source.hand(side)[0]
+    for s in ("left", "right"):
+        if s != side:
+            with pytest.raises(ValueError, match=f"lacks {s}"):
+                copied.hand(s)
+
+
 def test_buffer_waits_for_both_streams(observation):
     buffer = ObservationBuffer()
     buffer.update_observation(observation())

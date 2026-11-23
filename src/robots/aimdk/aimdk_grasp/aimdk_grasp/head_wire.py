@@ -19,7 +19,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from manipulation_execution.pick.pipeline.contracts import (
+from manipulation_execution.shared.contracts import (
     ArmSegment,
     Effect,
     EffectorAction,

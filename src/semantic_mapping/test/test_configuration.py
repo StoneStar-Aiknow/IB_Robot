@@ -13,7 +13,12 @@ from semantic_mapping.configuration import (
     semantic_perception_nodes,
 )
 
-CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_realsense_mapping.yaml"
+CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "test" / "config" / "semantic_mapping_fixture.yaml"
+
+
+def test_standalone_mapping_requires_an_explicit_deployment():
+    with pytest.raises(ValueError, match="Specify config_path or robot_config"):
+        load_semantic_mapping_robot_config("")
 
 
 def _write_enabled_config(tmp_path: Path) -> Path:

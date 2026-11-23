@@ -7,8 +7,8 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 import pytest
-from aimdk_grasp.hand import HandMapping, hand_links, load_gripper_presets
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES
+from aimdk_grasp.hand import HandLimitError, HandMapping, hand_links, load_gripper_presets
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, hand_joints
 from aimdk_grasp.planning_model import HAND_URDF, description_share
 from aimdk_grasp.robot_model import planning_model
 
@@ -79,3 +79,68 @@ def test_gripper_presets_must_describe_this_hand(tmp_path):
     (gripper / "config.json").write_text(json.dumps({"links": links[:-1], **PRESETS}))
     with pytest.raises(ValueError, match="gripper links"):
         load_gripper_presets(gripper, planning_model())
+
+
+def test_the_right_hand_is_mounted_natively_with_the_same_alias_presets():
+    """One gripper description serves both hands: its alias presets are the right hand's native values."""
+    from aimdk_grasp.joints import HAND_SIGNS
+    from aimdk_grasp.robot_model import config_directory
+
+    left = HandMapping(planning_model(), PRESETS)
+    right = HandMapping(planning_model(config_directory("right")), PRESETS, side="right")
+    assert right.side == "right" and left.side == "left"
+    for name in ("open", "close"):
+        np.testing.assert_allclose(right.preset(name), [PRESETS[name][joint] for joint in HAND_ALIASES])
+        np.testing.assert_allclose(right.preset(name), left.preset(name) * HAND_SIGNS)
+    # Mirror poses of the two hands give the same aliases and coupled distal joints.
+    native = np.asarray(RELEASE) * HAND_SIGNS
+    assert right.to_alias(native) == pytest.approx(left.to_alias(RELEASE))
+    assert right.kinematic_alias(native) == pytest.approx(left.kinematic_alias(RELEASE))
+    np.testing.assert_allclose(right.lower, np.sort(np.c_[left.lower, left.upper] * HAND_SIGNS[:, None])[:, 0])
+    with pytest.raises(ValueError, match="Right hand exceeds"):
+        right.check(native + np.r_[0.0, 4.0, np.zeros(8)])
+    with pytest.raises(RuntimeError, match="Initial right hand is not open"):
+        right.require_open(right.preset("close"))
+    # A thumb abduction 0.088 rad short of the open preset counts as open; 0.12 does not.
+    open_pose = right.preset("open")
+    inward = 1.0 if open_pose[1] + 0.12 <= right.upper[1] else -1.0
+    short = open_pose.copy()
+    short[1] += 0.088 * inward
+    assert right.require_open(short) == pytest.approx(0.088)
+    short[1] = open_pose[1] + 0.12 * inward
+    with pytest.raises(RuntimeError, match="Initial right hand is not open"):
+        right.require_open(short)
+    # Every other joint keeps the 0.025 rad bound.
+    for joint in (0, 2, 4):
+        short = open_pose.copy()
+        short[joint] += 0.03 if open_pose[joint] + 0.03 <= right.upper[joint] else -0.03
+        with pytest.raises(RuntimeError, match="Initial right hand is not open"):
+            right.require_open(short)
+    with pytest.raises(ValueError, match="side must be"):
+        HandMapping(planning_model(), PRESETS, side="middle")
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_limit_refusal_names_each_joint_its_excess_and_the_vector(side):
+    from aimdk_grasp.robot_model import config_directory
+
+    mapping = HandMapping(planning_model(config_directory(side)), PRESETS, side=side)
+    q = mapping.preset("open").copy()
+    q[0] = mapping.lower[0] - 2e-6
+    q[3] = mapping.upper[3] + 0.01
+    with pytest.raises(HandLimitError) as exc:
+        mapping.check(q)
+    joints = hand_joints(side)
+    assert [(v[0], v[1]) for v in exc.value.violations] == [(joints[0], 0), (joints[3], 3)]
+    assert [v[5] for v in exc.value.violations] == pytest.approx([2e-6, 0.01], abs=1e-9)
+    message = str(exc.value)
+    assert message.startswith(f"{side.capitalize()} hand exceeds native URDF limits: {joints[0]}[0]=")
+    assert ", ".join(joints) in message and f"{q[3]:.6f}" in message
+    assert isinstance(exc.value, ValueError)  # existing ValueError handlers keep working
+
+
+def test_limit_slack_is_round_off_only():
+    mapping = HandMapping(planning_model(), PRESETS)
+    q = mapping.preset("open").copy()
+    q[0] = mapping.lower[0] - 0.5e-6
+    mapping.check(q)

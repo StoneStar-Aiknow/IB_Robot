@@ -15,6 +15,8 @@ from aimdk_grasp.execution_watch import (
     WatchStatus,
     WatchTimeouts,
     X2TargetWatch,
+    covered_by_the_arm,
+    covered_reason,
     moved_reason,
     watch_failure,
 )
@@ -26,7 +28,7 @@ from aimdk_grasp.target_watch import WatchConfig
 from aimdk_grasp.types import RGBDFrame
 from test_target_watch import K, far_spheres, scene, watcher_inputs
 
-from manipulation_execution.pick.pipeline.contracts import GraspFailure, Observation, Proposals
+from manipulation_execution.shared.contracts import GraspFailure, Observation, Proposals
 
 STILL, MOVED = scene(), scene(target_at=(30, 55))
 
@@ -61,7 +63,7 @@ def no_watcher_left_running(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def one_moving_sphere(monkeypatch):
-    monkeypatch.setattr("aimdk_grasp.target_watch.moving_sphere_indices", lambda: np.array([0]))
+    monkeypatch.setattr("aimdk_grasp.target_watch.moving_sphere_indices", lambda side="left": np.array([0]))
 
 
 def planned(image=STILL):
@@ -404,6 +406,32 @@ def test_which_states_fail_a_watch():
         with pytest.raises(ValueError, match="frame_s must be a finite number"):
             WatchTimeouts(frame_s=bad)
     assert WatchTimeouts(unknown_s=60).unknown_s == 60
+
+
+def test_the_arm_covering_the_target_in_the_grasp_segment_has_the_longer_limit():
+    timeouts = WatchTimeouts(unknown_s=4.0, occluded_s=8.0)
+    covered = covered_reason(0.0)
+    assert covered == "target 0% visible" and covered_by_the_arm(covered) and covered_by_the_arm(covered_reason(0.29))
+
+    def fails(phase, unknown_s, reason=covered):
+        return watch_failure(WatchStatus(WatchState.UNKNOWN, phase, unknown_s=unknown_s, reason=reason), timeouts)
+
+    assert fails("grasp", 7.9) is None
+    assert fails("grasp", 8.1) == "target not observable for 8.1 s (over 8 s): target 0% visible"
+    # The approach, or any other reason (the watch cannot measure), keeps the short limit.
+    assert fails("approach", 4.1).endswith("(over 4 s): target 0% visible")
+    for reason in ("no camera shift (background or IMU)", "image-time feedback unhealthy", "a frame voted moved"):
+        assert not covered_by_the_arm(reason) and fails("grasp", 4.1, reason) is not None
+    # Never shorter than unknown_s.
+    assert (
+        watch_failure(
+            WatchStatus(WatchState.UNKNOWN, "grasp", unknown_s=5.0, reason=covered),
+            WatchTimeouts(unknown_s=6.0, occluded_s=2.0),
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="occluded_s must be a finite number"):
+        WatchTimeouts(occluded_s=0.0)
 
 
 def test_the_imu_is_paused_once_the_execution_it_watched_ends():

@@ -18,7 +18,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from .contracts import Flag, GraspBackends, GraspFailure, GraspPlan, Observation, Proposals
+from manipulation_execution.shared.contracts import Flag, GraspBackends, GraspFailure, GraspPlan, Observation, Proposals
+
 from .sequence import GraspSequence, PhaseCallback
 
 

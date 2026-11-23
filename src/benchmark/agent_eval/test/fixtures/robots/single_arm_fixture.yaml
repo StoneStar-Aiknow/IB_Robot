@@ -1,0 +1,10 @@
+# Test fixture: one 7-DOF arm, no gripper approach presets.
+robot:
+  name: single_arm_fixture
+  runtime: {provider: fixture_robot, profile: single_arm_fixture}
+  task_dispatch:
+    groups:
+      arm: {gripper_joint: hand}
+  embodied:
+    execution:
+      arm_groups: {main: arm}

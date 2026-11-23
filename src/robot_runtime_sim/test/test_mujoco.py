@@ -20,7 +20,7 @@ import pytest
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import build_description
-from robot_runtime.launch_support import runtime_stack_actions
+from robot_runtime.launch_support import RuntimeProfileError, runtime_stack_actions
 from robot_runtime_sim.mujoco import (
     CAMERA_PLUGIN_INSTANCE,
     CAMERA_PLUGIN_TYPE,
@@ -421,6 +421,40 @@ def test_camera_plugin_parameters_without_cameras_is_empty(tmp_path):
     assert camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals) == {}
 
 
+def test_camera_plugin_parameters_disable_every_other_model_camera(tmp_path):
+    """mujoco_ros2_control 0.1.2's CameraPlugin streams every model camera
+    whose policy is unset, so each model camera that is not an enabled
+    peripheral (a viewer-only camera, a disabled peripheral's camera) gets
+    an explicit ``disabled`` policy; the declared cameras keep streaming."""
+    peripherals = [TOP, {**WRIST, "disabled": True}]
+    profile = _profile(tmp_path, peripherals=peripherals)
+    model_cameras = ["top_camera", "side_view", "wrist_camera", "gripper_follow"]
+    instance = camera_plugin_parameters(profile, peripherals, model_cameras)["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    policy = {name: (instance.get(name) or {}).get("policy", "streaming") for name in model_cameras}
+    assert policy == {
+        "top_camera": "streaming",
+        "side_view": "disabled",
+        "wrist_camera": "disabled",
+        "gripper_follow": "disabled",
+    }
+    assert (
+        instance["top_camera"]
+        == camera_plugin_parameters(profile, peripherals)["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["top_camera"]
+    )
+    # no enabled camera: no plugin is loaded, so nothing is published either way
+    none = [{**TOP, "disabled": True}]
+    assert camera_plugin_parameters(_profile(tmp_path, peripherals=none), none, model_cameras) == {}
+
+
+@pytest.mark.parametrize("name", ["", "type", "camera_publish_rate"])
+def test_camera_plugin_parameters_reject_a_model_camera_no_parameter_can_disable(tmp_path, name):
+    """An unnamed camera, or one named like an instance key, would stream
+    with no way to disable it by parameter."""
+    peripherals = [TOP]
+    with pytest.raises(RuntimeProfileError, match="cannot disable"):
+        camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals, ["top_camera", name])
+
+
 # ---------------------------------------------------------------------------
 # issue #195: the FreeJointStatePublisherPlugin parameters for scene objects
 # ---------------------------------------------------------------------------
@@ -666,6 +700,12 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     monkeypatch.setattr(
         scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
     )
+    # the fake model's cameras (the composition is faked, so is its camera list)
+    monkeypatch.setattr(
+        scene_compiler,
+        "mujoco_model_camera_names",
+        lambda path: ["top_camera", "side_view", "wrist_camera", "gripper_follow"],
+    )
     profile = _profile(tmp_path)
     description = render_mujoco_description(profile, tmp_path / "profile.yaml")
     actions = mujoco_embodiment_actions(
@@ -688,6 +728,11 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
     tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
     assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
+    # model cameras that are not enabled peripherals are disabled, or the plugin would stream them
+    cameras = tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert cameras["side_view"] == {"policy": "disabled"}
+    assert cameras["gripper_follow"] == {"policy": "disabled"}
+    assert cameras["top_camera"]["policy"] == "streaming"
     # the empty scene composes no dynamic objects: no free-joint publisher
     assert FREE_JOINT_STATE_PLUGIN_INSTANCE not in tree["mujoco_plugins"]
 
@@ -708,6 +753,8 @@ def test_mujoco_embodiment_adds_the_free_joint_state_plugin_for_dynamic_scenes(t
     monkeypatch.setattr(
         scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
     )
+    # the fake model's cameras (the composition is faked, so is its camera list)
+    monkeypatch.setattr(scene_compiler, "mujoco_model_camera_names", lambda path: [])
     profile = _profile(tmp_path)
     description = render_mujoco_description(profile, tmp_path / "profile.yaml")
     actions = mujoco_embodiment_actions(
@@ -755,7 +802,8 @@ def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
     assert interfaces["camera.top.color"]["qos"]["reliability"] == "reliable"
     assert interfaces["camera.front.depth"]["qos"]["reliability"] == "reliable"
     assert interfaces["camera.front.depth_info"]["qos"]["reliability"] == "reliable"
-    # non-mujoco platforms keep the historical best-effort sensor contract
+    # off mujoco the trait does not apply: hardware follows each driver's own
+    # publisher (usb_cam publishes reliable, realsense stays best-effort)
     physical = build_description(
         {
             "runtime": {"name": "test_robot", "version": "0.1.0"},
@@ -764,7 +812,9 @@ def test_descriptor_streams_match_the_generated_sensors_and_relays(tmp_path):
             "peripherals": peripherals,
         }
     )
-    assert physical["interfaces"]["camera.top.color"]["qos"]["reliability"] == "best_effort"
+    assert physical["interfaces"]["camera.top.color"]["qos"]["reliability"] == "reliable"
+    assert physical["interfaces"]["camera.front.color"]["qos"]["reliability"] == "best_effort"
+    assert physical["interfaces"]["camera.front.depth"]["qos"]["reliability"] == "best_effort"
     # 5b.3: the advertised frames follow the shared convention (opencv →
     # frame_id, realsense → optical), identical to hardware/sdk/gazebo
     assert interfaces["camera.top.color"]["frame_id"] == "camera_top_frame"
@@ -1942,3 +1992,258 @@ def test_no_option_section_leaves_the_render_byte_identical(tmp_path):
     profile["simulation"]["mujoco"]["option"] = {"cone": "elliptic"}
     with pytest.raises(RuntimeError, match="no <option> element"):
         render_robot_mjcf(profile)
+
+
+@pytest.mark.parametrize(
+    ("headless", "profile_headless", "expected"),
+    [
+        ("0", None, 1),
+        ("1", None, 0),
+        # hardware.xacro_args is applied last, so the simulator (and the
+        # guide) follow the profile when it disagrees with the environment
+        ("0", "true", 0),
+        ("1", "false", 1),
+    ],
+)
+def test_mujoco_embodiment_logs_the_viewer_key_guide_only_with_a_window(
+    tmp_path, monkeypatch, headless, profile_headless, expected
+):
+    from launch.actions import LogInfo
+
+    monkeypatch.setenv("IBROBOT_MUJOCO_HEADLESS", headless)
+    profile = _profile(tmp_path)
+    if profile_headless is not None:
+        profile.setdefault("hardware", {}).setdefault("xacro_args", {})["mujoco_headless"] = profile_headless
+    description = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    actions = mujoco_embodiment_actions(
+        profile, tmp_path / "profile.yaml", robot_description=description, mujoco_scene=""
+    )
+    hints = [action for action in actions if isinstance(action, LogInfo)]
+    # the simulator reads this same rendered parameter
+    assert ('<param name="headless">true</param>' in description) == (expected == 0)
+    assert len(hints) == expected
+    if hints:
+        text = _text(hints[0].msg)
+        for key in ("Ctrl+A", "Esc", "] / ["):
+            assert key in text
+
+
+def _hardware(plugin, *params):
+    body = "".join(params)
+    return f'<ros2_control name="s" type="system"><hardware><plugin>{plugin}</plugin>{body}</hardware></ros2_control>'
+
+
+def _control(*hardware):
+    """One <ros2_control> with several <hardware> children, each (plugin, *params)."""
+    body = "".join(f"<hardware><plugin>{plugin}</plugin>{''.join(params)}</hardware>" for plugin, *params in hardware)
+    return f'<ros2_control name="s" type="system">{body}</ros2_control>'
+
+
+_MUJOCO = "mujoco_ros2_control/MujocoSystemInterface"
+_HEADLESS = '<param name="headless">{}</param>'
+_MODEL = '<param name="mujoco_model">{}</param>'
+
+
+@pytest.mark.parametrize(
+    ("hardware_blocks", "headless"),
+    [
+        ([_hardware(_MUJOCO)], False),
+        ([_hardware(_MUJOCO, _HEADLESS.format("true"))], True),
+        # hardware_interface::parse_bool accepts exactly "true" and "True",
+        # on the raw element text
+        ([_hardware(_MUJOCO, _HEADLESS.format("True"))], True),
+        ([_hardware(_MUJOCO, _HEADLESS.format(" true "))], False),
+        ([_hardware(_MUJOCO, _HEADLESS.format("TRUE"))], False),
+        ([_hardware(_MUJOCO, _HEADLESS.format("1"))], False),
+        # attribute order and extra attributes do not matter
+        ([_hardware(_MUJOCO, '<param type="bool" name="headless">true</param>')], True),
+        # a repeated parameter keeps its last value, as in the component parser
+        ([_hardware(_MUJOCO, _HEADLESS.format("true"), _HEADLESS.format("false"))], False),
+        ([_hardware(_MUJOCO, _HEADLESS.format("false"), _HEADLESS.format("true"))], True),
+        # only the MuJoCo system's own hardware block counts
+        (
+            [_hardware(_MUJOCO, _HEADLESS.format("false")), _hardware("other/System", _HEADLESS.format("true"))],
+            False,
+        ),
+        ([_hardware("other/System", _HEADLESS.format("true"))], False),
+        # text that merely looks like the parameter is not one
+        ([_hardware(_MUJOCO, "<!-- " + _HEADLESS.format("true") + " -->")], False),
+        # TinyXML2 GetText: a comment splits the text (first part only), and a
+        # leading comment is skipped
+        ([_hardware(_MUJOCO, '<param name="headless">tr<!--n-->ue</param>')], False),
+        ([_hardware(_MUJOCO, '<param name="headless"><!--n-->true</param>')], True),
+        ([_hardware(_MUJOCO, '<param name="headless"></param>')], False),
+        # a CDATA section is a text node of its own; whitespace-only text is
+        # dropped (TinyXML2 9.0, checked against the native GetText)
+        ([_hardware(_MUJOCO, '<param name="headless"><![CDATA[true]]><!--n--></param>')], True),
+        ([_hardware(_MUJOCO, '<param name="headless"><![CDATA[true]]>false</param>')], True),
+        ([_hardware(_MUJOCO, '<param name="headless"><![CDATA[tr]]>ue</param>')], False),
+        ([_hardware(_MUJOCO, '<param name="headless">\n  <![CDATA[true]]>\n</param>')], True),
+        ([_hardware(_MUJOCO, '<param name="headless">&#x74;rue</param>')], True),
+        # the plugin name is read as is: a padded name is not the MuJoCo system
+        ([_hardware(" " + _MUJOCO + " ", _HEADLESS.format("true"))], False),
+        # only <robot>/<ros2_control>/<hardware> counts, not a look-alike
+        # nested in another element
+        (
+            [
+                _hardware(_MUJOCO, _HEADLESS.format("true")),
+                f"<gazebo><hardware><plugin>{_MUJOCO}</plugin>{_HEADLESS.format('false')}</hardware></gazebo>",
+            ],
+            True,
+        ),
+        ([f"<gazebo>{_hardware(_MUJOCO, _HEADLESS.format('true'))}</gazebo>"], False),
+        # several <hardware> in one <ros2_control>: the last names the plugin,
+        # and the last one with <param> children supplies the parameters
+        ([_control(("other/System", _HEADLESS.format("true")), (_MUJOCO,))], True),
+        ([_control((_MUJOCO, _HEADLESS.format("true")), ("other/System",))], False),
+        ([_control((_MUJOCO, _HEADLESS.format("true")), (_MUJOCO, _HEADLESS.format("false")))], False),
+    ],
+)
+def test_viewer_headless_is_read_like_the_simulator_reads_it(hardware_blocks, headless):
+    from robot_runtime_sim.mujoco_embodiment import mujoco_viewer_hint_actions, mujoco_viewer_is_headless
+
+    description = '<robot name="r">' + "".join(hardware_blocks) + "</robot>"
+    assert mujoco_viewer_is_headless(description) is headless
+    assert (mujoco_viewer_hint_actions(description) == []) is headless
+
+
+def test_viewer_headless_follows_a_cdata_value_through_the_real_xacro_render(tmp_path):
+    """The xacro CLI keeps a CDATA value as its own node and adds layout
+    whitespace around it; the guide still reads it like the simulator."""
+    from robot_runtime.launch_support import render_xacro
+    from robot_runtime_sim.mujoco_embodiment import mujoco_viewer_hint_actions, mujoco_viewer_is_headless
+
+    xacro = tmp_path / "cdata.urdf.xacro"
+    xacro.write_text(
+        '<?xml version="1.0"?><robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="r">'
+        + _hardware(_MUJOCO, '<param name="headless"><![CDATA[true]]><!--n--></param>')
+        + "</robot>",
+        encoding="utf-8",
+    )
+    description = render_xacro(xacro, {})
+    assert "CDATA[true]" in description
+    assert mujoco_viewer_is_headless(description)
+    assert mujoco_viewer_hint_actions(description) == []
+
+
+def test_viewer_key_guide_lists_the_cameras_in_model_id_order(tmp_path):
+    """']' cycles mjModel cameras by id, so the guide must list them in that order."""
+    from robot_runtime_sim.mujoco_embodiment import mujoco_viewer_camera_order
+
+    mujoco = pytest.importorskip("mujoco")
+    xml = tmp_path / "m.xml"
+    xml.write_text(
+        '<mujoco><worldbody><camera name="w1"/><body name="b"><camera name="b1"/><geom size="0.1"/></body>'
+        '<camera name="w2"/></worldbody></mujoco>'
+    )
+    model = mujoco.MjModel.from_xml_path(str(xml))
+    expected = [model.camera(i).name for i in range(model.ncam)]
+    mjb = tmp_path / "m.mjb"
+    mujoco.mj_saveModel(model, str(mjb))
+    for path in (xml, mjb):
+        description = f"<robot>{_hardware(_MUJOCO, _MODEL.format(path))}</robot>"
+        assert mujoco_viewer_camera_order(description) == expected
+    assert mujoco_viewer_camera_order(f"<robot>{_hardware(_MUJOCO, _MODEL.format('/no/such.mjb'))}</robot>") is None
+    assert mujoco_viewer_camera_order("<robot/>") is None
+
+
+@pytest.mark.parametrize(
+    ("blocks", "pick"),
+    [
+        # a commented-out parameter and a non-MuJoCo block come first
+        (
+            lambda a, b: [
+                f"<!-- {_MODEL.format(b)} -->",
+                _hardware("other/Plugin", _MODEL.format(b)),
+                _hardware(_MUJOCO, _MODEL.format(a)),
+            ],
+            "a",
+        ),
+        # ros2_control keeps the LAST of a repeated parameter
+        (lambda a, b: [_hardware(_MUJOCO, _MODEL.format(b), _MODEL.format(a))], "a"),
+        # a MuJoCo hardware block not directly under the root is not parsed
+        (
+            lambda a, b: [
+                f"<gazebo>{_hardware(_MUJOCO, _MODEL.format(b))}</gazebo>",
+                _hardware(_MUJOCO, _MODEL.format(a)),
+            ],
+            "a",
+        ),
+        # two MuJoCo blocks naming the same model agree; different models cannot be told apart
+        (lambda a, b: [_hardware(_MUJOCO, _MODEL.format(a)), _hardware(_MUJOCO, _MODEL.format(a))], "a"),
+        (lambda a, b: [_hardware(_MUJOCO, _MODEL.format(a)), _hardware(_MUJOCO, _MODEL.format(b))], None),
+        # a parameter outside any MuJoCo hardware block is not the simulator's model
+        (lambda a, b: [_MODEL.format(a)], None),
+        # several <hardware> in one <ros2_control>, as the component parser
+        # merges them: the last names the plugin, the last with parameters
+        # supplies them
+        (lambda a, b: [_control((_MUJOCO, _MODEL.format(b)), (_MUJOCO, _MODEL.format(a)))], "a"),
+        (lambda a, b: [_control(("other/Plugin", _MODEL.format(a)), (_MUJOCO,))], "a"),
+        (lambda a, b: [_control((_MUJOCO, _MODEL.format(a)), ("other/Plugin",))], None),
+        # mujoco_ros2_control trims the path's surrounding whitespace
+        (lambda a, b: [_hardware(_MUJOCO, _MODEL.format(f"\n    {a}\t\n  "))], "a"),
+        # a MuJoCo block without the parameter loads its model from a topic:
+        # the order cannot be known here
+        (lambda a, b: [_hardware(_MUJOCO), _hardware(_MUJOCO, _MODEL.format(a))], None),
+        # an empty parameter is "" in the parser, a path that does not exist
+        (lambda a, b: [_hardware(_MUJOCO, _MODEL.format(""))], None),
+    ],
+)
+def test_viewer_key_guide_reads_the_model_the_simulator_loads(tmp_path, blocks, pick):
+    """The camera order comes from the mujoco_model the MuJoCo hardware block
+    finally holds, read with the same rules as the headless flag."""
+    from robot_runtime_sim.mujoco_embodiment import mujoco_viewer_camera_order
+
+    pytest.importorskip("mujoco")
+    a, b = tmp_path / "a.xml", tmp_path / "b.xml"
+    a.write_text('<mujoco><worldbody><camera name="a1"/><camera name="a2"/></worldbody></mujoco>')
+    b.write_text('<mujoco><worldbody><camera name="b1"/></worldbody></mujoco>')
+    description = '<robot name="r">' + "".join(blocks(a, b)) + "</robot>"
+    expected = {"a": ["a1", "a2"], None: None}[pick]
+    assert mujoco_viewer_camera_order(description) == expected
+
+
+def _description_with_model(model_param: str) -> str:
+    return f'<robot name="r">{_hardware(_MUJOCO, model_param)}</robot>'
+
+
+@pytest.mark.parametrize(
+    "model_param",
+    [
+        _MODEL.format("/tmp/ibrobot_no_such_composed_model.mjb"),
+        # no parameter: the simulator would load the model from a topic
+        "",
+    ],
+    ids=["missing-file", "no-mujoco_model"],
+)
+def test_mujoco_embodiment_fails_when_the_model_cameras_cannot_be_listed(tmp_path, model_param):
+    """With cameras configured, a model whose cameras cannot be listed would
+    stream cameras nobody declared: the launch fails instead."""
+    profile = _profile(tmp_path)
+    with pytest.raises(RuntimeProfileError, match="camera"):
+        mujoco_embodiment_actions(
+            profile,
+            tmp_path / "profile.yaml",
+            robot_description=_description_with_model(model_param),
+            mujoco_scene="",
+        )
+
+
+def test_viewer_key_guide_survives_an_unusable_model_path(tmp_path):
+    """The guide is informational: a path the OS rejects (ENAMETOOLONG) only
+    drops the camera order."""
+    from robot_runtime_sim.mujoco_embodiment import mujoco_viewer_camera_order
+
+    long_path = str(tmp_path / ("x" * 1015))
+    assert mujoco_viewer_camera_order(_description_with_model(_MODEL.format(long_path))) is None
+
+
+def test_viewer_key_guide_loads_a_bare_mjb_name_as_mjcf(tmp_path, monkeypatch):
+    """mujoco_ros2_control loads a binary only when the path is longer than
+    four characters and ends in .mjb; a file named exactly '.mjb' is MJCF."""
+    from robot_runtime_sim.mujoco_embodiment import mujoco_viewer_camera_order
+
+    pytest.importorskip("mujoco")
+    (tmp_path / ".mjb").write_text('<mujoco><worldbody><camera name="c1"/><camera/></worldbody></mujoco>')
+    monkeypatch.chdir(tmp_path)
+    assert mujoco_viewer_camera_order(_description_with_model(_MODEL.format(".mjb"))) == ["c1", "camera 1"]

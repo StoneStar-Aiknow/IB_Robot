@@ -22,21 +22,24 @@ from .types import RGBDFrame
 MAX_IMAGE_FEEDBACK_OFFSET_S = 0.1
 
 
-@lru_cache(maxsize=1)
-def observation_hand_mapping() -> HandMapping:
-    """Generate the planning model once per process, outside streaming callbacks."""
-    from .robot_model import planning_model
+@lru_cache(maxsize=2)
+def observation_hand_mapping(side: str = "left") -> HandMapping:
+    """Generate ``side``'s planning model once per process, outside streaming callbacks."""
+    from .robot_model import config_directory, planning_model
 
-    return HandMapping(planning_model())
+    return HandMapping(planning_model(config_directory(side)), side=side)
 
 
 def copy_feedback(feedback: Feedback) -> Feedback:
-    """An owned copy, with the body joints and the left hand checked against the planning model."""
+    """An owned copy, with the body joints and each hand it carries checked against its planning model."""
     positions = dict(zip(BODY_JOINTS, feedback.vector(BODY_JOINTS), strict=True))
-    hand = observation_hand_mapping().check(feedback.left_hand).copy()
+    hands = {
+        side: None if native is None else observation_hand_mapping(side).check(native).copy()
+        for side, native in (("left", feedback.left_hand), ("right", feedback.right_hand))
+    }
     if not np.isfinite(feedback.received_at):
         raise ValueError("Finite feedback source time required")
-    return replace(feedback, positions=positions, left_hand=hand)
+    return replace(feedback, positions=positions, left_hand=hands["left"], right_hand=hands["right"])
 
 
 @dataclass(frozen=True)
@@ -106,7 +109,6 @@ class ObservationBuffer:
     """CPU-only input owner; callbacks continue updating while the GPU is busy."""
 
     def __init__(self) -> None:
-        observation_hand_mapping()
         self._lock = RLock()
         self._observation: RegisteredObservation | None = None
         self._feedback: Feedback | None = None

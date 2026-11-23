@@ -13,8 +13,10 @@ import os
 import tempfile
 from pathlib import Path
 from typing import Any
+from xml.dom import minidom
 
 import yaml
+from launch.actions import LogInfo
 from launch_ros.actions import Node
 
 from robot_runtime.interface_description import platform_peripherals
@@ -87,8 +89,9 @@ def render_mujoco_description(
     Gazebo render — ``description.xacro_args`` <
     ``simulation.mujoco.xacro_args`` (platform-scoped) < this renderer's
     fixed platform keys (``use_sim``, ``simulated``, ``sim_plugin``,
-    ``sim_effort_state``, ``mujoco_model``, ``mujoco_headless`` — never
-    overridable by the profile) < ``hardware.xacro_args`` (last). A profile
+    ``sim_effort_state``, ``mujoco_model``, ``mujoco_headless`` — not
+    overridable by the description or platform args) <
+    ``hardware.xacro_args`` (last, overrides everything). A profile
     without the platform section renders byte-identically.
     """
     from sim_models.scene_compiler import compose_mujoco_model, mjcf_engine_extensions
@@ -114,11 +117,12 @@ def render_mujoco_description(
         {
             "use_sim": "true",
             "simulated": "false",  # the SDK virtual transport flag is off under MuJoCo
-            "sim_plugin": "mujoco_ros2_control/MujocoSystemInterface",
+            "sim_plugin": _MUJOCO_SYSTEM_PLUGIN,
             "sim_effort_state": "true",
             "mujoco_model": MUJOCO_MODEL_PLACEHOLDER,
-            # env-derived fixed key: always passed (the xacros default it to
-            # false), never overridable by the profile
+            # env-derived key: always passed (the xacros default it to
+            # false); like every arg here, hardware.xacro_args below still
+            # overrides it, and the simulator uses that final value
             "mujoco_headless": "true" if os.environ.get("IBROBOT_MUJOCO_HEADLESS", "0") == "1" else "false",
         }
     )
@@ -156,6 +160,165 @@ def render_mujoco_description(
     if imus_xml:
         robot_description = robot_description.replace("</ros2_control>", imus_xml + "\n  </ros2_control>", 1)
     return _resolve_package_uris(robot_description)
+
+
+# The operator's key guide for the MuJoCo viewer window (simulate's own
+# bindings; the viewer has no API for a custom on-screen label, so the guide
+# goes to the launch log).
+MUJOCO_VIEWER_KEYS = (
+    "MuJoCo viewer keys: Ctrl+A = back to the scene's start view | "
+    "Esc = free camera (left-drag rotate, right-drag pan, scroll zoom) | "
+    "{cycle} | "
+    "Ctrl + right double-click on a body = track that body"
+)
+_MUJOCO_SYSTEM_PLUGIN = "mujoco_ros2_control/MujocoSystemInterface"
+
+
+def _simulator_model_path(robot_description: str) -> str | None:
+    """The model file the simulator will load, or ``None`` when it cannot be named.
+
+    The ``mujoco_model`` parameter of the MuJoCo hardware component, read the
+    way the simulator reads it (see ``_mujoco_hardware_param``), with the
+    surrounding whitespace mujoco_ros2_control trims removed. ``None`` for no
+    MuJoCo hardware component, a component without ``mujoco_model`` (the
+    simulator then loads the model from a topic), or components that name
+    different models.
+    """
+    values = _mujoco_hardware_param(robot_description, "mujoco_model")
+    if not values or None in values:
+        return None
+    # mujoco_ros2_control trims this set of whitespace off the path
+    paths = {value.strip(" \t\n\r\f\v") for value in values}
+    return paths.pop() if len(paths) == 1 else None
+
+
+def mujoco_viewer_camera_order(robot_description: str) -> list[str] | None:
+    """The fixed cameras in the order the viewer's ']' key cycles them.
+
+    simulate cycles ``mjModel`` cameras by id (']' from the free camera
+    starts at id 0, '[' starts at the last id), and the ids follow the
+    compiled body tree — they mix recorded and viewer-only cameras, so the
+    order is read from the composed model the node will load
+    (``_simulator_model_path``, loaded by ``mujoco_model_camera_names``).
+    ``None`` when that model cannot be named or read here; the guide is
+    informational, so no failure here stops the launch.
+    """
+    path = _simulator_model_path(robot_description)
+    if path is None:
+        return None
+    try:
+        from sim_models.scene_compiler import mujoco_model_camera_names
+
+        names = mujoco_model_camera_names(path)
+    except Exception:  # noqa: BLE001 - the guide is informational, never fatal
+        return None
+    return [name or f"camera {i}" for i, name in enumerate(names)]
+
+
+def _composed_model_cameras(robot_description: str) -> list[str]:
+    """The composed model's camera names for the CameraPlugin parameters.
+
+    The plugin publishes every model camera it is not told to disable, so a
+    model that cannot be named or read fails the launch here instead of
+    publishing cameras nobody declared.
+    """
+    path = _simulator_model_path(robot_description)
+    if path is None:
+        raise RuntimeProfileError(
+            "the CameraPlugin is configured but the MuJoCo hardware component names no single "
+            "mujoco_model, so its cameras cannot be listed"
+        )
+    from sim_models.scene_compiler import mujoco_model_camera_names
+
+    try:
+        return mujoco_model_camera_names(path)
+    except Exception as exc:
+        raise RuntimeProfileError(f"cannot list the cameras of the MuJoCo model {path!r}: {exc}") from exc
+
+
+def _first_text(element) -> str | None:
+    """TinyXML2 ``GetText`` on a minidom element.
+
+    The first child text node after any leading comments, as TinyXML2 9.0
+    builds them: whitespace-only text nodes are dropped, a CDATA section is a
+    text node of its own, and neither a comment nor a CDATA boundary joins
+    the text around it. Any other first child means no text.
+
+    Checked against the native GetText on xacro-rendered descriptions, the
+    only input here. Raw XML the xacro render would normalise can still
+    differ: an empty CDATA section (minidom drops it) or a leading
+    character reference to a space or NBSP (Python's ``str.strip`` treats it
+    as layout whitespace).
+    """
+    for node in element.childNodes:
+        if node.nodeType == node.COMMENT_NODE:
+            continue
+        if node.nodeType == node.TEXT_NODE and not node.data.strip():
+            continue
+        if node.nodeType in (node.TEXT_NODE, node.CDATA_SECTION_NODE):
+            return node.data
+        return None
+    return None
+
+
+def _child_elements(element, tag: str) -> list:
+    return [node for node in element.childNodes if node.nodeType == node.ELEMENT_NODE and node.tagName == tag]
+
+
+def _mujoco_hardware_param(robot_description: str, name: str) -> list[str | None]:
+    """One value of parameter ``name`` per MuJoCo hardware component.
+
+    Read the way the simulator reads the rendered description, following
+    ros2_control 2.54's ``parse_control_resources_from_urdf``: each
+    ``<ros2_control>`` directly under the root is one component. Every
+    ``<hardware>`` child of it, in order, replaces the component's plugin
+    (its first ``<plugin>``), and a ``<hardware>`` with ``<param>`` children
+    replaces the parameters, so the last ``<hardware>`` names the plugin and
+    the last one with parameters supplies them. Only components whose plugin
+    is the MuJoCo system count. A repeated parameter keeps its last value;
+    each value is TinyXML2's ``GetText`` (see ``_first_text``), and a
+    parameter without text is ``""`` as in the parser. ``None`` when the
+    component has no such parameter.
+    """
+    root = minidom.parseString(robot_description).documentElement
+    values = []
+    for control in _child_elements(root, "ros2_control"):
+        plugin, params = None, {}
+        for hardware in _child_elements(control, "hardware"):
+            plugins = _child_elements(hardware, "plugin")
+            plugin = (_first_text(plugins[0]) or "") if plugins else None
+            param_elements = _child_elements(hardware, "param")
+            if param_elements:
+                params = {param.getAttribute("name"): _first_text(param) or "" for param in param_elements}
+        if plugin == _MUJOCO_SYSTEM_PLUGIN:
+            values.append(params.get(name))
+    return values
+
+
+def mujoco_viewer_is_headless(robot_description: str) -> bool:
+    """Whether the simulator runs without the Simulate window.
+
+    ``IBROBOT_MUJOCO_HEADLESS`` sets the ``mujoco_headless`` xacro arg, and
+    a profile's ``hardware.xacro_args`` (applied last) can override it, so
+    the final value is read from the rendered description's MuJoCo hardware
+    blocks (``_mujoco_hardware_param``) with ``hardware_interface::parse_bool``,
+    which accepts exactly ``true`` and ``True``. With more than one MuJoCo
+    hardware component, a window exists unless every one is headless.
+    """
+    flags = [value in ("true", "True") for value in _mujoco_hardware_param(robot_description, "headless")]
+    return bool(flags) and all(flags)
+
+
+def mujoco_viewer_hint_actions(robot_description: str) -> list:
+    """The viewer key guide as a launch log line; none when running headless."""
+    if mujoco_viewer_is_headless(robot_description):
+        return []
+    order = mujoco_viewer_camera_order(robot_description)
+    if order:
+        cycle = "] / [ = cycle the fixed cameras: " + " -> ".join(order) + " (] from the first, [ from the last)"
+    else:
+        cycle = "] / [ = cycle the model's fixed cameras"
+    return [LogInfo(msg=MUJOCO_VIEWER_KEYS.format(cycle=cycle))]
 
 
 # The node name mujoco_ros2_control's hardware interface hard-codes for the
@@ -225,9 +388,12 @@ def mujoco_embodiment_actions(
     # One params file carries every simulator plugin: the cameras, the lidars,
     # the floating-base drive and, when the composed scene has dynamic
     # objects, the free-joint state publisher the scene task observes
-    # (issue #195).
+    # (issue #195). Once the CameraPlugin is configured, every camera of the
+    # composed model gets an explicit policy, or the plugin streams it
+    # (viewer-only cameras are disabled).
+    model_cameras = _composed_model_cameras(robot_description) if camera_plugin_parameters(profile, peripherals) else ()
     plugin_parameters = merge_mujoco_plugin_parameters(
-        camera_plugin_parameters(profile, peripherals),
+        camera_plugin_parameters(profile, peripherals, model_cameras),
         free_joint_state_plugin_parameters(mujoco_scene),
         base_velocity_plugin_parameters(floating_base),
         lidar_plugin_parameters(peripherals),
@@ -235,6 +401,7 @@ def mujoco_embodiment_actions(
     if plugin_parameters:
         mujoco_node_parameters.append(write_node_params(MUJOCO_SIMULATION_NODE, plugin_parameters))
     return [
+        *mujoco_viewer_hint_actions(robot_description),
         Node(
             package="robot_state_publisher",
             executable="robot_state_publisher",

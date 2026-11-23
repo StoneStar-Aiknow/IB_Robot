@@ -13,8 +13,11 @@ from __future__ import annotations
 import ast
 import importlib
 import math
+import os
 import pkgutil
 import random
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,6 +25,7 @@ import numpy as np
 import pytest
 
 from sim_models.scene_compiler import (
+    ViewerViewError,
     arm_rest_pairs,
     compose_mujoco_model,
     composed_model_path,
@@ -31,9 +35,11 @@ from sim_models.scene_compiler import (
     get_scene_task,
     load_mujoco_engine_plugins,
     mjcf_engine_extensions,
+    mujoco_model_camera_names,
     randomization_placements,
     resolve_robot_spawn,
     scene_dynamic_objects,
+    scene_viewer_view,
 )
 
 mujoco = pytest.importorskip("mujoco")
@@ -660,3 +666,604 @@ def test_fresh_process_compose_and_recompile(lidar_robot_mjcf, clean_domain, tmp
     )
     assert second.returncode == 0, second.stderr
     assert "RECOMPILED" in second.stdout
+
+
+# ---------------------------------------------------------------------------
+# MuJoCo viewer start view (layout mujoco_viewer)
+# ---------------------------------------------------------------------------
+
+
+def _free_camera(model):
+    camera = mujoco.MjvCamera()
+    mujoco.mjv_defaultFreeCamera(model, camera)
+    return camera
+
+
+def test_compose_pick_banana_sets_the_viewer_free_camera_without_touching_the_extent(robot_mjcf, clean_domain):
+    view = scene_viewer_view("pick_banana")
+    assert view is not None
+    model = _model_of(compose_mujoco_model(robot_mjcf, "pick_banana", ()))
+    camera = _free_camera(model)
+    assert model.vis.global_.cameraid == -1, "the viewer starts on the (draggable) free camera"
+    assert tuple(camera.lookat) == pytest.approx(view["lookat"])
+    assert camera.azimuth == pytest.approx(view["azimuth"])
+    assert camera.elevation == pytest.approx(view["elevation"])
+    # the apparent distance comes from the fovy: same frame half-height as the
+    # reference 45 deg fovy at the declared distance
+    frame = camera.distance * math.tan(math.radians(model.vis.global_.fovy) / 2)
+    assert frame == pytest.approx(view["distance"] * math.tan(math.radians(45.0) / 2), rel=1e-5)
+    # the extent (znear/zfar scale of every camera) is the auto-computed one
+    recompiled = mujoco.MjModel.from_xml_path(str(composed_model_path("pick_banana").with_suffix(".xml")))
+    assert model.stat.extent == pytest.approx(recompiled.stat.extent)
+
+
+def test_compose_without_a_viewer_view_keeps_the_default_free_camera(robot_mjcf, clean_domain):
+    assert scene_viewer_view(None) is None
+    assert scene_viewer_view("empty") is None
+    model = _model_of(compose_mujoco_model(robot_mjcf, None, ()))
+    assert model.vis.global_.fovy == pytest.approx(45.0)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        None,  # an explicit empty "mujoco_viewer:" is not "no view"
+        "front",
+        {"lookat": [0, 0, 0], "distance": 1.0, "azimuth": 0},
+        {"lookat": [0, 0], "distance": 1.0, "azimuth": 0, "elevation": -30},
+        {"lookat": [0, 0, 0], "distance": 0.0, "azimuth": 0, "elevation": -30},
+        {"lookat": [0, 0, 0], "distance": 1.0, "azimuth": "x", "elevation": -30},
+        {"lookat": [0, 0, 0], "distance": 1.0, "azimuth": 0, "elevation": -90},
+        {"lookat": [0, 0, 0], "distnace": 1.0, "distance": 1.0, "azimuth": 0, "elevation": -30},
+        {"lookat": [0, 0, 0], "distance": 1.0, "azimuth": 0, "elevation": -30, "fovy": 30},
+    ],
+)
+def test_compose_rejects_a_malformed_viewer_view(robot_mjcf, clean_domain, monkeypatch, value):
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": value}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with pytest.raises(ViewerViewError):
+        compose_mujoco_model(robot_mjcf, "pick_banana", ())
+
+
+_TEST_VIEW = {"lookat": [0.1, 0.06, 0.0], "distance": 0.72, "azimuth": -110, "elevation": -55}
+
+
+def test_extension_model_carries_the_viewer_view_with_an_unchanged_extent(lidar_robot_mjcf, clean_domain, monkeypatch):
+    """The delivered XML (engine-extension path) carries the start view, and the
+    extent the C++ node recompiles is exactly the one the plain path yields."""
+    composed_model_path("empty").unlink(missing_ok=True)
+    plain_xml = compose_mujoco_model(lidar_robot_mjcf, "empty", ()).read_text(encoding="utf-8")
+    plain = mujoco.MjModel.from_xml_string(plain_xml)
+
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": _TEST_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    out = compose_mujoco_model(lidar_robot_mjcf, "empty", ())
+    assert out.suffix == ".xml"
+    model = mujoco.MjModel.from_xml_string(out.read_text(encoding="utf-8"))
+    assert model.stat.extent == plain.stat.extent
+    assert model.vis.map.znear == plain.vis.map.znear and model.vis.map.zfar == plain.vis.map.zfar
+    camera = _free_camera(model)
+    assert tuple(camera.lookat) == pytest.approx(_TEST_VIEW["lookat"])
+    assert camera.azimuth == pytest.approx(-110) and camera.elevation == pytest.approx(-55)
+
+
+def test_compile_fallback_warns_that_the_viewer_view_was_not_applied(robot_mjcf, clean_domain, monkeypatch, caplog):
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": _TEST_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+
+    def broken(_content):
+        raise RuntimeError("probe compile failure")
+
+    monkeypatch.setattr(mujoco.MjSpec, "from_string", staticmethod(broken))
+    with caplog.at_level("WARNING"):
+        out = compose_mujoco_model(robot_mjcf, "pick_banana", ())
+    assert out.suffix == ".xml"
+    assert "mujoco_viewer start view was NOT applied" in caplog.text
+
+
+# The out-of-range numbers must fail closed with ViewerViewError on every
+# delivery path: never an OverflowError, never a 0 / 180 deg fovy, never the
+# silent compile-fallback XML.
+_NUMERIC_EDGE_VIEWS = [
+    pytest.param({**_TEST_VIEW, "distance": 10**400}, id="huge-int-distance"),
+    pytest.param({**_TEST_VIEW, "lookat": [10**400, 0, 0]}, id="huge-int-lookat"),
+    pytest.param({**_TEST_VIEW, "azimuth": -(10**400)}, id="huge-int-azimuth"),
+    pytest.param({**_TEST_VIEW, "distance": 1e308}, id="huge-distance-fovy-180"),
+    pytest.param({**_TEST_VIEW, "distance": 5e-324}, id="tiny-distance-fovy-0"),
+    pytest.param({**_TEST_VIEW, "elevation": 89.000001}, id="elevation-above-viewer-clamp"),
+    pytest.param({**_TEST_VIEW, "elevation": -89.5}, id="elevation-below-viewer-clamp"),
+    pytest.param({**_TEST_VIEW, "lookat": [1.0e39, 0, 0]}, id="lookat-beyond-float32"),
+    pytest.param({**_TEST_VIEW, "distance": 1e-44}, id="tiny-distance-zero-frustum"),
+    pytest.param({**_TEST_VIEW, "distance": 1e-39}, id="tiny-distance-inf-projection"),
+]
+
+# Valid views that MjSpec.to_xml()'s 6 significant digits would have changed:
+# a float32 elevation just inside the bound (printed -89), a fovy just below
+# 180 deg (printed 180), and a lookat / angles finer than 6 digits, which at a
+# small framing moved the view by more than the frame itself.
+_FINE_VIEWS = [
+    pytest.param({**_TEST_VIEW, "elevation": -88.99999}, id="elevation-just-inside"),
+    pytest.param(None, id="fovy-just-below-180"),
+    pytest.param(
+        {
+            "lookat": [1.23456789, -0.98765432, 0.0123456789],
+            "distance": 1e-6,
+            "azimuth": -110.123456789,
+            "elevation": -55.123456789,
+        },
+        id="fine-lookat-and-angles",
+    ),
+]
+
+
+def _fine_view(view, extent):
+    if view is not None:
+        return view
+    import numpy as np
+
+    fovy = float(np.nextafter(np.float32(180.0), np.float32(0.0)))  # 179.99998, a valid float32 fovy
+    return {**_TEST_VIEW, "distance": 1.5 * extent * math.tan(math.radians(fovy / 2)) / math.tan(math.radians(22.5))}
+
+
+def _expected_free_camera(view):
+    import numpy as np
+
+    return tuple(view["lookat"]), float(np.float32(view["azimuth"])), float(np.float32(view["elevation"]))
+
+
+@pytest.mark.parametrize("view", _FINE_VIEWS)
+def test_plain_model_keeps_a_fine_view_exactly(robot_mjcf, clean_domain, monkeypatch, view):
+    composed_model_path("pick_banana").unlink(missing_ok=True)
+    extent = float(_model_of(compose_mujoco_model(robot_mjcf, "pick_banana", ())).stat.extent)
+    view = _fine_view(view, extent)
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": view}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    model = _model_of(compose_mujoco_model(robot_mjcf, "pick_banana", ()))
+    camera = _free_camera(model)
+    assert (tuple(camera.lookat), camera.azimuth, camera.elevation) == _expected_free_camera(view)
+    # the debug XML beside the .mjb carries the same view
+    debug = mujoco.MjModel.from_xml_path(str(composed_model_path("pick_banana").with_suffix(".xml")))
+    assert tuple(debug.stat.center) == tuple(model.stat.center)
+    assert debug.vis.global_.fovy == model.vis.global_.fovy
+
+
+@pytest.mark.parametrize("view", _FINE_VIEWS)
+def test_extension_model_delivers_a_fine_view_exactly(lidar_robot_mjcf, clean_domain, monkeypatch, view):
+    composed_model_path("empty").unlink(missing_ok=True)
+    plain = mujoco.MjModel.from_xml_string(compose_mujoco_model(lidar_robot_mjcf, "empty", ()).read_text("utf-8"))
+    view = _fine_view(view, float(plain.stat.extent))
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": view}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    delivered = mujoco.MjModel.from_xml_string(compose_mujoco_model(lidar_robot_mjcf, "empty", ()).read_text("utf-8"))
+    camera = _free_camera(delivered)
+    assert (tuple(camera.lookat), camera.azimuth, camera.elevation) == _expected_free_camera(view)
+    assert 0.0 < delivered.vis.global_.fovy < 180.0
+    assert delivered.stat.extent == plain.stat.extent, "the exact view rewrite leaves the rest of the model alone"
+
+
+def test_extension_model_rejects_a_delivered_view_that_differs(lidar_robot_mjcf, clean_domain, monkeypatch):
+    """The read-back check itself: a delivered XML that lost the view fails closed."""
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": _TEST_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    monkeypatch.setattr(
+        "sim_models.scene_compiler._view_exact_xml", lambda xml, _stat, _global: xml.replace("-110", "-111")
+    )
+    with pytest.raises(ViewerViewError, match="delivered XML"):
+        compose_mujoco_model(lidar_robot_mjcf, "empty", ())
+
+
+def _with_extent(mjcf_path, extent):
+    """The robot MJCF with a declared model extent (scales every znear/zfar)."""
+    path = Path(mjcf_path)
+    text = path.read_text(encoding="utf-8")
+    head, sep, rest = text.partition(">")  # end of the <mujoco ...> tag
+    assert head.lstrip().startswith("<mujoco"), "the robot template opens with <mujoco>"
+    out = path.with_name(f"extent_{path.name}")
+    out.write_text(f'{head}{sep}<statistic extent="{extent!r}"/>{rest}', encoding="utf-8")
+    return str(out)
+
+
+def _with_visual_global(mjcf_path, attrs):
+    """The robot MJCF with extra ``visual/global`` attributes."""
+    path = Path(mjcf_path)
+    text = path.read_text(encoding="utf-8")
+    head, sep, rest = text.partition(">")  # end of the <mujoco ...> tag
+    assert head.lstrip().startswith("<mujoco"), "the robot template opens with <mujoco>"
+    out = path.with_name(f"global_{path.name}")
+    out.write_text(f"{head}{sep}<visual><global {attrs}/></visual>{rest}", encoding="utf-8")
+    return str(out)
+
+
+@pytest.mark.parametrize(
+    ("attrs", "match"),
+    [('orthographic="true"', "orthographic"), ('cameraid="0"', "cameraid=0")],
+)
+def test_compose_rejects_a_view_the_viewer_would_not_show(robot_mjcf, clean_domain, monkeypatch, attrs, match):
+    """An orthographic free camera reads fovy as a length, and a valid cameraid
+    starts simulate (and Ctrl+A) on a fixed camera: either breaks the view."""
+    robot = _with_visual_global(robot_mjcf, attrs)
+    without_view = {k: v for k, v in get_scene_layout("pick_banana").items() if k != "mujoco_viewer"}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: without_view)
+    plain = _model_of(compose_mujoco_model(robot, "pick_banana", ()))
+    assert plain.ncam > 0, "pick_banana has fixed cameras for cameraid to name"
+    assert (plain.vis.global_.orthographic, plain.vis.global_.cameraid) != (0, -1), "the setting reaches the model"
+    layout = {**without_view, "mujoco_viewer": _TEST_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with pytest.raises(ViewerViewError, match=match):
+        compose_mujoco_model(robot, "pick_banana", ())
+
+
+def test_compose_accepts_a_cameraid_outside_the_model_cameras(robot_mjcf, clean_domain, monkeypatch):
+    """simulate falls back to the free camera for an id outside [0, ncam)."""
+    robot = _with_visual_global(robot_mjcf, 'cameraid="999"')
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": _TEST_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    model = _model_of(compose_mujoco_model(robot, "pick_banana", ()))
+    assert model.vis.global_.cameraid == 999 and model.ncam < 999
+    assert model.vis.global_.azimuth == pytest.approx(_TEST_VIEW["azimuth"])
+
+
+def test_extension_model_rejects_an_orthographic_free_camera(lidar_robot_mjcf, clean_domain, monkeypatch):
+    robot = _with_visual_global(lidar_robot_mjcf, 'orthographic="true"')
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": _TEST_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with pytest.raises(ViewerViewError, match="orthographic"):
+        compose_mujoco_model(robot, "empty", ())
+
+
+# A wide fovy at a large near: top = near * tan(fovy / 2) overflows a C float,
+# which used to pass as a finite (zero) projection scale.
+_OVERFLOW_TOP_VIEW = {**_TEST_VIEW, "lookat": [0.0, 0.0, 0.0], "distance": 1e42}
+
+
+def test_compose_rejects_a_view_whose_frustum_overflows(robot_mjcf, clean_domain, monkeypatch, caplog):
+    robot = _with_extent(robot_mjcf, 1e35)
+    composed_model_path("pick_banana").unlink(missing_ok=True)
+    plain = _model_of(compose_mujoco_model(robot, None, ()))
+    assert plain.stat.extent == pytest.approx(1e35), "the declared extent reaches the composed model"
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": _OVERFLOW_TOP_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with caplog.at_level("WARNING"), pytest.raises(ViewerViewError, match="float32 projection"):
+        compose_mujoco_model(robot, "pick_banana", ())
+    assert "falling back to XML" not in caplog.text
+
+
+def test_extension_model_rejects_a_view_whose_frustum_overflows(lidar_robot_mjcf, clean_domain, monkeypatch):
+    robot = _with_extent(lidar_robot_mjcf, 1e35)
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": _OVERFLOW_TOP_VIEW}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with pytest.raises(ViewerViewError, match="float32 projection"):
+        compose_mujoco_model(robot, "empty", ())
+
+
+# lookat in float32 range, but the free camera sits 1.5 * extent away from it
+# and its GL position (a C float) overflowed.
+_OVERFLOW_POSITION_VIEW = {"lookat": [3.0e38, 0.0, 0.0], "distance": 1e38, "azimuth": 180, "elevation": -10}
+
+
+# finite eye components at a normal model scale, whose modelview translation
+# (a float dot product of the eye with a camera axis) overflowed
+_OVERFLOW_MODELVIEW_VIEW = {"lookat": [3.0e38, 3.0e38, 0.0], "distance": 0.72, "azimuth": 45, "elevation": -10}
+
+
+@pytest.mark.parametrize(
+    ("extent", "view"),
+    [(1e38, _OVERFLOW_POSITION_VIEW), (None, _OVERFLOW_MODELVIEW_VIEW)],
+    ids=["eye-position", "modelview-translation"],
+)
+def test_compose_rejects_a_view_whose_camera_position_overflows(
+    robot_mjcf, clean_domain, monkeypatch, caplog, extent, view
+):
+    robot = robot_mjcf if extent is None else _with_extent(robot_mjcf, extent)
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": view}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    composed_model_path("pick_banana").unlink(missing_ok=True)
+    with caplog.at_level("WARNING"), pytest.raises(ViewerViewError, match="float32 range"):
+        compose_mujoco_model(robot, "pick_banana", ())
+    assert "falling back to XML" not in caplog.text
+    assert not composed_model_path("pick_banana").exists()
+
+
+@pytest.mark.parametrize(
+    ("extent", "view"),
+    [(1e38, _OVERFLOW_POSITION_VIEW), (None, _OVERFLOW_MODELVIEW_VIEW)],
+    ids=["eye-position", "modelview-translation"],
+)
+def test_extension_model_rejects_a_view_whose_camera_position_overflows(
+    lidar_robot_mjcf, clean_domain, monkeypatch, extent, view
+):
+    robot = lidar_robot_mjcf if extent is None else _with_extent(lidar_robot_mjcf, extent)
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": view}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with pytest.raises(ViewerViewError, match="float32 range"):
+        compose_mujoco_model(robot, "empty", ())
+
+
+# lookats: the origin, a normal scene point, and points near the float32 limit
+# on one or several axes, where the camera offset (1.5 * extent, either sign)
+# or the modelview dot product decides overflow
+_SWEEP_LOOKATS = [
+    (0.0, 0.0, 0.0),
+    (1.0, -0.5, 0.2),
+    (-3.0e38, 0.0, 0.0),
+    (3.4e38, 0.0, 0.0),
+    (3.0e38, 3.0e38, 0.0),
+    (2.0e38, -2.0e38, 2.0e38),
+    (1.0e38, 1.0e38, 1.0e38),
+]
+
+
+def _modelview_translation(gl):
+    """mjr_lookAt's float modelview translation for one GL camera (eye).
+
+    In MuJoCo's order: normalise forward, side = forward x up normalised,
+    up = side x forward normalised, then the three dot products with the eye,
+    every step (partial sums included) in floats.
+    """
+    import numpy as np
+
+    f32 = np.float32
+    eye, forward, up = (np.asarray(v, dtype=f32) for v in (gl.pos, gl.forward, gl.up))
+    partials = []
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+
+        def normalise(v):
+            # MuJoCo: scl = 1.0f / length, then multiply each component
+            scale = f32(f32(1.0) / f32(np.sqrt(f32(f32(v[0] * v[0]) + f32(v[1] * v[1]) + f32(v[2] * v[2])))))
+            return (v * scale).astype(f32)
+
+        def dot(a, b):
+            first = f32(f32(a[0] * b[0]) + f32(a[1] * b[1]))
+            partials.append(first)
+            return f32(first + f32(a[2] * b[2]))
+
+        forward = normalise(forward)
+        side = normalise(np.cross(forward, up).astype(f32))
+        up = normalise(np.cross(side, forward).astype(f32))
+        translation = np.array([-dot(side, eye), -dot(up, eye), dot(forward, eye)], dtype=f32)
+    return np.concatenate([translation, np.asarray(partials, dtype=f32)])
+
+
+@pytest.mark.parametrize("extent", [1e-3, 1.0, 1e3, 1e30, 1e35, 1e38])
+def test_free_camera_is_finite_for_every_accepted_view(extent):
+    """Every view _apply_viewer_view accepts, across model scales (near =
+    znear * extent, camera offset = 1.5 * extent), lookats, directions and
+    distances, gives mjv_updateScene finite float32 eye positions, a finite
+    modelview translation and a finite frustum with a finite, positive
+    projection scale; the rest raise before anything is written."""
+    import numpy as np
+
+    from sim_models.scene_compiler import _apply_viewer_view
+
+    model = mujoco.MjModel.from_xml_string(
+        f'<mujoco><statistic extent="{extent!r}"/><worldbody><geom size=".1"/></worldbody></mujoco>'
+    )
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    extent, znear = float(model.stat.extent), float(model.vis.map.znear)
+    accepted = rejected = 0
+    for distance in np.logspace(-50, 45, 191):
+        for lookat in _SWEEP_LOOKATS:
+            for azimuth, elevation in ((180.0, -10.0), (0.0, -10.0), (45.0, -10.0), (-110.0, -55.0)):
+                view = {
+                    "lookat": lookat,
+                    "distance": float(distance),
+                    "azimuth": azimuth,
+                    "elevation": elevation,
+                }
+                before = (tuple(model.stat.center), float(model.vis.global_.fovy))
+                try:
+                    _apply_viewer_view(view, model.stat, model.vis.global_, extent, znear)
+                except ViewerViewError:
+                    rejected += 1
+                    assert (tuple(model.stat.center), float(model.vis.global_.fovy)) == before, "nothing written"
+                    continue
+                accepted += 1
+                scene = mujoco.MjvScene(model, 10)
+                camera = _free_camera(model)
+                mujoco.mjv_updateScene(model, data, mujoco.MjvOption(), None, camera, mujoco.mjtCatBit.mjCAT_ALL, scene)
+                where = f"extent {extent} lookat {lookat} distance {distance} az {azimuth}"
+                for gl in scene.camera:
+                    assert np.isfinite(np.asarray(gl.pos, dtype=np.float32)).all(), f"{where}: {gl.pos}"
+                    assert np.isfinite(_modelview_translation(gl)).all(), f"{where}: modelview of {gl.pos}"
+                    near, top, bottom = (np.float32(v) for v in (gl.frustum_near, gl.frustum_top, gl.frustum_bottom))
+                    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+                        height = top - bottom
+                        scale = (near + near) / height
+                    for value in (near, top, height, scale):
+                        assert np.isfinite(value) and value > 0, f"{where}: {gl}"
+    assert accepted and rejected
+
+
+@pytest.mark.parametrize("elevation", [-89, 89, -89.0, 89.0])
+def test_viewer_view_accepts_the_viewer_elevation_bounds(monkeypatch, elevation):
+    # mjv_moveCamera clamps the free camera elevation to [-89, 89]: the bounds
+    # themselves are views the viewer keeps on the first mouse action
+    layout = {"mujoco_viewer": {**_TEST_VIEW, "elevation": elevation}}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    assert scene_viewer_view("pick_banana")["elevation"] == float(elevation)
+
+
+def test_viewer_view_rejects_a_huge_elevation_without_a_cast_warning(monkeypatch):
+    import warnings
+
+    layout = {"mujoco_viewer": {**_TEST_VIEW, "elevation": 1e39}}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ViewerViewError):
+            scene_viewer_view("pick_banana")
+
+
+# Finite azimuths that a C float cannot hold as given: reduced to one turn
+# before MuJoCo stores them (expected free-camera azimuth in degrees).
+_LARGE_AZIMUTHS = [
+    pytest.param(1.0e39, -8.0, id="float32-overflow"),
+    pytest.param(-110 + 360 * 10**6, -110.0, id="float32-precision-loss"),
+    pytest.param(250, -110.0, id="one-turn-equivalent"),
+]
+
+
+@pytest.mark.parametrize(("azimuth", "expected"), _LARGE_AZIMUTHS)
+def test_compose_reduces_a_large_azimuth_to_one_turn(robot_mjcf, clean_domain, monkeypatch, caplog, azimuth, expected):
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": {**_TEST_VIEW, "azimuth": azimuth}}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with caplog.at_level("WARNING"):
+        out = compose_mujoco_model(robot_mjcf, "pick_banana", ())
+    assert out.suffix == ".mjb" and "falling back to XML" not in caplog.text
+    model = _model_of(out)
+    assert model.vis.global_.azimuth == pytest.approx(expected)
+    assert _free_camera(model).azimuth == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(("azimuth", "expected"), _LARGE_AZIMUTHS)
+def test_extension_model_reduces_a_large_azimuth_to_one_turn(
+    lidar_robot_mjcf, clean_domain, monkeypatch, azimuth, expected
+):
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": {**_TEST_VIEW, "azimuth": azimuth}}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    out = compose_mujoco_model(lidar_robot_mjcf, "empty", ())
+    model = mujoco.MjModel.from_xml_string(out.read_text(encoding="utf-8"))
+    assert model.vis.global_.azimuth == pytest.approx(expected)
+    assert _free_camera(model).azimuth == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("view", _NUMERIC_EDGE_VIEWS)
+def test_compose_rejects_numeric_edge_views_without_the_compile_fallback(
+    robot_mjcf, clean_domain, monkeypatch, caplog, view
+):
+    layout = {**get_scene_layout("pick_banana"), "mujoco_viewer": view}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    composed_model_path("pick_banana").unlink(missing_ok=True)
+    with caplog.at_level("WARNING"), pytest.raises(ViewerViewError):
+        compose_mujoco_model(robot_mjcf, "pick_banana", ())
+    assert "falling back to XML" not in caplog.text
+    assert not composed_model_path("pick_banana").exists(), "no model artifact for a rejected view"
+
+
+@pytest.mark.parametrize("view", _NUMERIC_EDGE_VIEWS)
+def test_extension_model_rejects_numeric_edge_views(lidar_robot_mjcf, clean_domain, monkeypatch, view):
+    layout = {**get_scene_layout("empty"), "mujoco_viewer": view}
+    monkeypatch.setattr("sim_models.scene_compiler.get_scene_layout", lambda _scene: layout)
+    with pytest.raises(ViewerViewError):
+        compose_mujoco_model(lidar_robot_mjcf, "empty", ())
+
+
+def test_viewer_fovy_is_checked_after_float32_rounding():
+    """A distance whose double fovy is just below 180 deg rounds to 180.0 in
+    MuJoCo's float field and must be rejected; a normal one is returned as
+    the exact float32 value MuJoCo stores, strictly inside (0, 180)."""
+    import numpy as np
+
+    from sim_models.scene_compiler import _viewer_fovy
+
+    extent = 2.437745426586574  # the pick_banana composition's extent
+    camera_distance = 1.5 * extent
+    fovy = 180.0 - 1e-6
+    assert fovy < 180.0 and float(np.float32(fovy)) == 180.0
+    distance = camera_distance * math.tan(math.radians(fovy / 2)) / math.tan(math.radians(22.5))
+    with pytest.raises(ViewerViewError):
+        _viewer_fovy({**_TEST_VIEW, "distance": distance}, extent, 0.01)
+    stored = _viewer_fovy(_TEST_VIEW, extent, 0.01)
+    assert 0.0 < stored < 180.0 and stored == float(np.float32(stored))
+    for bad_extent in (0.0, -1.0, math.inf, math.nan):
+        with pytest.raises(ViewerViewError):
+            _viewer_fovy(_TEST_VIEW, bad_extent, 0.01)
+
+
+# ---------------------------------------------------------------------------
+# mujoco_model_camera_names: the cameras the simulator's model carries
+# ---------------------------------------------------------------------------
+
+_CAMERAS_MJCF = (
+    '<mujoco><worldbody><camera name="first"/><body name="b"><camera/><camera name="last"/></body></worldbody></mujoco>'
+)
+
+
+def test_model_camera_names_follow_the_model_id_order(tmp_path):
+    """XML and binary models list their cameras in mjModel id order; an
+    unnamed camera is ''."""
+    xml = tmp_path / "model.xml"
+    xml.write_text(_CAMERAS_MJCF, encoding="utf-8")
+    binary = tmp_path / "model.mjb"
+    mujoco.mj_saveModel(mujoco.MjModel.from_xml_path(str(xml)), str(binary), None)
+    assert mujoco_model_camera_names(str(xml)) == ["first", "", "last"]
+    assert mujoco_model_camera_names(str(binary)) == ["first", "", "last"]
+
+
+def test_model_camera_names_load_like_mujoco_ros2_control(tmp_path, monkeypatch):
+    """A file named exactly '.mjb' is MJCF (the binary rule needs more than
+    four characters); a .mjb name over XML text is read as a binary and fails."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".mjb").write_text(_CAMERAS_MJCF, encoding="utf-8")
+    assert mujoco_model_camera_names(".mjb") == ["first", "", "last"]
+    (tmp_path / "x.mjb").write_text(_CAMERAS_MJCF, encoding="utf-8")
+    with pytest.raises(Exception):  # noqa: B017 - any load error; the binary reader's type is not part of the rule
+        mujoco_model_camera_names("x.mjb")
+
+
+def test_model_camera_names_report_unusable_paths_without_mujoco(tmp_path, monkeypatch):
+    """A missing file or a path the OS rejects (ENAMETOOLONG: a 300-byte name)
+    raises FileNotFoundError before MuJoCo would log it to MUJOCO_LOG.TXT in
+    the cwd."""
+    monkeypatch.chdir(tmp_path)
+    for path in (str(tmp_path / "missing.xml"), str(tmp_path / ("x" * 300))):
+        with pytest.raises(FileNotFoundError):
+            mujoco_model_camera_names(path)
+    assert not (tmp_path / "MUJOCO_LOG.TXT").exists()
+
+
+def _model_path_of(directory: Path, size: int) -> Path:
+    """An .xml path of exactly ``size`` bytes under ``directory``, nested so
+    every component stays under the 255-byte name limit."""
+    path = directory
+    while size - len(os.fsencode(str(path))) > 200:
+        path = path / ("d" * 100)
+    return path / ("m" * (size - len(os.fsencode(str(path))) - len("/.xml")) + ".xml")
+
+
+def test_model_camera_names_reject_paths_the_simulator_truncates(tmp_path):
+    """mujoco_ros2_control copies mujoco_model into simulate's 1000-byte
+    buffer, so from 1000 bytes on it would load a truncated path, a different
+    file. Bytes count, not characters: the copy is a C string."""
+    fits = _model_path_of(tmp_path, 999)
+    fits.parent.mkdir(parents=True, exist_ok=True)
+    fits.write_text(_CAMERAS_MJCF, encoding="utf-8")
+    assert len(os.fsencode(str(fits))) == 999
+    assert mujoco_model_camera_names(str(fits)) == ["first", "", "last"]
+
+    too_long = _model_path_of(tmp_path, 1000)
+    too_long.parent.mkdir(parents=True, exist_ok=True)
+    too_long.write_text(_CAMERAS_MJCF, encoding="utf-8")
+    with pytest.raises(ValueError, match="truncates"):
+        mujoco_model_camera_names(str(too_long))
+
+    # fewer than 1000 characters, 1000 bytes: the two-byte name crosses the limit
+    multibyte = fits.with_name(fits.name[: -len("m.xml")] + "é.xml")
+    multibyte.write_text(_CAMERAS_MJCF, encoding="utf-8")
+    assert len(str(multibyte)) < 1000 <= len(os.fsencode(str(multibyte)))
+    with pytest.raises(ValueError, match="truncates"):
+        mujoco_model_camera_names(str(multibyte))
+
+
+def test_model_camera_names_read_engine_extension_models(tmp_path):
+    """An extension-declaring model (the XML the compiler delivers) parses
+    only with its engine plugins registered; the helper registers them. Run
+    in a fresh process: other tests here register the lidar plugin in this one."""
+    path = tmp_path / "lidar_robot.xml"
+    path.write_text(
+        LIDAR_ROBOT_TEMPLATE.replace(
+            '<site name="probe_lidar_site"', '<camera name="probe_cam"/><site name="probe_lidar_site"'
+        ),
+        encoding="utf-8",
+    )
+    probe = (
+        "import sys\n"
+        "from sim_models.scene_compiler import mujoco_model_camera_names\n"
+        "print(mujoco_model_camera_names(sys.argv[1]))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(path)], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "['probe_cam']"

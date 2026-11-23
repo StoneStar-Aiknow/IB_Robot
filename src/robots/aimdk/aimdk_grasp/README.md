@@ -42,6 +42,46 @@ HAL leaves `meas_stamp` zero), so joint states and images are compared within on
 clock domain, as in the standalone pipeline; the nearest sample is at most 10 ms
 from the image.
 
+### Removed hands
+
+Declare the mounted hands explicitly in `grasp_execution.backend_options` on
+both the pipeline host and the grasp-head host. For a robot with only the right
+OmniHand mounted:
+
+```yaml
+grasp_execution:
+  backend_options:
+    installed_hands: [right]
+    arm_side: right
+```
+
+The default is `[left, right]`. A single mounted hand requires its own explicit
+`arm_side`; `auto` requires both hands, and an `arm_side` naming a hand that is
+not installed is a configuration error.
+
+Feedback must contain every joint of each declared hand. Missing or partial
+feedback for a declared hand is refused. The vendor HAL reports both hands
+whether or not one is mounted, so whatever it reports for a hand declared
+absent is ignored and never gates the other hand. A runtime `none` report is
+never used to infer physical removal. The fixed 20-value stream keeps ten zero placeholders for an
+absent hand; these are output slots, never invented measurements or a substitute
+for feedback.
+
+When neither hand is mounted, disable `grasp_execution.enabled`. The mounting
+parser accepts `installed_hands: []`, and `FeedbackHistory(required_hands=())`
+subscribes only to body/head feedback and runtime health. Enabling grasp
+execution with no installed hands is an explicit configuration error.
+
+The runtime's transport-health checks still apply. If the vendor publishes no
+hand-state messages at all, the handless deployment's runtime profile must also
+set `vendor.feedback.required_groups: [arm]`. Keep the arm/head fault checks and
+the normal `[arm, hand]` freshness requirement whenever a hand is mounted. An
+empty hand-joint view and a failed runtime transport are separate conditions.
+
+Changing these settings requires matching configuration on both hosts and a
+restart of the affected nodes. Mock checks do not establish hardware approval
+for a new right-hand grasp deployment.
+
 ## Planning model
 
 `aimdk_grasp.planning_model.build_planning_model()` generates the planning URDF
@@ -209,18 +249,26 @@ leaves less than 0.06 of the tracking limit.
 
 ## The hand
 
-`aimdk_grasp.omnihand.OmniHandEffector` is the left OmniHand as the pipeline's
-end effector, streamed on the runtime's `joint.hand_stream` (the left hand's ten
-native joints, then ten zeros for the right, the packing the motion-control
-contract was verified with). The last command is kept alive between actions, so
-the hand holds its target while the arm moves; after a goal the stream is
-released and the platform keeps it.
+`aimdk_grasp.omnihand.OmniHandEffector` drives either OmniHand through the runtime's
+`joint.hand_stream` (the left hand's ten native joints followed by the right's
+ten). Before its first output in each goal, it records the other hand's position
+from fresh feedback and preserves that pose in every command. Missing or
+non-finite feedback of that hand refuses further hand commands; its drift from
+the recorded pose is only reported (`preserved_hand.max_drift_rad`). It never fills the other hand's slots with zeros. Prepare
+both hands in the model's open preset before a dual-arm grasp run. The last
+command is kept alive between actions, so the hand holds its target while the
+arm moves; after a goal the stream is released and the platform keeps it.
 
 Preshape and release open along a straight line, 0.01 rad per 50 Hz frame, and
-wait up to 3 s for the fingers; a hand left more than 0.1 rad short of open is
-blocked. The close moves each finger on its own and freezes it at its first
-contact, a fingertip pad reading 30 or more or the flex joint 0.15 rad behind
-its command; the thumb and one more finger in contact is a grip. The hand's
+wait up to 3 s for the fingers. A hand still more than 0.1 rad short that holds
+nothing tries once more from its measured pose with the thumb cleared
+(`thumb_clear`: the thumb straightens out of the fingers' way, the fingers open,
+then the thumb comes in); a gripping hand only ever opens along the straight
+line. Still more than 0.1 rad short, the hand is blocked. Open means every joint
+within 0.025 rad of the open preset, the thumb abduction within 0.1 rad.
+
+The close moves each finger on its own and freezes it at its first contact, a
+fingertip pad reading 30 or more or the flex joint 0.15 rad behind its command; the thumb and one more finger in contact is a grip. The hand's
 fault codes are not used and the runtime does not publish them: a finger
 pressing an object reports one for as long as it grips. Open and close shapes
 come from the GraspGenX gripper description.
@@ -294,6 +342,25 @@ without a watch status (`status_timeout_s`). Ending the split means selecting
 `aimdk_grasp.backend:x2_grasp_backends`, which keeps everything in one process,
 and dropping that block.
 
+## Automatic arm selection
+
+The shipped X2 grasp profiles set `grasp_execution.backend_options.arm_side`
+to `auto`. The head transforms the target's depth points into `torso_link`
+and uses their median y: positive selects the left arm, negative the right.
+Within 5 cm of the midline, it tries the nearer arm first and the other arm
+if planning fails, returning the first executable plan. Each attempt receives
+an equal share of the remaining planning budget; both attempts share the
+observation's original budget and the goal deadline.
+
+Both arm planners stay resident and share the camera, IMU and GPU lock.
+Each has its own collision scene, joint limits, gravity model and hand mapping.
+The accepted plan's `report.arm_side` routes arm commands, hand commands and
+the target watch; execution rejects trajectories whose joint names disagree
+with that side. Startup requires fresh feedback showing both hands open.
+
+Set `arm_side: left` or `arm_side: right` on both hosts to force one arm.
+Configurations that omit the option retain the left-arm default.
+
 ## Target watch states
 
 While the arm approaches and grasps (the `approach` and `grasp` steps), the
@@ -304,9 +371,12 @@ say (`execution_watch.WatchState`) decides what `watch: stop` does:
 |---|---|---|
 | stable | the newest fresh frame reads the target where it was planned | go on |
 | moved | the votes decided the target moved | halt, retrace, plan again (`TARGET_MOVED`) |
-| unknown | frames arrive but do not decide (the hand covers the target) | go on for `watch_unknown_timeout_s`, then stop in place (`WATCH_FAILED`) |
+| unknown | frames arrive but do not decide (the hand covers the target) | go on for `watch_unknown_timeout_s` (`watch_occluded_timeout_s` in the `grasp` step while the newest frame is undecided only because the arm covers the target), then stop in place (`WATCH_FAILED`) |
 | unavailable | not started, stopped, or no fresh frame for `watch_frame_timeout_s` | refuse to start; mid-way stop in place (`WATCH_FAILED`) |
 | waiting / ended | before the approach / from the close on, or `watch: off` | nothing is judged |
+
+A frame votes moved only when both its measured depth and its RGB changed over
+their limits; depth alone misreads next to the closing hand.
 
 A failed watch is not a move: nothing says where the target is, so the arm is
 held where it halted and nothing is retraced, replanned or released. When the

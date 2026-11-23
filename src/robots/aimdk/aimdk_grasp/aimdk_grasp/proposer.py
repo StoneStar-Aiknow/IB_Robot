@@ -34,8 +34,8 @@ from dataclasses import asdict, dataclass, field, replace
 
 import numpy as np
 
-from manipulation_execution.pick.pipeline.contracts import Flag, GraspFailure, Observation, Proposals
 from manipulation_execution.pick.pipeline.perception import Detection, PerceptionServices
+from manipulation_execution.shared.contracts import Flag, GraspFailure, Observation, Proposals
 
 from .feedback import Feedback
 from .joints import LEFT_ARM
@@ -158,8 +158,28 @@ class PerceptionSettings:
 
 def measured_spheres(model: RobotSphereModel, feedback) -> np.ndarray:
     """Torso-frame collision spheres of the measured pose."""
-    spheres, _ = model.spheres(feedback, feedback.vector(LEFT_ARM)[None])
+    # The planning arm's joints (a model without ``arm`` plans the left arm).
+    spheres, _ = model.spheres(feedback, feedback.vector(getattr(model, "arm", LEFT_ARM))[None])
     return spheres[0].copy()
+
+
+def prepare_capture_scene(observation, model: RobotSphereModel, config):
+    """The mask-independent scene stage of one registered capture, with ``model``'s arm at its image-time pose."""
+    from .scene_estimation import prepare_scene
+
+    registered = observation.robot_state.live.observation
+    frame, transform = registered.frame, registered.transform
+    return prepare_scene(
+        frame.depth,
+        frame.intrinsics,
+        transform,
+        stamp_ns=transform.stamp_ns,
+        camera_frame=frame.frame_id,
+        received_at=registered.received_at,
+        robot_spheres_torso=measured_spheres(model, registered.image_feedback),
+        depth_scale=frame.depth_scale,
+        config=config,
+    )
 
 
 class X2Proposer:
@@ -293,13 +313,19 @@ class X2Proposer:
         started = time.perf_counter()
         timings = {}
 
+        # Each stage's [name, start, end] from the start of perception: stages that run side by side
+        # (the scene beside GraspGen-X) are judged by which ends last, not by their sum.
+        spans = timings["spans_s"] = []
+
         def measured(name, operation):
             checkpoint()
             before = time.perf_counter()
             try:
                 result = operation()
             finally:
-                timings[name] = time.perf_counter() - before
+                after = time.perf_counter()
+                timings[name] = after - before
+                spans.append([name, round(before - started, 4), round(after - started, 4)])
             checkpoint()
             return result
 

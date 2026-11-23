@@ -122,3 +122,30 @@ def test_normalized_loader_reports_base_to_overlay_source_chain(tmp_path: Path) 
     assert resolved["values"] == [1, 2]
     assert resolved["_config_path"] == str(overlay.resolve())
     assert resolved["_config_sources"] == [str(base.resolve()), str(middle.resolve()), str(overlay.resolve())]
+
+
+_SO101_PROFILE = (
+    Path(__file__).resolve().parents[2] / "robots" / "so101" / "so101_robot" / "profiles" / "so101_single_arm.yaml"
+)
+
+
+def test_so101_rgbd_overlay_binds_the_runtime_realsense_streams() -> None:
+    from robot_config.testing.provider_binding import bind_offline
+
+    deferred = load_robot_config_dict(CONFIG_DIR / "so101_single_arm_rgbd.yaml", defer_interface_binding=True)
+    assert deferred["runtime"]["provider"] == "so101_robot"
+    assert deferred["default_control_mode"] == "teleop"
+    assert {entry["name"] for entry in deferred["peripherals"] if entry.get("disabled")} == {"top", "wrist"}
+
+    bound = bind_offline(deferred, _SO101_PROFILE)
+
+    assert {obs["key"]: obs["topic"] for obs in bound["contract"]["observations"]} == {
+        "observation.images.front": "/camera/front/image_raw",
+        "observation.images.front.depth": "/camera/front/aligned_depth_to_color/image_raw",
+        "observation.pointcloud.front": "/camera/front/depth/color/points",
+        "observation.state": "/joint_states",
+        "observation.current": "/so101_follower/joint_currents",
+    }
+    # The teleoperation target is the managed SO-101 arm session, not a controller topic.
+    assert bound["teleoperation"]["target"]["interfaces"]["session_start"] == "motion.arm.session_start"
+    assert "devices" not in bound["teleoperation"]

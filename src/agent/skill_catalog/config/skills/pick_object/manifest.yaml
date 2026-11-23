@@ -47,7 +47,9 @@ description_variants:
   # The X2 puts the object back where it was after holding it lifted; it has
   # no container to transport it to.
   aimdk_x2_grasp:
-    summary: Detect and grasp the requested object with the left hand, lift and hold it, then put it back.
+    summary: >-
+      Detect and grasp the requested object with the selected hand, lift and hold it, then put it back.
+      The X2 selects the arm from the object's side unless its configuration forces one arm.
     category: manipulation
     when_to_use:
     - pick up a visible object identified by a text query

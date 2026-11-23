@@ -1,4 +1,4 @@
-"""Left OmniHand joint mapping between native positions and planning-model aliases."""
+"""OmniHand joint mapping between native positions and planning-model aliases, per side."""
 
 from __future__ import annotations
 
@@ -9,9 +9,57 @@ from pathlib import Path
 
 import numpy as np
 
-from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_SIGNS
+from aimdk_grasp.joints import DIP_FOLLOWERS, HAND_ALIASES, HAND_PARTS, check_side, hand_alias_signs, hand_joints
 
+#: How far (rad) a measured joint may be from the open preset and still count
+#: as open: before planning a grasp, after opening and on release.
 OPEN_HAND_TOLERANCE_RAD = 0.025
+#: Except the thumb abduction, which can stop short near the end of its travel
+#: toward the palm: 0.088 rad short after a release (2026-11-08) failed the
+#: following regrasp. Every other joint keeps the tight bound.
+THUMB_ABAD_OPEN_TOLERANCE_RAD = 0.1
+#: Per native joint (HAND_PARTS order, either hand).
+OPEN_TOLERANCES_RAD = np.full(len(HAND_PARTS), OPEN_HAND_TOLERANCE_RAD)
+OPEN_TOLERANCES_RAD[HAND_PARTS.index("thumb_abad")] = THUMB_ABAD_OPEN_TOLERANCE_RAD
+OPEN_TOLERANCES_RAD.setflags(write=False)
+
+
+#: Round-off allowed past a native URDF limit; not a feedback tolerance.
+LIMIT_SLACK_RAD = 1e-6
+
+
+class HandLimitError(ValueError):
+    """Native hand positions beyond the planning model's limits, and by how much.
+
+    The message keeps the "<Side> hand exceeds native URDF limits" prefix and
+    adds every offending joint and the complete vector, so a refusal can be
+    told apart (real overtravel, boundary jitter, mapping or model mismatch)
+    from the log alone. ``violations`` holds ``(joint, index, value, lower,
+    upper, excess)`` per offending joint, ``excess`` > 0 in rad.
+    """
+
+    def __init__(self, side: str, native: np.ndarray, lower: np.ndarray, upper: np.ndarray):
+        joints = hand_joints(side)
+        self.side = side
+        self.native = np.array(native, dtype=np.float64)
+        self.violations = tuple(
+            (joints[i], i, float(q), float(lo), float(hi), float(max(lo - q, q - hi)))
+            for i, (q, lo, hi) in enumerate(zip(self.native, lower, upper, strict=True))
+            if q < lo - LIMIT_SLACK_RAD or q > hi + LIMIT_SLACK_RAD
+        )
+        detail = "; ".join(
+            f"{name}[{i}]={q:.6f} outside [{lo:.6f}, {hi:.6f}] by {excess:.6f} rad"
+            for name, i, q, lo, hi, excess in self.violations
+        )
+        vector = ", ".join(f"{q:.6f}" for q in self.native)
+        super().__init__(
+            f"{side.capitalize()} hand exceeds native URDF limits: {detail}; native ({', '.join(joints)}) = [{vector}]"
+        )
+
+
+def is_open(native, open_pose) -> bool:
+    """Every joint within its open tolerance of ``open_pose`` (both native)."""
+    return bool(np.all(np.abs(np.asarray(native, float) - np.asarray(open_pose, float)) <= OPEN_TOLERANCES_RAD))
 
 
 def hand_links(model: ET.Element) -> tuple[str, ...]:
@@ -50,13 +98,19 @@ def load_gripper_presets(gripper: Path, model: ET.Element) -> dict[str, dict[str
 
 
 class HandMapping:
-    """Native left-hand positions (``L_*`` order) to and from mounted ``R_*`` aliases.
+    """Native positions of ``side``'s hand (``hand_joints(side)`` order) to and from mounted ``R_*`` aliases.
 
-    Limits come from the planning model; presets, when given, from the gripper
-    description (:func:`load_gripper_presets`).
+    ``model`` is that side's planning model: the left hand is mounted mirrored
+    (alias = native x ``HAND_SIGNS``), the right hand natively. Limits come
+    from the planning model; presets, when given, from the gripper description
+    (:func:`load_gripper_presets`), in alias space, so one description serves
+    both hands.
     """
 
-    def __init__(self, model: ET.Element, presets: Mapping[str, Mapping[str, float]] | None = None):
+    def __init__(self, model: ET.Element, presets: Mapping[str, Mapping[str, float]] | None = None, side: str = "left"):
+        self.side = check_side(side)
+        self.signs = hand_alias_signs(side)
+
         def limit(name: str) -> tuple[float, float]:
             element = model.find(f"joint[@name='{name}']/limit")
             if element is None:
@@ -64,7 +118,7 @@ class HandMapping:
             return float(element.get("lower")), float(element.get("upper"))
 
         bounds = np.array(
-            [sorted(sign * value for value in limit(name)) for name, sign in zip(HAND_ALIASES, HAND_SIGNS, strict=True)]
+            [sorted(sign * value for value in limit(name)) for name, sign in zip(HAND_ALIASES, self.signs, strict=True)]
         )
         self.lower, self.upper = bounds[:, 0].copy(), bounds[:, 1].copy()
         self.distal_limits = {name: limit(name) for name in DIP_FOLLOWERS}
@@ -76,18 +130,18 @@ class HandMapping:
     def check(self, native) -> np.ndarray:
         q = np.asarray(native, dtype=np.float64)
         if q.shape != (10,) or not np.isfinite(q).all():
-            raise ValueError("Exactly ten finite active left joints required")
-        if np.any(q < self.lower - 1e-6) or np.any(q > self.upper + 1e-6):
-            raise ValueError("Left hand exceeds native URDF limits")
+            raise ValueError(f"Exactly ten finite active {self.side} joints required")
+        if np.any(q < self.lower - LIMIT_SLACK_RAD) or np.any(q > self.upper + LIMIT_SLACK_RAD):
+            raise HandLimitError(self.side, q, self.lower, self.upper)
         return q
 
     def to_native(self, alias: Mapping[str, float]) -> np.ndarray:
         if set(alias) != set(HAND_ALIASES):
             raise ValueError("Active alias mapping must contain exactly the ten commanded joints")
-        return self.check([sign * alias[name] for name, sign in zip(HAND_ALIASES, HAND_SIGNS, strict=True)])
+        return self.check([sign * alias[name] for name, sign in zip(HAND_ALIASES, self.signs, strict=True)])
 
     def to_alias(self, native) -> dict[str, float]:
-        return dict(zip(HAND_ALIASES, self.check(native) * HAND_SIGNS, strict=True))
+        return dict(zip(HAND_ALIASES, self.check(native) * self.signs, strict=True))
 
     def kinematic_alias(self, native) -> dict[str, float]:
         """Active aliases plus the five model-derived, unmeasured DIP angles."""
@@ -108,11 +162,12 @@ class HandMapping:
     def require_open(self, native) -> float:
         """Require the measured pregrasp pose; never replace it with a preset."""
         self.kinematic_alias(native)
-        error = float(np.max(np.abs(self.check(native) - self.preset("open"))))
-        if error > OPEN_HAND_TOLERANCE_RAD:
+        measured = self.check(native)
+        error = float(np.max(np.abs(measured - self.preset("open"))))
+        if not is_open(measured, self.preset("open")):
             raise RuntimeError(
-                "Initial left hand is not open; open the hand and confirm fresh feedback "
-                f"before capturing/planning (max error {error:.4f} rad, "
-                f"tolerance {OPEN_HAND_TOLERANCE_RAD:.3f} rad)"
+                f"Initial {self.side} hand is not open; open the hand and confirm fresh feedback "
+                f"before capturing/planning (max error {error:.4f} rad, tolerance {OPEN_HAND_TOLERANCE_RAD:.3f} rad, "
+                f"thumb abduction {THUMB_ABAD_OPEN_TOLERANCE_RAD:.3f} rad)"
             )
         return error

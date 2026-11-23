@@ -14,6 +14,9 @@
 
 """The public robot model the LeKiwi runtime hands to its facade.
 
+Tests that render ``lekiwi_nav_grasp`` on hardware request ``pinned_calibration``
+(conftest.py), so they never read the host's arm calibration.
+
 The runtime launch renders the whole robot once and builds the interface
 description from it, as the SO-101 runtime does. Without that the facade has no
 ``model`` and consumers cannot read joint groups, limits or frames from the
@@ -39,7 +42,7 @@ def _description(name: str, simulated: bool) -> dict:
 
 
 @pytest.mark.parametrize("simulated", (True, False), ids=("simulated", "physical"))
-def test_nav_grasp_publishes_arm_gripper_and_wheels(simulated):
+def test_nav_grasp_publishes_arm_gripper_and_wheels(simulated, pinned_calibration):
     groups = _description("lekiwi_nav_grasp", simulated)["model"]["joint_groups"]
     assert groups["base"] == ["7", "8", "9"]
     assert len(groups["arm"]) == 5 and len(groups["gripper"]) == 1
@@ -87,7 +90,7 @@ def test_nav_grasp_declares_the_public_ee_pose_stream():
 
 
 @pytest.mark.parametrize("simulated", (True, False), ids=("simulated", "physical"))
-def test_nav_grasp_description_exposes_home_positions_and_ee_pose(simulated):
+def test_nav_grasp_description_exposes_home_positions_and_ee_pose(simulated, pinned_calibration):
     # Both D5 profile additions are part of the public description (and
     # therefore its digest): the model's semantic home positions and the
     # declared motion.ee_pose stream.

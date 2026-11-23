@@ -47,6 +47,26 @@ def test_only_the_left_hand_is_taken_in_the_platform_order():
     np.testing.assert_allclose(history.latest().left_hand, list(reversed(range(10))))
 
 
+def test_the_right_hand_is_taken_in_its_platform_order_when_the_view_carries_it():
+    history = FeedbackHistory()
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    hand = LEFT_HAND + tuple(reversed(RIGHT_HAND))
+    history.record("joint.hand_state", 10 * MS, hand, [7.0] * 10 + list(range(10)))
+    feedback = history.latest()
+    np.testing.assert_allclose(feedback.hand("right"), list(reversed(range(10))))
+    np.testing.assert_allclose(feedback.hand("left"), [7.0] * 10)
+
+    history = FeedbackHistory(required_hands=("left",))
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, LEFT_HAND, [0.0] * 10)
+    feedback = history.latest()
+    assert feedback.right_hand is None
+    with pytest.raises(ValueError, match="lacks right hand"):
+        feedback.hand("right")
+
+
 def test_an_image_without_feedback_within_50_ms_is_refused():
     history = FeedbackHistory()
     _record(history, 1000 * MS)
@@ -56,12 +76,66 @@ def test_an_image_without_feedback_within_50_ms_is_refused():
         history.at(1051 * MS)
 
 
+def test_both_hands_are_required_unless_the_mounting_says_otherwise():
+    history = FeedbackHistory()
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, LEFT_HAND, [0.0] * 10)
+    with pytest.raises(ValueError, match="lacks installed right hand"):
+        history.latest()
+
+
 def test_every_view_is_required():
     history = FeedbackHistory()
     history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
     history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
 
     with pytest.raises(ValueError, match=r"No feedback yet from \['joint.hand_state'\]"):
+        history.latest()
+
+
+@pytest.mark.parametrize("sides", [("left",), ("right",), ("left", "right"), ()])
+def test_only_explicitly_installed_hands_are_required(sides):
+    history = FeedbackHistory(required_hands=sides)
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    names = tuple(name for side in sides for name in (LEFT_HAND if side == "left" else RIGHT_HAND))
+    if sides:
+        history.record("joint.hand_state", 10 * MS, names, [0.1] * len(names))
+    history.set_healthy(True, time.monotonic())
+    for feedback in (history.latest(), history.at(10 * MS)):
+        assert feedback.healthy and len(feedback.vector(ARMS)) == 14
+        for side in ("left", "right"):
+            if side in sides:
+                np.testing.assert_allclose(feedback.hand(side), [0.1] * 10)
+            else:
+                with pytest.raises(ValueError, match=f"lacks {side} hand"):
+                    feedback.hand(side)
+
+
+@pytest.mark.parametrize(
+    "names,values",
+    [(LEFT_HAND + RIGHT_HAND, [0.2] * 10 + [0.1] * 10), (LEFT_HAND[:-1] + RIGHT_HAND, [np.nan] * 9 + [0.1] * 10)],
+)
+def test_whatever_is_reported_for_a_hand_declared_not_installed_is_ignored(names, values):
+    history = FeedbackHistory(required_hands=("right",))
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, names, values)
+    feedback = history.latest()
+    np.testing.assert_allclose(feedback.hand("right"), [0.1] * 10)
+    assert feedback.left_hand is None
+    with pytest.raises(ValueError, match="lacks left hand"):
+        feedback.hand("left")
+
+
+@pytest.mark.parametrize("names", [(), RIGHT_HAND[:-1], LEFT_HAND])
+def test_missing_or_partial_hand_feedback_cannot_change_the_mounting_configuration(names):
+    history = FeedbackHistory(required_hands=("right",))
+    history.record("joint.state", 10 * MS, ARMS, [0.0] * 14)
+    history.record("joint.head_state", 10 * MS, HEAD, [0.0, 0.0])
+    history.record("joint.hand_state", 10 * MS, names, [0.0] * len(names))
+    with pytest.raises(ValueError, match="hand"):
         history.latest()
 
 

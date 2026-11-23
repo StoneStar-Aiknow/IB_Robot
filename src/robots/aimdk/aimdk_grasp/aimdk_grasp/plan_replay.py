@@ -36,11 +36,16 @@ def recorded_calls(paths: list[Path]) -> list[Path]:
     return files
 
 
-def with_leg_boxes(estimate, shrink_m: float):
-    """The estimate with the pelvis and left leg as boxes in its coarse scene only (scene_estimation.leg_boxes)."""
-    from aimdk_grasp.scene_estimation import leg_boxes
+def with_leg_boxes(estimate, shrink_m: float, side: str = "left"):
+    """The estimate with the pelvis and ``side``'s leg as boxes in its coarse scene only (scene_estimation.leg_boxes).
 
-    scene = dict(estimate.scene, cuboid={**estimate.scene["cuboid"], **leg_boxes(shrink_m)})
+    Boxes the recording already carries for that leg are replaced, so ``shrink_m`` is the one in effect.
+    """
+    from aimdk_grasp.scene_estimation import leg_boxes, leg_obstacle_name
+
+    prefix = f"{leg_obstacle_name(side)}_"
+    cuboids = {name: box for name, box in estimate.scene["cuboid"].items() if not name.startswith(prefix)}
+    scene = dict(estimate.scene, cuboid={**cuboids, **leg_boxes(shrink_m, side)})
     return replace(estimate, scene=scene)
 
 
@@ -54,18 +59,24 @@ def shifted(recorded: dict, offset_s: float):
     return feedback, estimate, options
 
 
-def x2_service(config_name: str):
-    """The grasp head's planning service for a robot configuration (backend.head_parts)."""
-    from aimdk_grasp.backend import x2_robot
+def recorded_side(recorded: dict) -> str:
+    """The arm a recorded call planned; recordings from before both arms planned are the left's."""
+    return str((recorded.get("service") or {}).get("side", "left"))
+
+
+def x2_service(config_name: str, side: str = "left"):
+    """The grasp head's planning service for one arm of a robot configuration (backend.head_parts)."""
+    from aimdk_grasp.backend import robot_for_side, x2_robot
     from aimdk_grasp.planner_service import GraspPlanningService
     from robot_config.config_path import resolve_robot_config_path
     from robot_config.loader import load_robot_config_dict
 
     config = load_robot_config_dict(resolve_robot_config_path(config_name=config_name), defer_interface_binding=True)
-    robot = x2_robot(config.get("grasp_execution") or {})
+    robot = robot_for_side(x2_robot(config.get("grasp_execution") or {}), side)
     planning = robot.planning
     service = GraspPlanningService(
         gripper=robot.gripper,
+        side=robot.side,
         planning_profile=planning.planning_profile,
         approach_seed_policy=planning.approach_seed_policy,
         max_goalset=planning.max_goalset,
@@ -78,25 +89,33 @@ def x2_service(config_name: str):
 
 
 def replay(files, service, *, leg_shrink_m=None, budget_s=None, repeats=1):
-    """One row per call and repeat: live outcome beside the replayed one."""
+    """One row per call and repeat: live outcome beside the replayed one.
+
+    ``service`` is one planning service, or one per arm keyed by side; a call is
+    replayed on the arm it was recorded on, never quietly on another.
+    """
     rows, clock = [], 1_000.0
     for repeat in range(repeats):
         for path in files:
             recorded = pickle.loads(path.read_bytes())
+            side = recorded_side(recorded)
+            arm_service = service.get(side) if isinstance(service, dict) else service
+            if arm_service is None or getattr(arm_service, "side", "left") != side:
+                raise ValueError(f"{path.name} was planned for the {side} arm; no {side}-arm service to replay it")
             offset = clock - recorded["estimate"].received_at
             clock += 100.0
             feedback, estimate, options = shifted(recorded, offset)
             if leg_shrink_m is not None:
-                estimate = with_leg_boxes(estimate, leg_shrink_m)
+                estimate = with_leg_boxes(estimate, leg_shrink_m, side)
             budget = budget_s if budget_s is not None else recorded["budget_s"]
-            rebuilt = service._planner is None or not service._planner.locked_joints_match(feedback)
+            rebuilt = arm_service._planner is None or not arm_service._planner.locked_joints_match(feedback)
             row = dict(call=path.name, repeat=repeat, live=recorded["outcome"], rebuilt=rebuilt, budget_s=budget)
             began = time.perf_counter()
             try:
                 if rebuilt:
-                    service.prepare(feedback, estimate)  # a build is not part of a live plan call
+                    arm_service.prepare(feedback, estimate)  # a build is not part of a live plan call
                     began = time.perf_counter()
-                _, report = service.plan(
+                _, report = arm_service.plan(
                     feedback,
                     estimate,
                     recorded["camera_from_grasps"],
@@ -139,11 +158,15 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     args = parser.parse_args()
     files = recorded_calls(args.inputs)
-    service, options = x2_service(args.robot_config)
+    sides = sorted({recorded_side(pickle.loads(path.read_bytes())) for path in files})
+    services, options = {}, {}
     try:
-        rows = replay(files, service, leg_shrink_m=args.coarse_leg_boxes, budget_s=args.budget_s, repeats=args.repeats)
+        for side in sides:
+            services[side], options[side] = x2_service(args.robot_config, side)
+        rows = replay(files, services, leg_shrink_m=args.coarse_leg_boxes, budget_s=args.budget_s, repeats=args.repeats)
     finally:
-        service.close()
+        for service in services.values():
+            service.close()
     result = dict(
         robot_config=args.robot_config,
         service=options,

@@ -1,0 +1,21 @@
+# Read-only validation of exactly these moves on a newly captured world, for
+# putting a held or interrupted pick back at its source contact (custody
+# recovery). Old collision certificates never authorize them.
+string arm_side
+GraspPlanStep[] steps
+# The custody being recovered (ibrobot_msgs/HeldObject.custody_id) and the
+# recovery request it belongs to; both are echoed back.
+string custody_id
+string request_id
+float64[] hand_positions
+float64 timeout_s
+# Optional verified grasp geometry, only for retracing the lift and opening at contact.
+ibrobot_msgs/HeldObject held_object
+string plan_id
+---
+bool success
+string error_code
+string message
+string custody_id
+string request_id
+string report_json

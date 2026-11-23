@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .contracts import Flag, GraspFailure
+from manipulation_execution.shared.contracts import Flag, GraspFailure
 
 RPC_FAILED = "RPC_FAILED"
 

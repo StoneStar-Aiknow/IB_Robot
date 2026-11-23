@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .contracts import (
+from manipulation_execution.shared.contracts import (
     ArmSegment,
     Effect,
     EffectorAction,

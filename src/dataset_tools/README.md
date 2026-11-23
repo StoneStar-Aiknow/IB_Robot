@@ -342,7 +342,8 @@ ros2 run dataset_tools bag_to_lerobot \
 | `--out` | 输出数据集目录 | 必需 |
 | `--repo-id` | 数据集 repo_id | `rosbag_v30` |
 | `--no-videos` | 存储 PNG 图像而非视频 | `false` |
-| `--timestamp` | 时间戳来源 (contract/bag/header) | `contract` |
+| `--timestamp` | 时间戳来源 (contract/receive/header；`bag` 是 `receive` 的别名) | `contract` |
+| `--header-skew-warn-ms` | 图像 header 偏移告警阈值（ms，`0` 关闭；只告警） | `200` |
 | `--image-threads` | 图像写入线程数 | `4` |
 | `--chunk-size` | 每个 chunk 的帧数 | `1000` |
 
@@ -424,7 +425,7 @@ ros2 run dataset_tools policy_eval compare \
 - 默认 `policy_state_mode=continuous`，保留同一次 run 内的 policy runtime state；`--policy-state-mode per_frame_reset` 只用于显式诊断，会在每帧前调用 `/inference/<pipeline_id>/reset`。
 - `per_frame_reset` 完成后，replay client 会把该帧发布消息的 header stamp 和请求时间重映射到当前 ROS 时间，避免历史 bag 时间戳被 reset cutoff 判定为 reset 前旧消息。prediction JSON 中仍保留原始 bag frame timestamp，并以 `replay_timestamp_mode=live_rebased` 标记该行为。
 - replay publisher 使用 best-effort 相机 QoS 时，首次发布可能发生在 DDS endpoint 完全匹配之前。capture 会在 `required policy observations are not ready` 时重复发布同一帧并重试，默认最多等待 5 秒；可用 `--observation-ready-timeout-sec` 调整。其他 backend 或模型错误不会自动重试。
-- 离线逐帧回放的 publisher 固定使用 `reliable + keep_last(depth=1)`，确保选定的大图像消息不会因 best-effort 丢包而随机截断评估，也不会在逐帧 gate 中积压旧图像；pipeline 的 best-effort subscription 与 reliable publisher 兼容。该覆盖仅用于 `policy_eval`，不修改生产相机或 contract QoS。
+- 离线逐帧回放的 publisher 固定使用 `reliable + keep_last(depth=1)`，确保选定的大图像消息不会因 best-effort 丢包而随机截断评估，也不会在逐帧 gate 中积压旧图像；pipeline 的 subscription 无论是 best-effort 还是 reliable（真机 usb_cam 相机的接口声明为 reliable）都与 reliable publisher 兼容。该覆盖仅用于 `policy_eval`，不修改生产相机或 contract QoS。
 - `per_frame_reset` 为每个原始 bag frame 只生成一个 live timestamp；该帧的所有重发和推理请求都复用同一 timestamp。这样即使大图像 callback 晚一轮到达，也不会因为重试不断推进 goal timestamp 而被永久判定为 stale。
 - prediction JSON 会记录 contract fingerprint、timestamp policy、frame stride、backend 名称、calibration 静态检查结果、每帧 action chunk、latency 和 replay stream diagnostics。
 - prediction JSON 同时记录 `planned_frame_count`、`successful_frame_count` 和 `complete`。`compare` 默认拒绝任一不完整 run 或成功帧集合不同的结果，防止不同平台各自对随机收到的帧子集计算出不可比指标；`--allow-incompatible` 仅用于显式诊断子集。

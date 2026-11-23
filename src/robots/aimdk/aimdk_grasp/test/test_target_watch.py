@@ -70,6 +70,23 @@ def test_a_still_target_votes_still_and_a_moved_one_votes_moved():
     assert target_change(rgb, depth, moved_rgb, moved_depth, mask, NONE, NONE)["vote"] == "moved"
 
 
+def test_a_depth_change_without_an_rgb_change_is_not_a_move():
+    # The second X2's grasp-segment stops: depth over its fraction next to the hand, the colours unchanged.
+    rgb, depth, mask = scene()
+    near = depth.copy()
+    near[30:42, 40:52] -= 0.05
+    result = target_change(rgb, depth, rgb, near, mask, NONE, NONE)
+    assert result["vote"] == "still" and result["depth_changed_fraction"] > 0.15 > result["rgb_changed_fraction"]
+    either = WatchConfig(moved_needs_rgb=False)
+    assert target_change(rgb, depth, rgb, near, mask, NONE, NONE, either)["vote"] == "moved"
+
+
+def test_a_shift_that_leaves_no_room_is_not_reported_as_the_arm_covering_the_target():
+    rgb, depth, mask = scene(target_at=(2, 40))
+    result = target_change(rgb, depth, rgb, depth, mask, NONE, NONE, predicted_shift=(0.0, 30.0))
+    assert result == dict(vote="unknown", visible_fraction=0.0, unknown="the shift leaves no room in this image")
+
+
 def test_camera_sway_within_the_shift_range_is_not_a_move():
     rgb, depth, mask = scene()
     swayed_rgb, swayed_depth = np.roll(rgb, (2, -3), axis=(0, 1)), np.roll(depth, (2, -3), axis=(0, 1))
@@ -156,7 +173,7 @@ def far_spheres(feedback):
 
 @pytest.fixture(autouse=True)
 def one_moving_sphere(monkeypatch):
-    monkeypatch.setattr("aimdk_grasp.target_watch.moving_sphere_indices", lambda: np.array([0]))
+    monkeypatch.setattr("aimdk_grasp.target_watch.moving_sphere_indices", lambda side="left": np.array([0]))
 
 
 def test_only_the_left_arm_below_the_shoulder_and_the_hand_are_masked(monkeypatch):
@@ -480,3 +497,28 @@ def test_the_background_measures_the_camera_shift_the_imu_misses():
     )
     watcher._run()
     assert watcher.report()["votes"] == {"still": 3, "moved": 0, "unknown": 0}
+
+
+def test_the_right_arm_watch_leaves_out_the_right_arm_and_its_hand(monkeypatch):
+    monkeypatch.undo()  # the real sphere model
+    from aimdk_grasp.robot_model import config_directory
+    from aimdk_grasp.robot_spheres import RobotSphereModel
+    from aimdk_grasp.target_watch import moving_sphere_indices
+
+    links = RobotSphereModel(directory=config_directory("right")).sphere_links
+    right = {links[i] for i in moving_sphere_indices("right")}
+    assert {"right_elbow_link", "right_wrist_roll_link", "R_palm"} <= right
+    assert not any(link.startswith("left_") for link in right) and "torso_link" not in right
+    assert len(moving_sphere_indices("right")) == len(moving_sphere_indices())
+
+
+def test_alternating_arms_keep_both_watch_sphere_rows(monkeypatch):
+    monkeypatch.undo()  # the real sphere model
+    from aimdk_grasp import target_watch
+
+    target_watch._moving_sphere_indices.cache_clear()
+    for side in ("left", "right", "left", "right"):
+        target_watch.moving_sphere_indices(side)
+    target_watch.moving_sphere_indices()
+    # One build per arm: switching arms between picks does not rebuild before the motion starts.
+    assert target_watch._moving_sphere_indices.cache_info().misses == 2

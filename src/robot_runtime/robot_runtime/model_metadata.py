@@ -255,7 +255,12 @@ def validate_public_conversion_metadata(metadata: dict) -> None:
 
 
 def build_model_metadata(
-    profile: dict, *, use_sim: bool, sim_platform: str | None, robot_description: str | None
+    profile: dict,
+    *,
+    use_sim: bool,
+    sim_platform: str | None,
+    robot_description: str | None,
+    validate: bool = True,
 ) -> dict:
     """Project calibrated ranges, grouping, rest pose and public motion frame names.
 
@@ -264,6 +269,12 @@ def build_model_metadata(
     reads the URDF convention, physical hardware reads calibration. Conversion
     ranges preserve calibration semantics; admissible command limits intersect
     those ranges with the effective URDF. Simulation never reads calibration.
+
+    ``validate=False`` returns the projected model without the final
+    ``validate_model_metadata`` check, so a caller such as the runtime
+    preflight can report every joint before raising the same check itself.
+    Errors met while projecting (unreadable calibration, missing joints) are
+    still raised.
     """
     simulated = bool(use_sim)
     if simulated:
@@ -291,6 +302,13 @@ def build_model_metadata(
         raise ValueError("model arm, gripper and base groups must be disjoint")
     motion, hardware = profile.get("motion") or {}, profile.get("hardware") or {}
     home = deepcopy(profile.get("home_positions") or {})
+    for name, value in home.items():
+        # An integer beyond the float range raises OverflowError in isfinite;
+        # report it like any other non-finite home pose, naming the joint.
+        try:
+            math.isfinite(value)
+        except OverflowError:
+            raise ValueError(f"home_positions.{name} is too large to be a joint position") from None
     if not set(home) <= set(names) or any(not math.isfinite(value) for value in home.values()):
         raise ValueError("home_positions must contain finite values for profile joints")
     model = {
@@ -330,7 +348,10 @@ def build_model_metadata(
         for name, entry in zip(positions, table, strict=True):
             modes[mode][name] = dict(zip(_ENTRY_FIELDS, entry, strict=True))
         if wheels:
-            maximum = float(base["max_wheel_radps"])
+            try:
+                maximum = float(base["max_wheel_radps"])
+            except OverflowError:
+                raise ValueError("base.max_wheel_radps is too large to be a wheel speed") from None
             if not math.isfinite(maximum) or maximum <= 0:
                 raise ValueError("base.max_wheel_radps must be finite and positive")
             for name in wheels:
@@ -370,5 +391,6 @@ def build_model_metadata(
             "modes": {NORM_MODE_DEGREES: {}, NORM_MODE_RANGE: {}, NORM_MODE_NONE: {}},
         }
     model["joint_conversions_fingerprint"] = joint_conversions_fingerprint(model["joint_conversions"])
-    validate_model_metadata(model)
+    if validate:
+        validate_model_metadata(model)
     return model

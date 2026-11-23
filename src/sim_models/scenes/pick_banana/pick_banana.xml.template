@@ -17,7 +17,9 @@
     <headlight diffuse="0.14 0.14 0.14" ambient="0.425 0.425 0.425" specular="0.0 0.0 0.0"/>
     <quality shadowsize="2048"/>
     <rgba haze="0.15 0.25 0.35 1.0"/>
-    <global azimuth="160" elevation="-20"/>
+    <!-- The viewer's start view (free camera) comes from layout.yaml
+         mujoco_viewer; the compiler writes it into statistic/center and
+         visual/global (azimuth, elevation, fovy). -->
   </visual>
 
   <asset>
@@ -77,6 +79,19 @@
 
   <worldbody>
     <light pos="1.0 1.0 3.5" dir="-0.2 -0.2 -1.0" directional="true" castshadow="false" diffuse="0.32 0.32 0.32"/>
+    <!--
+      side_view: viewer-only camera for judging the gripper's height above the
+      table and the plate. World-fixed at the table's +X end, 0.6 m from
+      (0.12, 0.10, 0.06) and only 6 deg below horizontal, looking along -X:
+      the plate is nearest, the banana randomisation area (x -0.03..0.10,
+      y -0.02..0.10) and the robot base (y 0.30) are behind it. World-fixed
+      rather than robot-tracking because it frames this scene's objects,
+      which are world-fixed too (the so101 base is welded). Not a peripheral:
+      the runtime sets its CameraPlugin policy to "disabled", so it is never
+      published.
+    -->
+    <camera name="side_view" pos="0.7167 0.1 0.1227" fovy="50"
+            xyaxes="0 1 0 -0.1045 0 0.9945"/>
     <!--
       Support surfaces (floor, table_surface) carry geom priority="1" with
       moderate friction (issue #190 D8): MuJoCo mixes contact friction

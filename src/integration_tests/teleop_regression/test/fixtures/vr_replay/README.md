@@ -1,6 +1,6 @@
 # Quest 原始数据回放素材
 
-本目录保存 2026-10-29 真机录制的 Quest 原始数据片段。`test_vr_replay_gate.py` 用这些片段做回放门禁。
+本目录保存 2026-10-29 真机录制的 Quest 原始数据片段。`teleop_regression` 包的 `test_vr_replay_gate.py` 用这些片段做回放门禁。
 
 ## 素材
 
@@ -25,27 +25,28 @@
 
 前置条件：
 
-- 工作区已经构建 `robot_teleop` 和它的依赖。
+- 工作区已经构建 `teleop_regression` 和它的测试依赖。
 - 环境已经安装 `placo`。只有 `full` setup profile 安装 `placo`。
 
 步骤：
 
-1. 加载环境：
+1. 构建测试包和依赖：
 
    ```bash
-   source .shrc_local
+   source .shrc_local && ./scripts/build.sh -- --packages-up-to teleop_regression
    ```
 
 2. 运行测试：
 
    ```bash
-   colcon test --merge-install --packages-select robot_teleop --return-code-on-test-failure
+   source .shrc_local && timeout 900 colcon test --merge-install \
+     --packages-select teleop_regression --return-code-on-test-failure
    ```
 
 3. 查看结果：
 
    ```bash
-   colcon test-result --test-result-base build/robot_teleop --verbose
+   source .shrc_local && colcon test-result --test-result-base build/teleop_regression --verbose
    ```
 
 门禁在作者本机运行。`src/workflows/jenkinsfile_gate` 只检查 commit message，所以远端不强制运行门禁。
@@ -59,6 +60,8 @@
 - 删除 `leader_source`。
 - 把从臂串口改为不存在的设备。
 - 使用中性标定。
+
+临时 profile 只保护测试环境。生产配置中的 `leader_source` 问题由 #242 跟踪。
 
 测试解除 HOLD 前，先确认 runtime 报告的运行环境是 SDK 模拟。根 `conftest.py` 提供只限本机的 ROS 域。如果 ROS 域隔离缺失，测试失败。
 

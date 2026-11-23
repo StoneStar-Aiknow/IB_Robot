@@ -827,7 +827,9 @@ class IncubationAgentNode(Node):
             planner_config_raw = str(self.get_parameter("planner_config_json").value)
             vision_topics = _planner_vision_topics(planner_config_raw)
             if vision_topics:
-                self._planner_images = _LatestCameraFrames(self, vision_topics)
+                self._planner_images = _LatestCameraFrames(
+                    self, vision_topics, epoch_topic=_planner_vision_epoch_topic(planner_config_raw)
+                )
             planner = _planner_from_config(planner_config_raw, images=self._planner_images)
         active_planner = planner
         self._injected_ready = catalog_port is not None
@@ -1143,6 +1145,17 @@ def planner_prompt_builder(*, request, context, catalog):
     return build_planner_messages(request=request, context=context, catalog=planner_catalog_view(catalog))
 
 
+def _planner_vision_epoch_topic(raw: str) -> str:
+    try:
+        config = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    topic = config.get("vision_epoch_topic", "") if isinstance(config, dict) else ""
+    if topic and (not isinstance(topic, str) or not topic.startswith("/")):
+        raise ValueError("embodied.agent.planner.vision_epoch_topic must be an absolute topic")
+    return str(topic or "")
+
+
 def _planner_vision_topics(raw: str) -> list[str]:
     try:
         config = json.loads(raw)
@@ -1159,12 +1172,31 @@ class _LatestCameraFrames:
 
     Opt-in through ``planner.vision_topics``; without it the planner stays text-only.
     Frames are JPEG-encoded at request time; a camera without a frame is listed as missing.
+
+    ``planner.vision_epoch_topic`` (optional) names a JSON topic carrying ``session_id`` and
+    ``generation`` (a direct-control runtime's ``/simulation/clock``, which also carries the
+    simulated ``sim_time_total_s`` and ``sim_time_s``). When the session changes the cache is
+    emptied, and a frame stamped before the session's start (simulated time, the stamp of its
+    first observation) is dropped, so a frame of an earlier session never reaches the prompt.
+    The runtime publishes no frame between a reset and the new session's first observation.
     """
 
-    def __init__(self, node: Node, topics: list[str], *, max_width: int = 640, jpeg_quality: int = 85) -> None:
+    def __init__(
+        self,
+        node: Node,
+        topics: list[str],
+        *,
+        epoch_topic: str = "",
+        max_width: int = 640,
+        jpeg_quality: int = 85,
+    ) -> None:
         from sensor_msgs.msg import Image
+        from std_msgs.msg import String
 
         self._base_builder = build_planner_messages
+        self._epoch: tuple | None = None
+        self._epoch_start: float | None = None
+        self.dropped_frames = 0
         self._lock = threading.Lock()
         self._frames: dict[str, Image] = {}
         self._topics = list(topics)
@@ -1172,12 +1204,38 @@ class _LatestCameraFrames:
         self._jpeg_quality = jpeg_quality
         for topic in self._topics:
             node.create_subscription(Image, topic, lambda msg, t=topic: self._store(t, msg), 2)
+        if epoch_topic:
+            node.create_subscription(String, epoch_topic, self._on_epoch_msg, 10)
+
+    def _on_epoch_msg(self, msg) -> None:
+        try:
+            data = json.loads(msg.data)
+        except (TypeError, json.JSONDecodeError):
+            return
+        if isinstance(data, dict):
+            self.on_epoch(data)
+
+    def on_epoch(self, data: Mapping[str, Any]) -> None:
+        key = (data.get("session_id"), data.get("generation"))
+        total, within = data.get("sim_time_total_s"), data.get("sim_time_s")
+        with self._lock:
+            if key == self._epoch:
+                return
+            self._epoch = key
+            # Equal stamps are kept: a new session's first observation may repeat the last stamp.
+            numeric = all(isinstance(v, int | float) and not isinstance(v, bool) for v in (total, within))
+            self._epoch_start = float(total) - float(within) if numeric else None
+            self._frames = {}  # nothing of the previous session is kept
 
     def set_base_builder(self, builder) -> None:
         self._base_builder = builder
 
     def _store(self, topic: str, msg) -> None:
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         with self._lock:
+            if self._epoch_start is not None and stamp < self._epoch_start - 1e-6:
+                self.dropped_frames += 1  # taken before this session started
+                return
             self._frames[topic] = msg
 
     def _encode(self, msg) -> str | None:

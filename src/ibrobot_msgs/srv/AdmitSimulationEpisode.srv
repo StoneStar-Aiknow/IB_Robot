@@ -1,0 +1,14 @@
+# AdmitSimulationEpisode.srv - Open one simulation session for motion as an evaluation episode.
+#
+# Served at /evaluation/admit_episode by an evaluation layer attached to a direct-control
+# runtime (agent_eval's runtime extension); the runtime itself has no admission. Called by
+# the evaluator once the session's own observations arrived and nothing of the previous
+# episode can still reach the runtime (its Agent requests are terminal or stopped). Until
+# then every motion of the session's generation is refused, so a request planned in an
+# earlier episode can never execute in a later one.
+
+string session_id     # the runtime's session id (as on /simulation/session)
+int32 generation      # its reset generation
+---
+bool success
+string message

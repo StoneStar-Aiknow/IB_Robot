@@ -28,9 +28,6 @@ Usage:
     # Basic simulation
     ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
 
-    # Contract mock simulation
-    ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true sim_platform:=mock control_mode:=model_inference
-
     # Real hardware
     ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=false
 

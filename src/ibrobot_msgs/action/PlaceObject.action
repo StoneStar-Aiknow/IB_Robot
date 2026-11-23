@@ -7,6 +7,12 @@ string target_query
 string container_query
 float32 timeout_sec
 DelegatedExecutorIdentity expected_executor
+# The held custody this place releases, filled by the Gateway from that arm's
+# HeldObject so two held objects never mix up; the claim checks all three.
+# Empty for a place without custody (the fixed-pose placement executor).
+string custody_id
+string custody_epoch
+string arm_side
 ---
 uint8 RELEASE_NOT_RELEASED=0
 uint8 RELEASE_RELEASED=1
@@ -28,7 +34,12 @@ string[] diagnostic_details
 string pipeline_timings_json
 string debug_output_dir
 DelegatedExecutorIdentity actual_executor
+ExecutionDetail execution_detail
+uint64 last_feedback_sequence
+ExecutionDetail[<=256] execution_history
 ---
 string phase
 float32 progress
 string detail
+ExecutionDetail execution_detail
+uint64 sequence

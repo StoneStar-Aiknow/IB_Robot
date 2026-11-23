@@ -38,12 +38,35 @@ def test_options_default_to_the_x2_deployment_and_refuse_what_they_do_not_know()
     )
     with pytest.raises(ValueError, match="watch_unknown_timeout_s must be a finite number of seconds"):
         _options({"backend_options": {"watch_unknown_timeout_s": 0.0}})
+    assert options["watch_occluded_timeout_s"] == 8.0
+    with pytest.raises(ValueError, match="watch_occluded_timeout_s must be a finite number"):
+        _options({"backend_options": {"watch_occluded_timeout_s": float("nan")}})
     with pytest.raises(ValueError, match="watch_frame_timeout_s must be a finite number"):
         _options({"backend_options": {"watch_frame_timeout_s": float("inf")}})
     with pytest.raises(ValueError, match="status_timeout_s must be a finite number"):
         _options({"backend_options": {"head": {"status_timeout_s": float("nan")}}})
     with pytest.raises(ValueError, match="head has unknown keys \\['nodes'\\]"):
         _options({"backend_options": {"head": {"nodes": "4-7"}}})
+    assert options["arm_side"] == "left" and _options({"backend_options": {"arm_side": "right"}})["arm_side"] == "right"
+    with pytest.raises(ValueError, match="arm_side must be left or right"):
+        _options({"backend_options": {"arm_side": "both"}})
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_grasp_side_must_have_an_explicitly_installed_hand(side):
+    options = {"installed_hands": [side], "arm_side": side}
+    assert _options({"backend_options": options})["installed_hands"] == [side]
+    for arm_side in ("auto", "right" if side == "left" else "left"):
+        with pytest.raises(ValueError, match="arm_side"):
+            _options({"backend_options": {**options, "arm_side": arm_side}})
+    with pytest.raises(ValueError, match="at least one installed hand"):
+        _options({"backend_options": {"installed_hands": []}})
+
+
+@pytest.mark.parametrize("value", ["right", None, ["left", "left"], ["other"]])
+def test_mounting_configuration_cannot_be_mistyped_or_duplicated(value):
+    with pytest.raises(ValueError, match="installed_hands"):
+        _options({"backend_options": {"installed_hands": value}})
 
 
 def test_the_x2_backends_refuse_a_configuration_that_names_no_model_deployment():
@@ -121,10 +144,12 @@ def test_the_gripper_is_the_one_the_deployed_bundle_generates_for(tmp_path, monk
 
 
 @pytest.mark.skipif(not (BUNDLE / "assets" / "adapter.json").is_file(), reason="GraspGen-X bundle not installed")
-def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup():
+@pytest.mark.parametrize("side", ["left", "right", "auto"])
+def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup(side):
     rclpy = pytest.importorskip("rclpy")
     pytest.importorskip("warp")
     from aimdk_grasp.backend import x2_grasp_backends
+    from aimdk_grasp.dual_arm import ArmWatch, AutomaticPlanner, SelectedPart, SelectingPlanner
     from aimdk_grasp.execution_watch import X2TargetWatch
     from aimdk_grasp.grasp_request import X2GraspPlanner
     from aimdk_grasp.omnihand import OmniHandEffector
@@ -143,22 +168,92 @@ def test_the_backends_assemble_on_the_x2_description_and_wait_for_their_warmup()
         "model_bundle_path": os.fspath(BUNDLE),
         "model_deployment": "torch_cuda",
         "command_interfaces": list(COMMAND_INTERFACES),
-        "backend_options": {"service_timeout_s": 0.2, "registration_device": "cpu"},
+        "backend_options": {"service_timeout_s": 0.2, "registration_device": "cpu", "arm_side": side},
     }
     split = {**grasp_execution, "backend_options": {**grasp_execution["backend_options"], "head": {"namespace": "/h"}}}
     with pytest.raises(ValueError, match="single-process X2 backends run none"):
         x2_grasp_backends(node=node, grasp_execution=split, description=description)
     backends = x2_grasp_backends(node=node, grasp_execution=grasp_execution, description=description)
     try:
-        assert isinstance(backends.proposer, X2Proposer) and isinstance(backends.executor, StreamExecutor)
-        assert isinstance(backends.planner._inner, X2GraspPlanner)  # resumes the paused IMU after planning
-        assert isinstance(backends.effector, OmniHandEffector) and isinstance(backends.watch, X2TargetWatch)
+        assert isinstance(backends.proposer, X2Proposer)
+        if side == "auto":
+            assert isinstance(backends.planner._inner, SelectingPlanner)
+            assert isinstance(backends.planner._inner.planner, AutomaticPlanner)
+            assert isinstance(backends.executor, SelectedPart) and isinstance(backends.effector, SelectedPart)
+            assert isinstance(backends.watch, ArmWatch)
+        else:
+            assert isinstance(backends.executor, StreamExecutor)
+            assert isinstance(backends.planner._inner, X2GraspPlanner)  # resumes the paused IMU after planning
+            assert isinstance(backends.effector, OmniHandEffector) and isinstance(backends.watch, X2TargetWatch)
         # No camera on this graph: the warmup fails and is retried by the node.
         with pytest.raises(RuntimeError, match="warmup on 'a bottle .'.*RGB-D"):
             backends.prepare()
-        assert backends.watch.imu.paused  # nothing executes after a warmup
+        assert backends.observation._imu.paused  # nothing executes after a warmup
     finally:
         backends.close()
         node.destroy_node()
         if owned and rclpy.ok():
             rclpy.shutdown()
+
+
+@pytest.mark.skipif(not (BUNDLE / "assets" / "adapter.json").is_file(), reason="GraspGen-X bundle not installed")
+def test_arm_side_right_switches_every_part_to_the_right_arm_and_hand():
+    from aimdk_grasp.backend import x2_robot
+    from aimdk_grasp.joints import RIGHT_ARM
+    from aimdk_grasp.robot_model import arm_limits, config_directory
+
+    grasp_execution = {
+        "model_bundle_path": os.fspath(BUNDLE),
+        "model_deployment": "torch_cuda",
+        "command_interfaces": list(COMMAND_INTERFACES),
+    }
+    left = x2_robot(grasp_execution)
+    assert (left.side, left.hand.side, left.gravity.side, left.perception.scene.arm_side) == ("left",) * 4
+    right = x2_robot({**grasp_execution, "backend_options": {"arm_side": "right"}})
+    assert (right.side, right.hand.side, right.gravity.side, right.perception.scene.arm_side) == ("right",) * 4
+    assert right.limits == arm_limits(config_directory("right")) and set(right.limits) == set(RIGHT_ARM)
+    # One gripper description serves both hands: the same alias presets, the right hand's native values.
+    for name in ("open", "close"):
+        assert right.hand.presets[name] == left.hand.presets[name]
+
+
+def test_automatic_arm_selection_reads_the_runtime_streams_once_for_both_arms(monkeypatch):
+    """Two sets would double the DDS readers of the runtime's arm and hand state on the robot host."""
+    import aimdk_grasp.arm_stream
+    import aimdk_grasp.backend as backend
+    import aimdk_grasp.omnihand
+
+    opened, executors, effectors = [], {}, {}
+
+    class Hand:
+        def __init__(self, side):
+            self.side = side
+
+        def for_side(self, side):
+            return Hand(side)
+
+    def runtime_streams(node, description, closers, side):
+        opened.append(side)
+        return "arm stream", Hand(side)
+
+    monkeypatch.setattr(backend, "runtime_streams", runtime_streams)
+    monkeypatch.setattr(
+        backend,
+        "robot_for_side",
+        lambda robot, side: SimpleNamespace(side=side, gravity=None, limits=None, hand=None, options=robot.options),
+    )
+    monkeypatch.setattr(
+        aimdk_grasp.arm_stream,
+        "x2_arm_executor",
+        lambda io, *, gravity, limits, side: executors.setdefault(side, io),
+    )
+    monkeypatch.setattr(
+        aimdk_grasp.omnihand,
+        "OmniHandEffector",
+        lambda io, hand, *, absent_other: effectors.setdefault(io.side, io),
+    )
+    robot = SimpleNamespace(options={"installed_hands": ["left", "right"]})
+    backend.automatic_execution(None, robot, {}, [], SimpleNamespace(plan=lambda *args, **kwargs: None))
+    assert len(opened) == 1
+    assert executors == {"left": "arm stream", "right": "arm stream"}
+    assert {side: io.side for side, io in effectors.items()} == {"left": "left", "right": "right"}

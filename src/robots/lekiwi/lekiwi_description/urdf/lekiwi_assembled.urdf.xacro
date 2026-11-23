@@ -45,7 +45,7 @@
        accepts the mapping — including base_only renders whose tree never
        includes the arm (the same "accepted even when unused" rule as
        gz_ros2_control_parameters_file below). The Gazebo render path passes
-       `hulls` (robot_runtime.launch_support.render_gazebo_description); the
+       `hulls` (robot_runtime_sim.gazebo_embodiment.render_gazebo_description); the
        default `mesh` keeps hardware/SDK/MuJoCo renders byte-identical. -->
   <xacro:arg name="jaw_collision" default="mesh"/>
   <!-- gz_ros2_control: always passed by render_gazebo_description (accepted

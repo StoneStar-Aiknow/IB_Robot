@@ -497,9 +497,12 @@ def peripheral_interfaces(
     explicit ``camera_rate_hz``/``imu_rate_hz`` overrides keep their
     meaning. ``scan_source_runs`` says whether the derived scan's source
     (FAST-LIO's registered body cloud) runs on the selected platform (D5).
-    ``sim_platform`` only selects the exclusion filter
+    ``sim_platform`` selects the exclusion filter
     (``simulation.<platform>.enabled: false``, D3: an excluded peripheral
-    is neither advertised nor claimed).
+    is neither advertised nor claimed) and the camera QoS: ``None`` means
+    hardware, where usb_cam (``driver: opencv``) streams are offered
+    reliable like the driver publishes them (issue #247); simulated
+    platforms keep their own trait.
     """
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
@@ -682,11 +685,21 @@ def peripheral_interfaces(
                     configured_profile=configured,
                     supported_profiles=supported,
                 )
-                if traits is not None and traits.camera_qos_reliable:
-                    # the platform's camera publishers are reliable (depth 1):
-                    # large images lose fragments without repair under
-                    # best-effort, so the contract on the platform offers
-                    # reliable delivery (what the simulator actually publishes)
+                reliable_camera = (traits is not None and traits.camera_qos_reliable) or (
+                    # usb_cam publishes image_raw and camera_info reliable
+                    # (rclcpp::QoS{100}); a best-effort reader discards a whole
+                    # 640x480 rgb8 frame (921,600 bytes, many UDP fragments)
+                    # whenever one fragment is lost, which cut a 30 fps camera
+                    # to 25 Hz while recording and to 5-9 Hz under host load
+                    # (issue #247). Hardware only: simulated publishers keep
+                    # their own declared QoS.
+                    sim_platform is None and driver == "opencv"
+                )
+                if reliable_camera:
+                    # the camera publishers are reliable: large images lose
+                    # fragments without repair under best-effort, so the
+                    # contract offers reliable delivery (what is actually
+                    # published)
                     interfaces[key]["qos"]["reliability"] = "reliable"
                 if traits is not None and not is_color and traits.shared_depth_camera_info:
                     # the shared colour info interface above already carries the
@@ -696,7 +709,7 @@ def peripheral_interfaces(
                 interfaces[f"{key}_info"] = _topic(
                     info_topic, "sensor_msgs/msg/CameraInfo", capability, frame_id=stream_info_frame, rate_hz=fps
                 )
-                if traits is not None and traits.camera_qos_reliable:
+                if reliable_camera:
                     interfaces[f"{key}_info"]["qos"]["reliability"] = "reliable"
             if "pointcloud" in streams:
                 interfaces[f"camera.{name}.points"] = _topic(

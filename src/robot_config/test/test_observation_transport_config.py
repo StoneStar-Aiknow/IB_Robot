@@ -260,11 +260,19 @@ def test_explicit_rtp_mode_is_never_rewritten_to_dds():
     assert replace(transport, stream_id="top").mode == "rtp"
 
 
-def test_generated_yaml_round_trip_preserves_rtp_transport():
-    config = load_robot_config(
-        # The development profile has no runtime dependency on a camera being present during parsing.
-        ROBOTS_DIR / "dev_rtp_single_camera.yaml"
-    )
+_SO101_PROFILE = (
+    Path(__file__).resolve().parents[2] / "robots" / "so101" / "so101_robot" / "profiles" / "so101_single_arm.yaml"
+)
+
+
+def _snapshot(name, tmp_path):
+    from robot_config.testing.provider_binding import write_offline_snapshot
+
+    return write_offline_snapshot(ROBOTS_DIR / name, _SO101_PROFILE, tmp_path / "robots")
+
+
+def test_generated_yaml_round_trip_preserves_rtp_transport(tmp_path):
+    config = load_robot_config(_snapshot("dev_rtp_single_camera.yaml", tmp_path))
 
     generated = generate_contract_from_robot_config(config)
     round_trip = yaml.safe_load(generated)
@@ -287,13 +295,15 @@ def test_standalone_contract_yaml_preserves_rtp_transport(tmp_path):
     assert contract.observations[0].transport == _contract(_rtp_observation()).observations[0].transport
 
 
-def test_development_profile_typed_and_raw_contracts_match():
-    path = ROBOTS_DIR / "dev_rtp_multi_camera.yaml"
+def test_development_profile_typed_and_raw_contracts_match(tmp_path):
+    from robot_config.loader import load_robot_config_dict
+
+    path = _snapshot("dev_rtp_multi_camera.yaml", tmp_path)
     typed = load_robot_config(path)
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))["robot"]
+    bound = load_robot_config_dict(path)
 
     typed_contract = typed.to_contract()
-    raw_contract = build_contract_from_robot_config_dict(raw)
+    raw_contract = build_contract_from_robot_config_dict(bound)
 
     assert typed_contract.observations == raw_contract.observations
 

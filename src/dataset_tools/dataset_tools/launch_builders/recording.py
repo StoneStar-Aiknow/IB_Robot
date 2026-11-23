@@ -29,7 +29,7 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
-from robot_config.interface_binding import required_interface_ids, resolve_robot_interfaces
+from robot_config.interface_binding import resolve_robot_interfaces
 from robot_config.launch_registry.builder_support import rerun_visualizer_requested
 from robot_config.launch_registry.launch_options import ArgumentSpec
 from robot_config.launch_registry.registry import BuilderSpec, BuildResult, LaunchBuildContext
@@ -41,6 +41,7 @@ from robot_config.utils import (
     resolve_lerobot_norm_mode,
     resolve_ros_path,
 )
+from robot_runtime.sim_platforms import is_physics_selection
 
 
 def _sanitize_dataset_name(value: str) -> str:
@@ -103,6 +104,7 @@ def generate_recording_nodes(
     record_mode: str = "continuous",
     *,
     scheduler_enabled: bool = False,
+    lidar_message_type: str = "livox_ros_driver2/msg/CustomMsg",
 ) -> list[Node | ExecuteProcess | RegisterEventHandler]:
     """
     Generate recording nodes based on robot configuration and recording mode.
@@ -141,10 +143,12 @@ def generate_recording_nodes(
             scheduler_enabled=scheduler_enabled,
         )
     else:
-        return generate_continuous_recording_action(robot_config)
+        return generate_continuous_recording_action(robot_config, lidar_message_type=lidar_message_type)
 
 
-def generate_continuous_recording_action(robot_config: dict) -> list[Node | ExecuteProcess | RegisterEventHandler]:
+def generate_continuous_recording_action(
+    robot_config: dict, *, lidar_message_type: str = "livox_ros_driver2/msg/CustomMsg"
+) -> list[Node | ExecuteProcess | RegisterEventHandler]:
     """
     Generate continuous recording action using ros2 bag record.
 
@@ -169,7 +173,9 @@ def generate_continuous_recording_action(robot_config: dict) -> list[Node | Exec
     output_file = rosbag_command[rosbag_command.index("-o") + 1]
     recording = robot_config.get("recording", {})
     command = (
-        build_supervised_recording_command(robot_config, timestamp, rosbag_command)
+        build_supervised_recording_command(
+            robot_config, timestamp, rosbag_command, lidar_message_type=lidar_message_type
+        )
         if recording.get("semantic_dataset", False)
         else rosbag_command
     )
@@ -243,6 +249,8 @@ def build_supervised_recording_command(
     robot_config: dict,
     timestamp: str,
     rosbag_command: list[str] | None = None,
+    *,
+    lidar_message_type: str = "livox_ros_driver2/msg/CustomMsg",
 ) -> list[str]:
     """Wrap semantic dataset recording with the minimal session supervisor."""
     recording = robot_config.get("recording", {})
@@ -279,6 +287,8 @@ def build_supervised_recording_command(
         resolve_ros_path(str(mount_file)),
         "--camera-info-topic",
         str(recording.get("camera_info_topic", "/camera/front/camera_info")),
+        "--lidar-message-type",
+        lidar_message_type,
     ]
     if camera_file:
         command.extend(["--camera-file", resolve_ros_path(str(camera_file))])
@@ -513,7 +523,11 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         ['/joint_states', '/arm_position_controller/commands', '/camera/cam0/image_raw', ...]
     """
     robot_config = resolve_robot_interfaces(robot_config)
-    logical_bindings = bool(required_interface_ids(robot_config))
+    # Record from the runtime description only when one is materialized. An
+    # active provider gamepad needs a live binding at launch, but an offline
+    # configuration whose contract binds nothing carries no description.
+    description = (robot_config.get("runtime") or {}).get("interface_description")
+    logical_bindings = isinstance(description, dict)
     recording = robot_config.get("recording", {})
     topics = []
 
@@ -542,7 +556,6 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         _append((action.get("publish") or {}).get("topic", ""))
 
     if logical_bindings:
-        description = robot_config["runtime"]["interface_description"]
         for interface in description["interfaces"].values():
             if interface["kind"] == "topic" and interface["direction"] == "publish":
                 _append(interface["endpoint"])
@@ -641,6 +654,12 @@ def build_recording(context: LaunchBuildContext) -> BuildResult:
                 context.control_mode,
                 record_mode,
                 scheduler_enabled=context.scheduler_enabled,
+                # Mock publishes SDK-style sensor streams without a physics backend.
+                lidar_message_type=(
+                    "sensor_msgs/msg/PointCloud2"
+                    if is_physics_selection(context.use_sim, context.sim_platform) and not context.mock_backend_active
+                    else "livox_ros_driver2/msg/CustomMsg"
+                ),
             )
             logger.info(f"Added {len(recording_nodes)} recording node(s)")
             return BuildResult(actions=list(recording_nodes))

@@ -1,0 +1,26 @@
+From ee0a2f76d8ccf5a4e1e5e88127689d30ba36f243 Mon Sep 17 00:00:00 2001
+From: Evan Flynn <evanflynn.msu@gmail.com>
+Date: Sun, 16 Jun 2024 09:44:06 -0700
+Subject: [PATCH] Keep units as microseconds, not nanoseconds
+
+Signed-off-by: Evan Flynn <evanflynn.msu@gmail.com>
+---
+ include/usb_cam/utils.hpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/usb_cam/utils.hpp b/include/usb_cam/utils.hpp
+index add1ff9..acd03d4 100644
+--- a/include/usb_cam/utils.hpp
++++ b/include/usb_cam/utils.hpp
+@@ -94,7 +94,7 @@ inline time_t get_epoch_time_shift_us()
+     monotonic_time.tv_sec * 1000000 + static_cast<int64_t>(
+     std::round(monotonic_time.tv_nsec / 1000.0));
+   const int64_t epoch_us =
+-    epoch_time.tv_sec * 1000000 + epoch_time.tv_usec / 1000.0;
++    epoch_time.tv_sec * 1000000 + epoch_time.tv_usec;
+ 
+   return static_cast<time_t>(epoch_us - uptime_us);
+ }
+-- 
+2.34.1
+

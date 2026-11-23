@@ -108,6 +108,7 @@ import math
 import os
 import random
 import tempfile
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -477,15 +478,349 @@ def load_mujoco_engine_plugins(required_extensions: list[str] | tuple[str, ...])
             ) from exc
 
 
+#: mujoco_ros2_control copies ``mujoco_model`` into a buffer of simulate's
+#: ``kMaxFilenameLength`` bytes, so it keeps at most one byte less.
+_SIMULATOR_MAX_FILENAME_BYTES = 1000
+
+
+def mujoco_model_camera_names(model_path: str) -> list[str]:
+    """The camera names of a composed model, in ``mjModel`` id order.
+
+    Loaded the way mujoco_ros2_control 0.1.2 loads ``mujoco_model``: as a
+    binary when the path is longer than four characters and ends in
+    ``.mjb``, otherwise as MJCF, after registering the engine extensions the
+    MJCF declares (``load_mujoco_engine_plugins``; even a parse needs them).
+    An unnamed camera is ``""``. Raises when the model cannot be read; a
+    missing file is reported before MuJoCo would log it to
+    ``MUJOCO_LOG.TXT`` in the working directory. A path of 1000 bytes or
+    more raises too: the simulator copies it into simulate's 1000-byte
+    filename buffer (``kMaxFilenameLength``) and would load the truncated
+    path, a different file from the one read here.
+    """
+    import mujoco
+
+    if len(os.fsencode(model_path)) >= _SIMULATOR_MAX_FILENAME_BYTES:
+        raise ValueError(
+            f"MuJoCo model path is {len(os.fsencode(model_path))} bytes; the simulator truncates paths to "
+            f"{_SIMULATOR_MAX_FILENAME_BYTES - 1} bytes and would load a different file"
+        )
+    if not os.path.isfile(model_path):  # unlike Path.is_file, never raises OSError
+        raise FileNotFoundError(f"MuJoCo model {model_path!r} does not exist")
+    if len(model_path) > 4 and model_path.endswith(".mjb"):
+        model = mujoco.MjModel.from_binary_path(model_path)
+    else:
+        extensions = mjcf_engine_extensions(Path(model_path))
+        if extensions:
+            load_mujoco_engine_plugins(extensions)
+        model = mujoco.MjModel.from_xml_path(model_path)
+    return [model.camera(i).name for i in range(model.ncam)]
+
+
+class ViewerViewError(ValueError):
+    """The scene's ``mujoco_viewer`` view declaration is malformed."""
+
+
+#: MuJoCo's default free-camera field of view (``visual/global/fovy``); the
+#: layout ``distance`` is "what this fovy would show from that distance".
+_VIEWER_REFERENCE_FOVY_DEG = 45.0
+#: mjv_defaultFreeCamera places the free camera at 1.5 * stat.extent.
+_FREE_CAMERA_DISTANCE_PER_EXTENT = 1.5
+#: The complete key set of a layout ``mujoco_viewer`` view (fail closed).
+_VIEWER_VIEW_KEYS = frozenset({"lookat", "distance", "azimuth", "elevation"})
+#: mjv_moveCamera clamps the free camera elevation to this range.
+_VIEWER_MIN_ELEVATION_DEG, _VIEWER_MAX_ELEVATION_DEG = -89.0, 89.0
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+#: Relative headroom for float32 rounding in a few products and sums.
+_FLOAT32_ROUNDING_MARGIN = 1e-5
+
+
+def scene_viewer_view(scene: str | None) -> dict | None:
+    """The MuJoCo viewer's initial free-camera view, from the scene layout.
+
+    ``layout.yaml`` may declare::
+
+        mujoco_viewer:
+          lookat: [x, y, z]     # world point the view is centred on (m)
+          distance: 0.72        # apparent viewing distance (m), > 0
+          azimuth: -110         # degrees, MuJoCo free-camera convention
+          elevation: -55        # degrees, in [-89, 89]
+
+    Returns the validated view (floats; ``lookat`` a 3-tuple), or ``None``
+    without a scene or without the key; a key without a value is an error. See ``_apply_viewer_view`` for how it
+    lands in the model without touching any recorded camera.
+    """
+    if not scene:
+        return None
+    layout = get_scene_layout(scene)
+    if "mujoco_viewer" not in layout:
+        return None
+    # an explicit empty ``mujoco_viewer:`` (YAML null) is a malformed view,
+    # not "no view": it goes through the mapping check below
+    raw = layout["mujoco_viewer"]
+    where = f"scene {scene!r}: mujoco_viewer"
+    if not isinstance(raw, dict):
+        raise ViewerViewError(f"{where} must be a mapping, got {raw!r}")
+    missing = _VIEWER_VIEW_KEYS - raw.keys()
+    if missing:
+        raise ViewerViewError(f"{where} is missing {sorted(missing)}")
+    unknown = set(raw) - _VIEWER_VIEW_KEYS
+    if unknown:
+        raise ViewerViewError(f"{where} has unknown keys {sorted(map(str, unknown))}")
+
+    def number(key, value):
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ViewerViewError(f"{where}.{key} must be a finite number, got {value!r}")
+        try:
+            converted = float(value)  # a huge Python int overflows here
+        except OverflowError:
+            converted = math.inf
+        if not math.isfinite(converted):
+            raise ViewerViewError(f"{where}.{key} must be a finite number, got {value!r}")
+        return converted
+
+    lookat = raw["lookat"]
+    if not isinstance(lookat, list | tuple) or len(lookat) != 3:
+        raise ViewerViewError(f"{where}.lookat must be [x, y, z], got {lookat!r}")
+    view = {
+        "lookat": tuple(number("lookat", v) for v in lookat),
+        "distance": number("distance", raw["distance"]),
+        "azimuth": number("azimuth", raw["azimuth"]),
+        "elevation": number("elevation", raw["elevation"]),
+    }
+    # stat.center is a double, but the free camera's GL position is a C float
+    # computed from it: a lookat beyond the float32 range renders from inf
+    if any(abs(v) >= _FLOAT32_MAX for v in view["lookat"]):
+        raise ViewerViewError(f"{where}.lookat must fit a float32, got {lookat!r}")
+    if view["distance"] <= 0:
+        raise ViewerViewError(f"{where}.distance must be > 0, got {view['distance']}")
+    # visual/global azimuth and elevation are C floats. A finite double
+    # azimuth such as 1e39 would overflow to inf (and a large one loses whole
+    # degrees), so it is reduced to one turn first: [-180, 180], the range
+    # mjv_moveCamera wraps it to.
+    view["azimuth"] = float(np.float32(math.remainder(view["azimuth"], 360.0)))
+    # mjv_moveCamera clamps the elevation to [-89, 89] on every mouse action
+    # (rotate, pan or zoom), so a start view outside it would jump on the
+    # first touch. The range is checked on the double, before the cast (which
+    # would overflow); +-89 are exact floats and rounding is monotonic, so the
+    # stored value stays in range.
+    if not _VIEWER_MIN_ELEVATION_DEG <= view["elevation"] <= _VIEWER_MAX_ELEVATION_DEG:
+        raise ViewerViewError(
+            f"{where}.elevation must be in [{_VIEWER_MIN_ELEVATION_DEG:g}, {_VIEWER_MAX_ELEVATION_DEG:g}] "
+            f"(the viewer's own range), got {view['elevation']!r}"
+        )
+    view["elevation"] = float(np.float32(view["elevation"]))
+    return view
+
+
+def _viewer_fovy(view: dict, extent: float, znear: float) -> float:
+    """The free-camera fovy that makes the fixed-distance camera frame ``view``.
+
+    The free camera sits at ``1.5 * stat.extent``, and the extent cannot be
+    changed for the viewer: znear/zfar are ``vis.map.znear/zfar * extent``
+    for EVERY camera, the recorded ones included. The apparent distance is
+    therefore set through ``visual/global/fovy``, which only the free camera
+    uses (MJCF cameras carry their own fovy).
+
+    ``znear`` is the model's ``vis.map.znear``: the fovy must also give the
+    viewer a usable projection, which MuJoCo builds in C floats.
+    """
+    if not (math.isfinite(extent) and extent > 0):
+        raise ViewerViewError(f"mujoco_viewer: the compiled model extent {extent!r} cannot frame a view")
+    camera_distance = _FREE_CAMERA_DISTANCE_PER_EXTENT * extent
+    half = math.atan(math.tan(math.radians(_VIEWER_REFERENCE_FOVY_DEG) / 2) * view["distance"] / camera_distance)
+    fovy = math.degrees(2 * half)
+    # visual/global/fovy is a C float: check the value MuJoCo will hold, so a
+    # distance that is valid as a double cannot round to a 0 or 180 deg fovy
+    stored = float(np.float32(fovy))
+    if not (math.isfinite(stored) and 0.0 < stored < 180.0):
+        raise ViewerViewError(
+            f"mujoco_viewer.distance {view['distance']!r} m needs a free-camera fovy of {stored!r} deg at "
+            f"extent {extent!r}; it must lie strictly between 0 and 180 deg"
+        )
+    # mjv_updateScene builds the free camera's frustum in C floats: near =
+    # znear * extent, top = -bottom = near * tan(fovy / 2), and the GL
+    # projection scales by 2 near / (top - bottom). A tiny fovy underflows
+    # top to 0 (inf scale); a wide fovy at a large near overflows top or
+    # top - bottom to inf (zero scale). Every one must be finite and > 0.
+    # (The horizontal extent also scales with the window aspect, a runtime
+    # value this compile cannot know.)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore", under="ignore"):
+        near = np.float32(znear * extent)
+        top = np.float32(float(near) * math.tan(math.radians(stored) / 2))
+        height = top + top
+        scale = (near + near) / height if height > 0 else np.float32(np.inf)
+
+    def finite_positive(value) -> bool:
+        return bool(np.isfinite(value) and value > 0)
+
+    if not all(finite_positive(v) for v in (near, top, height, scale)):
+        raise ViewerViewError(
+            f"mujoco_viewer.distance {view['distance']!r} m needs a free-camera fovy of {stored!r} deg at extent "
+            f"{extent!r}, which cannot form a finite positive float32 projection (near {float(near)!r}, "
+            f"top {float(top)!r}, height {float(height)!r}, scale {float(scale)!r})"
+        )
+    return stored
+
+
+def _check_free_camera_position(view: dict, extent: float, ipd: float) -> None:
+    """The free camera's GL eye positions and view transform must stay finite C floats.
+
+    mjv_updateScene places each eye at ``lookat - 1.5 * extent * forward``
+    (forward from azimuth/elevation), shifted by ``ipd / 2`` sideways, and
+    stores it as a float. The renderer then builds the modelview translation
+    in floats as dot products of the eye with the unit camera axes
+    (``mjr_lookAt``): a lookat that fits a float32 can still overflow once
+    the camera offset is added, and finite eye components can still overflow
+    in that dot product. ``|lookat_i| + distance * |forward_i| + ipd / 2``
+    bounds each eye component; their sum bounds every component, every dot
+    product with a unit axis and every partial sum of it. A small margin
+    covers float rounding of those operations.
+    """
+    distance = _FREE_CAMERA_DISTANCE_PER_EXTENT * extent
+    azimuth, elevation = math.radians(view["azimuth"]), math.radians(view["elevation"])
+    forward = (
+        math.cos(elevation) * math.cos(azimuth),
+        math.cos(elevation) * math.sin(azimuth),
+        math.sin(elevation),
+    )
+    bound = [abs(c) + distance * abs(f) + abs(ipd) / 2 for c, f in zip(view["lookat"], forward, strict=True)]
+    total = math.fsum(bound) * (1 + _FLOAT32_ROUNDING_MARGIN)
+    if not (math.isfinite(total) and total < _FLOAT32_MAX):
+        raise ViewerViewError(
+            f"mujoco_viewer.lookat {list(view['lookat'])!r} at extent {extent!r}: the free camera's position or "
+            f"view transform would leave the float32 range (|eye| components up to {bound!r})"
+        )
+
+
+def _check_free_camera_mode(model, where: str) -> None:
+    """Reject a model whose viewer would not show ``mujoco_viewer`` as defined.
+
+    The view is a perspective free-camera start view. Two ``visual/global``
+    settings change what that means, so neither may be combined with it:
+
+    - ``orthographic``: MuJoCo then reads the free camera's fovy as the
+      half-height of the view volume (``fovy / 2``, a length), not as an
+      angle, so the fovy derived from ``distance`` would frame something
+      else;
+    - ``cameraid`` naming one of the model's cameras: simulate's
+      ``AlignAndScaleView`` then starts on that fixed camera, and Ctrl+A
+      returns to it, so the start view would never be shown. (An id outside
+      ``[0, ncam)`` falls back to the free camera and is accepted.)
+    """
+    vis_global = model.vis.global_
+    if vis_global.orthographic:
+        raise ViewerViewError(
+            f"{where}: the model sets visual/global orthographic, but the view's distance sets a "
+            "perspective fovy; an orthographic free camera reads fovy as a length"
+        )
+    if 0 <= vis_global.cameraid < model.ncam:
+        raise ViewerViewError(
+            f"{where}: the model sets visual/global cameraid={vis_global.cameraid}, so the viewer starts "
+            "on that fixed camera (and Ctrl+A returns to it); the free-camera start view would never show"
+        )
+
+
+def _apply_viewer_view(view: dict, stat, vis_global, extent: float, znear: float) -> None:
+    """Write ``view`` into a compiled model's (or a spec's) statistic/visual.
+
+    The caller first rejects an orthographic free camera or a fixed start
+    camera (``_check_free_camera_mode``). Scope of the compile-time numeric
+    checks. A view failing one of them
+    raises ``ViewerViewError``, and this function validates all of them
+    before it writes any model field (the exact read-back of a delivered
+    extension XML runs later, in ``compose_mujoco_model``):
+
+    - azimuth is reduced to one turn and stored as a C float; elevation is
+      in [-89, 89] (the range the viewer clamps it to) and stored as a C
+      float; every lookat component (stored in the
+      double ``stat.center``) is below the float32 maximum;
+    - the fovy derived from ``distance`` is a C float in (0, 180), and the
+      free camera's frustum ``near``, ``top``, ``top - bottom`` and
+      ``2 near / (top - bottom)`` are finite and positive (far is the
+      model's own, not changed here);
+    - a bound on the free camera's GL eye components (both stereo eyes) and
+      on its modelview translation stays within the float32 range.
+
+    Not checked: renderer values computed further downstream, such as the
+    squared eye-to-geom distance used to sort transparent geoms, infinite
+    plane placement, shadow matrices, and the horizontal frustum, which
+    depends on the runtime window aspect. The supported domain is scenes
+    whose camera and geom coordinates stay within about 1e18 m. This is a
+    support statement, not a rejection threshold: a view outside it may pass
+    the checks above and still render wrongly.
+
+    Viewer-only: ``stat.center``, the global azimuth/elevation and the global
+    fovy are read by ``mjv_defaultFreeCamera`` (the viewer's start view and
+    its Ctrl+A "Align") and by nothing that renders the recorded cameras.
+    The extent is not written: MuJoCo's auto-computed extent does not depend
+    on a user-set center, so it (and every camera's znear/zfar) stays as the
+    plain compile yields it.
+    """
+    fovy = _viewer_fovy(view, extent, znear)
+    _check_free_camera_position(view, extent, float(vis_global.ipd))
+    stat.center[:] = view["lookat"]
+    vis_global.azimuth = view["azimuth"]
+    vis_global.elevation = view["elevation"]
+    vis_global.fovy = fovy
+
+
+def _view_exact_xml(xml: str, stat, vis_global) -> str:
+    """``xml`` with the start view written at full precision.
+
+    ``MjSpec.to_xml()`` prints 6 significant digits, so the view the C++
+    node recompiles could differ from the one validated here: a valid
+    float32 elevation of -89.99999 became -90, and a lookat of 1.23456789
+    became 1.23457, a large error for a small framing. ``repr`` of a double
+    round-trips exactly, and the float32 fields are exact doubles.
+    """
+    root = ET.fromstring(xml)
+    statistic = root.find("statistic")
+    if statistic is None:
+        statistic = ET.SubElement(root, "statistic")
+    statistic.set("center", " ".join(repr(float(value)) for value in stat.center))
+    visual = root.find("visual")
+    if visual is None:
+        visual = ET.SubElement(root, "visual")
+    global_ = visual.find("global")
+    if global_ is None:
+        global_ = ET.SubElement(visual, "global")
+    for key in ("azimuth", "elevation", "fovy"):
+        global_.set(key, repr(float(getattr(vis_global, key))))
+    return ET.tostring(root, encoding="unicode")
+
+
+def _check_delivered_view(delivered, stat, vis_global, where: str) -> None:
+    """The delivered model must hold exactly the validated start view."""
+    expected = (
+        tuple(map(float, stat.center)),
+        *(float(getattr(vis_global, k)) for k in ("azimuth", "elevation", "fovy")),
+    )
+    got = (
+        tuple(map(float, delivered.stat.center)),
+        *(float(getattr(delivered.vis.global_, k)) for k in ("azimuth", "elevation", "fovy")),
+    )
+    if got != expected:
+        raise ViewerViewError(f"{where}: the delivered XML carries view {got!r}, not the validated {expected!r}")
+
+
+def _view_not_applied(viewer_view: dict | None) -> str:
+    """Suffix for a fallback warning: the uncompiled XML carries no start view."""
+    return " (the scene's mujoco_viewer start view was NOT applied)" if viewer_view else ""
+
+
 def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names) -> Path:
     """Robot-agnostic robot+scene composition for the MuJoCo provider (D3).
 
     Substitutes the robot MJCF into the named scene template (``scene=None``
     compiles the robot MJCF alone), enables SDF collision on the given mesh
     names, compiles and saves the ``.mjb`` at ``composed_model_path(scene)``.
-    The intermediate XML is kept beside it for debugging. Falls back to the
-    ``.xml`` path only when the ``mujoco`` package is missing; the provider
-    treats that as fatal. Issue #195: no keyframes are injected any more —
+    The intermediate XML is kept beside it for debugging. A layout
+    ``mujoco_viewer`` view becomes the viewer's initial free camera
+    (``scene_viewer_view``); a malformed view raises ``ViewerViewError``
+    and never falls back. Falls back to the uncompiled ``.xml`` path when
+    the ``mujoco`` package is missing or the extension-free compile fails
+    (logged as a warning); the MuJoCo runtime provider rejects that
+    fallback XML (``RuntimeProfileError``) instead of launching it. Issue #195: no keyframes are injected any more —
     scene placements travel through ``ResetWorld`` state overrides built
     from the layout, not through compiled-in ``random_KKK`` keys.
 
@@ -510,8 +845,9 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
 
     Returns:
         :class:`pathlib.Path` to the compiled ``.mjb`` (or the delivered
-        ``.xml`` when the model declares engine extensions; the ``.xml``
-        fallback when the ``mujoco`` package is unavailable).
+        ``.xml`` when the model declares engine extensions; the uncompiled
+        ``.xml`` fallback when the ``mujoco`` package is missing or the
+        extension-free compile fails, which the runtime provider rejects).
     """
     robot_path = Path(robot_mjcf_path)
     if scene:
@@ -522,6 +858,7 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
     else:
         content = robot_path.read_text()
 
+    viewer_view = scene_viewer_view(scene)
     xml_out = composed_model_path(scene).with_suffix(".xml")
     xml_out.parent.mkdir(parents=True, exist_ok=True)
     xml_out.write_text(content)
@@ -540,7 +877,9 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
                 + ", ".join(sorted(engine_extensions))
                 + ") and cannot be delivered uncompiled: the mujoco Python package is required"
             ) from None
-        logging.warning("mujoco not available; composed model left as XML at %s", xml_out)
+        logging.warning(
+            "mujoco not available; composed model left as XML at %s%s", xml_out, _view_not_applied(viewer_view)
+        )
         return xml_out
 
     sdf_names = {str(name) for name in sdf_mesh_names}
@@ -558,7 +897,18 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
         model = spec.compile()
         # the delivered artifact: the compiled spec's XML, recompilable by the
         # C++ node with ITS OWN (correct) extension registration
-        xml_out.write_text(spec.to_xml())
+        if not viewer_view:
+            delivered = spec.to_xml()
+        else:
+            _check_free_camera_mode(model, f"scene {scene!r}: mujoco_viewer")
+            stat, vis_global = spec.stat, spec.visual.global_
+            _apply_viewer_view(viewer_view, stat, vis_global, float(model.stat.extent), float(model.vis.map.znear))
+            delivered = _view_exact_xml(spec.to_xml(), stat, vis_global)
+            # check what the node will read back
+            _check_delivered_view(
+                mujoco.MjModel.from_xml_string(delivered), stat, vis_global, f"scene {scene!r}: mujoco_viewer"
+            )
+        xml_out.write_text(delivered)
         del model  # the compile was validation; the artifact is the XML
         return xml_out
 
@@ -568,11 +918,24 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
             if mesh.name in sdf_names:
                 mesh.needsdf = True
         model = spec.compile()
+        if viewer_view:
+            _check_free_camera_mode(model, f"scene {scene!r}: mujoco_viewer")
+            extent, znear = float(model.stat.extent), float(model.vis.map.znear)
+            _apply_viewer_view(viewer_view, model.stat, model.vis.global_, extent, znear)
+            # the debug XML beside the .mjb carries the same start view; best
+            # effort only, it must never turn a good .mjb into the fallback
+            try:
+                _apply_viewer_view(viewer_view, spec.stat, spec.visual.global_, extent, znear)
+                xml_out.write_text(_view_exact_xml(spec.to_xml(), spec.stat, spec.visual.global_))
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("debug XML %s left without the viewer start view: %s", xml_out, exc)
         mjb_out = composed_model_path(scene)
         mujoco.mj_saveModel(model, str(mjb_out))
         return mjb_out
+    except ViewerViewError:
+        raise  # a layout error, never the compile fallback
     except Exception as exc:  # noqa: BLE001
-        logging.warning("MuJoCo compile failed, falling back to XML: %s", exc)
+        logging.warning("MuJoCo compile failed, falling back to XML: %s%s", exc, _view_not_applied(viewer_view))
         return xml_out
 
 

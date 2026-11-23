@@ -92,6 +92,22 @@ ibrobot_msgs / rclpy
 - `embodied_common.mirror_session_contract`：X2 照镜子会话的共享常量（节点名、`~/set_session` 服务名、
   技能绑定的命令 `start` / `stop`、停止超时默认值、释放预留与 Gateway 超时余量）。会话节点、launch
   builder、Gateway、skill catalog 和 `robot_skill_cli` 都从这里取，不各自保留副本；模块不依赖任何包。
+- `embodied_common.execution_detail`：结构化执行详情 `ExecutionDetail`（`ibrobot_msgs/ExecutionDetail` 的
+  Python 侧），以及 `short_message`、`fill_execution_detail`、`execution_context` 等投影函数。生产方严格校验，
+  消费方遇到未知版本或缺字段时退化为 `schema_version=0`，不抛异常、不从文字推断物理事实。
+- `embodied_common.held_custody_contract`：每只手一份的持有物 custody（一只手出问题只停这只手）的四个状态
+  （`EMPTY`/`HELD`/`RECOVERING`/`UNKNOWN`）、owner（`pick`/`place`）、各状态允许的原因，以及每个状态下谁能动：
+  `HELD` 是安全状态，归 pick 时这只手只放行移动身体和放下这件物体（不论哪个 root），归 place 时什么都不放行
+  （`blocked_arms`/`free_arms`）；Gateway 空闲满 `IDLE_PUT_BACK_S` 才自动放回，放不了就继续拿着（`NO_PUT_BACK`，
+  操作员可接管）；`EMPTY` 带 `DROPPED` 时 Gateway 先张开手、回 home 一次；`UNKNOWN` 时 Gateway 取消这只手上正在
+  运行的动作，这只手只准入操作员的 `OPEN_HAND`、`RETURN_HOME`，出口为严格核对后自动回到 `HELD`
+  （`state_after_reverify`）或操作员当场确认空手（`state_after_reset`）；重启后只有新鲜的空手反馈才是 `EMPTY`；
+  按收到时间超时或订阅后第一条 latched 的 custody 按 `UNKNOWN` 读（`fresh_custody`）；Gateway 启动后等各手稳定才
+  准入（`settled_for_admission`）。另含领取、续租、place 归还时可报的状态和五个拒绝码。持有 custody 的 executor
+  和 Gateway 都从这里取值，不各自保留副本；`validate_custody` 拒绝 owner 不应发布的组合。模块不依赖任何包。
+- `embodied_common.pick_contract`：`PickObject` 的可选抓取规格 `GraspSpec`、本体能力声明 `GraspCapability`
+  （`unsupported()` 列出不能满足的字段，executor 据此以 `GRASP_SPEC_UNSUPPORTED` 拒绝）和结果的
+  `FAILURE_CLASSES`。模块不依赖任何包。
 
 Agent execution mode is captured when an Agent plan is created and must match
 at confirmation. `immediate_after_presentation` only removes the second user

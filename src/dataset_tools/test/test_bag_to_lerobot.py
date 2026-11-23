@@ -24,9 +24,11 @@ from dataset_tools.bag_to_lerobot import (  # noqa: E402
     _contract_from_dataset_metadata,
     _dataset_feature_names_for_spec,
     _estimate_stream_rate_hz,
+    _header_offset_warnings,
     _image_to_hwc,
     _log_image_stream_diagnostics,
     _merge_integrity_report,
+    _normalize_timestamp_source,
     _persist_custom_info,
     _plan_streams,
     _preflight_bags,
@@ -1200,3 +1202,343 @@ def test_transport_snapshot_yaml_round_trip(tmp_path, mode, integrity_mode):
         else:
             assert serialized["transport"]["recording"] == {"integrity_mode": integrity_mode}
             assert after.recording.integrity_mode == integrity_mode
+
+
+# --- #246: timestamp policy selection and header-offset diagnostics -------------------------
+
+_IMAGE_HEADER_LEAD_NS = 300_000_000  # usb_cam 0.8.1 stamps images this far before receive time
+
+
+def _install_dds_image_stubs(monkeypatch, tmp_path, *, image_header_lead_ns=_IMAGE_HEADER_LEAD_NS) -> Path:
+    """One DDS bag: image/state/action sampled together at 10 Hz, sample k carries value k.
+
+    State and action headers equal the bag receive time. The image header is
+    ``image_header_lead_ns`` earlier, as with the usb_cam 0.8.1 epoch-shift bug.
+    """
+
+    @dataclass
+    class TopicType:
+        name: str
+        type: str
+
+    def stamp(ns):
+        return SimpleNamespace(stamp=SimpleNamespace(sec=ns // 1_000_000_000, nanosec=ns % 1_000_000_000))
+
+    messages = []
+    payloads = {}
+    for k in range(10):
+        bag_ns = 1_000_000_000 + k * 100_000_000
+        for topic, kind, header_ns in (
+            ("/camera/top", "img", bag_ns - image_header_lead_ns),
+            ("/state", "state", bag_ns),
+            ("/action", "action", bag_ns),
+        ):
+            data = f"{kind}{k}".encode()
+            payloads[data] = SimpleNamespace(header=stamp(header_ns), kind=kind, k=k)
+            messages.append((topic, data, bag_ns))
+
+    class FakeReader:
+        def __init__(self):
+            self.messages = list(messages)
+
+        def open(self, *_args):
+            pass
+
+        def get_all_topics_and_types(self):
+            return [
+                TopicType("/camera/top", "sensor_msgs/msg/Image"),
+                TopicType("/state", "test/State"),
+                TopicType("/action", "test/Action"),
+            ]
+
+        def has_next(self):
+            return bool(self.messages)
+
+        def read_next(self):
+            return self.messages.pop(0)
+
+    def spec(key, topic, ros_type, *, is_action=False, image=False):
+        return SimpleNamespace(
+            key=key,
+            topic=topic,
+            ros_type=ros_type,
+            is_action=is_action,
+            names=[] if image else ["joint"],
+            image_resize=(16, 16) if image else None,
+            resample_policy="hold",
+            asof_tol_ms=0,
+            stamp_src="header",
+        )
+
+    specs = [
+        spec("observation.images.top", "/camera/top", "sensor_msgs/msg/Image", image=True),
+        spec("observation.state", "/state", "test/State"),
+        spec("action", "/action", "test/Action", is_action=True),
+    ]
+    contract = SimpleNamespace(rate_hz=10, robot_type="test", observations=[], actions=[])
+
+    def decode(_ros_type, msg, _spec):
+        if msg.kind == "img":
+            return np.full((16, 16, 3), msg.k * 20, dtype=np.uint8)
+        return np.asarray([float(msg.k)], dtype=np.float32)
+
+    monkeypatch.setattr(
+        "dataset_tools.bag_to_lerobot._preflight_bags",
+        lambda bags: (
+            contract,
+            [{"dataset_meta": {}, "info": {"storage_identifier": "mcap"}, "tables": {}} for _ in bags],
+        ),
+    )
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.iter_specs", lambda _contract: specs)
+    monkeypatch.setattr(
+        "dataset_tools.bag_to_lerobot.feature_from_spec",
+        lambda sv, _videos: (
+            sv.key,
+            {"dtype": "image", "shape": (16, 16, 3)}
+            if sv.image_resize
+            else {"dtype": "float32", "shape": (1,), "names": ["joint"]},
+            sv.image_resize is not None,
+        ),
+    )
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.make_zero_pad", lambda feature: np.zeros(feature["shape"]))
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.rosbag2_py.SequentialReader", FakeReader)
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.deserialize_message", lambda data, _type: payloads[data])
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.get_message", lambda ros_type: ros_type)
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.decode_value", decode)
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.LeRobotDataset", _CountingDataset)
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot.contract_fingerprint", lambda _contract: "fingerprint")
+    bag = tmp_path / "episode_000001"
+    bag.mkdir()
+    return bag
+
+
+def _image_minus_state_samples(frames) -> set[int]:
+    """Sample-index difference between the image and the state written into each frame."""
+    return {
+        int(frame["observation.images.top"][0, 0, 0]) // 20 - int(frame["observation.state"][0]) for frame in frames
+    }
+
+
+@pytest.mark.parametrize("policy", ["receive", "bag"])
+def test_receive_policy_aligns_images_by_bag_time(tmp_path, monkeypatch, policy):
+    """``bag`` used to fall through to the contract branch and keep the image header (#246)."""
+    bag = _install_dds_image_stubs(monkeypatch, tmp_path)
+
+    export_bags_to_lerobot([bag], out_root=tmp_path / "out", use_videos=False, timestamp_source=policy)
+
+    frames = _CountingDataset.last.frames
+    assert len(frames) == 10
+    assert _image_minus_state_samples(frames) == {0}
+
+
+def test_contract_header_policy_still_follows_image_header(tmp_path, monkeypatch, capsys):
+    """The default policy is unchanged: a 300 ms early header shifts images 3 ticks ahead, with a warning."""
+    bag = _install_dds_image_stubs(monkeypatch, tmp_path)
+
+    export_bags_to_lerobot([bag], out_root=tmp_path / "out", use_videos=False)
+
+    frames = _CountingDataset.last.frames
+    assert 3 in _image_minus_state_samples(frames[3:])
+    out = capsys.readouterr().out
+    assert "observation.images.top: receive-header offset differs from the non-image header streams" in out
+    assert "by +300 ms" in out
+    assert "used for alignment" in out
+
+
+def test_header_skew_warning_can_be_disabled(tmp_path, monkeypatch, capsys):
+    bag = _install_dds_image_stubs(monkeypatch, tmp_path)
+
+    export_bags_to_lerobot([bag], out_root=tmp_path / "out", use_videos=False, header_skew_warn_ms=0)
+
+    assert "receive-header offset differs" not in capsys.readouterr().out
+
+
+def test_aligned_headers_do_not_warn(tmp_path, monkeypatch, capsys):
+    bag = _install_dds_image_stubs(monkeypatch, tmp_path, image_header_lead_ns=0)
+
+    export_bags_to_lerobot([bag], out_root=tmp_path / "out", use_videos=False)
+
+    assert _image_minus_state_samples(_CountingDataset.last.frames) == {0}
+    assert "receive-header offset differs" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", ["receive_time", "Bag", "", "stamp"])
+def test_unknown_timestamp_source_is_rejected_before_output(tmp_path, value):
+    out = tmp_path / "out"
+    with pytest.raises(ValueError, match="unknown timestamp_source"):
+        export_bags_to_lerobot([tmp_path / "missing_bag"], out_root=out, timestamp_source=value)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf")])
+def test_invalid_header_skew_threshold_is_rejected(tmp_path, value):
+    with pytest.raises(ValueError, match="header_skew_warn_ms"):
+        export_bags_to_lerobot([tmp_path / "missing_bag"], out_root=tmp_path / "out", header_skew_warn_ms=value)
+
+
+def test_timestamp_source_aliases():
+    assert _normalize_timestamp_source("bag") == "receive"
+    assert [_normalize_timestamp_source(v) for v in ("contract", "receive", "header")] == [
+        "contract",
+        "receive",
+        "header",
+    ]
+
+
+@pytest.mark.parametrize("value", ["contract", "receive", "bag", "header"])
+def test_cli_accepts_every_timestamp_policy(monkeypatch, value):
+    monkeypatch.setattr(sys, "argv", ["bag_to_lerobot", "--bag", "bag", "--out", "out", "--timestamp", value])
+    args = parse_args()
+    assert args.timestamp == value
+    assert args.header_skew_warn_ms == 200.0
+
+
+def _offsets(receive_s, offset_s):
+    return [(int(r * 1e9), int(o * 1e9)) for r, o in zip(receive_s, offset_s, strict=True)]
+
+
+def _ticks(start_s, count, period_s=0.02):
+    return [start_s + i * period_s for i in range(count)]
+
+
+def test_header_offset_shared_clock_domain_cancels():
+    """Simulation: every header is sim time, so all streams share one large offset -> no warning."""
+    receive = _ticks(0, 10)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(receive, [5] * 10),
+            "observation.state": _offsets(receive, [5] * 10),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=["observation.images.top"],
+        warn_ms=200,
+    )
+    assert warnings == []
+
+
+def test_header_offset_drifting_clock_with_late_camera_does_not_warn():
+    """Sim time at half speed: offsets grow 0.5 s per wall second; the camera starts 2 s late.
+
+    Whole-stream medians would differ by 500 ms; pairing by receive time must not.
+    """
+    state_receive = _ticks(0, 250)
+    camera_receive = _ticks(2.005, 100, period_s=0.033)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(camera_receive, [10 + 0.5 * r for r in camera_receive]),
+            "observation.state": _offsets(state_receive, [10 + 0.5 * r for r in state_receive]),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=["observation.images.top"],
+        warn_ms=200,
+    )
+    assert warnings == []
+
+
+def test_header_offset_sparse_reference_on_drifting_clock_is_unchecked(capsys):
+    """Review of !601: header = receive / 2 everywhere, reference samples 4 s apart.
+
+    Pairing each image with a far-away reference would report the clock drift as +500 ms.
+    """
+    reference_receive = [100, 104]
+    image_receive = [101, 102, 103]
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(image_receive, [r / 2 for r in image_receive]),
+            "observation.state": _offsets(reference_receive, [r / 2 for r in reference_receive]),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=["observation.images.top"],
+        warn_ms=200,
+    )
+    assert warnings == []
+    assert "unchecked for observation.images.top: 0 image samples have a non-image header sample within 50 ms" in (
+        capsys.readouterr().out
+    )
+
+
+def test_header_offset_ignores_pairs_across_a_reference_gap():
+    """A 2 s gap in the reference stream on a drifting clock: only close pairs are judged."""
+    reference_receive = _ticks(0, 50) + _ticks(3, 50)
+    image_receive = _ticks(0.005, 120, period_s=0.033)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(image_receive, [0.5 * r for r in image_receive]),
+            "observation.state": _offsets(reference_receive, [0.5 * r for r in reference_receive]),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    assert warnings == []
+
+
+def test_header_offset_checks_each_camera_separately():
+    receive = _ticks(0, 10)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets(receive, [0.4] * 10),
+            "observation.images.wrist": _offsets(receive, [0.001] * 10),
+            "observation.state": _offsets(receive, [0.001] * 10),
+        },
+        image_keys=["observation.images.top", "observation.images.wrist"],
+        external_video_keys=[],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    assert len(warnings) == 1
+    assert warnings[0].startswith("observation.images.top: receive-header offset differs")
+    assert "by +399 ms" in warnings[0]
+    assert "not used for alignment" in warnings[0]
+
+
+def test_header_offset_warns_when_header_is_late():
+    receive = _ticks(0, 10)
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": _offsets([r + 0.01 for r in receive], [-0.25] * 10),
+            "observation.state": _offsets(receive, [0.0] * 10),
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    assert len(warnings) == 1
+    assert "by -250 ms" in warnings[0]
+
+
+def test_header_offset_extreme_stamps_do_not_wrap(capsys):
+    """Review of !601: int64 distance between INT64_MAX and -1 wrapped and passed the 50 ms bound."""
+    big = np.iinfo(np.int64).max
+    warnings = _header_offset_warnings(
+        header_offsets_ns={
+            "observation.images.top": [(big - i, 400_000_000) for i in range(5)],
+            "observation.state": [(-1, 0)],
+        },
+        image_keys=["observation.images.top"],
+        external_video_keys=[],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    assert warnings == []
+    assert "0 image samples have a non-image header sample within 50 ms" in capsys.readouterr().out
+
+
+def test_header_offset_reports_unchecked_streams(capsys):
+    warnings = _header_offset_warnings(
+        header_offsets_ns={"observation.images.top": _offsets([0], [0.4])},
+        image_keys=["observation.images.top", "observation.images.rtp", "observation.images.raw"],
+        external_video_keys=["observation.images.rtp"],
+        header_aligned_keys=[],
+        warn_ms=200,
+    )
+    out = capsys.readouterr().out
+    assert warnings == []
+    assert "unchecked for observation.images.rtp: Annex-B video has no receive time" in out
+    assert "unchecked for observation.images.raw: no header stamps" in out
+    assert "unchecked for observation.images.top: no non-image header stream to compare" in out

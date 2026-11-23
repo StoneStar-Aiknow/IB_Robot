@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .joints import HEAD, LEFT_ARM, RIGHT_ARM
+from .joints import HEAD, arm_joints, other_side
 
 
 class ReobserveRequired(RuntimeError):
@@ -60,12 +60,19 @@ def require_fresh(state, now: float, config: RevalidationConfig) -> None:
         )
 
 
-def require_posture(reference, current, config: RevalidationConfig, *, include_left: bool = True) -> float:
-    """The largest joint change since the planning snapshot; rejects one beyond the start tolerance."""
-    names = LEFT_ARM + RIGHT_ARM + HEAD if include_left else RIGHT_ARM + HEAD
+def require_posture(
+    reference, current, config: RevalidationConfig, *, include_left: bool = True, side: str = "left"
+) -> float:
+    """The largest joint change since the planning snapshot; rejects one beyond the start tolerance.
+
+    ``side`` is the planning arm, whose hand is compared; ``include_left`` (historic name) includes
+    that arm itself, besides the locked other arm and head.
+    """
+    locked = arm_joints(other_side(side)) + HEAD
+    names = arm_joints(side) + locked if include_left else locked
     error = max(
         float(np.max(np.abs(reference.vector(names) - current.vector(names)))),
-        float(np.max(np.abs(reference.left_hand - current.left_hand))),
+        float(np.max(np.abs(reference.hand(side) - current.hand(side)))),
     )
     if error > config.start_tolerance_rad:
         raise ReobserveRequired("Robot moved beyond the planning snapshot; replan required")

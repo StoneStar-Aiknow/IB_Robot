@@ -45,6 +45,62 @@ BASE = {
 }
 
 
+@pytest.mark.parametrize("waiter_code", [0, 1])
+def test_semantic_capture_constructs_gamepad_only_after_live_binding(monkeypatch, tmp_path, waiter_code):
+    from launch import LaunchContext
+    from launch.actions import EmitEvent, RegisterEventHandler
+    from launch.events.process import ProcessExited
+
+    from robot_config.launch_builders import runtime
+    from robot_config.launch_registry.builtin_registry import build_launch_registry
+    from robot_config.launch_registry.preparation import prepare_launch
+    from robot_config.testing.provider_binding import offline_description
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(runtime.tempfile, "tempdir", str(tmp_path))
+    context = LaunchContext()
+    context.launch_configurations.update(robot_config="lekiwi_semantic_capture", use_sim="false")
+    prepared = prepare_launch(context, build_launch_registry())
+    assert prepared.live_binding_required is True
+    profile = Path(get_package_share_directory("lekiwi_robot")) / "profiles/lekiwi_lidar.yaml"
+    constructed = []
+
+    def construct(effective):
+        assert "base.cmd_vel" in effective["runtime"]["interface_description"]["interfaces"]
+        constructed.extend(generate_teleop_nodes(effective))
+        return constructed
+
+    actions = runtime.generate_bound_runtime_actions(
+        prepared.robot_config, construct, use_sim=False, start_provider=False
+    )
+    waiter = actions[-1]
+    arguments = waiter._Node__arguments
+    assert arguments[arguments.index("--require-interfaces") + 1] == "base.cmd_vel"
+    assert not constructed
+    # Emulate only the waiter's description output and exit event; no provider,
+    # process, simulator or hardware starts in this construction test.
+    descriptor = offline_description(prepared.robot_config, profile)
+    descriptor["execution"] = "physical"
+    descriptor.pop("simulation", None)
+    from robot_runtime.interface_description import description_digest
+
+    descriptor["digest"] = description_digest(descriptor)
+    output = Path(arguments[arguments.index("--description-output") + 1])
+    output.write_text(yaml.safe_dump(descriptor))
+    event = ProcessExited(action=waiter, name="waiter", cmd=[], cwd=None, env=None, pid=1, returncode=waiter_code)
+    handler = next(
+        action.event_handler
+        for action in actions
+        if isinstance(action, RegisterEventHandler) and action.event_handler.matches(event)
+    )
+    returned = list(handler.handle(event, context))
+    if waiter_code:
+        assert not constructed
+        assert all(isinstance(action, EmitEvent) for action in returned)
+    else:
+        assert [vars(node)["_Node__package"] for node in constructed] == ["joy", "joy_teleop"]
+
+
 def _gamepad() -> dict:
     return yaml.safe_load(GAMEPAD.read_text())
 

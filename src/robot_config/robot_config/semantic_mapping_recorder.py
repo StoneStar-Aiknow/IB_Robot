@@ -28,6 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mount-file", required=True)
     parser.add_argument("--camera-file", default="~/.ros/ibrobot/calib/current/base_to_front_camera.yaml")
     parser.add_argument("--camera-info-topic", required=True)
+    parser.add_argument(
+        "--lidar-message-type",
+        choices=("livox_ros_driver2/msg/CustomMsg", "sensor_msgs/msg/PointCloud2"),
+        default="livox_ros_driver2/msg/CustomMsg",
+    )
     parser.add_argument("--topic", action="append", default=[])
     parser.add_argument("command", nargs=argparse.REMAINDER)
     return parser
@@ -119,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
         "map_prefix": str((map_path / "map").resolve()),
         "calibration_sources": calibration_sources,
         "camera_info_topic": args.camera_info_topic,
+        "lidar_message_type": args.lidar_message_type,
         "topics": list(args.topic),
         "supervisor_pid": os.getpid(),
         "recorder_pid": 0,

@@ -1,0 +1,23 @@
+# Task card for RoboDojo general_pickup (agent_eval TaskSpec).
+#
+# Holds what the experiment lets the Agent see and do, never the answer: no object pose,
+# target coordinates, layout, seed or evaluator success threshold (the loader rejects such
+# fields). RoboDojo's own verdict, on /evaluation/native_result, is the only success signal.
+schema_version: 1
+kind: task_spec
+task: general_pickup
+# Task name on the platform side (the platform plugin maps it to its task config).
+platform_task: general_pickup
+# The instruction text is the platform's (session_start "instruction"), not written here.
+instruction_source: platform
+observation:
+  # Camera views the Agent's planner attaches (robot config planner.vision_topics);
+  # recorded for the report, the runner itself never forwards images.
+  cameras: [cam_head_overlay, cam_left_wrist, cam_right_wrist]
+  # Whitelisted observation fields the episode context receives.
+  fields: [instruction, tick, step_lim, tcp_xyz, tcp_quat, gripper_opening, wrist_joint_rad]
+decision_budget:
+  max_decisions: 40
+  decision_timeout_s: 300.0
+# The Agent's DONE reply ends an episode early; it is not a success signal.
+recipe: general_pickup_x5

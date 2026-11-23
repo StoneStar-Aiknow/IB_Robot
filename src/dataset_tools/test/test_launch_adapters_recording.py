@@ -9,14 +9,31 @@ Assertions are verbatim; only the import paths changed.
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from ament_index_python.packages import get_package_share_directory
 from launch.actions import EmitEvent
 from launch.events import Shutdown
 
 import dataset_tools.launch_builders.recording as recording_module
 from robot_config.launch_registry.registry import LaunchBuildContext
+from robot_config.loader import load_robot_config_dict
 from robot_config.runtime_target import RuntimeTarget
+
+
+def test_managed_semantic_capture_forces_continuous_mcap(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_path = Path(get_package_share_directory("robot_config")) / "config/robots/lekiwi_semantic_capture.yaml"
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
+    assert recording_module.resolve_recording_launch(config, requested=False, mode="continuous") == (True, "continuous")
+    with pytest.raises(ValueError, match="require continuous"):
+        recording_module.resolve_recording_launch(config, requested=True, mode="episodic")
+    command = recording_module.build_continuous_recording_command(config, "fixture")
+    assert command[command.index("-s") + 1] == "mcap"
+    assert command[command.index("-o") + 1].endswith("lekiwi_semantic_capture_fixture/bag")
+    assert set(config["recording"]["topics"]) <= set(command)
 
 
 class _FakeNode:
@@ -65,7 +82,13 @@ class TestRecordingEntry:
     def test_semantic_dataset_with_continuous_mode_forces_recording_on(self, monkeypatch):
         calls: list = []
 
-        def fake_generate(robot_config, control_mode, mode, scheduler_enabled=False):
+        def fake_generate(
+            robot_config,
+            control_mode,
+            mode,
+            scheduler_enabled=False,
+            lidar_message_type="livox_ros_driver2/msg/CustomMsg",
+        ):
             calls.append((mode, scheduler_enabled))
             return [_FakeNode("recorder")]
 
@@ -85,6 +108,44 @@ class TestRecordingEntry:
         result = recording_module.build_recording(context)
 
         assert result.actions == []
+
+
+@pytest.mark.parametrize(
+    ("use_sim", "sim_platform", "expected"),
+    [
+        (False, "", "livox_ros_driver2/msg/CustomMsg"),
+        (True, "sdk", "livox_ros_driver2/msg/CustomMsg"),
+        (True, "mock", "livox_ros_driver2/msg/CustomMsg"),
+        (True, "gazebo", "sensor_msgs/msg/PointCloud2"),
+        (True, "mujoco", "sensor_msgs/msg/PointCloud2"),
+    ],
+    ids=["hardware", "sdk", "mock", "gazebo", "mujoco"],
+)
+def test_semantic_recording_command_uses_launch_simulation_platform(
+    monkeypatch, tmp_path, use_sim, sim_platform, expected
+):
+    from launch import LaunchContext
+    from launch.actions import ExecuteProcess
+    from launch.utilities import perform_substitutions
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_path = Path(get_package_share_directory("robot_config")) / "config/robots/lekiwi_semantic_capture.yaml"
+    config = load_robot_config_dict(config_path, defer_interface_binding=True)
+    result = recording_module.build_recording(
+        _context(
+            robot_config=config,
+            runtime_target=RuntimeTarget.SIMULATION if use_sim else RuntimeTarget.HARDWARE,
+            use_sim=use_sim,
+            sim_platform=sim_platform,
+        )
+    )
+    commands = [
+        [perform_substitutions(LaunchContext(), item) for item in action.cmd]
+        for action in result.actions
+        if isinstance(action, ExecuteProcess)
+    ]
+    command = next(command for command in commands if "semantic_mapping_recorder" in command)
+    assert command[command.index("--lidar-message-type") + 1] == expected
 
 
 class TestRerunVisualizerEntry:

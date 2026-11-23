@@ -40,6 +40,7 @@ package.
 | `/aimdk/arm/commands`, `/aimdk/gripper/commands`, `/aimdk/head/commands` | `Float64MultiArray` | `/mc/upper_body_command` (`arm_pos` / `hand_pos` / `head_pos`) |
 | `/cmd_vel` | `geometry_msgs/Twist` | `/aima/mc/locomotion/velocity` + input-source arbitration |
 | `/motion/execute_named` | `ibrobot_msgs/action/ExecuteNamedMotion` | `SetMcPresetMotion` (wave, handshake, clap…) and posture MC actions (sit, squat, lie, stand up, stairs); in `stream`, recorded arm trajectories on `/mc/upper_body_command` |
+| `/arm_trajectory_controller/follow_joint_trajectory` (`joint.trajectory`, `x2_ultra_omnihand` only) | `control_msgs/action/FollowJointTrajectory` | caller-planned arm trajectories replayed on `/mc/upper_body_command`, see below |
 | `/speech/speak` | `ibrobot_msgs/srv/SpeakText` | `PlayTts` (neutral 0–100 priority stepped onto the platform's TTS layers, background…warning; the safety layer is unreachable) |
 | `/expression/play` | `ibrobot_msgs/srv/PlayExpression` | `PlayEmoji` (semantic name → vendor emotion id) |
 | `/led/set_pattern` | `ibrobot_msgs/srv/SetLedPattern` | `SetPmuLed` (reports platform preemption instead of faking success) |
@@ -254,6 +255,55 @@ plays the rest. The runtime keeps one checkpoint and honours it once, within
 arm or changed who commands it: a public arm target, another named motion, a
 mode change, a stop or lost arbitration all void it. A void token plays the
 motion from the start and says why in the result message.
+
+### Caller-planned arm trajectories (`joint.trajectory`)
+
+The vendor MC tier has no arm trajectory endpoint, so `x2_ultra_omnihand`
+declares `trajectory_actions` and the `joint.trajectory` capability and the
+runtime serves `FollowJointTrajectory` itself, on the same replay as recorded
+motions: one arm motion at a time, the public arm stream refused while it runs,
+a stop ends it. It is admitted in the modes whose profile entry sets
+`allows_trajectory` (`stream`, `policy_stream`); the vendor's arm travel is
+`vendor.arm.limits` (official URDF v1.3.0).
+
+- **Joints.** `joint_names` may be any subset of the 14 arm joints; the others
+  hold where the command starts. Head and hands do not move.
+- **Start.** The command starts from the arm target the platform is driving
+  when its echo is fresh (< 0.25 s) and within 0.3 rad of the measured arm,
+  else from the measured arm: under load the arm settles below its target, and
+  starting from the measured pose would step the command down. A point at
+  `time_from_start` 0 must be that start (within 0.05 rad of it or of the
+  measured arm) and is dropped. `trajectory.header.stamp` must be zero: the
+  motion starts when the goal executes, there is no scheduled start.
+- **Timing.** Waypoints are joined linearly in joint space and sampled at the
+  vendor command rate, as a trajectory controller does with positions only; a
+  single waypoint is reached by a cosine ease, so it starts and ends at rest.
+  `velocities` and `accelerations` are not used. A goal is refused before
+  moving when a target is outside the arm travel, a step is faster than
+  `trajectory_max_speed_radps`, time does not increase, or it lasts over 120 s.
+- **Success.** Both checks are coarse on purpose: they catch a joint that is
+  stuck or stopped well short, not a pose the platform holds with an error
+  against gravity or a command a caller raised by the sag it predicts. First,
+  the measured arm must follow, as for recordings, and here every goal joint
+  commanded at least `trajectory_follow_joint_min_rad` (0.1 rad) must itself
+  have moved `trajectory_follow_min_ratio` (0.3) of its travel, else
+  `PATH_TOLERANCE_VIOLATED`; travel is measured from where the arm was, so a
+  steady offset does not count against it. Second, each goal joint must reach
+  its final target within `goal_time_tolerance` after the plan ends (default
+  `trajectory_goal_settle_s`, 2 s; the final-target confirmation spends the
+  same budget), else `GOAL_TOLERANCE_VIOLATED` with the final error per joint.
+  The runtime keeps the arm, and keeps sending the final target, until then.
+  A positive position `goal_tolerance` is used as given; a negative one skips
+  that joint's own follow and arrival checks; an unset one is off by more than
+  `trajectory_goal_tolerance_rad` (0.2 rad) and more than
+  `trajectory_goal_tolerance_ratio` (0.5) of the joint's travel. A caller that
+  needs more precision sends its own tolerance. `path_tolerance` and velocity
+  or acceleration tolerances are refused: the arm trails its command by the
+  platform's tracking lag. Every result reports the final error.
+- **Cancel.** As for recordings, the arm holds the target sent
+  `trajectory_hold_lag_s` ago, also when the cancel arrives while the final
+  target is being confirmed or the arm is settling, and the goal ends
+  `CANCELED`.
 
 Record a gesture with the runtime in `idle` (stable stand, so the preset plays):
 
@@ -612,8 +662,10 @@ off (issue #201).
   consumers needing LeRobot normalization metadata fail closed on X2 (design D5,
   decided 2026-09-16). Policy inference and dataset recording on X2 are not part
   of this stage.
-- **No trajectory / FK / IK / move-to capabilities** — the vendor MC tier
-  exposes no joint-trajectory endpoint.
+- **No FK / IK / move-to capabilities, and no trajectory capability outside
+  `x2_ultra_omnihand`** — the vendor MC tier exposes no joint-trajectory
+  endpoint; only that profile serves `joint.trajectory`, on the runtime's own
+  replay (see "Caller-planned arm trajectories").
 - **No `base.odom`** — `/slam/lidar_odom` is a map-frame localization that jumps
   on relocalization, not continuous odometry. It is published as
   `localization.pose` with its true frames instead (design D6/D13).

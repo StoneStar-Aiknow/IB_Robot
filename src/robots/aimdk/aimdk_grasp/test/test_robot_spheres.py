@@ -83,3 +83,55 @@ def test_a_state_beyond_a_joint_limit_is_flagged(model):
     assert in_bounds.tolist() == [True, False]
     with pytest.raises(ValueError, match="Nx7"):
         model.spheres(feedback, np.zeros(7))
+
+
+def test_the_right_model_moves_the_right_arm_as_the_mirror_of_the_left(model):
+    """At mirrored body and hand states the right model's spheres are the left model's mirrored about y = 0."""
+    from aimdk_grasp.joints import ARM_MIRROR_SIGNS, HAND_SIGNS, swap_side_name
+    from aimdk_grasp.robot_model import config_directory
+    from scipy.spatial import cKDTree
+
+    right = RobotSphereModel(directory=config_directory("right"))
+    assert right.side == "right" and right.mapping.side == "right" and right.arm == RIGHT_ARM
+    rng = np.random.default_rng(11)
+    limits = np.array([joint["bounds"] for name in LEFT_ARM for joint in model.joints if joint["name"] == name])
+    q = rng.uniform(limits[:, 0], limits[:, 1], (4, 7))
+    other = rng.uniform(-0.3, 0.3, 7)
+    head = np.array([0.2, 0.3])
+    left_body = dict(zip(LEFT_ARM + RIGHT_ARM + HEAD, [0.0] * 14 + list(head), strict=True))
+    left_body.update(zip(RIGHT_ARM, other, strict=True))
+    right_body = dict(left_body, **dict(zip(LEFT_ARM, other * ARM_MIRROR_SIGNS, strict=True)))
+    right_body.update(zip(HEAD, head * [-1.0, 1.0], strict=True))
+    left_spheres, left_ok = model.spheres(Feedback(0.0, left_body, RELEASE), q)
+    right_spheres, right_ok = right.spheres(
+        Feedback(0.0, right_body, np.zeros(10), right_hand=RELEASE * HAND_SIGNS), q * ARM_MIRROR_SIGNS
+    )
+    np.testing.assert_array_equal(left_ok, right_ok)
+    assert left_spheres.shape == right_spheres.shape
+    # The right configuration is generated link by link from the left one (a
+    # link's spheres may be listed in another order). Up to the description's
+    # own left/right differences (test_mirror_side: < 8 mm).
+    assert sorted(right.links) == sorted(swap_side_name(link) for link in model.links)
+    # The torso cover is copied, not mirrored (mirror_side): it is checked
+    # against the torso mesh itself, which is not exactly symmetric.
+    np.testing.assert_array_equal(
+        right.local[right.link_slices["torso_link"]], model.local[model.link_slices["torso_link"]]
+    )
+    for link in model.links:
+        mine, theirs = model.link_slices[link], right.link_slices[swap_side_name(link)]
+        assert len(mine) == len(theirs), link
+        if link == "torso_link":
+            continue
+        for state in range(len(q)):
+            mirrored = left_spheres[state, mine] * [1.0, -1.0, 1.0, 1.0]
+            distance, _ = cKDTree(mirrored).query(right_spheres[state, theirs])
+            assert distance.max() < 0.008, link
+    left_center, left_radius = model.arm_reach()
+    right_center, right_radius = right.arm_reach()
+    np.testing.assert_allclose(right_center, left_center * [1.0, -1.0, 1.0], atol=1e-5)
+    assert right_radius == pytest.approx(left_radius, abs=0.008)
+    assert right.palm_reach()[1] == pytest.approx(model.palm_reach()[1], abs=0.008)
+    with pytest.raises(ValueError, match="left_arm_reach of a right"):
+        right.left_arm_reach()
+    with pytest.raises(ValueError, match="cannot drive"):
+        RobotSphereModel(mapping=model.mapping, directory=config_directory("right"))

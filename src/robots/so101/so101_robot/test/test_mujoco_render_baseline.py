@@ -13,6 +13,9 @@ the baseline's own profile and template, with the identity spawn and the
 profile's peripherals as-is; the checkout-dependent absolute meshes
 directory is normalized to {{MESHES_DIR}} on both sides (comments are
 stripped in the comparison — see the lekiwi twin for the rationale).
+The one intentional addition since then is the viewer-only
+`gripper_follow` camera in the gripper body (operator chase view; never
+published, the recorded camera elements and poses are unchanged).
 """
 
 from __future__ import annotations

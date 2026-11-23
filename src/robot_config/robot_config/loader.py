@@ -942,7 +942,7 @@ def validate_semantic_mapping_config(
             errors.append("semantic_mapping.camera.peripheral must use the realsense driver")
         if not peripheral.get("align_depth", False):
             errors.append("semantic_mapping.camera.peripheral must enable aligned depth")
-        if peripheral.get("transform", {}).get("parent_frame") != camera.get("parent_frame"):
+        if (peripheral.get("transform") or {}).get("parent_frame") != camera.get("parent_frame"):
             errors.append(
                 "semantic_mapping.camera.parent_frame must match the camera peripheral transform parent_frame"
             )
@@ -1956,7 +1956,12 @@ def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
         logger.info("Approved camera calibration is not installed: %s", artifact_path)
         for camera in robot_config.get("peripherals", []):
             if camera.get("type") == "camera" and camera.get("skip_urdf_without_transform", False):
-                camera.pop("transform", None)
+                if isinstance(runtime, dict) and runtime.get("provider"):
+                    # An absent override would restore the profile's placeholder
+                    # mount during the runtime merge. Null explicitly clears it.
+                    camera["transform"] = None
+                else:
+                    camera.pop("transform", None)
         return
     try:
         document = yaml.safe_load(artifact_path.read_bytes()) or {}
@@ -1979,6 +1984,10 @@ def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
         )
         for camera in robot_config.get("peripherals", []):
             if camera.get("type") == "camera" and camera.get("optical_frame_id") == transform.get("child_frame"):
+                camera["transform"] = {
+                    **(camera.get("transform") or {}),
+                    "parent_frame": transform["parent_frame"],
+                }
                 camera["transform"].update(
                     {
                         "x": float(translation_values[0]),

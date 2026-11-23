@@ -26,7 +26,9 @@ from typing import Any
 
 import numpy as np
 
-from manipulation_execution.pick.pipeline.contracts import (
+from manipulation_execution.pick.pipeline.perception import PerceptionServices
+from manipulation_execution.pick.pipeline.streaming import received_at_or_stale
+from manipulation_execution.shared.contracts import (
     Flag,
     GraspBackends,
     GraspFailure,
@@ -34,11 +36,9 @@ from manipulation_execution.pick.pipeline.contracts import (
     Observation,
     Proposals,
 )
-from manipulation_execution.pick.pipeline.perception import PerceptionServices
-from manipulation_execution.pick.pipeline.streaming import received_at_or_stale
 
 from . import head_wire as wire
-from .backend import WARMUP_BUDGET_S, arm_and_hand, watch_timeouts, x2_robot
+from .backend import WARMUP_BUDGET_S, arm_and_hand, automatic_execution, watch_timeouts, x2_robot
 from .execution_watch import WATCH_FAILED, WatchState, WatchStatus, WatchTimeouts, watch_failure
 from .head_interface import NO_SUPPORT, STATUS_DEPTH, head_endpoints, session_id
 from .proposer import X2Proposer
@@ -500,7 +500,11 @@ def x2_remote_grasp_backends(
         )
         camera = RemoteHeadCamera(head)
         proposer = X2Proposer(services, None, settings=robot.perception, remote_scene=head.complete_scene)
-        executor, effector = arm_and_hand(node, robot, description, closers)
+        planner = RemotePlanner(head)
+        if options["arm_side"] == "auto":
+            planner, executor, effector = automatic_execution(node, robot, description, closers, planner)
+        else:
+            executor, effector = arm_and_hand(node, robot, description, closers)
     except BaseException:
         for close in reversed(closers):
             close()
@@ -526,4 +530,4 @@ def x2_remote_grasp_backends(
         for closer in reversed(closers):
             closer()
 
-    return GraspBackends(camera, proposer, RemotePlanner(head), executor, effector, watch, close=close, prepare=prepare)
+    return GraspBackends(camera, proposer, planner, executor, effector, watch, close=close, prepare=prepare)

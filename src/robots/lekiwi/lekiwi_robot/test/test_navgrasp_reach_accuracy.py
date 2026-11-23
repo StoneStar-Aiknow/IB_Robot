@@ -177,7 +177,7 @@ def _mujoco_model_path(node: ReachNode, launch_log: Path) -> str:
 
 @pytest.mark.parametrize("sim_platform", ("gazebo", "mujoco"))
 def test_navgrasp_reach_accuracy(tmp_path, sim_platform):
-    from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
+    from robot_runtime_sim.testing.sim_environment import environment_missing, skip_or_fail
 
     environment_reason = environment_missing(sim_platform)
     if environment_reason:

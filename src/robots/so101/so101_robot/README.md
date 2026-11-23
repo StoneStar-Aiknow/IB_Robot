@@ -26,6 +26,29 @@ ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm use_sim:=tru
 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=gazebo     # Gazebo physics
 ```
 
+The hardware launch checks the local calibration against the profile before
+any hardware node starts and logs the result as `runtime_preflight`: one line
+on a pass, the joint table when a home pose is within 0.05 rad of a limit, and
+a FAIL report followed by the launch error when the calibration file is
+missing or unreadable or a home pose lies outside the calibrated limits. The
+FAIL report includes the joint table whenever the model can still be
+projected (a home pose out of range); a missing or unreadable file gives the
+file path and the error only. To check
+without launching (no serial port or driver is opened; exit 1 on a failure):
+
+```bash
+ros2 run robot_runtime runtime_preflight --package so101_robot --profile so101_single_arm
+```
+
+The table shows every joint's limits, home pose and margin; a negative margin
+is the joint that fails, and a warning marks a margin below 0.05 rad. Check
+the arm before acting: if that joint was not driven to its end stop during
+calibration, recalibrate; if the arm cannot reach the home pose, the
+deployment profile's home is what needs changing. A pass does not check the
+fields only the SO-101 SDK validates (`homing_offset`, and `drive_mode` and
+motor ids when present), nor
+that the file was made on the attached arm.
+
 `profile` is a path or the name of a file in `profiles/`. The profile is the
 single source of runtime parameters: port, calibration, controllers config,
 modes → controller sets, capabilities with parameters (incl. stop latency
@@ -77,6 +100,50 @@ ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform
 # plus a GL driver, both pulled in by the mujoco_ros2_control packages)
 IBROBOT_MUJOCO_HEADLESS=1 ros2 launch so101_robot runtime.launch.py profile:=so101_single_arm sim_platform:=mujoco
 ```
+
+A profile's `hardware.xacro_args.mujoco_headless` is applied last and
+overrides the environment variable.
+
+With a window, the launch log prints the viewer key guide. The viewer starts
+on the free camera (left-drag rotates, right-drag pans, scroll zooms,
+Ctrl+A returns to the start view). `]` / `[` cycle the model's fixed cameras
+in model id order (`]` from the first, `[` from the last), and `Esc` returns
+to the free camera. In `pick_banana` the order is `top_camera -> side_view ->
+front_camera -> gripper_follow -> wrist_camera`: `side_view` (near
+horizontal, for the gripper height above table and plate) and
+`gripper_follow` (a chase view of gripper, banana and plate) are viewer-only
+cameras. They are not published or recorded: the simulator's CameraPlugin
+streams every model camera that has no policy, so the launch reads the
+composed model's cameras and sets every camera that is not an enabled
+peripheral to `policy: disabled` (a model whose cameras cannot be read, or
+an unnamed camera, fails the launch).
+
+The start view comes from the scene's `layout.yaml`:
+
+```yaml
+mujoco_viewer:
+  lookat: [x, y, z]   # world point at the centre of the view (m)
+  distance: 0.72      # framing: shows what a 45 deg camera would show from 0.72 m
+  azimuth: -110       # degrees
+  elevation: -55      # degrees, in [-89, 89] (the viewer clamps to this range)
+```
+
+`distance` sets the framing, not the camera position: MuJoCo keeps the free
+camera at 1.5 x the model extent (changing the extent would move every
+camera's near/far planes), so the compiler narrows the field of view instead.
+The result is a long-lens, nearly orthographic view with little depth cue;
+use `side_view` to judge heights. A malformed view, including an empty
+`mujoco_viewer:` key, fails the launch with `ViewerViewError`. So does a
+model whose `visual/global` sets `orthographic` (MuJoCo then reads the
+free camera's fovy as a length) or a `cameraid` naming one of its cameras
+(the viewer would start on that fixed camera, and Ctrl+A would return to
+it). So does a
+view that fails the numeric checks on the stored angles and field of
+view, the free camera position and transform, and the vertical
+projection. These checks do not cover every renderer computation: only
+scenes whose camera and geom coordinates stay within about 1e18 m are
+supported, and a view beyond that may pass the checks and still render
+wrongly.
 
 The workspace Python `mujoco` must equal the simulator's libmujoco
 (`requirements/mujoco-sim.txt` pins 3.12.0); a mismatch fails the launch

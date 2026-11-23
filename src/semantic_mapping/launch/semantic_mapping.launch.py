@@ -22,7 +22,7 @@ def _query_only_parameters(config, overrides):
 def launch_setup(context, *_args, **_kwargs):
     mode = context.launch_configurations.get("mode", "online")
     config = load_semantic_mapping_robot_config(
-        context.launch_configurations.get("robot_config", "lekiwi_realsense_mapping"),
+        context.launch_configurations.get("robot_config", ""),
         context.launch_configurations.get("config_path", ""),
     )
     if mode == "query_only":
@@ -54,7 +54,9 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("mode", default_value="online"),
-            DeclareLaunchArgument("robot_config", default_value="lekiwi_realsense_mapping"),
+            DeclareLaunchArgument(
+                "robot_config", default_value="", description="Enabled semantic mapping deployment; or set config_path"
+            ),
             DeclareLaunchArgument("config_path", default_value=""),
             DeclareLaunchArgument("database_path", default_value=""),
             DeclareLaunchArgument("artifact_output_dir", default_value=""),

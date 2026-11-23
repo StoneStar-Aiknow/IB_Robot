@@ -1,0 +1,18 @@
+# Agent-side method knowledge for general_pickup on the RoboDojo dual-arm ARX X5.
+#
+# Consumed by agent_eval.episode_context (RecipeFacts): every request carries the guide. The
+# guide started as the MR !551 episode driver's; the lines that relied on the driver's step
+# feedback and DONE review (both removed) are rewritten to the robot state the request shows.
+# Changing it is an experiment variable, not a refactor.
+# The evaluator's own goal and success test are RoboDojo's and are not described here.
+schema_version: 1
+kind: recipe
+name: general_pickup_x5
+done_word: DONE
+max_idle_replies: 3
+thresholds:
+  # The tool centre point's height when the fingertips reach the table (blocked descents end at
+  # 0.796-0.80); the robot state shows fingers_above_table relative to it.
+  fingers_on_table_z: 0.795
+guide: |-
+  Dual-arm robot (two ARX X5 arms, parallel grippers). Frame: +y forward (away from the robot), +x right, +z up; skill directions forward/backward/left/right/up/down. Left arm base x=-0.3, right x=+0.3: use the arm on the object's side. Positions are the GRASP POINT between the finger pads. cam_head (overlay): fixed view from behind; the yellow grid lies ON THE TABLE, crossings every 0.1 m are labelled x,y: read the object's x, y off it. Blue L / red R circle = table point below that grasp point. cam_*_wrist: view along that gripper, its fingers at the bottom. GRIPPER POSE (in ROBOT STATE): horizontal = start, points forward, fingers close along x. set_gripper_approach (field approach) turns it in place: top_down points down, fingers close along x; top_down_rotated points down, fingers close along y; tilted_45 half way. rotate_gripper_cw/ccw twist the wrist by motion_distance degrees (90 swaps the closing line). top_down suits small, flat, round or wide objects; it is reachable only at y <= -0.05 (farther: tilted_45). Long thin objects or handles: make the fingers close ACROSS the long axis. Change pose at least 0.08 above the object, never near the table. move_relative_ee keeps the pose. RECIPE: (1) read the target x, y from cam_head. (2) gripper open, choose the pose, bring the grasp point over the target (horizontal: ~0.03 short of its y), <= 0.10 per move; horizontal at y < -0.15: move forward before descending. Above the object the arm hides it in cam_head: do not keep re-centring, descend. (3) descend by about fingers_above_table (0 = fingertips on the table). A descent that STOPS SHORT near the table is grasp depth; one that stops clearly higher landed ON the object. (4) in the wrist image centre the object between the fingers (shift 0.01-0.03). (5) close_gripper_skill. (6) once it holds the object (closed gripper opening clearly above 0) lift at once: up 0.10 twice. A closed gripper reading about 0 is EMPTY: open, up 0.03, re-centre, descend, close. After NO IK use a smaller step, another pose, or move horizontally first. Never give up. Reply with EXACTLY ONE workflow step (one skill), arm_side left or right, flat fields (schema_version, skill_name, arm_side, motion_direction, motion_distance, approach), never a 'parameters' object. Keep summary and user_message under 120 characters. Reply kind=conversation with user_message DONE only after lifting the held object; DONE ends the episode.

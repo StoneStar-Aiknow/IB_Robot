@@ -1,0 +1,19 @@
+# Hand custody back after a place. Idempotent per request_id; a repeated
+# request returns the first answer and causes no second motion.
+uint32 schema_version
+string request_id
+string custody_id
+string custody_epoch
+string claim_token
+# What the place saw (held_custody_contract.RETURN_STATES): EMPTY, with
+# reason_code DROPPED if the object fell; HELD only with the arm back at the
+# handover pose it claimed it at; otherwise UNKNOWN. The owner checks it
+# (EMPTY still needs fresh empty-hand feedback): see state_after_return.
+string state
+string reason_code
+---
+bool success
+# Why the return was refused (held_custody_contract.CUSTODY_ERRORS); empty on success.
+string error_code
+# The custody state after the return.
+string state

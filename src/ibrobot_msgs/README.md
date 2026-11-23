@@ -616,8 +616,10 @@ Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway �
 | `timeout_sec` | per-entry 超时上限，受 `task_budget` 剩余预算约束 |
 | `expected_executor` | `DelegatedExecutorIdentity`，调用方声明的期望 executor identity |
 | `supervised_direct` | 仅人工真机测试 client 为 `true`；Hermes/catalog 固定为 `false` |
-| `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY` |
-| `release_after_success` | 验证成功并运输到 place container 后是否开爪 |
+| `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY`、`MODE_OBSERVE_ONLY` 或 `MODE_RECOVER` |
+| `release_after_success` | 验证成功并运输到 place container 后是否开爪；为 false 时抓完继续拿着（custody 为 `HELD`），留给之后的 place 或 Gateway 空闲时的自动放回 |
+| `custody_id` / `custody_epoch` / `request_id` | 仅 `MODE_RECOVER`（Gateway 的自动放回）：要放回的 custody、Gateway 做决定时看到的 owner epoch 和幂等键。owner 要求 custody 与 epoch 都一致、且仍在 pick 手里，否则拒绝；原接触位姿未验证或抓取后身体动过时也拒绝，继续拿着（`NO_PUT_BACK`）；重复的 `request_id` 返回第一次的结果。只在验证过的原接触处释放后回 home，按当前场景重新校验，旧碰撞证书不能授权 |
+| `grasp_spec` | 可选的 `GraspSpec`；`schema_version=0` 表示不指定 |
 
 **Result 字段**
 
@@ -635,6 +637,12 @@ Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway �
 | `candidate_index` | 最终规划或执行的候选索引，未选择时为 `-1` |
 | `released_after_success` | 是否完成正式释放流程 |
 | `pipeline_timings_json` | 正式 executor 返回的阶段耗时 JSON |
+| `custody_id` | 本 goal 建立或恢复的 custody（`HeldObject.custody_id`）；没有时为空 |
+| `failure_class` | 失败类别，取值见 `embodied_common.pick_contract.FAILURE_CLASSES`；成功时为空 |
+| `recoverable` | 从当前状态重新规划可能成功，不需要先人工检查 |
+| `measured_phase` | 机器人实际到达的最后阶段（不是计划中的最后阶段） |
+| `execution_detail` | 结构化执行详情 `ExecutionDetail` |
+| `last_feedback_sequence` / `execution_history` | 最后一条反馈的序号，以及按序号排列、最多 256 条的反馈尾部，用于找回被 result 抢先的反馈 |
 
 **Feedback 字段**
 
@@ -644,6 +652,23 @@ Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway �
 | `progress` | 进度 `0.0`-`1.0` |
 | `attempt` | 当前尝试序号 |
 | `detail` | 当前进度说明 |
+| `execution_detail` | 结构化执行详情 |
+| `sequence` | 反馈序号，从 1 递增 |
+
+### 抓取 custody、预取与执行详情
+
+| 接口 | 说明 |
+| --- | --- |
+| `HeldObject.msg` | 一只手里拿着什么、归谁管。由持有 custody 的 executor latched 发布，每次发布前先落盘，至少每 1 秒重发一次；Gateway 只从这里判断能否放行运动，按收到的时间算新鲜度（不用时间戳，机器人与主机时钟不同），订阅后第一条 latched 消息不算，超过 3 秒没更新的按 `UNKNOWN` 处理；Gateway 重启后要等每只手都没有在跑的 goal、没有 place 持有、不在恢复中才开始准入。`custody_id` 永不为空；`goal_active` 表示 owner 自己的 goal（pick、放回）正在这只手上执行，期间这只手什么都不放行。custody 每只手各一份（`arm_side`，单臂机器人也写配置里的手名），一只手出问题只停这只手，另一只的任务照常准入（Gateway 仍一次只跑一个 root）。`state` 只有四个：`EMPTY`（手是空的，只凭新鲜的空手反馈进入，重启后也一样；原因 `DROPPED` 表示掉了，Gateway 先张开手、回 home 一次再准入别的 root，下一次 pick 开始时清掉）、`HELD`（`owner` 为 `pick` 或 `place`；拿着是安全状态。归 pick 时不管哪个 root，这只手只放行移动身体（搬运）和放下这件物体的 place（place 带上 custody），不能再抓；归 place 时这只手什么都不放行（连走路也不行），直到 place 归还，place 凭自己的 token 续租；place 没放成时交还 pick；Gateway 空闲（没有任何 root）满 60 秒仍在 pick 手里才自动放回原接触处并回 home；原接触位姿未验证或抓取后身体动过时拒绝放回、继续拿着（原因 `NO_PUT_BACK`，提醒操作员，操作员可以接管）；owner 的记录保存抓取时的身体位姿和 `NO_PUT_BACK` 标记，重启和重新确认后都保留；Gateway 断联时一直拿着；只有归 pick 时 owner 才判断掉落）、`RECOVERING`（owner 主动张手：放回，或 pick 在自己 goal 内放回、成功后释放；成功变 `EMPTY`，否则变 `UNKNOWN`，不再自动放回）、`UNKNOWN`（说不清；手的反馈中断超过 1 秒才算；Gateway 取消这只手上正在运行的动作和移动身体的动作，这只手只准入操作员针对它的“张开手”“回 home”（占用 Gateway 唯一租约，回 home 带上手里物体的几何，未知时按最大物体包络），Agent 不能下发。出口两个：记录描述了物体、新鲜反馈显示仍握着、手臂在记录位置、期间手臂没动过时自动回到 `HELD`（重启后“没动过”要有跨重启的来源作证）；或操作员确认空手的那一刻空手反馈新鲜且手臂稳定在机器人配置的 home，变为 `EMPTY`）。`custody_epoch` 在 owner 进程启动时生成，其他 epoch 的请求和 token 一律拒绝。中断的 pick 也记录在这里，没有第二份状态。状态、owner、各状态允许的原因统一定义在 `embodied_common.held_custody_contract` |
+| `ClaimHeldObject.srv` / `ReturnHeldObject.srv` | place 领取、归还 custody。按 `request_id` 幂等：重复请求返回第一次的结果，不会第二次转移所有权，也不会第二次运动。`claimant` 只能是 `place`，只有 pick 手里的物体能被领取，租约不超过 120 秒，place 凭自己的 token 续租；归还时 place 报自己看到的状态：`EMPTY`（掉了带 `DROPPED`）、`HELD`（只在手臂已回到领取时的交接位姿时；owner 核实握持反馈和手臂位姿后交还 pick，否则按 place 说不清处理）或 `UNKNOWN`，owner 按 `held_custody_contract.state_after_return` 核对后决定新状态。三个 custody 服务的拒绝原因都放在 `error_code`（`CUSTODY_ERRORS` 共五个），`reason_code` 只表示 custody 自身的原因 |
+| `AuthorizeHeldReset.srv` | 由 Gateway 提供（核对操作员身份后转给 owner）。`UNKNOWN` 时操作员在“张开手”“回 home”之后确认空手；到达时当场核对空手反馈和 home，满足就变为 `EMPTY`，否则拒绝（`WRONG_STATE`），不保留确认；`inspect_only` 只查询当前 custody |
+| `PrefetchGrasp.srv` / `PrefetchedContainer.msg` | 在 `PickObject` goal 之前开始采集和感知。结果只给同一 root task、同一目标使用；采集时间属于 ROS 时钟域，年龄由 pick executor 用本机单调时钟计算；姿态变化、超龄、时钟回跳或被新的预取替换时作废 |
+| `GraspSpec.msg` | 可选抓取意图：部位、避开部位、抓法、参与手指、目标力。全部可选，空表示 executor 自选；本体按能力声明不能满足的非空字段直接拒绝（`GRASP_SPEC_UNSUPPORTED`），不默默忽略 |
+| `ExecutionDetail.msg` | 与技能无关的结构化执行事实（阶段、原因码、恢复状态、释放与验证状态）；`schema_version=0` 表示不可用。`suggested_action` 不授权任何运动。Python 侧见 `embodied_common.execution_detail` |
+
+**部署**：这些字段改变了 `PickObject`、`PlaceObject`、`SkillCommand`、`ExecuteProgram`、`ExecutionEvent`
+和 `GetExecution` 的 ROS type hash，新旧类型之间不保证互通。所有使用这些接口的主机（X2 的 310P、Orin、机器人
+运行端和 Agent 端）必须一起停机、重建并切换，回滚时也要整套回滚，不能只换一端。
 
 ### `ExecuteAgentPlan.action`
 
@@ -706,10 +731,12 @@ HRI 的内部 delegated action，由 `manipulation_execution/imitate_human_motio
 | --- | --- |
 | `target_query` | 释放后用于视觉检测的物品名称，必填 |
 | `container_query` | 释放后用于视觉检测的指定容器名称，必填；不改变固定释放位 |
+| `custody_id` / `custody_epoch` / `arm_side` | 要放下的持有物 custody，由 Gateway 从那只手的 `HeldObject` 填入，两只手都拿着东西时不会领错；领取时三者都要核对。不经 custody 的固定位 place 留空 |
 | `release_status` | `NOT_RELEASED`、`RELEASED` 或 `UNKNOWN`；不代表已进入容器 |
 | `verification_status` | 二维分割包含验证的 `SUCCESS`、`FAILED`、`UNCERTAIN` 或 `NOT_RUN` |
 | `place_succeeded` | 仅夹爪确认打开且目标物品连续确认位于容器区域内时为 true |
 | `completed_phases` | 包括 `move_to_place`、`release`、`move_to_verify`、`verify_place` 和 `return_to_place` |
+| `execution_detail` / `last_feedback_sequence` / `execution_history` | 与 `PickObject` 相同的结构化执行详情和反馈尾部；feedback 同样带 `execution_detail` 和 `sequence` |
 | `debug_output_dir` | 当前固定放置证据目录；包含版本化 manifest、开爪 JointState、RGB、检测 mask、判定和最终结果，可由 `placement_replay` 离线重放 |
 
 ### `ArmReturnHome.action`

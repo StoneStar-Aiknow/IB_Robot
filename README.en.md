@@ -16,6 +16,8 @@ IB-Robot now fully supports remote social control via the **[OpenClaw](https://g
 
 **User Guide**: [IB-Robot Usage Guide](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)
 
+**Optional: [RoboDojo first-use guide (Chinese)](src/robots/robodojo/robodojo_robot/README.md)** — External simulator and asset setup, a runtime smoke test without an LLM, and an optional single-episode Agent evaluation. RoboDojo assets are not required for other IB-Robot workflows; the project setup does not install this external simulation environment.
+
 IB-Robot connects teleoperation, data collection, model training, edge-cloud collaborative inference, embodied skills, and robot control. It organizes applications through unified observation/action contracts, robot capability interfaces, and model execution abstractions, while Robot Runtime adapts robotic arms, mobile bases, humanoid robots, and vendor control systems.
 
 ### Project Capabilities

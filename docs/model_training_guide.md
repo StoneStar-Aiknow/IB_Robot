@@ -44,7 +44,8 @@
 | `--image-threads` / `--image-processes` | 图像写入线程数 / 进程数，默认 4 / 0 | 否 |
 | `--chunk-size` / `--data-mb` / `--video-mb` | 数据/视频 chunk 大小上限 | 否 |
 | `--video-codec` | 视频编码，可选 `auto`/`h264`/`hevc`/`libsvtav1`/`h264_nvenc`/`hevc_nvenc`，默认 `auto` | 否 |
-| `--timestamp` | 时间基准，可选 `contract`/`bag`/`header`，默认 `contract`（按契约频率重采样） | 否 |
+| `--timestamp` | 时间基准，可选 `contract`/`receive`/`bag`/`header`，默认 `contract`（按契约频率重采样）。`bag` 是 `receive` 的别名，表示用录制接收时间；Annex-B 视频始终使用 sidecar 的采集时间 | 否 |
+| `--header-skew-warn-ms` | 图像流的「接收时间 − header」偏移与同一 bag 内非图像 header 流相差超过该值时告警，默认 `200`，`0` 关闭；只告警，不拦截。每帧图像只与接收时间相差 ≤ 50 ms 的参照样本配对，有效配对少于 5 对时输出 unchecked。所有流共用的时钟偏移会抵消；时钟相对墙钟漂移时（如仿真加速），残差约为漂移速率 × 配对间隔，倍率很大时可能误报 | 否 |
 
 早期版本的 `--robot-config` 参数已移除，传入会直接报错（[bag_to_lerobot.py:42](https://gitcode.com/openeuler/IB_Robot/blob/master/src/dataset_tools/dataset_tools/bag_to_lerobot.py#L42)）。
 

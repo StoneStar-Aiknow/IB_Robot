@@ -13,6 +13,31 @@ must pass.
   QoS and independently observed states. See `docs/robot_interface_schema.md`.
   `runtime_interfaces` exports/validates YAML; `/runtime/get_status` exposes
   the same document in `RuntimeStatus.interface_description_json`.
+- **Calibration preflight** (`preflight.py`): checks a physical profile
+  against the calibration file on this machine around the runtime-layer steps
+  a physical launch takes before any hardware node starts (xacro render, which
+  requires the calibration file; model projection; `build_description`). The
+  report lists per position joint the calibrated range, the effective limit
+  (arm joints: calibration intersected with the URDF; a physical gripper keeps
+  its calibrated range), the home pose and its margin, and warns when a margin
+  is below 0.05 rad. Two entry points:
+  - `checked_physical_description`, called by a provider's physical launch
+    around its own render and `build_description` calls (so101_robot,
+    lekiwi_robot). A pass logs one line; a small margin logs the table and
+    continues; a failure logs a FAIL report (with the table when the model can
+    still be projected) and re-raises the original exception, so the launch
+    fails before any hardware node starts, on the same conditions as before. Simulated selections read no calibration and are not wrapped.
+  - `runtime_preflight`, offline (no launch, no serial port): prints the
+    report for a profile used as is (no peripherals fragment or robot_config
+    overlay) and exits 1 when a step fails; `--min-margin` sets the warning
+    threshold. With `--package`, `--profile` must be a plain profile name
+    (no path) and is looked up only in that package's `profiles/`, never in
+    the working directory.
+
+  Neither checks the provider's own reading of the calibration file (the
+  SO-101 SDK also requires an in-range `homing_offset` and validates
+  `drive_mode` and motor ids when present), later provider launch steps, or
+  that the file belongs to the attached arm.
 
 - **Contract surface** (`contract.py`): canonical, runtime-neutral topic and
   service names (`/runtime_status`, `/runtime/set_mode`, `/runtime/stop`,
@@ -25,6 +50,10 @@ must pass.
   (identity, modes → controller sets, declared capabilities with parameters,
   stop latency bounds, command channels, trajectory endpoints, hardware
   components). Missing required keys fail fast naming the key and the file.
+  `hardware.xacro_args` passes extra xacro args to the hardware render but must
+  not set `simulated`, `port`, `calib_file` or `reset_positions`: the renderer
+  derives those from `hardware` and the launch selection, and the model
+  projection and calibration preflight read the same values.
 - **Mode model** (`modes.py`): named controller activation sets with
   validated transitions and per-channel rejected-command counters. It does
   not arbitrate commands: "one command source per joint group" is enforced
@@ -63,6 +92,15 @@ must pass.
   `robot_runtime_sim`; the boundary is enforced by
   `test/test_sim_boundary.py`).
 - **Conformance suite** (`test/test_conformance.py`): the executable contract.
+- **Task poses and fixed-pose support** (`task_poses.py`, `path_validation.py`,
+  `pose_backend.py`, `hand_mounts.py`): startup-only, runtime-neutral data
+  shared by robot configuration, the skill catalog and robot grasp backends —
+  the immutable task-pose snapshot and its digest (named arm targets such as
+  the pick entry pose, optional transition routes and hand-open actions), the
+  fixed-pose path-validation policy and its digest, the neutral pose-planning
+  result types with a joint-limit intersection that never widens runtime
+  travel, and the explicit hand-mount declaration (missing feedback never
+  implies a removed hand). No file is reread while a task runs.
 
 ## Prohibited
 

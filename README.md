@@ -6,6 +6,8 @@ IB-Robot 贯通遥操作、数据采集、模型训练、边端协同推理、�
 
 **[用户指导文档](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)** · **[机器人配置](src/robot_config/README.md)** · **[推理运行时](src/inference_service/README.md)** · **[Agent 技能入口](src/agent/robot_skill_cli/README.md)** · **[开发与测试](docs/testing.md)**
 
+**可选：[RoboDojo 首次使用手册](src/robots/robodojo/robodojo_robot/README.md)** — 外部仿真环境与资产准备、无模型运行时冒烟、Agent 单局评测。普通 IB-Robot 用户无需下载 RoboDojo 资产；项目 setup 不会代装该仿真环境。
+
 ## 项目能力
 
 | 方向 | 核心能力 |
@@ -381,7 +383,7 @@ IB_Robot/
 │   ├── torch_models/            # Torch 模型实现与适配
 │   ├── model_utils/             # 模型导出与转换工具
 │   ├── dataset_tools/           # 数据采集、转换、评估与可视化
-│   ├── benchmark/               # Benchmark 运行时与 LIBERO 适配
+│   ├── benchmark/               # Benchmark 运行时与 LIBERO 适配、Agent 评测（agent_eval）
 │   ├── agent/                   # Agent 栈（技能目录、Gateway、规划、CLI、自然语言 Agent）
 │   │   ├── ibrobot_agent/       # 自然语言 Agent（孵化）
 │   │   ├── robot_skill_cli/     # Agent 受控 CLI 与集成接口

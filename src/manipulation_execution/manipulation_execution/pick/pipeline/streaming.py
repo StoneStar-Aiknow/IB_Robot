@@ -30,7 +30,7 @@ from typing import Protocol
 
 import numpy as np
 
-from .contracts import ArmSegment, Flag, MotionOutcome, MotionState, SegmentKind
+from manipulation_execution.shared.contracts import ArmSegment, Flag, MotionOutcome, MotionState, SegmentKind
 
 #: How far back a command report that matches no recent target is looked up, to say how stale it is.
 MISMATCH_LOOKBACK_S = 2.0

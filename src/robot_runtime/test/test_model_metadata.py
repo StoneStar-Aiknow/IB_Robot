@@ -113,3 +113,15 @@ def test_conversion_lookup_error_hints_at_field_selectors():
     model = build_model_metadata(_profile(), use_sim=True, sim_platform="sdk", robot_description=URDF)
     with pytest.raises(ValueError, match="field selectors"):
         build_joint_conversion_table_from_model(model, ["position.1", "position.6"], "degrees")
+
+
+def test_validate_false_returns_the_model_the_default_rejects(tmp_path):
+    # Joint 1 is limited to -1.0 .. 1.0 rad; a home of 1.5 rad is outside.
+    profile = _profile(_write_calibration(tmp_path))
+    profile["home_positions"] = {"1": 1.5}
+    with pytest.raises(ValueError, match=r"home_positions\.1 is outside physical limits"):
+        build_model_metadata(profile, use_sim=False, sim_platform=None, robot_description=URDF)
+
+    model = build_model_metadata(profile, use_sim=False, sim_platform=None, robot_description=URDF, validate=False)
+    assert model["home_positions"] == {"1": 1.5}
+    assert model["joint_limits"]["1"]["max"] == pytest.approx(1.0)

@@ -30,6 +30,7 @@ setup(
             "topic_relay = robot_runtime.topic_relay:main",
             "synthetic_perception = robot_runtime.synthetic_perception:main",
             "runtime_interfaces = robot_runtime.interface_description:main",
+            "runtime_preflight = robot_runtime.preflight:main",
         ],
         # The physics platforms (gazebo, mujoco) moved to robot_runtime_sim
         # (openspec sim-platform-registry D6); this package registers none.

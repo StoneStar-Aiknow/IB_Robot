@@ -1,0 +1,43 @@
+# Smoke suite: one RoboDojo general_pickup episode (layout 9001, index 0).
+# Same stack, planner view and skills as robodojo_general_pickup_e2.
+#
+#   ROBODOJO_ROOT=<RoboDojo checkout> ros2 run agent_eval run_suite --suite robodojo_general_pickup_smoke \
+#     [--episodes N] [--out DIR] \
+#     [--override embodied.agent.planner.base_url=<endpoint>] [--override embodied.agent.planner.api_key_env=<VAR>]
+#
+schema_version: 1
+kind: suite
+name: robodojo_general_pickup_smoke
+platform: robodojo
+robot_config: robodojo_x5
+task: general_pickup
+episode_tag: true
+# Optional shell env file exporting the planner key (api_key_env of the robot config). Only
+# its path is handled: the stack process sources it; agent_eval never reads or logs it.
+env_file: null
+timeouts:
+  stack_ready_s: 300.0
+  episode_wait_s: 1800.0
+  native_result_wait_s: 600.0
+  client_exit_s: 180.0
+# robodojo_root / conda_sh default to ROBODOJO_ROOT / CONDA_SH from the environment.
+platform_options: {}
+# The planner's view the recipe is written for: the six pickup skills (no hold_simulation)
+# and the full catalog in the prompt.
+robot_config_overrides:
+  embodied:
+    skill_catalog_profile: robodojo_x5_pickup
+    execution:
+      simulation_hold: null
+    agent:
+      test_allowlist:
+        - move_relative_ee
+        - open_gripper_skill
+        - close_gripper_skill
+        - rotate_gripper_cw
+        - rotate_gripper_ccw
+        - set_gripper_approach
+      planner:
+        catalog_view: full
+layouts:
+  - {name: shovel_9001, seed_start: 9001, episodes: 1, platform_options: {}}

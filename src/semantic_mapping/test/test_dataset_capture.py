@@ -86,6 +86,94 @@ class _Failed:
     returncode = 7
 
 
+@pytest.mark.parametrize("message_type", [None, "livox_ros_driver2/msg/CustomMsg", "sensor_msgs/msg/PointCloud2"])
+def test_finalize_checks_simulated_lidar_against_session_state(tmp_path, monkeypatch, message_type):
+    topics = _required_topics()
+    next(item for item in topics if item["topic_metadata"]["name"] == "/livox/lidar")["topic_metadata"]["type"] = (
+        "sensor_msgs/msg/PointCloud2"
+    )
+    _write_bag(tmp_path, topics=topics)
+    _write_map(tmp_path)
+    state = {
+        "session_id": "fixture",
+        "profile": "lekiwi_semantic_capture",
+        "session_root": str(tmp_path),
+        "status": "recorded",
+        "calibration_sources": {},
+        "camera_info_topic": "/camera/front/camera_info",
+    }
+    if message_type is not None:
+        state["lidar_message_type"] = message_type
+    state_file = tmp_path / "current.json"
+    state_file.write_text(json.dumps(state))
+    monkeypatch.setattr(
+        dataset_capture,
+        "build_calibration_snapshot",
+        lambda *_args, **_kwargs: {"status": "complete", "artifacts": {"base_to_front_camera": {"status": "approved"}}},
+    )
+    if message_type != "sensor_msgs/msg/PointCloud2":
+        with pytest.raises(ValueError, match=r"wrong_types=\['/livox/lidar'\]"):
+            dataset_capture.finalize_dataset(state_file, command_runner=lambda *_args, **_kwargs: _Completed())
+        return
+    archive = dataset_capture.finalize_dataset(state_file, command_runner=lambda *_args, **_kwargs: _Completed())
+    assert archive.is_file()
+    manifest = json.loads((tmp_path / "manifest.json").read_text())
+    assert manifest["lidar_message_type"] == message_type
+    assert next(item for item in manifest["topics"] if item["name"] == "/livox/lidar")["type"] == message_type
+
+
+@pytest.mark.parametrize("message_type", ["sensor_msgs/msg/Image", "", None, 5, []])
+def test_finalize_stops_recorder_before_rejecting_invalid_lidar_type(tmp_path, monkeypatch, message_type):
+    state_file = tmp_path / "current.json"
+    state_file.write_text(
+        json.dumps({"lidar_message_type": message_type, "status": "recording", "session_root": str(tmp_path)})
+    )
+    stopped = []
+
+    def stop_recorder(path, state, timeout_sec):
+        assert path == state_file
+        assert state["status"] == "recording"
+        state["status"] = "recorded"
+        path.write_text(json.dumps(state))
+        stopped.append(True)
+        return state
+
+    monkeypatch.setattr(dataset_capture, "_stop_recorder", stop_recorder)
+    with pytest.raises(ValueError, match="invalid lidar_message_type"):
+        dataset_capture.finalize_dataset(state_file)
+    assert stopped == [True]
+    assert json.loads(state_file.read_text())["status"] == "recorded"
+
+
+def test_finalize_rejects_outside_map_prefix_without_stopping_recorder(tmp_path, monkeypatch):
+    state_file = tmp_path / "current.json"
+    state_file.write_text(json.dumps({"status": "recording", "session_root": str(tmp_path / "session")}))
+    stopped = []
+    monkeypatch.setattr(dataset_capture, "_stop_recorder", lambda *args: stopped.append(True))
+
+    with pytest.raises(ValueError, match="map prefix must remain inside the semantic dataset session"):
+        dataset_capture.finalize_dataset(state_file, map_prefix=tmp_path / "outside" / "map")
+
+    assert stopped == []
+    assert json.loads(state_file.read_text())["status"] == "recording"
+    assert not (tmp_path / "outside").exists()
+
+
+def test_simulated_lidar_does_not_relax_other_topic_types(tmp_path):
+    topics = _required_topics()
+    for item in topics:
+        if item["topic_metadata"]["name"] in {"/livox/lidar", "/livox/imu"}:
+            item["topic_metadata"]["type"] = "sensor_msgs/msg/PointCloud2"
+    _write_bag(tmp_path, topics=topics)
+    with pytest.raises(ValueError, match=r"wrong_types=\['/livox/imu'\]"):
+        dataset_capture.validate_mcap_metadata(tmp_path / "bag", lidar_message_type="sensor_msgs/msg/PointCloud2")
+
+
+def test_metadata_rejects_invalid_lidar_type(tmp_path):
+    with pytest.raises(ValueError, match="invalid lidar_message_type"):
+        dataset_capture.validate_mcap_metadata(tmp_path / "bag", lidar_message_type="sensor_msgs/msg/Image")
+
+
 def test_validate_mcap_metadata_requires_every_actual_split(tmp_path):
     _write_bag(tmp_path)
 
@@ -117,7 +205,7 @@ def test_validate_mcap_metadata_uses_actual_topic_type_count_and_time_coverage(t
     }
     assert result["topic_validation"]["required_nonzero"] == sorted(dataset_capture.SEMANTIC_REQUIRED_NONZERO_TOPICS)
     assert result["topic_validation"]["reported_optional"]["/cmd_vel"] == 0
-    assert result["topic_validation"]["missing_optional"] == ["/wheel/odom"]
+    assert result["topic_validation"]["missing_optional"] == ["/odom"]
     assert result["time_coverage"]["status"] == "validated"
     assert result["time_coverage"]["files_end_ns"] == 500
 

@@ -49,8 +49,11 @@ runtime_options:
   model_dtype: fp16
 ```
 
-The `so101_pi05_ascend_310p_mock` profile supplies this pipeline and mock
-observations, defaulting to fast. From the workspace root, after building and
+The `so101_pi05_ascend_310p_mock` profile supplies this pipeline on the SO-101
+runtime's SDK simulation platform (simulated follower arm, synthetic images on
+the runtime camera topics), defaulting to fast. The runtime still starts its
+leader-arm reader, which exits when no leader arm is connected; inference does
+not depend on it. From the workspace root, after building and
 packaging both presets:
 
 ```bash

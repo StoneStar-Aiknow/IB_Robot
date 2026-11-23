@@ -85,6 +85,9 @@
   <test_depend>shape_msgs</test_depend>
   <test_depend>geometry_msgs</test_depend>
   <test_depend>robot_navigation</test_depend>
+  <!-- The mobile-pick E2E reads ground truth and marks its processes through
+       robot_runtime_sim.testing (entity_ground_truth, sim_ground_truth). -->
+  <test_depend>robot_runtime_sim</test_depend>
   <!-- The E2E's sim-clock subscription and the reach test read /clock
        (review r1 item 12). -->
   <test_depend>rosgraph_msgs</test_depend>
